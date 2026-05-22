@@ -63,7 +63,7 @@ node pa/dist/bin/pa.js health
 pwsh projects/telegram-bot/run-bot.ps1
 ```
 
-Detailed walkthrough: [`docs/QUICKSTART.md`](docs/QUICKSTART.md).
+Detailed walkthrough: [`docs/QUICKSTART.md`](docs/QUICKSTART.md). For deployment patterns (simple fork vs dual-`.git`), see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 ## What's included
 
@@ -71,8 +71,9 @@ Detailed walkthrough: [`docs/QUICKSTART.md`](docs/QUICKSTART.md).
 - **`projects/telegram-bot/`** — Long-poll Telegram bot with forum-topic support, conversation archive, DLQ, sentinel-based graceful shutdown.
 - **`projects/daily-mail-brief/`** — Reference sample: Gmail triage → LLM summary → Telegram + optional Obsidian archival.
 - **`examples/skills/`** — Three sample skills (`reminders`, `daily-mail-brief`, `update-brain`) demonstrating the full feature surface.
-- **`examples/config.yaml.example`** + **`examples/secrets.env.example`** — annotated config templates.
-- **`docs/`** — Architecture, quickstart, configuration, skills guide, workers guide, bot guide, troubleshooting.
+- **`examples/oauth/`** — Google OAuth helpers (`google_auth.py`, `reauth_google.py`, `requirements.txt`, walkthrough README) for skills that need Gmail/Drive/Docs access.
+- **`examples/config.yaml.example`** + **`examples/secrets.env.example`** + **`examples/topics-template.json`** — annotated config templates.
+- **`docs/`** — Architecture, quickstart, configuration, skills guide, workers guide, bot guide, deployment, conventions, troubleshooting.
 
 ## Status
 

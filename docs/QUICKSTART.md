@@ -2,6 +2,8 @@
 
 > Goal: get a stranger from `git clone` to a running skill + Telegram delivery in ~30 minutes.
 
+> **Before you start**: read [`docs/CONVENTIONS.md`](CONVENTIONS.md) for the file-placement rules so personal data doesn't accidentally land in a tracked location. For deployment patterns (simple fork vs dual-`.git`), see [`docs/DEPLOYMENT.md`](DEPLOYMENT.md).
+
 ## 1. Prerequisites
 
 - **Node.js 22+** (the framework uses ES modules with Node native test runner).
@@ -13,7 +15,7 @@
   - [OpenAI Codex](https://github.com/openai/codex) (`codex`)
   - Or a Claude alternative like zClaude.
 - **Optional**: a Telegram bot (created via [@BotFather](https://t.me/BotFather)) + the chat ID where you want it to operate. See `docs/BOT_GUIDE.md`.
-- **Optional**: a Google OAuth client (for the `daily-mail-brief` sample's Gmail access). See `examples/secrets.env.example` for the env vars expected.
+- **Optional**: a Google OAuth client (for the `daily-mail-brief` sample's Gmail access). See [`examples/oauth/README.md`](../examples/oauth/README.md) for the full setup walkthrough.
 
 ## 2. Build
 
@@ -80,7 +82,41 @@ PA_ALERTS_THREAD_ID=<forum thread ID, or 0 for general>
 
 See `examples/secrets.env.example` for the full annotated list.
 
-## 5. Configure workers
+## 5. OAuth setup (if using Gmail-based skills)
+
+If you'll run the `daily-mail-brief` sample or any other Gmail-using skill, set up Google OAuth now. Skip this section if you're not using Gmail/Drive/Docs.
+
+Install Python deps:
+
+```
+pip install -r examples/oauth/requirements.txt
+```
+
+Copy the OAuth helpers to PA_HOME (where skills load them from):
+
+```powershell
+# PowerShell
+Copy-Item examples/oauth/google_auth.py $HOME/.pa/google_auth.py
+Copy-Item examples/oauth/reauth_google.py $HOME/.pa/reauth_google.py
+```
+
+```bash
+# Bash / POSIX
+cp examples/oauth/google_auth.py ~/.pa/google_auth.py
+cp examples/oauth/reauth_google.py ~/.pa/reauth_google.py
+```
+
+Get your OAuth credentials JSON from Google Cloud Console — visit https://console.cloud.google.com → APIs & Services → Credentials → Create Credentials → OAuth Client ID → **Desktop app** → Download JSON → save as `~/.pa/google-credentials.json`. See [`examples/oauth/README.md`](../examples/oauth/README.md) for the full walkthrough (consent screen setup, scopes, troubleshooting).
+
+Run the one-time auth flow:
+
+```powershell
+python ~/.pa/reauth_google.py
+```
+
+A browser window opens — sign in, approve scopes, and the token is written to `~/.pa/google-token.json`.
+
+## 6. Configure workers
 
 Edit `~/.pa/config.yaml`. The default scaffolded config assumes your worker CLIs are in PATH. If yours are at custom paths (common on Windows), adjust the `command` field:
 
@@ -95,7 +131,7 @@ workers:
 
 Full schema in `docs/CONFIGURATION.md`. Annotated example in `examples/config.yaml.example`.
 
-## 6. Register your first skill
+## 7. Register your first skill
 
 Copy the minimal sample:
 
@@ -115,7 +151,7 @@ node pa/dist/bin/pa.js list
 
 You should see `reminders` listed with cron `* * * * *`.
 
-## 7. Run it
+## 8. Run it
 
 Dry-run:
 
@@ -137,7 +173,7 @@ If `~/.pa/skills/reminders/reminders.json` is empty or missing, the script exits
 
 Save as `~/.pa/skills/reminders/reminders.json`. Run again — you should see a Telegram message.
 
-## 8. Health check
+## 9. Health check
 
 ```
 node pa/dist/bin/pa.js health
@@ -145,7 +181,7 @@ node pa/dist/bin/pa.js health
 
 Should report most checks as `PASS` or `WARN`. Failures come with actionable hints (see `docs/TROUBLESHOOTING.md`).
 
-## 9. Start the Telegram bot
+## 10. Start the Telegram bot
 
 ```powershell
 # Foreground (logs to ~/.pa/logs/telegram-bot.log via the wrapper)
@@ -161,7 +197,15 @@ To stop gracefully: `node pa/dist/bin/pa.js bot stop` (sets a sentinel file the 
 
 To restart: `node pa/dist/bin/pa.js bot restart` (stop → Task Scheduler / your supervisor brings it back).
 
-## 10. Schedule recurring runs
+**Optional: auto-create canonical Telegram topics** — if your `TELEGRAM_CHAT_ID` points at a supergroup with forum topics enabled, the framework can auto-create a recommended set (`pa-alerts`, `pa-support`, `daily-briefings`, `claude-support`, etc.) so each skill has a natural destination:
+
+```
+node pa/dist/bin/pa.js bot setup-topics
+```
+
+Defaults to the first entry in `TELEGRAM_CHAT_ID`; pass `--chat-id <supergroup-id>` to override if your first entry is a DM (DMs don't have forum topics). Idempotent — safe to re-run; only creates missing topics. See [`docs/BOT_GUIDE.md`](BOT_GUIDE.md) for details and the template at `examples/topics-template.json`.
+
+## 11. Schedule recurring runs
 
 On Windows:
 
@@ -177,22 +221,18 @@ On Linux/macOS (until cross-platform scheduler ships): add to your crontab manua
 */1 * * * * /usr/bin/env node /path/to/pa-framework/pa/dist/bin/pa.js catchup
 ```
 
-## 11. Sync framework changes to public repo (maintainer-only)
+## 12. Going further: deploying your own version
 
-If you've forked this repo and made improvements you want to publish back to your own public mirror, follow the dual-`.git`-directory pattern documented in the framework's [plan](https://github.com/coderexpert123/pa-framework/blob/main/docs/ARCHITECTURE.md):
+To set up your own deployment (your own private repo seeded with the framework, or a dual-`.git` setup if you contribute substrate fixes upstream), see [`docs/DEPLOYMENT.md`](DEPLOYMENT.md). It documents two patterns:
 
-```powershell
-git-public status
-git-public add <files>
-git-public commit -m "..."
-git-public push
-```
-
-This is for the substrate maintainer only — regular users contribute via PRs.
+- **Pattern A — Simple fork** (recommended for most users): one private repo containing the framework + your personal additions.
+- **Pattern B — Dual-`.git`** (advanced): two `.git` directories in one working tree, for contributors who push substrate fixes back to the public framework.
 
 ## Next steps
 
 - Read [`docs/SKILLS_GUIDE.md`](SKILLS_GUIDE.md) to write your own skills.
 - Read [`docs/WORKERS_GUIDE.md`](WORKERS_GUIDE.md) to add new worker CLIs.
 - Read [`docs/BOT_GUIDE.md`](BOT_GUIDE.md) for full Telegram setup.
+- Read [`docs/DEPLOYMENT.md`](DEPLOYMENT.md) to plan your own deployment (simple fork or dual-`.git`).
+- Read [`docs/CONVENTIONS.md`](CONVENTIONS.md) for file-placement rules (where personal data goes vs where framework code goes).
 - Read [`docs/TROUBLESHOOTING.md`](TROUBLESHOOTING.md) if `pa health` shows failures.

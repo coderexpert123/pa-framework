@@ -101,7 +101,7 @@ Add the missing keys. See [`CONFIGURATION.md`](CONFIGURATION.md) for the full li
 No skill has ever run. Either:
 
 1. You just installed (normal) — try `pa run reminders` to confirm execution works.
-2. The catchup task isn't firing automatically — register Windows Task Scheduler / crontab. See [`QUICKSTART.md`](QUICKSTART.md) §10.
+2. The catchup task isn't firing automatically — register Windows Task Scheduler / crontab. See [`QUICKSTART.md`](QUICKSTART.md) §11 "Schedule recurring runs".
 
 ### `last-catchup` WARN — "stale > 2h"
 

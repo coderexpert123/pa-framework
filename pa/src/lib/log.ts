@@ -11,7 +11,7 @@ import { appendFile, mkdir, writeFile } from 'fs/promises';
 import { dirname, join } from 'path';
 import lockfile from 'proper-lockfile';
 import { paHome } from '../paths.js';
-import { rotateFileIfNeeded } from '../archive-files.js';
+import { rotateFileIfNeeded } from './archive-files.js';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 

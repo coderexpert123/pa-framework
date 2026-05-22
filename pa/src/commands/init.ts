@@ -161,6 +161,10 @@ export async function initCommand(): Promise<void> {
   console.log('');
   console.log('Next steps:');
   console.log('');
+  console.log('  Important — read first: docs/CONVENTIONS.md covers file-placement rules.');
+  console.log('  Personal docs go OUTSIDE the repo (~/Documents/personal-imports/),');
+  console.log('  not at the repo root. For deployment patterns, see docs/DEPLOYMENT.md.');
+  console.log('');
   console.log('  1. Set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID in', sp);
   console.log('     See docs/BOT_GUIDE.md for Telegram setup.');
   console.log('');
