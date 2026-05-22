@@ -1,0 +1,23 @@
+{
+  "name": "pa-telegram-bot",
+  "version": "1.0.0",
+  "description": "Conversational Telegram bot for pa — routes messages through the pa worker pipeline",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/main.js",
+    "dev": "tsc --watch",
+    "test": "node --test dist/tests/*.test.js"
+  },
+  "dependencies": {
+    "fs-extra": "^11.3.4",
+    "proper-lockfile": "^4.1.2",
+    "yaml": "^2.7.0"
+  },
+  "devDependencies": {
+    "@types/fs-extra": "^11.0.4",
+    "@types/node": "^22.0.0",
+    "@types/proper-lockfile": "^4.1.4",
+    "typescript": "^5.7.0"
+  }
+}

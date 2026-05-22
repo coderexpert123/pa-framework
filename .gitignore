@@ -1,0 +1,140 @@
+# Dependencies
+node_modules/
+
+# Build output
+pa/dist/
+
+# Environment & secrets
+.env
+.env.*
+
+# OS
+.DS_Store
+
+# Debug logs
+npm-debug.log*
+
+# TypeScript
+*.tsbuildinfo
+
+# Deprecated (archived, don't track changes)
+_deprecated/
+
+# Claude Code
+.claude/settings.local.json
+
+# Python
+__pycache__/
+**/venv/
+**/.venv/
+
+# Generated data files
+*.db
+*.csv
+*.pdf
+*.log
+
+# Secrets
+**/credentials.json
+**/google-token.json
+**/secrets.env
+
+# Editor
+.obsidian/
+
+# Root repo hygiene scratch/state
+/.codex/
+/pa/blackboard.json
+
+# === Repo-root hygiene: nothing personal/ephemeral lives at the root ===
+# See docs/CONVENTIONS.md (public) + CLAUDE.md "Repository hygiene" (private).
+# Repo root is reserved for repo-level files only: README, LICENSE, CLAUDE.md,
+# BACKLOG.md, MEMORY.md, DEBUGGING.md, AGENTS.md, GEMINI.md, .gitignore*,
+# git-public.*. Anything else gets caught by the patterns below.
+
+# External imports at root (PDFs, images, binaries — likely Telegram attachments)
+/*.jpg
+/*.jpeg
+/*.png
+/*.gif
+/*.pdf
+/*.db
+/*.csv
+/*.xlsx
+/*.docx
+
+# Email/conversation exports at root
+/*_email_*.txt
+/*_export_*.*
+/*turns*.json
+/*turns*.jsonl
+/*turns*.txt
+/extracted_facts.md
+
+# Ad-hoc analysis scripts at root (must live in scratch/ or proper project)
+/analyze_*.py
+/check_*.py
+/find_*.py
+/extract_*.py
+/fetch_*.py
+/search_*.py
+/temp_*.py
+/scratch_*
+
+# Misplaced Ecosystem KB schema files at repo root (canonical home is in your
+# Obsidian vault / KB directory outside this repo, configured per-deployment).
+# These are the standard filenames used by the `ecosystem-kb` skill.
+/Action\ Items.md
+/Preferences.md
+/Financial.md
+/People\ &\ Contacts.md
+/Health\ &\ Medical.md
+
+# Scratch workspace — for ad-hoc / WIP / throwaway files (see scratch/README.md)
+/scratch/*
+!/scratch/.gitkeep
+!/scratch/README.md
+
+# Inside any project: scratch + temp/debug-prefixed artifacts
+**/scratch/
+**/temp_*.py
+**/temp_*.json
+**/temp_*.md
+**/temp_*.txt
+**/debug_*.py
+**/debug_*.log
+**/*-debug.log
+**/test_repro.*
+**/test_real_login.*
+
+# Large input data dirs
+src_pdfs/
+
+# === Public-repo coexistence ===
+# Separate .git directory + wrapper for the public framework repo
+/.git-public/
+/.gitignore-public
+/git-public.cmd
+/git-public.ps1
+
+# Public-only files (untracked by private repo to avoid pollution)
+/README.md
+/LICENSE
+/docs/
+/examples/
+
+# === OAuth artifact hygiene (prevent recurrence of auth_code leak) ===
+**/auth_code.txt
+**/auth_url*.txt
+**/auth_*.txt
+
+# === Temp / debug-only files that have leaked before ===
+projects/daily-mail-brief/temp_brief.md
+projects/daily-mail-brief/temp_*.py
+
+# === User-personalized prompts (do not auto-stage in public clones) ===
+# bot-instructions.md is the static system prompt appended to claude/zclaude spawns
+# via --append-system-prompt-file. Each user customizes it locally.
+# The private repo's existing tracked copy is unaffected — gitignore only
+# prevents NEW additions in fresh clones (e.g. of the future public repo).
+projects/telegram-bot/bot-instructions.md

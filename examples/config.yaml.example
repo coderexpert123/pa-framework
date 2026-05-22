@@ -1,0 +1,125 @@
+# pa-framework — annotated config template.
+#
+# Copy this to ~/.pa/config.yaml after `pa init` and customize for your setup.
+# `pa init` scaffolds a minimal default; this template shows ALL fields.
+
+workers:
+  # ---- zclaude (priority 1 — your highest-preferred worker) ----
+  - name: zclaude
+    command: zclaude          # PATH-resolved binary, or absolute path
+    # Windows example with custom shim:
+    # command: C:/Users/you/.local/bin/zclaude.bat
+    args:
+      - "-p"
+      - "--dangerously-skip-permissions"
+      - "--output-format"
+      - "stream-json"
+      - "--input-format"
+      - "stream-json"
+      - "--verbose"
+    input_mode: stdin-json
+    output_format: stream-json
+    check: zclaude --version
+    check_timeout: 30           # seconds; default 30
+    rate_limit_patterns:
+      - "rate limit"
+      - "token limit"
+      - "quota exceeded"
+      - "Usage limit"
+      - "over your limit"
+      - "hit your limit"
+      - "429"
+    priority: 1
+    state_dir: "~/.claude/projects"   # for session-mode rate-limit detection
+    state_pattern: "*.jsonl"
+
+  # ---- gemini (priority 2) ----
+  - name: gemini
+    command: gemini
+    # Windows example with a shim that wraps the gemini-cli to fix arg quoting:
+    # command: C:/Users/<you>/.local/bin/gemini-shim.cmd
+    args:
+      - "--yolo"
+      - "--output-format"
+      - "stream-json"
+    input_mode: stdin-text
+    output_format: stream-json
+    check: gemini --version
+    check_timeout: 10
+    rate_limit_patterns:
+      - "RESOURCE_EXHAUSTED"
+      - "429"
+      - "quota"
+      - "rate limit"
+      - "Resource exhausted"
+    priority: 2
+    state_dir: "~/.gemini/tmp/personal-assistant/chats"  # must match GEMINI_PROJECT_DIR
+    state_pattern: "*.json"
+
+  # ---- codex (priority 3) ----
+  - name: codex
+    command: codex
+    # Windows + Node-based codex example (path varies by your npm setup):
+    # command: node C:/Users/<you>/AppData/Roaming/npm/node_modules/@openai/codex/bin/codex.js
+    args:
+      - "exec"
+      - "--dangerously-bypass-approvals-and-sandbox"
+      - "--color"
+      - "never"
+      - "--json"
+      - "-"
+    input_mode: stdin-text
+    output_format: stream-json
+    check: codex --version
+    check_timeout: 15
+    rate_limit_patterns:
+      - "hit your usage limit"
+      - "rate limit"
+      - "quota exceeded"
+      - "429"
+    priority: 3
+
+  # ---- claude (priority 4 — fallback) ----
+  - name: claude
+    command: claude
+    # Windows example:
+    # command: C:/Users/<you>/AppData/Roaming/npm/claude.cmd
+    args:
+      - "-p"
+      - "--dangerously-skip-permissions"
+      - "--output-format"
+      - "stream-json"
+      - "--input-format"
+      - "stream-json"
+      - "--verbose"
+    input_mode: stdin-json
+    output_format: stream-json
+    check: claude --version
+    rate_limit_patterns: []   # session-mode detection via state files
+    priority: 4
+    state_dir: "~/.claude/projects"
+    state_pattern: "*.jsonl"
+
+# ---- evaluator (optional) ----
+# When a worker appears stuck (no output for idle_timeout seconds), the
+# orchestrator consults this LLM to decide: extend timeout, kill, or
+# fail-over to next worker.
+evaluator:
+  worker: claude            # name must match one of the workers above
+  timeout: 60               # seconds; default 60
+
+# ---- topic_defaults (optional) ----
+# Maps Telegram (chat_id, thread_id) pairs to a preferred worker.
+# Useful when you want different topics to default to different LLMs
+# (e.g., a "coding" topic always uses claude, a "research" topic always
+# uses gemini). The bot's /model command can override per-topic; this
+# is the initial default.
+topic_defaults:
+  # "1000000001_0": zclaude            # private chat with this user_id, topic 0 → zclaude
+  # "-1001234567890_310": claude       # supergroup thread 310 → claude
+  # "-1001234567890_29": gemini
+
+# ---- bg_tasks (background-leak detection) ----
+bg_tasks:
+  alert_seconds: 300          # alert if a worker's descendant outlives parent by N seconds; min 60
+  alert_repeat_seconds: 1800  # repeat alerts every N seconds (must be >= alert_seconds); default 1800

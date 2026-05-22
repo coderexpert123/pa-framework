@@ -1,0 +1,65 @@
+{
+  "_comment": "Default topic structure for pa-framework Telegram bot. Used by `pa bot setup-topics` to auto-create topics in a supergroup. Edit names/order/roles for your deployment. The bot must be an admin in the target supergroup with forum topics enabled.",
+  "topics": [
+    {
+      "name": "general-knowledge",
+      "description": "Default catch-all topic — quick questions, conversations that don't fit elsewhere.",
+      "special_role": "general",
+      "default_worker": null
+    },
+    {
+      "name": "pa-alerts",
+      "description": "Automated framework alerts: worker failures, rate-limit events, bg-process leaks, evaluator parse errors.",
+      "special_role": "alerts",
+      "default_worker": null
+    },
+    {
+      "name": "pa-support",
+      "description": "Manual debugging — pa CLI issues, scheduler problems, lock investigation, skill failures.",
+      "special_role": "none",
+      "default_worker": "claude"
+    },
+    {
+      "name": "daily-briefings",
+      "description": "Scheduled informational output — daily mail brief, weekly reports, calendar alerts.",
+      "special_role": "briefings",
+      "default_worker": "gemini"
+    },
+    {
+      "name": "claude-support",
+      "description": "Debugging the claude worker — Claude API issues, prompt engineering, Claude-specific troubleshooting.",
+      "special_role": "none",
+      "default_worker": "claude"
+    },
+    {
+      "name": "zclaude-support",
+      "description": "Debugging the zclaude worker — zclaude-specific issues and worker failover scenarios.",
+      "special_role": "none",
+      "default_worker": "zclaude"
+    },
+    {
+      "name": "gemini-support",
+      "description": "Debugging the gemini worker — gemini-cli quirks, RESOURCE_EXHAUSTED, grounded search issues.",
+      "special_role": "none",
+      "default_worker": "gemini"
+    },
+    {
+      "name": "codex-support",
+      "description": "Debugging the codex worker — codex-cli issues, /skill translation, output parsing.",
+      "special_role": "none",
+      "default_worker": "codex"
+    },
+    {
+      "name": "feature-changes",
+      "description": "Discussion about implementing changes to the framework / bot / skills.",
+      "special_role": "none",
+      "default_worker": "claude"
+    },
+    {
+      "name": "system-dashboard",
+      "description": "Pinned-message status card maintained automatically by the bot's dashboard.ts. First message sent here creates the dashboard.",
+      "special_role": "dashboard",
+      "default_worker": null
+    }
+  ]
+}
