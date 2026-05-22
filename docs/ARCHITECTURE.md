@@ -12,7 +12,7 @@ The framework is structured so that each layer depends only on the ones below it
 | 4 | Skill substrate | `~/.pa/skills/<name>/skill.md` | Markdown skills with YAML frontmatter; runtime dispatch |
 | 3 | Orchestrator | `pa/src/{scheduler,blackboard,analyzer,drafts,lib/*}.ts` | Cron eval, locking, structured logs, alert dedup, learn pipeline |
 | 2 | Worker pool | `pa/src/{workers,worker-exec,worker-evaluator,state-monitor,rate-limits-*}.ts` | CLI spawn, failover, rate-limit parsing, stuck-state evaluation |
-| 1 | Auth substrate | `~/.pa/google_auth.py` (user-supplied template) | Shared OAuth for Gmail/Drive/Docs across projects |
+| 1 | Auth substrate | `~/.pa/google_auth.py` (copy from `examples/oauth/` — see `examples/oauth/README.md`) | Shared OAuth for Gmail/Drive/Docs across projects |
 
 Domain projects (e.g., `projects/daily-mail-brief/`) sit *above* layer 5; they use the bot for delivery, register skills in `~/.pa/skills/`, and call into the orchestrator via the `pa` CLI or `pa notify`.
 
