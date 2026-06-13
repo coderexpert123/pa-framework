@@ -15,7 +15,7 @@ function warnProcessTreeUnavailable(tool: string, fn: string): void {
   _warnedProcessTree = true;
   console.warn(
     `[pa/process-tree] ${tool} not found. Child-process tracking disabled. ` +
-    `To add support for this system, implement the POSIX branch in pa/src/process-tree.ts:${fn}() ` +
+    `To add support for this system, implement a new branch in pa/src/process-tree.ts:${fn}() ` +
     `using your platform's process-listing tool.`
   );
 }

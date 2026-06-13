@@ -110,13 +110,24 @@ No skill has ever run. Either:
 1. You just installed (normal) — try `pa run reminders` to confirm execution works.
 2. The catchup task isn't firing automatically — register Windows Task Scheduler / crontab. See [`QUICKSTART.md`](QUICKSTART.md) §11 "Schedule recurring runs".
 
-### `last-catchup` WARN — "stale > 2h"
+### `last-catchup` WARN / FAIL — "stale > 30m / 2h"
 
-Catchup hasn't run in over 2 hours. Check the supervisor (Task Scheduler / cron):
+Catchup hasn't run recently. Check which tasks are registered (cross-platform):
+
+```
+pa schedules list
+```
+
+Or check your platform's scheduler directly:
 
 ```powershell
 # Windows
 schtasks /query /tn PA-Catchup
+```
+
+```bash
+# macOS / Linux
+crontab -l | grep pa
 ```
 
 If the task disappeared, re-register: `node pa/dist/bin/pa.js schedules sync`.
