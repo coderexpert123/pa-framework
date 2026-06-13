@@ -81,7 +81,7 @@ Per-worker cooldowns are tracked in `~/.pa/rate-limit-state.json`. While a worke
 
 ### Process tree
 
-The framework tracks descendant PIDs of spawned workers (`pa/src/process-tree.ts` — Windows-only currently) and kills the entire tree on idle-timeout or absolute-timeout. Background-leak alerts fire when descendants outlive the parent.
+The framework tracks descendant PIDs of spawned workers (`pa/src/process-tree.ts`) and kills the entire tree on idle-timeout or absolute-timeout. On Windows it uses PowerShell + CIM; on POSIX it uses `ps`/`pgrep`. Background-leak alerts fire when descendants outlive the parent.
 
 ### Adding a new worker
 

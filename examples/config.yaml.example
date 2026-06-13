@@ -7,8 +7,8 @@ workers:
   # ---- zclaude (priority 1 — your highest-preferred worker) ----
   - name: zclaude
     command: zclaude          # PATH-resolved binary, or absolute path
-    # Windows example with custom shim:
-    # command: C:/Users/you/.local/bin/zclaude.bat
+    # Windows: command: C:/Users/you/.local/bin/zclaude.bat
+    # POSIX:   command: ~/.local/bin/zclaude
     args:
       - "-p"
       - "--dangerously-skip-permissions"
@@ -36,8 +36,8 @@ workers:
   # ---- gemini (priority 2) ----
   - name: gemini
     command: gemini
-    # Windows example with a shim that wraps the gemini-cli to fix arg quoting:
-    # command: C:/Users/<you>/.local/bin/gemini-shim.cmd
+    # Windows (shim that fixes arg quoting): command: C:/Users/<you>/.local/bin/gemini-shim.cmd
+    # POSIX:   command: ~/.local/bin/gemini   (or use a wrapper script)
     args:
       - "--yolo"
       - "--output-format"
@@ -59,8 +59,9 @@ workers:
   # ---- codex (priority 3) ----
   - name: codex
     command: codex
-    # Windows + Node-based codex example (path varies by your npm setup):
+    # Windows (Node-based, path varies by npm setup):
     # command: node C:/Users/<you>/AppData/Roaming/npm/node_modules/@openai/codex/bin/codex.js
+    # POSIX:   command: codex   (or: node ~/.npm-global/lib/node_modules/@openai/codex/bin/codex.js)
     args:
       - "exec"
       - "--dangerously-bypass-approvals-and-sandbox"
@@ -82,8 +83,8 @@ workers:
   # ---- claude (priority 4 — fallback) ----
   - name: claude
     command: claude
-    # Windows example:
-    # command: C:/Users/<you>/AppData/Roaming/npm/claude.cmd
+    # Windows: command: C:/Users/<you>/AppData/Roaming/npm/claude.cmd
+    # POSIX:   command: claude   (if in PATH) or ~/.local/bin/claude
     args:
       - "-p"
       - "--dangerously-skip-permissions"

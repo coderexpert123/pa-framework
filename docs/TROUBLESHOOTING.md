@@ -187,17 +187,13 @@ Workaround: emit the literal text outside the `[PA_META]` envelope position (any
 
 These don't work on Linux/macOS:
 
-- `pa schedules sync` — uses Windows Task Scheduler
-- `pa/src/process-tree.ts` — uses PowerShell + WMI for descendant PID discovery
-- `pa/src/commands/bgtasks.ts` — depends on process-tree
-- `bg-leak alerts` — needs descendant-PID introspection
+- `/keepawake` — toggles `SetThreadExecutionState` via a PowerShell helper; no POSIX equivalent.
 
-POSIX workarounds:
-- Schedule `pa catchup` via crontab manually
-- BG-leak detection is silently disabled
-- Other commands (`pa run`, `pa list`, `pa health` partial) work fine
+Everything else is cross-platform:
 
-Full cross-platform support is on the roadmap.
+- `pa schedules sync` — registers via Windows Task Scheduler on Windows; registers via `crontab` on Linux/macOS.
+- `pa/src/process-tree.ts` — uses PowerShell + CIM on Windows; uses `ps`/`pgrep` on POSIX.
+- `pa bgtasks` and bg-leak alerts — fully functional on POSIX via the `ps`-based process tree.
 
 ### Path separators
 
