@@ -210,7 +210,21 @@ async function syncSchedulesPosix(): Promise<void> {
   const tmpPath = join(tmpdir(), `pa-crontab-${process.pid}.tmp`);
   try {
     await writeFile(tmpPath, updated, 'utf8');
-    await execAsync(`crontab "${tmpPath}"`);
+    try {
+      await execAsync(`crontab "${tmpPath}"`);
+    } catch (err: any) {
+      const notFound = err.code === 'ENOENT' || String(err.stderr ?? '').toLowerCase().includes('not found');
+      if (notFound) {
+        throw new Error(
+          `pa schedules sync: crontab not found on this system. ` +
+          `To add scheduling support, implement a new branch in pa/src/scheduler.ts:syncSchedules() ` +
+          `that registers "pa catchup" on your platform's scheduler ` +
+          `(systemd timers, fcron, launchd, Task Scheduler, etc.). ` +
+          `See syncSchedulesWindows() and syncSchedulesPosix() as reference implementations.`
+        );
+      }
+      throw err;
+    }
     console.log(`[+] Registered PA-Catchup-Reminders: * * * * * ${paPath} catchup --topic reminders`);
     console.log(`[+] Registered PA-Catchup:           */15 * * * * ${paPath} catchup`);
   } finally {
@@ -250,8 +264,14 @@ export async function listSchedules(): Promise<void> {
         console.log('No PA-Catchup crontab entries found.');
         console.log('Run `pa schedules sync` to register them.');
       }
-    } catch {
-      console.log('No crontab set. Run `pa schedules sync` to register PA entries.');
+    } catch (err: any) {
+      const notFound = err.code === 'ENOENT' || String(err.stderr ?? '').toLowerCase().includes('not found');
+      if (notFound) {
+        console.log('crontab not available on this system.');
+        console.log('See pa/src/scheduler.ts:syncSchedules() and docs/TROUBLESHOOTING.md §"Unsupported OS" to add scheduling support.');
+      } else {
+        console.log('No crontab set. Run `pa schedules sync` to register PA entries.');
+      }
     }
   }
 

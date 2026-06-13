@@ -8,6 +8,18 @@ export type ExecFn = (cmd: string) => Promise<{ stdout: string; stderr: string }
 
 const BATCH_SIZE = 50;
 
+// Emit at most one warning per process lifetime when process-listing tools are absent
+let _warnedProcessTree = false;
+function warnProcessTreeUnavailable(tool: string, fn: string): void {
+  if (_warnedProcessTree) return;
+  _warnedProcessTree = true;
+  console.warn(
+    `[pa/process-tree] ${tool} not found. Child-process tracking disabled. ` +
+    `To add support for this system, implement the POSIX branch in pa/src/process-tree.ts:${fn}() ` +
+    `using your platform's process-listing tool.`
+  );
+}
+
 export async function getChildPids(pid: number): Promise<number[]> {
   try {
     if (platform() === 'win32') {
@@ -20,7 +32,8 @@ export async function getChildPids(pid: number): Promise<number[]> {
       const { stdout } = await execAsync(`pgrep -P ${pid}`);
       return stdout.trim().split('\n').map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n));
     }
-  } catch {
+  } catch (err: any) {
+    if (err.code === 'ENOENT') warnProcessTreeUnavailable('pgrep', 'getChildPids');
     return [];
   }
 }
@@ -99,7 +112,8 @@ export async function getDescendantPids(
     }
 
     return result;
-  } catch {
+  } catch (err: any) {
+    if (err.code === 'ENOENT') warnProcessTreeUnavailable('ps', 'getDescendantPids');
     return [];
   }
 }

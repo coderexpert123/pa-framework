@@ -197,29 +197,52 @@ All commands are cross-platform. Per-platform backends:
 
 ### Unsupported OS (FreeBSD, Alpine, musl, other POSIX)
 
-Works natively on any POSIX-compliant system (no changes needed):
+The framework is designed to tell you exactly what to change when something is missing on your OS. Every OS-specific feature either degrades gracefully or throws/warns with a precise adaptation pointer.
 
-| Component | Why it works |
-|-----------|-------------|
-| `pa schedules sync` | Uses `crontab` — present on all POSIX |
-| `pa bgtasks` / process tree | Uses `ps -o pid,ppid` — POSIX-portable |
+**Works natively on any POSIX-compliant system (no changes needed):**
+
+| Component | How |
+|-----------|-----|
 | `run-bot.sh` launcher | Plain bash, no OS-specific calls |
 | All skills, workers, Telegram bot | Pure Node.js / Python |
+| `areProcessesAlive()` / `killProcessTree()` | Uses `process.kill(pid, 0)` / `process.kill(-pid, 'SIGTERM')` — POSIX signals, no subprocess |
 
-**Needs adaptation — one file, one function:**
+**Needs `crontab` — self-describes if absent:**
 
-`/keepawake` is the only feature tied to OS-specific APIs. On an unknown OS the bot will throw:
+`pa schedules sync` and `pa schedules list` use `crontab`. If not installed, `sync` throws:
+
+```
+pa schedules sync: crontab not found on this system. To add scheduling support,
+implement a new branch in pa/src/scheduler.ts:syncSchedules() that registers
+"pa catchup" on your platform's scheduler (systemd timers, fcron, launchd, etc.).
+See syncSchedulesWindows() and syncSchedulesPosix() as reference implementations.
+```
+
+The two existing implementations in that file are complete references. The contract: register `pa catchup` to run every 15 minutes and `pa catchup --topic reminders` to run every minute.
+
+**Needs `pgrep` / `ps` — warns once if absent:**
+
+`pa bgtasks` and orphan detection use `pgrep -P` (child PIDs) and `ps -eo pid,ppid` (full tree). On systems where these are missing, the framework emits one warning per process lifetime and returns empty results (non-fatal — bgtasks shows "no active workers" rather than crashing):
+
+```
+[pa/process-tree] pgrep not found. Child-process tracking disabled.
+To add support for this system, implement the POSIX branch in
+pa/src/process-tree.ts:getChildPids() using your platform's process-listing tool.
+```
+
+Adaptation point: `pa/src/process-tree.ts` — two functions: `getChildPids()` (immediate children) and `getDescendantPids()` (full subtree via BFS). Both have complete Windows and POSIX implementations in the same file.
+
+**Needs `caffeinate` / `systemd-inhibit` — throws with exact instructions:**
+
+`/keepawake` (bot sleep-prevention toggle) is the only feature with no universal POSIX fallback. On an unknown OS the toggle throws:
 
 ```
 keepawake not supported on platform "<os>". To add support, implement a new branch
-in projects/telegram-bot/src/keepawake.ts inside startKeepAwake(): ...
+in projects/telegram-bot/src/keepawake.ts inside startKeepAwake(): spawn a background
+process that prevents sleep and can be killed by PID (or process group if it forks).
 ```
 
-The error message contains the exact file, function, and what to implement. The pattern for every OS is the same: spawn a background process that holds a sleep-inhibitor lock, store its PID in `~/.pa/telegram-keepawake.json`, and kill it in `stopKeepAwake()`. If the process forks children (like `systemd-inhibit` does), kill the whole process group (`process.kill(-pid, 'SIGTERM')`); otherwise kill by PID.
-
-Reference implementations already in the file:
-- **macOS**: `caffeinate -s` — single process, kill by PID
-- **Linux**: `systemd-inhibit ... sleep infinity` — forks a child, kill by process group (`-pid`)
+The pattern is identical for every OS: spawn a sleep-inhibitor process, store its PID, kill it in `stopKeepAwake()`. If your tool forks children (as `systemd-inhibit` does), kill the process group (`process.kill(-pid, 'SIGTERM')`); if it's a single process (as `caffeinate` is), kill by PID. Both reference implementations are in the same file.
 
 ### Path separators
 
