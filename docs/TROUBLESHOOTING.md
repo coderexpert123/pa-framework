@@ -193,7 +193,33 @@ All commands are cross-platform. Per-platform backends:
 | Process tree / bgtasks | PowerShell + CIM | `ps`/`pgrep` | `ps`/`pgrep` |
 | `/keepawake` | `SetThreadExecutionState` (PS helper) | `caffeinate -s` | `systemd-inhibit` |
 
-> **Linux keepawake caveat:** requires systemd. On non-systemd distros `/keepawake` will fail to start; use a distro-specific inhibitor manually.
+> **Linux keepawake caveat:** requires systemd. On non-systemd distros `/keepawake` will fail to start; see "Unsupported OS" below.
+
+### Unsupported OS (FreeBSD, Alpine, musl, other POSIX)
+
+Works natively on any POSIX-compliant system (no changes needed):
+
+| Component | Why it works |
+|-----------|-------------|
+| `pa schedules sync` | Uses `crontab` — present on all POSIX |
+| `pa bgtasks` / process tree | Uses `ps -o pid,ppid` — POSIX-portable |
+| `run-bot.sh` launcher | Plain bash, no OS-specific calls |
+| All skills, workers, Telegram bot | Pure Node.js / Python |
+
+**Needs adaptation — one file, one function:**
+
+`/keepawake` is the only feature tied to OS-specific APIs. On an unknown OS the bot will throw:
+
+```
+keepawake not supported on platform "<os>". To add support, implement a new branch
+in projects/telegram-bot/src/keepawake.ts inside startKeepAwake(): ...
+```
+
+The error message contains the exact file, function, and what to implement. The pattern for every OS is the same: spawn a background process that holds a sleep-inhibitor lock, store its PID in `~/.pa/telegram-keepawake.json`, and kill it in `stopKeepAwake()`. If the process forks children (like `systemd-inhibit` does), kill the whole process group (`process.kill(-pid, 'SIGTERM')`); otherwise kill by PID.
+
+Reference implementations already in the file:
+- **macOS**: `caffeinate -s` — single process, kill by PID
+- **Linux**: `systemd-inhibit ... sleep infinity` — forks a child, kill by process group (`-pid`)
 
 ### Path separators
 
