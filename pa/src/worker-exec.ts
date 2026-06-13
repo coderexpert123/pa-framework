@@ -188,6 +188,18 @@ export async function executeWorker(
         });
       };
 
+      const killWithSuccess = (summary: string) => {
+        if (child.pid) killProcessTree(child.pid);
+        else child.kill();
+        done({
+          success: true,
+          output: stdout || summary,
+          exitCode: 0,
+          evaluatorSummary: summary,
+          rateLimitTelemetry: lastCodexTelemetry,
+        });
+      };
+
       // --- Idle timeout with "check before kill" ---
       // When idle timer fires, don't kill immediately. First analyze the conversation
       // state to see if the agent is actually working (pending tool call, active thinking)
@@ -220,6 +232,10 @@ export async function executeWorker(
               process.stdout.write(`\r  [check] ${worker.name}: ${state.status} — consulting evaluator...    `);
               const verdict = await evaluateWorkerState(stateDir, statePattern, worker.name, options.env, executeWorker);
               if (verdict) {
+                if (verdict.verdict === 'done') {
+                  killWithSuccess(verdict.summary);
+                  return;
+                }
                 if (verdict.verdict === 'kill') {
                   killWithSummary(
                     `Killed: LLM evaluator decided to stop (${verdict.reason})`,

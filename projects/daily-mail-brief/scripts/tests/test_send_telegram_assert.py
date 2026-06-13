@@ -5,7 +5,7 @@ import sys
 import tempfile
 import shutil
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 # The test needs to work with the real PROJECT_ROOT since send_telegram.py
 # uses it as a module-level constant. We'll create test fixtures in the
@@ -13,7 +13,6 @@ from unittest.mock import patch, MagicMock
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
-FETCH_FAILED = os.path.join(PROJECT_ROOT, ".fetch-failed.json")
 EMAILS_JSON = os.path.join(PROJECT_ROOT, "emails.json")
 
 
@@ -21,26 +20,32 @@ class TestAssertionCheck(unittest.TestCase):
     """Test _check_assertion in send_telegram.py."""
 
     def setUp(self):
+        self.pa_home = tempfile.mkdtemp()
+        self.fetch_failed = os.path.join(self.pa_home, "daily-mail-brief-fetch-failed.json")
+        self.env_patch = patch.dict(os.environ, {"PA_HOME": self.pa_home}, clear=False)
+        self.env_patch.start()
         self._saved_emails = None
         if os.path.exists(EMAILS_JSON):
             with open(EMAILS_JSON, 'r', encoding='utf-8') as f:
                 self._saved_emails = f.read()
         self._saved_failed = None
-        if os.path.exists(FETCH_FAILED):
-            with open(FETCH_FAILED, 'r', encoding='utf-8') as f:
+        if os.path.exists(self.fetch_failed):
+            with open(self.fetch_failed, 'r', encoding='utf-8') as f:
                 self._saved_failed = f.read()
 
     def tearDown(self):
+        self.env_patch.stop()
         if self._saved_emails is not None:
             with open(EMAILS_JSON, 'w', encoding='utf-8') as f:
                 f.write(self._saved_emails)
         elif os.path.exists(EMAILS_JSON):
             os.remove(EMAILS_JSON)
         if self._saved_failed is not None:
-            with open(FETCH_FAILED, 'w', encoding='utf-8') as f:
+            with open(self.fetch_failed, 'w', encoding='utf-8') as f:
                 f.write(self._saved_failed)
-        elif os.path.exists(FETCH_FAILED):
-            os.remove(FETCH_FAILED)
+        elif os.path.exists(self.fetch_failed):
+            os.remove(self.fetch_failed)
+        shutil.rmtree(self.pa_home, ignore_errors=True)
 
     def _import(self):
         if 'send_telegram' in sys.modules:
@@ -104,25 +109,31 @@ class TestAssertionCheck(unittest.TestCase):
 
 
 class TestFailureMode(unittest.TestCase):
-    """Test that .fetch-failed.json presence bypasses assertion check."""       
+    """Test that the PA_HOME failure marker bypasses assertion check."""
 
     def setUp(self):
+        self.pa_home = tempfile.mkdtemp()
+        self.fetch_failed = os.path.join(self.pa_home, "daily-mail-brief-fetch-failed.json")
+        self.env_patch = patch.dict(os.environ, {"PA_HOME": self.pa_home}, clear=False)
+        self.env_patch.start()
         self._saved_failed = None
-        if os.path.exists(FETCH_FAILED):
-            with open(FETCH_FAILED, 'r', encoding='utf-8') as f:
+        if os.path.exists(self.fetch_failed):
+            with open(self.fetch_failed, 'r', encoding='utf-8') as f:
                 self._saved_failed = f.read()
 
     def tearDown(self):
+        self.env_patch.stop()
         if self._saved_failed is not None:
-            with open(FETCH_FAILED, 'w', encoding='utf-8') as f:
+            with open(self.fetch_failed, 'w', encoding='utf-8') as f:
                 f.write(self._saved_failed)
-        elif os.path.exists(FETCH_FAILED):
-            os.remove(FETCH_FAILED)
+        elif os.path.exists(self.fetch_failed):
+            os.remove(self.fetch_failed)
+        shutil.rmtree(self.pa_home, ignore_errors=True)
 
     def test_failure_mode_sends_without_assert(self):
-        """When .fetch-failed.json exists, send_telegram bypasses assertion and sends."""
+        """When the PA_HOME failure marker exists, send_telegram bypasses assertion and sends."""
         # Create failure marker
-        with open(FETCH_FAILED, 'w', encoding='utf-8') as f:
+        with open(self.fetch_failed, 'w', encoding='utf-8') as f:
             json.dump({"status": "auth", "reason": "token expired"}, f)
 
         # Create briefing without assert header

@@ -111,59 +111,36 @@ export async function syncSchedules(): Promise<void> {
     return;
   }
 
-  const taskName = 'PA-Catchup';
-  const logonTaskName = 'PA-Catchup-OnLogon';
-
-  // Write a VBScript launcher to ~/.pa/ — wscript.exe + windowStyle=0 is the only
-  // truly flash-free approach on Windows (powershell -WindowStyle Hidden still flickers)
-  const vbsPath = join(paHome(), 'run-catchup-hidden.vbs');
-  const paPathCmd = paPath.replace(/"/g, '""'); // escape double quotes for cmd embed
-  writeFileSync(
-    vbsPath,
-    `Set WshShell = CreateObject("WScript.Shell")\n` +
-    `WshShell.Run "cmd /c ""${paPathCmd}"" catchup", 0, True\n`,
-    'utf8'
-  );
-
-  const vbsPathPs = vbsPath.replace(/'/g, "''");
-
-  const psScript = `
-$action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument '"${vbsPathPs}"'
-$settings = New-ScheduledTaskSettingsSet \`
-  -Hidden \`
-  -StartWhenAvailable \`
-  -ExecutionTimeLimit (New-TimeSpan -Hours 72) \`
-  -DontStopIfGoingOnBatteries
-$settings.DisallowStartIfOnBatteries = $false
-
-# Every 1 minute
-$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1)
-Unregister-ScheduledTask -TaskName '${taskName}' -Confirm:$false -ErrorAction SilentlyContinue
-Register-ScheduledTask -TaskName '${taskName}' -Action $action -Trigger $trigger -Settings $settings | Out-Null
-Write-Host "[+] Registered '${taskName}' - runs every 1 minute (hidden)"
-
-# On logon
-$logonTrigger = New-ScheduledTaskTrigger -AtLogOn
-Unregister-ScheduledTask -TaskName '${logonTaskName}' -Confirm:$false -ErrorAction SilentlyContinue
-Register-ScheduledTask -TaskName '${logonTaskName}' -Action $action -Trigger $logonTrigger -Settings $settings | Out-Null
-Write-Host "[+] Registered '${logonTaskName}' - runs on logon (hidden)"
-`.trim();
-
-  const tmpFile = join(tmpdir(), `pa-sync-${Date.now()}.ps1`);
-  writeFileSync(tmpFile, psScript, 'utf8');
-
-  try {
-    const { stdout } = await execAsync(
-      `powershell -NonInteractive -ExecutionPolicy Bypass -File "${tmpFile}"`,
-      {}
+  // Write VBScript launchers to ~/.pa/
+  const createVbs = (name: string, args: string) => {
+    const vbsPath = join(paHome(), `run-${name}-hidden.vbs`);
+    const paPathCmd = paPath.replace(/"/g, '""');
+    writeFileSync(
+      vbsPath,
+      `Set WshShell = CreateObject("WScript.Shell")\n` +
+      `WshShell.Run "cmd /c ""${paPathCmd}"" ${args}", 0, True\n`,
+      'utf8'
     );
-    console.log(stdout.trim());
-  } catch (err: any) {
-    console.error(`Failed to register scheduled tasks: ${err.message}`);
-    console.log('You may need to run this command as administrator.');
-  } finally {
-    try { unlinkSync(tmpFile); } catch {}
-  }
+    return vbsPath.replace(/'/g, "''");
+  };
+
+  const highVbs = join(paHome(), 'run-catchup-reminders-hidden.vbs');
+  createVbs('catchup-reminders', 'catchup --topic reminders');
+  const defaultVbs = join(paHome(), 'run-catchup-hidden.vbs');
+  createVbs('catchup', 'catchup --topic default');
+
+  const registerTask = async (name: string, vbsPath: string) => {
+    try {
+      await execAsync(`schtasks /delete /tn "${name}" /f`).catch(() => {});
+      const { stdout } = await execAsync(`schtasks /create /tn "${name}" /tr "wscript.exe \\"${vbsPath}\\"" /sc minute /mo 1 /f`);
+      console.log(`[+] Registered '${name}': ${stdout.trim()}`);
+    } catch (err: any) {
+      console.error(`[-] Failed to register '${name}': ${err.message}`);
+    }
+  };
+
+  await registerTask('PA-Catchup-Reminders', highVbs);
+  await registerTask('PA-Catchup', defaultVbs);
 
   // Show scheduled skills
   const skills = await listSkills();
@@ -171,7 +148,7 @@ Write-Host "[+] Registered '${logonTaskName}' - runs on logon (hidden)"
   if (scheduled.length > 0) {
     console.log(`\nSkills with schedules (evaluated by catchup):`);
     for (const s of scheduled) {
-      console.log(`  ${s.name}: ${s.frontmatter.cron}`);
+      console.log(`  ${s.name}: ${s.frontmatter.cron} (topic: ${s.frontmatter.topic || 'default'})`);
     }
   }
 }
@@ -180,12 +157,20 @@ export async function listSchedules(): Promise<void> {
   // Show registered PA tasks from Windows Task Scheduler
   if (platform() === 'win32') {
     try {
+      // Query all tasks and filter manually for better compatibility
       const { stdout } = await execAsync(
-        'schtasks /query /fo LIST /tn "PA-Catchup"',
+        'schtasks /query /fo TABLE /nh',
         {}
       );
+      const lines = stdout.split('\n').filter(l => l.includes('PA-Catchup'));
       console.log('Registered OS tasks:\n');
-      console.log(stdout);
+      console.log('TaskName'.padEnd(25) + '  ' + 'Next Run Time'.padEnd(20) + '  ' + 'Status');
+      console.log('-'.repeat(60));
+      if (lines.length > 0) {
+        console.log(lines.join('\n').trim());
+      } else {
+        console.log('No PA-Catchup tasks found.');
+      }
     } catch {
       console.log('No PA tasks registered in Windows Task Scheduler.');
       console.log('Run `pa schedules sync` to register them.');
@@ -203,13 +188,14 @@ export async function listSchedules(): Promise<void> {
 
   console.log('\nSkill schedules:');
   const nameWidth = Math.max(10, ...scheduled.map((s) => s.name.length));
-  console.log('Skill'.padEnd(nameWidth) + '  ' + 'Cron'.padEnd(20) + '  ' + 'On Missed');
-  console.log('-'.repeat(nameWidth + 35));
+  console.log('Skill'.padEnd(nameWidth) + '  ' + 'Cron'.padEnd(20) + '  ' + 'Topic'.padEnd(12) + '  ' + 'On Missed');
+  console.log('-'.repeat(nameWidth + 45));
 
   for (const s of scheduled) {
     const onMissed = s.frontmatter.on_missed || 'latest';
+    const topic = s.frontmatter.topic || 'default';
     console.log(
-      `${s.name.padEnd(nameWidth)}  ${(s.frontmatter.cron || '').padEnd(20)}  ${onMissed}`
+      `${s.name.padEnd(nameWidth)}  ${(s.frontmatter.cron || '').padEnd(20)}  ${topic.padEnd(12)}  ${onMissed}`
     );
   }
 }

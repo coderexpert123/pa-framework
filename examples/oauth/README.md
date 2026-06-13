@@ -9,7 +9,8 @@ The framework ships scripts that depend on Google OAuth at `~/.pa/google_auth.py
 | File | Purpose |
 |---|---|
 | `google_auth.py` | Shared module — exposes `get_credentials()`, `get_gmail_service()`, `get_drive_service()`, `get_docs_service()`. Auto-refreshes tokens with retry on transient errors. |
-| `reauth_google.py` | One-time browser-based authentication. Run when token is missing or revoked. |
+| `reauth_google.py` | One-time browser-based desktop authentication. Run when token is missing or revoked. |
+| `telegram_oauth_resume_hook.example.py` | Example private resume hook for the Telegram/mobile auth flow. |
 | `requirements.txt` | Python dependencies (`google-auth`, `google-auth-oauthlib`, `google-api-python-client`). |
 
 ## One-time setup
@@ -76,6 +77,66 @@ Or just try running a sample skill that uses OAuth (e.g., `daily-mail-brief`).
 3. Re-run `python ~/.pa/reauth_google.py`.
 
 The new token will be limited to your edited scope set.
+
+## Optional: Telegram/mobile re-auth flow
+
+Use this when you want a blocked Google-backed skill to recover from your phone
+through Telegram instead of running `reauth_google.py` locally.
+
+### Files involved
+
+- `pa/scripts/start_google_telegram_reauth.py`
+- `pa/scripts/finish_google_telegram_reauth.py`
+- `projects/google-oauth-redirect/index.html`
+- `projects/telegram-bot/src/main.ts` (`/auth` handling)
+- `telegram_oauth_resume_hook.example.py` → copy to `~/.pa/oauth_resume_hook.py`
+
+### One-time setup
+
+1. Create a **Web application** OAuth client in Google Cloud Console.
+2. Save that JSON as `~/.pa/google-credentials-telegram.json`.
+3. Deploy `projects/google-oauth-redirect/` to a public HTTPS URL.
+4. Add that exact URL to the OAuth client's authorized redirect URIs.
+5. Set `GOOGLE_AUTH_REDIRECT_URI=<your deployed URL>` in `~/.pa/secrets.env`.
+6. Copy this example hook:
+
+```powershell
+Copy-Item examples/oauth/telegram_oauth_resume_hook.example.py $HOME/.pa/oauth_resume_hook.py
+```
+
+7. Customize `~/.pa/oauth_resume_hook.py` so it understands your own
+   `resume_action` payloads.
+
+### Runtime flow
+
+1. A project detects expired/revoked Google auth and calls
+   `start_google_telegram_reauth.py` with:
+   - the deployed redirect URI
+   - destination chat/thread
+   - an opaque `resume_action` JSON object
+2. The script generates the Google consent URL and stores pending auth state in
+   `~/.pa/google-telegram-auth.json`.
+3. After the user authorizes, Google redirects to the static bridge page.
+4. The bridge page renders a full Telegram command:
+
+```text
+/auth <code> <state>
+```
+
+5. The user pastes that command into Telegram.
+6. The bot exchanges the code via `finish_google_telegram_reauth.py`.
+7. If `~/.pa/oauth_resume_hook.py` exists (or `PA_TELEGRAM_OAUTH_RESUME_HOOK`
+   is configured), the bot passes the saved `resume_action` to that hook.
+
+### Contract
+
+- The public framework treats `resume_action` as opaque metadata.
+- Your private hook decides what action types exist and how to resume them.
+- Storage paths stay private under `~/.pa/` by default, but can be overridden
+  via:
+  - `GOOGLE_TELEGRAM_CREDENTIALS_FILE`
+  - `GOOGLE_TELEGRAM_TOKEN_FILE`
+  - `GOOGLE_TELEGRAM_STATE_FILE`
 
 ## Token rotation (when the client is compromised)
 

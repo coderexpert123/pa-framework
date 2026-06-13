@@ -13,17 +13,13 @@ import sys
 import traceback
 import subprocess
 
+from runtime_state import clear_failure_marker, write_failure_marker
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
-FETCH_FAILED_FILE = os.path.join(PROJECT_ROOT, ".fetch-failed.json")
 
 sys.path.insert(0, SCRIPT_DIR)
 from notify import send as notify_send
-
-
-def _write_fetch_failed(status: str, reason: str):
-    with open(FETCH_FAILED_FILE, "w", encoding="utf-8") as f:
-        json.dump({"status": status, "reason": reason, "timestamp": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()}, f, indent=2)
 
 
 def _dedup_key_for_status(status: str) -> str:
@@ -104,7 +100,7 @@ def main():
             except Exception as auth_err:
                 print(f"[preflight] Failed to start reauth flow: {auth_err}", file=sys.stderr)
 
-        _write_fetch_failed(status, reason)
+        write_failure_marker(status, reason)
 
         dedup_key = _dedup_key_for_status(status)
         notify_send(
@@ -117,11 +113,7 @@ def main():
         sys.exit(2)
 
     # Success — clean up any stale marker
-    if os.path.exists(FETCH_FAILED_FILE):
-        try:
-            os.remove(FETCH_FAILED_FILE)
-        except OSError:
-            pass
+    clear_failure_marker()
 
 
 if __name__ == "__main__":

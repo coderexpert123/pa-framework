@@ -60,5 +60,11 @@ export async function loadConfig(): Promise<PaConfig> {
     }
   }
 
-  return { workers, evaluator, topic_defaults: parsed.topic_defaults, bg_tasks };
+    return {
+      workers,
+      evaluator,
+      topic_defaults: parsed.topic_defaults,
+      bg_tasks,
+      concurrency_limit: Number.isInteger(parsed.concurrency_limit) ? parsed.concurrency_limit : 2,
+    };
 }

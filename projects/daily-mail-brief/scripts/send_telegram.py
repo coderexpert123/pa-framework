@@ -1,21 +1,4 @@
-"""
-Send a markdown briefing file to Telegram.
-Usage: python send_telegram.py <path_to_briefing.md>
-Reads TELEGRAM_BOT_TOKEN from environment.
-Chat routing (in priority order):
-  TELEGRAM_BRIEFING_CHAT_ID — if set, used instead of TELEGRAM_CHAT_ID (briefing-specific override)
-  TELEGRAM_CHAT_ID          — fallback; may be comma-separated (e.g. "1000000001,-1001234567890")
-TELEGRAM_DAILY_BRIEFING_THREAD_ID (optional): if set, messages sent to supergroup
-chats (IDs starting with -100) will be posted into that forum topic.
-
-Failure mode: when .fetch-failed.json exists in cwd, bypasses the [pa assert]
-header check and sends briefing_output.md content as-is (user-facing failure
-notice delivery).
-
-Normal mode: verifies [pa assert] emails.json listed={n} header matches the
-actual email count in emails.json. Mismatch or missing header → halucination
-alert via pa notify, does NOT send the briefing to the user.
-"""
+"""Send a markdown briefing file to Telegram."""
 import json
 import os
 import secrets
@@ -23,10 +6,10 @@ import sys
 from datetime import datetime, timezone
 
 import requests
+from runtime_state import fetch_failed_file
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
-FETCH_FAILED_FILE = os.path.join(PROJECT_ROOT, ".fetch-failed.json")
 
 MAX_MSG_LEN = 4000  # Telegram limit is 4096, leave buffer
 
@@ -224,8 +207,10 @@ def main():
         print(f"[Telegram] ERROR: File not found: {path}", file=sys.stderr)
         sys.exit(1)
 
-    # Failure mode: .fetch-failed.json present → bypass assert, send as-is
-    if os.path.exists(FETCH_FAILED_FILE):
+    failure_marker = fetch_failed_file()
+
+    # Failure mode: the PA-home failure marker exists → bypass assert, send as-is
+    if os.path.exists(failure_marker):
         print("[send_telegram] failure-mode delivery", file=sys.stderr)
 
     if path.lower().endswith(".pdf"):
@@ -236,7 +221,7 @@ def main():
         text = f.read()
 
     # Normal mode: verify assertion header
-    if not os.path.exists(FETCH_FAILED_FILE):
+    if not os.path.exists(failure_marker):
         ok, claimed, actual = _check_assertion(text)
         if not ok:
             first_line = text.split("\n", 1)[0].strip()

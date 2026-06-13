@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""
+pre-push PII guard for the public pa-framework mirror.
+
+Strategy (three layers, fastest-first):
+  1. Structural regex — catches unambiguous credentials immediately (no LLM).
+  2. Personal tripwire regex — patterns from ~/.pa/pii-tripwires.txt (outside repo).
+  3. Gemini semantic scan — catches personal data that doesn't match a regex.
+
+Fail-open on LLM errors: a Gemini timeout or missing binary produces a warning
+but does NOT block the push. Regex layers always run.
+
+Set PA_SKIP_PII_GUARD=1 to bypass entirely (logged loudly).
+
+Install:
+  cp pa/scripts/git-hooks/pre-push-pii-guard .git-public/hooks/pre-push
+  chmod +x .git-public/hooks/pre-push
+"""
+import os
+import re
+import subprocess
+import sys
+
+PA_HOME = os.environ.get("PA_HOME") or os.path.join(os.path.expanduser("~"), ".pa")
+
+# Structural credential patterns — always block, no LLM needed.
+CREDENTIAL_PATTERNS = [
+    r"[0-9]{8,10}:[A-Za-z0-9_\-]{35}",    # Telegram bot token
+    r"sk-ant-[A-Za-z0-9_\-]{20,}",          # Anthropic API key
+    r"sk-proj-[A-Za-z0-9_\-]{20,}",         # OpenAI project key
+    r"AIza[0-9A-Za-z_\-]{35}",              # Google API key
+    r"BOT_TOKEN\s*=\s*[\"'][0-9]{6,}",      # Hardcoded bot token assignment
+    r"CHAT_ID\s*=\s*[\"']-?[0-9]{7,}",      # Hardcoded chat ID assignment
+]
+
+# Added lines from this push (content only, no leading +).
+ADDED: list[str] = []
+
+
+def collect_diff():
+    """Read push info from stdin, populate ADDED with new content lines."""
+    for line in sys.stdin:
+        parts = line.strip().split()
+        if len(parts) < 4:
+            continue
+        local_sha, remote_sha = parts[1], parts[3]
+        if local_sha == "0" * 40:
+            continue  # branch deletion
+        empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+        base = empty_tree if remote_sha == "0" * 40 else remote_sha
+        try:
+            result = subprocess.run(
+                ["git", "diff", "--unified=0", base, local_sha],
+                capture_output=True, text=True, timeout=30,
+            )
+            for dl in result.stdout.splitlines():
+                if dl.startswith("+") and not dl.startswith("+++"):
+                    ADDED.append(dl[1:])
+        except Exception:
+            pass
+
+
+def load_tripwires() -> list[str]:
+    """Load personal PII regexes from ~/.pa/pii-tripwires.txt."""
+    path = os.path.join(PA_HOME, "pii-tripwires.txt")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+    except FileNotFoundError:
+        return []
+
+
+def gemini_check(content: str, tripwires: list[str]) -> tuple[bool, str]:
+    """
+    Ask Gemini to scan content for PII. Returns (is_clean, reason).
+    Fail-open: returns (True, '') on any error.
+    """
+    gemini_cmd = os.environ.get("GEMINI_CMD", "gemini")
+    tripwire_ctx = ""
+    if tripwires:
+        tripwire_ctx = "\nAlso specifically flag:\n" + "\n".join(f"- {t}" for t in tripwires)
+
+    prompt = f"""You are a security guard for a public open-source git repository.
+Analyze the following added lines (git diff) for personal or private information that must NOT appear in a public repository.
+
+Block (respond VIOLATION) if you find:
+- Real full names of individuals (first + last) that are not clearly placeholder/example data
+- Personal email addresses (not @example.com)
+- Financial account numbers, transaction amounts, or specific investment instructions
+- Phone numbers, bank account numbers, or card numbers
+- Medical or health information
+- Real authentication tokens or API keys not already caught by the structural scan{tripwire_ctx}
+
+Do NOT block for:
+- Copyright lines like "Copyright (c) YEAR Name" in a LICENSE file
+- Generic placeholder data (example@example.com, 12345, TODO, etc.)
+- Code variable names that happen to contain common words
+
+Respond with EXACTLY one of these two formats (nothing else):
+CLEAN
+VIOLATION: <short description>
+
+Added lines to analyze (capped at 400 lines):
+{chr(10).join(content.splitlines()[:400])}
+"""
+    try:
+        result = subprocess.run(
+            [gemini_cmd, "--yolo"],
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        response = result.stdout.strip()
+        # Find the verdict line (skip any preamble noise)
+        for resp_line in response.splitlines():
+            resp_line = resp_line.strip()
+            if resp_line.startswith("VIOLATION"):
+                return False, resp_line[len("VIOLATION:"):].strip()
+            if resp_line == "CLEAN":
+                return True, ""
+        # If we can't parse a verdict, fail-open with a warning
+        print("⚠  PII guard: Gemini response unparseable — skipping LLM check", file=sys.stderr)
+        return True, ""
+    except FileNotFoundError:
+        print(f"⚠  PII guard: '{gemini_cmd}' not found — skipping LLM check", file=sys.stderr)
+        return True, ""
+    except subprocess.TimeoutExpired:
+        print("⚠  PII guard: Gemini timed out — skipping LLM check", file=sys.stderr)
+        return True, ""
+    except Exception as exc:
+        print(f"⚠  PII guard: LLM error ({exc}) — skipping LLM check", file=sys.stderr)
+        return True, ""
+
+
+def main() -> int:
+    if os.environ.get("PA_SKIP_PII_GUARD"):
+        print("⚠  PII guard: bypassed via PA_SKIP_PII_GUARD", file=sys.stderr)
+        return 0
+
+    collect_diff()
+    if not ADDED:
+        return 0
+
+    content = "\n".join(ADDED)
+
+    # Layer 1: structural credential regex (instant, always runs)
+    for pattern in CREDENTIAL_PATTERNS:
+        matches = re.findall(pattern, content)
+        if matches:
+            print("🚫 PII guard: credential pattern detected — push aborted", file=sys.stderr)
+            print(f"   Pattern: {pattern}", file=sys.stderr)
+            print(f"   Match:   {str(matches[0])[:60]}", file=sys.stderr)
+            return 1
+
+    # Layer 2: personal tripwire regex (fast, from ~/.pa/pii-tripwires.txt)
+    tripwires = load_tripwires()
+    for pattern in tripwires:
+        try:
+            if re.search(pattern, content, re.IGNORECASE):
+                print("🚫 PII guard: personal identifier matched — push aborted", file=sys.stderr)
+                print(f"   Pattern: {pattern}", file=sys.stderr)
+                return 1
+        except re.error:
+            pass  # skip malformed patterns silently
+
+    # Layer 3: Gemini semantic scan
+    is_clean, reason = gemini_check(content, tripwires)
+    if not is_clean:
+        print("🚫 PII guard (Gemini): personal data detected — push aborted", file=sys.stderr)
+        print(f"   Reason: {reason}", file=sys.stderr)
+        return 1
+
+    print("✓  PII guard: clean", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

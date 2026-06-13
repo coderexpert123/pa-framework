@@ -87,11 +87,11 @@ export function classifyCodexError(stdout: string, stderr: string): RateLimitPar
       if (monthIdx >= 0) {
         // ChatGPT renders reset times in the user's system locale timezone.
         // Parsing with new Date(y, m, d, h, min) uses system local time — no hardcoded offset.
-        // Cap at 24h so a wrong clock/locale can't produce an unbounded cooldown.
+        // Cap at 45 days so a wrong clock/locale can't produce an unbounded cooldown.
         const resetDate = new Date(parseInt(year, 10), monthIdx, parseInt(day, 10), h, min, 0);
         const resetUtcMs = resetDate.getTime();
         const rawMinutes = Math.ceil((resetUtcMs - Date.now()) / 60000);
-        const minutes = Math.max(1, Math.min(24 * 60, rawMinutes));
+        const minutes = Math.max(1, Math.min(45 * 24 * 60, rawMinutes));
         const resetsAtIST = formatIST(resetDate);
         return {
           minutes,
