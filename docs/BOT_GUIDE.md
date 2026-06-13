@@ -114,7 +114,7 @@ WantedBy=default.target
 ```bash
 systemctl --user daemon-reload
 systemctl --user enable --now pa-telegram-bot
-journalctl --user -u pa-telegram-bot -f   # follow logs
+tail -f ~/.pa/logs/telegram-bot.log       # follow logs (run-bot.sh redirects there, not to journal)
 ```
 
 #### Option C: launchd (macOS)
