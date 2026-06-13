@@ -73,12 +73,22 @@ async function startKeepAwake(): Promise<KeepAwakeStatus> {
   } else if (platform() === 'darwin') {
     // caffeinate -s: prevent system sleep; ships with macOS, no install needed
     child = spawn('caffeinate', ['-s'], { detached: true, stdio: 'ignore' });
-  } else {
+  } else if (platform() === 'linux') {
     // Linux: systemd-inhibit keeps an inhibitor lock for the lifetime of the child process
     child = spawn(
       'systemd-inhibit',
       ['--what=sleep:idle', '--who=pa-framework', '--why=keepawake', 'sleep', 'infinity'],
       { detached: true, stdio: 'ignore' }
+    );
+  } else {
+    // Unknown OS — throw with a precise adaptation pointer so an agent knows exactly what to change
+    throw new Error(
+      `keepawake not supported on platform "${platform()}". ` +
+      `To add support, implement a new branch in projects/telegram-bot/src/keepawake.ts ` +
+      `inside startKeepAwake(): spawn a background process that prevents sleep and can be ` +
+      `killed by PID (or by process group if it forks children). ` +
+      `Examples: \`caffeinate\` (macOS-compatible shim), \`sysutils/caffeine-ng\` (FreeBSD), ` +
+      `\`xdg-screensaver reset\` loop (Wayland). Mirror the linux branch if your tool forks.`
     );
   }
 
