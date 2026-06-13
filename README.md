@@ -96,7 +96,7 @@ The framework runs on **Windows, macOS, and Linux**. Platform-specific notes:
 | Process tree / bgtasks | PowerShell + CIM | `ps` / `pgrep` | `ps` / `pgrep` |
 | `/keepawake` | `SetThreadExecutionState` | `caffeinate -s` (built-in) | `systemd-inhibit` (requires systemd) |
 
-**Other POSIX (FreeBSD, Alpine, musl, etc.):** scheduler and process-tree work natively on any POSIX system. Only `/keepawake` needs a one-function adaptation — on an unknown OS the toggle throws a descriptive error pointing exactly to `projects/telegram-bot/src/keepawake.ts:startKeepAwake()` with instructions on what to implement.
+**Other POSIX (FreeBSD, Alpine, musl, etc.):** every OS-specific feature is self-describing when its underlying tool is absent. `pa schedules sync` throws an error naming `scheduler.ts:syncSchedules()` if `crontab` isn't installed. `pa bgtasks` warns once naming `process-tree.ts:getChildPids()` if `pgrep`/`ps` aren't found. `/keepawake` throws naming `keepawake.ts:startKeepAwake()` with the exact implementation contract. All three messages include reference implementations in the same file.
 
 See [`docs/QUICKSTART.md`](docs/QUICKSTART.md) for per-OS installation steps and [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) for platform-specific caveats (including the adaptation guide for unsupported OSes).
 
