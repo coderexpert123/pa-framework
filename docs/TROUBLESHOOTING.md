@@ -52,7 +52,14 @@ Get-Content ~/.pa/app.log.jsonl | ConvertFrom-Json | Where-Object { $_.level -eq
 
 The bot's permanent archive at `~/.pa/conversation-history.jsonl` has grown. Archive it:
 
+```bash
+# macOS / Linux
+mv ~/.pa/conversation-history.jsonl ~/.pa/archive/conv-$(date +%Y-%m-%d).jsonl
+touch ~/.pa/conversation-history.jsonl
+```
+
 ```powershell
+# Windows PowerShell
 Move-Item ~/.pa/conversation-history.jsonl ~/.pa/archive/conv-$(Get-Date -Format yyyy-MM-dd).jsonl
 New-Item -ItemType File ~/.pa/conversation-history.jsonl
 ```

@@ -5,6 +5,7 @@ cwd: "${PA_FRAMEWORK_ROOT}"
 secrets:
   - TELEGRAM_BOT_TOKEN
   - PA_FRAMEWORK_ROOT
+  - TELEGRAM_CHAT_ID
 worker: gemini
 no_fallback: true
 telegram_output:

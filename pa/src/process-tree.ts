@@ -215,7 +215,10 @@ export function killProcessTree(pid: number): void {
   if (platform() === 'win32') {
     // taskkill /T kills the tree, /F forces it
     exec(`taskkill /T /F /PID ${pid}`, () => {});
-  } else {
+  } else if (platform() === 'linux' || platform() === 'darwin') {
     try { process.kill(-pid, 'SIGTERM'); } catch {} // negative PID = process group
+  } else {
+    warnProcessTreeUnavailable('process group kill', 'killProcessTree');
+    try { process.kill(pid, 'SIGTERM'); } catch {} // best-effort single-PID kill
   }
 }

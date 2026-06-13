@@ -18,6 +18,17 @@ function sanitizeCmdline(cmdline: string): string {
   return cmdline.replace(/([?&](api_key|token|password|secret)=)[^\s&]*/gi, '$1<redacted>').slice(0, 200);
 }
 
+// With shell:true, Node joins command + args into a shell string on all platforms.
+// Quote args containing spaces or metacharacters to prevent word-splitting.
+function quoteArg(a: string): string {
+  if (process.platform === 'win32') {
+    // cmd.exe: wrap in double quotes, escape embedded double quotes
+    return /[\s"]/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a;
+  }
+  // POSIX sh: wrap in single quotes, escape embedded single quotes via '\''
+  return /[\s'"\\$`!|&;()<>]/.test(a) ? `'${a.replace(/'/g, "'\\''")}'` : a;
+}
+
 async function writeTempPrompt(prompt: string): Promise<string> {
   const id = randomBytes(8).toString('hex');
   const tmpPath = join(tmpdir(), `pa-prompt-${id}.txt`);
@@ -88,12 +99,9 @@ export async function executeWorker(
       args = [...substitutedArgs, ...extraArgs]; // APPEND extra args
     }
 
-    // On Windows with shell:true, spawn joins args with spaces without quoting.
-    // Args containing spaces (e.g. "C:/Path With Spaces") get split into
-    // separate tokens by cmd.exe. Quote them to preserve arg boundaries.
-    if (process.platform === 'win32') {
-      args = args.map(a => /\s/.test(a) ? `"${a}"` : a);
-    }
+    // shell:true runs on all platforms — quote args that contain spaces or
+    // shell metacharacters so they aren't word-split by cmd.exe / sh.
+    args = args.map(quoteArg);
 
     const mergedEnv = { ...process.env, ...(options.env || {}), PA_BOT_PID: String(process.pid) } as NodeJS.ProcessEnv;
 

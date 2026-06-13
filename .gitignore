@@ -74,12 +74,17 @@ __pycache__/
 # Ad-hoc analysis scripts at root (must live in scratch/ or proper project)
 /analyze_*.py
 /check_*.py
+/check*.ps1
 /find_*.py
 /extract_*.py
+/extract_turns.py
 /fetch_*.py
 /search_*.py
 /temp_*.py
 /scratch_*
+/all_files.txt
+/out*.txt
+*.bak
 
 # Misplaced Ecosystem KB schema files at repo root (canonical home is in your
 # Obsidian vault / KB directory outside this repo, configured per-deployment).
