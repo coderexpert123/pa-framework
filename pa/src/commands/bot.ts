@@ -1,5 +1,6 @@
 import { readFile, writeFile, unlink } from 'fs/promises';
 import { join } from 'path';
+import { platform } from 'os';
 import { formatIST } from '../ist.js';
 import { rotateFileIfNeeded } from '../lib/archive-files.js';
 import { paHome as getPAHome } from '../paths.js';
@@ -60,7 +61,10 @@ export async function botStopCommand(): Promise<boolean> {
   }
 
   console.log('[bot] Timed out after 120s. The bot may still be finishing a long worker task.');
-  console.log(`[bot] Force-kill if needed: Stop-Process -Force -Id ${pid}`);
+  const killHint = platform() === 'win32'
+    ? `Stop-Process -Force -Id ${pid}`
+    : `kill -9 ${pid}`;
+  console.log(`[bot] Force-kill if needed: ${killHint}`);
   return false;
 }
 

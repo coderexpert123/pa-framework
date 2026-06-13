@@ -149,8 +149,8 @@ export async function approveDraft(name: string): Promise<void> {
     await stat(targetSkill);
     throw new Error(`Skill '${name}' already exists at ${targetSkill}. Remove it first.`);
   } catch (err: any) {
-    if (err.message.includes('already exists')) throw err;
-    // ENOENT is expected — skill doesn't exist yet
+    if (err.code !== 'ENOENT') throw err;
+    // ENOENT — skill doesn't exist yet, continue
   }
 
   await mkdir(targetDir, { recursive: true });

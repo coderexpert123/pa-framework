@@ -53,7 +53,12 @@ export async function notifyCommand(args: string[] = process.argv.slice(2)): Pro
       console.error('Error: --body-file requires a path argument');
       process.exit(2);
     }
-    body = await readFile(filePath, 'utf8');
+    try {
+      body = await readFile(filePath, 'utf8');
+    } catch (err: any) {
+      console.error(`Error: cannot read --body-file ${filePath}: ${err.message}`);
+      process.exit(2);
+    }
   } else if (bodyStdinIdx !== -1) {
     body = await readStdin();
   } else {

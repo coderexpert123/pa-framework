@@ -6,6 +6,7 @@
 # Re-include public substrate at the root
 !/.gitignore
 !/.gitignore-public
+!/.github/
 !/README.md
 !/LICENSE
 !/docs/
@@ -36,6 +37,9 @@ pa/scripts/upload_apk.py
 # Inside projects/telegram-bot/: exclude build/state/runtime artifacts + personal prompt
 projects/telegram-bot/dist/
 projects/telegram-bot/node_modules/
+# Compiled .js artifacts that belong in dist/, not src/ (catches accidental tsc output in source dirs)
+projects/telegram-bot/src/*.js
+projects/telegram-bot/src/tests/*.js
 projects/telegram-bot/.claude-needs-brain
 projects/telegram-bot/bot-instructions.md
 projects/telegram-bot/run-bot-hidden.vbs

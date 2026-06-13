@@ -1,5 +1,6 @@
 import { stat, readFile, readdir } from 'fs/promises';
 import { join } from 'path';
+import { platform } from 'os';
 import { paHome } from '../paths.js';
 import { loadConfig } from '../config.js';
 import { listSkills } from '../skills.js';
@@ -56,19 +57,23 @@ async function checkBotProcess(): Promise<CheckResult> {
   const lockPath = join(paHome(), 'telegram-bot.lock');
   const content = await readFile(lockPath, 'utf8').catch(() => null);
   if (content === null) {
+    const launcher = platform() === 'win32'
+      ? '`pwsh projects/telegram-bot/run-bot.ps1`'
+      : '`bash projects/telegram-bot/run-bot.sh`';
     return {
       name: 'bot-process',
       status: 'FAIL',
-      detail: 'no lock file at ~/.pa/telegram-bot.lock — bot not running. Fix: `pa bot restart` (Windows Task Scheduler will keep it running) OR `pwsh projects/telegram-bot/run-bot.ps1`. See docs/BOT_GUIDE.md.',
+      detail: `no lock file at ~/.pa/telegram-bot.lock — bot not running. Fix: \`pa bot restart\` (your supervisor will bring it back) OR start manually: ${launcher}. See docs/BOT_GUIDE.md.`,
     };
   }
 
   const pid = parseInt(content.trim(), 10);
   if (isNaN(pid)) {
+    const rmCmd = platform() === 'win32' ? 'Remove-Item ~/.pa/telegram-bot.lock' : 'rm ~/.pa/telegram-bot.lock';
     return {
       name: 'bot-process',
       status: 'FAIL',
-      detail: 'lock file unreadable. Fix: `Remove-Item ~/.pa/telegram-bot.lock` then `pa bot restart`.',
+      detail: `lock file unreadable. Fix: \`${rmCmd}\` then \`pa bot restart\`.`,
     };
   }
 
@@ -119,7 +124,7 @@ async function checkConversationLog(): Promise<CheckResult> {
     return { name: 'conversation-log', status: 'WARN', detail: 'missing — normal on a fresh install; the bot creates it on first message' };
   }
   const label = fmtSize(size);
-  if (size > 5 * 1024 * 1024) return { name: 'conversation-log', status: 'FAIL', detail: `${label} (>5MB). Fix: archive — \`Move-Item ~/.pa/conversation-history.jsonl ~/.pa/archive/conv-$(Get-Date -Format yyyy-MM-dd).jsonl\` then \`New-Item -ItemType File ~/.pa/conversation-history.jsonl\`.` };
+  if (size > 5 * 1024 * 1024) return { name: 'conversation-log', status: 'FAIL', detail: `${label} (>5MB). Fix: move to ~/.pa/archive/ and recreate an empty file. See docs/TROUBLESHOOTING.md §"conversation-log FAIL".` };
   if (size > 1024 * 1024) return { name: 'conversation-log', status: 'WARN', detail: `${label} (1–5MB) — consider archiving soon` };
   return { name: 'conversation-log', status: 'OK', detail: label };
 }
@@ -139,7 +144,7 @@ async function checkAppLog(): Promise<CheckResult> {
   const size = await fileSize(logPath);
   if (size === null) return { name: 'app-log', status: 'WARN', detail: 'no structured log yet — normal on a fresh install' };
   const label = fmtSize(size);
-  if (size > 5 * 1024 * 1024) return { name: 'app-log', status: 'FAIL', detail: `${label} (>5MB). Fix: \`Move-Item ~/.pa/app.log.jsonl ~/.pa/archive/app-$(Get-Date -Format yyyy-MM-dd).jsonl\`.` };
+  if (size > 5 * 1024 * 1024) return { name: 'app-log', status: 'FAIL', detail: `${label} (>5MB). Fix: move ~/.pa/app.log.jsonl to ~/.pa/archive/.` };
   if (size > 1024 * 1024) return { name: 'app-log', status: 'WARN', detail: `${label} (1–5MB)` };
   return { name: 'app-log', status: 'OK', detail: label };
 }
@@ -227,10 +232,10 @@ async function checkLastCatchup(): Promise<CheckResult> {
         }
       } catch {}
     }
-    if (!latestMtime) return { name: 'last-catchup', status: 'WARN', detail: 'no run logs found — no skill has executed yet. Try: `pa run <some-skill>`. To enable automatic runs, register Task Scheduler: `pa schedules sync` (Windows-only currently).' };
+    if (!latestMtime) return { name: 'last-catchup', status: 'WARN', detail: 'no run logs found — no skill has executed yet. Try: `pa run <some-skill>`. To enable automatic runs: `pa schedules sync`.' };
     const ageMs = Date.now() - latestMtime.getTime();
     const label = fmtAge(ageMs);
-    if (ageMs > 2 * 3_600_000) return { name: 'last-catchup', status: 'FAIL', detail: `last run ${label} (>2h). Task Scheduler may have stopped — check \`schtasks /query /tn PA-Catchup\`. Re-register: \`pa schedules sync\`.` };
+    if (ageMs > 2 * 3_600_000) return { name: 'last-catchup', status: 'FAIL', detail: `last run ${label} (>2h). Catchup scheduler may have stopped — check with \`pa schedules list\`. Re-register: \`pa schedules sync\`.` };
     if (ageMs > 30 * 60_000) return { name: 'last-catchup', status: 'WARN', detail: `last run ${label} (>30m)` };
     return { name: 'last-catchup', status: 'OK', detail: `last run ${label}` };
   } catch {

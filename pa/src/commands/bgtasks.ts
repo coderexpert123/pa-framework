@@ -28,7 +28,8 @@ export async function bgtasksCommand(argv: string[], hooks?: BgtasksHooks): Prom
   let data: BlackboardData = { active_locks: [] };
   try {
     const raw = await readFile(bbPath, 'utf8');
-    data = JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed?.active_locks)) data = parsed;
   } catch {
     // No blackboard or unreadable — treat as empty
   }
