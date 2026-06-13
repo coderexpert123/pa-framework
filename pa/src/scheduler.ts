@@ -3,7 +3,8 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import { platform, tmpdir } from 'os';
 import { join } from 'path';
-import { writeFileSync, unlinkSync } from 'fs';
+import { writeFileSync } from 'fs';
+import { writeFile, unlink } from 'fs/promises';
 import { listSkills } from './skills.js';
 import { getLastSuccessfulRun } from './logger.js';
 import { paHome } from './paths.js';
@@ -86,13 +87,29 @@ export async function getOverdueSkills(): Promise<OverdueSkill[]> {
   return overdue;
 }
 
+// Sentinel comments that anchor PA-managed cron lines on POSIX
+const PA_CRON_REMINDERS = '# PA-Catchup-Reminders (managed by pa schedules sync)';
+const PA_CRON_DEFAULT   = '# PA-Catchup (managed by pa schedules sync)';
+
 export async function syncSchedules(): Promise<void> {
-  if (platform() !== 'win32') {
-    console.log('Schedule sync currently supports Windows only.');
-    console.log('On Linux/Mac, add to crontab: */15 * * * * pa catchup');
-    return;
+  if (platform() === 'win32') {
+    await syncSchedulesWindows();
+  } else {
+    await syncSchedulesPosix();
   }
 
+  // Show scheduled skills (shared by both paths)
+  const skills = await listSkills();
+  const scheduled = skills.filter((s) => s.frontmatter.cron);
+  if (scheduled.length > 0) {
+    console.log('\nSkills with schedules (evaluated by catchup):');
+    for (const s of scheduled) {
+      console.log(`  ${s.name}: ${s.frontmatter.cron} (topic: ${s.frontmatter.topic || 'default'})`);
+    }
+  }
+}
+
+async function syncSchedulesWindows(): Promise<void> {
   // Find pa executable path and sanitize for shell safety
   let paPath: string;
   try {
@@ -141,27 +158,71 @@ export async function syncSchedules(): Promise<void> {
 
   await registerTask('PA-Catchup-Reminders', highVbs);
   await registerTask('PA-Catchup', defaultVbs);
+}
 
-  // Show scheduled skills
-  const skills = await listSkills();
-  const scheduled = skills.filter((s) => s.frontmatter.cron);
-  if (scheduled.length > 0) {
-    console.log(`\nSkills with schedules (evaluated by catchup):`);
-    for (const s of scheduled) {
-      console.log(`  ${s.name}: ${s.frontmatter.cron} (topic: ${s.frontmatter.topic || 'default'})`);
+async function syncSchedulesPosix(): Promise<void> {
+  // Find pa on PATH
+  let paPath: string;
+  try {
+    const { stdout } = await execAsync('which pa');
+    paPath = stdout.trim();
+  } catch {
+    paPath = 'pa';
+  }
+
+  // Validate paPath — no shell metacharacters
+  if (/[;&|<>`$'"\\]/.test(paPath)) {
+    console.error(`Error: pa path contains unsafe characters: ${paPath}`);
+    console.log('Install pa to a path without special characters.');
+    return;
+  }
+
+  // Read existing crontab (empty string if none set)
+  let existing = '';
+  try {
+    const { stdout } = await execAsync('crontab -l');
+    existing = stdout;
+  } catch {
+    // No crontab yet — start fresh
+  }
+
+  // Desired cron lines (reminders fires every minute, catchup every 15)
+  const lines: Record<string, string> = {
+    [PA_CRON_REMINDERS]: `* * * * * ${paPath} catchup --topic reminders`,
+    [PA_CRON_DEFAULT]:   `*/15 * * * * ${paPath} catchup`,
+  };
+
+  // Upsert: replace any existing PA-managed block, or append
+  let updated = existing;
+  for (const [sentinel, cronLine] of Object.entries(lines)) {
+    const escapedSentinel = sentinel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp(`${escapedSentinel}\\n[^\\n]*\\n?`, 'g');
+    const block = `${sentinel}\n${cronLine}\n`;
+    if (pattern.test(updated)) {
+      updated = updated.replace(pattern, block);
+    } else {
+      if (!updated.endsWith('\n') && updated.length > 0) updated += '\n';
+      updated += block;
     }
+  }
+
+  // Write back via `crontab -`
+  const tmpPath = join(tmpdir(), `pa-crontab-${process.pid}.tmp`);
+  try {
+    await writeFile(tmpPath, updated, 'utf8');
+    await execAsync(`crontab ${tmpPath}`);
+    console.log('[+] Registered PA-Catchup-Reminders: * * * * * pa catchup --topic reminders');
+    console.log('[+] Registered PA-Catchup:           */15 * * * * pa catchup');
+  } finally {
+    await unlink(tmpPath).catch(() => {});
   }
 }
 
 export async function listSchedules(): Promise<void> {
-  // Show registered PA tasks from Windows Task Scheduler
+  // Show registered OS-level catchup tasks
   if (platform() === 'win32') {
     try {
-      // Query all tasks and filter manually for better compatibility
-      const { stdout } = await execAsync(
-        'schtasks /query /fo TABLE /nh',
-        {}
-      );
+      const { stdout } = await execAsync('schtasks /query /fo TABLE /nh', {});
       const lines = stdout.split('\n').filter(l => l.includes('PA-Catchup'));
       console.log('Registered OS tasks:\n');
       console.log('TaskName'.padEnd(25) + '  ' + 'Next Run Time'.padEnd(20) + '  ' + 'Status');
@@ -174,6 +235,23 @@ export async function listSchedules(): Promise<void> {
     } catch {
       console.log('No PA tasks registered in Windows Task Scheduler.');
       console.log('Run `pa schedules sync` to register them.');
+    }
+  } else {
+    try {
+      const { stdout } = await execAsync('crontab -l');
+      const lines = stdout.split('\n').filter(l =>
+        l.includes(PA_CRON_REMINDERS.slice(2)) || l.includes(PA_CRON_DEFAULT.slice(2)) ||
+        l.includes('pa catchup')
+      );
+      console.log('Registered crontab entries:\n');
+      if (lines.length > 0) {
+        console.log(lines.join('\n').trim());
+      } else {
+        console.log('No PA-Catchup crontab entries found.');
+        console.log('Run `pa schedules sync` to register them.');
+      }
+    } catch {
+      console.log('No crontab set. Run `pa schedules sync` to register PA entries.');
     }
   }
 

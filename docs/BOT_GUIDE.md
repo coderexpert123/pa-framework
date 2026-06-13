@@ -92,13 +92,63 @@ $trigger = New-ScheduledTaskTrigger -At (Get-Date) -RepetitionInterval (New-Time
 Register-ScheduledTask -TaskName "PA-Telegram-Bot" -Action $action -Trigger $trigger -Settings (New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew)
 ```
 
-#### Option B: Foreground run
+#### Option B: systemd (Linux)
 
-For testing or non-Windows systems:
+Create `~/.config/systemd/user/pa-telegram-bot.service`:
 
-```powershell
-pwsh projects/telegram-bot/run-bot.ps1   # on Windows
-node projects/telegram-bot/dist/main.js >> ~/.pa/logs/telegram-bot.log 2>&1 &   # on POSIX
+```ini
+[Unit]
+Description=PA Telegram Bot
+After=network.target
+
+[Service]
+ExecStart=/bin/bash /path/to/projects/telegram-bot/run-bot.sh
+Restart=always
+RestartSec=30
+Environment=PA_HOME=%h/.pa
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now pa-telegram-bot
+journalctl --user -u pa-telegram-bot -f   # follow logs
+```
+
+#### Option C: launchd (macOS)
+
+Create `~/Library/LaunchAgents/com.pa.telegram-bot.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.pa.telegram-bot</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/path/to/projects/telegram-bot/run-bot.sh</string>
+  </array>
+  <key>KeepAlive</key><true/>
+  <key>EnvironmentVariables</key>
+  <dict><key>PA_HOME</key><string>/Users/you/.pa</string></dict>
+</dict>
+</plist>
+```
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.pa.telegram-bot.plist
+```
+
+#### Option D: Foreground run / testing
+
+```bash
+pwsh projects/telegram-bot/run-bot.ps1          # Windows
+bash projects/telegram-bot/run-bot.sh &         # POSIX (background)
+node projects/telegram-bot/dist/main.js         # direct, foreground
 ```
 
 ## Recommended topic layout (conventional)
