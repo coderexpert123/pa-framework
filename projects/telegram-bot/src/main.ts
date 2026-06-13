@@ -5,7 +5,7 @@ import { readdir, unlink, rename, writeFile, readFile } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
 import { acquireLock, releaseLock } from './lock.js';
-import { getUpdates, sendMessage, sendMessageWithId, pinChatMessage, unpinChatMessage, sendTyping, setMessageReaction, downloadFile, editMessageText, createForumTopic } from './telegram.js';
+import { getUpdates, sendMessage, sendMessageWithId, pinChatMessage, unpinChatMessage, sendTyping, setMessageReaction, downloadFile, editMessageText, createForumTopic, deleteMessage } from './telegram.js';
 import { loadState, saveState, loadTopicState, saveTopicState, addTurn, findHistoricalSessionTurns, findRecentTurnsByTopic, listTopicStateRefs } from './conversation.js';
 import { buildPrompt, buildResumedPrompt, buildSkillStatus } from './context.js';
 import {
@@ -32,6 +32,7 @@ import {
   KEEP_AWAKE_PATTERN,
   SKILLS_PATTERN,
   HELP_PATTERN,
+  AUTH_PATTERN,
   BRANCH_PATTERN,
   CHILD_OF_PATTERN,
   MERGE_PATTERN,
@@ -70,6 +71,12 @@ import type { ConversationState, SessionInfo, PAMeta, ModelStatusSnapshot, Model
 import { loadTopicNames, updateTopicName, setTopicDescription, extractTopicEvent, loadBranches, addBranch, removeBranch, findBranchParent, getTopicName, type TopicNameMap, type BranchIndex } from './topic-names.js';
 import { formatFailoverMessage, escapeMd } from './notify-format.js';
 import { registerBotCommands } from './commands.js';
+import {
+  buildOAuthCompletionMessage,
+  launchOAuthResumeAction,
+  normalizeResumeAction,
+  redactAuthCommand,
+} from './oauth.js';
 
 // Import pa modules
 import { loadSecrets } from '../../../pa/dist/src/secrets.js';
@@ -85,34 +92,12 @@ import { RUNTIME_ARCHIVE_MAX_BYTES } from '../../../pa/dist/src/lib/archive-file
 /** Topic keys created by /branch — signals forum_topic_created to skip description */
 const branchCreatedTopicKeys = new Set<string>();
 
-export function makeRefId(prefix: string = 's'): string {
-  return `${prefix}-${randomBytes(2).toString('hex')}`;
-}
-export function appendRefId(text: string, prefix: string = 's'): string {
-  return `${text.trim()}\n\n_Ref: ${makeRefId(prefix)}_`;
-}
-
-export type RefKind = 'pin' | 'help' | 'branch' | 'lock_busy' | 'failover' | 'system';
-
-// Mints a refId, logs a 'system message sent' entry for queryability via `pa ref`,
-// and returns the message text with the ref appended. Use for bot-system messages
-// (pins, help, branch notifications, failover banners, lock-busy notices) — anything
-// that's not a worker reply (which has its own 'message sent' log call).
-export function appendRefIdAndLog(
-  text: string,
-  ctx: { kind: RefKind; chatId: number; threadId?: number },
-  prefix: string = 's',
-): string {
-  const refId = makeRefId(prefix);
-  logger.info('bot', 'system message sent', {
-    refId,
-    kind: ctx.kind,
-    chatId: ctx.chatId,
-    threadId: ctx.threadId,
-    textPreview: text.slice(0, 500),
-  });
-  return `${text.trim()}\n\n_Ref: ${refId}_`;
-}
+import {
+  makeRefId,
+  appendRefId,
+  appendRefIdAndLog,
+  RefKind
+} from './ref-id.js';
 
 // Default bot working directory. Env-driven so the framework is portable.
 // Set BOT_CWD in secrets.env to the absolute path of your project root.
@@ -191,7 +176,7 @@ async function refreshPinnedStatusCardInPlace(
 
   const pinText = renderStatusCard({ snapshot, keepAwake });
   if (state.pinned_status_message_id) {
-    const pinOk = await editMessageText(token, chatId, state.pinned_status_message_id, pinText).catch(() => false);
+    const pinOk = await editMessageText(token, chatId, state.pinned_status_message_id, appendRefIdAndLog(pinText, { kind: 'pin', chatId, threadId })).catch(() => false);
     if (pinOk) return;
   }
 
@@ -545,8 +530,23 @@ export async function dispatchMessage(
   let lastFailedSession: { worker: string; sessionId: string } | undefined;
   const config = await loadConfig();
 
-  if (currentSession && await isWorkerCoolingDown(currentSession.worker)) {
+  if (currentSession && await isWorkerCoolingDown(currentSession.worker)) {     
     currentSession = undefined;
+  }
+
+  // AI-030: Switch-back logic. If a higher-priority worker is available, drop the current
+  // session (likely from a failover worker) to trigger a fresh start on the optimal model.
+  if (currentSession) {
+    const preferredAvailable = state.preferred_worker && !(await isWorkerCoolingDown(state.preferred_worker));
+    const defaultAvailable = defaultWorker && !(await isWorkerCoolingDown(defaultWorker));
+
+    const isOptimal = (currentSession.worker === state.preferred_worker && preferredAvailable) ||
+                      (currentSession.worker === defaultWorker && defaultAvailable && !preferredAvailable);
+
+    if ((preferredAvailable || defaultAvailable) && !isOptimal) {
+      logger.info('session', `Worker switch-back detected (${currentSession.worker} -> ${preferredAvailable ? state.preferred_worker : defaultWorker}). Resetting session.`);
+      currentSession = undefined;
+    }
   }
   if (currentSession && await isSessionValid(currentSession, effectiveCwd(state))) {
     const activeSession = currentSession;
@@ -690,20 +690,61 @@ async function processUpdate(
     const topicState = await loadTopicState(chatId, threadId);
     let restartBot = false;
     const topicKey = topicKeyFor(chatId, threadId);
+    const runtimeEnv = { ...process.env, ...secrets };
     let config: any = { workers: [] };
     try { config = await loadConfig(); } catch {}
     let effectiveDefault = getEffectiveDefaultWorker(config, topicKey);
 
+    
+    let response = '';
+    let skipWorker = false;
+    let archivedUserText = userText;
     const workerExpired = expirePreferredWorker(topicState);
+    if (AUTH_PATTERN.test(userText)) {
+      const match = AUTH_PATTERN.exec(userText);
+      const code = match![1];
+      const authState = match![2];
+      logger.info('auth', `Authorization code received via Telegram (chat=${chatId})`);
+      archivedUserText = redactAuthCommand();
+      
+      deleteMessage(token, chatId, messageId).catch(() => {});
+
+      const exchangeScript = runtimeEnv.PA_OAUTH_FINISH_SCRIPT || join(BOT_CWD, 'pa', 'scripts', 'finish_google_telegram_reauth.py');
+      const exchangeArgs = [exchangeScript, '--code', code];
+      if (authState) exchangeArgs.push('--state', authState);
+      if (runtimeEnv.PA_OAUTH_SECRETS_FILE) exchangeArgs.push('--secrets-file', runtimeEnv.PA_OAUTH_SECRETS_FILE);
+      if (runtimeEnv.PA_OAUTH_STATE_FILE) exchangeArgs.push('--state-file', runtimeEnv.PA_OAUTH_STATE_FILE);
+      if (runtimeEnv.PA_OAUTH_TOKEN_FILE) exchangeArgs.push('--token-file', runtimeEnv.PA_OAUTH_TOKEN_FILE);
+      const exchangeProc = spawn('python', exchangeArgs, { shell: true, env: runtimeEnv });
+      
+      let exchangeOut = '';
+      exchangeProc.stdout.on('data', (d) => exchangeOut += d.toString());
+      
+      const exchangeResult = await new Promise<any>((resolve) => {
+        exchangeProc.on('close', () => {
+          try { resolve(JSON.parse(exchangeOut)); }
+          catch { resolve({ error: 'Failed to parse exchange output.' }); }
+        });
+      });
+
+      const resumeStatus = launchOAuthResumeAction(normalizeResumeAction(exchangeResult), {
+        cwd: BOT_CWD,
+        env: runtimeEnv,
+      });
+      response = buildOAuthCompletionMessage(exchangeResult, resumeStatus);
+      
+      skipWorker = true;
+    }
+
     if (workerExpired) {
       const expirySnapshot = buildModelStatusSnapshot({ defaultWorker: effectiveDefault, reasonCode: 'midnight_reset' });
       await replacePinnedStatusCard(token, chatId, threadId, topicState, expirySnapshot);
     }
 
-    addTurn(topicState, { role: 'user', text: userText, timestamp, message_id: messageId, worker: topicState.preferred_worker || effectiveDefault, session_id: topicState.session?.session_id });
+    addTurn(topicState, { role: 'user', text: archivedUserText, timestamp, message_id: messageId, worker: topicState.preferred_worker || effectiveDefault, session_id: topicState.session?.session_id });
 
-    let response = '';
-    let skipWorker = false;
+    
+    
 
     const modelTarget = getModelSwitchTarget(userText);
     if (modelTarget) {

@@ -56,7 +56,7 @@ export async function cleanupExpiredSessions(): Promise<void> {
     const geminiSessionDir = join(homedir(), '.gemini', 'tmp', 'personal-assistant', 'chats');
     const geminiEntries = await readdir(geminiSessionDir);
     for (const entry of geminiEntries) {
-      if (!entry.startsWith('session-') || !entry.endsWith('.json')) continue;
+      if (!entry.startsWith('session-') || (!entry.endsWith('.json') && !entry.endsWith('.jsonl'))) continue;
 
       const fp = join(geminiSessionDir, entry);
       try {
@@ -144,7 +144,7 @@ export function getPriorSessionPath(worker: string, sessionId: string, cwd?: str
   }
   if (worker === 'gemini') {
     // Exact filename requires async dir scan; return a glob pattern the LLM can resolve.
-    return `${homedir()}/.gemini/tmp/personal-assistant/chats/session-*-${sessionId.slice(0, 8)}*.json`;
+    return `${homedir()}/.gemini/tmp/personal-assistant/chats/session-*-${sessionId.slice(0, 8)}*.json*`;
   }
   // Codex: stored in SQLite only — no transcript file.
   return null;
@@ -173,7 +173,7 @@ async function geminiSessionPath(sessionId: string): Promise<string | null> {
   try {
     const entries = await readdir(dir);
     const match = entries.find(
-      (e) => e.startsWith('session-') && e.includes(prefix) && e.endsWith('.json')
+      (e) => e.startsWith('session-') && e.includes(prefix) && (e.endsWith('.json') || e.endsWith('.jsonl'))
     );
     return match ? join(dir, match) : null;
   } catch {
@@ -215,7 +215,7 @@ export async function discoverGeminiSessionId(projectDir: string): Promise<strin
     let latest: { path: string; mtime: Date } | null = null;
 
     for (const name of entries) {
-      if (!name.startsWith('session-') || !name.endsWith('.json')) continue;
+      if (!name.startsWith('session-') || (!name.endsWith('.json') && !name.endsWith('.jsonl'))) continue;
       const fp = join(dir, name);
       try {
         const s = await stat(fp);
@@ -229,8 +229,14 @@ export async function discoverGeminiSessionId(projectDir: string): Promise<strin
 
     if (!latest) return null;
 
-    const raw = await readFile(latest.path, 'utf8');
-    const data = JSON.parse(raw) as { sessionId?: string };
+        const raw = await readFile(latest.path, 'utf8');
+    let data: { sessionId?: string };
+    if (latest.path.endsWith('.jsonl')) {
+      const firstLine = raw.split('\n')[0];
+      data = JSON.parse(firstLine);
+    } else {
+      data = JSON.parse(raw);
+    }
     return data.sessionId ?? null;
   } catch {
     return null;

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, readFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { makeRefId, appendRefId, appendRefIdAndLog } from '../main.js';
+import { makeRefId, appendRefId, appendRefIdAndLog } from '../ref-id.js';
 
 describe('makeRefId', { concurrency: 1 }, () => {
   it('returns s-xxxx format by default', () => {

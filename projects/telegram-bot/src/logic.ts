@@ -23,6 +23,7 @@ export const NEW_PATTERN = /^\/new(?:@\w+)?(?:\s+(.+))?$/i;
 export const STATUS_PATTERN = /^\/status(?:@\w+)?$/i;
 export const KEEP_AWAKE_PATTERN = /^\/keepawake(?:@\w+)?$/i;
 export const SKILLS_PATTERN = /^\/skills(?:@\w+)?$/i;
+export const AUTH_PATTERN = /^\/auth(?:@\w+)?\s+(\S+)(?:\s+(\S+))?$/i;
 export const HELP_PATTERN = /^\/help(?:@\w+)?$/i;
 
 export interface StatusCardArgs {

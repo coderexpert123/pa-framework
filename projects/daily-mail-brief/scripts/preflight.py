@@ -11,6 +11,7 @@ import json
 import os
 import sys
 import traceback
+import subprocess
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
@@ -61,6 +62,48 @@ def main():
                 status = "unknown"
 
         reason = error_str[:500]
+        
+        if status == "auth":
+            try:
+                pa_home = os.environ.get("PA_HOME", os.path.join(os.path.expanduser("~"), ".pa"))
+                # Path to start_google_telegram_reauth.py relative to projects/daily-mail-brief/scripts/preflight.py
+                # D:\Personal Assistant\projects\daily-mail-brief\scripts\preflight.py
+                # -> D:\Personal Assistant\pa\scripts\start_google_telegram_reauth.py
+                start_script = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(SCRIPT_DIR))), "pa", "scripts", "start_google_telegram_reauth.py")
+                
+                chat_id = os.environ.get("TELEGRAM_BRIEFING_CHAT_ID", "").split(",")[0].strip() or os.environ.get("TELEGRAM_CHAT_ID", "").split(",")[0].strip()
+                thread_id = os.environ.get("TELEGRAM_DAILY_BRIEFING_THREAD_ID")
+                
+                redirect_uri = os.environ.get("GOOGLE_AUTH_REDIRECT_URI", "").strip()
+                if not redirect_uri:
+                    raise RuntimeError("GOOGLE_AUTH_REDIRECT_URI is not configured in ~/.pa/secrets.env")
+
+                resume_action = {
+                    "type": "run_pa_skill",
+                    "skill": "daily-mail-brief",
+                    "description": "Retry the daily mail brief",
+                }
+
+                if os.path.exists(start_script) and chat_id:
+                    cmd = [sys.executable, start_script, "--redirect-uri", redirect_uri, "--chat-id", chat_id]
+                    if thread_id:
+                        cmd.extend(["--thread-id", thread_id])
+                    cmd.extend(["--resume-action-json", json.dumps(resume_action)])
+                    
+                    res = subprocess.run(cmd, capture_output=True, text=True)
+                    if res.returncode == 0:
+                        auth_data = json.loads(res.stdout)
+                        auth_url = auth_data["auth_url"]
+                        reason = (
+                            "Google authentication expired.\n\n"
+                            f"1. [Tap here to authorize]({auth_url}) on your phone.\n"
+                            "2. Copy the full `/auth ...` command from the page.\n"
+                            "3. Return here and paste that command into Telegram.\n\n"
+                            "PA will automatically retry the mail brief after success."
+                        )
+            except Exception as auth_err:
+                print(f"[preflight] Failed to start reauth flow: {auth_err}", file=sys.stderr)
+
         _write_fetch_failed(status, reason)
 
         dedup_key = _dedup_key_for_status(status)

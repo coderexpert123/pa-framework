@@ -18,7 +18,9 @@ alert via pa notify, does NOT send the briefing to the user.
 """
 import json
 import os
+import secrets
 import sys
+from datetime import datetime, timezone
 
 import requests
 
@@ -27,6 +29,30 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 FETCH_FAILED_FILE = os.path.join(PROJECT_ROOT, ".fetch-failed.json")
 
 MAX_MSG_LEN = 4000  # Telegram limit is 4096, leave buffer
+
+
+def _pa_home() -> str:
+    return os.environ.get("PA_HOME") or os.path.join(os.path.expanduser("~"), ".pa")
+
+
+def _log_skill_message_sent(ref_id: str, chat_id: str, thread_id, chunk_index: int, text_preview: str) -> None:
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "level": "info",
+        "module": "telegram",
+        "message": "skill message sent",
+        "refId": ref_id,
+        "chatId": int(chat_id),
+        "threadId": int(thread_id) if thread_id is not None else None,
+        "chunkIndex": chunk_index,
+        "textPreview": text_preview[:500],
+    }
+    try:
+        log_path = os.path.join(_pa_home(), "app.log.jsonl")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass  # log failures must never crash delivery
 
 
 def split_message(text: str) -> list:
@@ -58,9 +84,12 @@ def send(text: str):
         print("[Telegram] ERROR: TELEGRAM_BOT_TOKEN and TELEGRAM_BRIEFING_CHAT_ID (or TELEGRAM_CHAT_ID) must be set", file=sys.stderr)
         sys.exit(1)
 
+    ref_id = f"s-{secrets.token_hex(2)}"
     chat_ids = [cid.strip() for cid in chat_id_raw.split(",") if cid.strip()]
     base_url = f"https://api.telegram.org/bot{token}"
     parts = split_message(text)
+    # Append ref trailer to last chunk so it shows up in the message
+    parts[-1] = f"{parts[-1]}\n\n_Ref: {ref_id}_"
     any_failed = False
 
     for chat_id in chat_ids:
@@ -70,6 +99,7 @@ def send(text: str):
             use_thread_id = int(thread_id_str)
 
         for i, part in enumerate(parts, 1):
+            chunk_index = i - 1
             payload = {
                 "chat_id": chat_id,
                 "text": part,
@@ -81,15 +111,18 @@ def send(text: str):
             try:
                 resp = requests.post(f"{base_url}/sendMessage", json=payload)
                 if resp.status_code == 200:
-                    print(f"[Telegram] {chat_id} Part {i}/{len(parts)} sent OK")
+                    print(f"[Telegram] {chat_id} Part {i}/{len(parts)} sent OK (ref={ref_id})")
+                    _log_skill_message_sent(ref_id, chat_id, use_thread_id, chunk_index, part)
                 else:
                     # Retry without Markdown in case of formatting errors
-                    fallback = {"chat_id": chat_id, "text": part}
+                    plain_text = part.replace(f"\n\n_Ref: {ref_id}_", f"\n\nRef: {ref_id}")
+                    fallback = {"chat_id": chat_id, "text": plain_text}
                     if use_thread_id is not None:
                         fallback["message_thread_id"] = use_thread_id
                     resp2 = requests.post(f"{base_url}/sendMessage", json=fallback)
                     if resp2.status_code == 200:
-                        print(f"[Telegram] {chat_id} Part {i}/{len(parts)} sent (plain fallback): OK")
+                        print(f"[Telegram] {chat_id} Part {i}/{len(parts)} sent (plain fallback): OK (ref={ref_id})")
+                        _log_skill_message_sent(ref_id, chat_id, use_thread_id, chunk_index, plain_text)
                     else:
                         print(f"[Telegram] ERROR: {chat_id} Part {i}/{len(parts)} failed even without Markdown: {resp2.status_code} {resp2.text}", file=sys.stderr)
                         any_failed = True

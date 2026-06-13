@@ -176,10 +176,16 @@ For the full file-placement decision tree, see [`CONVENTIONS.md`](CONVENTIONS.md
 | Your personal projects | `projects/<your-name>/` inside your private repo |
 | Skills you run | `~/.pa/skills/<name>/` — outside repo, in `PA_HOME` |
 | Runtime config + secrets | `~/.pa/config.yaml`, `~/.pa/secrets.env` — outside repo |
+| Runtime OAuth helpers + resume hook | `~/.pa/google_*.json`, `~/.pa/google_auth.py`, `~/.pa/oauth_resume_hook.py` — outside repo |
 | Personal docs (medical, financial, family) | `~/Documents/personal-imports/<date>/` — outside repo |
 | Ad-hoc / throwaway / WIP scripts | `scratch/` — inside repo but gitignored (both repos) |
 | Framework docs (you author for community) | `docs/` — substrate, shared |
 | Personal plans / brain / backlog | `plans/`, `CLAUDE.md`, `MEMORY.md`, `BACKLOG.md` — private only |
+
+If you use the Telegram/mobile Google auth flow, deploy
+`projects/google-oauth-redirect/` to any static HTTPS host and keep the actual
+OAuth client JSON, token file, pending-auth state, and resume hook under
+`~/.pa/` rather than inside either repo.
 
 ---
 

@@ -12,9 +12,30 @@ The framework is structured so that each layer depends only on the ones below it
 | 4 | Skill substrate | `~/.pa/skills/<name>/skill.md` | Markdown skills with YAML frontmatter; runtime dispatch |
 | 3 | Orchestrator | `pa/src/{scheduler,blackboard,analyzer,drafts,lib/*}.ts` | Cron eval, locking, structured logs, alert dedup, learn pipeline |
 | 2 | Worker pool | `pa/src/{workers,worker-exec,worker-evaluator,state-monitor,rate-limits-*}.ts` | CLI spawn, failover, rate-limit parsing, stuck-state evaluation |
-| 1 | Auth substrate | `~/.pa/google_auth.py` (copy from `examples/oauth/` — see `examples/oauth/README.md`) | Shared OAuth for Gmail/Drive/Docs across projects |
+| 1 | Auth substrate | `~/.pa/google_auth.py` + Telegram/mobile bridge helpers (see `examples/oauth/README.md`) | Shared Google OAuth for Gmail/Drive/Docs plus optional Telegram/mobile recovery |
 
 Domain projects (e.g., `projects/daily-mail-brief/`) sit *above* layer 5; they use the bot for delivery, register skills in `~/.pa/skills/`, and call into the orchestrator via the `pa` CLI or `pa notify`.
+
+## Telegram/mobile OAuth recovery
+
+The framework also supports a mobile-friendly Google OAuth recovery loop:
+
+1. A project detects expired Google credentials and launches
+   `pa/scripts/start_google_telegram_reauth.py`.
+2. That script generates a consent URL, stores pending state in
+   `~/.pa/google-telegram-auth.json`, and sends the URL to Telegram.
+3. Google redirects the user to `projects/google-oauth-redirect/`, a static
+   page that renders `/auth <code> <state>`.
+4. The user pastes that command into Telegram.
+5. The bot's `/auth` handler runs `finish_google_telegram_reauth.py`, writes the
+   refreshed token, and optionally invokes a private resume hook.
+
+Public/private boundary:
+
+- **Public substrate**: the bot `/auth` surface, pending auth-session format,
+  start/finish scripts, static bridge page, and docs.
+- **Private deployment**: OAuth client JSONs, token/state storage paths, and the
+  action registry in `~/.pa/oauth_resume_hook.py`.
 
 ## Worker pool contract
 
