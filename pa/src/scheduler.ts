@@ -210,9 +210,9 @@ async function syncSchedulesPosix(): Promise<void> {
   const tmpPath = join(tmpdir(), `pa-crontab-${process.pid}.tmp`);
   try {
     await writeFile(tmpPath, updated, 'utf8');
-    await execAsync(`crontab ${tmpPath}`);
-    console.log('[+] Registered PA-Catchup-Reminders: * * * * * pa catchup --topic reminders');
-    console.log('[+] Registered PA-Catchup:           */15 * * * * pa catchup');
+    await execAsync(`crontab "${tmpPath}"`);
+    console.log(`[+] Registered PA-Catchup-Reminders: * * * * * ${paPath} catchup --topic reminders`);
+    console.log(`[+] Registered PA-Catchup:           */15 * * * * ${paPath} catchup`);
   } finally {
     await unlink(tmpPath).catch(() => {});
   }

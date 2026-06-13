@@ -8,7 +8,8 @@
 
 - **Node.js 22+** (the framework uses ES modules with Node native test runner).
 - **Python 3.11+** (only if you'll use Python-based skills like the sample `daily-mail-brief`).
-- **PowerShell 7+** on Windows (or any POSIX shell on Linux/macOS — needed for `&&` chaining, `Remove-Item`/`Join-Path` cmdlets in our scripts).
+- **PowerShell 7+** on Windows. On Linux/macOS any POSIX shell (bash/zsh) is sufficient — no PowerShell needed.
+- **systemd** on Linux (for `/keepawake` and the recommended bot supervisor). Not required if you use a non-systemd distro, but those features will be unavailable.
 - **At least one LLM CLI** in your PATH:
   - [Claude Code](https://github.com/anthropics/claude-code) (`claude`)
   - [Gemini CLI](https://github.com/google-gemini/gemini-cli) (`gemini`)
@@ -19,21 +20,17 @@
 
 ## 2. Build
 
-```powershell
+These commands work identically on Windows (PowerShell 7+), macOS, and Linux:
+
+```bash
 git clone https://github.com/coderexpert123/pa-framework.git
 cd pa-framework
 
 # pa orchestrator
-cd pa
-npm install
-npm run build
-cd ..
+cd pa && npm install && npm run build && cd ..
 
 # telegram bot
-cd projects/telegram-bot
-npm install
-npm run build
-cd ../..
+cd projects/telegram-bot && npm install && npm run build && cd ../..
 ```
 
 Both should compile with zero errors. If TypeScript errors fire, you likely have a Node version mismatch — verify with `node --version`.
@@ -183,19 +180,27 @@ Should report most checks as `PASS` or `WARN`. Failures come with actionable hin
 
 ## 10. Start the Telegram bot
 
+**Windows (PowerShell):**
 ```powershell
-# Foreground (logs to ~/.pa/logs/telegram-bot.log via the wrapper)
 pwsh projects/telegram-bot/run-bot.ps1
-
-# Bash equivalent
-node projects/telegram-bot/dist/main.js >> ~/.pa/logs/telegram-bot.log 2>&1
 ```
+Register as a Task Scheduler task so it auto-restarts (see `docs/BOT_GUIDE.md §"Option A: Windows Task Scheduler"`).
+
+**macOS / Linux (POSIX):**
+```bash
+# Foreground (logs to ~/.pa/logs/telegram-bot.log, rotates at 2 MB)
+bash projects/telegram-bot/run-bot.sh
+
+# Background
+bash projects/telegram-bot/run-bot.sh &
+```
+For persistent deployment register as a systemd service (Linux) or launchd agent (macOS) — see `docs/BOT_GUIDE.md §"Option B / Option C"`.
 
 Send your bot a message in Telegram — it responds via your highest-priority available worker. Use `/help` to see the bot's slash commands (defined in `projects/telegram-bot/src/commands.ts`).
 
 To stop gracefully: `node pa/dist/bin/pa.js bot stop` (sets a sentinel file the bot polls).
 
-To restart: `node pa/dist/bin/pa.js bot restart` (stop → Task Scheduler / your supervisor brings it back).
+To restart: `node pa/dist/bin/pa.js bot restart` (stop → your supervisor brings it back).
 
 **Optional: auto-create canonical Telegram topics** — if your `TELEGRAM_CHAT_ID` points at a supergroup with forum topics enabled, the framework can auto-create a recommended set (`pa-alerts`, `pa-support`, `daily-briefings`, `claude-support`, etc.) so each skill has a natural destination:
 
@@ -207,19 +212,18 @@ Defaults to the first entry in `TELEGRAM_CHAT_ID`; pass `--chat-id <supergroup-i
 
 ## 11. Schedule recurring runs
 
-On Windows:
-
 ```
 node pa/dist/bin/pa.js schedules sync
 ```
 
-Registers `PA-Catchup` and `PA-Catchup-OnLogon` Windows Task Scheduler entries. The catchup task runs `pa catchup` every minute, which iterates overdue skills and fires them.
+Works on all platforms:
 
-On Linux/macOS (until cross-platform scheduler ships): add to your crontab manually:
+- **Windows**: registers `PA-Catchup` and `PA-Catchup-Reminders` in Windows Task Scheduler (runs via a hidden VBScript wrapper every minute).
+- **macOS / Linux**: upserts two entries into your user crontab (`crontab -l` / `crontab <file>`): `PA-Catchup` every 15 minutes, and `PA-Catchup-Reminders` every minute.
 
-```
-*/1 * * * * /usr/bin/env node /path/to/pa-framework/pa/dist/bin/pa.js catchup
-```
+The catchup task runs `pa catchup`, which iterates overdue skills and fires them.
+
+> **macOS / Linux cron PATH note:** cron runs with a minimal `PATH`. If `pa` isn't in `/usr/bin` or `/usr/local/bin`, the cron entry may fail silently. Run `which pa` to see the resolved path — `pa schedules sync` uses that full path in the registered cron lines. If `pa` isn't on `PATH` at all, install it globally (e.g. `npm install -g .` inside `pa/`) before syncing.
 
 ## 12. Going further: deploying your own version
 

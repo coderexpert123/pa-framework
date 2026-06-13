@@ -41,10 +41,10 @@ Full design: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Quickstart (abbreviated)
 
-```powershell
-# Build
-cd pa ; npm install ; npm run build ; cd ..
-cd projects/telegram-bot ; npm install ; npm run build ; cd ../..
+```bash
+# Build (same on all platforms)
+cd pa && npm install && npm run build && cd ..
+cd projects/telegram-bot && npm install && npm run build && cd ../..
 
 # Scaffold ~/.pa/
 node pa/dist/bin/pa.js init
@@ -53,14 +53,19 @@ node pa/dist/bin/pa.js init
 # Configure: edit ~/.pa/config.yaml worker `command` paths if your CLIs aren't in PATH
 
 # Copy a sample skill
-Copy-Item -Recurse examples/skills/reminders ~/.pa/skills/
+cp -r examples/skills/reminders ~/.pa/skills/          # macOS / Linux
+# Copy-Item -Recurse examples/skills/reminders ~/.pa/skills/   # Windows PowerShell
 
 # Verify
 node pa/dist/bin/pa.js list
 node pa/dist/bin/pa.js health
 
-# Run the bot (optional)
-pwsh projects/telegram-bot/run-bot.ps1
+# Register the catchup scheduler (all platforms)
+node pa/dist/bin/pa.js schedules sync
+
+# Run the bot
+bash projects/telegram-bot/run-bot.sh &               # macOS / Linux
+# pwsh projects/telegram-bot/run-bot.ps1              # Windows PowerShell
 ```
 
 Detailed walkthrough: [`docs/QUICKSTART.md`](docs/QUICKSTART.md). For deployment patterns (simple fork vs dual-`.git`), see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
@@ -82,11 +87,16 @@ Substrate extracted from a working personal deployment. Conventions are stable; 
 
 ## Platform support
 
-**Windows-tested.** Linux/macOS support is partial:
-- `pa/` orchestrator + `projects/telegram-bot/` build and run on POSIX systems (tested manually).
-- `pa schedules sync` (Windows Task Scheduler integration) and `pa/src/process-tree.ts` (descendant-PID introspection) are currently Windows-only. Use `crontab` directly on Linux/macOS as a workaround.
+The framework runs on **Windows, macOS, and Linux**. Platform-specific notes:
 
-Cross-platform support for the scheduler is on the roadmap (see future `docs/PLATFORM.md`).
+| Feature | Windows | macOS | Linux |
+|---------|---------|-------|-------|
+| Bot launcher | `run-bot.ps1` + Task Scheduler | `run-bot.sh` + launchd | `run-bot.sh` + systemd |
+| `pa schedules sync` | Windows Task Scheduler | crontab | crontab |
+| Process tree / bgtasks | PowerShell + CIM | `ps` / `pgrep` | `ps` / `pgrep` |
+| `/keepawake` | `SetThreadExecutionState` | `caffeinate -s` (built-in) | `systemd-inhibit` (requires systemd) |
+
+See [`docs/QUICKSTART.md`](docs/QUICKSTART.md) for per-OS installation steps and [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) for platform-specific caveats.
 
 ## License
 

@@ -117,10 +117,13 @@ async function stopKeepAwake(pid: number): Promise<void> {
     }
   }
 
-  // POSIX: caffeinate / systemd-inhibit exit cleanly on SIGTERM
-  try {
-    process.kill(pid, 'SIGTERM');
-  } catch {}
+  if (platform() === 'linux') {
+    // systemd-inhibit spawns `sleep infinity` as a child; kill the whole process group
+    try { process.kill(-pid, 'SIGTERM'); } catch {}
+  } else {
+    // macOS caffeinate has no children; Windows already handled above
+    try { process.kill(pid, 'SIGTERM'); } catch {}
+  }
 
   cleanupStaleState();
 }
