@@ -8,6 +8,7 @@ import { listSkills } from '../../../pa/dist/src/skills.js';
 import { formatIST } from '../../../pa/dist/src/ist.js';
 import { logger } from '../../../pa/dist/src/lib/log.js';
 import { loadTopicNames, setTopicDescription } from './topic-names.js';
+import { appendRefIdAndLog } from './ref-id.js';
 
 const DASHBOARD_TOPIC_NAME = 'System Dashboard';
 const DASHBOARD_DESCRIPTION = 'Live system status — keep-awake state, model failover priorities, and scheduled skill crons. Auto-updated by the bot.';
@@ -147,7 +148,7 @@ export async function updateDashboard(token: string, fallbackChatId: number): Pr
   // 2. Message creation or update
   if (!state.message_id) {
     logger.info('dashboard', 'Sending initial dashboard message');
-    const msgId = await sendMessageWithId(token, chatId, content, state.thread_id);
+    const msgId = await sendMessageWithId(token, chatId, appendRefIdAndLog(content, { kind: 'system', chatId, threadId: state.thread_id }), state.thread_id);
     if (msgId) {
       state.message_id = msgId;
       const pinned = await pinChatMessage(token, chatId, msgId);
@@ -159,14 +160,14 @@ export async function updateDashboard(token: string, fallbackChatId: number): Pr
     }
   } else {
     logger.info('dashboard', `Editing existing dashboard message: ${state.message_id}`);
-    const success = await editMessageText(token, chatId, state.message_id, content);
+    const success = await editMessageText(token, chatId, state.message_id, appendRefIdAndLog(content, { kind: 'system', chatId, threadId: state.thread_id }));
     if (!success) {
       // Potential deletion, clear and recreate
       logger.warn('dashboard', 'Edit failed, attempting recreation');
       state.message_id = undefined;
       await saveDashboardState(state);
 
-      const msgId = await sendMessageWithId(token, chatId, content, state.thread_id);
+      const msgId = await sendMessageWithId(token, chatId, appendRefIdAndLog(content, { kind: 'system', chatId, threadId: state.thread_id }), state.thread_id);
       if (msgId) {
         state.message_id = msgId;
         await pinChatMessage(token, chatId, msgId);

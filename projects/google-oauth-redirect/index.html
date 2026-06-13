@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PA OAuth Bridge</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            margin: 0;
+            background-color: #f4f7f9;
+            color: #333;
+            text-align: center;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            max-width: 400px;
+            width: 100%;
+        }
+        h1 {
+            font-size: 20px;
+            margin-bottom: 20px;
+            color: #1a73e8;
+        }
+        p {
+            font-size: 14px;
+            line-height: 1.5;
+            margin-bottom: 20px;
+            color: #666;
+        }
+        .command-box {
+            background: #f8f9fa;
+            border: 1px solid #ddd;
+            padding: 15px;
+            border-radius: 6px;
+            font-family: monospace;
+            font-size: 16px;
+            word-break: break-all;
+            margin-bottom: 20px;
+            min-height: 24px;
+        }
+        .copy-btn {
+            background-color: #1a73e8;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 6px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+            width: 100%;
+        }
+        .copy-btn:hover {
+            background-color: #1557b0;
+        }
+        .copy-btn:active {
+            background-color: #174ea6;
+        }
+        .footer {
+            margin-top: 20px;
+            font-size: 12px;
+            color: #999;
+        }
+        .success-msg {
+            color: #188038;
+            font-size: 14px;
+            margin-top: 10px;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>PA Authentication</h1>
+        <p>Google has authorized your request. Copy the command below and paste it back into Telegram.</p>
+
+        <div class="command-box" id="command-display">Loading command...</div>
+
+        <button class="copy-btn" id="copy-btn">Copy Command</button>
+        <div class="success-msg" id="success-msg">Command copied to clipboard!</div>
+        
+        <div class="footer">
+            This command expires quickly. If it fails, restart the auth flow.
+        </div>
+    </div>
+
+    <script>
+        const urlParams = new URLSearchParams(window.location.search);
+        const code = urlParams.get('code');
+        const state = urlParams.get('state');
+        const commandDisplay = document.getElementById('command-display');
+        const copyBtn = document.getElementById('copy-btn');
+        const successMsg = document.getElementById('success-msg');
+        const authCommand = code ? `/auth ${code}${state ? ` ${state}` : ''}` : '';
+
+        if (code) {
+            commandDisplay.textContent = authCommand;
+        } else {
+            commandDisplay.textContent = 'No OAuth command could be built from this URL.';
+            commandDisplay.style.color = '#d93025';
+            copyBtn.disabled = true;
+            copyBtn.style.backgroundColor = '#ccc';
+        }
+
+        copyBtn.addEventListener('click', () => {
+            if (authCommand) {
+                navigator.clipboard.writeText(authCommand).then(() => {
+                    successMsg.style.display = 'block';
+                    setTimeout(() => {
+                        successMsg.style.display = 'none';
+                    }, 3000);
+                }).catch(err => {
+                    console.error('Failed to copy: ', err);
+                });
+            }
+        });
+    </script>
+</body>
+</html>

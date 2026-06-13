@@ -1,0 +1,78 @@
+# pa-framework public repo: whitelist-style exclude file.
+# Default: ignore EVERY top-level entry. Then un-ignore the substrate paths.
+
+/*
+
+# Re-include public substrate at the root
+!/.gitignore
+!/.gitignore-public
+!/README.md
+!/LICENSE
+!/docs/
+!/examples/
+!/pa/
+!/projects/
+
+# Inside projects/: ignore everything except the public-facing subtrees
+projects/*
+!projects/telegram-bot/
+!projects/daily-mail-brief/
+!projects/google-oauth-redirect/
+
+# Inside pa/: exclude personal/build/private artifacts
+pa/data/
+pa/.claude-needs-brain
+pa/dist/
+pa/node_modules/
+pa/src/oracle_agent.py
+pa/src/active_mail.py
+pa/src/learn_agent.py
+pa/src/travel_butler.py
+pa/src/gmail_utils.py
+pa/src/telegram_notify.py
+pa/scripts/upload_apk.py
+# pa/scripts/upload_plan.py — INCLUDED (refactored to env-driven via PA_PLANS_DRIVE_FOLDER_ID; see Cat E3)
+
+# Inside projects/telegram-bot/: exclude build/state/runtime artifacts + personal prompt
+projects/telegram-bot/dist/
+projects/telegram-bot/node_modules/
+projects/telegram-bot/.claude-needs-brain
+projects/telegram-bot/bot-instructions.md
+projects/telegram-bot/run-bot-hidden.vbs
+projects/telegram-bot/test_repro.mjs
+
+# Inside projects/daily-mail-brief/: track only scripts + README + requirements
+projects/daily-mail-brief/*
+!projects/daily-mail-brief/README.md
+!projects/daily-mail-brief/requirements.txt
+!projects/daily-mail-brief/scripts/
+# Exclude personal one-off email helpers (hardcoded recipient/subject/body)
+projects/daily-mail-brief/scripts/draft_reply.py
+
+# Universal noise excludes
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/venv/
+**/.venv/
+**/*.log
+**/.DS_Store
+**/*.tsbuildinfo
+
+# === Repo hygiene patterns (mirror of private .gitignore — see docs/CONVENTIONS.md) ===
+# Scratch and WIP — never tracked publicly
+**/scratch/
+**/temp_*.py
+**/temp_*.json
+**/temp_*.md
+**/temp_*.txt
+**/debug_*.py
+**/debug_*.log
+**/*-debug.log
+**/test_repro.*
+**/test_real_login.*
+
+# Project data subdirectories (each project keeps its own data outside the repo)
+**/data/raw/
+**/data/processed/
+**/data/exports/

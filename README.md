@@ -30,8 +30,8 @@ Use it to build your own personal automation: inbox triage, periodic reports, re
 └────────────────────────┬────────────────────────────────────┘
                          │
 ┌────────────────────────┴────────────────────────────────────┐
-│  Auth substrate      ~/.pa/google_auth.py (template)        │
-│  (shared Google OAuth for Gmail/Drive/Docs)                 │
+│  Auth substrate      ~/.pa/google_auth.py + OAuth bridge    │
+│  (desktop + Telegram/mobile Google OAuth recovery)          │
 └─────────────────────────────────────────────────────────────┘
 
 Domain projects (built on top): projects/daily-mail-brief/ — sample
@@ -70,8 +70,9 @@ Detailed walkthrough: [`docs/QUICKSTART.md`](docs/QUICKSTART.md). For deployment
 - **`pa/`** — CLI dispatcher: `pa run`, `pa list`, `pa schedules`, `pa health`, `pa notify`, `pa bot restart`, `pa learn`, ...
 - **`projects/telegram-bot/`** — Long-poll Telegram bot with forum-topic support, conversation archive, DLQ, sentinel-based graceful shutdown.
 - **`projects/daily-mail-brief/`** — Reference sample: Gmail triage → LLM summary → Telegram + optional Obsidian archival.
+- **`projects/google-oauth-redirect/`** — Static bridge page for Telegram/mobile Google OAuth recovery.
 - **`examples/skills/`** — Three sample skills (`reminders`, `daily-mail-brief`, `update-brain`) demonstrating the full feature surface.
-- **`examples/oauth/`** — Google OAuth helpers (`google_auth.py`, `reauth_google.py`, `requirements.txt`, walkthrough README) for skills that need Gmail/Drive/Docs access.
+- **`examples/oauth/`** — Google OAuth helpers (`google_auth.py`, `reauth_google.py`, resume-hook example, requirements, walkthrough README) for skills that need Gmail/Drive/Docs access.
 - **`examples/config.yaml.example`** + **`examples/secrets.env.example`** + **`examples/topics-template.json`** — annotated config templates.
 - **`docs/`** — Architecture, quickstart, configuration, skills guide, workers guide, bot guide, deployment, conventions, troubleshooting.
 

@@ -50,6 +50,25 @@ TELEGRAM_DAILY_BRIEFING_THREAD_ID=29
 
 Restart the bot (`node pa/dist/bin/pa.js bot restart`).
 
+## Optional: `/auth` for Google OAuth recovery
+
+If you enable the Telegram/mobile Google auth flow, the bot also supports:
+
+```text
+/auth <code> <state>
+```
+
+The intended user path is:
+
+1. A Google-backed project sends an authorization link to Telegram.
+2. The user opens it, signs in, and lands on the deployed
+   `projects/google-oauth-redirect/` bridge page.
+3. That page renders a full `/auth ...` command and offers a copy button.
+4. The user pastes the command into Telegram.
+5. The bot exchanges the code and optionally triggers `~/.pa/oauth_resume_hook.py`.
+
+See `examples/oauth/README.md` for the full setup.
+
 ## Bot lifecycle
 
 ### `pa bot stop` / `pa bot restart` / `pa bot rotate`
@@ -215,6 +234,7 @@ Defined in `projects/telegram-bot/src/commands.ts`. Common ones:
 
 - `/help` — list commands
 - `/model <name>` — switch the topic to a specific worker
+- `/auth <code> <state>` — complete the Telegram/mobile Google OAuth flow
 - `/code <path>` — set the working directory for this topic
 - `/code reset` — clear working-directory override
 - `/branch <name>` — create a branched conversation (child topic in supergroups)
@@ -278,3 +298,16 @@ For gemini and codex workers, the bot's `context.ts` constructs an equivalent pr
 - [`CONFIGURATION.md`](CONFIGURATION.md) — `topic_defaults` mapping
 - [`SKILLS_GUIDE.md`](SKILLS_GUIDE.md) — skills that deliver to Telegram via `telegram_output`
 - [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) — bot won't start, DLQ growing, etc.
+
+## Google OAuth Setup
+
+Some skills (like daily-mail-brief) require Google API access. To enable this via Telegram:
+
+1.  **Deploy a Bridge Page**: Host projects/google-oauth-redirect/index.html on a public URL (e.g., GitHub Pages).
+2.  **Configure Google Cloud**:
+    *   Create a "Web application" OAuth client in the Google Cloud Console.
+    *   Add your Bridge Page URL as a "Authorized redirect URI".
+    *   Download the JSON and save it to ~/.pa/google-credentials-telegram.json.
+3.  **Set Environment Variables**: In ~/.pa/secrets.env, set GOOGLE_AUTH_REDIRECT_URI to your Bridge Page URL.
+4.  **Usage**: When a skill requires authentication, it will send a Google link to Telegram. After authorizing, you will be redirected to the Bridge Page, which provides an /auth command. Copy and paste that command back into the bot.
+

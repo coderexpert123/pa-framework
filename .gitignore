@@ -49,8 +49,8 @@ __pycache__/
 # === Repo-root hygiene: nothing personal/ephemeral lives at the root ===
 # See docs/CONVENTIONS.md (public) + CLAUDE.md "Repository hygiene" (private).
 # Repo root is reserved for repo-level files only: README, LICENSE, CLAUDE.md,
-# BACKLOG.md, MEMORY.md, DEBUGGING.md, AGENTS.md, GEMINI.md, .gitignore*,
-# git-public.*. Anything else gets caught by the patterns below.
+# optional MEMORY.md, BACKLOG.md, DEBUGGING.md, AGENTS.md/GEMINI.md aliases,
+# .gitignore*, git-public.*. Anything else gets caught by the patterns below.
 
 # External imports at root (PDFs, images, binaries — likely Telegram attachments)
 /*.jpg

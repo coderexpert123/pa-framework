@@ -14,6 +14,7 @@ export const BOT_COMMANDS: BotCommand[] = [
   { command: 'new', description: 'Clear context and start a fresh session (optionally seed from replied message)' },
   { command: 'status', description: 'Show bot health and worker status' },
   { command: 'skills', description: 'List scheduled skills and last run' },
+  { command: 'auth', description: 'Complete OAuth flow using the bridge-page command' },
   { command: 'help', description: 'Show available commands' },
   { command: 'branch', description: 'Create a branch from this topic (manual topic creation required)' },
   { command: 'child_of', description: 'Link this topic as a child of a named parent topic' },

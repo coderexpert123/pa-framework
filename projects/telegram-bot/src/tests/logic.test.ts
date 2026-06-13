@@ -24,6 +24,7 @@ import {
   handleNewCommand,
   handleResetCommand,
   NEW_PATTERN,
+  AUTH_PATTERN,
   BRANCH_PATTERN,
   CHILD_OF_PATTERN,
   MERGE_PATTERN,
@@ -650,6 +651,26 @@ describe('buildWorkerResponse', () => {
 // ---------------------------------------------------------------------------
 // MODEL_SWITCH_PATTERN
 // ---------------------------------------------------------------------------
+
+describe('AUTH_PATTERN', () => {
+  it('matches `/auth <code>`', () => {
+    const match = AUTH_PATTERN.exec('/auth code-123');
+    assert.ok(match);
+    assert.equal(match?.[1], 'code-123');
+    assert.equal(match?.[2], undefined);
+  });
+
+  it('matches `/auth <code> <state>`', () => {
+    const match = AUTH_PATTERN.exec('/auth code-123 state-456');
+    assert.ok(match);
+    assert.equal(match?.[1], 'code-123');
+    assert.equal(match?.[2], 'state-456');
+  });
+
+  it('rejects malformed `/auth` without a code', () => {
+    assert.ok(!AUTH_PATTERN.test('/auth'));
+  });
+});
 
 describe('MODEL_SWITCH_PATTERN', () => {
   it('matches /model claude', () => assert.ok(MODEL_SWITCH_PATTERN.test('/model claude')));

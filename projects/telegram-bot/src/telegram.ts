@@ -516,3 +516,17 @@ export async function setMyCommands(token: string, commands: any[]): Promise<boo
     return false;
   }
 }
+
+export async function deleteMessage(token: string, chatId: number, messageId: number): Promise<boolean> {
+  try {
+    const res = await fetch(`${BASE}/bot${token}/deleteMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, message_id: messageId }),
+    });
+    return res.ok;
+  } catch (err) {
+    logger.warn('telegram', `deleteMessage error: ${(err as Error).message}`);
+    return false;
+  }
+}
