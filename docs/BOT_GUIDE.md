@@ -288,7 +288,7 @@ Defined in `projects/telegram-bot/src/commands.ts`. Common ones:
 - `/code <path>` — set the working directory for this topic
 - `/code reset` — clear working-directory override
 - `/branch <name>` — create a branched conversation (child topic in supergroups)
-- `/keepawake` — toggle machine-wide sleep prevention (Windows only)
+- `/keepawake` — toggle machine-wide sleep prevention (Windows: `SetThreadExecutionState` via PS; macOS: `caffeinate -s`; Linux: `systemd-inhibit`)
 - `/deep-plan`, `/deep-recheck`, `/update-brain`, etc. — pass-through to corresponding pa skills
 
 The pass-through list is defined in `~/.pa/codex-skill-translations.json` (shared with the codex worker's translation layer).

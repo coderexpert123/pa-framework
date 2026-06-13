@@ -183,17 +183,17 @@ Workaround: emit the literal text outside the `[PA_META]` envelope position (any
 
 ## Cross-platform issues
 
-### Windows-only features
+### Platform capabilities
 
-These don't work on Linux/macOS:
+All commands are cross-platform. Per-platform backends:
 
-- `/keepawake` — toggles `SetThreadExecutionState` via a PowerShell helper; no POSIX equivalent.
+| Feature | Windows | macOS | Linux |
+|---------|---------|-------|-------|
+| `pa schedules sync` | Windows Task Scheduler | crontab | crontab |
+| Process tree / bgtasks | PowerShell + CIM | `ps`/`pgrep` | `ps`/`pgrep` |
+| `/keepawake` | `SetThreadExecutionState` (PS helper) | `caffeinate -s` | `systemd-inhibit` |
 
-Everything else is cross-platform:
-
-- `pa schedules sync` — registers via Windows Task Scheduler on Windows; registers via `crontab` on Linux/macOS.
-- `pa/src/process-tree.ts` — uses PowerShell + CIM on Windows; uses `ps`/`pgrep` on POSIX.
-- `pa bgtasks` and bg-leak alerts — fully functional on POSIX via the `ps`-based process tree.
+> **Linux keepawake caveat:** requires systemd. On non-systemd distros `/keepawake` will fail to start; use a distro-specific inhibitor manually.
 
 ### Path separators
 

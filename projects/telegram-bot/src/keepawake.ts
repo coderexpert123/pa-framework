@@ -1,7 +1,7 @@
 import { spawn } from 'child_process';
 import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
-import { homedir } from 'os';
+import { homedir, platform } from 'os';
 
 function paHome(): string {
   return process.env.PA_HOME || join(homedir(), '.pa');
@@ -59,20 +59,28 @@ export async function toggleKeepAwake(): Promise<KeepAwakeStatus> {
 }
 
 async function startKeepAwake(): Promise<KeepAwakeStatus> {
-  // Ensure PS helper exists
-  ensurePowerShellHelper();
+  let child: ReturnType<typeof spawn>;
 
-  const sentinel = stopSentinel();
-  // Remove any stale stop sentinel
-  if (existsSync(sentinel)) unlinkSync(sentinel);
-
-  // Spawn the PowerShell script
-  // SetThreadExecutionState(0x80000001) -> ES_CONTINUOUS | ES_SYSTEM_REQUIRED
-  // We use a loop that calls it every 30 seconds to be safe, though ES_CONTINUOUS should be enough.
-  const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', psHelper()], {
-    detached: true,
-    stdio: 'ignore',
-  });
+  if (platform() === 'win32') {
+    ensurePowerShellHelper();
+    const sentinel = stopSentinel();
+    if (existsSync(sentinel)) unlinkSync(sentinel);
+    // SetThreadExecutionState(0x80000001) -> ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+    child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', psHelper()], {
+      detached: true,
+      stdio: 'ignore',
+    });
+  } else if (platform() === 'darwin') {
+    // caffeinate -s: prevent system sleep; ships with macOS, no install needed
+    child = spawn('caffeinate', ['-s'], { detached: true, stdio: 'ignore' });
+  } else {
+    // Linux: systemd-inhibit keeps an inhibitor lock for the lifetime of the child process
+    child = spawn(
+      'systemd-inhibit',
+      ['--what=sleep:idle', '--who=pa-framework', '--why=keepawake', 'sleep', 'infinity'],
+      { detached: true, stdio: 'ignore' }
+    );
+  }
 
   child.unref();
 
@@ -91,30 +99,29 @@ async function startKeepAwake(): Promise<KeepAwakeStatus> {
 }
 
 async function stopKeepAwake(pid: number): Promise<void> {
-  // 1. Try graceful shutdown via sentinel
-  try {
-    writeFileSync(stopSentinel(), '');
-  } catch (err) {
-    console.error('Failed to write stop sentinel:', err);
-  }
-  
-  // Wait up to 2 seconds for it to exit
-  for (let i = 0; i < 20; i++) {
-    await new Promise(resolve => setTimeout(resolve, 100));
+  if (platform() === 'win32') {
+    // Graceful shutdown: write sentinel so the PS loop exits cleanly, then wait
     try {
-      process.kill(pid, 0);
-    } catch {
-      // It's gone
-      cleanupStaleState();
-      return;
+      writeFileSync(stopSentinel(), '');
+    } catch (err) {
+      console.error('Failed to write stop sentinel:', err);
+    }
+    for (let i = 0; i < 20; i++) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      try {
+        process.kill(pid, 0);
+      } catch {
+        cleanupStaleState();
+        return;
+      }
     }
   }
 
-  // 2. Force kill if still alive
+  // POSIX: caffeinate / systemd-inhibit exit cleanly on SIGTERM
   try {
     process.kill(pid, 'SIGTERM');
   } catch {}
-  
+
   cleanupStaleState();
 }
 
