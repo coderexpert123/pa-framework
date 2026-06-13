@@ -260,6 +260,32 @@ async function checkDiskLogs(): Promise<CheckResult> {
   }
 }
 
+async function checkRefIdLogging(): Promise<CheckResult> {
+  const logPath = join(paHome(), 'app.log.jsonl');
+  try {
+    const content = await readFile(logPath, 'utf8');
+    const lines = content.trim().split('\n').reverse().slice(0, 100);
+    let messageSentCount = 0;
+    let missingRefIdCount = 0;
+
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+        if (entry.message && entry.message.includes('message sent')) {
+          messageSentCount++;
+          if (!entry.refId) missingRefIdCount++;
+        }
+      } catch {}
+    }
+
+    if (messageSentCount === 0) return { name: 'ref-id-logging', status: 'WARN', detail: 'no "message sent" logs found in last 100 entries' };
+    if (missingRefIdCount > 0) return { name: 'ref-id-logging', status: 'FAIL', detail: `${missingRefIdCount}/${messageSentCount} recent messages missing refId. Standards regression!` };
+    return { name: 'ref-id-logging', status: 'OK', detail: `last ${messageSentCount} messages verified` };
+  } catch {
+    return { name: 'ref-id-logging', status: 'WARN', detail: 'app.log.jsonl unreadable' };
+  }
+}
+
 // ---- Rendering ----
 
 function statusLabel(s: CheckStatus): string {
@@ -280,6 +306,7 @@ export async function healthCommand(): Promise<void> {
     checkSecrets(),
     checkLastCatchup(),
     checkDiskLogs(),
+    checkRefIdLogging(),
   ]);
 
   const nameWidth = Math.max(...checks.map((c) => c.name.length));

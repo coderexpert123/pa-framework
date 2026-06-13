@@ -12,22 +12,32 @@ import { listSkills } from '../skills.js';
 import { log } from '../lib/log.js';
 import { notifyUser, migrateStalenessAlertFile, gcAlertState } from '../lib/notify.js';
 import { parseExpression } from 'cron-parser';
+import { loadConfig } from '../config.js';
 
-export async function catchupCommand(): Promise<void> {
-  const locked = await blackboard.acquireLock('catchup', 'catchup-command', process.pid, 5000);
+export interface CatchupOptions {
+  topic?: string;
+}
+
+export async function catchupCommand(opts: CatchupOptions = {}): Promise<void> {
+  const lockKey = opts.topic ? `catchup:topic:${opts.topic}` : 'catchup';
+
+  const locked = await blackboard.acquireLock(lockKey, 'catchup-command', process.pid, 5000);
   if (!locked) {
-    console.log('Another catchup is already running. Exiting.');
+    console.log(`Another catchup (${lockKey}) is already running. Exiting.`);
     return;
   }
 
   try {
-    await runCatchup();
+    await runCatchup(opts);
   } finally {
-    await blackboard.releaseLock('catchup', 'catchup-command');
+    await blackboard.releaseLock(lockKey, 'catchup-command');
   }
 }
 
-async function runCatchup(): Promise<void> {
+async function runCatchup(opts: CatchupOptions): Promise<void> {
+  const config = await loadConfig();
+  const concurrencyLimit = config.concurrency_limit || 2;
+
   // 1. Kill any orphaned workers from previous crashed runs
   await cleanupOrphanedWorkers().catch(() => {});
 
@@ -41,15 +51,22 @@ async function runCatchup(): Promise<void> {
     console.error('[catchup] Blackboard purge failed:', err);
   }
 
-  // 3. One-time staleness migration + dedup GC
-  await migrateStalenessAlertFile();
-  await gcAlertState();
+  // 3. One-time staleness migration + dedup GC (only on default/unfiltered run)
+  if (!opts.topic) {
+    await migrateStalenessAlertFile();
+    await gcAlertState();
+  }
 
-  console.log('Checking for missed scheduled skills...\n');
-  const overdue = await getOverdueSkills();
+  console.log(`Checking for missed scheduled skills${opts.topic ? ` (topic: ${opts.topic})` : ''}...\n`);
+  let overdue = await getOverdueSkills();
+
+  // Filter by topic
+  if (opts.topic) {
+    overdue = overdue.filter(o => (o.skill.frontmatter.topic || 'default') === opts.topic);
+  }
 
   if (overdue.length === 0) {
-    console.log('All scheduled skills are up to date.');
+    console.log('No overdue skills matching the filter.');
   } else {
     // Group by skill name to handle on_missed: 'all' correctly
     const bySkill = new Map<string, number>();
@@ -61,42 +78,61 @@ async function runCatchup(): Promise<void> {
     for (const { skill, missedAt } of overdue) {
       console.log(`  ${skill.name} — missed at ${missedAt.toLocaleString()}`);
     }
-    console.log('');
+    console.log(`\nStarting execution with global concurrency limit: ${concurrencyLimit}...\n`);
 
-    // Run each overdue entry (on_missed: 'all' means multiple runs of the same skill)
+    // Concurrency-limited execution (respects global blackboard lock count)
+    const active = new Set<Promise<void>>();
     for (const { skill, missedAt } of overdue) {
-      console.log(`--- Running: ${skill.name} (missed ${missedAt.toLocaleString()}) ---`);
-      try {
-        const result = await runCommand(skill.name);
-        // Double-alert guard: on failure, handleSkillResult (or runWithFailover) already
-        // emitted the appropriate alert. No additional alert needed from catchup.
-        if (!result.success) {
-          log('info', 'catchup', `Skill ${skill.name} returned failure (alerted by run pipeline)`, {
-            skill: skill.name, alreadyAlerted: result.alreadyAlertedPaSupport,
-          });
-        }
-      } catch (err: any) {
-        // catchup-threw-*: only reachable when runCommand itself throws (misconfig, I/O failure)
-        const failMsg = `[catchup] ${skill.name} threw: ${err.message}`;
-        console.error(failMsg);
-        log('error', 'catchup', `Skill ${skill.name} threw`, { skill: skill.name, error: err.message });
-        await notifyUser(
-          `Catchup exception: ${skill.name}`,
-          `Skill: ${skill.name}\nMissed at: ${missedAt.toLocaleString()}\nException: ${err.message}`,
-          { dedupKey: `catchup-threw-${skill.name}`, severity: 'error' },
-        ).catch(() => {});
+      // Wait for global concurrency slot
+      while (true) {
+        const activeLocks = await blackboard.getActiveLocks();
+        const activeSkills = activeLocks.filter(l => l.resource.startsWith('skill-')).length;
+        if (activeSkills < concurrencyLimit) break;
+        
+        console.log(`[catchup] Global concurrency limit reached (${activeSkills}/${concurrencyLimit}). Waiting...`);
+        await new Promise(r => setTimeout(r, 5000));
       }
-      console.log('');
+
+      const promise = (async () => {
+        console.log(`--- Running: ${skill.name} (missed ${missedAt.toLocaleString()}) ---`);
+        try {
+          const result = await runCommand(skill.name);
+          if (!result.success) {
+            log('info', 'catchup', `Skill ${skill.name} returned failure (alerted by run pipeline)`, {
+              skill: skill.name, alreadyAlerted: result.alreadyAlertedPaSupport,
+            });
+          }
+        } catch (err: any) {
+          const failMsg = `[catchup] ${skill.name} threw: ${err.message}`;
+          console.error(failMsg);
+          log('error', 'catchup', `Skill ${skill.name} threw`, { skill: skill.name, error: err.message });
+          await notifyUser(
+            `Catchup exception: ${skill.name}`,
+            `Skill: ${skill.name}\nMissed at: ${missedAt.toLocaleString()}\nException: ${err.message}`,
+            { dedupKey: `catchup-threw-${skill.name}`, severity: 'error' },
+          ).catch(() => {});
+        }
+      })();
+
+      active.add(promise);
+      promise.finally(() => active.delete(promise));
+      
+      // Small stagger to allow lock acquisition to reflect in blackboard
+      await new Promise(r => setTimeout(r, 1000));
     }
+
+    await Promise.all(active);
   }
 
-  await checkStaleness().catch(() => {});
+  if (!opts.topic || opts.topic === 'default') {
+    await checkStaleness().catch(() => {});
 
-  // Rotate old logs for all skills
-  await rotateAllLogs();
+    // Rotate old logs for all skills
+    await rotateAllLogs();
 
-  // Weekly skill learning — always runs regardless of whether skills were overdue
-  await maybeRunLearn();
+    // Weekly skill learning — always runs regardless of whether skills were overdue
+    await maybeRunLearn();
+  }
 }
 
 async function rotateAllLogs(): Promise<void> {

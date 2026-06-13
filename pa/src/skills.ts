@@ -92,6 +92,7 @@ export async function loadSkill(name: string): Promise<Skill> {
     inject_triggers: !!meta.inject_triggers,
     worker: meta.worker,
     cmd: interpolate(meta.cmd),
+    topic: meta.topic || meta.queue || (meta.priority === 'high' ? 'reminders' : 'default'),
     telegram_output: telegramOutput,
     no_fallback: typeof meta.no_fallback === 'string'
       ? String(meta.no_fallback).toLowerCase() === 'true'

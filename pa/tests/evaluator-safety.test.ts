@@ -120,4 +120,16 @@ describe('evaluateWorkerState safety', () => {
     assert.ok(result !== null);
     assert.equal(result!.verdict, 'kill');
   });
+
+  it('returns parsed verdict when evaluator returns valid JSON with done', async () => {
+    const { evaluateWorkerState } = await import('../src/worker-evaluator.js');
+    const result = await evaluateWorkerState(
+      stateDir, '*.jsonl', 'gemini', {},
+      makeExecutor('{"verdict":"done","summary":"agent completed the task","reason":"final response produced, waiting for input"}'),
+    );
+    assert.ok(result !== null, 'should return a verdict');
+    assert.equal(result!.verdict, 'done');
+    assert.equal(result!.summary, 'agent completed the task');
+    assert.equal(result!.reason, 'final response produced, waiting for input');
+  });
 });

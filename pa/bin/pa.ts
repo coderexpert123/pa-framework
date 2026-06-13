@@ -28,7 +28,7 @@ Usage:
   pa list                       List all skills with schedules and last run
   pa workers                  Show available AI CLI workers
   pa logs <skill> [--last N]  View execution logs for a skill
-  pa catchup                  Run any missed scheduled skills
+  pa catchup [--topic t]      Run missed scheduled skills by topic partition
   pa purge-locks                Clear stale resource locks from blackboard
   pa schedules sync           Register schedules with OS task scheduler
   pa schedules list           Show registered scheduled tasks
@@ -87,9 +87,12 @@ async function main(): Promise<void> {
         break;
       }
 
-      case 'catchup':
-        await catchupCommand();
+      case 'catchup': {
+        const topicIdx = args.indexOf('--topic') !== -1 ? args.indexOf('--topic') : args.indexOf('-t');
+        const topic = topicIdx !== -1 ? args[topicIdx + 1] : undefined;
+        await catchupCommand({ topic });
         break;
+      }
 
       case 'purge-locks':
         await purgeLocksCommand();

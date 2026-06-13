@@ -2,6 +2,7 @@
 import json
 import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
@@ -10,6 +11,25 @@ SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SCRIPT_DIR)
 
 import run_brief
+
+
+class RunBriefTestCase(unittest.TestCase):
+    def setUp(self):
+        self._orig_project_root = run_brief.PROJECT_ROOT
+        self._project_tmp = tempfile.TemporaryDirectory()
+        self.project_root = self._project_tmp.name
+        self.pa_home = os.path.join(self.project_root, "pa-home")
+        self.env_patch = patch.dict(os.environ, {"PA_HOME": self.pa_home}, clear=False)
+        self.env_patch.start()
+        run_brief.PROJECT_ROOT = self.project_root
+
+    def tearDown(self):
+        run_brief.PROJECT_ROOT = self._orig_project_root
+        self.env_patch.stop()
+        self._project_tmp.cleanup()
+
+    def state_path(self):
+        return os.path.join(self.pa_home, "daily-mail-brief-state.json")
 
 
 class TestCallGeminiErrorFormat(unittest.TestCase):
@@ -59,7 +79,7 @@ class TestCallGeminiErrorFormat(unittest.TestCase):
         self.assertEqual(result, "real output")
 
 
-class TestStateAdvancementLogic(unittest.TestCase):
+class TestStateAdvancementLogic(RunBriefTestCase):
     """State must be written only after Gemini succeeds, not at fetch time."""
 
     def _make_fetch_data(self, window_end_utc="2026-05-17T13:30:00+00:00", listed=2):
@@ -95,141 +115,171 @@ class TestStateAdvancementLogic(unittest.TestCase):
 
     @patch("run_brief.run_py")
     @patch("run_brief.call_gemini")
-    def test_state_written_after_gemini_success(self, mock_gemini, mock_run_py, tmp_path=None):
-        """When Gemini succeeds, state.json gets window_end_utc from fetch output."""
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Redirect PROJECT_ROOT to tmpdir
-            orig_root = run_brief.PROJECT_ROOT
-            run_brief.PROJECT_ROOT = tmpdir
-            run_brief.FETCH_FAILED_FILE = os.path.join(tmpdir, ".fetch-failed.json")
+    def test_state_written_after_gemini_success(self, mock_gemini, mock_run_py):
+        """When Gemini succeeds, PA_HOME state gets window_end_utc from fetch output."""
+        fetch_data = self._make_fetch_data()
+        mock_run_py.side_effect = self._patch_run_py(fetch_data)
+        mock_gemini.return_value = (
+            "===BRIEFING_START===\n[pa assert] emails.json listed=2\n\nbrief\n===BRIEFING_END===\n"
+            "===ANALYSIS_START===\nanalysis\n===ANALYSIS_END==="
+        )
 
-            fetch_data = self._make_fetch_data()
-            mock_run_py.side_effect = self._patch_run_py(fetch_data)
-            # Gemini returns minimal valid output with markers
-            mock_gemini.return_value = (
-                "===BRIEFING_START===\n[pa assert] emails.json listed=2\n\nbrief\n===BRIEFING_END===\n"
-                "===ANALYSIS_START===\nanalysis\n===ANALYSIS_END==="
-            )
+        emails_path = os.path.join(self.project_root, "emails.json")
+        with open(emails_path, "w", encoding="utf-8") as f:
+            json.dump({"emails": [{}, {}], "listed_count": 2}, f)
 
-            # Create a fake emails.json (needed by send_telegram assertion path, mocked here)
-            emails_path = os.path.join(tmpdir, "emails.json")
-            with open(emails_path, "w") as f:
-                json.dump({"emails": [{}, {}], "listed_count": 2}, f)
+        try:
+            run_brief.main()
+        except SystemExit:
+            pass
 
-            try:
-                run_brief.main()
-            except SystemExit:
-                pass
-            finally:
-                run_brief.PROJECT_ROOT = orig_root
-                run_brief.FETCH_FAILED_FILE = os.path.join(orig_root, ".fetch-failed.json")
-
-            state_path = os.path.join(tmpdir, "state.json")
-            self.assertTrue(os.path.exists(state_path), "state.json must be written after Gemini success")
-            with open(state_path) as f:
-                state = json.load(f)
-            self.assertEqual(state["last_window_end_utc"], "2026-05-17T13:30:00+00:00")
+        state_path = self.state_path()
+        self.assertTrue(os.path.exists(state_path), "State must be written after Gemini success")
+        with open(state_path, encoding="utf-8") as f:
+            state = json.load(f)
+        self.assertEqual(state["last_window_end_utc"], "2026-05-17T13:30:00+00:00")
 
     @patch("run_brief.run_py")
     @patch("run_brief.call_gemini")
     def test_state_not_written_when_gemini_fails(self, mock_gemini, mock_run_py):
-        """When Gemini fails both attempts, state.json must NOT be written."""
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmpdir:
-            orig_root = run_brief.PROJECT_ROOT
-            run_brief.PROJECT_ROOT = tmpdir
-            run_brief.FETCH_FAILED_FILE = os.path.join(tmpdir, ".fetch-failed.json")
+        """When Gemini fails both attempts, state must NOT be written."""
+        fetch_data = self._make_fetch_data()
+        mock_run_py.side_effect = self._patch_run_py(fetch_data)
+        mock_gemini.side_effect = RuntimeError("Gemini exited 1: auth error")
 
-            fetch_data = self._make_fetch_data()
-            mock_run_py.side_effect = self._patch_run_py(fetch_data)
-            mock_gemini.side_effect = RuntimeError("Gemini exited 1: auth error")
+        with patch("run_brief.time.sleep"):
+            try:
+                run_brief.main()
+            except SystemExit:
+                pass
 
-            with patch("run_brief.time.sleep"):  # skip sleep delay
-                try:
-                    run_brief.main()
-                except SystemExit:
-                    pass
-                finally:
-                    run_brief.PROJECT_ROOT = orig_root
-                    run_brief.FETCH_FAILED_FILE = os.path.join(orig_root, ".fetch-failed.json")
-
-            state_path = os.path.join(tmpdir, "state.json")
-            self.assertFalse(os.path.exists(state_path), "state.json must NOT be written when Gemini fails")
+        self.assertFalse(os.path.exists(self.state_path()), "State must NOT be written when Gemini fails")
 
     @patch("run_brief.run_py")
     @patch("run_brief.call_gemini")
     def test_fetch_failed_written_on_gemini_failure(self, mock_gemini, mock_run_py):
-        """On Gemini failure, .fetch-failed.json must be written (send_telegram bypass)."""
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmpdir:
-            orig_root = run_brief.PROJECT_ROOT
-            run_brief.PROJECT_ROOT = tmpdir
-            run_brief.FETCH_FAILED_FILE = os.path.join(tmpdir, ".fetch-failed.json")
+        """On Gemini failure, the PA_HOME failure marker must be written."""
+        fetch_data = self._make_fetch_data()
+        mock_run_py.side_effect = self._patch_run_py(fetch_data)
+        mock_gemini.side_effect = RuntimeError("Gemini exited 1: auth error")
 
-            fetch_data = self._make_fetch_data()
-            mock_run_py.side_effect = self._patch_run_py(fetch_data)
-            mock_gemini.side_effect = RuntimeError("Gemini exited 1: auth error")
+        fetch_failed_path = os.path.join(self.pa_home, "daily-mail-brief-fetch-failed.json")
+        content = None
+        with patch("run_brief.time.sleep"):
+            try:
+                run_brief.main()
+            except SystemExit:
+                pass
 
-            fetch_failed_path = os.path.join(tmpdir, ".fetch-failed.json")
-            content = None
-            with patch("run_brief.time.sleep"):
-                try:
-                    run_brief.main()
-                except SystemExit:
-                    pass
-                finally:
-                    run_brief.PROJECT_ROOT = orig_root
-                    run_brief.FETCH_FAILED_FILE = os.path.join(orig_root, ".fetch-failed.json")
+        exists = os.path.exists(fetch_failed_path)
+        if exists:
+            with open(fetch_failed_path, encoding="utf-8") as f:
+                content = json.load(f)
+        self.assertTrue(exists, "Failure marker must be written on Gemini failure")
+        self.assertIsNotNone(content, "Failure marker must be valid JSON")
+        self.assertEqual(content.get("status"), "gemini")
 
-            exists = os.path.exists(fetch_failed_path)
-            if exists:
-                with open(fetch_failed_path) as f:
-                    content = json.load(f)
-            self.assertTrue(exists, ".fetch-failed.json must be written on Gemini failure")
-            self.assertIsNotNone(content, ".fetch-failed.json must be valid JSON")
-            self.assertEqual(content.get("status"), "gemini")
+    @patch("run_brief.detect_portfolio_statement_emails", return_value=[])
+    @patch("run_brief.run_py")
+    @patch("run_brief.call_gemini")
+    def test_retry_succeeds_on_second_attempt(self, mock_gemini, mock_run_py, _mock_detect):
+        """State is advanced when first Gemini attempt fails but second succeeds."""
+        fetch_data = self._make_fetch_data()
+        mock_run_py.side_effect = self._patch_run_py(fetch_data)
+
+        call_count = {"n": 0}
+
+        def gemini_fail_then_succeed(prompt):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError("transient error")
+            return (
+                "===BRIEFING_START===\n[pa assert] emails.json listed=2\n\nbrief\n===BRIEFING_END===\n"
+                "===ANALYSIS_START===\nanalysis\n===ANALYSIS_END==="
+            )
+
+        mock_gemini.side_effect = gemini_fail_then_succeed
+
+        emails_path = os.path.join(self.project_root, "emails.json")
+        with open(emails_path, "w", encoding="utf-8") as f:
+            json.dump({"emails": [{}, {}], "listed_count": 2}, f)
+
+        with patch("run_brief.time.sleep"):
+            try:
+                run_brief.main()
+            except SystemExit:
+                pass
+
+        self.assertEqual(call_count["n"], 2, "Gemini must be called exactly twice for brief retry")
+        self.assertTrue(os.path.exists(self.state_path()), "State must exist after retry success")
 
     @patch("run_brief.run_py")
     @patch("run_brief.call_gemini")
-    def test_retry_succeeds_on_second_attempt(self, mock_gemini, mock_run_py):
-        """State IS advanced when first Gemini attempt fails but second succeeds."""
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmpdir:
-            orig_root = run_brief.PROJECT_ROOT
-            run_brief.PROJECT_ROOT = tmpdir
-            run_brief.FETCH_FAILED_FILE = os.path.join(tmpdir, ".fetch-failed.json")
+    def test_state_not_written_when_telegram_send_fails(self, mock_gemini, mock_run_py):
+        """Primary delivery failure must not advance state."""
+        fetch_data = self._make_fetch_data()
+        mock_gemini.return_value = (
+            "===BRIEFING_START===\n[pa assert] emails.json listed=2\n\nbrief\n===BRIEFING_END===\n"
+            "===ANALYSIS_START===\nanalysis\n===ANALYSIS_END==="
+        )
 
-            fetch_data = self._make_fetch_data()
-            mock_run_py.side_effect = self._patch_run_py(fetch_data)
+        fetch_result = MagicMock(returncode=0, stdout=json.dumps(fetch_data))
+        preflight_result = MagicMock(returncode=0)
+        send_fail = MagicMock(returncode=2, stderr="assertion failed")
 
-            call_count = {"n": 0}
-            def gemini_fail_then_succeed(prompt):
-                call_count["n"] += 1
-                if call_count["n"] == 1:
-                    raise RuntimeError("transient error")
-                return (
-                    "===BRIEFING_START===\n[pa assert] emails.json listed=2\n\nbrief\n===BRIEFING_END===\n"
-                    "===ANALYSIS_START===\nanalysis\n===ANALYSIS_END==="
-                )
-            mock_gemini.side_effect = gemini_fail_then_succeed
+        def fake_run_py(script, *args, check=True):
+            if "preflight" in script:
+                return preflight_result
+            if "fetch_headers" in script:
+                return fetch_result
+            if "send_telegram" in script:
+                return send_fail
+            return MagicMock(returncode=0)
 
-            emails_path = os.path.join(tmpdir, "emails.json")
-            with open(emails_path, "w") as f:
-                json.dump({"emails": [{}, {}], "listed_count": 2}, f)
+        mock_run_py.side_effect = fake_run_py
 
-            with patch("run_brief.time.sleep"):
-                try:
-                    run_brief.main()
-                except SystemExit:
-                    pass
-                finally:
-                    run_brief.PROJECT_ROOT = orig_root
-                    run_brief.FETCH_FAILED_FILE = os.path.join(orig_root, ".fetch-failed.json")
+        with self.assertRaises(SystemExit):
+            run_brief.main()
 
-            self.assertEqual(call_count["n"], 2, "Gemini must be called twice")
-            state_path = os.path.join(tmpdir, "state.json")
-            self.assertTrue(os.path.exists(state_path), "state.json must exist after retry success")
+        self.assertFalse(os.path.exists(self.state_path()), "State must not advance when Telegram delivery fails")
+
+    @patch("run_brief.run_py")
+    @patch("run_brief.call_gemini")
+    def test_zero_email_window_advances_state_without_gemini(self, mock_gemini, mock_run_py):
+        """A zero-email slot should still be marked processed."""
+        fetch_data = {
+            "status": "ok",
+            "window": "17 May 2026 05:00 – 17 May 2026 19:00 IST",
+            "window_end_utc": "2026-05-17T13:30:00+00:00",
+            "listed_count": 0,
+            "total_count": 0,
+            "emails": [],
+        }
+        mock_run_py.side_effect = self._patch_run_py(fetch_data)
+
+        run_brief.main()
+
+        mock_gemini.assert_not_called()
+        self.assertTrue(os.path.exists(self.state_path()), "Zero-email slots must advance state")
+
+    @patch("run_brief.run_py")
+    @patch("run_brief.call_gemini")
+    def test_already_processed_window_short_circuits(self, mock_gemini, mock_run_py):
+        """Already-processed slots should exit without side effects."""
+        fetch_data = {
+            "status": "already_processed",
+            "window": "17 May 2026 05:00 – 17 May 2026 19:00 IST",
+            "window_end_utc": "2026-05-17T13:30:00+00:00",
+            "listed_count": 0,
+            "total_count": 0,
+            "emails": [],
+        }
+        mock_run_py.side_effect = self._patch_run_py(fetch_data)
+
+        run_brief.main()
+
+        mock_gemini.assert_not_called()
+        self.assertFalse(os.path.exists(self.state_path()), "Already-processed windows must not rewrite state")
 
 
 class TestMarkerParsing(unittest.TestCase):
@@ -257,45 +307,113 @@ class TestMarkerParsing(unittest.TestCase):
         self.assertEqual(self._parse_briefing(response), "actual content")
 
 
-class TestPreflightFailurePath(unittest.TestCase):
+class TestDetectPortfolioStatementEmails(unittest.TestCase):
+    """detect_portfolio_statement_emails must classify via Gemini and parse robustly."""
+
+    CENTRUM_EMAIL = {
+        "id": "abc123",
+        "from": "noreply@centrum.co.in",
+        "subject": "Your Monthly Portfolio Statement - May 2026",
+        "snippet": "Dear Account Holder, please find attached your monthly statement for May 2026.",
+    }
+    NEWS_EMAIL = {
+        "id": "xyz999",
+        "from": "alerts@economic-times.com",
+        "subject": "Sensex rallies 500 points; Nifty at all-time high",
+        "snippet": "Markets surged today as NSE and BSE saw heavy buying in banking stocks.",
+    }
+
+    @patch("run_brief.call_gemini")
+    def test_centrum_statement_triggers(self, mock_gemini):
+        mock_gemini.return_value = '["abc123"]'
+        result = run_brief.detect_portfolio_statement_emails([self.CENTRUM_EMAIL])
+        self.assertEqual(result, ["abc123"])
+
+    @patch("run_brief.call_gemini")
+    def test_market_news_does_not_trigger(self, mock_gemini):
+        mock_gemini.return_value = "[]"
+        result = run_brief.detect_portfolio_statement_emails([self.NEWS_EMAIL])
+        self.assertEqual(result, [])
+
+    @patch("run_brief.call_gemini")
+    def test_gemini_failure_returns_empty(self, mock_gemini):
+        mock_gemini.side_effect = RuntimeError("auth cancelled")
+        result = run_brief.detect_portfolio_statement_emails([self.CENTRUM_EMAIL])
+        self.assertEqual(result, [])
+
+    @patch("run_brief.call_gemini")
+    def test_json_embedded_in_text_parsed_correctly(self, mock_gemini):
+        # Gemini often wraps JSON in prose
+        mock_gemini.return_value = 'The emails that qualify are: ["abc123"]\nThat is the only one.'
+        result = run_brief.detect_portfolio_statement_emails([self.CENTRUM_EMAIL])
+        self.assertEqual(result, ["abc123"])
+
+    @patch("run_brief.call_gemini")
+    def test_empty_email_list_skips_gemini(self, mock_gemini):
+        result = run_brief.detect_portfolio_statement_emails([])
+        mock_gemini.assert_not_called()
+        self.assertEqual(result, [])
+
+    @patch("run_brief.call_gemini")
+    def test_detect_triggers_fires_portfolio_reports_when_statement_found(self, mock_gemini):
+        mock_gemini.return_value = '["abc123"]'
+        result = run_brief.detect_triggers([self.CENTRUM_EMAIL])
+        self.assertIn("portfolio-reports", result)
+
+    @patch("run_brief.call_gemini")
+    def test_detect_triggers_empty_when_only_news_emails(self, mock_gemini):
+        mock_gemini.return_value = "[]"
+        result = run_brief.detect_triggers([self.NEWS_EMAIL])
+        self.assertEqual(result, [])
+
+    @patch("run_brief.call_gemini")
+    def test_detect_triggers_empty_on_gemini_failure(self, mock_gemini):
+        mock_gemini.side_effect = RuntimeError("timeout")
+        result = run_brief.detect_triggers([self.CENTRUM_EMAIL])
+        self.assertEqual(result, [])
+
+    @patch("run_brief.call_gemini")
+    def test_gemini_returns_non_list_json_is_safe(self, mock_gemini):
+        # Gemini returns valid JSON that's not a list — must not crash
+        mock_gemini.return_value = '{"ids": ["abc123"]}'
+        result = run_brief.detect_portfolio_statement_emails([self.CENTRUM_EMAIL])
+        self.assertEqual(result, [])
+
+    @patch("run_brief.call_gemini")
+    def test_email_missing_id_field_does_not_crash(self, mock_gemini):
+        # If an email dict is missing "id", must return [] gracefully, not raise
+        bad_email = {"from": "x@y.com", "subject": "Statement", "snippet": ""}
+        result = run_brief.detect_portfolio_statement_emails([bad_email])
+        self.assertEqual(result, [])
+        mock_gemini.assert_not_called()  # should fail before reaching call_gemini
+
+
+class TestPreflightFailurePath(RunBriefTestCase):
     """Preflight failure must write .fetch-failed.json before send_telegram so assertion is bypassed."""
 
     @patch("run_brief.run_py")
     def test_fetch_failed_written_on_preflight_failure(self, mock_run_py):
-        """When preflight fails and no .fetch-failed.json exists, one is created before send_telegram."""
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmpdir:
-            orig_root = run_brief.PROJECT_ROOT
-            run_brief.PROJECT_ROOT = tmpdir
-            run_brief.FETCH_FAILED_FILE = os.path.join(tmpdir, ".fetch-failed.json")
+        """When preflight fails and no marker exists, one is created before send_telegram."""
+        preflight_fail = MagicMock(returncode=1, stderr="token expired")
+        send_result = MagicMock(returncode=0)
 
-            preflight_fail = MagicMock()
-            preflight_fail.returncode = 1
-            preflight_fail.stderr = "token expired"
+        def fake_run_py(script, *args, check=True):
+            if "preflight" in script:
+                return preflight_fail
+            return send_result
 
-            send_result = MagicMock()
-            send_result.returncode = 0
+        mock_run_py.side_effect = fake_run_py
 
-            def fake_run_py(script, *args, check=True):
-                if "preflight" in script:
-                    return preflight_fail
-                return send_result
+        try:
+            run_brief.main()
+        except SystemExit:
+            pass
 
-            mock_run_py.side_effect = fake_run_py
-
-            try:
-                run_brief.main()
-            except SystemExit:
-                pass
-            finally:
-                run_brief.PROJECT_ROOT = orig_root
-                run_brief.FETCH_FAILED_FILE = os.path.join(orig_root, ".fetch-failed.json")
-
-            fetch_failed_path = os.path.join(tmpdir, ".fetch-failed.json")
-            self.assertTrue(os.path.exists(fetch_failed_path), ".fetch-failed.json must exist after preflight failure")
-            with open(fetch_failed_path) as f:
-                content = json.load(f)
-            self.assertEqual(content.get("status"), "auth")
+        fetch_failed_path = os.path.join(self.pa_home, "daily-mail-brief-fetch-failed.json")
+        self.assertTrue(os.path.exists(fetch_failed_path), "Failure marker must exist after preflight failure")
+        with open(fetch_failed_path, encoding="utf-8") as f:
+            content = json.load(f)
+        self.assertEqual(content.get("status"), "auth")
 
 
 if __name__ == "__main__":

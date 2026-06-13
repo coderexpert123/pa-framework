@@ -44,6 +44,7 @@ export interface PaConfig {
   evaluator?: EvaluatorConfig;
   topic_defaults?: Record<string, string>;  // topicKey ("chatId_threadId") → worker name
   bg_tasks: BgTasksConfig;
+  concurrency_limit?: number; // max parallel skills in catchup
 }
 
 export const DEFAULT_TIMEOUT = 3600;       // max total seconds
@@ -95,6 +96,7 @@ export interface SkillFrontmatter {
   worker?: string;               // preferred worker for this skill (e.g. "claude", "gemini", "zclaude")
   no_fallback?: boolean;         // when true, don't failover to other workers on failure
   cmd?: string;                  // direct shell command to execute (bypasses LLM if set)
+  topic?: string;                // optional custom topic name for partitioning (replaces queue/priority)
   telegram_output?: TelegramOutput; // if set, pa run delivers LLM output to this Telegram chat/thread
 }
 
@@ -139,7 +141,7 @@ export interface CommandResult {
   error?: string;
   exitCode: number | null;
   sessionId?: string; // CLI session ID (Claude: from NDJSON stream; Gemini: undefined, discovered from disk)
-  evaluatorSummary?: string; // user-facing summary from LLM evaluator when worker is killed
+  evaluatorSummary?: string; // user-facing summary from LLM evaluator (set on both kill and done verdicts)
   alreadyAlertedPaSupport?: boolean; // true when runWithFailover already emitted exhaustion/wall alert
   rateLimitTelemetry?: {
     usedPercent: number;
