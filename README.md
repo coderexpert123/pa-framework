@@ -49,8 +49,15 @@ cd projects/telegram-bot && npm install && npm run build && cd ../..
 # Scaffold ~/.pa/
 node pa/dist/bin/pa.js init
 
-# Configure: edit ~/.pa/secrets.env (at minimum: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
-# Configure: edit ~/.pa/config.yaml worker `command` paths if your CLIs aren't in PATH
+# Set up Telegram (2 min):
+#   1. Message @BotFather on Telegram → send /newbot → follow prompts → copy the token
+#   2. Message @userinfobot on Telegram → it replies with your numeric chat ID
+#   3. Add both to ~/.pa/secrets.env:
+#      TELEGRAM_BOT_TOKEN=<token from step 1>
+#      TELEGRAM_CHAT_ID=<id from step 2>
+#
+# If your LLM CLIs (claude / gemini / codex) aren't in PATH, also edit
+# ~/.pa/config.yaml and set the `command:` field to the absolute path of each CLI.
 
 # Copy a sample skill
 cp -r examples/skills/reminders ~/.pa/skills/          # macOS / Linux
