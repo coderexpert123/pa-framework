@@ -49,15 +49,33 @@ cd projects/telegram-bot && npm install && npm run build && cd ../..
 # Scaffold ~/.pa/
 node pa/dist/bin/pa.js init
 
-# Set up Telegram (2 min):
-#   1. Message @BotFather on Telegram → send /newbot → follow prompts → copy the token
-#   2. Message @userinfobot on Telegram → it replies with your numeric chat ID
-#   3. Add both to ~/.pa/secrets.env:
-#      TELEGRAM_BOT_TOKEN=<token from step 1>
-#      TELEGRAM_CHAT_ID=<id from step 2>
+# ── Telegram setup (do this in the Telegram app first) ─────────────────────
 #
-# If your LLM CLIs (claude / gemini / codex) aren't in PATH, also edit
-# ~/.pa/config.yaml and set the `command:` field to the absolute path of each CLI.
+# Option A — DM mode (simplest, no group needed):
+#   1. Message @BotFather → /newbot → follow prompts → copy the token
+#   2. Message @userinfobot → it replies with your numeric chat ID (positive number)
+#   3. Add both to ~/.pa/secrets.env:
+#        TELEGRAM_BOT_TOKEN=<token>
+#        TELEGRAM_CHAT_ID=<your personal chat id>
+#
+# Option B — Forum/topic mode (recommended: separate topics per skill/alert):
+#   1. Same as A step 1 — create a bot via @BotFather, copy the token
+#   2. Create a Telegram group → Settings → Group type → enable "Topics"
+#   3. Add your bot to the group as an admin (allow "Manage topics" permission)
+#   4. Get the group's chat ID: forward any group message to @userinfobot
+#      (it will be a negative number, e.g. -1001234567890)
+#   5. Add to ~/.pa/secrets.env:
+#        TELEGRAM_BOT_TOKEN=<token>
+#        TELEGRAM_CHAT_ID=<negative group id>
+#   6. After the bot is running (see below), run:
+#        node pa/dist/bin/pa.js bot setup-topics
+#      This auto-creates the topic structure (skills, alerts, coding, etc.)
+#      from examples/topics-template.json — no manual topic creation needed.
+#
+# ── LLM CLI config ──────────────────────────────────────────────────────────
+#
+# If your LLM CLIs (claude / gemini / codex) aren't in PATH, edit
+# ~/.pa/config.yaml and set the `command:` field to each CLI's absolute path.
 
 # Copy a sample skill
 cp -r examples/skills/reminders ~/.pa/skills/          # macOS / Linux
