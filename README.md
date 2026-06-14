@@ -77,6 +77,16 @@ node pa/dist/bin/pa.js init
 # If your LLM CLIs (claude / gemini / codex) aren't in PATH, edit
 # ~/.pa/config.yaml and set the `command:` field to each CLI's absolute path.
 
+# ── Choose your default LLM worker ──────────────────────────────────────────
+#
+# Run this to see which CLIs were found:
+node pa/dist/bin/pa.js workers
+#
+# If more than one shows as available, ask the user which they prefer.
+# Then open ~/.pa/config.yaml and move the preferred worker to the TOP of the
+# `workers:` list — the dispatcher always tries workers in order, so first = default.
+# (You can change the active model per Telegram topic later with /model <name>.)
+
 # Copy a sample skill
 cp -r examples/skills/reminders ~/.pa/skills/          # macOS / Linux
 # Copy-Item -Recurse examples/skills/reminders ~/.pa/skills/   # Windows PowerShell
