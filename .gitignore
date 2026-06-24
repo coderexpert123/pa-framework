@@ -74,16 +74,13 @@ __pycache__/
 /*turns*.txt
 /extracted_facts.md
 
-# Ad-hoc analysis scripts at root (must live in scratch/ or proper project)
-/analyze_*.py
-/check_*.py
+# Root is sparse — no code lives here (see CLAUDE.md hygiene). Ignore ALL
+# root-level Python so ad-hoc / personal-data scripts can't be committed by
+# accident — this closes the analysis.py-class gap that prefix patterns
+# (/analyze_*.py, /check_*.py, ...) silently missed. Real scripts live in
+# pa/scripts/ or projects/*/scripts/; throwaways go in scratch/.
+/*.py
 /check*.ps1
-/find_*.py
-/extract_*.py
-/extract_turns.py
-/fetch_*.py
-/search_*.py
-/temp_*.py
 /scratch_*
 /all_files.txt
 /out*.txt
