@@ -7,7 +7,7 @@
     "build": "tsc",
     "start": "node dist/main.js",
     "dev": "tsc --watch",
-    "test": "node --test dist/tests/*.test.js"
+    "test": "node --import ./dist/tests/test-env-setup.js --test dist/tests/*.test.js"
   },
   "dependencies": {
     "fs-extra": "^11.3.4",

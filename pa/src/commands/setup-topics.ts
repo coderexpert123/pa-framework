@@ -29,6 +29,7 @@ import { readFile, writeFile, rename } from 'fs/promises';
 import { join, resolve } from 'path';
 import { loadSecrets } from '../secrets.js';
 import { paHome } from '../paths.js';
+import { telegramFetch } from '../lib/telegram-proxy.js';
 
 type SpecialRole = 'alerts' | 'briefings' | 'dashboard' | 'general' | 'none';
 
@@ -127,7 +128,7 @@ function existingThreadIdForName(reg: TopicRegistry, chatIdStr: string, name: st
 }
 
 async function createForumTopic(token: string, chatId: number, name: string): Promise<number> {
-  const res = await fetch(`https://api.telegram.org/bot${token}/createForumTopic`, {
+  const res = await telegramFetch(`https://api.telegram.org/bot${token}/createForumTopic`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ chat_id: chatId, name }),

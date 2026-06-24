@@ -12,7 +12,7 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'fs/promises';
 import { join } from 'path';
-import { createTempPaHome, cleanup } from './helpers.js';
+import { createTempPaHome, createTempConfig, cleanup } from './helpers.js';
 
 describe('catchupCommand: blackboard-based locking', () => {
   let dir: string;
@@ -20,6 +20,11 @@ describe('catchupCommand: blackboard-based locking', () => {
   before(async () => {
     // Set PA_HOME before any module-level Blackboard constructor runs
     dir = await createTempPaHome();
+    // catchupCommand calls loadConfig(); seed a minimal valid config.yaml so it
+    // reaches the blackboard-locking path instead of throwing "Config not found".
+    await createTempConfig(dir, [
+      { name: 'claude', command: 'node', args: ['-e', '0'], check: 'node -e "0"' },
+    ]);
   });
 
   after(async () => {

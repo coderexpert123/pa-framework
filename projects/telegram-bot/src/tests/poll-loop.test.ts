@@ -6,6 +6,7 @@ import { tmpdir } from 'os';
 import { runPollLoop, extractReplyContext, generateDescriptionSuggestion, isValidDescriptionOutput, parseDescriptionLLMOutput, postDescriptionSuggestion } from '../main.js';
 import { loadBranches, type BranchIndex } from '../topic-names.js';
 import type { ConversationState } from '../types.js';
+import { rmRetry } from './rm-retry.js';
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -77,7 +78,7 @@ describe('runPollLoop: signal control', { concurrency: 1 }, () => {
 
   afterEach(async () => {
     delete process.env.PA_HOME;
-    await rm(tempDir, { recursive: true, force: true });
+    await rmRetry(tempDir);
     (globalThis as Record<string, unknown>).fetch = savedFetch;
   });
 
@@ -107,7 +108,7 @@ describe('runPollLoop: polling', { concurrency: 1 }, () => {
 
   afterEach(async () => {
     delete process.env.PA_HOME;
-    await rm(tempDir, { recursive: true, force: true });
+    await rmRetry(tempDir);
     (globalThis as Record<string, unknown>).fetch = savedFetch;
   });
 
@@ -194,7 +195,7 @@ describe('runPollLoop: deferred acknowledgement', { concurrency: 1 }, () => {
 
   afterEach(async () => {
     delete process.env.PA_HOME;
-    await rm(tempDir, { recursive: true, force: true });
+    await rmRetry(tempDir);
     (globalThis as Record<string, unknown>).fetch = savedFetch;
   });
 
@@ -257,7 +258,7 @@ describe('runPollLoop: error recovery', { concurrency: 1 }, () => {
 
   afterEach(async () => {
     delete process.env.PA_HOME;
-    await rm(tempDir, { recursive: true, force: true });
+    await rmRetry(tempDir);
     (globalThis as Record<string, unknown>).fetch = savedFetch;
   });
 
@@ -363,7 +364,7 @@ describe('runPollLoop: at-least-once delivery', { concurrency: 1 }, () => {
 
   afterEach(async () => {
     delete process.env.PA_HOME;
-    await rm(tempDir, { recursive: true, force: true });
+    await rmRetry(tempDir);
     (globalThis as Record<string, unknown>).fetch = savedFetch;
   });
 
@@ -464,7 +465,7 @@ describe('runPollLoop: graceful shutdown', { concurrency: 1 }, () => {
 
   afterEach(async () => {
     delete process.env.PA_HOME;
-    await rm(tempDir, { recursive: true, force: true });
+    await rmRetry(tempDir);
     (globalThis as Record<string, unknown>).fetch = savedFetch;
   });
 
@@ -542,11 +543,14 @@ describe('runPollLoop: parallel processing', { concurrency: 1 }, () => {
   beforeEach(async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'tgbot-poll-parallel-'));
     process.env.PA_HOME = tempDir;
+    // /default calls saveTopicDefault() which reads config.yaml; without it
+    // processUpdate throws ENOENT (swallowed by the loop) and never sends.
+    await writeFile(join(tempDir, 'config.yaml'), JSON.stringify({ workers: [{ name: 'claude', command: 'node', args: ['-e', '0'], check: 'node -e 0' }] }), 'utf8');
   });
 
   afterEach(async () => {
     delete process.env.PA_HOME;
-    await rm(tempDir, { recursive: true, force: true });
+    await rmRetry(tempDir);
     (globalThis as Record<string, unknown>).fetch = savedFetch;
   });
 
@@ -861,7 +865,7 @@ describe('runPollLoop: model expiry sweep', { concurrency: 1 }, () => {
 
   afterEach(async () => {
     delete process.env.PA_HOME;
-    await rm(tempDir, { recursive: true, force: true });
+    await rmRetry(tempDir);
     (globalThis as Record<string, unknown>).fetch = savedFetch;
   });
 
@@ -1041,7 +1045,7 @@ describe('runPollLoop: dynamic pin update on failover (AI-026)', { concurrency: 
 
   afterEach(async () => {
     delete process.env.PA_HOME;
-    await rm(tempDir, { recursive: true, force: true });
+    await rmRetry(tempDir);
     (globalThis as Record<string, unknown>).fetch = savedFetch;
   });
 
@@ -1137,7 +1141,7 @@ describe('runPollLoop: /model status cards', { concurrency: 1 }, () => {
 
   afterEach(async () => {
     delete process.env.PA_HOME;
-    await rm(tempDir, { recursive: true, force: true });
+    await rmRetry(tempDir);
     (globalThis as Record<string, unknown>).fetch = savedFetch;
   });
 
@@ -1223,24 +1227,28 @@ describe('runPollLoop: DLQ', { concurrency: 1 }, () => {
   beforeEach(async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'tgbot-poll-dlq-'));
     process.env.PA_HOME = tempDir;
+    await writeFile(join(tempDir, 'config.yaml'), JSON.stringify({ workers: [{ name: 'claude', command: 'node', args: ['-e', '0'], check: 'node -e 0' }] }), 'utf8');
   });
 
   afterEach(async () => {
     delete process.env.PA_HOME;
-    await rm(tempDir, { recursive: true, force: true });
+    await rmRetry(tempDir);
     (globalThis as Record<string, unknown>).fetch = savedFetch;
   });
 
   /** URL-aware fetch: sendMessage fails with Forbidden; everything else succeeds. */
   function setupUrlAwareFetch(controller: AbortController): void {
     let getUpdatesCount = 0;
+    // Use /reset: it sets a text `response` that goes through the reply path
+    // (so a failed send is DLQ'd). /default only updates the pinned card, which
+    // is not DLQ-able, so it can't exercise the reply-failure → DLQ path.
     const update = {
       update_id: 1,
       message: {
         message_id: 10,
         chat: { id: 123, type: 'private' },
         date: Math.floor(Date.now() / 1000),
-        text: '/default',
+        text: '/reset',
       },
     };
 
@@ -1383,7 +1391,7 @@ describe('runPollLoop: restart_bot sentinel', { concurrency: 1 }, () => {
 
   afterEach(async () => {
     delete process.env.PA_HOME;
-    await rm(tempDir, { recursive: true, force: true });
+    await rmRetry(tempDir);
     (globalThis as Record<string, unknown>).fetch = savedFetch;
   });
 
@@ -1452,7 +1460,7 @@ describe('runPollLoop: processUpdate error handling', { concurrency: 1 }, () => 
 
   afterEach(async () => {
     process.env.PA_HOME = savedPaHome;
-    await rm(tempDir, { recursive: true, force: true });
+    await rmRetry(tempDir);
     (globalThis as Record<string, unknown>).fetch = savedFetch;
   });
 
@@ -1632,7 +1640,7 @@ describe('runPollLoop: B4 pending description approval', { concurrency: 1 }, () 
 
   afterEach(async () => {
     delete process.env.PA_HOME;
-    await rm(tempDir, { recursive: true, force: true });
+    await rmRetry(tempDir);
     (globalThis as Record<string, unknown>).fetch = savedFetch;
   });
 
@@ -1737,7 +1745,7 @@ describe('runPollLoop: branch/merge commands', { concurrency: 1 }, () => {
 
   afterEach(async () => {
     delete process.env.PA_HOME;
-    await rm(tempDir, { recursive: true, force: true });
+    await rmRetry(tempDir);
     (globalThis as Record<string, unknown>).fetch = savedFetch;
   });
 
@@ -1954,11 +1962,14 @@ describe('runPollLoop: per-topic serialization', { concurrency: 1 }, () => {
   beforeEach(async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'tgbot-poll-serial-'));
     process.env.PA_HOME = tempDir;
+    // /default reads config.yaml (saveTopicDefault) — seed it so processUpdate
+    // reaches the pinned-card sendMessage instead of throwing ENOENT.
+    await writeFile(join(tempDir, 'config.yaml'), JSON.stringify({ workers: [{ name: 'claude', command: 'node', args: ['-e', '0'], check: 'node -e 0' }] }), 'utf8');
   });
 
   afterEach(async () => {
     delete process.env.PA_HOME;
-    await rm(tempDir, { recursive: true, force: true });
+    await rmRetry(tempDir);
     (globalThis as Record<string, unknown>).fetch = savedFetch;
   });
 
@@ -2220,7 +2231,7 @@ describe('runPollLoop: branch ancestry race condition', { concurrency: 1 }, () =
 
   afterEach(async () => {
     delete process.env.PA_HOME;
-    await rm(tempDir, { recursive: true, force: true });
+    await rmRetry(tempDir);
     (globalThis as Record<string, unknown>).fetch = savedFetch;
   });
 

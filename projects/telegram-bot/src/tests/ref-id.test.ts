@@ -4,6 +4,8 @@ import { mkdtemp, rm, readFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { makeRefId, appendRefId, appendRefIdAndLog } from '../ref-id.js';
+import { flushLog } from '../../../../pa/dist/src/lib/log.js';
+import { rmRetry } from './rm-retry.js';
 
 describe('makeRefId', { concurrency: 1 }, () => {
   it('returns s-xxxx format by default', () => {
@@ -53,20 +55,21 @@ describe('appendRefIdAndLog', { concurrency: 1 }, () => {
   let originalPaHome: string | undefined;
 
   beforeEach(async () => {
+    await flushLog(); // drain pending appends before switching PA_HOME so they don't bleed into tempDir
     tempDir = await mkdtemp(join(tmpdir(), 'refid-log-test-'));
     originalPaHome = process.env.PA_HOME;
     process.env.PA_HOME = tempDir;
   });
 
   afterEach(async () => {
+    await flushLog(); // drain fire-and-forget appendRefIdAndLog writes to tempDir before removing it
     if (originalPaHome === undefined) delete process.env.PA_HOME;
     else process.env.PA_HOME = originalPaHome;
-    await rm(tempDir, { recursive: true, force: true });
+    await rmRetry(tempDir);
   });
 
   async function readLogEntries(): Promise<any[]> {
-    // Wait briefly for fire-and-forget log writes to land.
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await flushLog(); // deterministic — await pending log writes instead of a racy fixed sleep
     const raw = await readFile(join(tempDir, 'app.log.jsonl'), 'utf8');
     return raw.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
   }

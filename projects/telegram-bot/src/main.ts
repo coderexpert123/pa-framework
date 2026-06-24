@@ -66,6 +66,7 @@ import {
 import { computeBackoff, computePollOffset, LONG_POLL_TIMEOUT } from './poll.js';
 import { WatermarkTracker } from './watermark.js';
 import { appendDlq, flushDlq } from './dlq.js';
+import { deliveredKey, wasDelivered, markDelivered } from './delivered-store.js';
 import { updateDashboard } from './dashboard.js';
 import type { ConversationState, SessionInfo, PAMeta, ModelStatusSnapshot, ModelStatusReasonCode } from './types.js';
 import { loadTopicNames, updateTopicName, setTopicDescription, extractTopicEvent, loadBranches, addBranch, removeBranch, findBranchParent, getTopicName, type TopicNameMap, type BranchIndex } from './topic-names.js';
@@ -80,9 +81,10 @@ import {
 
 // Import pa modules
 import { loadSecrets } from '../../../pa/dist/src/secrets.js';
+import { startProxyAutoRefresh } from '../../../pa/dist/src/lib/telegram-proxy.js';
 import { cleanupOrphanedWorkers } from '../../../pa/dist/src/worker-pids.js';
 import { blackboard } from '../../../pa/dist/src/blackboard.js';
-import { loadConfig } from '../../../pa/dist/src/config.js';
+import { loadConfig, saveTopicDefault } from '../../../pa/dist/src/config.js';
 import type { CommandResult, FailoverNotifyPayload } from '../../../pa/dist/src/types.js';
 import { logger } from '../../../pa/dist/src/lib/log.js';
 import { formatIST } from '../../../pa/dist/src/ist.js';
@@ -777,6 +779,122 @@ async function processUpdate(
     }
 
     if (!skipWorker) {
+      const dq = handleDefaultQuery(userText);
+      if (dq.matched) {
+        if (dq.worker) {
+          await saveTopicDefault(topicKey, dq.worker);
+          effectiveDefault = dq.worker;
+        } else {
+          await saveTopicDefault(topicKey, undefined);
+          effectiveDefault = resolveEffectiveDefaultWorker(undefined, config?.workers ?? []);
+        }
+        topicState.preferred_worker = undefined;
+        topicState.preferred_worker_set_at = undefined;
+        topicState.session = undefined;
+        const nextSnapshot = buildModelStatusSnapshot({ currentWorker: effectiveDefault, defaultWorker: effectiveDefault, reasonCode: 'default_changed' });
+        await replacePinnedStatusCard(token, chatId, threadId, topicState, nextSnapshot);
+        skipWorker = true;
+      }
+    }
+
+    // AI-028: /branch <name> — create a child topic linked to this one.
+    if (!skipWorker) {
+      const br = handleBranchCommand(topicState, userText);
+      if (br.matched) {
+        if (br.branchName) {
+          const parentName = getTopicName(topicNames, chatId, threadId) ?? 'parent';
+          const newThreadId = await createForumTopic(token, chatId, br.branchName);
+          await updateTopicName(topicNames, chatId, newThreadId, br.branchName);
+          const branchState = await loadTopicState(chatId, newThreadId);
+          branchState.ancestry = { parentChatId: chatId, parentThreadId: threadId, branchName: br.branchName };
+          addTurn(branchState, { role: 'assistant', text: `[Branch of: ${parentName}]`, timestamp: new Date().toISOString(), worker: 'local' });
+          await saveTopicState(branchState);
+          await addBranch(branchIndex, chatId, newThreadId, { parentThreadId: threadId, branchName: br.branchName, createdAt: new Date().toISOString() });
+          branchCreatedTopicKeys.add(`${chatId}_${newThreadId}`);
+          await sendMessage(token, chatId, appendRefIdAndLog(`🌿 Branch *${br.branchName}* created — continue in the new topic.`, { kind: 'branch', chatId, threadId: newThreadId }), undefined, newThreadId);
+          await sendMessage(token, chatId, appendRefIdAndLog(`🌿 Created branch *${br.branchName}* as a new topic.`, { kind: 'branch', chatId, threadId }), messageId, threadId);
+        } else {
+          response = br.response;
+        }
+        skipWorker = true;
+      }
+    }
+
+    // AI-028: /child-of <parent> — link this topic as a branch of an existing one.
+    if (!skipWorker) {
+      const co = handleChildOfCommand(topicState, userText);
+      if (co.matched) {
+        if (co.parentName) {
+          const parentThreadId = findBranchParent(topicNames, chatId, co.parentName);
+          if (parentThreadId === undefined) {
+            response = `No topic named *${co.parentName}* found in this chat.`;
+          } else {
+            const myName = getTopicName(topicNames, chatId, threadId) ?? `topic-${threadId}`;
+            topicState.ancestry = { parentChatId: chatId, parentThreadId, branchName: myName };
+            await saveTopicState(topicState);
+            await addBranch(branchIndex, chatId, threadId, { parentThreadId, branchName: myName, createdAt: new Date().toISOString() });
+            response = `🔗 Linked as a branch of *${co.parentName}*.`;
+          }
+        } else {
+          response = co.response;
+        }
+        skipWorker = true;
+      }
+    }
+
+    // AI-028: /merge — copy branch turns back to the parent and close the branch.
+    if (!skipWorker) {
+      const mg = handleMergeCommand(topicState, userText);
+      if (mg.matched) {
+        if (mg.response) {
+          response = mg.response;
+        } else {
+          const anc = topicState.ancestry!;
+          const parentState = await loadTopicState(chatId, anc.parentThreadId);
+          addTurn(parentState, { role: 'assistant', text: `[Merge from: ${anc.branchName}]`, timestamp: new Date().toISOString(), worker: 'local' });
+          for (const t of topicState.turns) {
+            if (t.message_id === messageId) continue; // skip the /merge command itself
+            if (t.text.startsWith('[Branch of:') || t.text.startsWith('[Merge from:')) continue;
+            addTurn(parentState, t);
+          }
+          await saveTopicState(parentState);
+          anc.mergedAt = new Date().toISOString();
+          await saveTopicState(topicState);
+          await removeBranch(branchIndex, chatId, threadId);
+          const parentName = getTopicName(topicNames, chatId, anc.parentThreadId) ?? 'parent';
+          response = `✅ Merged into *${parentName}*.`;
+        }
+        skipWorker = true;
+      }
+    }
+
+    // AI-029: a pending auto-suggested description awaiting the user's approval.
+    if (!skipWorker && topicState.pendingDescription) {
+      const pd = topicState.pendingDescription;
+      const short = userText.trim().length <= 25;
+      if (short && CONFIRMATION_NO.test(userText)) {
+        response = 'OK, skipped.';
+        topicState.pendingDescription = undefined;
+        skipWorker = true;
+      } else if (short && CONFIRMATION_YES.test(userText)) {
+        if (pd.text && pd.text.length > 0) {
+          await setTopicDescription(topicNames, chatId, threadId, pd.text);
+          response = 'Description set.';
+          topicState.pendingDescription = undefined;
+        } else {
+          response = "Okay — type the description and I'll save it.";
+        }
+        skipWorker = true;
+      } else if (!short) {
+        // user typed a substantive line instead of yes/no → treat it as the description
+        await setTopicDescription(topicNames, chatId, threadId, userText.trim());
+        response = 'Description set.';
+        topicState.pendingDescription = undefined;
+        skipWorker = true;
+      }
+    }
+
+    if (!skipWorker) {
       expirePendingAction(topicState);
       if (topicState.pending_action) {
         const resolved = resolveConfirmation(topicState, userText);
@@ -812,9 +930,25 @@ async function processUpdate(
     if (response.trim()) {
       const refId = makeRefId();
       const textToSend = `${response.trim()}\n\n_Ref: ${refId}_`;
-      const delivered = await sendMessage(token, chatId, textToSend, messageId, threadId);
-      if (delivered) addTurn(topicState, { role: 'assistant', text: response.trim(), timestamp: new Date().toISOString(), worker: 'worker', refId });
-      else await appendDlq({ chatId, threadId, replyToMessageId: messageId, text: textToSend, timestamp: new Date().toISOString(), updateId: update.update_id, refId });
+      // Effectively-once guard: if a reply for this update was already delivered
+      // in a prior run (crash/restart before the poll offset persisted), skip it
+      // rather than re-send a duplicate. See delivered-store.ts.
+      // Bypass the persistent dedup under the test flag: integration tests reuse
+      // update_ids across cases, so a cross-test delivered-key would wrongly skip
+      // sends (the dlq/delivered-store units are tested directly elsewhere).
+      const dedupOn = process.env.PA_NOTIFY_DISABLED !== '1';
+      const idemKey = deliveredKey(chatId, threadId, update.update_id);
+      if (dedupOn && await wasDelivered(idemKey)) {
+        logger.warn('telegram', 'skipping reply for already-delivered update (dedup)', { updateId: update.update_id, chatId, threadId });
+      } else {
+        const delivered = await sendMessage(token, chatId, textToSend, messageId, threadId);
+        if (delivered) {
+          if (dedupOn) await markDelivered(idemKey);
+          addTurn(topicState, { role: 'assistant', text: response.trim(), timestamp: new Date().toISOString(), worker: 'worker', refId });
+        } else {
+          await appendDlq({ chatId, threadId, replyToMessageId: messageId, text: textToSend, timestamp: new Date().toISOString(), updateId: update.update_id, refId });
+        }
+      }
     }
     await saveTopicState(topicState);
     if (restartBot) writeFileSync(join(homedir(), '.pa', 'telegram-bot.stop'), '');
@@ -856,6 +990,7 @@ export async function runPollLoop(
   const topicPending = new Map<string, Promise<void>>();
   let nextSweepAt = 0;
   let nextLogCheckAt = 0;
+  let consecutiveErrors = 0; // drives escalating getUpdates backoff (capped at MAX_BACKOFF_MS)
 
   while (!signal.aborted) {
     if (sentinelPath && existsSync(sentinelPath)) break;
@@ -875,6 +1010,7 @@ export async function runPollLoop(
       }
       const timeout = inFlight.size > 0 ? 0 : LONG_POLL_TIMEOUT;
       const updates = await getUpdates(token, computePollOffset(pollOffset), timeout, signal);
+      consecutiveErrors = 0; // successful poll — reset backoff
       if (updates.length > 0) {
         pollOffset = updates[updates.length - 1].update_id;
         state.last_update_id = pollOffset;
@@ -895,7 +1031,8 @@ export async function runPollLoop(
       } else if (inFlight.size > 0) { await sleepFn(500); }
     } catch (err) {
       if (err instanceof Error && err.name === 'AbortError') break;
-      await sleepFn(computeBackoff(1));
+      consecutiveErrors++;
+      await sleepFn(computeBackoff(consecutiveErrors));
     }
   }
   if (inFlight.size > 0) await Promise.allSettled(inFlight);
@@ -909,6 +1046,9 @@ async function main(): Promise<void> {
     const token = secrets['TELEGRAM_BOT_TOKEN'];
     const chatIds = (secrets['TELEGRAM_CHAT_ID'] || '').split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n));
     if (!token || chatIds.length === 0) process.exit(1);
+    // Ensure a working Telegram proxy pool is loaded before any Telegram call,
+    // then keep it refreshed. No-op unless TELEGRAM_PROXY_SOURCE_URL is set.
+    await startProxyAutoRefresh(token).catch(() => {});
     await cleanupExpiredSessions();
     await cleanupOrphanedWorkers().catch(() => {});
     const state = await loadState(chatIds[0]);
@@ -921,7 +1061,19 @@ async function main(): Promise<void> {
     await registerBotCommands(token).catch(() => {});
     await updateDashboard(token, chatIds[0]).catch(() => {});
     const controller = new AbortController();
-    await runPollLoop(token, chatIds, state, secrets, controller.signal, (ms: number) => new Promise(r => setTimeout(r, ms)), sentinelPath, topicNames, branchIndex);
+    // Abort an in-flight (possibly slow, proxied) getUpdates promptly when the
+    // stop sentinel appears — otherwise graceful shutdown must wait out a full
+    // long-poll + proxy-failover cycle. The poll loop's AbortError handler then
+    // breaks. Checked every 1s; unref'd so it never keeps the process alive.
+    const stopWatcher = setInterval(() => {
+      try { if (existsSync(sentinelPath) && !controller.signal.aborted) controller.abort(); } catch {}
+    }, 1000);
+    stopWatcher.unref?.();
+    try {
+      await runPollLoop(token, chatIds, state, secrets, controller.signal, (ms: number) => new Promise(r => setTimeout(r, ms)), sentinelPath, topicNames, branchIndex);
+    } finally {
+      clearInterval(stopWatcher);
+    }
   } finally { await releaseLock().catch(() => {}); }
 }
 

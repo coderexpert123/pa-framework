@@ -265,16 +265,16 @@ describe('sanitizeMdV2', () => {
 
   it('percent-encodes spaces in link URLs (Telegram rejects literal spaces)', () => {
     // `.` inside (url) does NOT need escaping per MdV2 spec (only `\` and `)` do).
-    const result = sanitizeMdV2('[doc](<C:/test-project/file.md>)');
-    assert.equal(result, '[doc](D:/Personal%20Assistant/file.md)');
+    const result = sanitizeMdV2('[doc](<C:/test project/file.md>)');
+    assert.equal(result, '[doc](C:/test%20project/file.md)');
   });
 
   it('full regression: link with - and . in text plus angle-bracketed URL with spaces (g-c472)', () => {
-    const input = '[poll-loop-integration-extra.test.ts](</C:/test-project/file.ts>)';
+    const input = '[poll-loop-integration-extra.test.ts](</C:/test project/file.ts>)';
     const result = sanitizeMdV2(input);
     assert.equal(
       result,
-      '[poll\\-loop\\-integration\\-extra\\.test\\.ts](/D:/Personal%20Assistant/file.ts)'
+      '[poll\\-loop\\-integration\\-extra\\.test\\.ts](/C:/test%20project/file.ts)'
     );
   });
 

@@ -24,18 +24,23 @@ function makeRunner(proposals: DraftProposal[]) {
 }
 
 async function writeFixtureConversations(dir: string): Promise<void> {
-  // Create a clear repeated pattern: email summary asked 5 times over different days
+  // Create a clear repeated pattern: email summary asked 5 times over different
+  // days. Timestamps are RELATIVE (1-5 days ago) so the fixture never ages out
+  // of analyzeConversationPatterns' lookback window (was hardcoded Apr-2026,
+  // which silently fell outside the 30-day window over time).
+  const day = 24 * 60 * 60 * 1000;
+  const ago = (d: number) => new Date(Date.now() - d * day).toISOString();
   const turns = [
-    { role: 'user', text: 'summarize my unread emails', timestamp: '2026-04-01T09:00:00.000Z', message_id: '1' },
-    { role: 'assistant', text: 'Here are your unread emails...', timestamp: '2026-04-01T09:01:00.000Z' },
-    { role: 'user', text: 'check my unread emails please', timestamp: '2026-04-02T10:00:00.000Z', message_id: '2' },
-    { role: 'assistant', text: 'You have 5 unread emails.', timestamp: '2026-04-02T10:01:00.000Z' },
-    { role: 'user', text: 'any unread emails today?', timestamp: '2026-04-03T08:30:00.000Z', message_id: '3' },
-    { role: 'assistant', text: '3 unread emails.', timestamp: '2026-04-03T08:31:00.000Z' },
-    { role: 'user', text: 'summarize emails', timestamp: '2026-04-04T09:00:00.000Z', message_id: '4' },
-    { role: 'assistant', text: 'Email summary: ...', timestamp: '2026-04-04T09:01:00.000Z' },
-    { role: 'user', text: 'what emails do I have', timestamp: '2026-04-05T11:00:00.000Z', message_id: '5' },
-    { role: 'assistant', text: 'You have 2 emails.', timestamp: '2026-04-05T11:01:00.000Z' },
+    { role: 'user', text: 'summarize my unread emails', timestamp: ago(5), message_id: '1' },
+    { role: 'assistant', text: 'Here are your unread emails...', timestamp: ago(5) },
+    { role: 'user', text: 'check my unread emails please', timestamp: ago(4), message_id: '2' },
+    { role: 'assistant', text: 'You have 5 unread emails.', timestamp: ago(4) },
+    { role: 'user', text: 'any unread emails today?', timestamp: ago(3), message_id: '3' },
+    { role: 'assistant', text: '3 unread emails.', timestamp: ago(3) },
+    { role: 'user', text: 'summarize emails', timestamp: ago(2), message_id: '4' },
+    { role: 'assistant', text: 'Email summary: ...', timestamp: ago(2) },
+    { role: 'user', text: 'what emails do I have', timestamp: ago(1), message_id: '5' },
+    { role: 'assistant', text: 'You have 2 emails.', timestamp: ago(1) },
   ];
 
   await writeFile(

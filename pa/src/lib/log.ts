@@ -62,6 +62,16 @@ function appendLog(entry: LogEntry): void {
     });
 }
 
+/**
+ * Resolves once all log appends queued so far have flushed to disk. log() is
+ * fire-and-forget, so callers that need to READ the log right after writing
+ * (notably tests) must await this — a fixed sleep races the async lock-based
+ * append and flakes under load.
+ */
+export function flushLog(): Promise<void> {
+  return appendQueue.catch(() => {});
+}
+
 const LEVEL_PREFIX: Record<LogLevel, string> = {
   debug: '[DEBUG]',
   info:  '[INFO] ',

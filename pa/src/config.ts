@@ -1,4 +1,4 @@
-import { readFile } from 'fs/promises';
+import { readFile, writeFile } from 'fs/promises';
 import { parse as parseYaml } from 'yaml';
 import { configPath } from './paths.js';
 import type { PaConfig, WorkerConfig, EvaluatorConfig, BgTasksConfig } from './types.js';
@@ -67,4 +67,24 @@ export async function loadConfig(): Promise<PaConfig> {
       bg_tasks,
       concurrency_limit: Number.isInteger(parsed.concurrency_limit) ? parsed.concurrency_limit : 2,
     };
+}
+
+export async function saveTopicDefault(topicKey: string, worker: string | undefined): Promise<void> {
+  const path = configPath();
+  let raw = await readFile(path, 'utf8');
+
+  const escapedKey = topicKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const existingLineRegex = new RegExp(`^([ \\t]+${escapedKey}:[ \\t+])\\S+`, 'm');
+
+  if (worker === undefined) {
+    raw = raw.replace(new RegExp(`^[ \\t]+${escapedKey}:[ \\t]+\\S+\\r?\\n`, 'm'), '');
+  } else if (existingLineRegex.test(raw)) {
+    raw = raw.replace(existingLineRegex, `$1${worker}`);
+  } else if (/^topic_defaults:/m.test(raw)) {
+    raw = raw.replace(/^(topic_defaults:[ \t]*\r?\n)/m, `$1  ${topicKey}: ${worker}\n`);
+  } else {
+    raw += `\ntopic_defaults:\n  ${topicKey}: ${worker}\n`;
+  }
+
+  await writeFile(path, raw, 'utf8');
 }

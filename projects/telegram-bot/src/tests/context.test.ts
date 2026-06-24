@@ -179,10 +179,12 @@ describe('shouldIncludeSkillStatus', () => {
     assert.equal(shouldIncludeSkillStatus('show me the cron schedule'), true);
   });
 
-  it('returns true when skill names are referenced', () => {
-    assert.equal(shouldIncludeSkillStatus('portfolio report please'), true);
-    assert.equal(shouldIncludeSkillStatus('how is fitness tracking going?'), true);
-    assert.equal(shouldIncludeSkillStatus('update the ecosystem notes'), true);
+  it('returns true when a skill-status keyword is referenced', () => {
+    // shouldIncludeSkillStatus is a sync keyword-trigger regex (status/run/fail/
+    // brief/catchup/schedule/...), not a skill-name matcher.
+    assert.equal(shouldIncludeSkillStatus('what is the status of my skills?'), true);
+    assert.equal(shouldIncludeSkillStatus('did the daily brief run?'), true);
+    assert.equal(shouldIncludeSkillStatus('any failed skills?'), true);
     assert.equal(shouldIncludeSkillStatus('ran the oracle yet?'), true);
   });
 

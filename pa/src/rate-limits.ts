@@ -162,14 +162,34 @@ async function ensureStateFile(): Promise<void> {
   });
 }
 
+// In-process mutex: serialize same-process callers BEFORE the cross-process
+// file lock. Without this, many concurrent same-process calls stampede the file
+// lock — proper-lockfile's synchronized retry backoff then lets only ~1 acquirer
+// through per round, so high concurrency exhausts retries ("Lock file is already
+// being held"). Queuing in-process means only one file-lock acquisition is ever
+// in flight per process; the file lock still guards against OTHER processes.
+let rlMutex: Promise<void> = Promise.resolve();
+
 async function withRateLimitLock<T>(fn: () => Promise<T>): Promise<T> {
-  const path = statePath();
-  await ensureStateFile();
-  const release = await lockfile.lock(path, { retries: 5, realpath: false });
+  // Chain the mutex SYNCHRONOUSLY (before any await) so callers serialize in
+  // call order (FIFO) — this preserves last-write-wins for back-to-back records
+  // of the same worker. Doing it after an await would order by await-resume
+  // timing instead, which is non-deterministic.
+  const prev = rlMutex;
+  let releaseMutex!: () => void;
+  rlMutex = new Promise<void>((resolve) => { releaseMutex = resolve; });
+  await prev.catch(() => {});
   try {
-    return await fn();
+    const path = statePath();
+    await ensureStateFile();
+    const release = await lockfile.lock(path, { retries: 10, realpath: false });
+    try {
+      return await fn();
+    } finally {
+      await release();
+    }
   } finally {
-    await release();
+    releaseMutex();
   }
 }
 

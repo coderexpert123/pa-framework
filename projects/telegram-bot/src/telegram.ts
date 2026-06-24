@@ -2,6 +2,7 @@ import { createWriteStream } from 'fs';
 import { join } from 'path';
 import { pipeline } from 'stream/promises';
 import { logger } from '../../../pa/dist/src/lib/log.js';
+import { telegramFetch } from '../../../pa/dist/src/lib/telegram-proxy.js';
 import type { TelegramUpdate } from './types.js';
 
 const BASE = 'https://api.telegram.org';
@@ -28,7 +29,7 @@ export function splitMessage(text: string): string[] {
 
 export async function getUpdates(token: string, offset: number, timeout: number = 0, signal?: AbortSignal): Promise<TelegramUpdate[]> {
   const url = `${BASE}/bot${token}/getUpdates?offset=${offset}&timeout=${timeout}`;
-  const res = await fetch(url, signal ? { signal } : undefined);
+  const res = await telegramFetch(url, signal ? { signal } : undefined);
   if (!res.ok) throw new Error(`getUpdates failed: ${res.status} ${await res.text()}`);
   const data = await res.json() as { ok: boolean; result: TelegramUpdate[] };
   if (!data.ok) throw new Error(`getUpdates not ok`);
@@ -198,7 +199,7 @@ export async function sendMessage(
     for (let attempt = 0; attempt < 3; attempt++) {
       if (attempt > 0) await new Promise<void>((r) => setTimeout(r, 1000 * attempt));
       try {
-        res = await fetch(`${BASE}/bot${token}/sendMessage`, {
+        res = await telegramFetch(`${BASE}/bot${token}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
@@ -238,7 +239,7 @@ export async function sendMessage(
         // chunk, trimming the leading newlines.
         body.text = chunk.replace(/((?:\n\n)?)_Ref: ([a-z]+-[0-9a-f]{4})_$/, '$1Ref: $2');
         try {
-          res = await fetch(`${BASE}/bot${token}/sendMessage`, {
+          res = await telegramFetch(`${BASE}/bot${token}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body),
@@ -285,7 +286,7 @@ export async function sendMessageWithId(
   if (threadId !== undefined && threadId !== null && threadId !== 0) body.message_thread_id = threadId;
 
   try {
-    const res = await fetch(`${BASE}/bot${token}/sendMessage`, {
+    const res = await telegramFetch(`${BASE}/bot${token}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
@@ -317,7 +318,7 @@ export async function editMessageText(
   };
 
   try {
-    const res = await fetch(`${BASE}/bot${token}/editMessageText`, {
+    const res = await telegramFetch(`${BASE}/bot${token}/editMessageText`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
@@ -329,7 +330,7 @@ export async function editMessageText(
       if (errorText.includes('parse')) {
         delete (body as any).parse_mode;
         body.text = text.trim();
-        const res2 = await fetch(`${BASE}/bot${token}/editMessageText`, {
+        const res2 = await telegramFetch(`${BASE}/bot${token}/editMessageText`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
@@ -358,7 +359,7 @@ export async function pinChatMessage(
   for (let attempt = 0; attempt < 2; attempt++) {
     if (attempt > 0) await new Promise<void>((r) => setTimeout(r, 1000));
     try {
-      const res = await fetch(`${BASE}/bot${token}/pinChatMessage`, opts);
+      const res = await telegramFetch(`${BASE}/bot${token}/pinChatMessage`, opts);
       if (res.ok) return true;
       console.error(`pinChatMessage failed (attempt ${attempt + 1}): ${res.status} ${await res.text()}`);
     } catch (err) {
@@ -374,7 +375,7 @@ export async function unpinChatMessage(
   messageId: number
 ): Promise<void> {
   try {
-    const res = await fetch(`${BASE}/bot${token}/unpinChatMessage`, {
+    const res = await telegramFetch(`${BASE}/bot${token}/unpinChatMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: chatId, message_id: messageId }),
@@ -391,7 +392,7 @@ export async function createForumTopic(
   name: string
 ): Promise<number> {
   const body = JSON.stringify({ chat_id: chatId, name });
-  const res = await fetch(`${BASE}/bot${token}/createForumTopic`, {
+  const res = await telegramFetch(`${BASE}/bot${token}/createForumTopic`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body,
@@ -411,7 +412,7 @@ export async function deleteForumTopic(
   threadId: number
 ): Promise<boolean> {
   try {
-    const res = await fetch(`${BASE}/bot${token}/deleteForumTopic`, {
+    const res = await telegramFetch(`${BASE}/bot${token}/deleteForumTopic`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: chatId, message_thread_id: threadId }),
@@ -427,7 +428,7 @@ export async function sendTyping(token: string, chatId: number, threadId?: numbe
   const body: Record<string, unknown> = { chat_id: chatId, action: 'typing' };
   if (threadId !== undefined && threadId !== null && threadId !== 0) body.message_thread_id = threadId;
 
-  await fetch(`${BASE}/bot${token}/sendChatAction`, {
+  await telegramFetch(`${BASE}/bot${token}/sendChatAction`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -454,7 +455,7 @@ export async function setMessageReaction(
       /[\uD800-\uDBFF][\uDC00-\uDFFF]/g,
       (m) => `\\u${m.charCodeAt(0).toString(16)}\\u${m.charCodeAt(1).toString(16)}`,
     );
-    const res = await fetch(`${BASE}/bot${token}/setMessageReaction`, {
+    const res = await telegramFetch(`${BASE}/bot${token}/setMessageReaction`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: bodyStr,
@@ -473,7 +474,7 @@ export async function setMessageReaction(
 export async function downloadFile(token: string, fileId: string, destPath: string): Promise<boolean> {
   try {
     // 1. Get file path from fileId
-    const res = await fetch(`${BASE}/bot${token}/getFile?file_id=${fileId}`);
+    const res = await telegramFetch(`${BASE}/bot${token}/getFile?file_id=${fileId}`);
     if (!res.ok) {
       console.error(`getFile failed: ${res.status} ${await res.text()}`);
       return false;
@@ -483,7 +484,7 @@ export async function downloadFile(token: string, fileId: string, destPath: stri
 
     // 2. Download file from file_path
     const fileUrl = `${BASE}/file/bot${token}/${data.result.file_path}`;
-    const fileRes = await fetch(fileUrl);
+    const fileRes = await telegramFetch(fileUrl);
     if (!fileRes.ok || !fileRes.body) {
       console.error(`File download failed: ${fileRes.status}`);
       return false;
@@ -500,7 +501,7 @@ export async function downloadFile(token: string, fileId: string, destPath: stri
 
 export async function setMyCommands(token: string, commands: any[]): Promise<boolean> {
   try {
-    const res = await fetch(`${BASE}/bot${token}/setMyCommands`, {
+    const res = await telegramFetch(`${BASE}/bot${token}/setMyCommands`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ commands }),
@@ -519,7 +520,7 @@ export async function setMyCommands(token: string, commands: any[]): Promise<boo
 
 export async function deleteMessage(token: string, chatId: number, messageId: number): Promise<boolean> {
   try {
-    const res = await fetch(`${BASE}/bot${token}/deleteMessage`, {
+    const res = await telegramFetch(`${BASE}/bot${token}/deleteMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: chatId, message_id: messageId }),
