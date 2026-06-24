@@ -25,6 +25,7 @@ import { mkdtemp, rm, writeFile, mkdir } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import type { ConversationState } from '../types.js';
+import { rmRetry } from './rm-retry.js';
 
 const testRunId = `test-${process.pid}-${Date.now()}`;
 
@@ -39,7 +40,7 @@ before(async () => {
 
 after(async () => {
   delete process.env.PA_HOME;
-  await rm(sharedTempDir, { recursive: true, force: true });
+  await rmRetry(sharedTempDir);
 });
 
 // Dynamic imports after PA_HOME is set
@@ -132,7 +133,7 @@ describe('dispatchMessage non-rate-limit early-return', () => {
 
   afterEach(async () => {
     process.env.PA_HOME = sharedTempDir;
-    await rm(testDir, { recursive: true, force: true });
+    await rmRetry(testDir);
   });
 
   it('default zclaude non-rate-limit failure returns workerError:true', async () => {

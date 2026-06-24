@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { splitMessage, sendToTelegram } from '../src/telegram.js';
+import { flushLog } from '../src/lib/log.js';
 import type { TelegramOutput } from '../src/types.js';
 
 type FetchResponse = { ok: boolean; status?: number; bodyText?: string };
@@ -160,6 +161,10 @@ describe('sendToTelegram — app.log textPreview', () => {
   let originalPaHome: string | undefined;
 
   beforeEach(async () => {
+    // Drain any pending log appends from prior tests BEFORE switching PA_HOME —
+    // the logger resolves its path at write time, so undrained appends would
+    // otherwise bleed into this test's fresh tempDir and pollute the read.
+    await flushLog();
     tempDir = await mkdtemp(join(tmpdir(), 'pa-telegram-test-'));
     originalPaHome = process.env.PA_HOME;
     process.env.PA_HOME = tempDir;
@@ -172,7 +177,7 @@ describe('sendToTelegram — app.log textPreview', () => {
   });
 
   async function readLogEntries(): Promise<any[]> {
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await flushLog(); // deterministic — await pending log writes instead of racing a fixed sleep
     const raw = await readFile(join(tempDir, 'app.log.jsonl'), 'utf8');
     return raw.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
   }

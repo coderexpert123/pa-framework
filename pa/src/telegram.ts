@@ -2,6 +2,7 @@ import { randomBytes } from 'crypto';
 import type { TelegramOutput } from './types.js';
 import { log } from './lib/log.js';
 import { sanitizeMdV2 } from './lib/mdv2.js';
+import { telegramFetch } from './lib/telegram-proxy.js';
 
 const BASE = 'https://api.telegram.org';
 const MAX_MSG_LEN = 4000;
@@ -67,7 +68,7 @@ export async function sendToTelegram(
     }
 
     try {
-      const res = await fetch(`${BASE}/bot${token}/sendMessage`, {
+      const res = await telegramFetch(`${BASE}/bot${token}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -84,7 +85,7 @@ export async function sendToTelegram(
           // prefix + hex separately so output is always clean `Ref: s-9b43` regardless of input form.
           body.text = (body.text as string).replace(/((?:\n\n)?)_Ref: ([a-z]+)\\?-([0-9a-f]{4})_$/, '$1Ref: $2-$3');
           try {
-            const res2 = await fetch(`${BASE}/bot${token}/sendMessage`, {
+            const res2 = await telegramFetch(`${BASE}/bot${token}/sendMessage`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(body),

@@ -123,7 +123,7 @@ export function isSessionExpired(session: SessionInfo): boolean {
  * e.g. "C:/My Project"           -> "C--My-Project"
  *      "C:/code/claude-demo"     -> "C--code-claude-demo"
  */
-function cwdToClaudeProjectDir(cwd: string): string {
+export function cwdToClaudeProjectDir(cwd: string): string {
   return cwd
     .replace(/^([A-Za-z]):[\\/]/, '$1--')  // "C:/" -> "C--"
     .replace(/[\\/\s]/g, '-');             // separators and spaces -> "-"

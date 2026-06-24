@@ -249,17 +249,18 @@ describe('classifyCodexError', () => {
       `expected ~180 min cooldown, got ${result!.minutes}`);
   });
 
-  it('caps reset-time cooldown at 24 hours', () => {
-    // Reset time 5 days in the future — should be capped at 24h
-    const future = new Date(Date.now() + 5 * 24 * 60 * 60 * 1000);
+  it('caps reset-time cooldown at 45 days', () => {
+    // Reset ~100 days in the future — well beyond the 45-day sanity cap that
+    // guards against a wrong clock/locale producing an unbounded cooldown
+    // (classifyCodexError parses the reset time in system-local tz).
+    const future = new Date(Date.now() + 100 * 24 * 60 * 60 * 1000);
     const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-    const ist = new Date(future.getTime() + 5.5 * 60 * 60 * 1000);
-    const mon = months[ist.getUTCMonth()];
-    const day = ist.getUTCDate();
-    const msg = `You've hit your usage limit, try again at ${mon} ${day}th, ${ist.getUTCFullYear()} 10:00 AM.`;
+    const mon = months[future.getMonth()];
+    const day = future.getDate();
+    const msg = `You've hit your usage limit, try again at ${mon} ${day}th, ${future.getFullYear()} 10:00 AM.`;
     const result = classifyCodexError('', msg);
     assert.ok(result);
-    assert.equal(result!.minutes, 24 * 60);
+    assert.equal(result!.minutes, 45 * 24 * 60);
   });
 
   it('floors reset-time cooldown at 1 minute when reset is in past', () => {

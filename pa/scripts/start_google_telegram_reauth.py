@@ -77,7 +77,7 @@ def main():
             "resume_action": resume_action,
             "retry_action": args.retry_action,
             "created_at": int(time.time()),
-            "expires_at": int(time.time()) + 900  # 15 minutes
+            "expires_at": int(time.time()) + 3600  # 60 minutes
         }
 
         # Load existing

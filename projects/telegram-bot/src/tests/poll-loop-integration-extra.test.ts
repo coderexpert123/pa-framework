@@ -6,6 +6,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { runPollLoop } from '../main.js';
 import type { ConversationState } from '../types.js';
+import { rmRetry } from './rm-retry.js';
 
 // Instant sleep for tests — no real waiting
 const fastSleep = async (_ms: number): Promise<void> => {};
@@ -25,7 +26,7 @@ describe('runPollLoop: Integration Extra (Phase 4 Task 3)', { concurrency: 1 }, 
 
   afterEach(async () => {
     delete process.env.PA_HOME;
-    await rm(tempDir, { recursive: true, force: true });
+    await rmRetry(tempDir);
     (globalThis as Record<string, unknown>).fetch = savedFetch;
   });
 
@@ -200,7 +201,7 @@ topic_defaults:
     const state = makeState(123, -1);
     let getUpdatesCount = 0;
     const fetchLog: string[] = [];
-    const debugFile = 'C:/test-project/debug-fetch.log';
+    const debugFile = join(tempDir, 'debug-fetch.log');
     if (existsSync(debugFile)) unlinkSync(debugFile);
 
     (globalThis as Record<string, unknown>).fetch = async (url: string, opts?: any) => {

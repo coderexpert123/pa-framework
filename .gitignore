@@ -2,7 +2,7 @@
 node_modules/
 
 # Build output
-pa/dist/
+**/dist/
 
 # Environment & secrets
 .env
@@ -45,6 +45,9 @@ __pycache__/
 # Root repo hygiene scratch/state
 /.codex/
 /pa/blackboard.json
+# Generated reports at root (brain-recheck / audits — regenerated, not source)
+/*_report.md
+/brain_recheck_report.md
 
 # === Repo-root hygiene: nothing personal/ephemeral lives at the root ===
 # See docs/CONVENTIONS.md (public) + CLAUDE.md "Repository hygiene" (private).
@@ -114,6 +117,29 @@ __pycache__/
 
 # Large input data dirs
 src_pdfs/
+
+# Per-project data dirs — raw inputs, processed outputs, exports. Regenerated
+# from source and often personal/sensitive (e.g. financial statements); must
+# stay out of version control. config/ under data/ is intentionally NOT ignored.
+**/data/raw/
+**/data/processed/
+**/data/exports/
+**/data/prompt_processed/
+# Bulk extracts / caches / generated outputs (large + personal; regenerated)
+**/data/openai_history/
+**/data/full_openai_extract/
+**/data/files_zip_extract/
+**/data/dalle_zip_extract/
+**/data/simulations/
+**/data/legacy_output/
+**/data/query-results/
+**/data/market_cache/
+
+# Daily-mail-brief runtime artifacts (fetched email payloads + regenerated
+# brief inputs/outputs — personal, recreated each run)
+projects/daily-mail-brief/emails.json
+projects/daily-mail-brief/analysis_input.md
+projects/daily-mail-brief/briefing_output.md
 
 # === Public-repo coexistence ===
 # Separate .git directory + wrapper for the public framework repo

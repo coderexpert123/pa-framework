@@ -2,6 +2,7 @@ import { appendFile, readFile, unlink, writeFile, rename } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
 import { sendMessage } from './telegram.js';
+import { deliveredKey, wasDelivered, markDelivered } from './delivered-store.js';
 
 export const DLQ_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -82,16 +83,28 @@ async function writeDlqInner(entries: DlqEntry[]): Promise<void> {
 // should not exist yet. The mutex still protects against future overlap.
 // NOTE: this mutex is per-process. If another process ever writes the DLQ,
 // upgrade to proper-lockfile here.
-async function flushDlqInner(token: string): Promise<{ delivered: number; remaining: number }> {
+async function flushDlqInner(token: string): Promise<{ delivered: number; remaining: number; deduped: number }> {
   const entries = await loadDlqInner();
-  if (entries.length === 0) return { delivered: 0, remaining: 0 };
+  if (entries.length === 0) return { delivered: 0, remaining: 0, deduped: 0 };
 
   const remaining: DlqEntry[] = [];
   let delivered = 0;
+  let deduped = 0;
 
   for (const entry of entries) {
+    // Idempotency guard: if this reply was already confirmed delivered (e.g. a
+    // prior flush delivered it but crashed before persisting the trimmed queue),
+    // skip it — re-sending would duplicate. See delivered-store.ts.
+    const key = deliveredKey(entry.chatId, entry.threadId, entry.updateId);
+    if (await wasDelivered(key)) {
+      deduped++;
+      continue;
+    }
     const ok = await sendMessage(token, entry.chatId, entry.text, entry.replyToMessageId, entry.threadId || undefined);
     if (ok) {
+      // Mark delivered BEFORE moving on, so a crash later in this loop cannot
+      // cause a re-send of this entry on the next startup flush.
+      await markDelivered(key);
       delivered++;
     } else {
       remaining.push(entry);
@@ -104,7 +117,7 @@ async function flushDlqInner(token: string): Promise<{ delivered: number; remain
     await writeDlqInner(remaining);
   }
 
-  return { delivered, remaining: remaining.length };
+  return { delivered, remaining: remaining.length, deduped };
 }
 
 export async function appendDlq(entry: DlqEntry): Promise<void> {
@@ -123,6 +136,6 @@ export async function writeDlq(entries: DlqEntry[]): Promise<void> {
   return withDlqMutex(() => writeDlqInner(entries));
 }
 
-export async function flushDlq(token: string): Promise<{ delivered: number; remaining: number }> {
+export async function flushDlq(token: string): Promise<{ delivered: number; remaining: number; deduped: number }> {
   return withDlqMutex(() => flushDlqInner(token));
 }

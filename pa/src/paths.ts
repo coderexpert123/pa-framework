@@ -24,3 +24,7 @@ export function configPath(): string {
 export function secretsPath(): string {
   return join(paHome(), 'secrets.env');
 }
+
+export function profilePath(): string {
+  return join(paHome(), 'data', 'profile.json');
+}

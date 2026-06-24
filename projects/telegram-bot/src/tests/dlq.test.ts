@@ -4,6 +4,7 @@ import { mkdtemp, rm, readFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { appendDlq, loadDlq, clearDlq, writeDlq, flushDlq, DLQ_MAX_AGE_MS, type DlqEntry } from '../dlq.js';
+import { markDelivered, deliveredKey, _resetDeliveredCacheForTest } from '../delivered-store.js';
 
 function makeEntry(overrides: Partial<DlqEntry> = {}): DlqEntry {
   return {
@@ -29,6 +30,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  _resetDeliveredCacheForTest(); // delivered-store is module-global; isolate per test
   await rm(tempDir, { recursive: true, force: true });
   if (originalPaHome === undefined) {
     delete process.env.PA_HOME;
@@ -235,5 +237,32 @@ describe('flushDlq', () => {
     const result = await flushDlq('token');
     assert.equal(result.delivered, 1);
     assert.equal(result.remaining, 1);
+  });
+
+  it('skips an entry already marked delivered (idempotent — no duplicate send)', async () => {
+    let sendCount = 0;
+    (globalThis as Record<string, unknown>).fetch = async () => { sendCount++; return { ok: true, status: 200, text: async () => '{}', json: async () => ({ ok: true }) }; };
+    await appendDlq(makeEntry({ text: 'already-sent', chatId: 555, threadId: 7, updateId: 42 }));
+    // Simulate: this reply was confirmed delivered in a prior run.
+    await markDelivered(deliveredKey(555, 7, 42));
+    const result = await flushDlq('token');
+    assert.equal(sendCount, 0, 'must not re-send an already-delivered entry');
+    assert.equal(result.deduped, 1);
+    assert.equal(result.delivered, 0);
+    assert.equal(result.remaining, 0);
+  });
+
+  it('marks delivered on success so a re-flush (post-crash) does not resend', async () => {
+    let sendCount = 0;
+    (globalThis as Record<string, unknown>).fetch = async () => { sendCount++; return { ok: true, status: 200, text: async () => '{}', json: async () => ({ ok: true }) }; };
+    const entry = makeEntry({ text: 'deliver-once', chatId: 1, threadId: 0, updateId: 99 });
+    await appendDlq(entry);
+    await flushDlq('token'); // delivers + marks delivered
+    assert.equal(sendCount, 1);
+    // Simulate the entry lingering (crash before queue trim) and re-flushing.
+    await appendDlq(entry);
+    const result = await flushDlq('token');
+    assert.equal(sendCount, 1, 're-flush must not resend an already-delivered entry');
+    assert.equal(result.deduped, 1);
   });
 });

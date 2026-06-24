@@ -13,6 +13,7 @@ import {
   buildResumeArgs,
   cleanupCodexSessions,
   getPriorSessionPath,
+  cwdToClaudeProjectDir,
 } from '../session.js';
 import type { SessionInfo } from '../types.js';
 
@@ -278,8 +279,11 @@ describe('isSessionValid', () => {
     // Create a real .jsonl file in the Claude session directory — the same path
     // claudeSessionPath() resolves to — then verify isSessionValid returns true.
     const sessionId = `00000000-0000-0000-0000-${Date.now().toString(10).slice(-12).padStart(12, '0')}`;
-    const claudeDir = join(homedir(), '.claude', 'projects', 'D--Personal-Assistant');
+    // Resolve the default project dir exactly as the code does (cwd/BOT_CWD-derived)
+    // so the fixture lands where isSessionValid (no cwd) looks, on any machine.
+    const claudeDir = join(homedir(), '.claude', 'projects', cwdToClaudeProjectDir(process.env.BOT_CWD || process.cwd()));
     const sessionFile = join(claudeDir, `${sessionId}.jsonl`);
+    await mkdir(claudeDir, { recursive: true });
     try {
       await writeFile(sessionFile, '', 'utf8'); // empty JSONL is fine for existence check
       const session: SessionInfo = {
@@ -289,15 +293,16 @@ describe('isSessionValid', () => {
       };
       assert.equal(await isSessionValid(session), true);
     } finally {
-      try { await unlink(sessionFile); } catch {}
+      try { await unlink(sessionFile); } catch {} // unlink the file only — never rm a possibly-real dir
     }
   });
 
   it('returns true for zclaude session with existing Claude file (same path as claude)', async () => {
     // zclaude wraps claude and uses the same ~/.claude/projects/ state dir
     const sessionId = `11111111-1111-1111-1111-${Date.now().toString(10).slice(-12).padStart(12, '0')}`;
-    const claudeDir = join(homedir(), '.claude', 'projects', 'D--Personal-Assistant');
+    const claudeDir = join(homedir(), '.claude', 'projects', cwdToClaudeProjectDir(process.env.BOT_CWD || process.cwd()));
     const sessionFile = join(claudeDir, `${sessionId}.jsonl`);
+    await mkdir(claudeDir, { recursive: true });
     try {
       await writeFile(sessionFile, '', 'utf8');
       const session: SessionInfo = {
@@ -307,7 +312,7 @@ describe('isSessionValid', () => {
       };
       assert.equal(await isSessionValid(session), true);
     } finally {
-      try { await unlink(sessionFile); } catch {}
+      try { await unlink(sessionFile); } catch {} // unlink the file only — never rm a possibly-real dir
     }
   });
 
@@ -339,12 +344,12 @@ describe('isSessionValid', () => {
   });
 
   it('finds claude session in cwd-derived project dir when cwd is provided', async () => {
-    // Simulates the cwd_override scenario (e.g. C:/test-repos/claude-code-demo).
-    // The session file lives in D--My-Repos-test-<ts>, NOT D--Personal-Assistant.
-    // isSessionValid(session, cwd) must look in the right place.
+    // Simulates the cwd_override scenario: the session file lives in the
+    // project dir derived from fakeCwd, NOT the default (process cwd) project
+    // dir. isSessionValid(session, cwd) must look in the right place.
     const ts = Date.now();
     const fakeCwd = `C:/test-repos/test-${ts}`;
-    const projectDir = `D--My-Repos-test-${ts}`;
+    const projectDir = cwdToClaudeProjectDir(fakeCwd); // must match what isSessionValid(session, fakeCwd) derives
     const sessionId = `22222222-2222-2222-2222-${ts.toString().slice(-12).padStart(12, '0')}`;
     const claudeDir = join(homedir(), '.claude', 'projects', projectDir);
     const sessionFile = join(claudeDir, `${sessionId}.jsonl`);
@@ -355,7 +360,7 @@ describe('isSessionValid', () => {
       assert.equal(await isSessionValid(session, fakeCwd), true,
         'should find file in cwd-derived project dir');
       assert.equal(await isSessionValid(session), false,
-        'should NOT find file in default D--Personal-Assistant dir when file is elsewhere');
+        'should NOT find file in the default (cwd-derived) project dir when it is elsewhere');
     } finally {
       try { await unlink(sessionFile); } catch {}
       try { await rm(claudeDir, { recursive: true, force: true }); } catch {}
@@ -443,11 +448,11 @@ describe('getPriorSessionPath', () => {
     assert.equal(zclaude, claude);
   });
 
-  it('returns glob pattern for gemini containing id prefix and ending in .json', () => {
+  it('returns glob pattern for gemini containing id prefix and a .json* suffix (matches .json and .jsonl)', () => {
     const result = getPriorSessionPath('gemini', 'abc12345xxxx', undefined);
     assert.ok(result !== null, 'should return a path');
     assert.ok(result!.includes('abc12345'), `should contain first 8 chars of id, got: ${result}`);
-    assert.ok(result!.endsWith('.json'), `should end in .json, got: ${result}`);
+    assert.ok(/\.json\*?$/.test(result!), `should end in a .json/.json* glob suffix, got: ${result}`);
   });
 
   it('returns null for codex', () => {
