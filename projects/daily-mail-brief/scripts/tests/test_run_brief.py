@@ -310,9 +310,9 @@ class TestMarkerParsing(unittest.TestCase):
 class TestDetectPortfolioStatementEmails(unittest.TestCase):
     """detect_portfolio_statement_emails must classify via Gemini and parse robustly."""
 
-    CENTRUM_EMAIL = {
+    PORTFOLIO_EMAIL = {
         "id": "abc123",
-        "from": "noreply@centrum.co.in",
+        "from": "statements@example-broker.com",
         "subject": "Your Monthly Portfolio Statement - May 2026",
         "snippet": "Dear Account Holder, please find attached your monthly statement for May 2026.",
     }
@@ -324,9 +324,9 @@ class TestDetectPortfolioStatementEmails(unittest.TestCase):
     }
 
     @patch("run_brief.call_gemini")
-    def test_centrum_statement_triggers(self, mock_gemini):
+    def test_portfolio_statement_triggers(self, mock_gemini):
         mock_gemini.return_value = '["abc123"]'
-        result = run_brief.detect_portfolio_statement_emails([self.CENTRUM_EMAIL])
+        result = run_brief.detect_portfolio_statement_emails([self.PORTFOLIO_EMAIL])
         self.assertEqual(result, ["abc123"])
 
     @patch("run_brief.call_gemini")
@@ -338,14 +338,14 @@ class TestDetectPortfolioStatementEmails(unittest.TestCase):
     @patch("run_brief.call_gemini")
     def test_gemini_failure_returns_empty(self, mock_gemini):
         mock_gemini.side_effect = RuntimeError("auth cancelled")
-        result = run_brief.detect_portfolio_statement_emails([self.CENTRUM_EMAIL])
+        result = run_brief.detect_portfolio_statement_emails([self.PORTFOLIO_EMAIL])
         self.assertEqual(result, [])
 
     @patch("run_brief.call_gemini")
     def test_json_embedded_in_text_parsed_correctly(self, mock_gemini):
         # Gemini often wraps JSON in prose
         mock_gemini.return_value = 'The emails that qualify are: ["abc123"]\nThat is the only one.'
-        result = run_brief.detect_portfolio_statement_emails([self.CENTRUM_EMAIL])
+        result = run_brief.detect_portfolio_statement_emails([self.PORTFOLIO_EMAIL])
         self.assertEqual(result, ["abc123"])
 
     @patch("run_brief.call_gemini")
@@ -357,7 +357,7 @@ class TestDetectPortfolioStatementEmails(unittest.TestCase):
     @patch("run_brief.call_gemini")
     def test_detect_triggers_fires_portfolio_reports_when_statement_found(self, mock_gemini):
         mock_gemini.return_value = '["abc123"]'
-        result = run_brief.detect_triggers([self.CENTRUM_EMAIL])
+        result = run_brief.detect_triggers([self.PORTFOLIO_EMAIL])
         self.assertIn("portfolio-reports", result)
 
     @patch("run_brief.call_gemini")
@@ -369,14 +369,14 @@ class TestDetectPortfolioStatementEmails(unittest.TestCase):
     @patch("run_brief.call_gemini")
     def test_detect_triggers_empty_on_gemini_failure(self, mock_gemini):
         mock_gemini.side_effect = RuntimeError("timeout")
-        result = run_brief.detect_triggers([self.CENTRUM_EMAIL])
+        result = run_brief.detect_triggers([self.PORTFOLIO_EMAIL])
         self.assertEqual(result, [])
 
     @patch("run_brief.call_gemini")
     def test_gemini_returns_non_list_json_is_safe(self, mock_gemini):
         # Gemini returns valid JSON that's not a list — must not crash
         mock_gemini.return_value = '{"ids": ["abc123"]}'
-        result = run_brief.detect_portfolio_statement_emails([self.CENTRUM_EMAIL])
+        result = run_brief.detect_portfolio_statement_emails([self.PORTFOLIO_EMAIL])
         self.assertEqual(result, [])
 
     @patch("run_brief.call_gemini")

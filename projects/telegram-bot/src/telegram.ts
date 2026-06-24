@@ -128,7 +128,7 @@ export function sanitizeMdV2(text: string): string {
   // \x00 is included so bold inside an already-protected _italic_/~strike~ span
   // (e.g. `_*zclaude*_`) is still recognised — by this point the surrounding
   // `_` / `~` chars have been replaced with `\x00…\x00` placeholders. This
-  // prevents glob patterns like `commands/*, prerana_*.jpg` from being
+  // prevents glob patterns like `commands/*, photos_*.jpg` from being
   // mis-paired as bold while preserving normal usage; bare * fall through to
   // step 3 and get escaped (otherwise Telegram reports "Can't find end of
   // Bold entity" on unclosed *).
