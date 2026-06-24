@@ -1704,7 +1704,7 @@ describe('runPollLoop: B4 pending description approval', { concurrency: 1 }, () 
 
   it('long reply when pd.text is empty → saves user text as description', async () => {
     const expiresAt = Date.now() + 30 * 60 * 1000;
-    const userDescription = 'Research notes and links for the Interloom project partnership';
+    const userDescription = 'Research notes and links for the data-platform project partnership';
     const { fetchLog } = await runB4(userDescription, {
       chat_id: 123, thread_id: 0, turns: [],
       pendingDescription: { text: '', proposedAt: new Date().toISOString(), expiresAt },

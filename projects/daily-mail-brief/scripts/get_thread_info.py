@@ -11,7 +11,8 @@ from google_auth import get_credentials
 
 def main():
     service = build('gmail', 'v1', credentials=get_credentials())
-    q = 'from:"Anu Syal" "MONTHLY REPORT"'
+    # Gmail search query — pass as the first CLI arg; the default is a generic example.
+    q = sys.argv[1] if len(sys.argv) > 1 else 'subject:"MONTHLY REPORT" newer_than:90d'
     results = service.users().messages().list(userId='me', q=q, maxResults=1).execute()
     messages = results.get('messages', [])
     
