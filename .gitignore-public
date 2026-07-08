@@ -31,6 +31,10 @@ pa/src/learn_agent.py
 pa/src/travel_butler.py
 pa/src/gmail_utils.py
 pa/src/telegram_notify.py
+# Python tests for the excluded modules above — they import learn_agent/
+# telegram_notify, which don't exist in the public mirror (permanently-broken
+# tests there), and their fixtures/docstrings reference personal context.
+pa/src/tests/
 pa/scripts/upload_apk.py
 # pa/scripts/upload_plan.py — INCLUDED (refactored to env-driven via PA_PLANS_DRIVE_FOLDER_ID; see Cat E3)
 
