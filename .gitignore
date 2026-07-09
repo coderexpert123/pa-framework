@@ -101,6 +101,15 @@ pa/data/profile-history-archive.kb-watermark.json
 /People\ &\ Contacts.md
 /Health\ &\ Medical.md
 
+# LLM-agentic scratch writes: a worker occasionally "goes agentic" and writes
+# its response/analysis to a local file at cwd instead of returning it as
+# text or using its proper output path (run_brief.py has a documented retry
+# for this exact failure mode). No application code writes these filenames —
+# confirmed via full-repo grep 2026-07-09. If a new one recurs, add it here.
+/message_to_user.md
+/output.json
+/skill_proposals.json
+
 # Scratch workspace — for ad-hoc / WIP / throwaway files (see scratch/README.md)
 /scratch/*
 !/scratch/.gitkeep
