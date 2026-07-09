@@ -118,6 +118,42 @@ export async function markDelivered(key: string): Promise<void> {
   });
 }
 
+/**
+ * Runtime compaction: drop keys older than DELIVERED_MAX_AGE_MS from BOTH the
+ * in-memory Map and the on-disk file. load()'s one-shot compaction only runs on
+ * the first call per process (the cache is memoized for the process lifetime),
+ * so a forever-daemon needs this called periodically — otherwise the Map and
+ * telegram-delivered.jsonl grow with cumulative message count instead of the
+ * 24h working set. Returns the number of expired keys dropped.
+ *
+ * Edge case: a key that wasDelivered() already lazily evicted from the Map may
+ * leave its expired line on disk until the NEXT compaction that rewrites the
+ * file (or a restart's load()-time compaction) — this pass only rewrites when
+ * it drops something from the Map itself. Harmless: stale disk lines are
+ * re-filtered on every load.
+ */
+export async function compactDelivered(maxAgeMs: number = DELIVERED_MAX_AGE_MS): Promise<number> {
+  return withMutex(async () => {
+    const map = await load(); // `cache === map`, so mutating it prunes the cache too
+    const now = Date.now();
+    let dropped = 0;
+    for (const [key, ts] of map) {
+      if (now - ts > maxAgeMs) { map.delete(key); dropped++; }
+    }
+    if (dropped === 0) return 0;
+    const path = deliveredPath();
+    const tmp = path + '.tmp';
+    const body = [...map.entries()].map(([key, ts]) => JSON.stringify({ key, ts })).join('\n');
+    try {
+      await writeFile(tmp, body + (map.size ? '\n' : ''), 'utf8');
+      await rename(tmp, path);
+    } catch {
+      /* compaction is best-effort — the append log stays valid either way */
+    }
+    return dropped;
+  });
+}
+
 /** Test hook: drop the in-memory cache so a fresh PA_HOME is re-read. */
 export function _resetDeliveredCacheForTest(): void {
   cache = null;

@@ -1,6 +1,7 @@
 import { mkdir, readdir, rename, stat, writeFile } from 'fs/promises';
 import { basename, join, dirname } from 'path';
 import lockfile from 'proper-lockfile';
+import { safeLockOptions } from '../../../pa/dist/src/lib/safe-lock.js';
 import { homedir } from 'os';
 
 export const RUNTIME_ARCHIVE_MAX_BYTES = 5 * 1024 * 1024;
@@ -114,7 +115,7 @@ export async function rotateFileIfNeeded(
   return withRotationMutex(filePath, async () => {
     // Use a lock to ensure only one process performs the rotation.
     // realpath: false is used for Windows compatibility and to handle renames better.
-    const release = await lockfile.lock(filePath, { retries: 5, realpath: false });
+    const release = await lockfile.lock(filePath, safeLockOptions('archive-rotate', { retries: 5, realpath: false }));
     try {
       // Re-check size after acquiring lock (another process might have rotated it already).
       const freshSize = (await stat(filePath)).size;

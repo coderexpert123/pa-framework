@@ -53,8 +53,8 @@ describe('Ref-ID Integrity (Regression Tests)', () => {
     
     // Check Telegram payload
     const body = JSON.parse(calls[0].init!.body as string);
-    assert.match(body.text, /Test TS message\n\n_Ref: s-[0-9a-f]{4}_$/);
-    const refId = body.text.match(/_Ref: (s-[0-9a-f]{4})_$/)![1];
+    assert.match(body.text, /Test TS message\n\n_Ref: s-[0-9a-f]{12}_$/);
+    const refId = body.text.match(/_Ref: (s-[0-9a-f]{12})_$/)![1];
 
     // Check app.log.jsonl
     const entries = await readLogEntries();

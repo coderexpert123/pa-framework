@@ -2,6 +2,7 @@ import fs from 'fs-extra';
 import { open as fsOpen } from 'fs/promises';
 import { createInterface } from 'readline';
 import lockfile from 'proper-lockfile';
+import { safeLockOptions } from '../../../pa/dist/src/lib/safe-lock.js';
 import { join } from 'path';
 import { homedir } from 'os';
 import type { ConversationState, ConversationTurn } from './types.js';
@@ -108,7 +109,7 @@ async function archiveNewTurns(turns: ConversationTurn[], threadId?: number): Pr
   let release: (() => Promise<void>) | undefined;
   try {
     // Lock the archive file to prevent race conditions during read-filter-append
-    release = await lockfile.lock(archivePath, { retries: 10, realpath: false });
+    release = await lockfile.lock(archivePath, safeLockOptions('conversation-archive', { retries: 10, realpath: false }));
 
     // Per-thread watermarks replace the 64KB tail-scan for dedup.
     // Tail-scan was vulnerable to window exhaustion: if the 64KB buffer contained

@@ -10,6 +10,7 @@
 import { appendFile, mkdir, writeFile } from 'fs/promises';
 import { dirname, join } from 'path';
 import lockfile from 'proper-lockfile';
+import { safeLockOptions } from './safe-lock.js';
 import { paHome } from '../paths.js';
 import { rotateFileIfNeeded } from './archive-files.js';
 
@@ -42,7 +43,7 @@ async function ensureLogFile(path: string): Promise<void> {
 async function appendLogInner(line: string): Promise<void> {
   const logFile = getLogFile();
   await ensureLogFile(logFile);
-  const release = await lockfile.lock(logFile, { retries: 5, realpath: false });
+  const release = await lockfile.lock(logFile, safeLockOptions('app-log', { retries: 5, realpath: false }));
   try {
     await rotateFileIfNeeded(logFile, Buffer.byteLength(line, 'utf8'));
     await appendFile(logFile, line, 'utf8');

@@ -1,13 +1,13 @@
-import { readdir, stat } from 'fs/promises';
+import { readdir, stat, readFile } from 'fs/promises';
 import { join } from 'path';
-import { logsDir } from './paths.js';
+import { logsDir, draftsDir } from './paths.js';
 import { readLogs } from './logger.js';
 import { listSkills } from './skills.js';
-import { listDrafts, isDuplicate, computeFingerprint } from './drafts.js';
+import { listDrafts, isDuplicate, computeFingerprint, uniqueDraftName } from './drafts.js';
 import { runWithFailover } from './workers.js';
 import { parseProposalResponse } from './analyzer.js';
 import { notifyUser } from './lib/notify.js';
-import type { DraftProposal, RunMeta } from './types.js';
+import type { DraftProposal, DraftMeta, RunMeta } from './types.js';
 
 export interface FailureRecord {
   skillName: string;
@@ -99,10 +99,10 @@ ${exclusionList}
 ## Task
 
 For each failing skill pattern above, propose ONE of:
-1. A modified skill prompt (as a new draft named "<skill-name>-fix") that addresses the root cause
-2. A diagnostic skill that investigates why the failure keeps happening
+1. A modified skill prompt that addresses the root cause. Name the draft "<skill-name>-fix" and set "target_skill" to the exact existing skill name being fixed — this proposal will *replace* that skill's behavior, not create a new one.
+2. A diagnostic skill that investigates why the failure keeps happening. This is a brand-new, standalone skill unrelated to any existing one — set "target_skill" to null.
 
-Only propose fixes for patterns with 2+ failures. Ignore transient errors (network timeouts on a single day, etc.).
+Only propose fixes for patterns with 2+ failures. Ignore transient errors (network timeouts on a single day, etc.). The "target_skill" field is REQUIRED on every proposal (either the exact existing skill name for option 1, or the literal JSON value null for option 2) — never omit it.
 
 Respond with ONLY a JSON array (no markdown fences, no explanation):
 
@@ -111,6 +111,7 @@ Respond with ONLY a JSON array (no markdown fences, no explanation):
     "name": "skill-name-fix",
     "reason": "Why this fix addresses the failure pattern (1-2 sentences)",
     "source_message_ids": [],
+    "target_skill": "skill-name",
     "frontmatter": {
       "timeout": 600,
       "idle_timeout": 180
@@ -166,6 +167,14 @@ export async function analyzeFailurePatterns(
   const unique: DraftProposal[] = [];
 
   for (const proposal of proposals) {
+    // Fix/reinforce proposals (target_skill set) must never collide on the fixed
+    // "<target>-fix" name with an earlier, unrelated fix for the same skill — that would
+    // make isDuplicate()'s by-name check silently drop a genuinely new fix forever after
+    // the first one. New-skill/diagnostic proposals (no target_skill) keep the original
+    // "name collision = duplicate idea" semantics.
+    if (proposal.target_skill) {
+      proposal.name = await uniqueDraftName(proposal.name);
+    }
     const fingerprint = computeFingerprint(proposal.name, proposal.prompt);
     if (seenNames.has(proposal.name)) continue;
     if (seenFingerprints.has(fingerprint)) continue;
@@ -176,4 +185,116 @@ export async function analyzeFailurePatterns(
   }
 
   return unique;
+}
+
+export interface RollbackFlag {
+  kind: 'restore' | 'delete';
+  skillName: string;   // for 'restore': the target skill to restore; for 'delete': the skill to delete
+  draftName: string;   // the draft whose meta.json records the change (used to update its status)
+}
+
+const ROLLBACK_FAILURE_RATE_THRESHOLD = 0.5; // >50% failures in the window
+const ROLLBACK_WINDOW_DAYS = 1; // 24 hours
+const ROLLBACK_LOOKBACK_DAYS = 7; // only consider autonomous changes reviewed within the last 7 days
+const ROLLBACK_MIN_SAMPLE_SIZE = 3; // a single bad run (100% of n=1) must not trigger a rollback — need enough runs for the rate to mean anything
+// 200, not the usual 50: this read specifically feeds a safety-critical rollback decision, and
+// a hypothetical high-frequency autonomously-managed skill (e.g. running every few minutes)
+// would otherwise have its "24 hour" window silently truncated to well under an hour by the
+// default cap. No currently-deployed skill is affected, but the cost of reading a few hundred
+// small .meta JSON files is negligible next to getting this decision right.
+const ROLLBACK_LOG_SAMPLE_SIZE = 200;
+// Never let the self-improvement loop roll back (restore or delete) itself, regardless of what
+// the rest of this function's logic would otherwise conclude — matches the same protection
+// validator.ts's PROTECTED_SKILLS and self-improver.ts's excludesSelf filter apply elsewhere.
+// Currently also true structurally (self-improver was hand-authored, so it has no matching
+// draftsDir() entry either path checks for) — this makes it true by explicit design as well.
+const SELF_NAME = 'self-improver';
+
+async function computeFailureRates(): Promise<Map<string, { total: number; failed: number }>> {
+  const rates = new Map<string, { total: number; failed: number }>();
+  let skillDirs: string[];
+  try {
+    skillDirs = await readdir(logsDir());
+  } catch {
+    return rates;
+  }
+
+  const cutoff = new Date(Date.now() - ROLLBACK_WINDOW_DAYS * 24 * 60 * 60 * 1000);
+
+  for (const skillName of skillDirs) {
+    try {
+      const s = await stat(join(logsDir(), skillName));
+      if (!s.isDirectory()) continue;
+    } catch {
+      continue;
+    }
+
+    let logs: Array<{ meta: RunMeta; logPath: string }>;
+    try {
+      logs = await readLogs(skillName, ROLLBACK_LOG_SAMPLE_SIZE);
+    } catch {
+      continue;
+    }
+
+    let total = 0;
+    let failed = 0;
+    for (const { meta } of logs) {
+      if (new Date(meta.timestamp) < cutoff) continue;
+      total++;
+      if (meta.status === 'error') failed++;
+    }
+    if (total >= ROLLBACK_MIN_SAMPLE_SIZE) rates.set(skillName, { total, failed });
+  }
+
+  return rates;
+}
+
+/**
+ * Find autonomously-approved changes whose target skill is now failing at a high rate,
+ * and flag them for rollback — restoring an in-place fix from its backup, or deleting a
+ * brand-new autonomously-created skill entirely.
+ */
+export async function checkForRollbacks(): Promise<RollbackFlag[]> {
+  const rates = await computeFailureRates();
+  const flags: RollbackFlag[] = [];
+
+  for (const [skillName, { total, failed }] of rates) {
+    if (skillName === SELF_NAME) continue;
+    if (failed / total <= ROLLBACK_FAILURE_RATE_THRESHOLD) continue;
+
+    // First: is skillName itself the TARGET of a recent in-place fix? (applyFix overwrites
+    // the target's own skillsDir()/<skillName>/skill.md, so the draft recording that fix
+    // lives at a different path — search by meta.target_skill, not by directory name.)
+    const inPlaceFixes = await listDrafts();
+    const matchingFixes = inPlaceFixes.filter(
+      (d) => d.meta.target_skill === skillName && d.meta.applied_in_place === true
+        && d.meta.status === 'approved' && d.meta.reviewed_at
+        && new Date(d.meta.reviewed_at) >= new Date(Date.now() - ROLLBACK_LOOKBACK_DAYS * 24 * 60 * 60 * 1000),
+    );
+    if (matchingFixes.length > 0) {
+      const mostRecent = matchingFixes.reduce((a, b) =>
+        (a.meta.reviewed_at! > b.meta.reviewed_at!) ? a : b);
+      flags.push({ kind: 'restore', skillName, draftName: mostRecent.skill.name });
+      continue;
+    }
+
+    // Otherwise: was skillName itself deployed as a brand-new autonomously-approved skill?
+    let meta: DraftMeta;
+    try {
+      meta = JSON.parse(await readFile(join(draftsDir(), skillName, 'draft.meta.json'), 'utf8'));
+    } catch {
+      continue; // not an autonomous change we know about — leave it alone
+    }
+    if (
+      meta.status === 'approved'
+      && meta.approved_autonomously === true
+      && meta.applied_in_place !== true
+      && meta.reviewed_at
+      && new Date(meta.reviewed_at) >= new Date(Date.now() - ROLLBACK_LOOKBACK_DAYS * 24 * 60 * 60 * 1000)
+    ) {
+      flags.push({ kind: 'delete', skillName, draftName: skillName });
+    }
+  }
+
+  return flags;
 }

@@ -153,7 +153,10 @@ describe('BG-task tracking: age alert', () => {
 
 describe('BG-task tracking: orphan sweep', () => {
   it('fires bg-orphan alert when a descendant survives worker exit', async () => {
-    const script = await writeScript('orphan.js', 'process.stdout.write("done");');
+    // The child must outlive at least one 30ms heartbeat: an instant exit
+    // could beat the first heartbeat's async chain to populating bgTaskMap,
+    // making the orphan sweep a no-op (observed flake under suite load).
+    const script = await writeScript('orphan.js', 'setTimeout(() => process.stdout.write("done"), 150);');
     const notified: string[] = [];
     const worker = makeWorker({ args: [script] });
 
@@ -173,8 +176,11 @@ describe('BG-task tracking: orphan sweep', () => {
       },
     });
 
-    // Give the orphan sweep (fire-and-forget) time to complete
-    await new Promise(r => setTimeout(r, 100));
+    // The orphan sweep is fire-and-forget — poll for its effect instead of
+    // racing it with a fixed sleep.
+    for (let i = 0; i < 80 && !notified.some(s => s.startsWith('bg-orphan:')); i++) {
+      await new Promise(r => setTimeout(r, 25));
+    }
 
     const orphanAlerts = notified.filter(s => s.startsWith('bg-orphan:'));
     assert.ok(orphanAlerts.length >= 1, `Expected bg-orphan alert, got: ${JSON.stringify(notified)}`);
@@ -182,7 +188,9 @@ describe('BG-task tracking: orphan sweep', () => {
   });
 
   it('does NOT fire orphan alert when all descendants are gone', async () => {
-    const script = await writeScript('clean.js', 'process.stdout.write("done");');
+    // Long-lived child so the sweep actually RUNS and decides "all dead" —
+    // an instant exit would pass this vacuously (sweep skipped entirely).
+    const script = await writeScript('clean.js', 'setTimeout(() => process.stdout.write("done"), 150);');
     const notified: string[] = [];
     const worker = makeWorker({ args: [script] });
 
@@ -209,7 +217,9 @@ describe('BG-task tracking: orphan sweep', () => {
 
   it('uses areProcessesAlive in a single batched call for orphan sweep', async () => {
     const fakePids = [88881, 88882, 88883];
-    const script = await writeScript('batch-orphan.js', 'process.stdout.write("done");');
+    // Child must outlive at least one 30ms heartbeat, or the sweep is a
+    // no-op (bgTaskMap never populated) — same race as the orphan-alert test.
+    const script = await writeScript('batch-orphan.js', 'setTimeout(() => process.stdout.write("done"), 150);');
     const aliveCalls: number[][] = [];
     const worker = makeWorker({ args: [script] });
 
@@ -229,7 +239,10 @@ describe('BG-task tracking: orphan sweep', () => {
       },
     });
 
-    await new Promise(r => setTimeout(r, 100));
+    // Fire-and-forget sweep — poll for its effect instead of racing it.
+    for (let i = 0; i < 80 && aliveCalls.length === 0; i++) {
+      await new Promise(r => setTimeout(r, 25));
+    }
 
     // Orphan sweep calls areProcessesAlive once with all pids (batched)
     const orphanCall = aliveCalls[aliveCalls.length - 1];

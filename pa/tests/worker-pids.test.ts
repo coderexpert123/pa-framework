@@ -1,6 +1,6 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { access, readFile, mkdir, writeFile } from 'fs/promises';
+import { access, readFile, mkdir, writeFile, unlink } from 'fs/promises';
 import { join } from 'path';
 import { createTempPaHome, cleanup } from './helpers.js';
 
@@ -91,5 +91,57 @@ describe('worker-pids', () => {
     const { isProcessAlive } = await import('../src/worker-pids.js');
     assert.equal(isProcessAlive(process.pid), true, 'current process should be alive');
     assert.equal(isProcessAlive(999999), false, 'PID 999999 should not exist');
+  });
+
+  it('cleanupOrphanedWorkers skips entries whose skill is excluded (AI-095 reaper protection)', async () => {
+    const { cleanupOrphanedWorkers, removeWorkerPid } = await import('../src/worker-pids.js');
+
+    const pidsDir = join(dir, 'worker-pids');
+    await mkdir(pidsDir, { recursive: true });
+    // Dead spawner + dead worker → normally the file would be removed.
+    await writeFile(
+      join(pidsDir, '999996.json'),
+      JSON.stringify({ pid: 999996, spawnedBy: 999999, worker: 'claude', skill: 'topic--100_5', startedAt: new Date().toISOString() }),
+      'utf8'
+    );
+
+    await cleanupOrphanedWorkers(new Set(['topic--100_5']));
+    await assert.doesNotReject(access(join(pidsDir, '999996.json')), 'excluded entry must be left for the reaper');
+
+    // Without the exclusion it is cleaned up as before.
+    await cleanupOrphanedWorkers();
+    await assert.rejects(access(join(pidsDir, '999996.json')), 'entry removed once no longer excluded');
+    await removeWorkerPid(999996);
+  });
+
+  it('updateWorkerPidDescendants persists the live tree; no-op for unknown pid', async () => {
+    const { addWorkerPid, updateWorkerPidDescendants, listWorkerPids, removeWorkerPid } = await import('../src/worker-pids.js');
+
+    await addWorkerPid({ pid: 999994, spawnedBy: process.pid, worker: 'claude', skill: 'topic--100_7', startedAt: new Date().toISOString() });
+    await updateWorkerPidDescendants(999994, [111, 222]);
+    const entry = (await listWorkerPids()).find((e) => e.pid === 999994);
+    assert.deepEqual(entry?.descendants, [111, 222]);
+    // preserves original fields
+    assert.equal(entry?.skill, 'topic--100_7');
+
+    await assert.doesNotReject(updateWorkerPidDescendants(123456789, [1])); // unknown pid — silent no-op
+    await removeWorkerPid(999994);
+  });
+
+  it('listWorkerPids returns registered entries and skips corrupt files', async () => {
+    const { addWorkerPid, listWorkerPids, removeWorkerPid } = await import('../src/worker-pids.js');
+
+    const pidsDir = join(dir, 'worker-pids');
+    await mkdir(pidsDir, { recursive: true });
+    await addWorkerPid({ pid: 999995, spawnedBy: process.pid, worker: 'claude', skill: 'topic--100_9', startedAt: new Date().toISOString() });
+    await writeFile(join(pidsDir, 'corrupt.json'), 'not-json{{{', 'utf8');
+
+    const entries = await listWorkerPids();
+    const mine = entries.find((e) => e.pid === 999995);
+    assert.ok(mine, 'registered entry listed');
+    assert.equal(mine!.skill, 'topic--100_9');
+
+    await removeWorkerPid(999995);
+    await unlink(join(pidsDir, 'corrupt.json')).catch(() => {});
   });
 });

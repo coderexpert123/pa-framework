@@ -32,6 +32,34 @@ async function writeAppLog(entries: any[]): Promise<void> {
   await writeFile(path, content, 'utf8');
 }
 
+/**
+ * Write a conversation-history.jsonl big enough to actually exercise
+ * tailLines()'s byte-seek branch (startByte > 0), not just its final
+ * slice(-maxLines) line-window trim. tailLines' bytesToRead for
+ * scanConversationHistory is TAIL_LINES(10_000) * 1500 * 2 = ~28.6 MiB — a
+ * naive fixture of >10,000 small lines stays far under that and never
+ * exercises the seek offset or the partial-first-line-drop logic. This
+ * writes 60 entries padded to ~600KB each (~34MB total, safely over the
+ * ~28.6MB window) so a real seek happens.
+ */
+async function writeLargeConversationHistory(
+  entryCount: number,
+  paddingBytes: number,
+  overrides: (i: number) => Record<string, unknown>
+): Promise<void> {
+  const path = join(tempDir, 'conversation-history.jsonl');
+  const pad = 'x'.repeat(paddingBytes);
+  const lines: string[] = [];
+  for (let i = 0; i < entryCount; i++) {
+    lines.push(JSON.stringify({
+      role: 'assistant', text: pad, timestamp: `2026-01-01T00:00:${String(i % 60).padStart(2, '0')}Z`,
+      worker: 'claude', session_id: `sess-${i}`, thread_id: 1,
+      ...overrides(i),
+    }));
+  }
+  await writeFile(path, lines.join('\n') + '\n', 'utf8');
+}
+
 describe('lookupRefId — conversation-history matches', () => {
   it('returns kind=turn with full text when refId found in conversation-history.jsonl', async () => {
     await writeConversationHistory([
@@ -181,5 +209,188 @@ describe('lookupRefId — preference + missing files', () => {
     const result = await lookupRefId('c-good');
     assert.ok(result);
     assert.equal(result.text, 'valid');
+  });
+});
+
+describe('lookupRefId — tail-window byte-seek boundary (scanConversationHistory)', () => {
+  // These exercise tailLines()'s actual seek branch (startByte > 0) — a file
+  // large enough that scanConversationHistory can no longer read it whole,
+  // matching the change from a full readFile() to a byte-seeked tail read.
+  const PADDING_BYTES = 600_000; // ~600KB per entry
+  const ENTRY_COUNT = 60; // ~34-36MB total, safely over the ~28.6MB seek window
+
+  it('does NOT find a refId written near the start of a file bigger than the tail-seek window', async () => {
+    await writeLargeConversationHistory(ENTRY_COUNT, PADDING_BYTES, (i) => (
+      i === 0 ? { refId: 'c-toooldtofind' } : {}
+    ));
+
+    const result = await lookupRefId('c-toooldtofind');
+    assert.equal(result, null, 'an entry near byte offset 0 must fall outside the seeked tail window');
+  });
+
+  it('DOES find a refId written near the end of a file bigger than the tail-seek window', async () => {
+    await writeLargeConversationHistory(ENTRY_COUNT, PADDING_BYTES, (i) => (
+      i === ENTRY_COUNT - 1 ? { refId: 'c-recentenough' } : {}
+    ));
+
+    const result = await lookupRefId('c-recentenough');
+    assert.ok(result, 'an entry near the end of the file must be found within the seeked tail window');
+    assert.equal(result.source, 'conversation-history');
+  });
+
+  it('does not false-match or crash on the (possibly truncated) first line after the seek point', async () => {
+    // The entry immediately after the calculated seek offset may have its
+    // first line dropped by tailLines() (a mid-line seek can land inside an
+    // existing line). Plant a target a few entries further in — well clear
+    // of that boundary — and confirm no crash and no false match anywhere
+    // in between.
+    await writeLargeConversationHistory(ENTRY_COUNT, PADDING_BYTES, (i) => (
+      i === ENTRY_COUNT - 5 ? { refId: 'c-nearboundary' } : {}
+    ));
+
+    const result = await lookupRefId('c-nearboundary');
+    assert.ok(result, 'a target well within the tail window must still be found without crashing');
+    assert.equal(result.source, 'conversation-history');
+  });
+});
+
+describe('lookupRefId — ambiguity-detection warning', () => {
+  let warnCalls: string[];
+  let originalWarn: typeof console.warn;
+
+  beforeEach(() => {
+    warnCalls = [];
+    originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warnCalls.push(args.join(' ')); };
+  });
+
+  afterEach(() => {
+    console.warn = originalWarn;
+  });
+
+  it('warns and still returns the newest match when the same refId has DIFFERENT messageIds (genuine collision)', async () => {
+    await writeAppLog([
+      { timestamp: '2026-01-01T00:00:00Z', message: 'system message sent', refId: 's-amb1', messageId: 100, kind: 'system', textPreview: 'older, unrelated message' },
+      { timestamp: '2026-01-02T00:00:00Z', message: 'system message sent', refId: 's-amb1', messageId: 200, kind: 'system', textPreview: 'newer, unrelated message' },
+    ]);
+
+    const result = await lookupRefId('s-amb1');
+    assert.ok(result);
+    assert.equal(result.text, 'newer, unrelated message', 'still returns the newest match — warning is additive, not a behavior change');
+    assert.equal(warnCalls.length, 1, 'exactly one ambiguity warning');
+    assert.match(warnCalls[0], /refId_ambiguous/);
+  });
+
+  it('does NOT warn when the same refId has the same messageId (intentional reuse of one recurring message)', async () => {
+    await writeAppLog([
+      { timestamp: '2026-01-01T00:00:00Z', message: 'system message sent', refId: 's-reuse1', messageId: 3368, kind: 'system', textPreview: 'pin edit 1' },
+      { timestamp: '2026-01-02T00:00:00Z', message: 'system message sent', refId: 's-reuse1', messageId: 3368, kind: 'system', textPreview: 'pin edit 2 (newest)' },
+    ]);
+
+    const result = await lookupRefId('s-reuse1');
+    assert.ok(result);
+    assert.equal(result.text, 'pin edit 2 (newest)');
+    assert.equal(warnCalls.length, 0, 'same-messageId repeats (e.g. coding-dirs pin refresh) must not false-positive');
+  });
+
+  it('finds a genuine ambiguity buried behind many legitimate same-messageId repeats', async () => {
+    await writeAppLog([
+      { timestamp: '2026-01-01T00:00:00Z', message: 'system message sent', refId: 's-buried', messageId: 999, kind: 'system', textPreview: 'unrelated older message' },
+      { timestamp: '2026-01-02T00:00:00Z', message: 'system message sent', refId: 's-buried', messageId: 3368, kind: 'system', textPreview: 'pin edit 1' },
+      { timestamp: '2026-01-03T00:00:00Z', message: 'system message sent', refId: 's-buried', messageId: 3368, kind: 'system', textPreview: 'pin edit 2' },
+      { timestamp: '2026-01-04T00:00:00Z', message: 'system message sent', refId: 's-buried', messageId: 3368, kind: 'system', textPreview: 'pin edit 3 (newest)' },
+    ]);
+
+    const result = await lookupRefId('s-buried');
+    assert.ok(result);
+    assert.equal(result.text, 'pin edit 3 (newest)');
+    // Must not stop scanning after the first (matching) subsequent occurrence —
+    // the genuinely differing one is two entries further back.
+    assert.equal(warnCalls.length, 1, 'must still detect the older genuinely-differing entry past several legitimate repeats');
+  });
+
+  it('defaults to warning when messageId is missing on either side (conservative — most mint sites do not thread it yet)', async () => {
+    await writeConversationHistory([
+      { role: 'assistant', text: 'older reply, no message_id', timestamp: '2026-01-01T10:00:00Z', refId: 'c-nomid', thread_id: 1 },
+      { role: 'assistant', text: 'newer reply, no message_id', timestamp: '2026-01-02T10:00:00Z', refId: 'c-nomid', thread_id: 1 },
+    ]);
+
+    const result = await lookupRefId('c-nomid');
+    assert.ok(result);
+    assert.equal(result.text, 'newer reply, no message_id');
+    assert.equal(warnCalls.length, 1, 'missing messageId on both sides must default to warning, not silent suppression');
+  });
+
+  it('does not warn on a single, non-ambiguous match', async () => {
+    await writeAppLog([
+      { timestamp: '2026-01-01T00:00:00Z', message: 'system message sent', refId: 's-unique', messageId: 1, kind: 'system', textPreview: 'only one' },
+    ]);
+
+    const result = await lookupRefId('s-unique');
+    assert.ok(result);
+    assert.equal(warnCalls.length, 0);
+  });
+
+  it('never warns for wide (12-hex, post-widening) refIds — a repeat is the same logical send by construction', async () => {
+    // Multi-chat fan-out: same refId, differing messageIds, no suppression
+    // heuristic would match — but the 2^48 space makes a genuine collision
+    // within the window impossible, so detection is skipped entirely.
+    await writeAppLog([
+      { timestamp: '2026-01-01T00:00:00Z', message: 'skill message sent', refId: 's-a1b2c3d4e5f6', messageId: 100, chatId: -100, textPreview: 'sent to group' },
+      { timestamp: '2026-01-01T00:00:01Z', message: 'skill message sent', refId: 's-a1b2c3d4e5f6', messageId: 200, chatId: 555, textPreview: 'sent to DM' },
+    ]);
+
+    const result = await lookupRefId('s-a1b2c3d4e5f6');
+    assert.ok(result);
+    assert.equal(result.text, 'sent to DM', 'still returns the newest match');
+    assert.equal(warnCalls.length, 0, 'wide refIds must never trigger the ambiguity warning');
+  });
+
+  it('never warns for wide-ref multi-chunk sends that log no messageId at all', async () => {
+    await writeAppLog([
+      { timestamp: '2026-01-01T00:00:00Z', message: 'skill message sent', refId: 's-0123456789ab', chunkIndex: 0, textPreview: 'chunk one' },
+      { timestamp: '2026-01-01T00:00:01Z', message: 'skill message sent', refId: 's-0123456789ab', chunkIndex: 1, textPreview: 'chunk two' },
+    ]);
+
+    const result = await lookupRefId('s-0123456789ab');
+    assert.ok(result);
+    assert.equal(warnCalls.length, 0);
+  });
+
+  it('conversation-history: suppresses when both occurrences share the same defined message_id', async () => {
+    await writeConversationHistory([
+      { role: 'assistant', text: 'archived once', timestamp: '2026-01-01T10:00:00Z', refId: 'c-old1', message_id: 42, thread_id: 1 },
+      { role: 'assistant', text: 'archived again (newest)', timestamp: '2026-01-02T10:00:00Z', refId: 'c-old1', message_id: 42, thread_id: 1 },
+    ]);
+
+    const result = await lookupRefId('c-old1');
+    assert.ok(result);
+    assert.equal(result.text, 'archived again (newest)');
+    assert.equal(result.messageId, 42, 'snake_case message_id mapped through to the record');
+    assert.equal(warnCalls.length, 0, 'same defined message_id = same logical message, no warn');
+  });
+
+  it('conversation-history: suppresses byte-identical duplicate turns (crash re-archive / merge copies)', async () => {
+    await writeConversationHistory([
+      { role: 'assistant', text: 'the exact same reply', timestamp: '2026-01-01T10:00:00Z', refId: 'c-dup1', thread_id: 1 },
+      { role: 'assistant', text: 'the exact same reply', timestamp: '2026-01-02T10:00:00Z', refId: 'c-dup1', thread_id: 2 },
+    ]);
+
+    const result = await lookupRefId('c-dup1');
+    assert.ok(result);
+    assert.equal(warnCalls.length, 0, 'identical text = same logical turn duplicated, no warn');
+  });
+
+  it('warns at most ONCE per lookup even with several distinct colliding entries', async () => {
+    await writeAppLog([
+      { timestamp: '2026-01-01T00:00:00Z', message: 'system message sent', refId: 's-amb2', messageId: 1, kind: 'system', textPreview: 'first' },
+      { timestamp: '2026-01-02T00:00:00Z', message: 'system message sent', refId: 's-amb2', messageId: 2, kind: 'system', textPreview: 'second' },
+      { timestamp: '2026-01-03T00:00:00Z', message: 'system message sent', refId: 's-amb2', messageId: 3, kind: 'system', textPreview: 'third (newest)' },
+    ]);
+
+    const result = await lookupRefId('s-amb2');
+    assert.ok(result);
+    assert.equal(result.text, 'third (newest)');
+    assert.equal(warnCalls.length, 1, 'warnings are deduped to one per lookup');
   });
 });

@@ -97,6 +97,7 @@ export async function loadSkill(name: string): Promise<Skill> {
     no_fallback: typeof meta.no_fallback === 'string'
       ? String(meta.no_fallback).toLowerCase() === 'true'
       : !!meta.no_fallback,
+    critical: !!meta.critical,
   };
 
   return { name, path: skillPath, frontmatter, prompt: body };

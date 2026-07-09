@@ -70,6 +70,22 @@ workers:
     state_dir: "~/.claude/projects"
     state_pattern: "*.jsonl"
 
+  - name: agy
+    command: agy
+    args: ["--yolo", "--output-format", "stream-json"]
+    input_mode: stdin-text
+    output_format: stream-json
+    check: agy --version
+    check_timeout: 10
+    rate_limit_patterns:
+      - "quota"
+      - "rate limit"
+      - "429"
+      - "Resource exhausted"
+    priority: 5
+    state_dir: "~/.gemini/antigravity-cli/conversations"
+    state_pattern: "*.pb"  # protobuf conversation files (.db = pre-2026 legacy SQLite)
+
 bg_tasks:
   alert_seconds: 300
   alert_repeat_seconds: 1800

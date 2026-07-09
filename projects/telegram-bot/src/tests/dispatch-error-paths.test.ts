@@ -45,6 +45,7 @@ after(async () => {
 
 // Dynamic imports after PA_HOME is set
 const { tryClassifyAndNotify, dispatchMessage } = await import('../main.js');
+const { markTopicStopped, _clearStoppedForTest } = await import('../worker-stop.js');
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -226,5 +227,54 @@ describe('dispatchMessage non-rate-limit early-return', () => {
 
     assert.equal(result.workerError, undefined);
     assert.equal(result.rateLimitedWorker, 'gemini');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AI-092: /stop marker aborts fresh/failover spawns for CANCELLED dispatches only
+// ---------------------------------------------------------------------------
+
+describe('dispatchMessage stop-marker guard', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = await mkdtemp(join(tmpdir(), 'dispatch-stop-test-'));
+    process.env.PA_HOME = testDir;
+    await writeFile(join(testDir, 'blackboard.json'), JSON.stringify({ active_locks: [] }), 'utf8');
+    await writeFile(join(testDir, 'rate-limit-state.json'), '{}', 'utf8');
+    _clearStoppedForTest();
+  });
+
+  afterEach(async () => {
+    process.env.PA_HOME = sharedTempDir;
+    _clearStoppedForTest();
+    await rmRetry(testDir);
+  });
+
+  it('aborts (empty response, no spawn) when the dispatch is older than the /stop', async () => {
+    await writeConfig(testDir, [
+      { name: 'zclaude', command: 'cmd', args: ['/c', 'exit', '1'], priority: 1 },
+    ]);
+    const resource = `topic-999_${testRunId}-stop1`;
+    markTopicStopped(resource.replace(/^topic-/, ''), 'stop', 1000);
+
+    const result = await dispatchMessage('hello', undefined, undefined, makeState(), {}, resource, 'zclaude', undefined, undefined, 999 /* older than /stop */);
+
+    assert.equal(result.workerError, true);
+    assert.equal(result.response, '', 'aborted before any spawn — no worker-error text');
+    assert.equal(result.dispatchedWorker, undefined);
+  });
+
+  it('does NOT abort a dispatch newer than the /stop (user\'s next message)', async () => {
+    await writeConfig(testDir, [
+      { name: 'zclaude', command: 'cmd', args: ['/c', 'exit', '1'], priority: 1 },
+    ]);
+    const resource = `topic-999_${testRunId}-stop2`;
+    markTopicStopped(resource.replace(/^topic-/, ''), 'stop', 1000);
+
+    const result = await dispatchMessage('hello', undefined, undefined, makeState(), {}, resource, 'zclaude', undefined, undefined, 1001 /* newer than /stop */);
+
+    assert.equal(result.workerError, true);
+    assert.ok(result.response.startsWith('⚠️ zclaude failed'), 'spawn actually happened and failed normally');
   });
 });

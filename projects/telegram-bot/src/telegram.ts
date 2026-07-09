@@ -237,7 +237,7 @@ export async function sendMessage(
         // Strip italic markers from ref ID so it shows as "Ref: xxx" not "_Ref: xxx_" in plain text.
         // The optional (\n\n)? handles the edge case where splitMessage puts the ref into its own
         // chunk, trimming the leading newlines.
-        body.text = chunk.replace(/((?:\n\n)?)_Ref: ([a-z]+-[0-9a-f]{4})_$/, '$1Ref: $2');
+        body.text = chunk.replace(/((?:\n\n)?)_Ref: ([a-z]+-[0-9a-f]{4,})_$/, '$1Ref: $2');
         try {
           res = await telegramFetch(`${BASE}/bot${token}/sendMessage`, {
             method: 'POST',
@@ -424,6 +424,15 @@ export async function deleteForumTopic(
   }
 }
 
+// sendChatAction needs headroom: measured api.telegram.org latency from this
+// network swings 0.6s–15s+ (AI-095). A 3s budget silently killed every typing
+// indicator (327 swallowed timeouts) while sends succeeded on their 30s budget.
+export const SEND_TYPING_TIMEOUT_MS = 15_000;
+// Failures are throttled into the structured log (typing fires every ~4s during
+// a dispatch — one line per minute is enough to make degradation queryable).
+const SEND_TYPING_LOG_INTERVAL_MS = 60_000;
+let lastTypingErrorLoggedAt = 0;
+
 export async function sendTyping(token: string, chatId: number, threadId?: number): Promise<void> {
   const body: Record<string, unknown> = { chat_id: chatId, action: 'typing' };
   if (threadId !== undefined && threadId !== null && threadId !== 0) body.message_thread_id = threadId;
@@ -432,8 +441,14 @@ export async function sendTyping(token: string, chatId: number, threadId?: numbe
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(3000),
-  }).catch((err) => { console.error('sendTyping error:', err); });
+    signal: AbortSignal.timeout(SEND_TYPING_TIMEOUT_MS),
+  }).catch((err) => {
+    const now = Date.now();
+    if (now - lastTypingErrorLoggedAt >= SEND_TYPING_LOG_INTERVAL_MS) {
+      lastTypingErrorLoggedAt = now;
+      logger.warn('telegram', 'sendTyping failed', { chatId, threadId, error: String(err) });
+    }
+  });
 }
 
 export async function setMessageReaction(

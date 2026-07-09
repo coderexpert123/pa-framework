@@ -41,7 +41,7 @@ export async function sendToTelegram(
   token: string,
   parseMode?: string | false,
 ): Promise<void> {
-  const refId = `s-${randomBytes(2).toString('hex')}`;
+  const refId = `s-${randomBytes(6).toString('hex')}`;
   // For MarkdownV2 callers, sanitize the body so identifiers (node_modules,
   // snake_case), Windows paths, parens, etc. don't trigger parse failures.
   // The italic `_Ref: <id>_` trailer is appended AFTER sanitize so its markers
@@ -83,7 +83,7 @@ export async function sendToTelegram(
           // The optional (\n\n)? handles the edge case where splitMessage puts the ref into its own chunk.
           // The optional `\\` matches the dash escape for MdV2 (`s\-9b43`) — capture id as
           // prefix + hex separately so output is always clean `Ref: s-9b43` regardless of input form.
-          body.text = (body.text as string).replace(/((?:\n\n)?)_Ref: ([a-z]+)\\?-([0-9a-f]{4})_$/, '$1Ref: $2-$3');
+          body.text = (body.text as string).replace(/((?:\n\n)?)_Ref: ([a-z]+)\\?-([0-9a-f]{4,})_$/, '$1Ref: $2-$3');
           try {
             const res2 = await telegramFetch(`${BASE}/bot${token}/sendMessage`, {
               method: 'POST',

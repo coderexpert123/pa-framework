@@ -15,8 +15,8 @@ export interface WorkerResult {
   evaluatorSummary?: string; // user-facing summary from LLM evaluator when worker is killed
 }
 
-export const MODEL_SWITCH_PATTERN = /^\/models?(?:@\w+)?\s+(claude|gemini|zclaude|codex)\b/i;
-export const DEFAULT_SWITCH_PATTERN = /^\/default(?:@\w+)?(?:\s+(claude|gemini|zclaude|codex))?$/i;
+export const MODEL_SWITCH_PATTERN = /^\/models?(?:@\w+)?\s+(claude|gemini|zclaude|codex|agy)\b/i;
+export const DEFAULT_SWITCH_PATTERN = /^\/default(?:@\w+)?(?:\s+(claude|gemini|zclaude|codex|agy))?$/i;
 export const CODE_PATTERN = /^\/code(?:@\w+)?(?:\s+(.+))?$/i;
 export const RESET_PATTERN = /^\/reset(?:@\w+)?$/i;
 export const NEW_PATTERN = /^\/new(?:@\w+)?(?:\s+(.+))?$/i;
@@ -663,7 +663,7 @@ export function buildWorkerResponse(result: WorkerResult, worker: string): strin
   if (result.success && result.output.trim()) {
     let output = result.output.trim();
 
-    if (worker === 'gemini') {
+    if (worker === 'gemini' || worker === 'agy') {
       const thoughtRegex = /\[Thought: true\]([\s\S]*?)\[Thought: false\]/g;
       const blocks: string[] = [];
       let match;

@@ -43,7 +43,7 @@ node pa/dist/bin/pa.js init
 
 This scaffolds:
 
-- `~/.pa/config.yaml` — worker definitions (4 default workers; you'll customize paths)
+- `~/.pa/config.yaml` — worker definitions (5 default workers; you'll customize paths)
 - `~/.pa/secrets.env` — empty env-var file
 - `~/.pa/skills/`, `~/.pa/logs/`, `~/.pa/skill-drafts/` — runtime directories
 - `~/.pa/codex-skill-translations.json` — codex `/skill` → `$skill` translation patterns

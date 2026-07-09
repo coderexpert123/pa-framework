@@ -114,11 +114,18 @@ All others are skill-specific — see individual skill files.
 
 When set, the framework derives all paths from `${PA_HOME}/` instead of `~/.pa/`. Subdirectory names (skills/, logs/, etc.) remain hardcoded.
 
+## Resource tuning env vars
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `PA_MAX_CONCURRENT_WORKERS` | `3` | Machine-wide cap on concurrently running LLM CLI workers (bot dispatches + LLM skills share the pool via blackboard slot locks). Excess dispatches queue until a slot frees. Set `0` or negative to disable limiting. Evaluator calls are exempt (they run while a slot-holding worker awaits their verdict). Shell/`cmd:` skills are unaffected. |
+| `UV_THREADPOOL_SIZE` | Node default `4` | Recommended `16` for the bot and catchup processes: Node's fs and DNS lookups share this libuv pool, so heavy disk I/O can starve DNS and take all networking down with it. Set it in the process launcher (Task Scheduler wrapper, systemd unit, shell profile) — it must exist before Node starts. |
+
 ## `pa init` defaults
 
 Running `node pa/dist/bin/pa.js init` scaffolds:
 
-- A minimal `config.yaml` with 4 default workers (zclaude, gemini, codex, claude) at standard PATH-resolved commands
+- A minimal `config.yaml` with 5 default workers (zclaude, gemini, codex, claude, agy) at standard PATH-resolved commands
 - An empty `secrets.env` (you fill it in)
 - The codex-skill-translations.json + brain-files.json (defaults)
 - The `skills/`, `logs/`, `skill-drafts/` directories

@@ -125,6 +125,48 @@ describe('analyzer', () => {
       assert.equal(proposals[0].name, 'valid-skill');
     });
 
+    it('parses target_skill as a top-level field, not nested under frontmatter', () => {
+      const raw = JSON.stringify([
+        {
+          name: 'reminders-fix',
+          reason: 'r',
+          source_message_ids: [],
+          target_skill: 'reminders',
+          frontmatter: { timeout: 300 },
+          prompt: 'Fixed prompt.',
+        },
+      ]);
+      const proposals = parseProposalResponse(raw);
+      assert.equal(proposals.length, 1);
+      assert.equal(proposals[0].target_skill, 'reminders');
+      assert.equal((proposals[0].frontmatter as any).target_skill, undefined);
+    });
+
+    it('omits target_skill (undefined, not empty string) when absent', () => {
+      const raw = JSON.stringify([
+        { name: 'new-skill', reason: 'r', source_message_ids: [], frontmatter: {}, prompt: 'p.' },
+      ]);
+      const proposals = parseProposalResponse(raw);
+      assert.equal(proposals[0].target_skill, undefined);
+    });
+
+    it('treats an explicit null target_skill the same as omitted (valid, no target)', () => {
+      const raw = JSON.stringify([
+        { name: 'diagnostic-skill', reason: 'r', source_message_ids: [], target_skill: null, frontmatter: {}, prompt: 'p.' },
+      ]);
+      const proposals = parseProposalResponse(raw);
+      assert.equal(proposals.length, 1);
+      assert.equal(proposals[0].target_skill, undefined);
+    });
+
+    it('drops the whole proposal when target_skill is present but malformed', () => {
+      const raw = JSON.stringify([
+        { name: 'valid', reason: 'r', source_message_ids: [], target_skill: 'bad name!', frontmatter: {}, prompt: 'p.' },
+      ]);
+      const proposals = parseProposalResponse(raw);
+      assert.equal(proposals.length, 0);
+    });
+
     it('returns empty array for empty JSON array', () => {
       assert.deepEqual(parseProposalResponse('[]'), []);
     });

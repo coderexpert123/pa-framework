@@ -52,7 +52,7 @@ export function isRateLimited(worker: WorkerConfig, result: CommandResult): Rate
   //         separate from agent text — never scan output for these.
   // claude/zclaude: rate-limit text can appear in the stream output, so scan both; but patterns
   //                 must be specific phrases seen in real errors, not broad heuristics.
-  const combined = (worker.name === 'codex' || worker.name === 'gemini')
+  const combined = (worker.name === 'codex' || worker.name === 'gemini' || worker.name === 'agy')
     ? (result.error || '')
     : `${result.output}\n${result.error || ''}`;
   const lower = combined.toLowerCase();

@@ -26,7 +26,7 @@ Use it to build your own personal automation: inbox triage, periodic reports, re
                          │
 ┌────────────────────────┴────────────────────────────────────┐
 │  Worker pool         pa/src/{workers,worker-exec,...}       │
-│  (claude/gemini/codex/zclaude failover, rate-limit parsing) │
+│  (claude/gemini/codex/zclaude/agy failover, rate-limit)     │
 └────────────────────────┬────────────────────────────────────┘
                          │
 ┌────────────────────────┴────────────────────────────────────┐

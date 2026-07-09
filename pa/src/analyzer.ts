@@ -129,12 +129,18 @@ export function parseProposalResponse(raw: string): DraftProposal[] {
   const proposals: DraftProposal[] = [];
   for (const item of parsed) {
     if (typeof item !== 'object' || item === null) continue;
-    const { name, reason, source_message_ids, frontmatter, prompt } = item as Record<string, unknown>;
+    const { name, reason, source_message_ids, frontmatter, prompt, target_skill } = item as Record<string, unknown>;
 
     if (typeof name !== 'string' || !name.trim()) continue;
     if (typeof reason !== 'string' || !reason.trim()) continue;
     if (typeof prompt !== 'string' || !prompt.trim()) continue;
     if (!/^[a-zA-Z0-9_-]+$/.test(name)) continue; // injection guard
+    // target_skill (when present and non-null) names an *existing* skill — same charset as
+    // skill names, and must pass loadSkill()'s own traversal guard later. `null`/omitted both
+    // mean "no target" (e.g. a brand-new skill, or failure-analyzer's diagnostic-skill option)
+    // — only a non-null value that fails the shape check is treated as malformed.
+    if (target_skill !== undefined && target_skill !== null
+      && (typeof target_skill !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(target_skill))) continue;
 
     proposals.push({
       name: name.trim(),
@@ -146,6 +152,7 @@ export function parseProposalResponse(raw: string): DraftProposal[] {
         ? frontmatter as Partial<DraftProposal['frontmatter']>
         : {},
       prompt: prompt.trim(),
+      ...(typeof target_skill === 'string' && target_skill.trim() ? { target_skill: target_skill.trim() } : {}),
     });
   }
 

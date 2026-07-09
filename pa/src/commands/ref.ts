@@ -20,7 +20,15 @@ export async function refCommand(refId: string | undefined): Promise<void> {
   if (record.chatId !== undefined || record.threadId !== undefined) {
     lines.push(`chat/thread: ${record.chatId ?? '?'} / ${record.threadId ?? '?'}`);
   }
-  if (record.messageId !== undefined) lines.push(`message_id: ${record.messageId}`);
+  if (record.messageId !== undefined) {
+    lines.push(`message_id: ${record.messageId}`);
+    // Generate a direct Telegram link for supergroup messages (chatId starts with -100)
+    const chatStr = String(record.chatId ?? '');
+    if (chatStr.startsWith('-100') && record.messageId) {
+      const groupId = chatStr.slice(4); // strip leading "-100"
+      lines.push(`telegram:   https://t.me/c/${groupId}/${record.messageId}`);
+    }
+  }
   if (record.sessionId) lines.push(`session_id: ${record.sessionId}`);
   lines.push(`source:     ${record.source}`);
   lines.push('---');

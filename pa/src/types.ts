@@ -98,6 +98,7 @@ export interface SkillFrontmatter {
   cmd?: string;                  // direct shell command to execute (bypasses LLM if set)
   topic?: string;                // optional custom topic name for partitioning (replaces queue/priority)
   telegram_output?: TelegramOutput; // if set, pa run delivers LLM output to this Telegram chat/thread
+  critical?: boolean;            // if true, self-improver never autonomously approves changes targeting this skill
 }
 
 export interface Skill {
@@ -111,10 +112,13 @@ export interface DraftMeta {
   proposed_at: string;
   reason: string;
   source_turns: string[];
-  status: 'pending' | 'approved' | 'rejected';
+  status: 'pending' | 'approved' | 'rejected' | 'rejected_post_rollback';
   fingerprint: string;
-  source_type: 'conversation' | 'failure';
+  source_type: 'conversation' | 'failure' | 'feedback';
   reviewed_at?: string;
+  target_skill?: string;          // for fix/reinforce drafts: which existing skill this targets (manual-review visibility only)
+  approved_autonomously?: boolean; // true if self-improver approved/applied this without human review
+  applied_in_place?: boolean;      // true if this was applied via applyFix() (overwrote target_skill's skill.md) rather than approveDraft() (deployed as its own new skill)
 }
 
 export interface DraftProposal {
@@ -123,6 +127,7 @@ export interface DraftProposal {
   source_message_ids: string[];
   frontmatter: Partial<SkillFrontmatter>;
   prompt: string;
+  target_skill?: string; // set by failure-analyzer.ts/feedback-analyzer.ts for fix/reinforce proposals — the existing skill this proposal targets. Proposal-authoring metadata, NOT part of SkillFrontmatter (never written into a deployed skill.md).
 }
 
 export interface RunMeta {

@@ -21,30 +21,67 @@ export function computeFingerprint(_name: string, prompt: string): string {
     .digest('hex');
 }
 
+/**
+ * Serialize a (partial or full) SkillFrontmatter + prompt into skill.md content.
+ * Shared by saveDraft() (sparse, LLM-authored frontmatter) and applyFix() in validator.ts
+ * (full frontmatter from an existing deployed skill, via loadSkill()) so both stay in sync
+ * on which fields round-trip to disk.
+ *
+ * Note: fields that loadSkill() always defaults (on_missed, timeout, idle_timeout,
+ * inject_triggers, no_fallback, topic) will always be written explicitly when serializing
+ * a full loaded Skill's frontmatter, even if the original skill.md omitted them — harmless
+ * (same effective value) but slightly more verbose than the source file. Not worth the extra
+ * complexity of tracking which fields were explicitly authored vs. defaulted.
+ */
+export function serializeSkillMd(frontmatter: Partial<SkillFrontmatter>, prompt: string): string {
+  const fm: Record<string, any> = {};
+  if (frontmatter.cron) fm.cron = frontmatter.cron;
+  if (frontmatter.on_missed) fm.on_missed = frontmatter.on_missed;
+  if (frontmatter.cwd) fm.cwd = frontmatter.cwd;
+  if (frontmatter.secrets) fm.secrets = frontmatter.secrets;
+  if (frontmatter.timeout) fm.timeout = frontmatter.timeout;
+  if (frontmatter.idle_timeout) fm.idle_timeout = frontmatter.idle_timeout;
+  if (frontmatter.trigger_description) fm.trigger_description = frontmatter.trigger_description;
+  if (frontmatter.inject_triggers) fm.inject_triggers = frontmatter.inject_triggers;
+  if (frontmatter.worker) fm.worker = frontmatter.worker;
+  if (frontmatter.no_fallback) fm.no_fallback = frontmatter.no_fallback;
+  if (frontmatter.cmd) fm.cmd = frontmatter.cmd;
+  if (frontmatter.topic) fm.topic = frontmatter.topic;
+  if (frontmatter.critical) fm.critical = frontmatter.critical;
+  if (frontmatter.telegram_output) fm.telegram_output = frontmatter.telegram_output;
+
+  return Object.keys(fm).length > 0
+    ? `---\n${yamlStringify(fm).trim()}\n---\n\n${prompt}`
+    : prompt;
+}
+
+/**
+ * Find the first unused name among baseName, baseName-2, baseName-3, ... by checking
+ * both skillsDir() and draftsDir(). Used to avoid isDuplicate()'s by-name check silently
+ * dropping a genuinely new fix/reinforce proposal just because an earlier, unrelated fix
+ * for the same target skill already occupies the plain "<target>-fix" name.
+ */
+export async function uniqueDraftName(baseName: string): Promise<string> {
+  let candidate = baseName;
+  let suffix = 2;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const takenAsSkill = await stat(join(skillsDir(), candidate)).then(() => true, () => false);
+    const takenAsDraft = await stat(join(draftsDir(), candidate)).then(() => true, () => false);
+    if (!takenAsSkill && !takenAsDraft) return candidate;
+    candidate = `${baseName}-${suffix}`;
+    suffix++;
+  }
+}
+
 export async function saveDraft(
   proposal: DraftProposal,
-  sourceType: 'conversation' | 'failure'
+  sourceType: 'conversation' | 'failure' | 'feedback'
 ): Promise<void> {
   const dir = join(draftsDir(), proposal.name);
   await mkdir(dir, { recursive: true });
 
-  // Build skill.md content
-  const fm: Record<string, any> = {};
-  if (proposal.frontmatter.cron) fm.cron = proposal.frontmatter.cron;
-  if (proposal.frontmatter.on_missed) fm.on_missed = proposal.frontmatter.on_missed;
-  if (proposal.frontmatter.cwd) fm.cwd = proposal.frontmatter.cwd;
-  if (proposal.frontmatter.secrets) fm.secrets = proposal.frontmatter.secrets;
-  if (proposal.frontmatter.timeout) fm.timeout = proposal.frontmatter.timeout;
-  if (proposal.frontmatter.idle_timeout) fm.idle_timeout = proposal.frontmatter.idle_timeout;
-  if (proposal.frontmatter.trigger_description) fm.trigger_description = proposal.frontmatter.trigger_description;
-  if (proposal.frontmatter.inject_triggers) fm.inject_triggers = proposal.frontmatter.inject_triggers;
-  if (proposal.frontmatter.worker) fm.worker = proposal.frontmatter.worker;
-  if (proposal.frontmatter.telegram_output) fm.telegram_output = proposal.frontmatter.telegram_output;
-
-  const skillContent = Object.keys(fm).length > 0
-    ? `---\n${yamlStringify(fm).trim()}\n---\n\n${proposal.prompt}`
-    : proposal.prompt;
-
+  const skillContent = serializeSkillMd(proposal.frontmatter, proposal.prompt);
   await writeFile(draftSkillPath(proposal.name), skillContent, 'utf8');
 
   const meta: DraftMeta = {
@@ -54,6 +91,7 @@ export async function saveDraft(
     status: 'pending',
     fingerprint: computeFingerprint(proposal.name, proposal.prompt),
     source_type: sourceType,
+    ...(proposal.target_skill ? { target_skill: proposal.target_skill } : {}),
   };
 
   await writeFile(draftMetaPath(proposal.name), JSON.stringify(meta, null, 2), 'utf8');
@@ -96,6 +134,7 @@ export async function loadDraft(name: string): Promise<{ skill: Skill; meta: Dra
     inject_triggers: !!fm.inject_triggers,
     worker: fm.worker,
     telegram_output: telegramOutput,
+    critical: !!fm.critical,
   };
 
   const skill: Skill = { name, path: skillPath, frontmatter, prompt: body };
@@ -138,8 +177,20 @@ export async function listDrafts(
   return results;
 }
 
-export async function approveDraft(name: string): Promise<void> {
-  const { skill, meta } = await loadDraft(name);
+/**
+ * Update a draft's meta.json only — no skillsDir() deployment. Used by rejectDraft(),
+ * and by applyFix() in validator.ts, which deploys by overwriting target_skill's own
+ * skill.md directly (not by copying the draft under its own name) and only needs this
+ * function for the approval bookkeeping/audit-trail record.
+ */
+export async function markDraftMeta(name: string, updates: Partial<DraftMeta>): Promise<void> {
+  const { meta } = await loadDraft(name);
+  const updated: DraftMeta = { ...meta, ...updates, reviewed_at: updates.reviewed_at ?? new Date().toISOString() };
+  await writeFile(draftMetaPath(name), JSON.stringify(updated, null, 2), 'utf8');
+}
+
+export async function approveDraft(name: string, extra?: Partial<DraftMeta>): Promise<void> {
+  await loadDraft(name); // validates the draft exists and is readable before deploying
 
   const targetDir = join(skillsDir(), name);
   const targetSkill = join(targetDir, 'skill.md');
@@ -156,14 +207,11 @@ export async function approveDraft(name: string): Promise<void> {
   await mkdir(targetDir, { recursive: true });
   await copyFile(draftSkillPath(name), targetSkill);
 
-  const updated: DraftMeta = { ...meta, status: 'approved', reviewed_at: new Date().toISOString() };
-  await writeFile(draftMetaPath(name), JSON.stringify(updated, null, 2), 'utf8');
+  await markDraftMeta(name, { status: 'approved', ...extra });
 }
 
 export async function rejectDraft(name: string): Promise<void> {
-  const { meta } = await loadDraft(name);
-  const updated: DraftMeta = { ...meta, status: 'rejected', reviewed_at: new Date().toISOString() };
-  await writeFile(draftMetaPath(name), JSON.stringify(updated, null, 2), 'utf8');
+  await markDraftMeta(name, { status: 'rejected' });
 }
 
 export async function isDuplicate(proposal: DraftProposal): Promise<boolean> {

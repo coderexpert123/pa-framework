@@ -13,7 +13,7 @@ export interface DlqEntry {
   text: string;
   timestamp: string;
   updateId: number;
-  refId?: string;        // bot reply debug handle (e.g., 'c-a59a') — preserved for `pa ref` lookups while queued
+  refId?: string;        // bot reply debug handle (e.g., 's-a1b2c3d4e5f6') — preserved for `pa ref` lookups while queued
 }
 
 function dlqPath(): string {
@@ -79,8 +79,13 @@ async function writeDlqInner(entries: DlqEntry[]): Promise<void> {
   await rename(tmp, path);
 }
 
-// flushDlq runs at startup before the poll loop begins, so appendDlq callers
-// should not exist yet. The mutex still protects against future overlap.
+// flushDlq runs at startup before the poll loop begins AND on the poll loop's
+// 5-minute maintenance tick (Phase 1) — i.e. concurrently with live reply-path
+// appendDlq calls. The FIFO mutex is what makes that safe: flush and append
+// serialize, so a reply can never be appended mid-flush and lost in the
+// rewrite. The tick-side caller keeps at most one flush in flight (see
+// maintFlushInFlight in main.ts) so a slow flush during an outage can't pile
+// queued flushes onto this mutex ahead of live appends.
 // NOTE: this mutex is per-process. If another process ever writes the DLQ,
 // upgrade to proper-lockfile here.
 async function flushDlqInner(token: string): Promise<{ delivered: number; remaining: number; deduped: number }> {

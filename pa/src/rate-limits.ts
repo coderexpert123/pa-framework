@@ -1,7 +1,9 @@
 import { mkdir, readFile, rename, stat, writeFile } from 'fs/promises';
 import { dirname, join } from 'path';
 import { homedir } from 'os';
+import { randomBytes } from 'crypto';
 import lockfile from 'proper-lockfile';
+import { safeLockOptions } from './lib/safe-lock.js';
 
 export type RateLimitClassification =
   | 'quota-daily'
@@ -116,7 +118,7 @@ export async function classifyRateLimit(
     return result;
   }
 
-  if (worker === 'gemini') {
+  if (worker === 'gemini' || worker === 'agy') {
     // Google API 429 / RESOURCE_EXHAUSTED in stderr. Returns null for non-rate-limit stderr.
     const { classifyGeminiError } = await import('./rate-limits-gemini.js');
     const result = classifyGeminiError(stderr) ?? null;
@@ -182,7 +184,7 @@ async function withRateLimitLock<T>(fn: () => Promise<T>): Promise<T> {
   try {
     const path = statePath();
     await ensureStateFile();
-    const release = await lockfile.lock(path, { retries: 10, realpath: false });
+    const release = await lockfile.lock(path, safeLockOptions('rate-limits', { retries: 10, realpath: false }));
     try {
       return await fn();
     } finally {
@@ -221,7 +223,10 @@ async function loadState(): Promise<RateLimitState> {
 
 async function saveState(state: RateLimitState): Promise<void> {
   const path = statePath();
-  const tmp = path + '.tmp';
+  // Unique per-write tmp name: a FIXED tmp path races under concurrent
+  // writers (writer A renames while writer B is mid-writeFile into the same
+  // tmp → EPERM on Windows). Same fix class as logger.ts's pointer writes.
+  const tmp = `${path}.${process.pid.toString(36)}-${randomBytes(3).toString('hex')}.tmp`;
   await writeFile(tmp, JSON.stringify(state, null, 2), 'utf8');
   await rename(tmp, path);
   cache = state;

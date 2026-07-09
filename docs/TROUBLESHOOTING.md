@@ -164,7 +164,7 @@ Then `pa list` will show it.
 
 ### "Worker 'zclaude' check failed or script missing"
 
-The default `pa init` config lists 4 workers by name (zclaude, claude, gemini, codex). If none are installed, `pa run` fails immediately.
+The default `pa init` config lists 5 workers by name (zclaude, gemini, codex, claude, agy). If none are installed, `pa run` fails immediately.
 
 Fix: install at least one of:
 - Claude Code: [installation guide](https://github.com/anthropics/claude-code)

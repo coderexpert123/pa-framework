@@ -2,6 +2,7 @@ import { join } from 'path';
 import fs from 'fs-extra';
 import lockfile from 'proper-lockfile';
 import { paHome } from './paths.js';
+import { safeLockOptions } from './lib/safe-lock.js';
 
 export interface LockEntry {
   resource: string;
@@ -95,7 +96,7 @@ export class Blackboard {
       // Use proper-lockfile to ensure atomic access to blackboard.json
       let release: (() => Promise<void>) | undefined;
       try {
-        release = await lockfile.lock(this.path, { retries: 5 });
+        release = await lockfile.lock(this.path, safeLockOptions('blackboard', { retries: 5 }));
 
         const data = await this.readData();
         const now = new Date();
@@ -177,7 +178,7 @@ export class Blackboard {
     await this.ensureFile();
     let release: (() => Promise<void>) | undefined;
     try {
-      release = await lockfile.lock(this.path, { retries: 5 });
+      release = await lockfile.lock(this.path, safeLockOptions('blackboard', { retries: 5 }));
       const data = await this.readData();
       const activeLocks = data.active_locks.filter(
         (l) => !(l.resource === resource && l.agent === agent && (!contextId || l.contextId === contextId))
@@ -201,7 +202,7 @@ export class Blackboard {
     await this.ensureFile();
     let release: (() => Promise<void>) | undefined;
     try {
-      release = await lockfile.lock(this.path, { retries: 3 });
+      release = await lockfile.lock(this.path, safeLockOptions('blackboard', { retries: 3 }));
       const data = await this.readData();
       const entry = data.active_locks.find(
         (l) => l.resource === resource && l.agent === agent && (!contextId || l.contextId === contextId)
@@ -236,7 +237,7 @@ export class Blackboard {
     await this.ensureFile();
     let release: (() => Promise<void>) | undefined;
     try {
-      release = await lockfile.lock(this.path, { retries: 5 });
+      release = await lockfile.lock(this.path, safeLockOptions('blackboard', { retries: 5 }));
       const data = await this.readData();
       const before = data.active_locks.length;
       const now = new Date();

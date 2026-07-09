@@ -7,6 +7,7 @@ import { blackboard } from '../blackboard.js';
 import { paHome, logsDir } from '../paths.js';
 import { learnCommand } from './learn.js';
 import { rotateLogs, getLastSuccessfulRun } from '../logger.js';
+import { pruneArchive } from '../lib/archive-files.js';
 import { cleanupOrphanedWorkers } from '../worker-pids.js';
 import { listSkills } from '../skills.js';
 import { log } from '../lib/log.js';
@@ -27,9 +28,20 @@ export async function catchupCommand(opts: CatchupOptions = {}): Promise<void> {
     return;
   }
 
+  // Heartbeat the lock while the run is in flight: acquireLock purges any
+  // lock whose heartbeat is older than HEARTBEAT_STALE_MS (10 min) even when
+  // the holder is alive, and catchup runs can exceed that (skill execution +
+  // rotation + prune). Without this, Task Scheduler's next 15-min invocation
+  // would steal the lock mid-run and two catchups would overlap.
+  const heartbeat = setInterval(() => {
+    void blackboard.updateHeartbeat(lockKey, 'catchup-command').catch(() => {});
+  }, 60_000);
+  heartbeat.unref?.();
+
   try {
     await runCatchup(opts);
   } finally {
+    clearInterval(heartbeat);
     await blackboard.releaseLock(lockKey, 'catchup-command');
   }
 }
@@ -129,6 +141,12 @@ async function runCatchup(opts: CatchupOptions): Promise<void> {
 
     // Rotate old logs for all skills
     await rotateAllLogs();
+
+    // Prune ~/.pa/archive/ so rotated 5MB shards don't accumulate forever
+    // (rotation renames into archive/ but nothing else ever deleted from it).
+    await pruneArchive().catch((err) => {
+      console.error('[catchup] Archive prune failed:', err);
+    });
 
     // Weekly skill learning — always runs regardless of whether skills were overdue
     await maybeRunLearn();

@@ -10,23 +10,23 @@ import { rmRetry } from './rm-retry.js';
 describe('makeRefId', { concurrency: 1 }, () => {
   it('returns s-xxxx format by default', () => {
     const id = makeRefId();
-    assert.match(id, /^s-[0-9a-f]{4}$/);
+    assert.match(id, /^s-[0-9a-f]{12}$/);
   });
 
   it('uses the given prefix verbatim', () => {
     const id = makeRefId('z');
-    assert.match(id, /^z-[0-9a-f]{4}$/);
+    assert.match(id, /^z-[0-9a-f]{12}$/);
   });
 
   it('uses multi-char prefix verbatim (callers must pass single char if desired)', () => {
     const id = makeRefId('zclaude');
-    assert.match(id, /^zclaude-[0-9a-f]{4}$/);
+    assert.match(id, /^zclaude-[0-9a-f]{12}$/);
   });
 
   it('produces different values on successive calls (randomness)', () => {
     const a = makeRefId();
     const b = makeRefId();
-    // Extremely low probability of collision (1/65536); retry once to be safe
+    // Extremely low probability of collision (1 in 2^48 at 6 random bytes); retry once to be safe
     const c = makeRefId();
     assert.ok(a !== b || a !== c, 'makeRefId should produce unique values');
   });
@@ -35,7 +35,7 @@ describe('makeRefId', { concurrency: 1 }, () => {
 describe('appendRefId', { concurrency: 1 }, () => {
   it('appends ref ID with default s prefix', () => {
     const result = appendRefId('hello');
-    assert.match(result, /^hello\n\n_Ref: s-[0-9a-f]{4}_$/);
+    assert.match(result, /^hello\n\n_Ref: s-[0-9a-f]{12}_$/);
   });
 
   it('trims leading and trailing whitespace from input', () => {
@@ -46,7 +46,7 @@ describe('appendRefId', { concurrency: 1 }, () => {
 
   it('uses supplied prefix', () => {
     const result = appendRefId('hello', 'c');
-    assert.match(result, /^hello\n\n_Ref: c-[0-9a-f]{4}_$/);
+    assert.match(result, /^hello\n\n_Ref: c-[0-9a-f]{12}_$/);
   });
 });
 
@@ -76,7 +76,7 @@ describe('appendRefIdAndLog', { concurrency: 1 }, () => {
 
   it('returns text with ref appended (default s- prefix)', () => {
     const result = appendRefIdAndLog('hello', { kind: 'pin', chatId: 1, threadId: 2 });
-    assert.match(result, /^hello\n\n_Ref: s-[0-9a-f]{4}_$/);
+    assert.match(result, /^hello\n\n_Ref: s-[0-9a-f]{12}_$/);
   });
 
   it('logs an app.log entry with module=bot, message="system message sent", and full context', async () => {
@@ -89,7 +89,7 @@ describe('appendRefIdAndLog', { concurrency: 1 }, () => {
     assert.equal(entry.chatId, 42);
     assert.equal(entry.threadId, 7);
     assert.equal(entry.textPreview, 'hello world');
-    assert.match(entry.refId, /^s-[0-9a-f]{4}$/);
+    assert.match(entry.refId, /^s-[0-9a-f]{12}$/);
   });
 
   it('truncates textPreview to 500 chars', async () => {

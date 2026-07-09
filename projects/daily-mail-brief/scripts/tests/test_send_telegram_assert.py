@@ -149,11 +149,16 @@ class TestFailureMode(unittest.TestCase):
         import send_telegram
         mod = send_telegram
 
-        with patch.object(mod, 'send') as mock_send:
+        # send_telegram.py delegates to pa/src/telegram_notify.py's send_text
+        # (not the old self-contained send() this test used to patch — removed
+        # in the delegation rewrite). mod.send_text is the module-level binding
+        # created by `from telegram_notify import send_document, send_text`,
+        # so patching it here correctly intercepts main()'s call.
+        with patch.object(mod, 'send_text') as mock_send_text:
             with patch('sys.argv', ['send_telegram.py', briefing]):
                 mod.main()
-            mock_send.assert_called_once()
-            sent_text = mock_send.call_args[0][0]
+            mock_send_text.assert_called_once()
+            sent_text = mock_send_text.call_args[0][0]
             self.assertIn("Failure notice", sent_text)
 
         shutil.rmtree(tmpdir, ignore_errors=True)

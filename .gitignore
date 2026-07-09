@@ -33,6 +33,12 @@ __pycache__/
 *.csv
 *.pdf
 *.log
+# Atomic-write crash artifacts (learn_agent.py mkstemp tmps) + the regenerable
+# ecosystem-kb mining watermark. The archive ITSELF (profile-history-archive.jsonl)
+# is deliberately tracked — it's the only durable copy of evicted profile facts,
+# consistent with profile.json being tracked in this private repo.
+pa/data/*.tmp
+pa/data/profile-history-archive.kb-watermark.json
 
 # Secrets
 **/credentials.json

@@ -4,6 +4,8 @@ import os
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO
 from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 
@@ -113,9 +115,10 @@ class TestStateAdvancementLogic(RunBriefTestCase):
 
         return fake_run_py
 
+    @patch("run_brief.load_portfolio_context", return_value="")
     @patch("run_brief.run_py")
     @patch("run_brief.call_gemini")
-    def test_state_written_after_gemini_success(self, mock_gemini, mock_run_py):
+    def test_state_written_after_gemini_success(self, mock_gemini, mock_run_py, _mock_portfolio_context):
         """When Gemini succeeds, PA_HOME state gets window_end_utc from fetch output."""
         fetch_data = self._make_fetch_data()
         mock_run_py.side_effect = self._patch_run_py(fetch_data)
@@ -139,9 +142,10 @@ class TestStateAdvancementLogic(RunBriefTestCase):
             state = json.load(f)
         self.assertEqual(state["last_window_end_utc"], "2026-05-17T13:30:00+00:00")
 
+    @patch("run_brief.load_portfolio_context", return_value="")
     @patch("run_brief.run_py")
     @patch("run_brief.call_gemini")
-    def test_state_not_written_when_gemini_fails(self, mock_gemini, mock_run_py):
+    def test_state_not_written_when_gemini_fails(self, mock_gemini, mock_run_py, _mock_portfolio_context):
         """When Gemini fails both attempts, state must NOT be written."""
         fetch_data = self._make_fetch_data()
         mock_run_py.side_effect = self._patch_run_py(fetch_data)
@@ -155,9 +159,10 @@ class TestStateAdvancementLogic(RunBriefTestCase):
 
         self.assertFalse(os.path.exists(self.state_path()), "State must NOT be written when Gemini fails")
 
+    @patch("run_brief.load_portfolio_context", return_value="")
     @patch("run_brief.run_py")
     @patch("run_brief.call_gemini")
-    def test_fetch_failed_written_on_gemini_failure(self, mock_gemini, mock_run_py):
+    def test_fetch_failed_written_on_gemini_failure(self, mock_gemini, mock_run_py, _mock_portfolio_context):
         """On Gemini failure, the PA_HOME failure marker must be written."""
         fetch_data = self._make_fetch_data()
         mock_run_py.side_effect = self._patch_run_py(fetch_data)
@@ -179,10 +184,11 @@ class TestStateAdvancementLogic(RunBriefTestCase):
         self.assertIsNotNone(content, "Failure marker must be valid JSON")
         self.assertEqual(content.get("status"), "gemini")
 
+    @patch("run_brief.load_portfolio_context", return_value="")
     @patch("run_brief.detect_portfolio_statement_emails", return_value=[])
     @patch("run_brief.run_py")
     @patch("run_brief.call_gemini")
-    def test_retry_succeeds_on_second_attempt(self, mock_gemini, mock_run_py, _mock_detect):
+    def test_retry_succeeds_on_second_attempt(self, mock_gemini, mock_run_py, _mock_detect, _mock_portfolio_context):
         """State is advanced when first Gemini attempt fails but second succeeds."""
         fetch_data = self._make_fetch_data()
         mock_run_py.side_effect = self._patch_run_py(fetch_data)
@@ -213,9 +219,10 @@ class TestStateAdvancementLogic(RunBriefTestCase):
         self.assertEqual(call_count["n"], 2, "Gemini must be called exactly twice for brief retry")
         self.assertTrue(os.path.exists(self.state_path()), "State must exist after retry success")
 
+    @patch("run_brief.load_portfolio_context", return_value="")
     @patch("run_brief.run_py")
     @patch("run_brief.call_gemini")
-    def test_state_not_written_when_telegram_send_fails(self, mock_gemini, mock_run_py):
+    def test_state_not_written_when_telegram_send_fails(self, mock_gemini, mock_run_py, _mock_portfolio_context):
         """Primary delivery failure must not advance state."""
         fetch_data = self._make_fetch_data()
         mock_gemini.return_value = (
@@ -322,6 +329,24 @@ class TestDetectPortfolioStatementEmails(unittest.TestCase):
         "subject": "Sensex rallies 500 points; Nifty at all-time high",
         "snippet": "Markets surged today as NSE and BSE saw heavy buying in banking stocks.",
     }
+    exampleprovider_EMAIL = {
+        "id": "exampleprovider001",
+        "from": "Example Sender <sender@example.com>",
+        "subject": "MONTHLY REPORT- TESTOWNER CLIENT",
+        "snippet": "Please find attached your monthly portfolio report from Example Wealth.",
+    }
+    examplebank_ALERT_EMAIL = {
+        "id": "examplebank001",
+        "from": "alerts@examplebank.bank.in",
+        "subject": "A payment was made using your Credit Card",
+        "snippet": "Dear Customer, Rs. 11178.38 has been debited from your examplebank Bank Credit Card.",
+    }
+    examplebroker2_CONTRACT_NOTE_EMAIL = {
+        "id": "examplebroker2001",
+        "from": "noreply@examplebroker2.com",
+        "subject": "Contract Note for 03-Jul-2026",
+        "snippet": "Please find attached your contract note for trades executed today.",
+    }
 
     @patch("run_brief.call_gemini")
     def test_portfolio_statement_triggers(self, mock_gemini):
@@ -387,6 +412,47 @@ class TestDetectPortfolioStatementEmails(unittest.TestCase):
         self.assertEqual(result, [])
         mock_gemini.assert_not_called()  # should fail before reaching call_gemini
 
+    @patch("run_brief.call_gemini")
+    def test_exampleprovider_statement_triggers(self, mock_gemini):
+        mock_gemini.return_value = '["exampleprovider001"]'
+        result = run_brief.detect_portfolio_statement_emails([self.exampleprovider_EMAIL])
+        self.assertEqual(result, ["exampleprovider001"])
+
+    @patch("run_brief.call_gemini")
+    def test_examplebank_bank_alert_does_not_trigger(self, mock_gemini):
+        # Routine examplebank transactional alerts must not be flagged as portfolio statements
+        # (this was the primary source of near-daily false triggers before the prompt fix)
+        mock_gemini.return_value = "[]"
+        result = run_brief.detect_portfolio_statement_emails([self.examplebank_ALERT_EMAIL])
+        self.assertEqual(result, [])
+
+    @patch("run_brief.call_gemini")
+    def test_examplebroker2_contract_note_does_not_trigger(self, mock_gemini):
+        # Other-broker statements must not fire the ad-hoc trigger — only exampleprovider should
+        mock_gemini.return_value = "[]"
+        result = run_brief.detect_portfolio_statement_emails([self.examplebroker2_CONTRACT_NOTE_EMAIL])
+        self.assertEqual(result, [])
+
+    @patch("run_brief.call_gemini")
+    def test_detect_triggers_logs_matched_sender_and_subject(self, mock_gemini):
+        mock_gemini.return_value = '["exampleprovider001"]'
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            run_brief.detect_triggers([self.exampleprovider_EMAIL])
+        logged = stderr.getvalue()
+        self.assertIn("MONTHLY REPORT- TESTOWNER CLIENT", logged)
+        self.assertIn("Example Sender", logged)
+
+    @patch("run_brief.call_gemini")
+    def test_detect_triggers_mixed_batch_only_exampleprovider_triggers(self, mock_gemini):
+        # A batch containing both a genuine exampleprovider email and noise (examplebank alert, news)
+        # should trigger only on the exampleprovider match.
+        mock_gemini.return_value = '["exampleprovider001"]'
+        result = run_brief.detect_triggers(
+            [self.exampleprovider_EMAIL, self.examplebank_ALERT_EMAIL, self.NEWS_EMAIL]
+        )
+        self.assertIn("portfolio-reports", result)
+
 
 class TestPreflightFailurePath(RunBriefTestCase):
     """Preflight failure must write .fetch-failed.json before send_telegram so assertion is bypassed."""
@@ -414,6 +480,111 @@ class TestPreflightFailurePath(RunBriefTestCase):
         with open(fetch_failed_path, encoding="utf-8") as f:
             content = json.load(f)
         self.assertEqual(content.get("status"), "auth")
+
+
+class TestLoadPortfolioContext(unittest.TestCase):
+    """load_portfolio_context() is pure file-I/O + parsing (no LLM call) — must be
+    resilient (fail-soft) and correctly scope to non-exampleprovider, non-examplebroker providers."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.json_dir = self._tmp.name
+        self._orig_dir = run_brief.PORTFOLIO_JSON_DIR
+        run_brief.PORTFOLIO_JSON_DIR = self.json_dir
+        # Owner has no default (public-repo hygiene, AI-094) — pin a placeholder.
+        self._orig_owner = run_brief.PORTFOLIO_CONTEXT_OWNER
+        run_brief.PORTFOLIO_CONTEXT_OWNER = "Testowner"
+
+    def tearDown(self):
+        run_brief.PORTFOLIO_JSON_DIR = self._orig_dir
+        run_brief.PORTFOLIO_CONTEXT_OWNER = self._orig_owner
+        self._tmp.cleanup()
+
+    def _write_snapshot(self, filename, report_date, total_values):
+        data = {
+            "report_metadata": {"owner": "Testowner", "report_date": report_date},
+            "summary": [{"asset_class": "Equity", "current_value": v} for v in total_values],
+        }
+        with open(os.path.join(self.json_dir, filename), "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+    def test_unset_owner_disables_grounding(self):
+        # AI-094: no personal-name default — empty owner must fail soft, not match everything.
+        self._write_snapshot("2026-06-01_Testowner_examplebanksec.pdf_FullData.json", "2026-06-01", [100000])
+        run_brief.PORTFOLIO_CONTEXT_OWNER = ""
+        self.assertEqual(run_brief.load_portfolio_context(), "")
+
+    def test_missing_directory_returns_empty_string(self):
+        run_brief.PORTFOLIO_JSON_DIR = os.path.join(self.json_dir, "does-not-exist")
+        self.assertEqual(run_brief.load_portfolio_context(), "")
+
+    def test_empty_directory_returns_empty_string(self):
+        self.assertEqual(run_brief.load_portfolio_context(), "")
+
+    def test_exampleprovider_excluded(self):
+        self._write_snapshot("2026-06-01_Testowner_exampleprovider.pdf_FullData.json", "2026-06-01", [100000])
+        result = run_brief.load_portfolio_context()
+        self.assertEqual(result, "")
+
+    def test_examplebroker_excluded(self):
+        self._write_snapshot("2026-06-01_Testowner_examplebroker.pdf_FullData.json", "2026-06-01", [50000])
+        result = run_brief.load_portfolio_context()
+        self.assertEqual(result, "")
+
+    def test_other_owner_excluded(self):
+        self._write_snapshot("2026-06-01_Otherperson_exampleprovider.pdf_FullData.json", "2026-06-01", [100000])
+        self._write_snapshot("2026-06-01_Otherperson_examplebanksec.pdf_FullData.json", "2026-06-01", [200000])
+        result = run_brief.load_portfolio_context()
+        self.assertEqual(result, "", "Only the primary user's own snapshots should be used for grounding")
+
+    def test_picks_most_recent_file_per_provider(self):
+        self._write_snapshot("2026-01-01_Testowner_examplebanksec.pdf_FullData.json", "2026-01-01", [100000])
+        self._write_snapshot("2026-06-01_Testowner_examplebanksec.pdf_FullData.json", "2026-06-01", [150000])
+        result = run_brief.load_portfolio_context()
+        self.assertIn("150,000", result)
+        self.assertIn("2026-06-01", result)
+        self.assertNotIn("100,000", result)
+
+    def test_multiple_providers_all_included(self):
+        self._write_snapshot("2026-06-01_Testowner_examplebanksec.pdf_FullData.json", "2026-06-01", [100000])
+        self._write_snapshot("2026-06-01_Testowner_Portfolio.pdf_FullData.json", "2026-06-01", [200000])
+        result = run_brief.load_portfolio_context()
+        self.assertIn("examplebanksec", result)
+        self.assertIn("Portfolio", result)
+
+    def test_malformed_json_skipped_without_crashing(self):
+        with open(os.path.join(self.json_dir, "2026-06-01_Testowner_examplebanksec.pdf_FullData.json"), "w") as f:
+            f.write("{not valid json")
+        result = run_brief.load_portfolio_context()
+        self.assertEqual(result, "")
+
+    def test_nonmatching_filename_ignored(self):
+        with open(os.path.join(self.json_dir, "random_notes.txt"), "w") as f:
+            f.write("irrelevant")
+        with open(os.path.join(self.json_dir, "processed_log.json"), "w") as f:
+            f.write("{}")
+        result = run_brief.load_portfolio_context()
+        self.assertEqual(result, "")
+
+    def test_one_malformed_schema_does_not_wipe_out_other_providers(self):
+        # examplebanksec has a schema that would raise (report_metadata is null, and a
+        # non-numeric current_value) — Portfolio is well-formed. The malformed
+        # one must be skipped without discarding the valid one.
+        bad_data = {
+            "report_metadata": None,
+            "summary": [{"asset_class": "Equity", "current_value": "not-a-number"}],
+        }
+        with open(
+            os.path.join(self.json_dir, "2026-06-01_Testowner_examplebanksec.pdf_FullData.json"),
+            "w", encoding="utf-8",
+        ) as f:
+            json.dump(bad_data, f)
+        self._write_snapshot("2026-06-01_Testowner_Portfolio.pdf_FullData.json", "2026-06-01", [200000])
+
+        result = run_brief.load_portfolio_context()
+        self.assertIn("Portfolio", result)
+        self.assertIn("200,000", result)
+        self.assertNotIn("examplebanksec", result)
 
 
 if __name__ == "__main__":

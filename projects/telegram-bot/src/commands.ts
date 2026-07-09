@@ -20,6 +20,8 @@ export const BOT_COMMANDS: BotCommand[] = [
   { command: 'child_of', description: 'Link this topic as a child of a named parent topic' },
   { command: 'merge', description: 'Merge this branch context back into the parent topic' },
   { command: 'keepawake', description: 'Toggle machine keep-awake mode' },
+  { command: 'stop', description: 'Kill the worker currently running in this topic' },
+  { command: 'steer', description: 'Kill the running worker and resume the session with a new prompt (/steer <prompt>; no prompt = /stop)' },
 
   // Pass-through Commands (skipWorker = false)
   { command: 'deep_plan', description: 'Detailed implementation planning skill' },

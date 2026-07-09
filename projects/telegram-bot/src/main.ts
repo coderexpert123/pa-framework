@@ -1,7 +1,7 @@
 import { spawn, execFile } from 'child_process';
 import { randomBytes, randomUUID } from 'crypto';
 import { existsSync, unlinkSync, statSync, writeFileSync, mkdirSync } from 'fs';
-import { readdir, unlink, rename, writeFile, readFile } from 'fs/promises';
+import { readdir, unlink, rename, writeFile, readFile, stat } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
 import { acquireLock, releaseLock } from './lock.js';
@@ -45,7 +45,6 @@ import {
   modelStatusNeedsRefresh,
 } from './logic.js';
 import { getKeepAwakeStatus, toggleKeepAwake } from './keepawake.js';
-import { findSessionForRefId } from './ref-lookup.js';
 import {
   runWithFailover,
   executeWorker,
@@ -59,6 +58,7 @@ import {
 import {
   isSessionValid,
   discoverGeminiSessionId,
+  discoverAgySessionId,
   buildResumeArgs,
   cleanupExpiredSessions,
   getPriorSessionPath,
@@ -66,7 +66,12 @@ import {
 import { computeBackoff, computePollOffset, LONG_POLL_TIMEOUT } from './poll.js';
 import { WatermarkTracker } from './watermark.js';
 import { appendDlq, flushDlq } from './dlq.js';
-import { deliveredKey, wasDelivered, markDelivered } from './delivered-store.js';
+import { deliveredKey, wasDelivered, markDelivered, compactDelivered } from './delivered-store.js';
+import { addPendingDispatch, removePendingDispatch, pendingDispatchKey, listPendingDispatches } from './pending-dispatches.js';
+import { reapOrphanedDispatches } from './orphan-reaper.js';
+import { isTopicRecovering } from './recovery-gate.js';
+import { isDegraded, startHealthProbe } from './health.js';
+import { parseStopSteer, stopTopicWorkers, markTopicStopped, unmarkTopicStopped, isTopicStopped, consumeTopicStopped } from './worker-stop.js';
 import { updateDashboard } from './dashboard.js';
 import type { ConversationState, SessionInfo, PAMeta, ModelStatusSnapshot, ModelStatusReasonCode } from './types.js';
 import { loadTopicNames, updateTopicName, setTopicDescription, extractTopicEvent, loadBranches, addBranch, removeBranch, findBranchParent, getTopicName, type TopicNameMap, type BranchIndex } from './topic-names.js';
@@ -120,6 +125,20 @@ function effectiveCwd(state: ConversationState): string {
 }
 
 const MODEL_SWEEP_INTERVAL_MS = 60_000;
+// Skip topics idle beyond this in the sweep — avoids O(all-topics-ever) lock+
+// read+hydrate work for topics nobody's using. Safe: nothing else discovers
+// topics via directory scan (/branch, /child-of, /merge, ref-lookup all
+// address topic-state files by explicit chatId/threadId), and
+// expirePreferredWorker also runs inline on every per-message reply
+// independent of the sweep, so an idle topic's override self-heals the
+// moment it gets a real message. Skipping only delays a cosmetic pinned
+// status-card refresh on a topic nobody is looking at. See
+// plans/2026-07-08-autonomous-scale-longevity-hardening-phase2.md.
+const TOPIC_SWEEP_STALE_MS = 7 * 24 * 60 * 60 * 1000;
+// Periodic steady-state maintenance (the startup IIFE runs these once; the
+// daemon runs for months, so they must also fire on an interval).
+const MAINTENANCE_INTERVAL_MS = 5 * 60 * 1000;      // DLQ flush/retry + delivered-store compaction
+const SESSION_GC_INTERVAL_MS = 6 * 60 * 60 * 1000;  // worker-session TTL prune (heavier full-tree scan)
 
 function topicKeyFor(chatId: number, threadId: number): string {
   return `${chatId}_${threadId}`;
@@ -264,6 +283,13 @@ export async function runExpiredModelOverrideSweep(
 
   for (const ref of topicRefs) {
     if (!allowedChatIds.has(ref.chatId)) continue;
+
+    try {
+      const st = await stat(ref.path);
+      if (Date.now() - st.mtimeMs > TOPIC_SWEEP_STALE_MS) continue; // idle topic — skip the expensive lock+read+hydrate
+    } catch {
+      continue; // file vanished between listTopicStateRefs() and stat() — nothing to process
+    }
 
     const resourceId = `topic-${ref.chatId}_${ref.threadId}`;
     const contextId = `sweep-${randomUUID()}`;
@@ -576,6 +602,11 @@ export async function dispatchMessage(
   }
 
   if (!dispatchResult) {
+    // AI-092: if the user /stop'd this topic while the (session) attempt above
+    // was being killed, do NOT fail over to a fresh worker for a cancelled request.
+    if (isTopicStopped(resource.replace(/^topic-/, ''), updateId)) {
+      return { response: '', session: state.session, meta: null, workerError: true };
+    }
     let freshResult: { result: CommandResult; worker: string } | undefined;
     if (state.preferred_worker && !failedWorkers.has(state.preferred_worker) && !(await isWorkerCoolingDown(state.preferred_worker))) {
       const preferredWorkerConfig = config.workers.find((w) => w.name === state.preferred_worker);
@@ -620,6 +651,9 @@ export async function dispatchMessage(
     }
 
     if (!freshResult) {
+      if (isTopicStopped(resource.replace(/^topic-/, ''), updateId)) {
+        return { response: '', session: state.session, meta: null, workerError: true };
+      }
       const priorCtxFo = lastFailedSession ? { ...lastFailedSession, sessionPath: getPriorSessionPath(lastFailedSession.worker, lastFailedSession.sessionId, effectiveCwd(state)) } : undefined;
       const failoverPrompt = await buildPrompt(userText, state, topicNames, replyContext, pendingDesc, { omitStatic: false, priorContext: priorCtxFo });
       freshResult = await runWithFailover(failoverPrompt, { cwd: effectiveCwd(state), env: secrets, resource, updateId, excludeWorkers: failedWorkers, onWorkerSwitch: async (payload) => { if (onNotify) await onNotify(payload); }, checkAvailable: async (w) => !(await isWorkerCoolingDown(w.name)), preferredWorker: state.preferred_worker, contextId });
@@ -629,6 +663,7 @@ export async function dispatchMessage(
     let sessionId: string | undefined;
     if (freshResult.worker === 'claude' || freshResult.worker === 'zclaude' || freshResult.worker === 'codex') sessionId = freshResult.result.sessionId;
     else if (freshResult.worker === 'gemini') sessionId = freshResult.result.sessionId ?? (await discoverGeminiSessionId(GEMINI_PROJECT_DIR).catch(() => null)) ?? undefined;
+    else if (freshResult.worker === 'agy') sessionId = freshResult.result.sessionId ?? (await discoverAgySessionId().catch(() => null)) ?? undefined;
     if (sessionId) newSession = { session_id: sessionId, worker: freshResult.worker, started_at: new Date().toISOString() };
     dispatchResult = { ...freshResult, session: newSession };
   }
@@ -640,6 +675,22 @@ export async function dispatchMessage(
     return { response: buildWorkerErrorResponse({ worker: workerName, emptyResponse: true, suggestedWorker }), session: state.session, meta: null, workerError: true };
   }
   return { response: buildWorkerResponse({ ...result, output: cleaned }, workerName), session: capturedSession, meta, rateLimitedWorker, dispatchedWorker: workerName, rateLimitTelemetry: result.rateLimitTelemetry };
+}
+
+/**
+ * Shared by processUpdate's own guard AND the poll loop's enqueue-time
+ * pending-dispatch placeholder write (AI-095 follow-up, deep-recheck
+ * 2026-07-08, Phase 1A) — kept as ONE predicate so the two checks can't
+ * silently drift apart over time (e.g. if the allowed-chat logic later
+ * grows a nuance, updating only one copy would reopen the "no placeholder
+ * for a disallowed chat" gap).
+ */
+function isAcceptableUpdate(update: any, allowedChatIds: Set<number>): boolean {
+  const msg = update?.message;
+  if (!msg) return false;
+  if (!msg.text && !msg.caption) return false;
+  if (!allowedChatIds.has(msg.chat?.id)) return false;
+  return true;
 }
 
 async function processUpdate(
@@ -668,9 +719,8 @@ async function processUpdate(
     }
   }
 
-  if (!msg.text && !msg.caption) return;
+  if (!isAcceptableUpdate(update, allowedChatIds)) return;
   const chatId = msg.chat.id;
-  if (!allowedChatIds.has(chatId)) return;
 
   const threadId = msg.message_thread_id ?? 0;
   let userText = (msg.text || msg.caption || '').trim();
@@ -744,6 +794,11 @@ async function processUpdate(
     }
 
     addTurn(topicState, { role: 'user', text: archivedUserText, timestamp, message_id: messageId, worker: topicState.preferred_worker || effectiveDefault, session_id: topicState.session?.session_id });
+    // AI-095 item 2: persist + archive the user turn AT RECEIPT. A crash during
+    // the (possibly minutes-long) dispatch must not erase the user's message from
+    // topic state / conversation-history.jsonl — 2026-07-03 lost two user turns
+    // this way. Watermark dedup makes the second save at the end idempotent.
+    await saveTopicState(topicState).catch((err) => logger.warn('conversation', 'early user-turn save failed', { error: String(err) }));
 
     
     
@@ -902,9 +957,33 @@ async function processUpdate(
       }
     }
 
+    // AI-095 follow-up (deep-recheck 2026-07-08, Phase 1B): a topic with an
+    // orphan-recovery still in flight must not receive a new dispatch — it
+    // would resume the SAME session the orphan may still be writing to
+    // (concurrent transcript writes), and the reaper's harvest could later
+    // deliver this new reply a second time, mislabeled "Recovered reply".
+    // Gated on `!skipWorker` — this must never override a command guard
+    // (/reset, /model, etc.) that already resolved its own response above;
+    // only intervene when the update was genuinely about to dispatch.
+    if (!skipWorker && isTopicRecovering(topicKey)) {
+      response = '⏳ Still recovering the reply to your previous message after a restart — please resend this once you receive it.';
+      skipWorker = true;
+    }
+
+    let pendingKey: string | undefined;
     if (!skipWorker) {
-      await sendTyping(token, chatId, threadId);
-      const typingInterval = setInterval(() => { sendTyping(token, chatId, threadId).catch(() => {}); }, 4000);
+      // AI-095: persist the in-flight dispatch so a crash mid-dispatch leaves a
+      // recoverable record for the startup orphan reaper instead of a silent void.
+      pendingKey = pendingDispatchKey(chatId, threadId, update.update_id);
+      await addPendingDispatch({
+        updateId: update.update_id, chatId, threadId, messageId,
+        userText: archivedUserText, startedAt: new Date().toISOString(),
+        cwd: effectiveCwd(topicState), session: topicState.session,
+      }).catch((err) => logger.warn('dispatch', 'failed to persist pending dispatch', { error: String(err) }));
+      if (!isDegraded()) await sendTyping(token, chatId, threadId);
+      // Skip typing while DEGRADED (AI-096): under I/O starvation these calls
+      // only queue more doomed work ahead of the reply send.
+      const typingInterval = setInterval(() => { if (!isDegraded()) sendTyping(token, chatId, threadId).catch(() => {}); }, 4000);
       let latestFailoverPayload: FailoverNotifyPayload | undefined;
       const onNotify = async (payload: FailoverNotifyPayload) => {
         latestFailoverPayload = payload;
@@ -912,9 +991,11 @@ async function processUpdate(
         await sendMessage(token, chatId, appendRefIdAndLog(msg, { kind: 'failover', chatId, threadId }), messageId, threadId);
       };
 
+      let workerErrored = false;
       try {
         const dr = await dispatchMessage(userText, replyContext, topicState.pending_action?.description, topicState, secrets, resourceId, effectiveDefault, topicNames, onNotify, update.update_id, contextId);
         response = dr.response; topicState.session = dr.session;
+        workerErrored = !!dr.workerError;
         const { response: processedResponse, skillToRun, restartBot: metaRestartBot } = applyMetaActions(response, dr.meta, topicState);
         response = processedResponse; restartBot = metaRestartBot;
         if (skillToRun) {
@@ -924,7 +1005,18 @@ async function processUpdate(
       } catch (dispatchErr) {
         logger.warn('dispatch', `dispatchMessage error: ${(dispatchErr as Error).message}`);
         response = '⚠️ Service temporarily unavailable.';
+        workerErrored = true;
       } finally { clearInterval(typingInterval); }
+
+      // AI-092: a /stop or /steer killed this dispatch's worker. Swap the
+      // resulting error for a clean confirmation (stop) or silence (steer —
+      // the steer prompt's own dispatch is queued right behind this one). If
+      // the worker actually finished before the kill landed, keep its real
+      // reply — the marker is consumed either way so it can't leak forward.
+      const stoppedKind = consumeTopicStopped(topicKey, update.update_id);
+      if (stoppedKind && workerErrored) {
+        response = stoppedKind === 'stop' ? '⏹ Stopped.' : '';
+      }
     }
 
     if (response.trim()) {
@@ -950,6 +1042,9 @@ async function processUpdate(
         }
       }
     }
+    // Reply delivered, DLQ'd (itself persistent), or intentionally empty — the
+    // in-flight record has served its purpose either way.
+    if (pendingKey) await removePendingDispatch(pendingKey).catch(() => {});
     await saveTopicState(topicState);
     if (restartBot) writeFileSync(join(homedir(), '.pa', 'telegram-bot.stop'), '');
   } finally { await blackboard.releaseLock(resourceId, 'telegram-bot', contextId); }
@@ -990,12 +1085,21 @@ export async function runPollLoop(
   const topicPending = new Map<string, Promise<void>>();
   let nextSweepAt = 0;
   let nextLogCheckAt = 0;
+  // Seeded one interval out: the startup IIFE already ran flushDlq + session GC once.
+  let nextMaintenanceAt = Date.now() + MAINTENANCE_INTERVAL_MS;
+  let nextSessionGcAt = Date.now() + SESSION_GC_INTERVAL_MS;
+  // In-flight guard: a flush during a sustained outage retries every queued
+  // entry over the network and can outlive the 5-min interval; without this,
+  // each tick would queue ANOTHER full flush behind dlq.ts's FIFO mutex —
+  // starving live reply-path appendDlq calls that share it. Skipped ticks are
+  // fine: the next free tick picks up the whole queue.
+  let maintFlushInFlight = false;
   let consecutiveErrors = 0; // drives escalating getUpdates backoff (capped at MAX_BACKOFF_MS)
 
   while (!signal.aborted) {
     if (sentinelPath && existsSync(sentinelPath)) break;
 
-    if (Date.now() >= nextLogCheckAt) {
+    if (!isDegraded() && Date.now() >= nextLogCheckAt) {
       if (await checkBotLogRotation() && sentinelPath) {
         writeFileSync(sentinelPath, String(Date.now()));
         break;
@@ -1003,8 +1107,42 @@ export async function runPollLoop(
       nextLogCheckAt = Date.now() + 10 * 60 * 1000;
     }
 
+    // Periodic steady-state maintenance. The startup IIFE runs DLQ flush and
+    // session GC once, but on a months-long daemon they must re-run so failed
+    // replies actually retry (fixes silent DLQ loss) and session/delivered-store
+    // growth stays bounded. Fire-and-forget — never delays getUpdates.
+    //
+    // The DLQ flush deliberately runs even while DEGRADED: it IS reply
+    // delivery, not cosmetic work — shedding it for >24h would let queued
+    // replies hit the DLQ TTL and silently expire, the exact invariant
+    // violation Phase 1 fixed. It's network-bound (not the disk pressure
+    // DEGRADED signals) with an ENOENT fast-path when the queue is empty.
+    // compactDelivered and session GC are fs-bound housekeeping and ARE shed.
+    if (Date.now() >= nextMaintenanceAt) {
+      nextMaintenanceAt = Date.now() + MAINTENANCE_INTERVAL_MS;
+      if (!maintFlushInFlight) {
+        maintFlushInFlight = true;
+        void flushDlq(token)
+          .then((r) => { if (r.delivered > 0) logger.info('maintenance', 'DLQ retry delivered queued replies', { delivered: r.delivered, remaining: r.remaining }); })
+          .catch((err) => logger.warn('maintenance', `DLQ flush failed: ${(err as Error).message}`))
+          .finally(() => { maintFlushInFlight = false; });
+      }
+      if (!isDegraded()) {
+        void compactDelivered()
+          .then((n) => { if (n > 0) logger.info('maintenance', 'delivered-store compacted', { dropped: n }); })
+          .catch((err) => logger.warn('maintenance', `delivered-store compaction failed: ${(err as Error).message}`));
+      }
+    }
+    if (!isDegraded() && Date.now() >= nextSessionGcAt) {
+      nextSessionGcAt = Date.now() + SESSION_GC_INTERVAL_MS;
+      void cleanupExpiredSessions()
+        .then((n) => { if (n > 0) logger.info('maintenance', 'session GC pruned expired transcripts', { deleted: n }); })
+        .catch((err) => logger.warn('maintenance', `session GC failed: ${(err as Error).message}`));
+    }
+
     try {
-      if (Date.now() >= nextSweepAt) {
+      // Model sweep is shed while DEGRADED (AI-096) — poll + replies come first.
+      if (!isDegraded() && Date.now() >= nextSweepAt) {
         await runExpiredModelOverrideSweep(token, chatIds);
         nextSweepAt = Date.now() + MODEL_SWEEP_INTERVAL_MS;
       }
@@ -1015,14 +1153,83 @@ export async function runPollLoop(
         pollOffset = updates[updates.length - 1].update_id;
         state.last_update_id = pollOffset;
         for (const update of updates) {
+          // AI-092: /stop and /steer act on the topic's RUNNING worker, so they
+          // must bypass per-topic serialization (queuing behind the in-flight
+          // dispatch would defeat them). Handled here; /steer then re-enters
+          // the normal chain as a plain message carrying the steer prompt.
+          const stopMsg = update.message;
+          const stopReq = stopMsg && allowedChatIds.has(stopMsg.chat?.id)
+            ? parseStopSteer((stopMsg.text ?? '').trim())
+            : null;
+          if (stopReq && stopMsg) {
+            const sChatId = stopMsg.chat.id;
+            const sThreadId = stopMsg.message_thread_id ?? 0;
+            const sMessageId = stopMsg.message_id;
+            const sUpdateId = update.update_id;
+            void (async () => {
+              // Mark BEFORE killing: a fast-dying worker's error path could
+              // otherwise race past the consume check before the marker exists.
+              markTopicStopped(`${sChatId}_${sThreadId}`, stopReq.kind, sUpdateId);
+              const killed = await stopTopicWorkers(sChatId, sThreadId);
+              if (killed === 0) unmarkTopicStopped(`${sChatId}_${sThreadId}`);
+              if (stopReq.kind === 'stop') {
+                const text = killed > 0
+                  ? '⏹ Stopping the running worker…'
+                  : 'Nothing is running in this topic.';
+                await sendMessage(token, sChatId, appendRefIdAndLog(text, { kind: 'system', chatId: sChatId, threadId: sThreadId }), sMessageId, sThreadId);
+              } else if (killed === 0) {
+                // Steer with nothing running: the prompt below dispatches normally.
+                await sendMessage(token, sChatId, appendRefIdAndLog('Nothing was running — dispatching your prompt as a new message.', { kind: 'system', chatId: sChatId, threadId: sThreadId }), sMessageId, sThreadId);
+              }
+            })().catch((err) => logger.warn('worker-stop', `stop/steer failed: ${(err as Error).message}`));
+            if (stopReq.kind === 'stop') continue; // fully handled out-of-band
+            stopMsg.text = stopReq.prompt!;        // steer → normal chain with the prompt
+          }
           const topicKey = getUpdateTopicKey(update);
+          // AI-095 follow-up (deep-recheck 2026-07-08, Phase 1A): persist a
+          // minimal placeholder record for this update BEFORE it's chained
+          // into topicPending — a same-topic update queued behind a
+          // still-running predecessor previously existed only in this
+          // in-memory chain until its OWN processUpdate reached the
+          // dispatch-time addPendingDispatch call (which can be minutes
+          // later), and the poll offset covering it is confirmed to
+          // Telegram (below) well before that. A crash in that window lost
+          // the update with zero trace. Awaited here, synchronously within
+          // the loop, so it is guaranteed on disk before saveState(state).
+          let enqKey: string | undefined;
+          if (isAcceptableUpdate(update, allowedChatIds) && update.message) {
+            const m = update.message;
+            const eChatId = m.chat.id;
+            const eThreadId = m.message_thread_id ?? 0;
+            enqKey = pendingDispatchKey(eChatId, eThreadId, update.update_id);
+            await addPendingDispatch({
+              updateId: update.update_id,
+              chatId: eChatId,
+              threadId: eThreadId,
+              messageId: m.message_id,
+              userText: (m.text || m.caption || '').trim(),
+              startedAt: new Date().toISOString(),
+              // Deliberately no cwd/session — those aren't known until
+              // topicState loads inside processUpdate. The dispatch-time
+              // addPendingDispatch call (same key) overwrites this with the
+              // full record; if a crash strands this placeholder as the
+              // only record, the reaper sends a death notice quoting the
+              // user's own raw text back to them.
+            }).catch((err) => logger.warn('dispatch', 'failed to persist enqueue-time placeholder', { error: String(err) }));
+          }
           const prev = topicPending.get(topicKey) ?? Promise.resolve();
           const p: Promise<void> = prev
             .then(() => processUpdate(update, token, allowedChatIds, secrets, topicNames, branchIndex))
             .catch((err) => logger.warn('poll', `processUpdate rejected: ${(err as Error).message}`, { update_id: update.update_id }))
-            .finally(() => {
+            .finally(async () => {
               inFlight.delete(p);
               if (topicPending.get(topicKey) === p) topicPending.delete(topicKey);
+              // Single choke point covering every processUpdate exit path
+              // (dispatch, skip-worker command, or a thrown exception) — a
+              // normal dispatch already removed its own (upgraded) record at
+              // :1018, making this a safe no-op; anything else that left the
+              // placeholder behind gets cleaned up here.
+              if (enqKey) await removePendingDispatch(enqKey).catch(() => {});
             });
           topicPending.set(topicKey, p);
           inFlight.add(p);
@@ -1046,20 +1253,34 @@ async function main(): Promise<void> {
     const token = secrets['TELEGRAM_BOT_TOKEN'];
     const chatIds = (secrets['TELEGRAM_CHAT_ID'] || '').split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n));
     if (!token || chatIds.length === 0) process.exit(1);
-    // Ensure a working Telegram proxy pool is loaded before any Telegram call,
-    // then keep it refreshed. No-op unless TELEGRAM_PROXY_SOURCE_URL is set.
-    await startProxyAutoRefresh(token).catch(() => {});
-    await cleanupExpiredSessions();
-    await cleanupOrphanedWorkers().catch(() => {});
+    // AI-096 item 5: only what the poll loop NEEDS runs before it starts. All
+    // fs-heavy / network-heavy maintenance is a background chain — on a starved
+    // disk the old sequential startup kept the bot deaf for 15-25 minutes.
     const state = await loadState(chatIds[0]);
     const topicNames = await loadTopicNames();
     const branchIndex = await loadBranches();
     const sentinelPath = join(homedir(), '.pa', 'telegram-bot.stop');
     try { unlinkSync(sentinelPath); } catch {}
-    await flushDlq(token).catch(() => {});
-    await backfillTopicDescriptions(token, chatIds, topicNames).catch(() => {});
-    await registerBotCommands(token).catch(() => {});
-    await updateDashboard(token, chatIds[0]).catch(() => {});
+    startHealthProbe();
+    void (async () => {
+      // Ensure a working Telegram proxy pool is loaded, then keep it refreshed.
+      // No-op unless TELEGRAM_PROXY_SOURCE_URL is set. Direct-first fetches work
+      // without it, so this need not gate the poll loop.
+      await startProxyAutoRefresh(token).catch(() => {});
+      await cleanupExpiredSessions().catch(() => {});
+      // AI-095: don't kill orphan workers still serving a crashed-instance dispatch —
+      // the reaper below waits for them and harvests their reply instead.
+      const pendingAtStartup = await listPendingDispatches().catch(() => [] as Awaited<ReturnType<typeof listPendingDispatches>>);
+      const protectedTopics = new Set(pendingAtStartup.map((r) => `topic-${r.chatId}_${r.threadId}`));
+      await cleanupOrphanedWorkers(protectedTopics).catch(() => {});
+      await flushDlq(token).catch(() => {});
+      // AI-095: recover replies from dispatches orphaned by a crashed prior instance.
+      // May wait many minutes for an orphan to finish.
+      void reapOrphanedDispatches(token).catch((err) => logger.warn('reaper', 'reap failed', { error: String(err) }));
+      await backfillTopicDescriptions(token, chatIds, topicNames).catch(() => {});
+      await registerBotCommands(token).catch(() => {});
+      await updateDashboard(token, chatIds[0]).catch(() => {});
+    })();
     const controller = new AbortController();
     // Abort an in-flight (possibly slow, proxied) getUpdates promptly when the
     // stop sentinel appears — otherwise graceful shutdown must wait out a full

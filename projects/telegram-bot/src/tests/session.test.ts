@@ -2,6 +2,7 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile, mkdir, unlink } from 'fs/promises';
 import { execFile } from 'child_process';
+import { randomUUID } from 'crypto';
 import { join } from 'path';
 import { tmpdir, homedir } from 'os';
 import {
@@ -10,6 +11,7 @@ import {
   sessionFileExists,
   isSessionValid,
   discoverGeminiSessionId,
+  discoverAgySessionId,
   buildResumeArgs,
   cleanupCodexSessions,
   getPriorSessionPath,
@@ -455,11 +457,132 @@ describe('getPriorSessionPath', () => {
     assert.ok(/\.json\*?$/.test(result!), `should end in a .json/.json* glob suffix, got: ${result}`);
   });
 
+  it('returns .pb path for agy under conversations (live CLI format)', () => {
+    const result = getPriorSessionPath('agy', 'abc-def-123', undefined);
+    assert.ok(result !== null, 'should return a path');
+    assert.ok(result!.endsWith('.gemini/antigravity-cli/conversations/abc-def-123.pb'), `expected .pb path, got: ${result}`);
+  });
+
   it('returns null for codex', () => {
     assert.equal(getPriorSessionPath('codex', 'any-id', undefined), null);
   });
 
   it('returns null for unknown worker', () => {
     assert.equal(getPriorSessionPath('unknown', 'any-id', undefined), null);
+  });
+});
+
+describe('discoverAgySessionId', () => {
+  it('returns null when conversations directory does not exist or has no db files', async () => {
+    const result = await discoverAgySessionId();
+    assert.ok(result === null || typeof result === 'string');
+  });
+
+  it('correctly extracts session id from a legacy .db file name', async () => {
+    const agyDir = join(homedir(), '.gemini', 'antigravity-cli', 'conversations');
+    await mkdir(agyDir, { recursive: true });
+    const sessionId = randomUUID(); // discovery is UUID-anchored — fixtures must be UUID-shaped
+    const testDb = join(agyDir, `${sessionId}.db`);
+    await writeFile(testDb, '', 'utf8');
+    try {
+      const result = await discoverAgySessionId();
+      assert.equal(result, sessionId);
+    } finally {
+      try { await unlink(testDb); } catch {}
+    }
+  });
+
+  it('correctly extracts session id from a .pb file name (live format)', async () => {
+    const agyDir = join(homedir(), '.gemini', 'antigravity-cli', 'conversations');
+    await mkdir(agyDir, { recursive: true });
+    const sessionId = randomUUID();
+    const testPb = join(agyDir, `${sessionId}.pb`);
+    await writeFile(testPb, '', 'utf8');
+    try {
+      const result = await discoverAgySessionId();
+      assert.equal(result, sessionId);
+    } finally {
+      try { await unlink(testPb); } catch {}
+    }
+  });
+
+  it('ignores non-UUID artifacts (e.g. index.pb) even when they are newest', async () => {
+    const agyDir = join(homedir(), '.gemini', 'antigravity-cli', 'conversations');
+    await mkdir(agyDir, { recursive: true });
+    const sessionId = randomUUID();
+    const realPb = join(agyDir, `${sessionId}.pb`);
+    // Unique name the real CLI can never own — writing a literal 'index.pb'
+    // into this REAL shared dir would truncate/delete an actual CLI artifact
+    // if one ever exists. The regex is fully anchored, so any non-UUID name
+    // exercises the same filter branch.
+    const artifact = join(agyDir, `test-artifact-${randomUUID()}.pb`);
+    await writeFile(realPb, '', 'utf8');
+    await new Promise((r) => setTimeout(r, 30));
+    await writeFile(artifact, '', 'utf8'); // newer than the real conversation
+    try {
+      const result = await discoverAgySessionId();
+      assert.equal(result, sessionId, 'a non-UUID artifact must never be returned as a session id');
+    } finally {
+      try { await unlink(realPb); } catch {}
+      try { await unlink(artifact); } catch {}
+    }
+  });
+});
+
+describe('sessionFileExists: agy worker', () => {
+  it('returns true when a .pb conversation file exists (live format)', async () => {
+    const agyDir = join(homedir(), '.gemini', 'antigravity-cli', 'conversations');
+    await mkdir(agyDir, { recursive: true });
+    const sessionId = randomUUID();
+    const testPb = join(agyDir, `${sessionId}.pb`);
+    await writeFile(testPb, '', 'utf8');
+    try {
+      const session: SessionInfo = {
+        session_id: sessionId,
+        worker: 'agy',
+        started_at: new Date().toISOString(),
+      };
+      assert.equal(await sessionFileExists(session), true);
+    } finally {
+      try { await unlink(testPb); } catch {}
+    }
+  });
+
+  it('falls back to a legacy .db conversation file when no .pb exists', async () => {
+    const agyDir = join(homedir(), '.gemini', 'antigravity-cli', 'conversations');
+    await mkdir(agyDir, { recursive: true });
+    const sessionId = randomUUID();
+    const testDb = join(agyDir, `${sessionId}.db`);
+    await writeFile(testDb, '', 'utf8');
+    try {
+      const session: SessionInfo = {
+        session_id: sessionId,
+        worker: 'agy',
+        started_at: new Date().toISOString(),
+      };
+      assert.equal(await sessionFileExists(session), true);
+    } finally {
+      try { await unlink(testDb); } catch {}
+    }
+  });
+
+  it('returns false when neither .pb nor .db exists', async () => {
+    const session: SessionInfo = {
+      session_id: 'nonexistent-db-file',
+      worker: 'agy',
+      started_at: new Date().toISOString(),
+    };
+    assert.equal(await sessionFileExists(session), false);
+  });
+});
+
+describe('buildResumeArgs: agy worker', () => {
+  it('returns --conversation <uuid> for agy', () => {
+    const session: SessionInfo = {
+      session_id: 'agy-session-uuid',
+      worker: 'agy',
+      started_at: new Date().toISOString(),
+    };
+    assert.deepEqual(buildResumeArgs(session), ['--conversation', 'agy-session-uuid']);
   });
 });

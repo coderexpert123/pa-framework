@@ -2,10 +2,10 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, writeFile } from 'fs/promises';
 import { join } from 'path';
-import { readRecentFailures, buildFailurePrompt } from '../src/failure-analyzer.js';
+import { readRecentFailures, buildFailurePrompt, checkForRollbacks } from '../src/failure-analyzer.js';
 import type { FailureRecord } from '../src/failure-analyzer.js';
-import { createTempPaHome, cleanup } from './helpers.js';
-import type { RunMeta } from '../src/types.js';
+import { createTempPaHome, createTempSkill, createTempDraft, cleanup } from './helpers.js';
+import type { DraftMeta, RunMeta } from '../src/types.js';
 
 async function createTempMeta(dir: string, skillName: string, meta: RunMeta): Promise<void> {
   const logDir = join(dir, 'logs', skillName);
@@ -112,6 +112,113 @@ describe('failure-analyzer', () => {
     it('includes existing skills in exclusion context', () => {
       const prompt = buildFailurePrompt([], ['daily-mail-brief'], []);
       assert.match(prompt, /daily-mail-brief/);
+    });
+  });
+
+  describe('checkForRollbacks', () => {
+    function draftMeta(overrides: Partial<DraftMeta> = {}): DraftMeta {
+      return {
+        proposed_at: new Date().toISOString(),
+        reason: 'test',
+        source_turns: [],
+        status: 'approved',
+        fingerprint: 'abc123',
+        source_type: 'failure',
+        reviewed_at: new Date().toISOString(),
+        ...overrides,
+      };
+    }
+
+    async function makeFailingSkill(skillName: string): Promise<void> {
+      // 3 errors, 1 success within the last 24h → 75% failure rate, over the 50% threshold
+      for (let i = 0; i < 3; i++) {
+        await createTempMeta(dir, skillName, makeErrorMeta({ timestamp: new Date(Date.now() - i * 60000).toISOString() }));
+      }
+      await createTempMeta(dir, skillName, {
+        worker: 'gemini', status: 'success', exitCode: 0, duration: 1000,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    it('flags "restore" for a skill with a matching applied_in_place fix draft, most recent one wins', async () => {
+      await makeFailingSkill('reminders');
+      await createTempSkill(dir, 'reminders', 'Broken now.');
+      await createTempDraft(dir, 'reminders-fix', 'Old fix.', draftMeta({
+        target_skill: 'reminders', applied_in_place: true, approved_autonomously: true,
+        reviewed_at: new Date(Date.now() - 60000).toISOString(),
+      }));
+      await createTempDraft(dir, 'reminders-fix-2', 'Newer fix.', draftMeta({
+        target_skill: 'reminders', applied_in_place: true, approved_autonomously: true,
+        reviewed_at: new Date().toISOString(),
+      }));
+
+      const flags = await checkForRollbacks();
+      const flag = flags.find((f) => f.skillName === 'reminders');
+      assert.ok(flag, 'expected a rollback flag for reminders');
+      assert.equal(flag!.kind, 'restore');
+      assert.equal(flag!.draftName, 'reminders-fix-2'); // the more recent one
+    });
+
+    it('flags "delete" for a brand-new autonomously-approved skill with no in-place-fix draft', async () => {
+      await makeFailingSkill('new-diagnostic-skill');
+      await createTempSkill(dir, 'new-diagnostic-skill', 'Broken now.');
+      await createTempDraft(dir, 'new-diagnostic-skill', 'Original.', draftMeta({
+        approved_autonomously: true,
+      }));
+
+      const flags = await checkForRollbacks();
+      const flag = flags.find((f) => f.skillName === 'new-diagnostic-skill');
+      assert.ok(flag, 'expected a rollback flag for new-diagnostic-skill');
+      assert.equal(flag!.kind, 'delete');
+      assert.equal(flag!.draftName, 'new-diagnostic-skill');
+    });
+
+    it('does not flag a manually-approved skill (no approved_autonomously)', async () => {
+      await makeFailingSkill('manual-skill');
+      await createTempSkill(dir, 'manual-skill', 'Broken now.');
+      await createTempDraft(dir, 'manual-skill', 'Original.', draftMeta({
+        approved_autonomously: undefined,
+      }));
+
+      const flags = await checkForRollbacks();
+      assert.equal(flags.find((f) => f.skillName === 'manual-skill'), undefined);
+    });
+
+    it('does not flag a skill with a healthy (low) failure rate', async () => {
+      await createTempSkill(dir, 'healthy-skill', 'Fine.');
+      await createTempDraft(dir, 'healthy-skill', 'Original.', draftMeta({ approved_autonomously: true }));
+      for (let i = 0; i < 4; i++) {
+        await createTempMeta(dir, 'healthy-skill', {
+          worker: 'gemini', status: 'success', exitCode: 0, duration: 1000,
+          timestamp: new Date(Date.now() - i * 60000).toISOString(),
+        });
+      }
+
+      const flags = await checkForRollbacks();
+      assert.equal(flags.find((f) => f.skillName === 'healthy-skill'), undefined);
+    });
+
+    it('does not flag a skill with a single failed run (100% of n=1 is not a meaningful sample)', async () => {
+      await createTempSkill(dir, 'sparse-skill', 'Broken now.');
+      await createTempDraft(dir, 'sparse-skill', 'Original.', draftMeta({ approved_autonomously: true }));
+      await createTempMeta(dir, 'sparse-skill', makeErrorMeta({ timestamp: new Date().toISOString() }));
+
+      const flags = await checkForRollbacks();
+      assert.equal(flags.find((f) => f.skillName === 'sparse-skill'), undefined,
+        'a single failing run must not trigger a rollback regardless of its 100% rate');
+    });
+
+    it('never flags self-improver itself for rollback, even with a high failure rate', async () => {
+      for (let i = 0; i < 3; i++) {
+        await createTempMeta(dir, 'self-improver', makeErrorMeta({ timestamp: new Date(Date.now() - i * 60000).toISOString() }));
+      }
+      // Even in the hypothetical case where self-improver somehow had a matching draft entry:
+      await createTempSkill(dir, 'self-improver', 'Broken now.');
+      await createTempDraft(dir, 'self-improver', 'Original.', draftMeta({ approved_autonomously: true }));
+
+      const flags = await checkForRollbacks();
+      assert.equal(flags.find((f) => f.skillName === 'self-improver'), undefined,
+        'self-improver must never be a rollback target, by explicit exclusion');
     });
   });
 });

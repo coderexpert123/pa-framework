@@ -12,7 +12,6 @@
  */
 
 import { createReadStream, existsSync, statSync } from 'fs';
-import { readFile } from 'fs/promises';
 import { createInterface } from 'readline';
 import { join } from 'path';
 import { paHome } from '../paths.js';
@@ -76,35 +75,82 @@ async function scanConversationHistory(refId: string): Promise<RefRecord | null>
   const path = join(paHome(), 'conversation-history.jsonl');
   if (!existsSync(path)) return null;
 
-  // Conversation turns are large (assistant replies often 1k–5k bytes). For
-  // current file sizes (~6 MB) reading the whole file is the simplest correct
-  // approach. If it grows past 50 MB, switch to a 1500-byte-per-line tail
-  // estimate similar to scanAppLog().
-  const raw = await readFile(path, 'utf8').catch(() => '');
-  if (!raw) return null;
+  // Byte-seek the tail instead of reading the whole file — same tailLines()
+  // helper scanAppLog uses below. 1500 bytes/line (vs. scanAppLog's 200)
+  // because conversation turns are large (assistant replies often 1k–5k
+  // bytes); this was previously deferred in favor of a whole-file read
+  // bounded only by the 5MB rotation invariant.
+  const lines = await tailLines(path, TAIL_LINES, 1500);
+  if (lines.length === 0) return null;
 
-  const lines = raw.trim().split('\n').filter(Boolean);
-  const start = Math.max(0, lines.length - TAIL_LINES);
+  let found: RefRecord | null = null;
+  let foundMessageId: number | undefined;
+  let foundText: string | undefined;
+  let ambiguousTimestamp: string | undefined;
+  const wide = isWideRefId(refId);
 
-  for (let i = lines.length - 1; i >= start; i--) {
+  for (let i = lines.length - 1; i >= 0; i--) {
     let entry: ConversationTurnEntry;
     try { entry = JSON.parse(lines[i]); } catch { continue; }
+    if (typeof entry !== 'object' || entry === null) continue; // e.g. a literal `null`/number line
     if (entry.refId !== refId) continue;
 
-    return {
-      refId,
-      kind: 'turn',
-      timestamp: entry.timestamp ?? '',
-      worker: entry.worker,
-      threadId: entry.thread_id,
-      messageId: entry.message_id,
-      sessionId: entry.session_id,
-      text: entry.text,
-      source: 'conversation-history',
-    };
+    if (!found) {
+      found = {
+        refId,
+        kind: 'turn',
+        timestamp: entry.timestamp ?? '',
+        worker: entry.worker,
+        threadId: entry.thread_id,
+        messageId: entry.message_id,
+        sessionId: entry.session_id,
+        text: entry.text,
+        source: 'conversation-history',
+      };
+      foundMessageId = entry.message_id;
+      foundText = entry.text;
+      if (wide) break; // wide refs can't collide — no need to scan for ambiguity
+      continue; // legacy ref: keep scanning the window for a genuine ambiguity
+    }
+
+    // Suppress legitimate same-logical-message repeats: equal defined
+    // message_ids, or byte-identical text (a turn re-archived after a crash,
+    // or copied across topics by /merge — assistant archive turns rarely
+    // carry message_id, so text equality is the working discriminator here).
+    if (foundMessageId !== undefined && entry.message_id === foundMessageId) continue;
+    if (foundText !== undefined && entry.text === foundText) continue;
+    ambiguousTimestamp = entry.timestamp;
   }
 
-  return null;
+  if (found && ambiguousTimestamp !== undefined) warnAmbiguous(refId, found.timestamp, ambiguousTimestamp);
+  return found;
+}
+
+/**
+ * Ambiguity detection scope: ONLY legacy short refIds can genuinely collide.
+ * Since Phase 3A, refs are minted with 6 random bytes (12 hex chars, 2^48
+ * space) — two entries sharing a wide refId within the 10k-line tail window
+ * are the same logical send by construction (multi-chunk/multi-chat fan-out
+ * logs one line per chunk per chat with the same refId, and coding-dirs
+ * deliberately reuses one refId for its recurring pin), not a collision
+ * (in-window collision odds ≈ 1e-8). Legacy 4-hex refs (65,536-value space,
+ * 80+ real collisions measured) are where wrong-record resolution lives, so
+ * the scan continues for those and warns — at most ONCE per lookup — via
+ * console.warn (stderr, not the structured app.log.jsonl logger: this backs
+ * the interactive `pa ref` CLI, and warning into the very file being scanned
+ * would add to exactly the log growth Phases 1-2 bounded).
+ */
+const WIDE_REF_HEX_LEN = 8;
+
+function isWideRefId(refId: string): boolean {
+  const dash = refId.indexOf('-');
+  return dash !== -1 && refId.length - dash - 1 >= WIDE_REF_HEX_LEN;
+}
+
+function warnAmbiguous(refId: string, foundTimestamp: string, otherTimestamp: string | undefined): void {
+  console.warn(
+    `[ref-lookup] refId_ambiguous: "${refId}" matches multiple distinct entries — returning the most recent (${foundTimestamp}); an older entry (${otherTimestamp ?? ''}) is shadowed.`
+  );
 }
 
 async function scanAppLog(refId: string): Promise<RefRecord | null> {
@@ -112,27 +158,50 @@ async function scanAppLog(refId: string): Promise<RefRecord | null> {
   if (!existsSync(path)) return null;
 
   const lines = await tailLines(path, TAIL_LINES, 200);
+
+  let found: RefRecord | null = null;
+  let foundMessageId: number | undefined;
+  let ambiguousTimestamp: string | undefined;
+  const wide = isWideRefId(refId);
+
   for (let i = lines.length - 1; i >= 0; i--) {
     let entry: AppLogEntry;
     try { entry = JSON.parse(lines[i]); } catch { continue; }
+    if (typeof entry !== 'object' || entry === null) continue; // e.g. a literal `null`/number line
     if (entry.refId !== refId) continue;
     if (!entry.message || !APP_LOG_MESSAGES.has(entry.message)) continue;
 
-    return {
-      refId,
-      kind: appLogKind(entry),
-      timestamp: entry.timestamp ?? '',
-      worker: entry.worker,
-      chatId: entry.chatId,
-      threadId: entry.threadId,
-      messageId: entry.messageId,
-      sessionId: entry.session_id,
-      text: entry.textPreview ?? entry.text,
-      source: 'app-log',
-    };
+    if (!found) {
+      found = {
+        refId,
+        kind: appLogKind(entry),
+        timestamp: entry.timestamp ?? '',
+        worker: entry.worker,
+        chatId: entry.chatId,
+        threadId: entry.threadId,
+        messageId: entry.messageId,
+        sessionId: entry.session_id,
+        text: entry.textPreview ?? entry.text,
+        source: 'app-log',
+      };
+      foundMessageId = entry.messageId;
+      if (wide) break; // wide refs can't collide — no need to scan for ambiguity
+      continue; // legacy ref: keep scanning the window for a genuine ambiguity
+    }
+
+    // Legacy entries: equal defined messageIds = same logical message
+    // (repeated pin edits). Anything else could be a real 16-bit collision —
+    // flag it. (Legacy multi-chunk sends share a refId with no messageId and
+    // differing per-chunk previews; they'll warn until they age out of the
+    // ~15-day tail window — acceptable transitional noise on an
+    // interactive-only path, preferred over heuristics that could mask a
+    // genuine collision.)
+    if (foundMessageId !== undefined && entry.messageId === foundMessageId) continue;
+    ambiguousTimestamp = entry.timestamp;
   }
 
-  return null;
+  if (found && ambiguousTimestamp !== undefined) warnAmbiguous(refId, found.timestamp, ambiguousTimestamp);
+  return found;
 }
 
 function appLogKind(entry: AppLogEntry): RefRecord['kind'] {

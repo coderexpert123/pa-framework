@@ -1,10 +1,10 @@
 import { randomBytes } from 'crypto';
 import { logger } from '../../../pa/dist/src/lib/log.js';
 
-export type RefKind = 'pin' | 'help' | 'branch' | 'lock_busy' | 'failover' | 'system';
+export type RefKind = 'pin' | 'help' | 'branch' | 'lock_busy' | 'failover' | 'system' | 'recovered';
 
 export function makeRefId(prefix: string = 's'): string {
-  return `${prefix}-${randomBytes(2).toString('hex')}`;
+  return `${prefix}-${randomBytes(6).toString('hex')}`;
 }
 
 export function appendRefId(text: string, prefix: string = 's'): string {
@@ -15,7 +15,8 @@ export function appendRefId(text: string, prefix: string = 's'): string {
  * Mints a refId, logs a 'system message sent' entry for queryability via `pa ref`,
  * and returns the message text with the ref appended. Use for bot-system messages
  * (pins, help, branch notifications, failover banners, lock-busy notices) — anything
- * that's not a worker reply (which has its own 'message sent' log call).
+ * that's not a worker reply (worker-reply refIds are queryable via the refId field
+ * on their conversation-history.jsonl assistant turns, not an app-log entry).
  */
 export function appendRefIdAndLog(
   text: string,

@@ -1,12 +1,15 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, readFile, writeFile, stat } from 'fs/promises';
+import { mkdtemp, rm, readFile, writeFile, stat, utimes } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { runPollLoop, extractReplyContext, generateDescriptionSuggestion, isValidDescriptionOutput, parseDescriptionLLMOutput, postDescriptionSuggestion } from '../main.js';
 import { loadBranches, type BranchIndex } from '../topic-names.js';
+import { _setDegradedForTest } from '../health.js';
 import type { ConversationState } from '../types.js';
 import { rmRetry } from './rm-retry.js';
+import { listPendingDispatches, pendingDispatchKey, _resetPendingDispatchesForTest } from '../pending-dispatches.js';
+import { markTopicRecovering, _resetRecoveryGateForTest } from '../recovery-gate.js';
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -1027,6 +1030,61 @@ describe('runPollLoop: model expiry sweep', { concurrency: 1 }, () => {
     const savedValid = JSON.parse(await readFile(validFile, 'utf8')) as ConversationState;
     assert.equal(savedValid.preferred_worker, undefined, 'valid topic still processed despite corrupt sibling');
     assert.equal(savedValid.model_status?.reason_code, 'midnight_reset');
+  });
+
+  it('skips a topic idle beyond TOPIC_SWEEP_STALE_MS (7 days) — its expired override is left untouched — while a fresh topic in the same sweep is still processed normally', async () => {
+    const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const freshFile = join(tempDir, 'telegram-bot-topic-123_1.json');
+    const staleFile = join(tempDir, 'telegram-bot-topic-123_2.json');
+    const sharedState = {
+      chat_id: 123, thread_id: 0, turns: [],
+      preferred_worker: 'gemini', preferred_worker_set_at: yesterday,
+    };
+    await writeFile(freshFile, JSON.stringify({ ...sharedState, thread_id: 1 }), 'utf8');
+    await writeFile(staleFile, JSON.stringify({ ...sharedState, thread_id: 2 }), 'utf8');
+
+    // Backdate ONLY the stale file's mtime past the 7-day threshold. The
+    // fresh file keeps its just-written (now) mtime.
+    const longAgo = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+    await utimes(staleFile, longAgo, longAgo);
+
+    const controller = new AbortController();
+    const state = makeState(123, -1);
+
+    (globalThis as Record<string, unknown>).fetch = async (url: string) => {
+      if ((url as string).includes('getUpdates')) {
+        controller.abort();
+        return {
+          ok: true, status: 200,
+          text: async () => JSON.stringify({ ok: true, result: [] }),
+          json: async () => ({ ok: true, result: [] }),
+        };
+      }
+      if ((url as string).includes('sendMessage')) {
+        return {
+          ok: true, status: 200,
+          text: async () => JSON.stringify({ ok: true, result: { message_id: 70 } }),
+          json: async () => ({ ok: true, result: { message_id: 70 } }),
+        };
+      }
+      return {
+        ok: true, status: 200,
+        text: async () => JSON.stringify({ ok: true, result: true }),
+        json: async () => ({ ok: true, result: true }),
+      };
+    };
+
+    await runPollLoop('token', [123], state, {}, controller.signal, fastSleep);
+
+    const savedFresh = JSON.parse(await readFile(freshFile, 'utf8')) as ConversationState;
+    const savedStale = JSON.parse(await readFile(staleFile, 'utf8')) as ConversationState;
+
+    assert.equal(savedFresh.preferred_worker, undefined, 'fresh topic still gets its expired override cleared');
+    assert.equal(savedFresh.model_status?.reason_code, 'midnight_reset');
+
+    assert.equal(savedStale.preferred_worker, 'gemini', 'stale topic is skipped — override left untouched by the sweep');
+    assert.equal(savedStale.preferred_worker_set_at, yesterday, 'stale topic file is not rewritten at all');
+    assert.equal(savedStale.model_status, undefined, 'sweep never even loaded/hydrated the stale topic');
   });
 });
 
@@ -2051,21 +2109,428 @@ describe('runPollLoop: per-topic serialization', { concurrency: 1 }, () => {
     // Start the loop without awaiting — we need to interact with it
     const loopDone = runPollLoop('token', [123], state, {}, controller.signal, fastSleep);
 
-    // Allow the loop to process the first batch and reach the sendMessage gate
-    await new Promise(r => setTimeout(r, 150));
+    // Wait DETERMINISTICALLY for update1 to reach the gate (a fixed sleep
+    // flaked under full-suite CPU load: the assert could fire before the
+    // first sendMessage even started, reading the -1 sentinel). Poll for the
+    // at-gate snapshot instead, up to 10s.
+    for (let i = 0; i < 500 && sendMessageCountAtGate === -1; i++) {
+      await new Promise(r => setTimeout(r, 20));
+    }
 
-    // With per-topic serialization: update2 has NOT started, so only 1 sendMessage fired
-    assert.equal(
-      sendMessageCountAtGate,
-      1,
-      `expected sendMessageCountAtGate=1 (update2 must not have started while update1 is in-flight), got ${sendMessageCountAtGate}`
-    );
-
-    // Release the gate — update1 finishes, then update2 runs
-    resolveGate();
-    await loopDone;
+    try {
+      // With per-topic serialization: update2 has NOT started, so only 1 sendMessage fired
+      assert.equal(
+        sendMessageCountAtGate,
+        1,
+        `expected sendMessageCountAtGate=1 (update2 must not have started while update1 is in-flight), got ${sendMessageCountAtGate}`
+      );
+    } finally {
+      // ALWAYS release the gate and drain the loop — an assertion failure
+      // that abandons them leaks a zombie poll loop holding the topic-123
+      // blackboard lock (with live heartbeats), which then starves every
+      // later suite using chatId 123 into 60s lock-waits and cancellations.
+      resolveGate();
+      await loopDone;
+    }
 
     assert.equal(sendMessageCallCount, 2, 'both sendMessages must fire after serialization completes');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AI-095 follow-up (deep-recheck 2026-07-08, Phase 1A): enqueue-time
+// pending-dispatch placeholder, written before an update's own processUpdate
+// call — closes the crash window where a queued same-topic update existed
+// only in the in-memory topicPending chain.
+// ---------------------------------------------------------------------------
+
+describe('runPollLoop: enqueue-time dispatch persistence', { concurrency: 1 }, () => {
+  let tempDir: string;
+  const savedFetch = globalThis.fetch;
+  const savedPaHome = process.env.PA_HOME;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'tgbot-poll-enqueue-'));
+    process.env.PA_HOME = tempDir;
+    _resetPendingDispatchesForTest();
+    await writeFile(join(tempDir, 'config.yaml'), JSON.stringify({ workers: [{ name: 'claude', command: 'node', args: ['-e', '0'], check: 'node -e 0' }] }), 'utf8');
+  });
+
+  afterEach(async () => {
+    process.env.PA_HOME = savedPaHome;
+    _resetPendingDispatchesForTest();
+    await rmRetry(tempDir);
+    (globalThis as Record<string, unknown>).fetch = savedFetch;
+  });
+
+  it('a pending-dispatch record for update #2 exists on disk while update #1 is still gated', async () => {
+    // Same shape as the per-topic-serialization test: two same-topic updates,
+    // gate update #1's sendMessage so update #2's own processUpdate never
+    // starts. If the record only appeared once update #2's own dispatch
+    // began, it would still be absent here — proving it was written at
+    // ENQUEUE time (in the poll loop, before either update's processUpdate
+    // runs), not deferred until each update's own turn.
+    const controller = new AbortController();
+    const state = makeState(123, -1);
+    const update1 = { update_id: 1, message: { message_id: 1, chat: { id: 123, type: 'private' }, date: Math.floor(Date.now() / 1000), text: '/default' } };
+    const update2 = { update_id: 2, message: { message_id: 2, chat: { id: 123, type: 'private' }, date: Math.floor(Date.now() / 1000), text: '/default' } };
+
+    let resolveGate!: () => void;
+    const gate = new Promise<void>(resolve => { resolveGate = resolve; });
+    let gateUsed = false;
+    let getUpdatesCallCount = 0;
+    let recordSeenAtGate: unknown;
+
+    (globalThis as Record<string, unknown>).fetch = async (url: string) => {
+      if ((url as string).includes('getUpdates')) {
+        getUpdatesCallCount++;
+        if (getUpdatesCallCount === 1) {
+          return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: [update1, update2] }), json: async () => ({ ok: true, result: [update1, update2] }) };
+        }
+        controller.abort();
+        return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: [] }), json: async () => ({ ok: true, result: [] }) };
+      }
+      if ((url as string).includes('sendMessage') && !gateUsed) {
+        gateUsed = true;
+        // update #2's placeholder must already be on disk right now — its own
+        // processUpdate hasn't started (update #1 is holding the gate).
+        const listed = await listPendingDispatches();
+        recordSeenAtGate = listed.find(r => r.updateId === 2);
+        await gate;
+      }
+      return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: { message_id: 999 } }), json: async () => ({ ok: true, result: { message_id: 999 } }) };
+    };
+
+    const loopDone = runPollLoop('token', [123], state, {}, controller.signal, fastSleep);
+    for (let i = 0; i < 500 && !gateUsed; i++) await new Promise(r => setTimeout(r, 20));
+    try {
+      assert.ok(recordSeenAtGate, 'update #2 should already have a pending-dispatch placeholder while update #1 is still gated');
+      assert.equal((recordSeenAtGate as { cwd?: string }).cwd, undefined, 'the enqueue-time placeholder has no cwd yet');
+    } finally {
+      resolveGate();
+      await loopDone;
+    }
+  });
+
+  it('the placeholder is removed after a skip-worker command completes, with no full record ever written', async () => {
+    const controller = new AbortController();
+    const state = makeState(123, -1);
+    let getUpdatesCallCount = 0;
+    (globalThis as Record<string, unknown>).fetch = async (url: string) => {
+      if ((url as string).includes('getUpdates')) {
+        getUpdatesCallCount++;
+        if (getUpdatesCallCount === 1) {
+          return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: [{ update_id: 10, message: { message_id: 1, chat: { id: 123, type: 'private' }, date: Math.floor(Date.now() / 1000), text: '/reset' } }] }), json: async () => ({ ok: true, result: [] }) };
+        }
+        controller.abort();
+        return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: [] }), json: async () => ({ ok: true, result: [] }) };
+      }
+      return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: { message_id: 999 } }), json: async () => ({ ok: true, result: { message_id: 999 } }) };
+    };
+
+    await runPollLoop('token', [123], state, {}, controller.signal, fastSleep);
+    assert.deepEqual(await listPendingDispatches(), [], 'no leftover placeholder after a skip-worker command settles');
+  });
+
+  it('no placeholder is written for a disallowed chat or a text-less message', async () => {
+    const controller = new AbortController();
+    const state = makeState(123, -1);
+    let getUpdatesCallCount = 0;
+    (globalThis as Record<string, unknown>).fetch = async (url: string) => {
+      if ((url as string).includes('getUpdates')) {
+        getUpdatesCallCount++;
+        if (getUpdatesCallCount === 1) {
+          return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({ ok: true, result: [
+              { update_id: 20, message: { message_id: 1, chat: { id: 999999, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'hello' } }, // disallowed chat
+              { update_id: 21, message: { message_id: 2, chat: { id: 123, type: 'private' }, date: Math.floor(Date.now() / 1000) } }, // no text/caption
+            ] }),
+            json: async () => ({ ok: true, result: [] }),
+          };
+        }
+        controller.abort();
+        return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: [] }), json: async () => ({ ok: true, result: [] }) };
+      }
+      return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: { message_id: 999 } }), json: async () => ({ ok: true, result: { message_id: 999 } }) };
+    };
+
+    await runPollLoop('token', [123], state, {}, controller.signal, fastSleep);
+    assert.deepEqual(await listPendingDispatches(), [], 'neither update should have produced a placeholder');
+  });
+
+  it('a processUpdate rejection does not crash the poll loop, and the new .finally() cleanup path is itself failure-safe', async () => {
+    // Force processUpdate to reject via the same technique as the existing
+    // "processUpdate error handling" suite (PA_HOME pointed at a non-existent
+    // path breaks conversation-state I/O, which is unguarded by any catch —
+    // the rejection escapes processUpdate). Note this ALSO breaks the
+    // enqueue-time placeholder write itself (same live-PA_HOME dependency),
+    // so this test cannot observe "written, then removed" directly — what it
+    // proves is the narrower but still real property the new code needs: the
+    // added enqueue-write + .finally()-cleanup logic does not turn an
+    // already-tolerated processUpdate rejection into a NEW unhandled
+    // rejection or a hang, even when its own disk operations are ALSO
+    // failing. (The "written, then removed on throw" property is exercised
+    // implicitly by test (a) and (b) above under a working PA_HOME — nothing
+    // in the removal path is throw-conditional, so there is no separate
+    // code path that only runs on the throw branch.)
+    process.env.PA_HOME = join(tempDir, 'does-not-exist');
+    _resetPendingDispatchesForTest();
+    const controller = new AbortController();
+    const state = makeState(123, -1);
+    let getUpdatesCallCount = 0;
+    (globalThis as Record<string, unknown>).fetch = async (url: string) => {
+      if ((url as string).includes('getUpdates')) {
+        getUpdatesCallCount++;
+        if (getUpdatesCallCount === 1) {
+          return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: [{ update_id: 30, message: { message_id: 1, chat: { id: 123, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'hello' } }] }), json: async () => ({ ok: true, result: [] }) };
+        }
+        controller.abort();
+        return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: [] }), json: async () => ({ ok: true, result: [] }) };
+      }
+      return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: true }), json: async () => ({ ok: true, result: true }) };
+    };
+
+    await assert.doesNotReject(() => runPollLoop('token', [123], state, {}, controller.signal, fastSleep));
+    assert.ok(getUpdatesCallCount >= 2, 'poll loop must have continued after the rejected processUpdate');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AI-095 follow-up (deep-recheck 2026-07-08, Phase 1B): recovery gate blocks
+// a new dispatch into a topic under active orphan-recovery.
+// ---------------------------------------------------------------------------
+
+describe('runPollLoop: recovery gate', { concurrency: 1 }, () => {
+  let tempDir: string;
+  const savedFetch = globalThis.fetch;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'tgbot-poll-gate-'));
+    process.env.PA_HOME = tempDir;
+    _resetPendingDispatchesForTest();
+    _resetRecoveryGateForTest();
+    await writeFile(join(tempDir, 'config.yaml'), JSON.stringify({ workers: [{ name: 'claude', command: 'node', args: ['-e', '0'], check: 'node -e 0' }] }), 'utf8');
+  });
+
+  afterEach(async () => {
+    delete process.env.PA_HOME;
+    _resetPendingDispatchesForTest();
+    _resetRecoveryGateForTest();
+    await rmRetry(tempDir);
+    (globalThis as Record<string, unknown>).fetch = savedFetch;
+  });
+
+  async function runOneUpdate(text: string, chatId = 123): Promise<string[]> {
+    const controller = new AbortController();
+    const state = makeState(chatId, -1);
+    const sentTexts: string[] = [];
+    let getUpdatesCallCount = 0;
+    (globalThis as Record<string, unknown>).fetch = async (url: string, opts?: { body?: string }) => {
+      if ((url as string).includes('getUpdates')) {
+        getUpdatesCallCount++;
+        if (getUpdatesCallCount === 1) {
+          const batch = { ok: true, result: [{ update_id: 1, message: { message_id: 1, chat: { id: chatId, type: 'private' }, date: Math.floor(Date.now() / 1000), text } }] };
+          // getUpdates() reads res.json(), not res.text() — both must carry the real batch.
+          return { ok: true, status: 200, text: async () => JSON.stringify(batch), json: async () => batch };
+        }
+        controller.abort();
+        return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: [] }), json: async () => ({ ok: true, result: [] }) };
+      }
+      if ((url as string).includes('sendMessage') && opts?.body) {
+        const body = JSON.parse(opts.body);
+        sentTexts.push(body.text ?? '');
+      }
+      return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: { message_id: 999 } }), json: async () => ({ ok: true, result: { message_id: 999 } }) };
+    };
+    await runPollLoop('token', [chatId], state, {}, controller.signal, fastSleep);
+    return sentTexts;
+  }
+
+  it('a plain worker message to a topic marked recovering gets the deferral response and never reaches a full pending-dispatch record', async () => {
+    markTopicRecovering('123_0');
+    const sent = await runOneUpdate('hello there');
+    assert.ok(sent.some(t => t.includes('Still recovering')), `expected a deferral notice, got: ${JSON.stringify(sent)}`);
+    assert.deepEqual(await listPendingDispatches(), [], 'the enqueue-time placeholder must be cleaned up, and no full record ever written');
+  });
+
+  it('a skip-worker command to a topic marked recovering still executes its own logic, not the deferral', async () => {
+    markTopicRecovering('123_0');
+    const sent = await runOneUpdate('/reset');
+    assert.ok(sent.length > 0, 'expected a response');
+    assert.ok(!sent.some(t => t.includes('Still recovering')), `the recovery gate must never override a resolved skip-worker response, got: ${JSON.stringify(sent)}`);
+  });
+
+  it('a plain worker message to a topic that is NOT marked recovering dispatches normally (gate is inert)', async () => {
+    const sent = await runOneUpdate('hello there', 456);
+    assert.ok(!sent.some(t => t.includes('Still recovering')), `gate must be inert when nothing is marked, got: ${JSON.stringify(sent)}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P1 maintenance tick wiring (deep-recheck P1-5/TQ-1)
+// ---------------------------------------------------------------------------
+
+describe('runPollLoop: maintenance tick', { concurrency: 1 }, () => {
+  let tempDir: string;
+  const savedFetch = globalThis.fetch;
+  const originalDateNow = Date.now;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'tgbot-poll-maint-'));
+    process.env.PA_HOME = tempDir;
+  });
+
+  afterEach(async () => {
+    Date.now = originalDateNow;
+    _setDegradedForTest(false);
+    delete process.env.PA_HOME;
+    await rmRetry(tempDir);
+    (globalThis as Record<string, unknown>).fetch = savedFetch;
+  });
+
+  it('the 5-min tick fires in steady state and delivers a queued DLQ entry', async () => {
+    // NOTE: deliberately does NOT advance the clock 6h to also exercise the
+    // session-GC tick — cleanupExpiredSessions() operates on the REAL homedir
+    // (~/.claude, ~/.gemini), and triggering it from a test would delete real
+    // expired session files as a side effect. The gating logic is identical
+    // in shape; this covers the shared wiring plus the flush effect.
+    const dlqEntry = {
+      chatId: 123, threadId: 0, text: 'queued reply from outage',
+      timestamp: new Date().toISOString(), updateId: 424242,
+    };
+    await writeFile(join(tempDir, 'telegram-dlq.jsonl'), JSON.stringify(dlqEntry) + '\n', 'utf8');
+
+    const controller = new AbortController();
+    const state = makeState(123, -1);
+    const sentBodies: string[] = [];
+    let getUpdatesCount = 0;
+
+    (globalThis as Record<string, unknown>).fetch = async (url: string, opts?: { body?: string }) => {
+      if ((url as string).includes('getUpdates')) {
+        getUpdatesCount++;
+        // Advance past MAINTENANCE_INTERVAL_MS (5 min) between iterations so
+        // the tick's gate opens on the SECOND loop pass, not the first
+        // (nextMaintenanceAt is seeded one interval out at loop entry).
+        now += 6 * 60 * 1000;
+        if (getUpdatesCount >= 2) controller.abort();
+        return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: [] }), json: async () => ({ ok: true, result: [] }) };
+      }
+      if ((url as string).includes('sendMessage')) {
+        if (opts?.body) sentBodies.push(String(opts.body));
+        return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: { message_id: 77 } }), json: async () => ({ ok: true, result: { message_id: 77 } }) };
+      }
+      return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: true }), json: async () => ({ ok: true, result: true }) };
+    };
+
+    let now = originalDateNow();
+    Date.now = () => now;
+    try {
+      await runPollLoop('token', [123], state, {}, controller.signal, fastSleep);
+    } finally {
+      Date.now = originalDateNow;
+    }
+
+    // The tick's flushDlq is fire-and-forget — wait for its LAST effect (the
+    // DLQ rewrite/clear happens after sendMessage + markDelivered), not just
+    // the first (the send), so the file assertion below can't race the flush.
+    for (let i = 0; i < 40; i++) {
+      const raw = await readFile(join(tempDir, 'telegram-dlq.jsonl'), 'utf8').catch(() => '');
+      if (raw.trim() === '') break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+
+    assert.ok(sentBodies.some((b) => b.includes('queued reply from outage')),
+      'maintenance tick must retry and deliver the queued DLQ entry in steady state (not only at startup)');
+    const dlqRaw = await readFile(join(tempDir, 'telegram-dlq.jsonl'), 'utf8').catch(() => '');
+    assert.equal(dlqRaw.trim(), '', 'delivered entry removed from the DLQ');
+  });
+
+  it('the DLQ flush fires even while DEGRADED (it is reply delivery, not sheddable housekeeping)', async () => {
+    // Pins the 4cb6d67 behavioral fix: reverting the tick's gate back to
+    // `if (!isDegraded() && ...)` must fail this test.
+    _setDegradedForTest(true);
+    const dlqEntry = {
+      chatId: 123, threadId: 0, text: 'queued reply under degradation',
+      timestamp: new Date().toISOString(), updateId: 424244,
+    };
+    await writeFile(join(tempDir, 'telegram-dlq.jsonl'), JSON.stringify(dlqEntry) + '\n', 'utf8');
+
+    const controller = new AbortController();
+    const state = makeState(123, -1);
+    const sentBodies: string[] = [];
+    let getUpdatesCount = 0;
+
+    (globalThis as Record<string, unknown>).fetch = async (url: string, opts?: { body?: string }) => {
+      if ((url as string).includes('getUpdates')) {
+        getUpdatesCount++;
+        now += 6 * 60 * 1000;
+        if (getUpdatesCount >= 2) controller.abort();
+        return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: [] }), json: async () => ({ ok: true, result: [] }) };
+      }
+      if ((url as string).includes('sendMessage')) {
+        if (opts?.body) sentBodies.push(String(opts.body));
+        return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: { message_id: 79 } }), json: async () => ({ ok: true, result: { message_id: 79 } }) };
+      }
+      return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: true }), json: async () => ({ ok: true, result: true }) };
+    };
+
+    let now = originalDateNow();
+    Date.now = () => now;
+    try {
+      await runPollLoop('token', [123], state, {}, controller.signal, fastSleep);
+    } finally {
+      Date.now = originalDateNow;
+    }
+    for (let i = 0; i < 40; i++) {
+      const raw = await readFile(join(tempDir, 'telegram-dlq.jsonl'), 'utf8').catch(() => '');
+      if (raw.trim() === '') break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+
+    assert.ok(sentBodies.some((b) => b.includes('queued reply under degradation')),
+      'DLQ flush must NOT be shed under DEGRADED — queued replies would silently expire at the 24h TTL');
+  });
+
+  it('does not fire the tick before the interval elapses', async () => {
+    const dlqEntry = {
+      chatId: 123, threadId: 0, text: 'must not send yet',
+      timestamp: new Date().toISOString(), updateId: 424243,
+    };
+    await writeFile(join(tempDir, 'telegram-dlq.jsonl'), JSON.stringify(dlqEntry) + '\n', 'utf8');
+
+    const controller = new AbortController();
+    const state = makeState(123, -1);
+    const sentBodies: string[] = [];
+    let getUpdatesCount = 0;
+
+    (globalThis as Record<string, unknown>).fetch = async (url: string, opts?: { body?: string }) => {
+      if ((url as string).includes('getUpdates')) {
+        getUpdatesCount++;
+        // Clock does NOT advance — the seeded-one-interval-out gate stays shut.
+        if (getUpdatesCount >= 3) controller.abort();
+        return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: [] }), json: async () => ({ ok: true, result: [] }) };
+      }
+      if ((url as string).includes('sendMessage')) {
+        if (opts?.body) sentBodies.push(String(opts.body));
+        return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: { message_id: 78 } }), json: async () => ({ ok: true, result: { message_id: 78 } }) };
+      }
+      return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: true }), json: async () => ({ ok: true, result: true }) };
+    };
+
+    let now = originalDateNow();
+    Date.now = () => now;
+    try {
+      await runPollLoop('token', [123], state, {}, controller.signal, fastSleep);
+    } finally {
+      Date.now = originalDateNow;
+    }
+    await new Promise((r) => setTimeout(r, 200));
+
+    assert.ok(!sentBodies.some((b) => b.includes('must not send yet')),
+      'tick must not fire before MAINTENANCE_INTERVAL_MS elapses');
+    const dlqRaw = await readFile(join(tempDir, 'telegram-dlq.jsonl'), 'utf8');
+    assert.ok(dlqRaw.includes('must not send yet'), 'entry still queued');
   });
 });
 

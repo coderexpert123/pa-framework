@@ -2,14 +2,14 @@ import { spawn } from 'child_process';
 import { writeFile, unlink } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { randomBytes } from 'crypto';
+import { randomBytes, randomUUID } from 'crypto';
 import { DEFAULT_TIMEOUT, DEFAULT_IDLE_TIMEOUT } from './types.js';
 import type { WorkerConfig, CommandResult, RunOptions } from './types.js';
 import { blackboard } from './blackboard.js';
 import { resolveStateDir, getLatestStateMtime, analyzeAgentState } from './state-monitor.js';
 import { hasChildProcesses, killProcessTree, getDescendantPids, getCommandLines, areProcessesAlive } from './process-tree.js';
 import { evaluateWorkerState } from './worker-evaluator.js';
-import { addWorkerPid, removeWorkerPid } from './worker-pids.js';
+import { addWorkerPid, removeWorkerPid, updateWorkerPidDescendants } from './worker-pids.js';
 import { logger } from './lib/log.js';
 import { notifyUser } from './lib/notify.js';
 import { getSkillTranslationPatterns } from './lib/skill-translations.js';
@@ -63,6 +63,31 @@ export async function executeWorker(
       success: false,
       output: '',
       error: `Failed to acquire lock for resource: ${resource} after ${maxTimeoutMs / 1000}s`,
+      exitCode: -1,
+    };
+  }
+
+  // 1b. Admission control (AI-096 item 3): heavyweight CLI workers all hit the
+  // same disk — unbounded concurrency is what collapsed the machine on
+  // 2026-07-04. Acquire one of PA_MAX_CONCURRENT_WORKERS blackboard slots
+  // (cross-process: bot + catchup share the pool) or queue until one frees.
+  // Slot AFTER resource: slot holders never wait on resources → no deadlock.
+  // Evaluators are exempt: they run WHILE a slot-holding worker awaits their
+  // verdict — making them queue for a slot would be a circular wait.
+  const slotHandle = options.isEvaluator
+    ? ('disabled' as const)
+    : await acquireWorkerSlot(agentName, maxTimeoutMs, blackboard, undefined, async () => {
+        // Keep the already-held resource lock fresh while queued — a slot wait
+        // can exceed HEARTBEAT_STALE_MS, and a purged topic lock would let a
+        // concurrent same-topic dispatch through.
+        await blackboard.updateHeartbeat(resource, agentName, contextId).catch(() => {});
+      });
+  if (slotHandle === null) {
+    await blackboard.releaseLock(resource, agentName, contextId);
+    return {
+      success: false,
+      output: '',
+      error: `All worker slots busy after ${maxTimeoutMs / 1000}s (PA_MAX_CONCURRENT_WORKERS=${workerSlotCount()}) — dispatch queued too long`,
       exitCode: -1,
     };
   }
@@ -132,7 +157,13 @@ export async function executeWorker(
       let codexStreamError = ''; // captures {"type":"error",...} events from codex NDJSON stream
       const isStreamJson = worker.output_format === 'stream-json';
 
-      const child = spawn(worker.command, args, {
+      const command = (worker.name === 'gemini' && (worker.command === 'gemini' || worker.command.endsWith('gemini.cmd')))
+        ? 'D:/gemini-shim/gemini.cmd'
+        : ((worker.name === 'agy' && (worker.command === 'agy' || worker.command.endsWith('agy.cmd')))
+          ? 'D:/gemini-shim/agy.cmd'
+          : worker.command);
+
+      const child = spawn(command, args, {
         cwd: options.cwd || process.cwd(),
         shell: true,
         env: mergedEnv,
@@ -323,10 +354,16 @@ export async function executeWorker(
             // Update blackboard heartbeat
             if (resolved) return;
             await blackboard.updateHeartbeat(resource, agentName, contextId);
+            if (slotHandle !== 'disabled') {
+              await blackboard.updateHeartbeat(slotHandle.slot, agentName, slotHandle.ctx).catch(() => {});
+            }
 
             // BG-task tracking: one OS query → BFS in memory
             const descendants = await bgGetDescendants(child.pid!);
             if (resolved) return; // guard: worker may have exited while querying OS
+            // Persist the live worker tree so the orphan reaper can check liveness
+            // even after the shell wrapper (child.pid) dies with a crashed spawner.
+            updateWorkerPidDescendants(child.pid!, descendants.map(d => d.pid)).catch(() => {});
             const now = Date.now();
             const currentPids = new Set(descendants.map(d => d.pid));
 
@@ -480,7 +517,7 @@ export async function executeWorker(
 
               // Tool boundary tracking (Gemini): record stdout position after each tool_result
               // so we can discard intermediate planning narration on exit.
-              if (event.type === 'tool_result' && worker.name === 'gemini') {
+              if (event.type === 'tool_result' && (worker.name === 'gemini' || worker.name === 'agy')) {
                 lastToolBoundary = stdout.length;
               }
 
@@ -565,7 +602,7 @@ export async function executeWorker(
             }
             if (event.type === 'item.completed' && event.item?.type === 'agent_message' && event.item?.text) {
               stdout += event.item.text;
-            } else if (event.type === 'tool_result' && worker.name === 'gemini') {
+            } else if (event.type === 'tool_result' && (worker.name === 'gemini' || worker.name === 'agy')) {
               lastToolBoundary = stdout.length;
             } else if (event.type === 'result' && event.result) {
               stdout = event.result;
@@ -589,7 +626,7 @@ export async function executeWorker(
         // Gemini tool-boundary trim: discard all content accumulated before the last
         // tool_result. This strips intermediate planning narration from multi-step
         // tool-use conversations, keeping only the final response segment.
-        if (worker.name === 'gemini' && lastToolBoundary > 0) {
+        if ((worker.name === 'gemini' || worker.name === 'agy') && lastToolBoundary > 0) {
           stdout = stdout.slice(lastToolBoundary);
         }
 
@@ -649,5 +686,53 @@ export async function executeWorker(
     return result;
   } finally {
     await blackboard.releaseLock(resource, agentName, contextId);
+    if (slotHandle !== 'disabled') {
+      await blackboard.releaseLock(slotHandle.slot, agentName, slotHandle.ctx).catch(() => {});
+    }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Worker admission control (AI-096 item 3)
+// ---------------------------------------------------------------------------
+
+const SLOT_RETRY_MS = 5_000;
+
+export function workerSlotCount(): number {
+  const n = parseInt(process.env.PA_MAX_CONCURRENT_WORKERS ?? '3', 10);
+  return Number.isFinite(n) ? n : 3;
+}
+
+export interface WorkerSlotHandle { slot: string; ctx: string }
+
+/**
+ * Acquire one of N machine-wide worker slots via the blackboard (cross-process).
+ * Returns 'disabled' when PA_MAX_CONCURRENT_WORKERS <= 0 (no limiting), a
+ * handle when a slot was acquired, or null when maxWaitMs elapsed with every
+ * slot busy. Each acquisition uses a fresh contextId so same-PID concurrent
+ * spawns (the bot) still exclude each other.
+ */
+export async function acquireWorkerSlot(
+  agent: string,
+  maxWaitMs: number,
+  bb: Pick<typeof blackboard, 'acquireLock'> = blackboard,
+  sleepFn: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+  onRetry?: () => Promise<void>,
+): Promise<WorkerSlotHandle | 'disabled' | null> {
+  const n = workerSlotCount();
+  if (n <= 0) return 'disabled';
+  const ctx = randomUUID();
+  const start = Date.now();
+  do {
+    for (let i = 0; i < n; i++) {
+      const slot = `worker-slot-${i}`;
+      // timeoutMs=50 → effectively a single acquisition attempt per slot (the
+      // acquire loop's internal retry sleeps 1s, past the budget), while giving
+      // enough headroom that a stray 1ms clock tick can't zero out the attempt.
+      if (await bb.acquireLock(slot, agent, process.pid, 50, ctx)) return { slot, ctx };
+    }
+    if (onRetry) await onRetry();
+    await sleepFn(SLOT_RETRY_MS);
+  } while (Date.now() - start < maxWaitMs);
+  return null;
 }

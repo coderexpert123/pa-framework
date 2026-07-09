@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { splitMessage, sanitizeMdV2, getUpdates, sendMessage, sendMessageWithId, pinChatMessage, unpinChatMessage, sendTyping } from '../telegram.js';
+import { splitMessage, sanitizeMdV2, getUpdates, sendMessage, sendMessageWithId, pinChatMessage, unpinChatMessage, sendTyping, SEND_TYPING_TIMEOUT_MS } from '../telegram.js';
 
 const MAX = 4000;
 
@@ -889,6 +889,20 @@ describe('sendMessage', () => {
     assert.ok(fallbackBody.text.includes('Ref: g-ab12'), 'ref ID preserved');
     assert.ok(!fallbackBody.text.includes('_Ref:'), 'italic markers stripped');
   });
+
+  it('strips italic markers from a 12-hex ref ID (post-Phase-3 width) in plain-text fallback', async () => {
+    // Pins the {4,} widening of the fallback regex: a mis-widened {12} would
+    // break the legacy tests above; a leftover {4} would break this one.
+    const calls = setupFetchMock([
+      { ok: false, status: 400, bodyText: "can't parse entities" },
+      { ok: true, bodyJson: { ok: true } },
+    ]);
+    await sendMessage('token', 123, 'hello world\n\n_Ref: s-a1b2c3d4e5f6_');
+    assert.equal(calls.length, 2, 'should retry after parse failure');
+    const fallbackBody = JSON.parse(calls[1].init!.body as string);
+    assert.ok(fallbackBody.text.includes('Ref: s-a1b2c3d4e5f6'), '12-hex ref ID preserved in fallback text');
+    assert.ok(!fallbackBody.text.includes('_Ref:'), 'italic markers stripped in fallback');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -924,6 +938,15 @@ describe('sendTyping', () => {
       const body = JSON.parse(calls[0].init!.body as string);
       assert.equal(body.message_thread_id, undefined, `threadId=${threadId} should omit field`);
     }
+  });
+
+  it('allows at least 10s for the request (AI-095: 3s budget starved typing on slow networks)', () => {
+    assert.ok(SEND_TYPING_TIMEOUT_MS >= 10_000, `SEND_TYPING_TIMEOUT_MS=${SEND_TYPING_TIMEOUT_MS}`);
+  });
+
+  it('swallows network errors without throwing', async () => {
+    globalThis.fetch = (async () => { throw new Error('boom'); }) as unknown as typeof fetch;
+    await assert.doesNotReject(sendTyping('token', 123, 456));
   });
 });
 

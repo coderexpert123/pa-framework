@@ -107,6 +107,32 @@ describe('drafts', () => {
         token_secret: 'TELEGRAM_BOT_TOKEN',
       });
     });
+
+    it('writes target_skill into draft.meta.json but NOT into skill.md frontmatter', async () => {
+      const proposal = makeProposal({
+        name: 'reminders-fix',
+        target_skill: 'reminders',
+        frontmatter: { timeout: 300 },
+      });
+      await saveDraft(proposal, 'failure');
+
+      const meta: DraftMeta = JSON.parse(
+        await readFile(join(dir, 'skill-drafts', 'reminders-fix', 'draft.meta.json'), 'utf8')
+      );
+      assert.equal(meta.target_skill, 'reminders');
+
+      const skillMd = await readFile(join(dir, 'skill-drafts', 'reminders-fix', 'skill.md'), 'utf8');
+      assert.doesNotMatch(skillMd, /target_skill/);
+    });
+
+    it('omits target_skill from draft.meta.json when not set on the proposal', async () => {
+      const proposal = makeProposal({ name: 'no-target' });
+      await saveDraft(proposal, 'conversation');
+      const meta: DraftMeta = JSON.parse(
+        await readFile(join(dir, 'skill-drafts', 'no-target', 'draft.meta.json'), 'utf8')
+      );
+      assert.equal(meta.target_skill, undefined);
+    });
   });
 
   describe('loadDraft', () => {
@@ -189,6 +215,53 @@ describe('drafts', () => {
       await createTempDraft(dir, 'existing-skill', 'Duplicate.', makeMeta());
 
       await assert.rejects(() => approveDraft('existing-skill'), /already exists/);
+    });
+
+    it('merges extra DraftMeta fields (approved_autonomously, applied_in_place)', async () => {
+      await createTempDraft(dir, 'auto-approved', 'Do the thing.', makeMeta());
+
+      await approveDraft('auto-approved', { approved_autonomously: true });
+
+      const meta: DraftMeta = JSON.parse(
+        await readFile(join(dir, 'skill-drafts', 'auto-approved', 'draft.meta.json'), 'utf8')
+      );
+      assert.equal(meta.status, 'approved');
+      assert.equal(meta.approved_autonomously, true);
+    });
+
+    it('single-argument call still works exactly as before (backward compatibility)', async () => {
+      await createTempDraft(dir, 'manual-approve', 'Do the thing.', makeMeta());
+      await approveDraft('manual-approve');
+      const meta: DraftMeta = JSON.parse(
+        await readFile(join(dir, 'skill-drafts', 'manual-approve', 'draft.meta.json'), 'utf8')
+      );
+      assert.equal(meta.status, 'approved');
+      assert.equal(meta.approved_autonomously, undefined);
+    });
+  });
+
+  describe('uniqueDraftName', () => {
+    it('returns the base name when free', async () => {
+      const { uniqueDraftName } = await import('../src/drafts.js');
+      const name = await uniqueDraftName('brand-new-fix');
+      assert.equal(name, 'brand-new-fix');
+    });
+
+    it('returns "<base>-2" when the base name is already a draft', async () => {
+      const { uniqueDraftName } = await import('../src/drafts.js');
+      await createTempDraft(dir, 'reminders-fix', 'Old fix.', makeMeta());
+
+      const name = await uniqueDraftName('reminders-fix');
+      assert.equal(name, 'reminders-fix-2');
+    });
+
+    it('returns "<base>-3" when base and "-2" are both taken (one as a deployed skill)', async () => {
+      const { uniqueDraftName } = await import('../src/drafts.js');
+      await createTempDraft(dir, 'daily-brief-fix', 'Old fix draft.', makeMeta());
+      await createTempSkill(dir, 'daily-brief-fix-2', 'Deployed fix.');
+
+      const name = await uniqueDraftName('daily-brief-fix');
+      assert.equal(name, 'daily-brief-fix-3');
     });
   });
 

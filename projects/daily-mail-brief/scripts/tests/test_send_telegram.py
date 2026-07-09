@@ -1,113 +1,140 @@
 """
-Tests for the send() function in send_telegram.py.
-Covers: TELEGRAM_BRIEFING_CHAT_ID override, fallback to TELEGRAM_CHAT_ID,
-thread ID routing, fallback retry preservation, and failure accumulation.
+Tests for send_telegram.py's OWN remaining logic.
+
+send_telegram.py used to be a self-contained Telegram sender; it now
+delegates delivery to pa/src/telegram_notify.py's send_text/send_document
+(see the module docstring). The routing/thread-id/fallback-retry/failure-
+accumulation behaviors those functions implement are tested directly in
+pa/src/tests/test_telegram_notify.py's TestSendTextRoutingAndRetry (migrated
+there 2026-07-08, deep-recheck Phase 2) — not duplicated here.
+
+_check_assertion is also NOT covered here: it already has comprehensive
+coverage in test_send_telegram_assert.py's TestAssertionCheck (5 tests),
+unaffected by the delegation rewrite.
+
+What's left, and what this file covers: _build_hallucination_body (no
+existing coverage anywhere), and main()'s file-type dispatch (.pdf ->
+send_document, else -> send_text), with both mocked at the send_telegram
+module boundary.
 """
 import sys
 import os
+import json
+import tempfile
+import shutil
 import unittest
 from unittest.mock import patch, MagicMock
 
 # Allow importing from parent scripts dir
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from send_telegram import send
 
 
-def ok_response():
-    r = MagicMock()
-    r.status_code = 200
-    return r
+def _import_fresh():
+    if 'send_telegram' in sys.modules:
+        del sys.modules['send_telegram']
+    import send_telegram
+    return send_telegram
 
 
-def fail_response(code=400, text="Bad Request"):
-    r = MagicMock()
-    r.status_code = code
-    r.text = text
-    return r
+class TestBuildHallucinationBody(unittest.TestCase):
+    def test_includes_claimed_actual_and_first_line(self):
+        mod = _import_fresh()
+        with patch.dict(os.environ, {"PA_WORKER_NAME": "zclaude"}, clear=False):
+            body = mod._build_hallucination_body("5", 3, "[pa assert] emails.json listed=5")
+        self.assertIn("Expected: 3", body)
+        self.assertIn("Claimed: 5", body)
+        self.assertIn("[pa assert] emails.json listed=5", body)
+        self.assertIn("zclaude", body)
+        self.assertIn("NOT sent", body)
+
+    def test_truncates_long_first_line(self):
+        mod = _import_fresh()
+        long_line = "x" * 500
+        body = mod._build_hallucination_body("1", 1, long_line)
+        # first_line is sliced to [:200] in the body builder
+        self.assertNotIn("x" * 201, body)
+        self.assertIn("x" * 200, body)
+
+    def test_unknown_worker_when_env_unset(self):
+        mod = _import_fresh()
+        with patch.dict(os.environ, {}, clear=True):
+            body = mod._build_hallucination_body("1", 1, "line")
+        self.assertIn("<unknown>", body)
 
 
-# Production env: TELEGRAM_BRIEFING_CHAT_ID set — only supergroup receives
-PROD_ENV = {
-    "TELEGRAM_BOT_TOKEN": "fake-token",
-    "TELEGRAM_CHAT_ID": "1000000001,-1001234567890",
-    "TELEGRAM_BRIEFING_CHAT_ID": "-1001234567890",
-    "TELEGRAM_DAILY_BRIEFING_THREAD_ID": "29",
-}
+class TestMainFileTypeDispatch(unittest.TestCase):
+    """main()'s .pdf -> send_document vs else -> send_text branch, and the
+    assertion-header gate feeding into send_text. Both delegated functions
+    are mocked at the send_telegram module boundary — their own routing/
+    retry logic is tested directly in test_telegram_notify.py."""
 
-# Fallback env: no TELEGRAM_BRIEFING_CHAT_ID — uses TELEGRAM_CHAT_ID (both destinations)
-FALLBACK_ENV = {
-    "TELEGRAM_BOT_TOKEN": "fake-token",
-    "TELEGRAM_CHAT_ID": "1000000001,-1001234567890",
-    "TELEGRAM_DAILY_BRIEFING_THREAD_ID": "29",
-}
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.pa_home = tempfile.mkdtemp()
+        self.env_patch = patch.dict(os.environ, {"PA_HOME": self.pa_home}, clear=False)
+        self.env_patch.start()
 
+    def tearDown(self):
+        self.env_patch.stop()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        shutil.rmtree(self.pa_home, ignore_errors=True)
 
-class TestBriefingChatIdOverride(unittest.TestCase):
-    """TELEGRAM_BRIEFING_CHAT_ID takes precedence over TELEGRAM_CHAT_ID."""
+    def test_pdf_path_dispatches_to_send_document(self):
+        mod = _import_fresh()
+        pdf_path = os.path.join(self.tmpdir, "report.pdf")
+        with open(pdf_path, "wb") as f:
+            f.write(b"%PDF fake")
 
-    @patch("send_telegram.requests.post", return_value=ok_response())
-    @patch.dict(os.environ, PROD_ENV, clear=True)
-    def test_only_supergroup_receives_when_briefing_chat_id_set(self, mock_post):
-        send("Hello")
-        chat_ids_called = {c[1]["json"]["chat_id"] for c in mock_post.call_args_list}
-        self.assertIn("-1001234567890", chat_ids_called)
-        self.assertNotIn("1000000001", chat_ids_called)
+        with patch.object(mod, "send_document") as mock_send_document, \
+             patch.object(mod, "send_text") as mock_send_text, \
+             patch("sys.argv", ["send_telegram.py", pdf_path]):
+            mod.main()
 
-    @patch("send_telegram.requests.post", return_value=ok_response())
-    @patch.dict(os.environ, FALLBACK_ENV, clear=True)
-    def test_both_chats_receive_when_fallback_to_chat_id(self, mock_post):
-        send("Hello")
-        chat_ids_called = {c[1]["json"]["chat_id"] for c in mock_post.call_args_list}
-        self.assertIn("1000000001", chat_ids_called)
-        self.assertIn("-1001234567890", chat_ids_called)
+        mock_send_document.assert_called_once_with(pdf_path)
+        mock_send_text.assert_not_called()
 
+    def test_markdown_path_with_valid_assertion_dispatches_to_send_text(self):
+        mod = _import_fresh()
+        emails_path = os.path.join(mod.PROJECT_ROOT, "emails.json")
+        saved = None
+        if os.path.exists(emails_path):
+            with open(emails_path, encoding="utf-8") as f:
+                saved = f.read()
+        try:
+            with open(emails_path, "w", encoding="utf-8") as f:
+                json.dump({"emails": [{"id": "1"}]}, f)
 
-class TestSendThreadIdRouting(unittest.TestCase):
-    """Thread ID is applied to supergroup chats only."""
+            briefing = os.path.join(self.tmpdir, "briefing_output.md")
+            with open(briefing, "w", encoding="utf-8") as f:
+                f.write("[pa assert] emails.json listed=1\n\nActual briefing body")
 
-    @patch("send_telegram.requests.post", return_value=ok_response())
-    @patch.dict(os.environ, PROD_ENV, clear=True)
-    def test_supergroup_gets_thread_id(self, mock_post):
-        send("Hello")
-        calls = mock_post.call_args_list
-        supergroup_call = next(c for c in calls if c[1]["json"]["chat_id"] == "-1001234567890")
-        self.assertEqual(supergroup_call[1]["json"]["message_thread_id"], 29)
+            with patch.object(mod, "send_document") as mock_send_document, \
+                 patch.object(mod, "send_text") as mock_send_text, \
+                 patch("sys.argv", ["send_telegram.py", briefing]):
+                mod.main()
 
-    @patch("send_telegram.requests.post", return_value=ok_response())
-    @patch.dict(os.environ, {**PROD_ENV, "TELEGRAM_DAILY_BRIEFING_THREAD_ID": ""}, clear=True)
-    def test_no_thread_id_env_sends_without_it(self, mock_post):
-        """When env var is absent/empty, no message_thread_id."""
-        send("Hello")
-        for c in mock_post.call_args_list:
-            self.assertNotIn("message_thread_id", c[1]["json"])
+            mock_send_document.assert_not_called()
+            mock_send_text.assert_called_once()
+            sent_text = mock_send_text.call_args[0][0]
+            # The assert header line is stripped before sending.
+            self.assertNotIn("[pa assert]", sent_text)
+            self.assertIn("Actual briefing body", sent_text)
+        finally:
+            if saved is not None:
+                with open(emails_path, "w", encoding="utf-8") as f:
+                    f.write(saved)
+            elif os.path.exists(emails_path):
+                os.remove(emails_path)
 
-
-class TestSendFallbackRetry(unittest.TestCase):
-    """Thread ID is preserved in the Markdown-fallback retry."""
-
-    @patch("send_telegram.requests.post")
-    @patch.dict(os.environ, PROD_ENV, clear=True)
-    def test_fallback_preserves_thread_id(self, mock_post):
-        # Supergroup Markdown fails then fallback succeeds.
-        mock_post.side_effect = [fail_response(), ok_response()]
-        send("Hello")
-        fallback = next(
-            c for c in mock_post.call_args_list
-            if c[1]["json"].get("chat_id") == "-1001234567890"
-            and "parse_mode" not in c[1]["json"]
-        )
-        self.assertEqual(fallback[1]["json"]["message_thread_id"], 29)
-
-
-class TestSendFailureAccumulation(unittest.TestCase):
-    """Both Markdown and fallback failing exits with error."""
-
-    @patch("send_telegram.requests.post")
-    @patch.dict(os.environ, PROD_ENV, clear=True)
-    def test_exits_on_full_failure(self, mock_post):
-        mock_post.side_effect = [fail_response(), fail_response()]
-        with self.assertRaises(SystemExit):
-            send("Hello")
+    def test_missing_file_exits_before_dispatching(self):
+        mod = _import_fresh()
+        with patch.object(mod, "send_document") as mock_send_document, \
+             patch.object(mod, "send_text") as mock_send_text, \
+             patch("sys.argv", ["send_telegram.py", os.path.join(self.tmpdir, "does-not-exist.md")]):
+            with self.assertRaises(SystemExit):
+                mod.main()
+        mock_send_document.assert_not_called()
+        mock_send_text.assert_not_called()
 
 
 if __name__ == "__main__":

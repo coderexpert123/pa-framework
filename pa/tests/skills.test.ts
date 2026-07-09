@@ -43,6 +43,18 @@ describe('loadSkill', () => {
     assert.equal(skill.prompt, 'Do the thing.');
   });
 
+  it('parses critical: true from frontmatter', async () => {
+    await createTempSkill(tempDir, 'critical-skill', '---\ncritical: true\n---\nPrompt.');
+    const skill = await loadSkill('critical-skill');
+    assert.equal(skill.frontmatter.critical, true);
+  });
+
+  it('defaults critical to false when absent', async () => {
+    await createTempSkill(tempDir, 'non-critical-skill', '---\ncron: "0 8 * * *"\n---\nPrompt.');
+    const skill = await loadSkill('non-critical-skill');
+    assert.equal(skill.frontmatter.critical, false);
+  });
+
   it('parses skill with no frontmatter', async () => {
     await createTempSkill(tempDir, 'bare', 'Just a prompt.');
     const skill = await loadSkill('bare');

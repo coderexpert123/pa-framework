@@ -223,7 +223,9 @@ describe('expirePendingAction', () => {
   });
 
   it('keeps pending_action just under TTL', () => {
-    const state = withPending('almost expired', PENDING_ACTION_TTL_MS - 1);
+    // 60s under the TTL, not 1ms — a 1ms margin flakes whenever suite load
+    // delays the expiry check past the boundary computed at fixture time.
+    const state = withPending('almost expired', PENDING_ACTION_TTL_MS - 60_000);
     expirePendingAction(state);
     assert.ok(state.pending_action, 'should still be present just under TTL');
   });
@@ -677,15 +679,18 @@ describe('MODEL_SWITCH_PATTERN', () => {
   it('matches /model gemini', () => assert.ok(MODEL_SWITCH_PATTERN.test('/model gemini')));
   it('matches /model zclaude', () => assert.ok(MODEL_SWITCH_PATTERN.test('/model zclaude')));
   it('matches /model codex', () => assert.ok(MODEL_SWITCH_PATTERN.test('/model codex')));
+  it('matches /model agy', () => assert.ok(MODEL_SWITCH_PATTERN.test('/model agy')));
   it('matches /models claude (plural)', () => assert.ok(MODEL_SWITCH_PATTERN.test('/models claude')));
   it('matches /models gemini (plural)', () => assert.ok(MODEL_SWITCH_PATTERN.test('/models gemini')));
   it('matches /models zclaude (plural)', () => assert.ok(MODEL_SWITCH_PATTERN.test('/models zclaude')));
   it('matches /models codex (plural)', () => assert.ok(MODEL_SWITCH_PATTERN.test('/models codex')));
+  it('matches /models agy (plural)', () => assert.ok(MODEL_SWITCH_PATTERN.test('/models agy')));
   it('matches case-insensitively', () => {
     assert.ok(MODEL_SWITCH_PATTERN.test('/model Claude'));
     assert.ok(MODEL_SWITCH_PATTERN.test('/MODEL GEMINI'));
     assert.ok(MODEL_SWITCH_PATTERN.test('/model ZCLAUDE'));
     assert.ok(MODEL_SWITCH_PATTERN.test('/model CODEX'));
+    assert.ok(MODEL_SWITCH_PATTERN.test('/model AGY'));
   });
   it('does not match /model unknown-worker', () => assert.ok(!MODEL_SWITCH_PATTERN.test('/model gpt4')));
   it('does not match plain text', () => assert.ok(!MODEL_SWITCH_PATTERN.test('use claude please')));
@@ -938,6 +943,12 @@ describe('handleDefaultQuery', () => {
     const result = handleDefaultQuery('/default codex');
     assert.equal(result.matched, true);
     assert.equal(result.worker, 'codex');
+  });
+
+  it('matches /default agy', () => {
+    const result = handleDefaultQuery('/default agy');
+    assert.equal(result.matched, true);
+    assert.equal(result.worker, 'agy');
   });
 
   it('does not match /default invalidmodel', () => {

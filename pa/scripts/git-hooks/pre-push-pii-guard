@@ -12,16 +12,52 @@ but does NOT block the push. Regex layers always run.
 
 Set PA_SKIP_PII_GUARD=1 to bypass entirely (logged loudly).
 
+Modes:
+  (default)      pre-push hook — scans ADDED lines of the outgoing push only.
+  --full         audit mode — scans EVERY tracked file of the repo the
+                 GIT_DIR env var points at (default: .git-public relative to
+                 cwd). Reports all violations, exits 1 if any. Use for the
+                 scheduled pii-audit skill / manual full-tree sweeps; the
+                 per-push diff scan never re-checks pre-existing lines.
+  --no-llm       with --full: skip the Gemini layer (regex + tripwires only).
+
 Install:
   cp pa/scripts/git-hooks/pre-push-pii-guard .git-public/hooks/pre-push
   chmod +x .git-public/hooks/pre-push
 """
 import os
 import re
+import shutil
 import subprocess
 import sys
 
+# Windows consoles may be cp1252 — the emoji status output must never crash the guard.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 PA_HOME = os.environ.get("PA_HOME") or os.path.join(os.path.expanduser("~"), ".pa")
+
+# AI-097: git hooks run with a minimal inherited environment — GEMINI_CMD
+# lives in ~/.pa/secrets.env but is not exported into that environment
+# unless something explicitly does so. Same self-contained-script pattern as
+# projects/coding-dirs-updater/update_coding_dirs.py's _load_secrets().
+def _load_secrets() -> dict[str, str]:
+    path = os.path.join(PA_HOME, "secrets.env")
+    out: dict[str, str] = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                out[key.strip()] = val.strip().strip("\"'")
+    except FileNotFoundError:
+        pass
+    return out
 
 # Structural credential patterns — always block, no LLM needed.
 CREDENTIAL_PATTERNS = [
@@ -70,12 +106,39 @@ def load_tripwires() -> list[str]:
         return []
 
 
+def resolve_gemini_argv() -> list[str] | None:
+    """
+    Resolve the Gemini invocation, Windows-aware.
+
+    Order: $GEMINI_CMD, then `gemini` on PATH. Returns the argv prefix (before
+    flags) or None when nothing resolvable — the caller fail-opens with a
+    warning either way, but None makes the "layer silently off" state explicit.
+
+    Windows: a `.cmd`/`.bat` shim cannot be exec'd directly by subprocess with
+    a list argv — it needs the cmd.exe interpreter. This was the bug that kept
+    the semantic layer silently disabled (AI-094).
+    """
+    candidate = (
+        os.environ.get("GEMINI_CMD")
+        or shutil.which("gemini")
+        or _load_secrets().get("GEMINI_CMD")
+    )
+    if not candidate:
+        return None
+    if candidate.lower().endswith((".cmd", ".bat")):
+        return ["cmd", "/c", candidate]
+    return [candidate]
+
+
 def gemini_check(content: str, tripwires: list[str]) -> tuple[bool, str]:
     """
     Ask Gemini to scan content for PII. Returns (is_clean, reason).
     Fail-open: returns (True, '') on any error.
     """
-    gemini_cmd = os.environ.get("GEMINI_CMD", "gemini")
+    argv = resolve_gemini_argv()
+    if argv is None:
+        print("⚠  PII guard: no Gemini binary (set GEMINI_CMD) — semantic layer OFF", file=sys.stderr)
+        return True, ""
     tripwire_ctx = ""
     if tripwires:
         tripwire_ctx = "\nAlso specifically flag:\n" + "\n".join(f"- {t}" for t in tripwires)
@@ -103,37 +166,158 @@ VIOLATION: <short description>
 Added lines to analyze (capped at 400 lines):
 {chr(10).join(content.splitlines()[:400])}
 """
-    try:
-        result = subprocess.run(
-            [gemini_cmd, "--yolo"],
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=45,
-        )
-        response = result.stdout.strip()
-        # Find the verdict line (skip any preamble noise)
-        for resp_line in response.splitlines():
-            resp_line = resp_line.strip()
-            if resp_line.startswith("VIOLATION"):
-                return False, resp_line[len("VIOLATION:"):].strip()
-            if resp_line == "CLEAN":
-                return True, ""
-        # If we can't parse a verdict, fail-open with a warning
-        print("⚠  PII guard: Gemini response unparseable — skipping LLM check", file=sys.stderr)
-        return True, ""
-    except FileNotFoundError:
-        print(f"⚠  PII guard: '{gemini_cmd}' not found — skipping LLM check", file=sys.stderr)
-        return True, ""
-    except subprocess.TimeoutExpired:
-        print("⚠  PII guard: Gemini timed out — skipping LLM check", file=sys.stderr)
-        return True, ""
-    except Exception as exc:
-        print(f"⚠  PII guard: LLM error ({exc}) — skipping LLM check", file=sys.stderr)
-        return True, ""
+    # AI-097: "sturdy, relied-on" means transient failures (timeout, a network
+    # blip surfacing as a generic subprocess error) get ONE retry before this
+    # layer gives up — a single hiccup silently disabling the semantic scan
+    # for an entire push defeats the point of relying on it. A genuinely
+    # missing binary is not transient — that fails open immediately, no
+    # retry. Explicit encoding="utf-8", errors="replace" is the 2026-07-08
+    # crash fix: without it, subprocess.run() on Windows decodes with the
+    # system codepage (cp1252), and Gemini's UTF-8 output (emoji, smart
+    # quotes) throws inside a background reader thread — an exception that
+    # escapes this try/except entirely (wrong thread) and crashes the hook
+    # with a raw traceback instead of failing open by design.
+    MAX_ATTEMPTS = 2
+    last_error: Exception | None = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            result = subprocess.run(
+                argv + ["--yolo"],
+                input=prompt,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
+            )
+            response = result.stdout.strip()
+            # Find the verdict line (skip any preamble noise)
+            for resp_line in response.splitlines():
+                resp_line = resp_line.strip()
+                if resp_line.startswith("VIOLATION"):
+                    return False, resp_line[len("VIOLATION:"):].strip()
+                if resp_line == "CLEAN":
+                    return True, ""
+            # Unparseable — treat like a transient failure and retry once.
+            last_error = RuntimeError(f"unparseable response: {response[:200]!r}")
+        except FileNotFoundError:
+            print(f"⚠  PII guard: '{argv[0]}' not found — skipping LLM check", file=sys.stderr)
+            return True, ""
+        except subprocess.TimeoutExpired:
+            last_error = TimeoutError("gemini call timed out")
+        except Exception as exc:
+            last_error = exc
+
+        if attempt < MAX_ATTEMPTS:
+            print(f"⚠  PII guard: Gemini attempt {attempt}/{MAX_ATTEMPTS} failed ({last_error}) — retrying", file=sys.stderr)
+
+    print(f"⚠  PII guard: Gemini failed after {MAX_ATTEMPTS} attempts ({last_error}) — skipping LLM check", file=sys.stderr)
+    return True, ""
+
+
+# File extensions that are never worth scanning (binary / generated).
+SKIP_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".db", ".sqlite",
+                   ".woff", ".woff2", ".ttf", ".zip", ".gz", ".exe", ".dll", ".lock")
+FULL_SCAN_MAX_BYTES = 1_000_000  # skip pathological single files
+
+
+def collect_tree(git_dir: str) -> list[tuple[str, str]]:
+    """All tracked (path, content) pairs of the repo at git_dir. Skips binaries."""
+    result = subprocess.run(
+        ["git", "--git-dir", git_dir, "--work-tree", ".", "ls-files"],
+        capture_output=True, text=True, timeout=60,
+    )
+    files: list[tuple[str, str]] = []
+    for path in result.stdout.splitlines():
+        path = path.strip()
+        if not path or path.lower().endswith(SKIP_EXTENSIONS):
+            continue
+        try:
+            if os.path.getsize(path) > FULL_SCAN_MAX_BYTES:
+                continue
+            with open(path, encoding="utf-8", errors="strict") as f:
+                files.append((path, f.read()))
+        except (OSError, UnicodeDecodeError):
+            continue  # unreadable / binary-ish → skip
+    return files
+
+
+def scan_text(path: str, content: str, tripwires: list[str]) -> list[str]:
+    """Regex layers 1+2 against one file. Returns violation descriptions."""
+    violations: list[str] = []
+    for pattern in CREDENTIAL_PATTERNS:
+        for m in re.finditer(pattern, content):
+            line_no = content.count("\n", 0, m.start()) + 1
+            violations.append(f"{path}:{line_no} credential pattern: {pattern}")
+    for pattern in tripwires:
+        try:
+            for m in re.finditer(pattern, content, re.IGNORECASE):
+                line_no = content.count("\n", 0, m.start()) + 1
+                violations.append(f"{path}:{line_no} tripwire: {pattern}")
+        except re.error:
+            pass
+    return violations
+
+
+def full_audit(use_llm: bool) -> int:
+    """
+    --full mode: scan the ENTIRE tracked tree of the public repo. Unlike the
+    per-push diff scan this re-checks pre-existing lines — the gap that let 5
+    residual leaks survive until the 2026-06-24 manual audit (AI-094).
+    """
+    git_dir = os.environ.get("GIT_DIR", ".git-public")
+    files = collect_tree(git_dir)
+    if not files:
+        print(f"⚠  PII audit: no tracked files found via git-dir '{git_dir}'", file=sys.stderr)
+        return 1
+
+    tripwires = load_tripwires()
+    if not tripwires:
+        print("⚠  PII audit: no tripwires loaded (~/.pa/pii-tripwires.txt) — personal-name layer OFF", file=sys.stderr)
+
+    violations: list[str] = []
+    for path, content in files:
+        violations.extend(scan_text(path, content, tripwires))
+
+    # Print (and flush) the regex verdict BEFORE the slow LLM phase: if the
+    # skill runner kills a long LLM run at its timeout, everything already on
+    # stdout is still captured — the regex findings must never die with it.
+    print(f"PII audit: scanned {len(files)} tracked files — "
+          f"regex layers: {len(violations)} violation(s)", flush=True)
+    for v in violations:
+        print(f"   {v}", flush=True)
+
+    if use_llm:
+        # Chunked semantic scan: ~300 lines per Gemini call. Cap sized to fit
+        # comfortably inside the pii-audit skill timeout (~40s/call observed).
+        all_lines = [f"{p}: {ln}" for p, c in files for ln in c.splitlines() if ln.strip()]
+        CHUNK, MAX_CHUNKS = 300, 30
+        chunks = [all_lines[i:i + CHUNK] for i in range(0, len(all_lines), CHUNK)][:MAX_CHUNKS]
+        if len(all_lines) > CHUNK * MAX_CHUNKS:
+            print(f"⚠  PII audit: LLM layer sampled {CHUNK * MAX_CHUNKS} of {len(all_lines)} lines", flush=True)
+        for i, chunk in enumerate(chunks):
+            is_clean, reason = gemini_check("\n".join(chunk), tripwires)
+            if not is_clean:
+                violations.append(f"(gemini chunk {i + 1}/{len(chunks)}) {reason}")
+
+    # Exit-code contract: 0 = scan COMPLETED (clean or not), non-zero = the scan
+    # itself failed. The scheduled pii-audit skill delivers stdout to Telegram
+    # only on success — exiting 1 on violations would swallow the violation list
+    # behind a generic "skill failed" alert (the exact silent-failure class this
+    # audit exists to catch). Findings are the OUTPUT, not an error.
+    if violations:
+        print(f"🚫 AUDIT RESULT: {len(violations)} VIOLATION(S) — scrub before any public push:", flush=True)
+        for v in violations:
+            print(f"   {v}", flush=True)
+        return 0
+    print("✓  clean", flush=True)
+    return 0
 
 
 def main() -> int:
+    if "--full" in sys.argv:
+        return full_audit(use_llm="--no-llm" not in sys.argv)
+
     if os.environ.get("PA_SKIP_PII_GUARD"):
         print("⚠  PII guard: bypassed via PA_SKIP_PII_GUARD", file=sys.stderr)
         return 0

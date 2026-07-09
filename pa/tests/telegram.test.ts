@@ -80,7 +80,7 @@ describe('sendToTelegram', () => {
     await sendToTelegram('hello', cfg, 'tok');
     assert.equal(calls.length, 1);
     const body = JSON.parse(calls[0].init!.body as string);
-    assert.match(body.text, /hello\n\n_Ref: s-[0-9a-f]{4}_$/);
+    assert.match(body.text, /hello\n\n_Ref: s-[0-9a-f]{12}_$/);
   });
 
   it('uses Markdown parse mode by default', async () => {
@@ -98,7 +98,7 @@ describe('sendToTelegram', () => {
     await sendToTelegram('hello', cfg, 'tok');
     assert.equal(calls.length, 2, 'should retry after parse failure');
     const fallback = JSON.parse(calls[1].init!.body as string);
-    assert.match(fallback.text, /Ref: s\-[0-9a-f]{4}$/, 'ref ID preserved');
+    assert.match(fallback.text, /Ref: s\-[0-9a-f]{12}$/, 'ref ID preserved');
     assert.ok(!fallback.text.includes('_Ref:'), 'italic markers stripped');
     assert.equal(fallback.parse_mode, undefined, 'parse_mode omitted');
   });
@@ -134,7 +134,7 @@ describe('sendToTelegram', () => {
     assert.ok(body.text.includes('node\\_modules/path \\(with parens\\)\\.'), 'body sanitized');
     // Trailer: italic markers RAW, but dash inside refId is escaped to \-
     // (Telegram MdV2 requires `-` escaped even inside italic spans).
-    assert.match(body.text, /\n\n_Ref: s\\-[0-9a-f]{4}_$/, 'italic Ref trailer with escaped dash');
+    assert.match(body.text, /\n\n_Ref: s\\-[0-9a-f]{12}_$/, 'italic Ref trailer with escaped dash');
   });
 
   it("MarkdownV2 plain-text fallback: parse error retries without parse_mode and strips italic Ref markers", async () => {
@@ -146,7 +146,7 @@ describe('sendToTelegram', () => {
     assert.equal(calls.length, 2, 'fallback retried');
     const fallback = JSON.parse(calls[1].init!.body as string);
     assert.equal(fallback.parse_mode, undefined, 'parse_mode omitted on retry');
-    assert.match(fallback.text, /Ref: s-[0-9a-f]{4}$/, 'ref ID kept (markers stripped)');
+    assert.match(fallback.text, /Ref: s-[0-9a-f]{12}$/, 'ref ID kept (markers stripped)');
     assert.ok(!fallback.text.includes('_Ref:'), 'italic markers stripped');
   });
 });

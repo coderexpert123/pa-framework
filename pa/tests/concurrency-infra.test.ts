@@ -18,7 +18,8 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await rm(tempDir, { recursive: true, force: true });
-  process.env.PA_HOME = originalPaHome;
+  if (originalPaHome === undefined) delete process.env.PA_HOME;
+  else process.env.PA_HOME = originalPaHome;
 });
 
 describe('Concurrency: Rate Limit State', () => {

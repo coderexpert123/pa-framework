@@ -1,159 +1,37 @@
 """Send a markdown briefing file to Telegram."""
 import json
 import os
-import secrets
 import sys
-from datetime import datetime, timezone
 
-import requests
 from runtime_state import fetch_failed_file
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 
-MAX_MSG_LEN = 4000  # Telegram limit is 4096, leave buffer
+
+def _find_pa_src():
+    """Locate the pa/src directory containing telegram_notify.py."""
+    root = os.environ.get("PA_FRAMEWORK_ROOT")
+    if root:
+        candidate = os.path.join(root, "pa", "src")
+        if os.path.isdir(candidate):
+            return candidate
+    current = os.path.abspath(__file__)
+    for _ in range(8):
+        current = os.path.dirname(current)
+        candidate = os.path.join(current, "pa", "src")
+        if os.path.isfile(os.path.join(candidate, "telegram_notify.py")):
+            return candidate
+    return None
 
 
-def _pa_home() -> str:
-    return os.environ.get("PA_HOME") or os.path.join(os.path.expanduser("~"), ".pa")
-
-
-def _log_skill_message_sent(ref_id: str, chat_id: str, thread_id, chunk_index: int, text_preview: str) -> None:
-    entry = {
-        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "level": "info",
-        "module": "telegram",
-        "message": "skill message sent",
-        "refId": ref_id,
-        "chatId": int(chat_id),
-        "threadId": int(thread_id) if thread_id is not None else None,
-        "chunkIndex": chunk_index,
-        "textPreview": text_preview[:500],
-    }
-    try:
-        log_path = os.path.join(_pa_home(), "app.log.jsonl")
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
-    except Exception:
-        pass  # log failures must never crash delivery
-
-
-def split_message(text: str) -> list:
-    """Split long text at paragraph boundaries."""
-    if len(text) <= MAX_MSG_LEN:
-        return [text]
-
-    parts = []
-    while len(text) > MAX_MSG_LEN:
-        # Find last paragraph break before limit
-        cut = text.rfind("\n\n", 0, MAX_MSG_LEN)
-        if cut == -1:
-            cut = text.rfind("\n", 0, MAX_MSG_LEN)
-        if cut == -1:
-            cut = MAX_MSG_LEN
-        parts.append(text[:cut].strip())
-        text = text[cut:].strip()
-    if text:
-        parts.append(text)
-    return parts
-
-
-def send(text: str):
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id_raw = os.environ.get("TELEGRAM_BRIEFING_CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID")
-    thread_id_str = os.environ.get("TELEGRAM_DAILY_BRIEFING_THREAD_ID")
-
-    if not token or not chat_id_raw:
-        print("[Telegram] ERROR: TELEGRAM_BOT_TOKEN and TELEGRAM_BRIEFING_CHAT_ID (or TELEGRAM_CHAT_ID) must be set", file=sys.stderr)
-        sys.exit(1)
-
-    ref_id = f"s-{secrets.token_hex(2)}"
-    chat_ids = [cid.strip() for cid in chat_id_raw.split(",") if cid.strip()]
-    base_url = f"https://api.telegram.org/bot{token}"
-    parts = split_message(text)
-    # Append ref trailer to last chunk so it shows up in the message
-    parts[-1] = f"{parts[-1]}\n\n_Ref: {ref_id}_"
-    any_failed = False
-
-    for chat_id in chat_ids:
-        # Apply thread_id only to supergroup chats (IDs starting with -100)
-        use_thread_id = None
-        if thread_id_str and chat_id.startswith("-100"):
-            use_thread_id = int(thread_id_str)
-
-        for i, part in enumerate(parts, 1):
-            chunk_index = i - 1
-            payload = {
-                "chat_id": chat_id,
-                "text": part,
-                "parse_mode": "Markdown",
-            }
-            if use_thread_id is not None:
-                payload["message_thread_id"] = use_thread_id
-
-            try:
-                resp = requests.post(f"{base_url}/sendMessage", json=payload)
-                if resp.status_code == 200:
-                    print(f"[Telegram] {chat_id} Part {i}/{len(parts)} sent OK (ref={ref_id})")
-                    _log_skill_message_sent(ref_id, chat_id, use_thread_id, chunk_index, part)
-                else:
-                    # Retry without Markdown in case of formatting errors
-                    plain_text = part.replace(f"\n\n_Ref: {ref_id}_", f"\n\nRef: {ref_id}")
-                    fallback = {"chat_id": chat_id, "text": plain_text}
-                    if use_thread_id is not None:
-                        fallback["message_thread_id"] = use_thread_id
-                    resp2 = requests.post(f"{base_url}/sendMessage", json=fallback)
-                    if resp2.status_code == 200:
-                        print(f"[Telegram] {chat_id} Part {i}/{len(parts)} sent (plain fallback): OK (ref={ref_id})")
-                        _log_skill_message_sent(ref_id, chat_id, use_thread_id, chunk_index, plain_text)
-                    else:
-                        print(f"[Telegram] ERROR: {chat_id} Part {i}/{len(parts)} failed even without Markdown: {resp2.status_code} {resp2.text}", file=sys.stderr)
-                        any_failed = True
-            except Exception as e:
-                print(f"[Telegram] Error sending to {chat_id} part {i}: {e}", file=sys.stderr)
-                any_failed = True
-
-    if any_failed:
-        sys.exit(1)
-
-
-def send_document(file_path: str):
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id_raw = os.environ.get("TELEGRAM_BRIEFING_CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID")
-    thread_id_str = os.environ.get("TELEGRAM_DAILY_BRIEFING_THREAD_ID")
-
-    if not token or not chat_id_raw:
-        print("[Telegram] ERROR: TELEGRAM_BOT_TOKEN and TELEGRAM_BRIEFING_CHAT_ID (or TELEGRAM_CHAT_ID) must be set", file=sys.stderr)
-        sys.exit(1)
-
-    chat_ids = [cid.strip() for cid in chat_id_raw.split(",") if cid.strip()]
-    url = f"https://api.telegram.org/bot{token}/sendDocument"
-    any_failed = False
-
-    for chat_id in chat_ids:
-        use_thread_id = None
-        if thread_id_str and chat_id.startswith("-100"):
-            use_thread_id = int(thread_id_str)
-
-        try:
-            with open(file_path, 'rb') as f:
-                files = {'document': f}
-                payload = {'chat_id': chat_id}
-                if use_thread_id is not None:
-                    payload["message_thread_id"] = use_thread_id
-                
-                resp = requests.post(url, data=payload, files=files)
-                if resp.status_code == 200:
-                    print(f"[Telegram] {chat_id} Document sent OK")
-                else:
-                    print(f"[Telegram] ERROR: {chat_id} Document failed: {resp.status_code} {resp.text}", file=sys.stderr)
-                    any_failed = True
-        except Exception as e:
-            print(f"[Telegram] Error sending document to {chat_id}: {e}", file=sys.stderr)
-            any_failed = True
-
-    if any_failed:
-        sys.exit(1)
+_pa_src = _find_pa_src()
+if not _pa_src:
+    print("[send_telegram] FATAL: could not locate pa/src/telegram_notify.py "
+          "(set PA_FRAMEWORK_ROOT)", file=sys.stderr)
+    sys.exit(1)
+sys.path.insert(0, _pa_src)
+from telegram_notify import send_document, send_text  # noqa: E402
 
 
 def _build_hallucination_body(claimed: str, actual: int, first_line: str) -> str:
@@ -238,7 +116,7 @@ def main():
         # Strip the assert header line before sending
         text = text.split("\n", 1)[1] if "\n" in text else ""
 
-    send(text)
+    send_text(text)
 
 
 if __name__ == "__main__":

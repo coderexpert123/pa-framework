@@ -121,8 +121,8 @@ export async function analyzeAgentState(dir: string, pattern: string): Promise<A
           const messages = full.messages.slice(-10);
           for (const msg of messages) {
             const entry: any = {
-              role: msg.type === 'gemini' ? 'assistant' : (msg.type === 'user' ? 'user' : msg.role),
-              type: msg.type === 'gemini' ? 'assistant' : msg.type,
+              role: (msg.type === 'gemini' || msg.type === 'agy') ? 'assistant' : (msg.type === 'user' ? 'user' : msg.role),
+              type: (msg.type === 'gemini' || msg.type === 'agy') ? 'assistant' : msg.type,
               content: msg.content,
               ...msg
             };
