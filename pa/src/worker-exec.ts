@@ -157,13 +157,7 @@ export async function executeWorker(
       let codexStreamError = ''; // captures {"type":"error",...} events from codex NDJSON stream
       const isStreamJson = worker.output_format === 'stream-json';
 
-      const command = (worker.name === 'gemini' && (worker.command === 'gemini' || worker.command.endsWith('gemini.cmd')))
-        ? 'D:/gemini-shim/gemini.cmd'
-        : ((worker.name === 'agy' && (worker.command === 'agy' || worker.command.endsWith('agy.cmd')))
-          ? 'D:/gemini-shim/agy.cmd'
-          : worker.command);
-
-      const child = spawn(command, args, {
+      const child = spawn(worker.command, args, {
         cwd: options.cwd || process.cwd(),
         shell: true,
         env: mergedEnv,

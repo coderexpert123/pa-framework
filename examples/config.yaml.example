@@ -36,8 +36,9 @@ workers:
   # ---- gemini (priority 2) ----
   - name: gemini
     command: gemini
-    # Windows (shim that fixes arg quoting): command: C:/Users/<you>/.local/bin/gemini-shim.cmd
-    # POSIX:   command: ~/.local/bin/gemini   (or use a wrapper script)
+    # Tip: point command at a small wrapper script if your CLI needs env vars
+    # set or arg-quoting fixes (see docs/WORKERS_GUIDE.md). worker-exec spawns
+    # this command verbatim — no name-based rewriting.
     args:
       - "--yolo"
       - "--output-format"
@@ -104,10 +105,10 @@ workers:
   # ---- agy (priority 5 — Antigravity CLI, Google-internal LLM) ----
   - name: agy
     command: agy
-    # Windows (shim — sets GCP project env vars + refreshes Antigravity token):
-    #   command: D:/gemini-shim/agy.cmd
-    # POSIX:
-    #   command: agy   (if in PATH)
+    # Tip: point command at a small wrapper script if your CLI needs env vars
+    # set (e.g. GCP project vars, token refresh) or arg-quoting fixes (see
+    # docs/WORKERS_GUIDE.md). worker-exec spawns this command verbatim — no
+    # name-based rewriting.
     args: ["--yolo", "--output-format", "stream-json"]
     input_mode: stdin-text
     output_format: stream-json
