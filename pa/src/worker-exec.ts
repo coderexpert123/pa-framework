@@ -182,6 +182,11 @@ export async function executeWorker(
 
       // Handle prompt injection via stdin
       if (useStdin && child.stdin) {
+        // A shell-exec failure (e.g. command not found) can close the pipe before or during
+        // this write, throwing an uncaught EPIPE that crashes the process. child.on('error')/
+        // ('close') below already produce the correct failure CommandResult — this just stops
+        // the stream-level error from escaping as an unhandled exception.
+        child.stdin.on('error', () => {});
         if (useStdinJson) {
           // Claude Code stream-json expects: {"type":"user","message":{"role":"user","content":"..."}}
           const message = JSON.stringify({

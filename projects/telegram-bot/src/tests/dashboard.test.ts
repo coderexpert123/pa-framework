@@ -37,7 +37,7 @@ before(async () => {
 cron: "45 7 * * *"
 ---
 p`;
-  await writeFile(join(briefPath, 'SKILL.md'), briefContent, 'utf8');
+  await writeFile(join(briefPath, 'skill.md'), briefContent, 'utf8');
 });
 
 after(async () => {
