@@ -1,7 +1,7 @@
 ---
 cron: "* * * * *"
 on_missed: latest
-cwd: "~/.pa/skills/reminders"
+cwd: "${PA_HOME}/skills/reminders"
 secrets:
   - TELEGRAM_BOT_TOKEN
 cmd: "python process_reminders.py"

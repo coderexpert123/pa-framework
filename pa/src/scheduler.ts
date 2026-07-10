@@ -150,11 +150,14 @@ export function resolvePosixPaPath(whichStdout: string | null): PaPathResolution
 }
 
 export async function syncSchedules(): Promise<void> {
-  if (platform() === 'win32') {
-    await syncSchedulesWindows();
-  } else {
-    await syncSchedulesPosix();
-  }
+  const ok = platform() === 'win32'
+    ? await syncSchedulesWindows()
+    : await syncSchedulesPosix();
+
+  // D4 fail-loud already printed its own error and set exitCode — nothing
+  // was registered, so don't follow it with a "Skills with schedules"
+  // listing that could read as if the sync partially succeeded.
+  if (!ok) return;
 
   // Show scheduled skills (shared by both paths)
   const skills = await listSkills();
@@ -167,7 +170,7 @@ export async function syncSchedules(): Promise<void> {
   }
 }
 
-async function syncSchedulesWindows(): Promise<void> {
+async function syncSchedulesWindows(): Promise<boolean> {
   // Find pa executable path and sanitize for shell safety
   let whereStdout: string | null;
   try {
@@ -180,7 +183,7 @@ async function syncSchedulesWindows(): Promise<void> {
   if (!resolution.ok) {
     console.error(`Error: ${resolution.errorMessage}`);
     process.exitCode = 1;
-    return;
+    return false;
   }
   const paPath = resolution.paPath;
 
@@ -214,9 +217,10 @@ async function syncSchedulesWindows(): Promise<void> {
 
   await registerTask('PA-Catchup-Reminders', highVbs);
   await registerTask('PA-Catchup', defaultVbs);
+  return true;
 }
 
-async function syncSchedulesPosix(): Promise<void> {
+async function syncSchedulesPosix(): Promise<boolean> {
   // Find pa on PATH
   let whichStdout: string | null;
   try {
@@ -229,7 +233,7 @@ async function syncSchedulesPosix(): Promise<void> {
   if (!resolution.ok) {
     console.error(`Error: ${resolution.errorMessage}`);
     process.exitCode = 1;
-    return;
+    return false;
   }
   const paPath = resolution.paPath;
 
@@ -288,6 +292,7 @@ async function syncSchedulesPosix(): Promise<void> {
   } finally {
     await unlink(tmpPath).catch(() => {});
   }
+  return true;
 }
 
 export async function listSchedules(): Promise<void> {

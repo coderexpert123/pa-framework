@@ -24,6 +24,32 @@ A "worker" is an external CLI process that the framework spawns to handle an LLM
 | `gemini` | `stdin-text` | `stream-json` | Text-pattern (RESOURCE_EXHAUSTED, 429) | Google Gemini CLI |
 | `codex` | `stdin-text` | `stream-json` | Text-pattern (`hit your usage limit`) | OpenAI Codex CLI |
 
+## Wrapper scripts
+
+A worker's `command:` field is spawned verbatim — `worker-exec.ts` does no name-based rewriting or magic path resolution (removed 2026-07-10; see `pa/tests/worker-exec-command.test.ts`). If your CLI needs something the framework doesn't do for you, point `command:` at a small wrapper script instead of the bare CLI binary. Common reasons:
+
+- **Env vars** the CLI needs set before it runs (e.g. a cloud project ID, an API base URL).
+- **Token refresh** — some CLIs need a credential refreshed before each invocation.
+- **Arg-quoting fixes** — a CLI that mishandles how `worker-exec.ts` passes arguments through `shell:true`.
+
+Minimal example, `gemini-wrapper.cmd` (Windows):
+
+```bat
+@echo off
+set GOOGLE_CLOUD_PROJECT=your-project-id
+gemini %*
+```
+
+Minimal example, `gemini-wrapper.sh` (POSIX):
+
+```sh
+#!/bin/sh
+export GOOGLE_CLOUD_PROJECT=your-project-id
+exec gemini "$@"
+```
+
+Point the worker's `command:` at the wrapper's absolute path in `config.yaml`, e.g. `command: C:/Users/you/gemini-wrapper.cmd` or `command: ~/.local/bin/gemini-wrapper.sh`. Since `worker-exec.ts` spawns `command:` verbatim, this works for any worker without any framework changes.
+
 ## Adding a new worker — walkthrough (Ollama example)
 
 Goal: add a local Ollama instance as a fallback worker for when external APIs are rate-limited or unavailable.

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { homedir } from 'os';
 import { join } from 'path';
 import { createTempPaHome, createTempSkill, cleanup } from './helpers.js';
-import { loadSkill, listSkills } from '../src/skills.js';
+import { loadSkill, listSkills, interpolate } from '../src/skills.js';
 
 let tempDir: string;
 
@@ -179,5 +179,49 @@ describe('listSkills', () => {
     await rm(join(tempDir, 'skills'), { recursive: true });
     const skills = await listSkills();
     assert.deepEqual(skills, []);
+  });
+});
+
+describe('interpolate — ${PA_HOME} resolution (dry-run finding B)', () => {
+  // process.env.PA_HOME may be unset even for a user relying on the implicit
+  // default (paHome() computes homedir()+'.pa' internally without ever writing
+  // that default back to process.env). A raw process.env.PA_HOME lookup would
+  // leave "${PA_HOME}" un-interpolated for that (most common) case, breaking
+  // any skill using it in cwd/cmd — verified here before relying on it.
+
+  it('resolves ${PA_HOME} via paHome() when process.env.PA_HOME is unset', () => {
+    delete process.env.PA_HOME;
+    // interpolate() does a plain string substitution, not a path-aware join —
+    // build the expected value the same way (paHome()'s own string + the
+    // literal suffix), not via path.join, which would normalize separators
+    // interpolate() never touches.
+    assert.equal(interpolate('${PA_HOME}/skills/reminders'), `${join(homedir(), '.pa')}/skills/reminders`);
+  });
+
+  it('resolves ${PA_HOME} via paHome() when process.env.PA_HOME is set (override)', () => {
+    process.env.PA_HOME = 'C:/custom/pa-home';
+    assert.equal(interpolate('${PA_HOME}/skills/reminders'), 'C:/custom/pa-home/skills/reminders');
+    delete process.env.PA_HOME;
+  });
+
+  it('still interpolates other ${VAR} references via process.env (unchanged behavior)', () => {
+    process.env.PA_TEST_INTERPOLATE_VAR = 'hello';
+    assert.equal(interpolate('${PA_TEST_INTERPOLATE_VAR} world'), 'hello world');
+    delete process.env.PA_TEST_INTERPOLATE_VAR;
+  });
+
+  it('leaves an unset non-PA_HOME var as a literal ${VAR} (unchanged behavior)', () => {
+    delete process.env.PA_TEST_TOTALLY_UNSET_VAR;
+    assert.equal(interpolate('${PA_TEST_TOTALLY_UNSET_VAR}'), '${PA_TEST_TOTALLY_UNSET_VAR}');
+  });
+});
+
+describe('loadSkill — cwd with ${PA_HOME} interpolation (dry-run finding B)', () => {
+  it('resolves a ${PA_HOME}-based cwd to the active PA_HOME, not the OS home', async () => {
+    await createTempSkill(tempDir, 'pa-home-cwd', '---\ncwd: "${PA_HOME}/skills/pa-home-cwd"\n---\nPrompt.');
+    const skill = await loadSkill('pa-home-cwd');
+    // tempDir IS process.env.PA_HOME here (set by createTempPaHome in beforeEach).
+    // Plain string substitution, not path.join — see the interpolate test above.
+    assert.equal(skill.frontmatter.cwd, `${tempDir}/skills/pa-home-cwd`);
   });
 });

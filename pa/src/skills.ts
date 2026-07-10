@@ -2,7 +2,7 @@ import { readFile, readdir, stat } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
 import { parse as parseYaml } from 'yaml';
-import { skillsDir } from './paths.js';
+import { skillsDir, paHome } from './paths.js';
 import { DEFAULT_TIMEOUT, DEFAULT_IDLE_TIMEOUT } from './types.js';
 import type { Skill, SkillFrontmatter, TelegramOutput } from './types.js';
 
@@ -28,13 +28,23 @@ export function parseFrontmatter(content: string): { meta: Record<string, any>; 
  * var is unset, leaves the literal `${VAR_NAME}` in place so the error surfaces
  * (rather than silently mis-routing to an empty string).
  *
+ * ${PA_HOME} is special-cased to paHome() rather than a raw process.env.PA_HOME
+ * read: paHome() defaults to homedir()+'.pa' internally when the env var is
+ * unset, but that default is never written back to process.env — so a user
+ * relying on the implicit default (the common case) would see "${PA_HOME}"
+ * left un-interpolated in any skill's cwd/cmd, not silently resolved to the
+ * right directory (2026-07-10, fresh-install dry-run finding B).
+ *
  * Applied to: cwd, cmd, telegram_output.chat_id, telegram_output.token_secret,
  * telegram_output.thread_id (with numeric coercion). NOT applied to: secrets[]
  * array entries (those are env-var NAMES, not values), body content, other fields.
  */
-function interpolate(s: string | undefined): string | undefined {
+export function interpolate(s: string | undefined): string | undefined {
   if (typeof s !== 'string') return s;
-  return s.replace(/\$\{([A-Z_][A-Z0-9_]*)\}/g, (_, k) => process.env[k] ?? `\${${k}}`);
+  return s.replace(/\$\{([A-Z_][A-Z0-9_]*)\}/g, (_, k) => {
+    if (k === 'PA_HOME') return paHome();
+    return process.env[k] ?? `\${${k}}`;
+  });
 }
 
 function resolvePath(p: string): string {

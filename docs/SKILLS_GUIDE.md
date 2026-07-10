@@ -19,7 +19,10 @@ See [`docs/ARCHITECTURE.md`](ARCHITECTURE.md#skill-yaml-frontmatter-schema) for 
 ---
 cron: "30 13,23 * * *"        # 5-field cron. Omit for manual-trigger only.
 on_missed: latest             # 'latest' | 'all' | 'skip'
-cwd: ~/.pa/skills/myskill     # ~ expands; ${VAR} env-interpolates
+cwd: ${PA_HOME}/skills/myskill # ~ expands (to the OS home dir); ${VAR} env-interpolates.
+                               # Use ${PA_HOME}, not ~/.pa, to reference the pa home — ~ always
+                               # means the OS home directory, which is NOT the same thing if
+                               # PA_HOME is overridden. ${PA_HOME} resolves correctly either way.
 secrets:                       # env vars to inject from secrets.env
   - TELEGRAM_BOT_TOKEN
 worker: gemini                # force a specific worker
@@ -79,7 +82,7 @@ The worker (gemini) receives the body as its prompt. Its output is captured and 
 ```yaml
 ---
 cron: "30 11 20 * *"
-cwd: ~/.pa/skills/credit-card-bills
+cwd: ${PA_HOME}/skills/credit-card-bills
 secrets:
   - TELEGRAM_BOT_TOKEN
 worker: gemini
@@ -200,7 +203,7 @@ The LLM enforces inter-step validation. Combined with `[pa assert]` headers in s
 
 ```yaml
 cron: "0 6 * * *"  # check every morning
-cwd: ~/.pa/skills/holiday-alert
+cwd: ${PA_HOME}/skills/holiday-alert
 cmd: "python check_calendar.py"
 ```
 

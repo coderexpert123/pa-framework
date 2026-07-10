@@ -22,7 +22,7 @@ node pa/dist/bin/pa.js bot restart   # if you have Task Scheduler / cron set up
 pwsh projects/telegram-bot/run-bot.ps1   # to start manually
 ```
 
-If still no lock file appears within 60 seconds, check `~/.pa/logs/telegram-bot.log` for errors (typically: missing `TELEGRAM_BOT_TOKEN`, gemini-shim path wrong, etc.).
+If still no lock file appears within 60 seconds, check `~/.pa/logs/telegram-bot.log` for errors (typically: missing `TELEGRAM_BOT_TOKEN`, worker command path wrong — check the `command:` field in config.yaml points at a real executable or wrapper script, etc.).
 
 ### `bot-process` FAIL — "PID not alive"
 

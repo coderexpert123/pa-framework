@@ -5,6 +5,7 @@ import { paHome } from '../paths.js';
 import { loadConfig } from '../config.js';
 import { listSkills } from '../skills.js';
 import { checkWorker, isWorkerCoolingDown } from '../workers.js';
+import { loadSecrets } from '../secrets.js';
 
 // ---- Types ----
 
@@ -190,14 +191,18 @@ async function checkSkills(): Promise<CheckResult> {
   }
 }
 
-async function checkSecrets(): Promise<CheckResult> {
+export async function checkSecrets(): Promise<CheckResult> {
   const secretsFile = join(paHome(), 'secrets.env');
   try {
-    const content = await readFile(secretsFile, 'utf8');
-    const missing: string[] = [];
-    for (const key of ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID']) {
-      if (!content.includes(key + '=') && !content.includes(key + ' =')) missing.push(key);
-    }
+    await readFile(secretsFile, 'utf8');
+    // Reuse loadSecrets' real line-by-line parser (skips comments, strips
+    // quotes) instead of a raw substring search — a substring search matches
+    // the scaffolded template's own comment text (e.g. "# TELEGRAM_BOT_TOKEN=
+    // <your bot token from @BotFather>"), reporting OK on a totally
+    // unconfigured install. Falsy check also catches a present-but-empty
+    // "KEY=" line, which loadSecrets treats as an assigned (empty) value.
+    const secrets = await loadSecrets();
+    const missing = ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID'].filter((key) => !secrets[key]);
     if (missing.length > 0) {
       return {
         name: 'secrets',
