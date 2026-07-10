@@ -194,7 +194,7 @@ bash projects/telegram-bot/run-bot.sh
 # Background
 bash projects/telegram-bot/run-bot.sh &
 ```
-For persistent deployment register as a systemd service (Linux) or launchd agent (macOS) — see `docs/BOT_GUIDE.md §"Option B / Option C"`.
+For persistent deployment register as a systemd service (Linux, template: `examples/systemd/pa-telegram-bot.service`) or launchd agent (macOS, template: `examples/launchd/com.pa-framework.telegram-bot.plist`) — see `docs/BOT_GUIDE.md §"Option B / Option C"`.
 
 Send your bot a message in Telegram — it responds via your highest-priority available worker. Use `/help` to see the bot's slash commands (defined in `projects/telegram-bot/src/commands.ts`).
 
@@ -219,11 +219,11 @@ node pa/dist/bin/pa.js schedules sync
 Works on all platforms:
 
 - **Windows**: registers `PA-Catchup` and `PA-Catchup-Reminders` in Windows Task Scheduler (runs via a hidden VBScript wrapper every minute).
-- **macOS / Linux**: upserts two entries into your user crontab (`crontab -l` / `crontab <file>`): `PA-Catchup` every 15 minutes, and `PA-Catchup-Reminders` every minute.
+- **macOS / Linux**: upserts two entries into your user crontab (`crontab -l` / `crontab <file>`): both `PA-Catchup` and `PA-Catchup-Reminders` fire every minute (matches the Windows cadence — `pa catchup` is lock-guarded, so the tighter interval just catches overdue skills sooner, it doesn't duplicate runs).
 
 The catchup task runs `pa catchup`, which iterates overdue skills and fires them.
 
-> **macOS / Linux cron PATH note:** cron runs with a minimal `PATH`. If `pa` isn't in `/usr/bin` or `/usr/local/bin`, the cron entry may fail silently. Run `which pa` to see the resolved path — `pa schedules sync` uses that full path in the registered cron lines. If `pa` isn't on `PATH` at all, install it globally (e.g. `npm install -g .` inside `pa/`) before syncing.
+> **macOS / Linux cron PATH note:** cron runs with a minimal `PATH`. If `pa` isn't in `/usr/bin` or `/usr/local/bin`, the cron entry may fail silently. Run `which pa` to see the resolved path — `pa schedules sync` uses that full path in the registered cron lines. If `pa` isn't on `PATH` at all, install it globally (`npm install -g .` inside `pa/`) before syncing — `pa schedules sync` fails loud (prints an actionable error and exits non-zero) rather than registering a task/cron entry pointed at a bare `pa` that could never resolve. **Windows** has the identical PATH requirement: run `npm install -g .` inside `pa\` first, or `pa schedules sync` fails loud there too instead of silently registering a broken hourly-forever task.
 
 ## 12. Going further: deploying your own version
 

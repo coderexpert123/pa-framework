@@ -216,7 +216,27 @@ export function killProcessTree(pid: number): void {
     // taskkill /T kills the tree, /F forces it
     exec(`taskkill /T /F /PID ${pid}`, () => {});
   } else if (platform() === 'linux' || platform() === 'darwin') {
-    try { process.kill(-pid, 'SIGTERM'); } catch {} // negative PID = process group
+    try {
+      process.kill(-pid, 'SIGTERM'); // negative PID = process group
+    } catch {
+      // process.kill(-pid) throws when pid isn't a process-group leader —
+      // i.e. it was spawned without `detached: true` (setsid). That's the
+      // common case for anything spawned with shell:true and no detached
+      // flag, so silently swallowing this (the old behavior) meant /stop,
+      // /steer, idle-kill, and orphan-reap all silently did nothing on
+      // Linux/macOS. Fall back to walking the descendant tree and killing
+      // each PID individually — void/fire-and-forget, so this runs as an
+      // un-awaited async IIFE (all callers of killProcessTree expect sync).
+      (async () => {
+        // Capture descendants BEFORE killing the parent: a dead parent can
+        // get its children reparented/reaped before we get to look them up.
+        const descendants = await getDescendantPids(pid);
+        try { process.kill(pid, 'SIGTERM'); } catch {}
+        for (const { pid: childPid } of descendants) {
+          try { process.kill(childPid, 'SIGTERM'); } catch {}
+        }
+      })();
+    }
   } else {
     warnProcessTreeUnavailable('process group kill', 'killProcessTree');
     try { process.kill(pid, 'SIGTERM'); } catch {} // best-effort single-PID kill

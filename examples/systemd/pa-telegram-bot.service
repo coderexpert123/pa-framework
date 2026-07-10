@@ -1,0 +1,37 @@
+# pa-telegram-bot.service — user-level systemd unit for the pa Telegram bot
+# on Linux. Canonical reference for docs/BOT_GUIDE.md Option B.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp examples/systemd/pa-telegram-bot.service ~/.config/systemd/user/
+#   # Edit the ExecStart path below to point at your actual clone.
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now pa-telegram-bot
+#
+# Follow logs (run-bot.sh redirects to a file, not the journal):
+#   tail -f ~/.pa/logs/telegram-bot.log
+#
+# Uninstall:
+#   systemctl --user disable --now pa-telegram-bot
+#   rm ~/.config/systemd/user/pa-telegram-bot.service
+#   systemctl --user daemon-reload
+
+[Unit]
+Description=PA Telegram Bot
+After=network.target
+
+[Service]
+# Replace /path/to with the actual absolute path to your clone of this repo.
+ExecStart=/bin/bash /path/to/projects/telegram-bot/run-bot.sh
+Restart=always
+RestartSec=30
+# %h expands to the invoking user's home directory (systemd specifier) —
+# matches pa's default PA_HOME (~/.pa) without hardcoding a username.
+Environment=PA_HOME=%h/.pa
+# run-bot.sh already defaults this to 16 if unset (AI-096: fs and
+# dns.lookup share libuv's threadpool), but setting it explicitly here
+# keeps the unit file self-documenting and immune to a future default change.
+Environment=UV_THREADPOOL_SIZE=16
+
+[Install]
+WantedBy=default.target

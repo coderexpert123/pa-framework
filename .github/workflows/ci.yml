@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
         node-version: [22]
 
     steps:
@@ -24,7 +24,17 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+          cache-dependency-path: |
+            pa/package-lock.json
+            projects/telegram-bot/package-lock.json
 
+      # Order is load-bearing — do not parallelize into separate jobs: the
+      # bot imports pa's compiled dist/ output directly (relative imports
+      # like ../../../pa/dist/src/...) AND resolves its own dependencies
+      # from pa/node_modules at runtime (no separate install for pa's deps
+      # in the bot's own node_modules). pa must be installed + built before
+      # the bot's install/build/test step runs.
       - name: Build and test pa orchestrator
         working-directory: pa
         run: |

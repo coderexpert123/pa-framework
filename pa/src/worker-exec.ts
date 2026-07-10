@@ -18,6 +18,47 @@ function sanitizeCmdline(cmdline: string): string {
   return cmdline.replace(/([?&](api_key|token|password|secret)=)[^\s&]*/gi, '$1<redacted>').slice(0, 200);
 }
 
+export interface BgEntry {
+  firstSeen: number;
+  cmdline?: string;
+  lastRepeatBucket: number;
+}
+
+export interface BgAlertEntry {
+  pid: number;
+  ageSec: number;
+  cmdline: string;
+}
+
+/**
+ * Decides which bg-task entries have aged past `alertMs` AND crossed into a
+ * new repeat bucket (age divided into `repeatMs`-wide windows) since they
+ * were last alerted on. Mutates `lastRepeatBucket` in place on every entry
+ * it returns — the per-PID bucket IS the dedup mechanism (no separate
+ * dedupKey), so this can't be pure-functional about entry state, but it has
+ * no I/O and calls no notifier itself; the caller decides what to do with
+ * the returned list.
+ */
+export function collectBgAlerts(
+  bgTaskMap: Map<number, BgEntry>,
+  now: number,
+  alertMs: number,
+  repeatMs: number
+): BgAlertEntry[] {
+  const alerting: BgAlertEntry[] = [];
+  for (const [pid, entry] of bgTaskMap) {
+    const ageMs = now - entry.firstSeen;
+    if (ageMs > alertMs) {
+      const bucket = Math.floor(ageMs / repeatMs);
+      if (bucket > entry.lastRepeatBucket) {
+        entry.lastRepeatBucket = bucket;
+        alerting.push({ pid, ageSec: Math.round(ageMs / 1000), cmdline: entry.cmdline ?? '(unknown)' });
+      }
+    }
+  }
+  return alerting;
+}
+
 // With shell:true, Node joins command + args into a shell string on all platforms.
 // Quote args containing spaces or metacharacters to prevent word-splitting.
 function quoteArg(a: string): string {
@@ -162,6 +203,11 @@ export async function executeWorker(
         shell: true,
         env: mergedEnv,
         stdio: useStdin ? ['pipe', 'pipe', 'pipe'] : undefined,
+        // POSIX only: makes the child a process-group leader so killProcessTree's
+        // `process.kill(-pid, ...)` can reach its whole subtree. Windows keeps
+        // taskkill /T (detached there can flash a console window). No unref() —
+        // we still want this process tracked as a normal child for waiting/reaping.
+        detached: process.platform !== 'win32',
       });
 
       pidTracked = child.pid
@@ -340,7 +386,6 @@ export async function executeWorker(
       const heartbeatMs = bgHooks.heartbeatIntervalMs ?? 30_000;
       const startedAt = Date.now();
 
-      interface BgEntry { firstSeen: number; cmdline?: string; lastRepeatBucket: number; }
       const bgTaskMap = new Map<number, BgEntry>();
 
       // Periodic heartbeat: checks process tree AND state file mtime
@@ -384,17 +429,7 @@ export async function executeWorker(
               }
             }
             // Collect entries whose age bucket advanced — batched into one alert per heartbeat
-            const alerting: Array<{ pid: number; ageSec: number; cmdline: string }> = [];
-            for (const [pid, entry] of bgTaskMap) {
-              const ageMs = now - entry.firstSeen;
-              if (ageMs > bgAlertMs) {
-                const bucket = Math.floor(ageMs / bgRepeatMs);
-                if (bucket > entry.lastRepeatBucket) {
-                  entry.lastRepeatBucket = bucket;
-                  alerting.push({ pid, ageSec: Math.round(ageMs / 1000), cmdline: entry.cmdline ?? '(unknown)' });
-                }
-              }
-            }
+            const alerting = collectBgAlerts(bgTaskMap, now, bgAlertMs, bgRepeatMs);
             if (alerting.length > 0) {
               const lines = alerting.map(a => `  PID ${a.pid} (age ${a.ageSec}s): ${a.cmdline}`);
               const body = `Worker: ${worker.name} (pid ${child.pid})\nResource: ${resource}\n${lines.join('\n')}`;

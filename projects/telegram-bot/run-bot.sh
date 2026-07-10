@@ -19,5 +19,10 @@ if [ -f "$LOG_FILE" ]; then
   fi
 fi
 
+# UV_THREADPOOL_SIZE=16 (AI-096): fs and dns.lookup share libuv's threadpool —
+# raising it decouples DNS from fs pressure (the coupling that took all
+# networking down on 2026-07-04). Matches run-bot.ps1 / run-bot-hidden.vbs.
+export UV_THREADPOOL_SIZE="${UV_THREADPOOL_SIZE:-16}"
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 exec node "$SCRIPT_DIR/dist/main.js" >> "$LOG_FILE" 2>&1

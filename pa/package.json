@@ -2,6 +2,9 @@
   "name": "pa-cli",
   "version": "1.0.0",
   "description": "Personal assistant CLI dispatcher — run skills across any AI CLI with automatic failover",
+  "engines": {
+    "node": ">=22"
+  },
   "bin": {
     "pa": "./dist/bin/pa.js"
   },

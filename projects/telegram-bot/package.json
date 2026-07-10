@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "Conversational Telegram bot for pa — routes messages through the pa worker pipeline",
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "build": "tsc",
     "start": "node dist/main.js",

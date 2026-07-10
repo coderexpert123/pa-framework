@@ -228,6 +228,9 @@ export async function runCommand(
         shell: true,
         cwd: skill.frontmatter.cwd,
         env: { ...process.env, ...secrets },
+        // POSIX only — see worker-exec.ts spawn for rationale (process-group
+        // leader for killProcessTree; Windows keeps taskkill /T).
+        detached: process.platform !== 'win32',
       });
 
       let output = '';

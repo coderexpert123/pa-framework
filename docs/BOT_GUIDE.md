@@ -94,7 +94,7 @@ Register-ScheduledTask -TaskName "PA-Telegram-Bot" -Action $action -Trigger $tri
 
 #### Option B: systemd (Linux)
 
-Create `~/.config/systemd/user/pa-telegram-bot.service`:
+Canonical template: [`examples/systemd/pa-telegram-bot.service`](../examples/systemd/pa-telegram-bot.service) — copy it to `~/.config/systemd/user/pa-telegram-bot.service`, edit the `ExecStart` path, and follow the install instructions in its header comment. Shape:
 
 ```ini
 [Unit]
@@ -106,6 +106,7 @@ ExecStart=/bin/bash /path/to/projects/telegram-bot/run-bot.sh
 Restart=always
 RestartSec=30
 Environment=PA_HOME=%h/.pa
+Environment=UV_THREADPOOL_SIZE=16
 
 [Install]
 WantedBy=default.target
@@ -119,14 +120,14 @@ tail -f ~/.pa/logs/telegram-bot.log       # follow logs (run-bot.sh redirects th
 
 #### Option C: launchd (macOS)
 
-Create `~/Library/LaunchAgents/com.pa.telegram-bot.plist`:
+Canonical template: [`examples/launchd/com.pa-framework.telegram-bot.plist`](../examples/launchd/com.pa-framework.telegram-bot.plist) — copy it to `~/Library/LaunchAgents/`, edit the `ProgramArguments` path and `PA_HOME` value, and follow the install instructions in its header comment. Shape:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>com.pa.telegram-bot</string>
+  <key>Label</key><string>com.pa-framework.telegram-bot</string>
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
@@ -134,13 +135,16 @@ Create `~/Library/LaunchAgents/com.pa.telegram-bot.plist`:
   </array>
   <key>KeepAlive</key><true/>
   <key>EnvironmentVariables</key>
-  <dict><key>PA_HOME</key><string>/Users/you/.pa</string></dict>
+  <dict>
+    <key>PA_HOME</key><string>/Users/you/.pa</string>
+    <key>UV_THREADPOOL_SIZE</key><string>16</string>
+  </dict>
 </dict>
 </plist>
 ```
 
 ```bash
-launchctl load ~/Library/LaunchAgents/com.pa.telegram-bot.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pa-framework.telegram-bot.plist
 ```
 
 #### Option D: Foreground run / testing

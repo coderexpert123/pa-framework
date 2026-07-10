@@ -8,7 +8,8 @@ import { logger } from './lib/log.js';
 import { isWorkerCoolingDown, recordRateLimit, parseRateLimitDuration, classifyRateLimit, getCooldownStatus, getWorkerCooldown, clearRateLimitCache } from './rate-limits.js';
 
 // Re-exports for backward compatibility — all existing imports from workers.js continue to work
-export { executeWorker } from './worker-exec.js';
+export { executeWorker, collectBgAlerts } from './worker-exec.js';
+export type { BgEntry, BgAlertEntry } from './worker-exec.js';
 export { readStateTail } from './state-monitor.js';
 export { isWorkerCoolingDown, recordRateLimit, parseRateLimitDuration, classifyRateLimit, getCooldownStatus, getWorkerCooldown, clearRateLimitCache };
 

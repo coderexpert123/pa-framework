@@ -5,6 +5,7 @@
 import { describe, it, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { createTempPaHome, cleanup } from './helpers.js';
+import { resolveWindowsPaPath, resolvePosixPaPath } from '../src/scheduler.js';
 
 let tempDir: string;
 
@@ -48,16 +49,19 @@ function upsertCronLines(
   return updated;
 }
 
+// Default catchup cadence matches Windows (every minute) as of 2026-07-10 —
+// catchup is lock-guarded, so the tighter cadence just means overdue skills
+// are caught sooner, not duplicated. Was */15 * * * *.
 const ENTRIES = [
   { sentinel: '# PA-Catchup-Reminders (managed by pa schedules sync)', line: '* * * * * pa catchup --topic reminders' },
-  { sentinel: '# PA-Catchup (managed by pa schedules sync)',            line: '*/15 * * * * pa catchup' },
+  { sentinel: '# PA-Catchup (managed by pa schedules sync)',            line: '* * * * * pa catchup' },
 ];
 
 describe('POSIX crontab upsert logic', () => {
   it('appends both entries to an empty crontab', () => {
     const result = upsertCronLines('', ENTRIES);
     assert.ok(result.includes('* * * * * pa catchup --topic reminders'));
-    assert.ok(result.includes('*/15 * * * * pa catchup'));
+    assert.ok(result.includes('* * * * * pa catchup'));
     assert.ok(result.includes('PA-Catchup-Reminders'));
     assert.ok(result.includes('PA-Catchup (managed'));
   });
@@ -67,7 +71,7 @@ describe('POSIX crontab upsert logic', () => {
     const result = upsertCronLines(existing, ENTRIES);
     assert.ok(result.startsWith('0 9 * * 1 /usr/local/bin/weekly-report\n'));
     assert.ok(result.includes('* * * * * pa catchup --topic reminders'));
-    assert.ok(result.includes('*/15 * * * * pa catchup'));
+    assert.ok(result.includes('* * * * * pa catchup'));
   });
 
   it('replaces existing PA lines in-place (no duplicates)', () => {
@@ -81,9 +85,12 @@ describe('POSIX crontab upsert logic', () => {
     // Old lines replaced
     assert.ok(!result.includes('pa-old'));
     assert.ok(!result.includes('*/30'));
-    // New lines present exactly once
+    // New lines present exactly once. The `$` anchor matters: the reminders
+    // line ends in "--topic reminders", so it can't accidentally satisfy the
+    // catchup-line count now that both share the "* * * * * pa catchup"
+    // prefix (they didn't before the cadence unification).
     const remindersCount = (result.match(/\* \* \* \* \* pa catchup --topic reminders/g) ?? []).length;
-    const catchupCount = (result.match(/\*\/15 \* \* \* \* pa catchup$/mg) ?? []).length;
+    const catchupCount = (result.match(/\* \* \* \* \* pa catchup$/mg) ?? []).length;
     assert.equal(remindersCount, 1);
     assert.equal(catchupCount, 1);
     // Existing non-PA line preserved
@@ -100,11 +107,61 @@ describe('POSIX crontab upsert logic', () => {
   it('sentinels are escaped correctly (no regex injection)', () => {
     // Sentinel contains characters that could break an unescaped regex
     const trickySentinel = '# PA-Catchup (managed by pa schedules sync)';
-    const entries = [{ sentinel: trickySentinel, line: '*/15 * * * * pa catchup' }];
-    const existing = `${trickySentinel}\n*/15 * * * * pa catchup\n`;
+    const entries = [{ sentinel: trickySentinel, line: '* * * * * pa catchup' }];
+    const existing = `${trickySentinel}\n* * * * * pa catchup\n`;
     const result = upsertCronLines(existing, entries);
     // Should replace, not duplicate
-    const count = (result.match(/\*\/15 \* \* \* \* pa catchup$/mg) ?? []).length;
+    const count = (result.match(/\* \* \* \* \* pa catchup$/mg) ?? []).length;
     assert.equal(count, 1);
+  });
+});
+
+// ── Fail-loud pa-path resolution (D4) ─────────────────────────────────────
+// Extracted as pure functions specifically so this is testable without
+// mocking child_process.exec (unreliable to intercept for a CJS-compiled
+// named import across Node versions) — syncSchedulesWindows/Posix just feed
+// real `where`/`which` output (or null on failure) through these.
+
+describe('resolveWindowsPaPath (D4 fail-loud on missing pa)', () => {
+  it('fails loud when `where pa` found nothing', () => {
+    const result = resolveWindowsPaPath(null);
+    assert.equal(result.ok, false);
+    assert.match(result.errorMessage!, /not on PATH/i);
+    assert.match(result.errorMessage!, /npm install -g \./);
+  });
+
+  it('prefers the .cmd wrapper when multiple candidates are found', () => {
+    const result = resolveWindowsPaPath(
+      'C:\\Users\\me\\AppData\\Roaming\\npm\\pa\nC:\\Users\\me\\AppData\\Roaming\\npm\\pa.cmd\n'
+    );
+    assert.equal(result.ok, true);
+    assert.ok(result.paPath.toLowerCase().endsWith('.cmd'));
+  });
+
+  it('rejects a path containing shell metacharacters', () => {
+    const result = resolveWindowsPaPath('C:\\evil&path\\pa.cmd\n');
+    assert.equal(result.ok, false);
+    assert.match(result.errorMessage!, /unsafe characters/);
+  });
+});
+
+describe('resolvePosixPaPath (D4 fail-loud on missing pa)', () => {
+  it('fails loud when `which pa` found nothing', () => {
+    const result = resolvePosixPaPath(null);
+    assert.equal(result.ok, false);
+    assert.match(result.errorMessage!, /not on PATH/i);
+    assert.match(result.errorMessage!, /npm install -g \./);
+  });
+
+  it('resolves a clean which-pa path', () => {
+    const result = resolvePosixPaPath('/usr/local/bin/pa\n');
+    assert.equal(result.ok, true);
+    assert.equal(result.paPath, '/usr/local/bin/pa');
+  });
+
+  it('rejects a path containing shell metacharacters', () => {
+    const result = resolvePosixPaPath('/usr/local/bin/pa; rm -rf /\n');
+    assert.equal(result.ok, false);
+    assert.match(result.errorMessage!, /unsafe characters/);
   });
 });

@@ -3,7 +3,6 @@ import { randomBytes, randomUUID } from 'crypto';
 import { existsSync, unlinkSync, statSync, writeFileSync, mkdirSync } from 'fs';
 import { readdir, unlink, rename, writeFile, readFile, stat } from 'fs/promises';
 import { join } from 'path';
-import { homedir } from 'os';
 import { acquireLock, releaseLock } from './lock.js';
 import { getUpdates, sendMessage, sendMessageWithId, pinChatMessage, unpinChatMessage, sendTyping, setMessageReaction, downloadFile, editMessageText, createForumTopic, deleteMessage } from './telegram.js';
 import { loadState, saveState, loadTopicState, saveTopicState, addTurn, findHistoricalSessionTurns, findRecentTurnsByTopic, listTopicStateRefs } from './conversation.js';
@@ -95,6 +94,8 @@ import { logger } from '../../../pa/dist/src/lib/log.js';
 import { formatIST } from '../../../pa/dist/src/ist.js';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { RUNTIME_ARCHIVE_MAX_BYTES } from '../../../pa/dist/src/lib/archive-files.js';
+import { resolvePythonCommand } from '../../../pa/dist/src/lib/python.js';
+import { paHome } from '../../../pa/dist/src/paths.js';
 
 /** Topic keys created by /branch — signals forum_topic_created to skip description */
 const branchCreatedTopicKeys = new Set<string>();
@@ -767,7 +768,7 @@ async function processUpdate(
       if (runtimeEnv.PA_OAUTH_SECRETS_FILE) exchangeArgs.push('--secrets-file', runtimeEnv.PA_OAUTH_SECRETS_FILE);
       if (runtimeEnv.PA_OAUTH_STATE_FILE) exchangeArgs.push('--state-file', runtimeEnv.PA_OAUTH_STATE_FILE);
       if (runtimeEnv.PA_OAUTH_TOKEN_FILE) exchangeArgs.push('--token-file', runtimeEnv.PA_OAUTH_TOKEN_FILE);
-      const exchangeProc = spawn('python', exchangeArgs, { shell: true, env: runtimeEnv });
+      const exchangeProc = spawn(resolvePythonCommand(runtimeEnv), exchangeArgs, { shell: true, env: runtimeEnv });
       
       let exchangeOut = '';
       exchangeProc.stdout.on('data', (d) => exchangeOut += d.toString());
@@ -1046,7 +1047,7 @@ async function processUpdate(
     // in-flight record has served its purpose either way.
     if (pendingKey) await removePendingDispatch(pendingKey).catch(() => {});
     await saveTopicState(topicState);
-    if (restartBot) writeFileSync(join(homedir(), '.pa', 'telegram-bot.stop'), '');
+    if (restartBot) writeFileSync(join(paHome(), 'telegram-bot.stop'), '');
   } finally { await blackboard.releaseLock(resourceId, 'telegram-bot', contextId); }
 }
 
@@ -1057,7 +1058,7 @@ function getUpdateTopicKey(update: any): string {
 }
 
 async function checkBotLogRotation(): Promise<boolean> {
-  const logPath = join(homedir(), '.pa', 'logs', 'telegram-bot.log');
+  const logPath = join(paHome(), 'logs', 'telegram-bot.log');
   try {
     const s = statSync(logPath);
     if (s.size > RUNTIME_ARCHIVE_MAX_BYTES) {
@@ -1259,7 +1260,7 @@ async function main(): Promise<void> {
     const state = await loadState(chatIds[0]);
     const topicNames = await loadTopicNames();
     const branchIndex = await loadBranches();
-    const sentinelPath = join(homedir(), '.pa', 'telegram-bot.stop');
+    const sentinelPath = join(paHome(), 'telegram-bot.stop');
     try { unlinkSync(sentinelPath); } catch {}
     startHealthProbe();
     void (async () => {

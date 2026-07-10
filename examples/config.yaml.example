@@ -97,7 +97,13 @@ workers:
     input_mode: stdin-json
     output_format: stream-json
     check: claude --version
-    rate_limit_patterns: []   # session-mode detection via state files
+    rate_limit_patterns:
+      - "rate limit"
+      - "token limit"
+      - "quota exceeded"
+      - "Usage limit"
+      - "over your limit"
+      - "hit your limit"
     priority: 4
     state_dir: "~/.claude/projects"
     state_pattern: "*.jsonl"

@@ -91,6 +91,64 @@ export async function getOverdueSkills(): Promise<OverdueSkill[]> {
 const PA_CRON_REMINDERS = '# PA-Catchup-Reminders (managed by pa schedules sync)';
 const PA_CRON_DEFAULT   = '# PA-Catchup (managed by pa schedules sync)';
 
+export interface PaPathResolution {
+  ok: boolean;
+  paPath: string;
+  errorMessage?: string;
+}
+
+const PA_NOT_FOUND_MESSAGE =
+  'pa is not on PATH — run "npm install -g ." inside pa/ then re-run "pa schedules sync".';
+
+/**
+ * Resolves the pa executable path from `where pa`'s stdout (Windows),
+ * applying the .cmd-wrapper preference and the shell-metacharacter safety
+ * check. `whereStdout` is null when the `where pa` command itself failed
+ * (pa not found on PATH) — this used to silently fall back to a bare 'pa',
+ * registering a scheduled task that could never actually run (a silent-
+ * failure machine running every minute). Now fails loud instead: caller
+ * must check `.ok` and register nothing when false (D4).
+ *
+ * Pure function so this is unit-testable without mocking child_process.exec.
+ */
+export function resolveWindowsPaPath(whereStdout: string | null): PaPathResolution {
+  if (whereStdout === null) {
+    return { ok: false, paPath: '', errorMessage: PA_NOT_FOUND_MESSAGE };
+  }
+  const candidates = whereStdout.trim().split('\n').map((p) => p.trim()).filter(Boolean);
+  const paPath = candidates.find((p) => p.toLowerCase().endsWith('.cmd')) ?? candidates[0];
+  if (!paPath) {
+    return { ok: false, paPath: '', errorMessage: PA_NOT_FOUND_MESSAGE };
+  }
+  if (/[&|<>^%!]/.test(paPath)) {
+    return {
+      ok: false,
+      paPath: '',
+      errorMessage: `pa path contains unsafe characters: ${paPath}. Install pa to a path without special characters (& | < > ^ % !).`,
+    };
+  }
+  return { ok: true, paPath };
+}
+
+/** Same idea as resolveWindowsPaPath, for POSIX `which pa` output (D4). */
+export function resolvePosixPaPath(whichStdout: string | null): PaPathResolution {
+  if (whichStdout === null) {
+    return { ok: false, paPath: '', errorMessage: PA_NOT_FOUND_MESSAGE };
+  }
+  const paPath = whichStdout.trim();
+  if (!paPath) {
+    return { ok: false, paPath: '', errorMessage: PA_NOT_FOUND_MESSAGE };
+  }
+  if (/[;&|<>`$'"\\]/.test(paPath)) {
+    return {
+      ok: false,
+      paPath: '',
+      errorMessage: `pa path contains unsafe characters: ${paPath}. Install pa to a path without special characters.`,
+    };
+  }
+  return { ok: true, paPath };
+}
+
 export async function syncSchedules(): Promise<void> {
   if (platform() === 'win32') {
     await syncSchedulesWindows();
@@ -111,22 +169,20 @@ export async function syncSchedules(): Promise<void> {
 
 async function syncSchedulesWindows(): Promise<void> {
   // Find pa executable path and sanitize for shell safety
-  let paPath: string;
+  let whereStdout: string | null;
   try {
     const { stdout } = await execAsync('where pa', {});
-    const candidates = stdout.trim().split('\n').map((p) => p.trim());
-    // On Windows prefer the .cmd wrapper over the bash shim
-    paPath = candidates.find((p) => p.toLowerCase().endsWith('.cmd')) ?? candidates[0];
+    whereStdout = stdout;
   } catch {
-    paPath = 'pa';
+    whereStdout = null;
   }
-
-  // Validate paPath doesn't contain shell metacharacters (prevents command injection)
-  if (/[&|<>^%!]/.test(paPath)) {
-    console.error(`Error: pa path contains unsafe characters: ${paPath}`);
-    console.log('Install pa to a path without special characters (& | < > ^ % !).');
+  const resolution = resolveWindowsPaPath(whereStdout);
+  if (!resolution.ok) {
+    console.error(`Error: ${resolution.errorMessage}`);
+    process.exitCode = 1;
     return;
   }
+  const paPath = resolution.paPath;
 
   // Write VBScript launchers to ~/.pa/
   const createVbs = (name: string, args: string) => {
@@ -162,20 +218,20 @@ async function syncSchedulesWindows(): Promise<void> {
 
 async function syncSchedulesPosix(): Promise<void> {
   // Find pa on PATH
-  let paPath: string;
+  let whichStdout: string | null;
   try {
     const { stdout } = await execAsync('which pa');
-    paPath = stdout.trim();
+    whichStdout = stdout;
   } catch {
-    paPath = 'pa';
+    whichStdout = null;
   }
-
-  // Validate paPath — no shell metacharacters
-  if (/[;&|<>`$'"\\]/.test(paPath)) {
-    console.error(`Error: pa path contains unsafe characters: ${paPath}`);
-    console.log('Install pa to a path without special characters.');
+  const resolution = resolvePosixPaPath(whichStdout);
+  if (!resolution.ok) {
+    console.error(`Error: ${resolution.errorMessage}`);
+    process.exitCode = 1;
     return;
   }
+  const paPath = resolution.paPath;
 
   // Read existing crontab (empty string if none set)
   let existing = '';
@@ -186,10 +242,12 @@ async function syncSchedulesPosix(): Promise<void> {
     // No crontab yet — start fresh
   }
 
-  // Desired cron lines (reminders fires every minute, catchup every 15)
+  // Desired cron lines — both fire every minute (matches Windows Task
+  // Scheduler's cadence; catchup is lock-guarded so the tighter interval
+  // just means overdue skills get caught sooner, not duplicated).
   const lines: Record<string, string> = {
     [PA_CRON_REMINDERS]: `* * * * * ${paPath} catchup --topic reminders`,
-    [PA_CRON_DEFAULT]:   `*/15 * * * * ${paPath} catchup`,
+    [PA_CRON_DEFAULT]:   `* * * * * ${paPath} catchup`,
   };
 
   // Upsert: replace any existing PA-managed block, or append
@@ -226,7 +284,7 @@ async function syncSchedulesPosix(): Promise<void> {
       throw err;
     }
     console.log(`[+] Registered PA-Catchup-Reminders: * * * * * ${paPath} catchup --topic reminders`);
-    console.log(`[+] Registered PA-Catchup:           */15 * * * * ${paPath} catchup`);
+    console.log(`[+] Registered PA-Catchup:           * * * * * ${paPath} catchup`);
   } finally {
     await unlink(tmpPath).catch(() => {});
   }

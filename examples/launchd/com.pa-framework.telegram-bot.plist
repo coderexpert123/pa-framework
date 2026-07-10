@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.pa-framework.telegram-bot.plist — launchd agent for the pa Telegram
+  bot on macOS. Canonical reference for docs/BOT_GUIDE.md Option C.
+
+  Install:
+    mkdir -p ~/Library/LaunchAgents
+    cp examples/launchd/com.pa-framework.telegram-bot.plist ~/Library/LaunchAgents/
+    # Edit the ProgramArguments path below and the PA_HOME value to match
+    # your actual clone and home directory (plist has no %h-style specifier).
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pa-framework.telegram-bot.plist
+    # (older macOS: launchctl load ~/Library/LaunchAgents/com.pa-framework.telegram-bot.plist)
+
+  Follow logs (run-bot.sh redirects to a file, not the system log):
+    tail -f ~/.pa/logs/telegram-bot.log
+
+  Uninstall:
+    launchctl bootout gui/$(id -u)/com.pa-framework.telegram-bot
+    rm ~/Library/LaunchAgents/com.pa-framework.telegram-bot.plist
+
+  UV_THREADPOOL_SIZE is set explicitly below even though run-bot.sh already
+  defaults it to 16 if unset (AI-096: fs and dns.lookup share libuv's
+  threadpool) — keeps this agent file self-documenting.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.pa-framework.telegram-bot</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/path/to/projects/telegram-bot/run-bot.sh</string>
+  </array>
+  <key>KeepAlive</key>
+  <true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PA_HOME</key>
+    <string>/Users/you/.pa</string>
+    <key>UV_THREADPOOL_SIZE</key>
+    <string>16</string>
+  </dict>
+</dict>
+</plist>

@@ -30,6 +30,7 @@ workers:
     check: gemini --version
     check_timeout: 10
     rate_limit_patterns:
+      - "RESOURCE_EXHAUSTED"
       - "quota"
       - "rate limit"
       - "429"
@@ -46,6 +47,7 @@ workers:
     check: codex --version
     check_timeout: 15
     rate_limit_patterns:
+      - "hit your usage limit"
       - "rate limit"
       - "quota exceeded"
       - "429"

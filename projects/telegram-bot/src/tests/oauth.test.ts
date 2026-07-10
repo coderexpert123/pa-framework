@@ -67,7 +67,13 @@ describe('launchOAuthResumeAction', () => {
 
     const status = launchOAuthResumeAction(action, {
       cwd: 'D:/Personal Assistant',
-      env: { PA_TELEGRAM_OAUTH_RESUME_HOOK: 'C:/Users/test/.pa/oauth_resume_hook.py' } as NodeJS.ProcessEnv,
+      // PYTHON pinned so this assertion is platform-independent — without it,
+      // resolvePythonCommand's real POSIX branch would probe python3/python
+      // for real on a POSIX CI runner instead of returning a fixed value.
+      env: {
+        PA_TELEGRAM_OAUTH_RESUME_HOOK: 'C:/Users/test/.pa/oauth_resume_hook.py',
+        PYTHON: 'python',
+      } as NodeJS.ProcessEnv,
       spawner: (command, args, options) => {
         captured = { command, args, cwd: options.cwd };
         return { unref() {} };

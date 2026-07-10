@@ -73,7 +73,7 @@ async function writeConfig(dir: string, workers: object[]) {
       args: w.args,
       input_mode: w.input_mode ?? 'stdin-text',
       output_format: w.output_format ?? 'text',
-      check: 'cmd /c exit 0',
+      check: 'echo ok',
       rate_limit_patterns: w.rate_limit_patterns ?? [],
       priority: w.priority ?? i + 1,
       state_dir: '/nonexistent/path',
@@ -139,8 +139,8 @@ describe('dispatchMessage non-rate-limit early-return', () => {
 
   it('default zclaude non-rate-limit failure returns workerError:true', async () => {
     await writeConfig(testDir, [
-      { name: 'zclaude', command: 'cmd', args: ['/c', 'exit', '1'], priority: 1 },
-      { name: 'gemini', command: 'cmd', args: ['/c', 'exit', '1'], priority: 2 },
+      { name: 'zclaude', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 1 },
+      { name: 'gemini', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 2 },
     ]);
 
     const resource = `topic-999_${testRunId}-1`;
@@ -153,8 +153,8 @@ describe('dispatchMessage non-rate-limit early-return', () => {
 
   it('default gemini non-rate-limit (empty rate_limit_patterns) returns workerError:true', async () => {
     await writeConfig(testDir, [
-      { name: 'zclaude', command: 'cmd', args: ['/c', 'exit', '1'], priority: 1 },
-      { name: 'gemini', command: 'cmd', args: ['/c', 'exit', '1'], priority: 2, rate_limit_patterns: [] },
+      { name: 'zclaude', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 1 },
+      { name: 'gemini', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 2, rate_limit_patterns: [] },
     ]);
 
     const resource = `topic-999_${testRunId}-2`;
@@ -167,8 +167,8 @@ describe('dispatchMessage non-rate-limit early-return', () => {
 
   it('empty response (success=true, empty output) returns workerError:true with empty-response text', async () => {
     await writeConfig(testDir, [
-      { name: 'zclaude', command: 'cmd', args: ['/c', 'exit', '0'], priority: 1 },
-      { name: 'gemini', command: 'cmd', args: ['/c', 'exit', '1'], priority: 2 },
+      { name: 'zclaude', command: 'node', args: ['-e', 'process.exitCode=0'], priority: 1 },
+      { name: 'gemini', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 2 },
     ]);
 
     const resource = `topic-999_${testRunId}-3`;
@@ -181,8 +181,8 @@ describe('dispatchMessage non-rate-limit early-return', () => {
 
   it('session is preserved in non-rate-limit early-return', async () => {
     await writeConfig(testDir, [
-      { name: 'zclaude', command: 'cmd', args: ['/c', 'exit', '1'], priority: 1 },
-      { name: 'gemini', command: 'cmd', args: ['/c', 'exit', '1'], priority: 2 },
+      { name: 'zclaude', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 1 },
+      { name: 'gemini', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 2 },
     ]);
 
     const originalSession = { session_id: 'keep-this', worker: 'zclaude', started_at: new Date().toISOString() };
@@ -195,8 +195,8 @@ describe('dispatchMessage non-rate-limit early-return', () => {
 
   it('preferred zclaude non-rate-limit returns workerError:true', async () => {
     await writeConfig(testDir, [
-      { name: 'zclaude', command: 'cmd', args: ['/c', 'exit', '1'], priority: 1 },
-      { name: 'gemini', command: 'cmd', args: ['/c', 'exit', '1'], priority: 2 },
+      { name: 'zclaude', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 1 },
+      { name: 'gemini', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 2 },
     ]);
 
     const resource = `topic-999_${testRunId}-5`;
@@ -212,11 +212,17 @@ describe('dispatchMessage non-rate-limit early-return', () => {
     // → { minutes: 2, ... } → rate-limit path → rateLimitedWorker set → falls to runWithFailover.
     // zclaude fails too → buildWorkerResponse returns error string, no workerError.
     await writeConfig(testDir, [
-      { name: 'zclaude', command: 'cmd', args: ['/c', 'exit', '1'], priority: 1 },
+      { name: 'zclaude', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 1 },
       {
         name: 'gemini',
         command: 'node',
-        args: ['-e', "process.stderr.write('RESOURCE_EXHAUSTED quota');process.exit(1)"],
+        // Embedded-double-quote form: the inner JS string uses double quotes
+        // instead of single, so POSIX's quoteArg (which wraps this whole arg
+        // in single quotes) has nothing to escape — the old single-quoted
+        // form needed the '\'' escape dance, which the old fixture only
+        // survived on ubuntu by accident (a shell parse-error message that
+        // happened to still contain "RESOURCE_EXHAUSTED" and exit non-zero).
+        args: ['-e', 'process.stderr.write("RESOURCE_EXHAUSTED quota");process.exitCode=1'],
         priority: 2,
         rate_limit_patterns: ['RESOURCE_EXHAUSTED'],
       },
@@ -253,7 +259,7 @@ describe('dispatchMessage stop-marker guard', () => {
 
   it('aborts (empty response, no spawn) when the dispatch is older than the /stop', async () => {
     await writeConfig(testDir, [
-      { name: 'zclaude', command: 'cmd', args: ['/c', 'exit', '1'], priority: 1 },
+      { name: 'zclaude', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 1 },
     ]);
     const resource = `topic-999_${testRunId}-stop1`;
     markTopicStopped(resource.replace(/^topic-/, ''), 'stop', 1000);
@@ -267,7 +273,7 @@ describe('dispatchMessage stop-marker guard', () => {
 
   it('does NOT abort a dispatch newer than the /stop (user\'s next message)', async () => {
     await writeConfig(testDir, [
-      { name: 'zclaude', command: 'cmd', args: ['/c', 'exit', '1'], priority: 1 },
+      { name: 'zclaude', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 1 },
     ]);
     const resource = `topic-999_${testRunId}-stop2`;
     markTopicStopped(resource.replace(/^topic-/, ''), 'stop', 1000);

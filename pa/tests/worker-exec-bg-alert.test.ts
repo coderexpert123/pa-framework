@@ -55,10 +55,11 @@ async function runWithBgHooks(
   overrides: Partial<RunOptions> & {
     fakeDescendants?: number[];
     fakeAreAlive?: Record<number, boolean>;
+    heartbeatIntervalMs?: number;
   }
 ): Promise<string[]> {
   const notified: string[] = [];
-  const { fakeDescendants = [], fakeAreAlive = {}, ...opts } = overrides;
+  const { fakeDescendants = [], fakeAreAlive = {}, heartbeatIntervalMs = 30, ...opts } = overrides;
 
   const worker = makeWorker({ args: [scriptPath] });
 
@@ -67,7 +68,7 @@ async function runWithBgHooks(
     resource: uniqueResource(), // unique per-test to avoid blackboard lock collisions
     bgTasksConfig: { alert_seconds: 0, alert_repeat_seconds: 1 },
     _bgTaskHooks: {
-      heartbeatIntervalMs: 30,
+      heartbeatIntervalMs,
       getDescendantPids: async () => fakeDescendants.map(pid => ({ pid, parentPid: 0 })),
       getCommandLines: async (pids) => {
         const m = new Map<number, string>();
@@ -100,17 +101,21 @@ describe('BG-task tracking: age alert', () => {
   });
 
   it('lastRepeatBucket gate blocks re-alert within same repeat bucket', async () => {
-    // alert_repeat_seconds=10 — first bucket is [0, 10s). Two heartbeats in < 10s → only 1 alert.
-    const script = await writeScript('medium.js', 'setTimeout(() => process.stdout.write("done"), 300);');
+    // alert_repeat_seconds=60 — first bucket is [0, 60s). The child runs far
+    // below the bucket width (2s vs 60s), so every heartbeat during its life
+    // is deterministically still bucket 0 — the exact `=== 1` assert below
+    // isn't sensitive to CI/system-load timing jitter the way a tight
+    // 300ms-child/10s-bucket margin was.
+    const script = await writeScript('medium.js', 'setTimeout(() => process.stdout.write("done"), 2000);');
     const notified: string[] = [];
     const worker = makeWorker({ args: [script] });
 
     await executeWorker(worker, '', {
       timeout: 10,
       resource: uniqueResource(),
-      bgTasksConfig: { alert_seconds: 0, alert_repeat_seconds: 10 },
+      bgTasksConfig: { alert_seconds: 0, alert_repeat_seconds: 60 },
       _bgTaskHooks: {
-        heartbeatIntervalMs: 50, // fires multiple times in 300ms
+        heartbeatIntervalMs: 100, // fires multiple times in 2000ms
         getDescendantPids: async () => [{ pid: 99992, parentPid: 0 }],
         getCommandLines: async (pids) => new Map(pids.map(p => [p, 'sleep'])),
         areProcessesAlive: async (pids) => new Map(pids.map(p => [p, false])),
@@ -143,8 +148,8 @@ describe('BG-task tracking: age alert', () => {
   });
 
   it('alert subject includes worker name and pid', async () => {
-    const script = await writeScript('name.js', 'setTimeout(() => process.stdout.write("done"), 100);');
-    const notified = await runWithBgHooks(script, { fakeDescendants: [99994] });
+    const script = await writeScript('name.js', 'setTimeout(() => process.stdout.write("done"), 1500);');
+    const notified = await runWithBgHooks(script, { fakeDescendants: [99994], heartbeatIntervalMs: 100 });
     const leakAlert = notified.find(s => s.startsWith('bg-leak:'));
     assert.ok(leakAlert, 'Expected a bg-leak alert');
     assert.ok(leakAlert.includes('worker-under-test'), `Alert should include worker name: ${leakAlert}`);

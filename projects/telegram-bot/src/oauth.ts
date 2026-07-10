@@ -2,6 +2,7 @@ import { spawn } from 'child_process';
 import { existsSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
+import { resolvePythonCommand } from '../../../pa/dist/src/lib/python.js';
 
 export interface OAuthResumeAction {
   description?: string;
@@ -93,7 +94,7 @@ export function launchOAuthResumeAction(
   if (!hookPath) return 'missing_hook';
 
   const encoded = Buffer.from(JSON.stringify(action), 'utf8').toString('base64');
-  const command = options.env.PYTHON?.trim() || 'python';
+  const command = resolvePythonCommand(options.env);
   const args = [hookPath, '--resume-action-base64', encoded];
 
   try {
