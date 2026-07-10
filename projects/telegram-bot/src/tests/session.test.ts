@@ -1,10 +1,10 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile, mkdir, unlink } from 'fs/promises';
-import { execFile } from 'child_process';
 import { randomUUID } from 'crypto';
 import { join } from 'path';
 import { tmpdir, homedir } from 'os';
+import { sqliteExec, sqliteQuery } from '../../../../pa/dist/src/lib/db.js';
 import {
   SESSION_TTL_MS,
   isSessionExpired,
@@ -387,19 +387,9 @@ describe('cleanupCodexSessions', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  /** Helper: run a sqlite3 command and return stdout */
-  function sqlite3(db: string, sql: string): Promise<string> {
-    return new Promise((resolve, reject) => {
-      execFile('sqlite3', [db, sql], (err, stdout) => {
-        if (err) reject(err);
-        else resolve((stdout as string).trim());
-      });
-    });
-  }
-
   it('archives threads older than cutoff', async () => {
     const expiredAt = Math.floor((Date.now() - 48 * 60 * 60 * 1000) / 1000); // 48h ago
-    await sqlite3(tmpDb, [
+    sqliteExec(tmpDb, [
       'CREATE TABLE threads (id TEXT PRIMARY KEY, updated_at INTEGER NOT NULL, archived INTEGER NOT NULL DEFAULT 0, archived_at INTEGER);',
       `INSERT INTO threads VALUES('expired-thread', ${expiredAt}, 0, NULL);`,
     ].join(' '));
@@ -407,13 +397,13 @@ describe('cleanupCodexSessions', () => {
     const cutoff = Date.now() - SESSION_TTL_MS;
     await cleanupCodexSessions(tmpDb, cutoff);
 
-    const archived = await sqlite3(tmpDb, "SELECT archived FROM threads WHERE id = 'expired-thread'");
-    assert.equal(archived, '1', 'expired thread should be archived');
+    const rows = sqliteQuery<{ archived: number }>(tmpDb, "SELECT archived FROM threads WHERE id = 'expired-thread'");
+    assert.equal(rows[0]?.archived, 1, 'expired thread should be archived');
   });
 
   it('does not archive recent threads', async () => {
     const recentAt = Math.floor((Date.now() - 1 * 60 * 60 * 1000) / 1000); // 1h ago
-    await sqlite3(tmpDb, [
+    sqliteExec(tmpDb, [
       'CREATE TABLE threads (id TEXT PRIMARY KEY, updated_at INTEGER NOT NULL, archived INTEGER NOT NULL DEFAULT 0, archived_at INTEGER);',
       `INSERT INTO threads VALUES('recent-thread', ${recentAt}, 0, NULL);`,
     ].join(' '));
@@ -421,8 +411,8 @@ describe('cleanupCodexSessions', () => {
     const cutoff = Date.now() - SESSION_TTL_MS;
     await cleanupCodexSessions(tmpDb, cutoff);
 
-    const archived = await sqlite3(tmpDb, "SELECT archived FROM threads WHERE id = 'recent-thread'");
-    assert.equal(archived, '0', 'recent thread should NOT be archived');
+    const rows = sqliteQuery<{ archived: number }>(tmpDb, "SELECT archived FROM threads WHERE id = 'recent-thread'");
+    assert.equal(rows[0]?.archived, 0, 'recent thread should NOT be archived');
   });
 
   it('rejects when DB does not exist', async () => {

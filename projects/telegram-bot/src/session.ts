@@ -1,7 +1,7 @@
 import { stat, readdir, readFile, unlink, rmdir } from 'fs/promises';
-import { execFile } from 'child_process';
 import { join } from 'path';
 import { homedir } from 'os';
+import { sqliteRun, sqliteQuery } from '../../../pa/dist/src/lib/db.js';
 import type { SessionInfo } from './types.js';
 
 // TODO: [AI-020 Phase 6] Extract to shared config (pa/src/lib/config-shared.ts)
@@ -187,15 +187,11 @@ export async function cleanupCodexSessions(dbPath: string, cutoffMs: number): Pr
   await stat(dbPath); // throws if DB doesn't exist — caller catches
   const cutoffEpoch = Math.floor(cutoffMs / 1000); // Codex updated_at is Unix seconds
   const archiveAt = Math.floor(Date.now() / 1000);
-  await new Promise<void>((resolve, reject) => {
-    execFile('sqlite3', [
-      dbPath,
-      `UPDATE threads SET archived = 1, archived_at = ${archiveAt} WHERE archived = 0 AND updated_at < ${cutoffEpoch}`
-    ], (err) => {
-      if (err) reject(err);
-      else resolve();
-    });
-  });
+  sqliteRun(
+    dbPath,
+    'UPDATE threads SET archived = 1, archived_at = ? WHERE archived = 0 AND updated_at < ?',
+    [archiveAt, cutoffEpoch]
+  );
 }
 
 // --- Expiry ---
@@ -245,18 +241,22 @@ export function getPriorSessionPath(worker: string, sessionId: string, cwd?: str
 }
 
 async function codexSessionExists(sessionId: string): Promise<boolean> {
+  // Kept even though parameterization below makes it redundant — defense in depth.
   const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   if (!UUID_RE.test(sessionId)) return false;
 
   const dbPath = join(homedir(), '.codex', 'state_5.sqlite');
-  try { await stat(dbPath); } catch { return false; }
-
-  return new Promise((resolve) => {
-    const query = `SELECT 1 FROM threads WHERE id = '${sessionId}' AND archived = 0 LIMIT 1`;
-    execFile('sqlite3', [dbPath, query], (err, stdout) => {
-      resolve(!err && stdout.trim() === '1');
-    });
-  });
+  try {
+    const rows = sqliteQuery<{ hit: number }>(
+      dbPath,
+      'SELECT 1 AS hit FROM threads WHERE id = ? AND archived = 0 LIMIT 1',
+      [sessionId]
+    );
+    return rows.length === 1;
+  } catch {
+    // Missing file, corrupt DB, locked — gracefully report "no session".
+    return false;
+  }
 }
 
 async function geminiSessionPath(sessionId: string): Promise<string | null> {
