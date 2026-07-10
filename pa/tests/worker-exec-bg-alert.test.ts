@@ -94,7 +94,7 @@ async function runWithBgHooks(
 describe('BG-task tracking: age alert', () => {
   it('fires alert when descendant age exceeds alert_seconds', async () => {
     // Worker runs briefly; fake descendant always present
-    const script = await writeScript('quick.js', 'setTimeout(() => process.stdout.write("done"), 150);');
+    const script = await writeScript('quick.js', 'setTimeout(() => process.stdout.write("done"), 1500);');
     const notified = await runWithBgHooks(script, { fakeDescendants: [99991] });
 
     assert.ok(notified.some(s => s.startsWith('bg-leak:')), `Expected bg-leak alert, got: ${JSON.stringify(notified)}`);
@@ -129,7 +129,7 @@ describe('BG-task tracking: age alert', () => {
   });
 
   it('lastRepeatBucket: -1 ensures first bucket-0 crossing fires', async () => {
-    const script = await writeScript('fast.js', 'setTimeout(() => process.stdout.write("done"), 100);');
+    const script = await writeScript('fast.js', 'setTimeout(() => process.stdout.write("done"), 1500);');
     const notified = await runWithBgHooks(script, { fakeDescendants: [99993] });
 
     // With alert_seconds=0 and repeat_seconds=1, age=0 → bucket=0, 0 > -1 → fires
@@ -138,7 +138,7 @@ describe('BG-task tracking: age alert', () => {
 
   it('multi-descendant: 10 PIDs crossing threshold → exactly 1 notifyUser per heartbeat', async () => {
     const fakePids = Array.from({ length: 10 }, (_, i) => 90000 + i);
-    const script = await writeScript('multi.js', 'setTimeout(() => process.stdout.write("done"), 150);');
+    const script = await writeScript('multi.js', 'setTimeout(() => process.stdout.write("done"), 1500);');
     const notified = await runWithBgHooks(script, { fakeDescendants: fakePids });
 
     // All 10 PIDs cross the threshold in the same heartbeat → 1 batched alert
@@ -158,10 +158,13 @@ describe('BG-task tracking: age alert', () => {
 
 describe('BG-task tracking: orphan sweep', () => {
   it('fires bg-orphan alert when a descendant survives worker exit', async () => {
-    // The child must outlive at least one 30ms heartbeat: an instant exit
-    // could beat the first heartbeat's async chain to populating bgTaskMap,
-    // making the orphan sweep a no-op (observed flake under suite load).
-    const script = await writeScript('orphan.js', 'setTimeout(() => process.stdout.write("done"), 150);');
+    // The child must outlive at least one heartbeat's FULL async chain
+    // (getDescendantPids → getCommandLines → bgTaskMap populate): an early
+    // exit makes the orphan sweep a no-op. 150ms/30ms flaked on starved CI
+    // runners (windows-latest, 2026-07-10 — child spawn + delayed interval
+    // callbacks beat the chain); 1500ms/100ms gives ~15 heartbeat chances,
+    // same margin as the hardened repeat-bucket tests above.
+    const script = await writeScript('orphan.js', 'setTimeout(() => process.stdout.write("done"), 1500);');
     const notified: string[] = [];
     const worker = makeWorker({ args: [script] });
 
@@ -170,7 +173,7 @@ describe('BG-task tracking: orphan sweep', () => {
       resource: uniqueResource(),
       bgTasksConfig: { alert_seconds: 0, alert_repeat_seconds: 1 },
       _bgTaskHooks: {
-        heartbeatIntervalMs: 30,
+        heartbeatIntervalMs: 100,
         getDescendantPids: async () => [{ pid: 99995, parentPid: 0 }],
         getCommandLines: async (pids) => new Map(pids.map(p => [p, `orphan-cmd-${p}`])),
         areProcessesAlive: async (pids) => new Map(pids.map(p => [p, true])), // all alive
@@ -194,8 +197,10 @@ describe('BG-task tracking: orphan sweep', () => {
 
   it('does NOT fire orphan alert when all descendants are gone', async () => {
     // Long-lived child so the sweep actually RUNS and decides "all dead" —
-    // an instant exit would pass this vacuously (sweep skipped entirely).
-    const script = await writeScript('clean.js', 'setTimeout(() => process.stdout.write("done"), 150);');
+    // an early exit would pass this vacuously (sweep skipped entirely).
+    // Same 1500ms/100ms hardening as the positive-case test above: under
+    // starvation the 150ms child made this test silently meaningless.
+    const script = await writeScript('clean.js', 'setTimeout(() => process.stdout.write("done"), 1500);');
     const notified: string[] = [];
     const worker = makeWorker({ args: [script] });
 
@@ -204,7 +209,7 @@ describe('BG-task tracking: orphan sweep', () => {
       resource: uniqueResource(),
       bgTasksConfig: { alert_seconds: 0, alert_repeat_seconds: 1 },
       _bgTaskHooks: {
-        heartbeatIntervalMs: 30,
+        heartbeatIntervalMs: 100,
         getDescendantPids: async () => [{ pid: 99996, parentPid: 0 }],
         getCommandLines: async (pids) => new Map(pids.map(p => [p, 'sleep'])),
         areProcessesAlive: async (pids) => new Map(pids.map(p => [p, false])), // all dead
@@ -224,7 +229,7 @@ describe('BG-task tracking: orphan sweep', () => {
     const fakePids = [88881, 88882, 88883];
     // Child must outlive at least one 30ms heartbeat, or the sweep is a
     // no-op (bgTaskMap never populated) — same race as the orphan-alert test.
-    const script = await writeScript('batch-orphan.js', 'setTimeout(() => process.stdout.write("done"), 150);');
+    const script = await writeScript('batch-orphan.js', 'setTimeout(() => process.stdout.write("done"), 1500);');
     const aliveCalls: number[][] = [];
     const worker = makeWorker({ args: [script] });
 
@@ -283,7 +288,7 @@ describe('BG-task tracking: no descendants', () => {
 
 describe('cmdline sanitizer', () => {
   it('strips api_key, token, password, secret from query strings', async () => {
-    const script = await writeScript('sanitize.js', 'setTimeout(() => process.stdout.write("done"), 100);');
+    const script = await writeScript('sanitize.js', 'setTimeout(() => process.stdout.write("done"), 1500);');
     const bodies: string[] = [];
     const worker = makeWorker({ args: [script] });
 
@@ -323,7 +328,7 @@ describe('cmdline sanitizer', () => {
 
     for (const cmdline of paramTests) {
       const bodies: string[] = [];
-      const script = await writeScript(`san-${paramTests.indexOf(cmdline)}.js`, 'setTimeout(() => process.stdout.write("done"), 100);');
+      const script = await writeScript(`san-${paramTests.indexOf(cmdline)}.js`, 'setTimeout(() => process.stdout.write("done"), 1500);');
       const worker = makeWorker({ args: [script] });
 
       await executeWorker(worker, '', {
