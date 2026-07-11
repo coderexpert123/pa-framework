@@ -47,9 +47,20 @@ async function setupSkill(
 
 describe('getOverdueSkills', () => {
   it('returns empty when skill ran recently', async () => {
-    // Skill runs every hour, last run was 5 minutes ago
-    const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
-    await setupSkill('recent', '0 * * * *', 'latest', fiveMinAgo);
+    // Skill runs hourly; "recent" must mean AFTER the most recent scheduled fire
+    // (the top of the current hour). A naive "now - 5min" flakes near the hour
+    // boundary: run the test at :03 and 5-min-ago (:58 last hour) is BEFORE the
+    // :00 fire, so the skill looks overdue (observed on CI 2026-07-12). Anchor
+    // the last run just after the top of the current hour instead — always after
+    // the last fire, never in the future.
+    // UTC, not local: the cron is evaluated tz:'UTC' (scheduler.ts), and IST is
+    // +5:30, so the top of the LOCAL hour is UTC :30 — using setMinutes here
+    // (local) rather than setUTCMinutes is itself what made an earlier attempt at
+    // this fix still land before the UTC :00 fire and read as overdue.
+    const now = Date.now();
+    const topOfHour = new Date(now); topOfHour.setUTCMinutes(0, 0, 0);
+    const lastRun = new Date(Math.min(now, topOfHour.getTime() + 1000)).toISOString();
+    await setupSkill('recent', '0 * * * *', 'latest', lastRun);
     const overdue = await getOverdueSkills();
     assert.equal(overdue.length, 0);
   });
