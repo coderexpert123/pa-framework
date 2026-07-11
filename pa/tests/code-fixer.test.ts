@@ -11,6 +11,7 @@ import {
   buildCodeFixBrief,
 } from '../src/code-fixer.js';
 import type { ExecFn, ExecResult } from '../src/code-fixer.js';
+import { resolvePythonCommand } from '../src/lib/python.js';
 import type { DraftProposal } from '../src/types.js';
 import type { FailureRecord } from '../src/failure-analyzer.js';
 import type { CheckResult } from '../src/commands/health.js';
@@ -481,6 +482,10 @@ describe('attemptCodeFix', () => {
 });
 
 function resolvePythonForTest(): string {
-  // Mirrors resolvePythonCommand()'s win32 branch — tests run on the Windows dev machine.
-  return 'python';
+  // Must match whatever code-fixer.ts's runVerificationGate() actually resolves at runtime —
+  // NOT a hardcoded 'python'. On the macOS/Linux CI lanes that probes to 'python3', so a
+  // hardcoded 'python' left the fake-exec pytest handler unmatched, the gate saw an
+  // "unhandled command" as a verification failure, and the fix got spuriously reverted
+  // (surfaced as an unhandled `git reset --hard`). Delegate to the real resolver.
+  return resolvePythonCommand();
 }
