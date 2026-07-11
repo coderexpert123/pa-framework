@@ -112,13 +112,17 @@ export interface DraftMeta {
   proposed_at: string;
   reason: string;
   source_turns: string[];
-  status: 'pending' | 'approved' | 'rejected' | 'rejected_post_rollback';
+  // 'rejected_stale' (2026-07-11): pending >14 days, reaped by the staleness sweep.
+  // 'rejected_auto' (2026-07-11): cmd-based fix target — prompt fixes are no-ops for it,
+  // auto-rejected immediately rather than left pending.
+  status: 'pending' | 'approved' | 'rejected' | 'rejected_post_rollback' | 'rejected_stale' | 'rejected_auto';
   fingerprint: string;
   source_type: 'conversation' | 'failure' | 'feedback';
   reviewed_at?: string;
-  target_skill?: string;          // for fix/reinforce drafts: which existing skill this targets (manual-review visibility only)
+  target_skill?: string;          // for fix/reinforce drafts: which existing skill this targets
   approved_autonomously?: boolean; // true if self-improver approved/applied this without human review
   applied_in_place?: boolean;      // true if this was applied via applyFix() (overwrote target_skill's skill.md) rather than approveDraft() (deployed as its own new skill)
+  risk_flags?: string[];          // 'critical-skill' | 'declares-secrets' — recorded at gate time (2026-07-11), no longer blocks
 }
 
 export interface DraftProposal {

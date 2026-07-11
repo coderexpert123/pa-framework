@@ -18,6 +18,7 @@ import { healthCommand } from '../src/commands/health.js';
 import { notifyCommand } from '../src/commands/notify-cmd.js';
 import { bgtasksCommand } from '../src/commands/bgtasks.js';
 import { refCommand } from '../src/commands/ref.js';
+import { improvementsCommand } from '../src/commands/improvements.js';
 
 const USAGE = `
 pa — Personal Assistant CLI Dispatcher
@@ -44,6 +45,7 @@ Usage:
   pa notify --subject <s> (--body <b> | --body-file <path> | --body-stdin) [--dedup-key <k>] [--topic-thread <id>] [--severity info|warn|error]
   pa bgtasks [--json] [--kill <pid>]  List or kill background descendant processes
   pa ref <refId>              Look up what message produced a Ref ID (e.g. 'pa ref c-a59a')
+  pa improvements [--since N] Eval self-improver's applied/rolled-back changes (default 30d)
   pa help                     Show this help message
 `.trim();
 
@@ -166,6 +168,13 @@ async function main(): Promise<void> {
       case 'ref':
         await refCommand(args[1]);
         break;
+
+      case 'improvements': {
+        const sinceIdx = args.indexOf('--since');
+        const sinceDays = sinceIdx !== -1 ? parseInt(args[sinceIdx + 1], 10) || 30 : 30;
+        await improvementsCommand(sinceDays);
+        break;
+      }
 
       case 'help':
       case '--help':
