@@ -163,4 +163,38 @@ describe('improvementsCommand', () => {
     assert.match(text, /brand-new-skill/);
     assert.match(text, /1 runs, 1 success, 0 fail/);
   });
+
+  it('includes applied-code-fix records with commit hash and files-changed count (2026-07-11)', async () => {
+    await appendAuditRecord(makeRecord({
+      draft: 'cdu-code-fix', action: 'applied-code-fix', target_skill: 'coding-dirs-update',
+      commit_hash: 'abc1234',
+      files_changed: ['projects/coding-dirs-updater/update_coding_dirs.py', 'projects/coding-dirs-updater/tests/test_update.py'],
+      baseline: { window_days: 14, runs: 4, successes: 1, failures: 3 },
+    }));
+    await createTempMeta('coding-dirs-update', makeMeta({ status: 'success' }), 'n1');
+
+    await improvementsCommand(30);
+
+    const text = output.join('\n');
+    assert.match(text, /cdu-code-fix/);
+    assert.match(text, /applied-code-fix/);
+    assert.match(text, /commit abc1234/);
+    assert.match(text, /2 file\(s\) changed/);
+    assert.match(text, /4 runs, 1 success, 3 fail/); // baseline still shown
+  });
+
+  it('shows the revert commit hash on a rolled-back code-fix record (2026-07-11)', async () => {
+    await appendAuditRecord(makeRecord({
+      draft: 'cdu-code-fix', action: 'rolled-back', target_skill: 'coding-dirs-update',
+      commit_hash: 'abc1234', revert_commit_hash: 'def5678',
+      baseline: { window_days: 14, runs: 4, successes: 1, failures: 3 },
+    }));
+
+    await improvementsCommand(30);
+
+    const text = output.join('\n');
+    assert.match(text, /rolled-back/);
+    assert.match(text, /reverted commit abc1234/);
+    assert.match(text, /revert: def5678/);
+  });
 });

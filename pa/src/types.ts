@@ -132,6 +132,7 @@ export interface DraftProposal {
   frontmatter: Partial<SkillFrontmatter>;
   prompt: string;
   target_skill?: string; // set by failure-analyzer.ts/feedback-analyzer.ts for fix/reinforce proposals — the existing skill this proposal targets. Proposal-authoring metadata, NOT part of SkillFrontmatter (never written into a deployed skill.md).
+  code_target?: string;  // set by failure-analyzer.ts (2026-07-11) when its evidence names a specific source file likely causing the failure — a relative repo path (e.g. "projects/daily-mail-brief/scripts/run_brief.py"), validated in analyzer.ts's parseProposalResponse. A hint for code-fixer.ts's attemptCodeFix(), not authoritative on its own — the coding worker still explores the project itself.
 }
 
 export interface RunMeta {

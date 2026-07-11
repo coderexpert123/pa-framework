@@ -100,14 +100,35 @@ describe('buildReport', () => {
     assert.doesNotMatch(report, /\[risk:/);
   });
 
-  it('lists auto-rejected cmd-target entries in their own section', () => {
+  it('lists an applied-code-fix entry in the Autonomously applied section, labeled as a code fix (2026-07-11)', () => {
     const entries: ReportEntry[] = [
-      makeEntry({ name: 'coding-dirs-update-fix', outcome: 'auto-rejected-cmd-target', targetSkill: 'coding-dirs-update', reason: 'coding-dirs-update failed twice.' }),
+      makeEntry({ name: 'coding-dirs-update-fix', outcome: 'applied-code-fix', targetSkill: 'coding-dirs-update', detail: 'Applied and pushed (commit abc1234).', reason: 'coding-dirs-update failed twice.' }),
     ];
     const report = buildReport([], entries);
-    assert.match(report, /Auto-rejected.*cmd-based target/);
+    assert.match(report, /Autonomously applied \(1\)/);
+    assert.match(report, /coding-dirs-update-fix.*— code fix to `coding-dirs-update`/);
+    assert.match(report, /Applied and pushed \(commit abc1234\)\./);
+  });
+
+  it('lists a code-fix-reverted entry in its own section (2026-07-11)', () => {
+    const entries: ReportEntry[] = [
+      makeEntry({ name: 'coding-dirs-update-fix', outcome: 'code-fix-reverted', targetSkill: 'coding-dirs-update', detail: 'Verification failed: pa test suite failed — reverted.' }),
+    ];
+    const report = buildReport([], entries);
+    assert.match(report, /Code fixes reverted \(1\)/);
     assert.match(report, /coding-dirs-update-fix/);
-    assert.match(report, /coding-dirs-update/);
+    assert.match(report, /pa test suite failed/);
+  });
+
+  it('lists code-fix-skipped-* entries (any reason suffix) in a shared section (2026-07-11)', () => {
+    const entries: ReportEntry[] = [
+      makeEntry({ name: 'a-fix', outcome: 'code-fix-skipped-dirty-worktree', targetSkill: 'a', detail: 'Working tree has 2 uncommitted change(s).' }),
+      makeEntry({ name: 'b-fix', outcome: 'code-fix-skipped-limit-reached', targetSkill: 'b' }),
+    ];
+    const report = buildReport([], entries);
+    assert.match(report, /Code fixes skipped \(2\)/);
+    assert.match(report, /a-fix.*dirty worktree/);
+    assert.match(report, /b-fix.*limit reached/);
   });
 
   it('lists skipped-duplicate-pending and skipped-cooldown entries in a shared skipped section', () => {
@@ -237,32 +258,86 @@ describe('gateAndApprove', () => {
     assert.deepEqual(approvedWith?.risk_flags, []);
   });
 
-  it('auto-rejects a fix targeting a cmd-based skill — rejected_auto status, never reaches validateSkillFix', async () => {
-    await createTempSkill(dir, 'coding-dirs-update', '---\ncmd: "python update_coding_dirs.py"\n---\nUpdates the pinned directory list.');
-    await createTempDraft(dir, 'coding-dirs-update-fix', 'New prompt (inert for a cmd-based skill).', {
-      proposed_at: new Date().toISOString(),
-      reason: 'coding-dirs-update failed twice.',
-      source_turns: [],
-      status: 'pending',
-      fingerprint: computeFingerprint('coding-dirs-update-fix', 'New prompt.'),
-      source_type: 'failure',
-      target_skill: 'coding-dirs-update',
+  describe('cmd-based target routing (2026-07-11 code-fix capability)', () => {
+    async function seedCmdTargetDraft(): Promise<void> {
+      await createTempSkill(dir, 'coding-dirs-update', '---\ncmd: "python update_coding_dirs.py"\n---\nUpdates the pinned directory list.');
+      await createTempDraft(dir, 'coding-dirs-update-fix', 'New prompt (inert for a cmd-based skill).', {
+        proposed_at: new Date().toISOString(),
+        reason: 'coding-dirs-update failed twice.',
+        source_turns: [],
+        status: 'pending',
+        fingerprint: computeFingerprint('coding-dirs-update-fix', 'New prompt.'),
+        source_type: 'failure',
+        target_skill: 'coding-dirs-update',
+      });
+    }
+
+    it('routes a fix targeting a cmd-based skill to attemptCodeFix instead of auto-rejecting — never reaches validateSkillFix', async () => {
+      await seedCmdTargetDraft();
+
+      let validateSkillFixCalled = false;
+      let codeFixArgs: any;
+      const entries = await gateAndApprove(
+        [{ proposal: makeProposal({ name: 'coding-dirs-update-fix', target_skill: 'coding-dirs-update', reason: 'coding-dirs-update failed twice.' }), sourceType: 'failure' }],
+        {
+          validateSkillFixFn: async () => { validateSkillFixCalled = true; return true; },
+          attemptCodeFixFn: async (proposal, evidence) => { codeFixArgs = { proposal, evidence }; return { outcome: 'applied-code-fix', reason: 'Applied and pushed (commit abc1234).', commitHash: 'abc1234', filesChanged: ['projects/coding-dirs-updater/update_coding_dirs.py'] }; },
+        }
+      );
+
+      assert.equal(entries.length, 1);
+      assert.equal(entries[0].outcome, 'applied-code-fix');
+      assert.equal(entries[0].detail, 'Applied and pushed (commit abc1234).');
+      assert.equal(validateSkillFixCalled, false, 'a cmd-based target must route to code-fixing before ever reaching validateSkillFix');
+      assert.equal(codeFixArgs.proposal.name, 'coding-dirs-update-fix');
+
+      const meta: DraftMeta = JSON.parse(
+        await readFile(join(dir, 'skill-drafts', 'coding-dirs-update-fix', 'draft.meta.json'), 'utf8')
+      );
+      assert.equal(meta.status, 'rejected_auto', 'the prompt-fix draft itself is never deployed — code-fixer commits directly to the project');
     });
 
-    let validateSkillFixCalled = false;
-    const entries = await gateAndApprove(
-      [{ proposal: makeProposal({ name: 'coding-dirs-update-fix', target_skill: 'coding-dirs-update', reason: 'coding-dirs-update failed twice.' }), sourceType: 'failure' }],
-      { validateSkillFixFn: async () => { validateSkillFixCalled = true; return true; } }
-    );
+    it('passes readRecentFailures results filtered to the target skill as evidence', async () => {
+      await seedCmdTargetDraft();
 
-    assert.equal(entries.length, 1);
-    assert.equal(entries[0].outcome, 'auto-rejected-cmd-target');
-    assert.equal(validateSkillFixCalled, false, 'a cmd-based target must be rejected before ever reaching validateSkillFix');
+      let receivedEvidence: any[] = [];
+      await gateAndApprove(
+        [{ proposal: makeProposal({ name: 'coding-dirs-update-fix', target_skill: 'coding-dirs-update' }), sourceType: 'failure' }],
+        {
+          readRecentFailuresFn: async () => [
+            { skillName: 'coding-dirs-update', error: 'boom A', timestamp: new Date().toISOString(), duration: 1000, worker: 'gemini' },
+            { skillName: 'unrelated-skill', error: 'boom B', timestamp: new Date().toISOString(), duration: 1000, worker: 'gemini' },
+          ],
+          attemptCodeFixFn: async (_proposal, evidence) => { receivedEvidence = evidence; return { outcome: 'code-fix-skipped-worker-failed', reason: 'x' }; },
+        }
+      );
 
-    const meta: DraftMeta = JSON.parse(
-      await readFile(join(dir, 'skill-drafts', 'coding-dirs-update-fix', 'draft.meta.json'), 'utf8')
-    );
-    assert.equal(meta.status, 'rejected_auto');
+      assert.equal(receivedEvidence.length, 1);
+      assert.equal(receivedEvidence[0].error, 'boom A');
+    });
+
+    it('enforces one code-fix attempt per gateAndApprove call (F5) — a second cmd-target proposal is skipped without calling attemptCodeFix again', async () => {
+      await seedCmdTargetDraft();
+      await createTempSkill(dir, 'other-cmd-skill', '---\ncmd: "python other.py"\n---\nOther.');
+      await createTempDraft(dir, 'other-cmd-skill-fix', 'New prompt.', {
+        proposed_at: new Date().toISOString(), reason: 'other-cmd-skill failed twice.', source_turns: [],
+        status: 'pending', fingerprint: computeFingerprint('other-cmd-skill-fix', 'New prompt.'),
+        source_type: 'failure', target_skill: 'other-cmd-skill',
+      });
+
+      let callCount = 0;
+      const entries = await gateAndApprove(
+        [
+          { proposal: makeProposal({ name: 'coding-dirs-update-fix', target_skill: 'coding-dirs-update' }), sourceType: 'failure' },
+          { proposal: makeProposal({ name: 'other-cmd-skill-fix', target_skill: 'other-cmd-skill' }), sourceType: 'failure' },
+        ],
+        { attemptCodeFixFn: async () => { callCount++; return { outcome: 'code-fix-reverted', reason: 'reverted' }; } }
+      );
+
+      assert.equal(callCount, 1, 'attemptCodeFix must be called at most once per nightly run');
+      assert.equal(entries[0].outcome, 'code-fix-reverted');
+      assert.equal(entries[1].outcome, 'code-fix-skipped-limit-reached');
+    });
   });
 
   describe('audit trail (2026-07-11) — every terminal decision appends a record', () => {
@@ -569,5 +644,105 @@ describe('sweepStaleDrafts (thrash control — 2026-07-11)', () => {
     assert.equal(await sweepStaleDrafts(14), 0);
     const records = await readAuditRecords(dir);
     assert.equal(records.length, 0);
+  });
+});
+
+describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await createTempPaHome();
+  });
+
+  afterEach(async () => {
+    await cleanup(dir);
+  });
+
+  function gitRevertFlag() {
+    return {
+      kind: 'git-revert' as const,
+      skillName: 'coding-dirs-update',
+      draftName: 'coding-dirs-update-fix',
+      commitHash: 'abc1234',
+    };
+  }
+
+  async function seedDraft(): Promise<void> {
+    await createTempDraft(dir, 'coding-dirs-update-fix', 'Trigger record.', {
+      proposed_at: new Date().toISOString(),
+      reason: 'coding-dirs-update failing.',
+      source_turns: [],
+      status: 'rejected_auto',
+      fingerprint: computeFingerprint('coding-dirs-update-fix', 'x'),
+      source_type: 'failure',
+      target_skill: 'coding-dirs-update',
+    });
+  }
+
+  it('executes git revert + push, audits rolled-back with both hashes, marks the draft', async () => {
+    await seedDraft();
+    const cmds: string[] = [];
+    const lines = await rollback({
+      checkForRollbacksFn: async () => [gitRevertFlag()],
+      execFn: async (cmd: string) => {
+        cmds.push(cmd);
+        return { stdout: cmd.includes('rev-parse') ? 'def5678\n' : '', stderr: '' };
+      },
+    });
+
+    assert.ok(cmds.some((c) => c.includes('git revert --no-edit abc1234')), `expected a git revert, got: ${cmds.join(' | ')}`);
+    assert.ok(cmds.some((c) => c.includes('git push')), 'expected the revert to be pushed (offsite recoverability)');
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /Reverted/);
+    assert.match(lines[0], /abc1234/);
+
+    const records = await readAuditRecords(dir);
+    const rec = records.find((r) => r.action === 'rolled-back');
+    assert.ok(rec, 'expected a rolled-back audit record');
+    assert.equal(rec.commit_hash, 'abc1234');
+    assert.equal(rec.revert_commit_hash, 'def5678');
+
+    const meta: DraftMeta = JSON.parse(
+      await readFile(join(dir, 'skill-drafts', 'coding-dirs-update-fix', 'draft.meta.json'), 'utf8')
+    );
+    assert.equal(meta.status, 'rejected_post_rollback');
+  });
+
+  it('reports and audits rollback-failed when the git revert command fails (e.g. conflict)', async () => {
+    await seedDraft();
+    const lines = await rollback({
+      checkForRollbacksFn: async () => [gitRevertFlag()],
+      execFn: async (cmd: string) => {
+        if (cmd.includes('git revert')) throw new Error('could not revert: merge conflict in update_coding_dirs.py');
+        return { stdout: '', stderr: '' };
+      },
+    });
+
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /Rollback FAILED/);
+    assert.match(lines[0], /merge conflict/);
+
+    const records = await readAuditRecords(dir);
+    const rec = records.find((r) => r.action === 'rollback-failed');
+    assert.ok(rec, 'expected a rollback-failed audit record');
+    assert.equal(rec.commit_hash, 'abc1234');
+  });
+
+  it('flags bot-restart necessity in the report line when the reverted fix touched bot code', async () => {
+    await seedDraft();
+    // The audit record for the original fix carries files_changed — rollback reads it to
+    // decide whether to warn (no git calls needed).
+    await appendAuditRecord({
+      ts: new Date().toISOString(), draft: 'coding-dirs-update-fix', source_type: 'failure',
+      target_skill: 'coding-dirs-update', action: 'applied-code-fix', risk_flags: [],
+      reason: 'x', commit_hash: 'abc1234',
+      files_changed: ['projects/telegram-bot/src/logic.ts'],
+    });
+    const lines = await rollback({
+      checkForRollbacksFn: async () => [gitRevertFlag()],
+      execFn: async (cmd: string) => ({ stdout: cmd.includes('rev-parse') ? 'def5678\n' : '', stderr: '' }),
+    });
+
+    assert.match(lines[0], /bot restart|rebuild/i);
   });
 });

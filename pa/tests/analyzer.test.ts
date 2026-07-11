@@ -170,6 +170,42 @@ describe('analyzer', () => {
     it('returns empty array for empty JSON array', () => {
       assert.deepEqual(parseProposalResponse('[]'), []);
     });
+
+    it('parses code_target as a top-level field when it is a safe relative path', () => {
+      const raw = JSON.stringify([
+        {
+          name: 'daily-mail-brief-fix', reason: 'r', source_message_ids: [],
+          target_skill: 'daily-mail-brief', code_target: 'projects/daily-mail-brief/scripts/run_brief.py',
+          frontmatter: {}, prompt: 'p.',
+        },
+      ]);
+      const proposals = parseProposalResponse(raw);
+      assert.equal(proposals.length, 1);
+      assert.equal(proposals[0].code_target, 'projects/daily-mail-brief/scripts/run_brief.py');
+    });
+
+    it('omits code_target (undefined) when absent or null', () => {
+      const raw = JSON.stringify([
+        { name: 'a', reason: 'r', source_message_ids: [], frontmatter: {}, prompt: 'p.' },
+        { name: 'b', reason: 'r', source_message_ids: [], code_target: null, frontmatter: {}, prompt: 'p.' },
+      ]);
+      const proposals = parseProposalResponse(raw);
+      assert.equal(proposals.length, 2);
+      assert.equal(proposals[0].code_target, undefined);
+      assert.equal(proposals[1].code_target, undefined);
+    });
+
+    it('drops the whole proposal when code_target attempts path traversal or an absolute path', () => {
+      const raw = JSON.stringify([
+        { name: 'a', reason: 'r', source_message_ids: [], code_target: '../../etc/passwd', frontmatter: {}, prompt: 'p.' },
+        { name: 'b', reason: 'r', source_message_ids: [], code_target: '/etc/passwd', frontmatter: {}, prompt: 'p.' },
+        { name: 'c', reason: 'r', source_message_ids: [], code_target: 'C:/Windows/System32/x', frontmatter: {}, prompt: 'p.' },
+        { name: 'd', reason: 'r', source_message_ids: [], code_target: 'projects/ok/file.py', frontmatter: {}, prompt: 'p.' },
+      ]);
+      const proposals = parseProposalResponse(raw);
+      assert.equal(proposals.length, 1);
+      assert.equal(proposals[0].name, 'd');
+    });
   });
 
   describe('readRecentConversations', () => {

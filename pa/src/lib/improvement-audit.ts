@@ -24,18 +24,47 @@ export interface AuditBaseline {
   failures: number;
 }
 
+// Test-run counts from the post-apply verification gate (code-fixer.ts's F3) — separate from
+// AuditBaseline (which is run/success/failure counts of the target SKILL's own history, not
+// the test suite that validated the fix).
+export interface AuditTestRunCounts {
+  total: number;
+  pass: number;
+  fail: number;
+  skip: number;
+}
+
 export interface AuditRecord {
   ts: string;
   draft: string;
   source_type: 'conversation' | 'failure' | 'feedback';
   target_skill?: string;
-  action: 'applied-fix' | 'approved-new-skill' | 'rejected_auto' | 'rejected_stale' | 'rolled-back' | 'validation-failed';
+  action: 'applied-fix' | 'approved-new-skill' | 'rejected_auto' | 'rejected_stale' | 'rolled-back' | 'validation-failed'
+    // Autonomous CODE-fix capability (2026-07-11) — see
+    // plans/2026-07-11-autonomous-code-fix-capability.md. code-fixer.ts's attemptCodeFix()
+    // appends one of these for every terminal branch, mirroring gateAndApprove's own
+    // one-audit-record-per-decision convention.
+    | 'applied-code-fix'
+    | 'code-fix-skipped-dirty-worktree'
+    | 'code-fix-skipped-worker-failed'
+    | 'code-fix-skipped-no-changes'
+    | 'reverted-protected-path'
+    | 'reverted-test-weakening'
+    | 'reverted-verification-failed'
+    // self-improver.ts's rollback() extension (Commit 3) — a prior applied-code-fix commit
+    // whose target skill is now failing at an elevated rate gets `git revert`-ed.
+    | 'rollback-failed';
   risk_flags: string[];
   reason: string;
   validation?: AuditValidation;
   diff?: string;         // unified diff (fix) or the full new prompt (new skill) — ≤4000 chars
   backup_path?: string;
   baseline?: AuditBaseline;
+  commit_hash?: string;         // the fix commit's hash (applied-code-fix only)
+  revert_commit_hash?: string;  // set when a prior applied-code-fix commit is `git revert`-ed (rolled-back action)
+  files_changed?: string[];     // repo-relative paths touched by a code fix
+  evidence_excerpt?: string;    // truncated failure evidence (readRecentFailures) that justified a code fix — ≤2000 chars
+  test_run_counts?: AuditTestRunCounts; // F3 verification-gate suite results, when the fix passed far enough to run them
 }
 
 /**

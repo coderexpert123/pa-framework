@@ -88,6 +88,10 @@ pa/data/profile-history-archive.kb-watermark.json
 /*.py
 /check*.ps1
 /scratch_*
+# Worker/agent artifact: coding CLIs occasionally create this brain-bootstrap
+# trigger file (referenced only in the global ~/.claude/CLAUDE.md protocol) in
+# subdirectories they work in — recurred 3x during 2026-07 agent sessions.
+**/.claude-needs-brain
 /all_files.txt
 /out*.txt
 *.bak

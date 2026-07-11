@@ -129,7 +129,7 @@ export function parseProposalResponse(raw: string): DraftProposal[] {
   const proposals: DraftProposal[] = [];
   for (const item of parsed) {
     if (typeof item !== 'object' || item === null) continue;
-    const { name, reason, source_message_ids, frontmatter, prompt, target_skill } = item as Record<string, unknown>;
+    const { name, reason, source_message_ids, frontmatter, prompt, target_skill, code_target } = item as Record<string, unknown>;
 
     if (typeof name !== 'string' || !name.trim()) continue;
     if (typeof reason !== 'string' || !reason.trim()) continue;
@@ -141,6 +141,19 @@ export function parseProposalResponse(raw: string): DraftProposal[] {
     // — only a non-null value that fails the shape check is treated as malformed.
     if (target_skill !== undefined && target_skill !== null
       && (typeof target_skill !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(target_skill))) continue;
+    // code_target (2026-07-11, autonomous code-fix capability) — an LLM-proposed repo-relative
+    // FILE path, not a skill name, so it needs its own charset + traversal guard rather than
+    // reusing target_skill's. `null`/omitted both mean "no hint" (the common case — most
+    // failure proposals won't name a specific file). A malformed value drops the WHOLE
+    // proposal, same severity as a malformed target_skill — code-fixer.ts treats this as a
+    // hint it will pass straight to a coding worker's brief, so it must never carry a
+    // traversal/absolute-path payload through unvalidated.
+    if (code_target !== undefined && code_target !== null
+      && (typeof code_target !== 'string'
+        || !/^[a-zA-Z0-9_][a-zA-Z0-9_.\-/]*$/.test(code_target)
+        || code_target.includes('..')
+        || code_target.startsWith('/')
+        || /^[a-zA-Z]:/.test(code_target))) continue;
 
     proposals.push({
       name: name.trim(),
@@ -153,6 +166,7 @@ export function parseProposalResponse(raw: string): DraftProposal[] {
         : {},
       prompt: prompt.trim(),
       ...(typeof target_skill === 'string' && target_skill.trim() ? { target_skill: target_skill.trim() } : {}),
+      ...(typeof code_target === 'string' && code_target.trim() ? { code_target: code_target.trim() } : {}),
     });
   }
 

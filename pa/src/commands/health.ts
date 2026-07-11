@@ -11,7 +11,7 @@ import { loadSecrets } from '../secrets.js';
 
 type CheckStatus = 'OK' | 'WARN' | 'FAIL';
 
-interface CheckResult {
+export interface CheckResult {
   name: string;
   status: CheckStatus;
   detail: string;
@@ -54,7 +54,10 @@ function fmtAge(ms: number): string {
 
 // ---- Individual checks ----
 
-async function checkBotProcess(): Promise<CheckResult> {
+// Exported (2026-07-11) so code-fixer.ts's F3 verification gate can poll it directly after a
+// `pa bot restart` triggered by a code fix that touched projects/telegram-bot — in-process
+// function call, not a `pa health` subprocess spawn + text-output parse.
+export async function checkBotProcess(): Promise<CheckResult> {
   const lockPath = join(paHome(), 'telegram-bot.lock');
   const content = await readFile(lockPath, 'utf8').catch(() => null);
   if (content === null) {

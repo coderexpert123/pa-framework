@@ -4,10 +4,10 @@ import type { AuditRecord, SkillRunStats } from '../lib/improvement-audit.js';
 const DEFAULT_SINCE_DAYS = 30;
 
 // Actions worth evaluating — a change actually reached production (applied-fix,
-// approved-new-skill) or was undone (rolled-back). Everything else (rejected_auto,
-// rejected_stale, validation-failed) never touched a live skill, so there's nothing to
-// eval a before/after delta against.
-const EVALUABLE_ACTIONS: ReadonlySet<AuditRecord['action']> = new Set(['applied-fix', 'approved-new-skill', 'rolled-back']);
+// approved-new-skill, applied-code-fix) or was undone (rolled-back). Everything else
+// (rejected_auto, rejected_stale, validation-failed, the code-fix skip/revert reasons)
+// never left a change live, so there's nothing to eval a before/after delta against.
+const EVALUABLE_ACTIONS: ReadonlySet<AuditRecord['action']> = new Set(['applied-fix', 'approved-new-skill', 'applied-code-fix', 'rolled-back']);
 
 export interface EvalEntry {
   record: AuditRecord;
@@ -49,6 +49,14 @@ export function buildEvalReport(entries: EvalEntry[], sinceDays: number): string
 
     lines.push(`${date}  ${record.draft}  [${record.action}]${riskSuffix}`);
     lines.push(`  target: ${target}`);
+    // Code fixes are git commits, not skill.md overwrites — surface the hash(es) so the
+    // eval reader can `git show` the exact change (and its revert, when rolled back).
+    if (record.action === 'applied-code-fix' && record.commit_hash) {
+      lines.push(`  commit ${record.commit_hash}${record.files_changed ? `, ${record.files_changed.length} file(s) changed` : ''}`);
+    }
+    if (record.action === 'rolled-back' && record.commit_hash) {
+      lines.push(`  reverted commit ${record.commit_hash}${record.revert_commit_hash ? ` (revert: ${record.revert_commit_hash})` : ''}`);
+    }
     if (record.baseline) {
       lines.push(`  baseline (${record.baseline.window_days}d @ apply): ${fmtStats(record.baseline)}`);
       lines.push(`  current  (${record.baseline.window_days}d now):     ${fmtStats(current)}`);

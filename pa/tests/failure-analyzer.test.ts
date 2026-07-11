@@ -5,6 +5,7 @@ import { join } from 'path';
 import { readRecentFailures, buildFailurePrompt, checkForRollbacks } from '../src/failure-analyzer.js';
 import type { FailureRecord } from '../src/failure-analyzer.js';
 import { createTempPaHome, createTempSkill, createTempDraft, cleanup } from './helpers.js';
+import { appendAuditRecord } from '../src/lib/improvement-audit.js';
 import type { DraftMeta, RunMeta } from '../src/types.js';
 
 async function createTempMeta(dir: string, skillName: string, meta: RunMeta): Promise<void> {
@@ -113,6 +114,15 @@ describe('failure-analyzer', () => {
       const prompt = buildFailurePrompt([], ['daily-mail-brief'], []);
       assert.match(prompt, /daily-mail-brief/);
     });
+
+    it('requests an optional code_target file-path hint (2026-07-11 code-fix capability)', () => {
+      const failures: FailureRecord[] = [
+        { skillName: 'daily-mail-brief', error: 'Missing BRIEFING marker', timestamp: new Date().toISOString(), duration: 5000, worker: 'gemini' },
+        { skillName: 'daily-mail-brief', error: 'Missing BRIEFING marker', timestamp: new Date().toISOString(), duration: 5000, worker: 'gemini' },
+      ];
+      const prompt = buildFailurePrompt(failures, ['daily-mail-brief'], []);
+      assert.match(prompt, /code_target/);
+    });
   });
 
   describe('checkForRollbacks', () => {
@@ -206,6 +216,73 @@ describe('failure-analyzer', () => {
       const flags = await checkForRollbacks();
       assert.equal(flags.find((f) => f.skillName === 'sparse-skill'), undefined,
         'a single failing run must not trigger a rollback regardless of its 100% rate');
+    });
+
+    it('flags "git-revert" with the commit hash for a failing skill with a recent applied-code-fix audit record (2026-07-11)', async () => {
+      await makeFailingSkill('coding-dirs-update');
+      await appendAuditRecord({
+        ts: new Date().toISOString(), draft: 'coding-dirs-update-fix', source_type: 'failure',
+        target_skill: 'coding-dirs-update', action: 'applied-code-fix', risk_flags: [],
+        reason: 'markers missing', commit_hash: 'abc1234',
+        files_changed: ['projects/coding-dirs-updater/update_coding_dirs.py'],
+      });
+
+      const flags = await checkForRollbacks();
+      const flag = flags.find((f) => f.skillName === 'coding-dirs-update');
+      assert.ok(flag, 'expected a rollback flag for the code-fixed failing skill');
+      assert.equal(flag!.kind, 'git-revert');
+      assert.equal(flag!.commitHash, 'abc1234');
+      assert.equal(flag!.draftName, 'coding-dirs-update-fix');
+    });
+
+    it('does NOT flag git-revert when the applied-code-fix record is older than the lookback window', async () => {
+      // NOTE: this suite shares one temp PA_HOME across tests (before, not beforeEach), so
+      // the audit file accumulates — each git-revert test uses its own unique skill name.
+      await makeFailingSkill('cdu-stale-skill');
+      await appendAuditRecord({
+        ts: new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString(), // 8d > 7d lookback
+        draft: 'cdu-stale-skill-fix', source_type: 'failure',
+        target_skill: 'cdu-stale-skill', action: 'applied-code-fix', risk_flags: [],
+        reason: 'markers missing', commit_hash: 'abc1234',
+      });
+
+      const flags = await checkForRollbacks();
+      assert.equal(flags.find((f) => f.skillName === 'cdu-stale-skill'), undefined);
+    });
+
+    it('the most recent applied-code-fix record wins when several exist for the same skill', async () => {
+      await makeFailingSkill('cdu-multi-skill');
+      await appendAuditRecord({
+        ts: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(),
+        draft: 'older-fix', source_type: 'failure', target_skill: 'cdu-multi-skill',
+        action: 'applied-code-fix', risk_flags: [], reason: 'x', commit_hash: 'old1111',
+      });
+      await appendAuditRecord({
+        ts: new Date(Date.now() - 1 * 60 * 60 * 1000).toISOString(), // 1h ago — strictly newer
+        draft: 'newer-fix', source_type: 'failure', target_skill: 'cdu-multi-skill',
+        action: 'applied-code-fix', risk_flags: [], reason: 'y', commit_hash: 'new2222',
+      });
+
+      const flags = await checkForRollbacks();
+      const flag = flags.find((f) => f.skillName === 'cdu-multi-skill');
+      assert.equal(flag?.commitHash, 'new2222');
+    });
+
+    it('prefers "restore" (in-place prompt fix) over git-revert when both exist for the same skill', async () => {
+      await makeFailingSkill('reminders');
+      await createTempSkill(dir, 'reminders', 'Broken now.');
+      await createTempDraft(dir, 'reminders-fix', 'Fix.', draftMeta({
+        target_skill: 'reminders', applied_in_place: true, approved_autonomously: true,
+      }));
+      await appendAuditRecord({
+        ts: new Date().toISOString(), draft: 'reminders-code-fix', source_type: 'failure',
+        target_skill: 'reminders', action: 'applied-code-fix', risk_flags: [],
+        reason: 'x', commit_hash: 'abc1234',
+      });
+
+      const flags = await checkForRollbacks();
+      const flag = flags.find((f) => f.skillName === 'reminders');
+      assert.equal(flag?.kind, 'restore', 'the in-place prompt-fix restore takes precedence');
     });
 
     it('never flags self-improver itself for rollback, even with a high failure rate', async () => {

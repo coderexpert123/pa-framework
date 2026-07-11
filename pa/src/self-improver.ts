@@ -25,8 +25,11 @@
  *    `telegram_output` for this reason; only this explicit notifyUser() call sends anything.
  */
 import { analyzeConversationPatterns } from './analyzer.js';
-import { analyzeFailurePatterns, checkForRollbacks } from './failure-analyzer.js';
+import { analyzeFailurePatterns, checkForRollbacks, readRecentFailures } from './failure-analyzer.js';
+import { attemptCodeFix } from './code-fixer.js';
 import { analyzeFeedbackPatterns } from './feedback-analyzer.js';
+import { exec as execCb } from 'child_process';
+import { promisify } from 'util';
 import { saveDraft, markDraftMeta, approveDraft, loadDraft, listDrafts } from './drafts.js';
 import { skillsDir, draftsDir } from './paths.js';
 import { isProtected, isCriticalChange, hasRealSideEffects, isCmdBasedTarget, validateNewSkill, validateSkillFix, applyFix } from './validator.js';
@@ -123,15 +126,25 @@ export async function sweepStaleDrafts(staleDays: number = STALE_DRAFT_DAYS): Pr
 export interface ReportEntry {
   name: string;
   sourceType: 'conversation' | 'failure' | 'feedback';
-  outcome: 'applied-fix' | 'approved-new-skill' | 'validation-failed-pending' | 'auto-rejected-cmd-target' | 'skipped-cooldown' | 'skipped-duplicate-pending' | 'blocked-protected';
+  outcome: 'applied-fix' | 'approved-new-skill' | 'validation-failed-pending' | 'auto-rejected-cmd-target' | 'skipped-cooldown' | 'skipped-duplicate-pending' | 'blocked-protected'
+    | 'applied-code-fix' | 'code-fix-reverted' | `code-fix-skipped-${string}`;
   reason: string;        // the proposal's own stated reason — what pattern triggered it, in plain language
   targetSkill?: string;  // for fix/reinforce proposals: which existing skill this touches or would touch
   detail?: string;
   riskFlags?: string[];  // 'critical-skill' | 'declares-secrets' — informational only, never blocks
 }
 
-export async function rollback(): Promise<string[]> {
-  const flags = await checkForRollbacks();
+// Injectable for tests — the git-revert kind shells out to real git otherwise.
+export interface RollbackDeps {
+  checkForRollbacksFn?: typeof checkForRollbacks;
+  execFn?: (command: string, options?: { cwd?: string }) => Promise<{ stdout: string; stderr: string }>;
+}
+
+const defaultRollbackExec = promisify(execCb);
+
+export async function rollback(deps: RollbackDeps = {}): Promise<string[]> {
+  const { checkForRollbacksFn = checkForRollbacks, execFn = defaultRollbackExec } = deps;
+  const flags = await checkForRollbacksFn();
   const lines: string[] = [];
 
   for (const flag of flags) {
@@ -150,6 +163,38 @@ export async function rollback(): Promise<string[]> {
         await copyFile(backupPath, targetPath);
         await markDraftMeta(flag.draftName, { status: 'rejected_post_rollback' });
         lines.push(`- **Restored** \`${flag.skillName}\` to its pre-fix version (fix draft: \`${flag.draftName}\`) — elevated failure rate since the fix was applied.`);
+      } else if (flag.kind === 'git-revert') {
+        // A prior autonomous CODE fix (applied-code-fix commit) whose target skill is now
+        // failing at an elevated rate: revert the commit, push the revert (offsite
+        // recoverability parity with the original fix), and warn when the reverted fix
+        // touched code that needs a rebuild/restart to take effect — the fix's own audit
+        // record carries files_changed, so no extra git call is needed for that.
+        await execFn(`git revert --no-edit ${flag.commitHash}`);
+        const { stdout: revHash } = await execFn('git rev-parse HEAD');
+        await execFn('git push origin master');
+        await markDraftMeta(flag.draftName, { status: 'rejected_post_rollback' }).catch(() => {});
+
+        const originalFix = (await readAuditRecords()).find(
+          (r) => r.action === 'applied-code-fix' && r.commit_hash === flag.commitHash);
+        const touched = originalFix?.files_changed ?? [];
+        const needsRebuild = touched.some((f: string) =>
+          f.startsWith('pa/src') || f.startsWith('projects/telegram-bot/src'));
+
+        lines.push(`- **Reverted** code fix \`${flag.commitHash}\` targeting \`${flag.skillName}\` (revert commit \`${revHash.trim()}\`) — elevated failure rate since the fix was applied.${needsRebuild ? ' ⚠️ The reverted fix touched framework/bot source — a rebuild and bot restart may be required for the revert to take effect.' : ''}`);
+
+        await appendAuditRecord({
+          ts: new Date().toISOString(),
+          draft: flag.draftName,
+          source_type: meta?.source_type ?? 'failure',
+          target_skill: flag.skillName,
+          action: 'rolled-back',
+          risk_flags: meta?.risk_flags ?? [],
+          reason: 'Elevated failure rate since the code fix was applied — git-reverted.',
+          commit_hash: flag.commitHash,
+          revert_commit_hash: revHash.trim(),
+          baseline: toAuditBaseline(await skillRunStats(flag.skillName, ANALYSIS_DAYS)),
+        });
+        continue; // audit written above with the revert-specific fields — skip the shared one
       } else {
         await rm(join(skillsDir(), flag.skillName), { recursive: true, force: true });
         await markDraftMeta(flag.draftName, { status: 'rejected_post_rollback' });
@@ -168,6 +213,20 @@ export async function rollback(): Promise<string[]> {
       });
     } catch (err: any) {
       lines.push(`- Rollback FAILED for \`${flag.skillName}\` (${flag.kind}): ${err.message}`);
+      if (flag.kind === 'git-revert') {
+        // A failed git revert (e.g. conflict) leaves the bad fix LIVE — make that queryable,
+        // not just a report line. Best-effort: audit-append must never mask the original error.
+        await appendAuditRecord({
+          ts: new Date().toISOString(),
+          draft: flag.draftName,
+          source_type: 'failure',
+          target_skill: flag.skillName,
+          action: 'rollback-failed',
+          risk_flags: [],
+          reason: `git revert ${flag.commitHash} failed: ${err.message}`.slice(0, 500),
+          commit_hash: flag.commitHash,
+        }).catch(() => {});
+      }
     }
   }
 
@@ -232,6 +291,8 @@ export interface GateDeps {
   validateSkillFixFn?: typeof validateSkillFix;
   applyFixFn?: typeof applyFix;
   approveDraftFn?: typeof approveDraft;
+  attemptCodeFixFn?: typeof attemptCodeFix;
+  readRecentFailuresFn?: typeof readRecentFailures;
 }
 
 export async function gateAndApprove(
@@ -243,9 +304,14 @@ export async function gateAndApprove(
     validateSkillFixFn = validateSkillFix,
     applyFixFn = applyFix,
     approveDraftFn = approveDraft,
+    attemptCodeFixFn = attemptCodeFix,
+    readRecentFailuresFn = readRecentFailures,
   } = deps;
 
   const entries: ReportEntry[] = [];
+  // F5: one code-fix attempt per nightly run, globally — bounds blast radius and keeps
+  // rollback attribution + evals to a single variable per night.
+  let codeFixAttempted = false;
 
   for (const { proposal, sourceType } of tagged) {
     const base = { name: proposal.name, sourceType, reason: proposal.reason, targetSkill: proposal.target_skill };
@@ -282,15 +348,30 @@ export async function gateAndApprove(
         });
       }
     } else if (await isCmdBasedTarget(proposal.target_skill)) {
-      // Prompt fixes are no-ops for a cmd-based skill (run.ts executes the cmd; the prompt is
-      // documentation) — auto-reject immediately rather than leave it pending forever.
+      // A cmd-based skill's real behavior lives in its script, not its prompt — so instead of
+      // parking a no-op prompt fix (the pre-2026-07-11 'auto-rejected-cmd-target' behavior),
+      // route the failure evidence to the autonomous code-fixer. The prompt-fix DRAFT itself
+      // is never deployed either way: it's marked rejected_auto and serves as the trigger
+      // record; the actual fix (if any) lands as a git commit in the target project.
+      // attemptCodeFix appends its own audit records for every outcome (applied, reverted,
+      // every skip reason) — the rejected_auto record below covers only the draft's fate.
       await markDraftMeta(proposal.name, { status: 'rejected_auto' });
-      entries.push({ ...base, outcome: 'auto-rejected-cmd-target', riskFlags });
       await appendAuditRecord({
         ts: new Date().toISOString(), draft: proposal.name, source_type: sourceType,
         target_skill: proposal.target_skill, action: 'rejected_auto', risk_flags: riskFlags,
         reason: proposal.reason,
       });
+
+      if (codeFixAttempted) {
+        entries.push({ ...base, outcome: 'code-fix-skipped-limit-reached', riskFlags });
+        continue;
+      }
+      codeFixAttempted = true;
+
+      const evidence = (await readRecentFailuresFn(ANALYSIS_DAYS))
+        .filter((f) => f.skillName === proposal.target_skill);
+      const result = await attemptCodeFixFn(proposal, evidence);
+      entries.push({ ...base, outcome: result.outcome, riskFlags, detail: result.reason });
     } else {
       // Capture the OLD prompt BEFORE applyFixFn overwrites target_skill's skill.md, so the
       // audit diff shows what actually changed — after applyFixFn, loadSkill would return
@@ -334,11 +415,13 @@ function riskFlagSuffix(e: ReportEntry): string {
 }
 
 export function buildReport(rollbackLines: string[], entries: ReportEntry[], staleCount: number = 0): string {
-  const applied = entries.filter((e) => e.outcome === 'approved-new-skill' || e.outcome === 'applied-fix');
+  const applied = entries.filter((e) => e.outcome === 'approved-new-skill' || e.outcome === 'applied-fix' || e.outcome === 'applied-code-fix');
   const pending = entries.filter((e) => e.outcome === 'validation-failed-pending');
   const autoRejected = entries.filter((e) => e.outcome === 'auto-rejected-cmd-target');
   const skipped = entries.filter((e) => e.outcome === 'skipped-duplicate-pending' || e.outcome === 'skipped-cooldown');
   const blocked = entries.filter((e) => e.outcome === 'blocked-protected');
+  const codeFixReverted = entries.filter((e) => e.outcome === 'code-fix-reverted');
+  const codeFixSkipped = entries.filter((e) => e.outcome.startsWith('code-fix-skipped-'));
 
   const lines: string[] = [];
   lines.push(`Analyzed the last ${ANALYSIS_DAYS} days. ${entries.length} proposal(s) generated.`);
@@ -358,10 +441,32 @@ export function buildReport(rollbackLines: string[], entries: ReportEntry[], sta
   if (applied.length > 0) {
     lines.push(`*Autonomously applied (${applied.length})*`);
     for (const e of applied) {
-      const what = e.outcome === 'approved-new-skill' ? 'new skill' : `fix to \`${e.targetSkill}\``;
+      const what = e.outcome === 'approved-new-skill' ? 'new skill'
+        : e.outcome === 'applied-code-fix' ? `code fix to \`${e.targetSkill}\``
+        : `fix to \`${e.targetSkill}\``;
       lines.push(`- \`${e.name}\` (${e.sourceType}) — ${what}${riskFlagSuffix(e)}${e.detail ? `: ${e.detail}` : ''}`);
       lines.push(`  ↳ ${e.reason}`);
       lines.push('  ↳ audit: self-improver-audit.jsonl');
+    }
+    lines.push('');
+  }
+
+  if (codeFixReverted.length > 0) {
+    lines.push(`*Code fixes reverted (${codeFixReverted.length})* — attempted, failed verification, restored`);
+    for (const e of codeFixReverted) {
+      lines.push(`- \`${e.name}\` — targeted \`${e.targetSkill}\`${riskFlagSuffix(e)}${e.detail ? `: ${e.detail}` : ''}`);
+      lines.push(`  ↳ ${e.reason}`);
+      lines.push('  ↳ audit: self-improver-audit.jsonl');
+    }
+    lines.push('');
+  }
+
+  if (codeFixSkipped.length > 0) {
+    lines.push(`*Code fixes skipped (${codeFixSkipped.length})*`);
+    for (const e of codeFixSkipped) {
+      // outcome suffix like 'dirty-worktree' / 'limit-reached' → human words
+      const why = e.outcome.slice('code-fix-skipped-'.length).replace(/-/g, ' ');
+      lines.push(`- \`${e.name}\` — ${why}${e.detail ? `: ${e.detail}` : ''}`);
     }
     lines.push('');
   }

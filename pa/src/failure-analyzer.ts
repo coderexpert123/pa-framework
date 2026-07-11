@@ -4,6 +4,7 @@ import { logsDir, draftsDir } from './paths.js';
 import { readLogs } from './logger.js';
 import { listSkills } from './skills.js';
 import { listDrafts, isDuplicate, computeFingerprint, uniqueDraftName } from './drafts.js';
+import { readAuditRecords } from './lib/improvement-audit.js';
 import { runWithFailover } from './workers.js';
 import { parseProposalResponse } from './analyzer.js';
 import { notifyUser } from './lib/notify.js';
@@ -104,6 +105,8 @@ For each failing skill pattern above, propose ONE of:
 
 Only propose fixes for patterns with 2+ failures. Ignore transient errors (network timeouts on a single day, etc.). The "target_skill" field is REQUIRED on every proposal (either the exact existing skill name for option 1, or the literal JSON value null for option 2) — never omit it.
 
+If the failure evidence clearly points to a specific source file (e.g. a Python script path mentioned in a traceback or error message) that most likely causes the recurring failure, include it as "code_target": a repo-relative file path such as "projects/daily-mail-brief/scripts/run_brief.py". Omit "code_target" (or set it to null) whenever you are not confident of the exact file — it is optional and most proposals should leave it out.
+
 Respond with ONLY a JSON array (no markdown fences, no explanation):
 
 [
@@ -112,6 +115,7 @@ Respond with ONLY a JSON array (no markdown fences, no explanation):
     "reason": "Why this fix addresses the failure pattern (1-2 sentences)",
     "source_message_ids": [],
     "target_skill": "skill-name",
+    "code_target": null,
     "frontmatter": {
       "timeout": 600,
       "idle_timeout": 180
@@ -188,9 +192,10 @@ export async function analyzeFailurePatterns(
 }
 
 export interface RollbackFlag {
-  kind: 'restore' | 'delete';
-  skillName: string;   // for 'restore': the target skill to restore; for 'delete': the skill to delete
+  kind: 'restore' | 'delete' | 'git-revert';
+  skillName: string;   // for 'restore': the target skill to restore; for 'delete': the skill to delete; for 'git-revert': the skill whose code fix gets reverted
   draftName: string;   // the draft whose meta.json records the change (used to update its status)
+  commitHash?: string; // 'git-revert' only — the applied-code-fix commit to revert (from its audit record)
 }
 
 const ROLLBACK_FAILURE_RATE_THRESHOLD = 0.5; // >50% failures in the window
@@ -275,6 +280,21 @@ export async function checkForRollbacks(): Promise<RollbackFlag[]> {
       const mostRecent = matchingFixes.reduce((a, b) =>
         (a.meta.reviewed_at! > b.meta.reviewed_at!) ? a : b);
       flags.push({ kind: 'restore', skillName, draftName: mostRecent.skill.name });
+      continue;
+    }
+
+    // Second (2026-07-11, autonomous code-fix capability): did a recent applied-code-fix
+    // commit target this skill? Code fixes live in git, not in a draft's backup file, so the
+    // evidence is the audit trail — the most recent 'applied-code-fix' record for this skill
+    // inside the lookback window supplies the commit hash to `git revert`. Checked AFTER the
+    // in-place prompt-fix branch (restore is cheaper and more targeted when both exist).
+    const codeFixes = (await readAuditRecords()).filter(
+      (r) => r.action === 'applied-code-fix' && r.target_skill === skillName && r.commit_hash
+        && new Date(r.ts) >= new Date(Date.now() - ROLLBACK_LOOKBACK_DAYS * 24 * 60 * 60 * 1000),
+    );
+    if (codeFixes.length > 0) {
+      const mostRecent = codeFixes.reduce((a, b) => (a.ts > b.ts ? a : b));
+      flags.push({ kind: 'git-revert', skillName, draftName: mostRecent.draft, commitHash: mostRecent.commit_hash });
       continue;
     }
 
