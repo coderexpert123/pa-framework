@@ -254,6 +254,43 @@ function parsePytestSummary(text: string): AuditTestRunCounts | undefined {
   return { total: pass + fail + skip, pass, fail, skip };
 }
 
+// Parse the set of failing test node-ids from pytest's `FAILED path::test` lines
+// (present with -q / default reporting). Used to baseline pre-existing failures so
+// the gate blocks only NEW regressions, not reds a human already left in the project.
+function parsePytestFailedIds(text: string): Set<string> {
+  const ids = new Set<string>();
+  for (const m of text.matchAll(/^FAILED (\S+)/gm)) ids.add(m[1]);
+  for (const m of text.matchAll(/^ERROR (\S+)/gm)) ids.add(m[1]);
+  return ids;
+}
+
+/**
+ * Run a project's pytest suite from its OWN directory so BOTH test layouts are
+ * discovered (projects/<x>/tests/ AND projects/<x>/scripts/tests/ — the old gate
+ * only checked <x>/tests and silently skipped the many projects that use
+ * scripts/tests/, e.g. daily-mail-brief). Returns null when the project has no
+ * tests at all. Never throws — a nonzero pytest exit (failures) is a normal,
+ * expected result we parse, not an error.
+ */
+async function collectProjectTests(
+  projectDir: string,
+  repoRoot: string,
+  exec: ExecFn
+): Promise<{ failedIds: Set<string>; counts?: AuditTestRunCounts } | null> {
+  const { stdout: tracked } = await exec(`git ls-files ${projectDir}`, { cwd: repoRoot });
+  if (!/(^|\/)tests?\//m.test(tracked) && !/test_.*\.py/m.test(tracked)) return null;
+  const python = resolvePythonCommand();
+  let out = '';
+  try {
+    const { stdout, stderr } = await exec(`${python} -m pytest`, { cwd: join(repoRoot, projectDir) });
+    out = `${stdout}\n${stderr}`;
+  } catch (err: any) {
+    // pytest exits nonzero on failures — that's data, not a crash. Capture its output.
+    out = `${err?.stdout ?? ''}\n${err?.stderr ?? err?.message ?? ''}`;
+  }
+  return { failedIds: parsePytestFailedIds(out), counts: parsePytestSummary(out) };
+}
+
 function mergeCounts(...counts: Array<AuditTestRunCounts | undefined>): AuditTestRunCounts | undefined {
   const present = counts.filter((c): c is AuditTestRunCounts => !!c);
   if (present.length === 0) return undefined;
@@ -282,7 +319,9 @@ async function runVerificationGate(
   exec: ExecFn,
   botRestartFn: typeof botRestartCommand,
   checkBotProcessFn: () => Promise<CheckResult>,
-  sleep: (ms: number) => Promise<void>
+  sleep: (ms: number) => Promise<void>,
+  targetProjectDir?: string,
+  projectBaselineFailures?: Set<string>
 ): Promise<VerificationOutcome> {
   // pa: build + full suite, always — the substrate everything else (including this module)
   // depends on, cheap enough to run unconditionally as the primary safety net.
@@ -321,18 +360,26 @@ async function runVerificationGate(
     }
   }
 
-  const projectMatch = touchedPaths.find((p) => p.startsWith('projects/') && !p.startsWith('projects/telegram-bot/'));
+  // Touched project's pytest suite — tested from the project dir so both
+  // tests/ and scripts/tests/ layouts are found. Blocks only NEW failures
+  // (post minus the pre-fix baseline), so a project carrying pre-existing reds
+  // a human left in place doesn't permanently freeze autonomous fixes to it,
+  // while a genuine regression the fix introduced still reverts.
   let projectCounts: AuditTestRunCounts | undefined;
-  if (projectMatch) {
-    const projectDir = projectMatch.split('/').slice(0, 2).join('/');
-    const { stdout: lsFiles } = await exec(`git ls-files ${projectDir}/tests`, { cwd: repoRoot });
-    if (lsFiles.trim().length > 0) {
-      try {
-        const python = resolvePythonCommand();
-        const { stdout, stderr } = await exec(`${python} -m pytest tests`, { cwd: join(repoRoot, projectDir) });
-        projectCounts = parsePytestSummary(stdout) ?? parsePytestSummary(stderr);
-      } catch (err) {
-        return { ok: false, excerpt: `${projectDir} pytest suite failed: ${excerptOf(err)}` };
+  const rawProjectDir = targetProjectDir
+    ?? touchedPaths.find((p) => p.startsWith('projects/') && !p.startsWith('projects/telegram-bot/'))
+      ?.split('/').slice(0, 2).join('/');
+  // telegram-bot is a node project verified by the bot npm-test arm above, not pytest.
+  const projectDir = rawProjectDir && !rawProjectDir.startsWith('projects/telegram-bot')
+    ? rawProjectDir : undefined;
+  if (projectDir) {
+    const post = await collectProjectTests(projectDir, repoRoot, exec);
+    if (post) {
+      projectCounts = post.counts;
+      const baseline = projectBaselineFailures ?? new Set<string>();
+      const newFailures = [...post.failedIds].filter((id) => !baseline.has(id));
+      if (newFailures.length > 0) {
+        return { ok: false, excerpt: `${projectDir}: fix introduced ${newFailures.length} new test failure(s): ${newFailures.slice(0, 5).join(', ')}` };
       }
     }
   }
@@ -437,6 +484,16 @@ export async function attemptCodeFix(
   const preFixHead = preFixHeadRaw.trim();
 
   const projectRelDir = normalizePath(relative(repoRoot, target.frontmatter.cwd));
+
+  // F3 baseline: capture the target project's PRE-FIX failing tests, on a clean
+  // tree, before the worker touches anything — so the post-fix gate can tell a
+  // regression the fix introduced from reds a human already left in the project.
+  // (telegram-bot is a node project checked by the bot npm-test arm, not pytest.)
+  const preFixProject = projectRelDir.startsWith('projects/telegram-bot')
+    ? null
+    : await collectProjectTests(projectRelDir, repoRoot, exec).catch(() => null);
+  const projectBaselineFailures = preFixProject?.failedIds ?? new Set<string>();
+
   const brief = buildCodeFixBrief(proposal, evidence, projectRelDir);
 
   const { result: workerResult } = await runner(brief, {
@@ -488,7 +545,7 @@ export async function attemptCodeFix(
   }
 
   // F3: post-apply verification gate — build + full relevant suites (+ bot restart/health).
-  const verification = await runVerificationGate(touchedPaths, repoRoot, exec, botRestartFn, checkBotProcessFn, sleep);
+  const verification = await runVerificationGate(touchedPaths, repoRoot, exec, botRestartFn, checkBotProcessFn, sleep, projectRelDir, projectBaselineFailures);
   if (!verification.ok) {
     await hardRevert(exec, repoRoot, preFixHead);
     const reason = `Verification failed: ${verification.excerpt ?? 'unknown failure'} — reverted.`;

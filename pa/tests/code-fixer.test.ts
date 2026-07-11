@@ -376,6 +376,80 @@ describe('attemptCodeFix', () => {
     assert.match(record.reason, /pa test/i);
   });
 
+  it('F3: does NOT block on PRE-EXISTING project test reds unchanged by the fix — still applies', async () => {
+    // Regression guard for the 2026-07-11 gap: daily-mail-brief carries 2 pre-existing
+    // pdf-test failures, and the gate must not let those freeze every autonomous fix to
+    // the project. Baseline pytest and post-fix pytest report the SAME failing id → no
+    // NEW failure → apply.
+    await createTempSkill(dir, 'daily-mail-brief', '---\ncwd: "D:/fake-repo/projects/daily-mail-brief"\ncmd: "python scripts/run_brief.py"\n---\n\nBody.');
+    let postWorkerStatus = false;
+    const preExistingRed = 'FAILED scripts/tests/test_generate_analysis_pdf.py::test_variation_selector\n1 failed, 3 passed';
+    const exec = makeExec([
+      ...baseHandlers(),
+      {
+        match: 'git status --porcelain', stdout: () => {
+          if (!postWorkerStatus) { postWorkerStatus = true; return ''; }
+          return ' M projects/daily-mail-brief/scripts/run_brief.py\n';
+        },
+      },
+      { match: 'git rev-parse HEAD', stdout: 'abc1111\n' },
+      { match: 'git ls-files projects/daily-mail-brief', stdout: 'projects/daily-mail-brief/scripts/tests/test_run_brief.py\n' },
+      { match: `${resolvePythonForTest()} -m pytest`, stdout: preExistingRed }, // same both calls
+      { match: 'git diff --numstat', stdout: '5\t1\tprojects/daily-mail-brief/scripts/run_brief.py\n' },
+      { match: 'npm run build', stdout: '' },
+      { match: 'npm test', stdout: '# tests 1\n# pass 1\n# fail 0\n# skipped 0\n' },
+      { match: 'git add -A', stdout: '' },
+      { match: 'git commit -F', stdout: '[master abc9999] fix\n' },
+      { match: 'git push origin', stdout: '' },
+    ]);
+
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner });
+    assert.equal(result.outcome, 'applied-code-fix');
+  });
+
+  it('F3: reverts when the fix introduces a NEW project test failure (not in the baseline)', async () => {
+    await createTempSkill(dir, 'daily-mail-brief', '---\ncwd: "D:/fake-repo/projects/daily-mail-brief"\ncmd: "python scripts/run_brief.py"\n---\n\nBody.');
+    let postWorkerStatus = false;
+    let pytestCall = 0;
+    const calls: ExecCall[] = [];
+    const exec = makeExec([
+      ...baseHandlers(),
+      {
+        match: 'git status --porcelain', stdout: () => {
+          if (!postWorkerStatus) { postWorkerStatus = true; return ''; }
+          return ' M projects/daily-mail-brief/scripts/run_brief.py\n';
+        },
+      },
+      { match: 'git rev-parse HEAD', stdout: 'abc1111\n' },
+      { match: 'git ls-files projects/daily-mail-brief', stdout: 'projects/daily-mail-brief/scripts/tests/test_run_brief.py\n' },
+      {
+        match: `${resolvePythonForTest()} -m pytest`, stdout: () => {
+          pytestCall++;
+          // baseline (call 1): clean; post-fix (call 2): a NEW failure the fix introduced.
+          return pytestCall === 1
+            ? '4 passed'
+            : 'FAILED scripts/tests/test_run_brief.py::test_regressed_by_fix\n1 failed, 3 passed';
+        },
+      },
+      { match: 'git diff --numstat', stdout: '5\t1\tprojects/daily-mail-brief/scripts/run_brief.py\n' },
+      { match: 'npm run build', stdout: '' },
+      { match: 'npm test', stdout: '# tests 1\n# pass 1\n# fail 0\n# skipped 0\n' },
+      { match: 'git reset --hard', stdout: '' },
+      { match: 'git clean -fd', stdout: '' },
+    ], calls);
+
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner });
+    assert.equal(result.outcome, 'code-fix-reverted');
+    assert.ok(calls.some((c) => c.command.startsWith('git reset --hard')));
+    assert.equal(calls.some((c) => c.command.startsWith('git push')), false);
+
+    const raw = await readFile(join(dir, 'self-improver-audit.jsonl'), 'utf8');
+    const record = JSON.parse(raw.trim());
+    assert.equal(record.action, 'reverted-verification-failed');
+    assert.match(record.reason, /new test failure/i);
+    assert.match(record.reason, /test_regressed_by_fix/);
+  });
+
   it('applies (happy path): commits + pushes to origin (private repo), audits applied-code-fix with commit hash and files changed', async () => {
     await createTempSkill(dir, 'daily-mail-brief', '---\ncwd: "D:/fake-repo/projects/daily-mail-brief"\ncmd: "python scripts/run_brief.py"\n---\n\nBody.');
     let postWorkerStatus = false;
