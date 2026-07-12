@@ -20,7 +20,23 @@ TEXT_GREY = colors.HexColor('#666666')
 CONTENT_WIDTH = A4[0] - 40 * mm
 
 
+def strip_variation_selectors(text):
+    """Remove Unicode variation selectors (U+FE00–U+FE0F) — e.g. the U+FE0F that
+    turns the bare ☀ (U+2600) into emoji-presentation ☀️. The LLM emits section
+    headers with or without the selector inconsistently, but parse_section's
+    icon argument is hardcoded WITH it (main() passes "☀️"/"📌"); a bare-vs-VS
+    mismatch made re.escape(icon_char) fail to match and silently returned an
+    empty PDF section. Stripping selectors on both sides of the match closes
+    that gap. (clean_text already drops these at render time, so removing them
+    here is behavior-consistent for parsed item text.)"""
+    if not text:
+        return text
+    return "".join(c for c in text if not (0xFE00 <= ord(c) <= 0xFE0F))
+
+
 def parse_section(md_content, section_title, icon_char):
+    icon_char = strip_variation_selectors(icon_char)
+    md_content = strip_variation_selectors(md_content)
     escaped_title = re.escape(section_title)
     section_pattern = re.escape(icon_char) + r" \*" + escaped_title + r" \(\d+\)\*"
     match = re.search(section_pattern + r"(.*?)(?=\n[☀📌📊📩]|\Z)", md_content, re.DOTALL)
