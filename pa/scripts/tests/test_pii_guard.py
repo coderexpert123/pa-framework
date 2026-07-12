@@ -153,5 +153,47 @@ class TestScanText(unittest.TestCase):
         self.assertIn("f.txt:3", violations[1])
 
 
+class TestCollectDiffEncoding(unittest.TestCase):
+    """The per-push diff scan must read `git diff` output as UTF-8. Same AI-097
+    class as the gemini subprocess: without explicit encoding=, Windows
+    subprocess.run(text=True) decodes with cp1252 — em-dashes silently mojibake
+    and the variation selector in ⚠️ (byte 0x8f, undefined in cp1252) raises
+    UnicodeDecodeError, which collect_diff's blanket `except` swallows → ADDED
+    empties → the whole scan silently vets nothing and the push proceeds
+    unchecked (observed 2026-07-12)."""
+
+    def setUp(self):
+        guard.ADDED.clear()
+
+    def _run(self, diff_stdout):
+        stdin_line = "refs/heads/main " + "a" * 40 + " refs/heads/main " + "b" * 40 + "\n"
+        mock_result = MagicMock(stdout=diff_stdout, returncode=0)
+        with patch.object(guard.subprocess, "run", return_value=mock_result) as mock_run:
+            with patch.object(guard.sys, "stdin", [stdin_line]):
+                guard.collect_diff()
+        return mock_run
+
+    def test_git_diff_called_with_explicit_utf8_and_replace(self):
+        mock_run = self._run("+added line\n")
+        _, kwargs = mock_run.call_args
+        self.assertEqual(kwargs.get("encoding"), "utf-8")
+        self.assertEqual(kwargs.get("errors"), "replace")
+
+    def test_utf8_added_lines_captured_not_dropped(self):
+        # A real diff that would crash cp1252 (⚠️ has byte 0x8f) must still be
+        # parsed into ADDED so the regex/tripwire/gemini layers actually see it.
+        self._run("+warn ⚠️ here\n+em — dash\n-removed old\n")
+        self.assertIn("warn ⚠️ here", guard.ADDED)
+        self.assertIn("em — dash", guard.ADDED)
+        self.assertNotIn("removed old", " ".join(guard.ADDED))
+
+    def test_utf8_pii_in_added_lines_survives_to_scan(self):
+        # End-to-end: a tripwire-matching name buried next to an emoji must NOT
+        # be lost to a decode failure — it must reach ADDED where scan_text sees it.
+        self._run("+report by Secretname ⚠️\n")
+        joined = "\n".join(guard.ADDED)
+        self.assertEqual(guard.scan_text("f.md", joined, ["Secretname"]) != [], True)
+
+
 if __name__ == "__main__":
     unittest.main()

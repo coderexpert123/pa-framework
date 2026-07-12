@@ -85,15 +85,27 @@ def collect_diff():
         empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
         base = empty_tree if remote_sha == "0" * 40 else remote_sha
         try:
+            # encoding="utf-8", errors="replace" is load-bearing (same AI-097
+            # class as gemini_check below): without it, Windows decodes the diff
+            # with the system codepage (cp1252), which silently mojibakes
+            # em-dashes and HARD-CRASHES on the undefined byte 0x8f in a ⚠️
+            # variation selector (EF B8 8F). Caught by the except below, that
+            # crash empties ADDED → the whole per-push scan silently vets nothing
+            # and the push proceeds unchecked (observed 2026-07-12).
             result = subprocess.run(
                 ["git", "diff", "--unified=0", base, local_sha],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=30,
             )
             for dl in result.stdout.splitlines():
                 if dl.startswith("+") and not dl.startswith("+++"):
                     ADDED.append(dl[1:])
-        except Exception:
-            pass
+        except Exception as e:
+            # Fail-open (never wedge a push on a git hiccup) but LOUD — a silent
+            # empty-ADDED here means the guard vetted nothing, the exact
+            # silent-failure class this hook exists to prevent.
+            print(f"⚠  PII guard: could not diff {base[:12]}..{local_sha[:12]} "
+                  f"({e}); this ref's added lines were NOT scanned", file=sys.stderr)
 
 
 def load_tripwires() -> list[str]:
@@ -225,7 +237,8 @@ def collect_tree(git_dir: str) -> list[tuple[str, str]]:
     """All tracked (path, content) pairs of the repo at git_dir. Skips binaries."""
     result = subprocess.run(
         ["git", "--git-dir", git_dir, "--work-tree", ".", "ls-files"],
-        capture_output=True, text=True, timeout=60,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=60,
     )
     files: list[tuple[str, str]] = []
     for path in result.stdout.splitlines():
