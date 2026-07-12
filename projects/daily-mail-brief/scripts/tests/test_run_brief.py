@@ -142,10 +142,11 @@ class TestStateAdvancementLogic(RunBriefTestCase):
             state = json.load(f)
         self.assertEqual(state["last_window_end_utc"], "2026-05-17T13:30:00+00:00")
 
+    @patch("run_brief._notify_failure")
     @patch("run_brief.load_portfolio_context", return_value="")
     @patch("run_brief.run_py")
     @patch("run_brief.call_gemini")
-    def test_state_not_written_when_gemini_fails(self, mock_gemini, mock_run_py, _mock_portfolio_context):
+    def test_state_not_written_when_gemini_fails(self, mock_gemini, mock_run_py, _mock_portfolio_context, _mock_notify):
         """When Gemini fails both attempts, state must NOT be written."""
         fetch_data = self._make_fetch_data()
         mock_run_py.side_effect = self._patch_run_py(fetch_data)
@@ -159,10 +160,11 @@ class TestStateAdvancementLogic(RunBriefTestCase):
 
         self.assertFalse(os.path.exists(self.state_path()), "State must NOT be written when Gemini fails")
 
+    @patch("run_brief._notify_failure")
     @patch("run_brief.load_portfolio_context", return_value="")
     @patch("run_brief.run_py")
     @patch("run_brief.call_gemini")
-    def test_fetch_failed_written_on_gemini_failure(self, mock_gemini, mock_run_py, _mock_portfolio_context):
+    def test_fetch_failed_written_on_gemini_failure(self, mock_gemini, mock_run_py, _mock_portfolio_context, _mock_notify):
         """On Gemini failure, the PA_HOME failure marker must be written."""
         fetch_data = self._make_fetch_data()
         mock_run_py.side_effect = self._patch_run_py(fetch_data)
@@ -183,6 +185,39 @@ class TestStateAdvancementLogic(RunBriefTestCase):
         self.assertTrue(exists, "Failure marker must be written on Gemini failure")
         self.assertIsNotNone(content, "Failure marker must be valid JSON")
         self.assertEqual(content.get("status"), "gemini")
+
+    def test_dedup_key_for_status(self):
+        """Dedup keys stay lockstep with fetch_headers.py so an 'auth' failure
+        collapses across both callers instead of double-notifying."""
+        self.assertEqual(run_brief._dedup_key_for_status("auth"), "daily-mail-brief-auth")
+        self.assertEqual(run_brief._dedup_key_for_status("gemini"), "daily-mail-brief-gemini")
+
+    @patch("run_brief._notify_failure")
+    @patch("run_brief.load_portfolio_context", return_value="")
+    @patch("run_brief.run_py")
+    @patch("run_brief.call_gemini")
+    def test_gemini_failure_notifies_and_skips_briefings_send(
+        self, mock_gemini, mock_run_py, _mock_portfolio_context, mock_notify
+    ):
+        """A Gemini failure must alert via the deduped notify path with status
+        'gemini' and must NOT send_telegram.py into the user-facing briefings
+        topic — the unthrottled direct send flooded thread 29 with 26 identical
+        failure notices during one overnight auth blip (2026-07-12)."""
+        fetch_data = self._make_fetch_data()
+        mock_run_py.side_effect = self._patch_run_py(fetch_data)
+        mock_gemini.side_effect = RuntimeError("Gemini exited 42: auth cancelled")
+
+        with patch("run_brief.time.sleep"):
+            try:
+                run_brief.main()
+            except SystemExit:
+                pass
+
+        mock_notify.assert_called_once()
+        self.assertEqual(mock_notify.call_args.args[0], "gemini")
+        send_calls = [c for c in mock_run_py.call_args_list
+                      if c.args and "send_telegram" in str(c.args[0])]
+        self.assertEqual(send_calls, [], "Gemini-failure path must not send_telegram.py to the briefings topic")
 
     @patch("run_brief.load_portfolio_context", return_value="")
     @patch("run_brief.detect_portfolio_statement_emails", return_value=[])
@@ -218,6 +253,46 @@ class TestStateAdvancementLogic(RunBriefTestCase):
 
         self.assertEqual(call_count["n"], 2, "Gemini must be called exactly twice for brief retry")
         self.assertTrue(os.path.exists(self.state_path()), "State must exist after retry success")
+
+    @patch("run_brief.load_portfolio_context", return_value="")
+    @patch("run_brief.detect_portfolio_statement_emails", return_value=[])
+    @patch("run_brief.run_py")
+    @patch("run_brief.call_gemini")
+    def test_retry_uses_stricter_marker_prompt_after_unmarked_response(
+        self, mock_gemini, mock_run_py, _mock_detect, _mock_portfolio_context
+    ):
+        """Retry must explicitly require both marker pairs even when a section is empty."""
+        fetch_data = self._make_fetch_data()
+        mock_run_py.side_effect = self._patch_run_py(fetch_data)
+
+        prompts = []
+
+        def gemini_requires_retry_instruction(prompt):
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                return "Here is the summary without markers."
+            if "even if one or both sections are empty" in prompt:
+                return (
+                    "===BRIEFING_START===\n[pa assert] emails.json listed=2\n\nbrief\n===BRIEFING_END===\n"
+                    "===ANALYSIS_START===\nanalysis\n===ANALYSIS_END==="
+                )
+            return "Still no markers."
+
+        mock_gemini.side_effect = gemini_requires_retry_instruction
+
+        emails_path = os.path.join(self.project_root, "emails.json")
+        with open(emails_path, "w", encoding="utf-8") as f:
+            json.dump({"emails": [{}, {}], "listed_count": 2}, f)
+
+        with patch("run_brief.time.sleep"):
+            try:
+                run_brief.main()
+            except SystemExit:
+                pass
+
+        self.assertEqual(len(prompts), 2, "Gemini must be called twice after an unmarked response")
+        self.assertIn("even if one or both sections are empty", prompts[1])
+        self.assertTrue(os.path.exists(self.state_path()), "State must exist after marker-enforced retry success")
 
     @patch("run_brief.load_portfolio_context", return_value="")
     @patch("run_brief.run_py")
@@ -455,11 +530,14 @@ class TestDetectPortfolioStatementEmails(unittest.TestCase):
 
 
 class TestPreflightFailurePath(RunBriefTestCase):
-    """Preflight failure must write .fetch-failed.json before send_telegram so assertion is bypassed."""
+    """Preflight failure must write the failure marker and alert via the deduped
+    `pa notify` path (pa-alerts), never a direct send into the briefings topic."""
 
+    @patch("run_brief._notify_failure")
     @patch("run_brief.run_py")
-    def test_fetch_failed_written_on_preflight_failure(self, mock_run_py):
-        """When preflight fails and no marker exists, one is created before send_telegram."""
+    def test_fetch_failed_written_on_preflight_failure(self, mock_run_py, mock_notify):
+        """When preflight fails and no marker exists, one is created and the alert
+        goes through _notify_failure (status 'auth'), not send_telegram.py."""
         preflight_fail = MagicMock(returncode=1, stderr="token expired")
         send_result = MagicMock(returncode=0)
 
@@ -480,6 +558,12 @@ class TestPreflightFailurePath(RunBriefTestCase):
         with open(fetch_failed_path, encoding="utf-8") as f:
             content = json.load(f)
         self.assertEqual(content.get("status"), "auth")
+        # Alert must route through the deduped notify path, not send_telegram.py
+        mock_notify.assert_called_once()
+        self.assertEqual(mock_notify.call_args.args[0], "auth")
+        send_calls = [c for c in mock_run_py.call_args_list
+                      if c.args and "send_telegram" in str(c.args[0])]
+        self.assertEqual(send_calls, [], "Preflight failure must not send_telegram.py to the briefings topic")
 
 
 class TestLoadPortfolioContext(unittest.TestCase):

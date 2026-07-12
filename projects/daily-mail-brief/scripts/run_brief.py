@@ -22,6 +22,33 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 GEMINI_CMD = os.environ.get("GEMINI_CMD", "gemini")
 
 
+def _dedup_key_for_status(status: str) -> str:
+    """Dedup key for `pa notify`. Kept lockstep with fetch_headers.py's key
+    convention so an 'auth' failure detected here at preflight collapses with
+    fetch_headers' own 'auth' alert (one auth notice, not two)."""
+    return f"daily-mail-brief-{status}"
+
+
+def _notify_failure(status: str, body: str) -> None:
+    """Send a brief-failure alert via `pa notify` (deduped, routed to pa-alerts)
+    instead of send_telegram.py into the user-facing daily-briefings topic.
+
+    A failed brief is retried by catchup every ~15 min; the old direct-send path
+    posted an identical failure notice to the briefings topic on EVERY retry, so
+    one overnight Gemini-auth blip produced 26 copies (2026-07-12) that read to
+    the user as a flood of 'portfolio reports'. pa notify's shared 1-hour dedup
+    window collapses the storm and keeps failure noise in the ops channel.
+    Mirrors fetch_headers.py's _fetch_failed. Fail-soft — notify.send never
+    raises."""
+    sys.path.insert(0, SCRIPT_DIR)
+    from notify import send as notify_send
+    notify_send(
+        subject=f"daily-mail-brief: {status} failure",
+        body=body,
+        dedup_key=_dedup_key_for_status(status),
+    )
+
+
 def run_py(script, *args, check=True):
     """Run a sibling Python script, return CompletedProcess."""
     result = subprocess.run(
@@ -332,6 +359,20 @@ Rules:
 - The [pa assert] line must be the very first line inside ===BRIEFING_START==="""
 
 
+def build_marker_retry_prompt(prompt: str) -> str:
+    return (
+        f"{prompt}\n\n"
+        "IMPORTANT RETRY INSTRUCTION:\n"
+        "Your previous response was invalid because it omitted the required markers.\n"
+        "Retry now and output only the two marked sections.\n"
+        "You must include these marker pairs verbatim: ===BRIEFING_START=== ... ===BRIEFING_END=== "
+        "and ===ANALYSIS_START=== ... ===ANALYSIS_END===.\n"
+        "These markers are mandatory even if one or both sections are empty.\n"
+        "If a section has no content, leave it blank between its markers instead of omitting the markers.\n"
+        "Do not add any text before ===BRIEFING_START=== or after ===ANALYSIS_END===."
+    )
+
+
 def determine_slot(window_end_utc: datetime) -> tuple:
     """Return (date_str, slot_name) for Obsidian filename."""
     ist = timezone(timedelta(hours=5, minutes=30))
@@ -356,16 +397,13 @@ def main():
         fail = read_failure_marker() or {}
         status = fail.get("status", "auth")
         reason = fail.get("reason", r.stderr[:200] or "Unknown")
-        briefing = (
-            f"⚠️ **Daily mail brief skipped — {status} failure**\n\n"
-            f"Reason: {reason}\n\n"
-            f"Re-auth: run `python ~/.pa/reauth_google.py`"
-        )
-        briefing_path = os.path.join(PROJECT_ROOT, "briefing_output.md")
-        with open(briefing_path, "w", encoding="utf-8") as f:
-            f.write(briefing)
         write_failure_marker(status, reason)
-        run_py("send_telegram.py", briefing_path, check=False)
+        _notify_failure(
+            status,
+            f"Daily mail brief skipped — {status} failure.\n"
+            f"Reason: {reason[:400]}\n"
+            f"Re-auth: run `python ~/.pa/reauth_google.py`",
+        )
         return
 
     # Step 2: Fetch email headers; state is advanced only after a successful primary delivery.
@@ -405,23 +443,21 @@ def main():
     prompt = build_prompt(window, total_count, emails_text, portfolio_context)
 
     def fail_gemini(reason: str) -> None:
-        fail_msg = (
-            f"⚠️ **Mail brief failed — Gemini error**\n\n"
-            f"Window: {window}\nError: {reason[:300]}\n\n"
-            f"State not advanced — next catchup will retry."
-        )
-        briefing_path = os.path.join(PROJECT_ROOT, "briefing_output.md")
-        with open(briefing_path, "w", encoding="utf-8") as f:
-            f.write(fail_msg)
         write_failure_marker("gemini", reason)
-        run_py("send_telegram.py", briefing_path, check=False)
+        _notify_failure(
+            "gemini",
+            f"Mail brief failed — Gemini error.\n"
+            f"Window: {window}\nError: {reason[:300]}\n\n"
+            f"State not advanced — next catchup will retry.",
+        )
         sys.exit(1)
 
     print(f"[run_brief] Calling gemini for {total_count} emails in {window}...")
     response = None
+    current_prompt = prompt
     for attempt in range(2):
         try:
-            candidate = call_gemini(prompt)
+            candidate = call_gemini(current_prompt)
         except Exception as e:
             if attempt == 0:
                 print(f"[WARN] Gemini attempt 1 failed, retrying in 10s: {e}", file=sys.stderr)
@@ -439,6 +475,7 @@ def main():
         # the requested text). Retry once rather than silently fabricating an
         # assert header that would bypass send_telegram.py's hallucination check.
         if attempt == 0:
+            current_prompt = build_marker_retry_prompt(prompt)
             print("[WARN] Gemini attempt 1 returned no BRIEFING markers, retrying in 10s", file=sys.stderr)
             time.sleep(10)
         else:
