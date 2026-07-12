@@ -71,13 +71,44 @@ def _client_secret():
 
 
 def load_creds():
-    with open(CREDS_PATH) as f:
-        return json.load(f)
+    """Read oauth_creds.json, self-healing a torn 'valid-JSON-then-garbage' file.
+
+    The shim rewrites this file before AND after every gemini call, and the
+    gemini CLI writes it too — under concurrent skill runs those non-atomic
+    writes could tear, leaving a complete JSON object followed by trailing
+    bytes from a longer prior write (the 2026-07-12 outage: all gemini skills
+    exit-42'd because the CLI couldn't parse its own creds). json.JSONDecodeError
+    reports the byte offset where the valid object ended — recover from that head
+    rather than crash. Still raises on genuinely unparseable content.
+    """
+    with open(CREDS_PATH, encoding="utf-8") as f:
+        raw = f.read()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        # "Extra data" → a complete object parsed, then junk. Recover the head.
+        if e.pos and e.pos > 0:
+            try:
+                healed = json.loads(raw[:e.pos])
+            except json.JSONDecodeError:
+                raise e
+            print(f"[gemini-refresh] Healed a torn creds file "
+                  f"({len(raw) - e.pos} trailing byte(s) discarded)", file=sys.stderr)
+            return healed
+        raise
 
 
 def save_creds(creds):
-    with open(CREDS_PATH, "w") as f:
+    """Atomic write: a concurrent reader (another shim invocation or the gemini
+    CLI) sees either the whole old file or the whole new one, never a torn mix.
+    os.replace is atomic on both Windows and POSIX. The temp name is per-process
+    so parallel writers don't clobber each other's temp file."""
+    tmp = f"{CREDS_PATH}.tmp.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(creds, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, CREDS_PATH)
 
 
 def pre_run():

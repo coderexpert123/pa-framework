@@ -385,5 +385,53 @@ class TestDoRefresh(unittest.TestCase):
                          "creds file must not be written on refresh failure")
 
 
+class TestCorruptionResilience(unittest.TestCase):
+    """Root-cause fixes for the 2026-07-12 oauth_creds.json torn-write corruption:
+    atomic writes + self-healing load of a torn 'valid-JSON-then-garbage' file."""
+
+    def setUp(self):
+        self._orig = rgt.CREDS_PATH
+        self._tmpdir = tempfile.mkdtemp()
+        rgt.CREDS_PATH = os.path.join(self._tmpdir, "oauth_creds.json")
+        rgt.STASH_PATH = rgt.CREDS_PATH + ".refresh_token_stash"
+
+    def tearDown(self):
+        rgt.CREDS_PATH = self._orig
+        rgt.STASH_PATH = rgt.CREDS_PATH + ".refresh_token_stash"
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_save_creds_is_atomic_no_tmp_left_behind(self):
+        rgt.save_creds({"access_token": "AT", "refresh_token": "RT"})
+        # The whole-file replace leaves no stray temp file next to the target.
+        siblings = os.listdir(self._tmpdir)
+        self.assertEqual(siblings, ["oauth_creds.json"], f"unexpected leftovers: {siblings}")
+        self.assertEqual(rgt.load_creds()["refresh_token"], "RT")
+
+    def test_load_creds_self_heals_a_torn_valid_then_garbage_file(self):
+        # Exactly the 2026-07-12 corruption shape: a complete object, then junk.
+        good = json.dumps({"access_token": "AT", "refresh_token": "RT", "expiry_date": 123})
+        with open(rgt.CREDS_PATH, "w", encoding="utf-8") as f:
+            f.write(good + "ASU0ePuv-6sHEM35garbage")
+        creds = rgt.load_creds()
+        self.assertEqual(creds["refresh_token"], "RT")
+        self.assertEqual(creds["access_token"], "AT")
+
+    def test_load_creds_still_raises_on_unrecoverable_garbage(self):
+        with open(rgt.CREDS_PATH, "w", encoding="utf-8") as f:
+            f.write("not json at all {[")
+        with self.assertRaises(Exception):
+            rgt.load_creds()
+
+    def test_save_then_load_round_trip_after_heal(self):
+        # A heal-on-load followed by a save produces a clean, re-parseable file.
+        with open(rgt.CREDS_PATH, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"access_token": "AT", "refresh_token": "RT"}) + "trailing")
+        creds = rgt.load_creds()
+        rgt.save_creds(creds)
+        with open(rgt.CREDS_PATH, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["refresh_token"], "RT")  # clean, no trailing junk
+
+
 if __name__ == "__main__":
     unittest.main()
