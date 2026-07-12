@@ -310,6 +310,10 @@ export async function runCommand(
   }
 
   // 2. LLM worker execution
+  // Skill-declared worker_args (e.g. gemini --include-directories to widen its
+  // file-tool workspace past the shim-forced repo cwd) prepend the run-time
+  // extraArgs. cmd-based skills above don't use these — they're worker CLI flags.
+  const workerExtraArgs = [...(skill.frontmatter.worker_args ?? []), ...extraArgs];
   // Resolve preferred worker: CLI --worker flag > skill frontmatter > global failover
   const workerPref = preferredWorker || skill.frontmatter.worker;
   const willFailover = !skill.frontmatter.no_fallback;
@@ -323,7 +327,7 @@ export async function runCommand(
         env: secrets,
         timeout: skill.frontmatter.timeout,
         idleTimeout: skill.frontmatter.idle_timeout,
-        extraArgs,
+        extraArgs: workerExtraArgs,
         resource: `skill-${skillName}`,
         agentName: workerPref,
         suppressExitAlert: willFailover,
@@ -350,7 +354,7 @@ export async function runCommand(
     env: secrets,
     timeout: skill.frontmatter.timeout,
     idleTimeout: skill.frontmatter.idle_timeout,
-    extraArgs,
+    extraArgs: workerExtraArgs,
     resource: `skill-${skillName}`,
     noFallback: !!skill.frontmatter.no_fallback,
   };

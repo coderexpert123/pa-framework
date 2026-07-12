@@ -99,6 +99,7 @@ export interface SkillFrontmatter {
   topic?: string;                // optional custom topic name for partitioning (replaces queue/priority)
   telegram_output?: TelegramOutput; // if set, pa run delivers LLM output to this Telegram chat/thread
   critical?: boolean;            // if true, self-improver never autonomously approves changes targeting this skill
+  worker_args?: string[];        // extra CLI args appended to the worker command for THIS skill only (e.g. gemini --include-directories to widen its file-tool workspace beyond the shim-forced repo cwd). Merged ahead of run-time extraArgs.
 }
 
 export interface Skill {

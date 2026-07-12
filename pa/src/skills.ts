@@ -108,6 +108,9 @@ export async function loadSkill(name: string): Promise<Skill> {
       ? String(meta.no_fallback).toLowerCase() === 'true'
       : !!meta.no_fallback,
     critical: !!meta.critical,
+    worker_args: Array.isArray(meta.worker_args)
+      ? meta.worker_args.map((a: unknown) => String(a))
+      : undefined,
   };
 
   return { name, path: skillPath, frontmatter, prompt: body };

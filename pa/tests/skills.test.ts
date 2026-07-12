@@ -49,6 +49,19 @@ describe('loadSkill', () => {
     assert.equal(skill.frontmatter.critical, true);
   });
 
+  it('parses worker_args array from frontmatter (2026-07-12)', async () => {
+    await createTempSkill(tempDir, 'wa-skill',
+      '---\nworker: gemini\nworker_args:\n  - "--include-directories"\n  - "C:/Users/x/.pa,D:/notes"\n---\nP.');
+    const skill = await loadSkill('wa-skill');
+    assert.deepEqual(skill.frontmatter.worker_args, ['--include-directories', 'C:/Users/x/.pa,D:/notes']);
+  });
+
+  it('worker_args is undefined when absent', async () => {
+    await createTempSkill(tempDir, 'no-wa-skill', '---\nworker: gemini\n---\nP.');
+    const skill = await loadSkill('no-wa-skill');
+    assert.equal(skill.frontmatter.worker_args, undefined);
+  });
+
   it('defaults critical to false when absent', async () => {
     await createTempSkill(tempDir, 'non-critical-skill', '---\ncron: "0 8 * * *"\n---\nPrompt.');
     const skill = await loadSkill('non-critical-skill');
