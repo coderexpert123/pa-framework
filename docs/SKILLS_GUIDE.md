@@ -81,20 +81,19 @@ The worker (gemini) receives the body as its prompt. Its output is captured and 
 
 ```yaml
 ---
-cron: "30 11 20 * *"
-cwd: ${PA_HOME}/skills/credit-card-bills
+cron: "0 9 1 * *"
+cwd: ${PA_HOME}/skills/expense-report
 secrets:
   - TELEGRAM_BOT_TOKEN
 worker: gemini
 ---
 
-# Monthly credit card bill processing
+# Monthly expense report
 
-1. Run `python scripts/fetch_bills.py` to download PDFs from Gmail.
-2. Run `python scripts/unlock_pdfs.py` to remove password protection.
-3. Extract spending categories via `python scripts/extract.py`.
-4. Summarize the month's spending in Markdown.
-5. Send the summary to Telegram via `[pa notify --subject "Credit cards" --body-stdin]`.
+1. Run `python scripts/fetch_statements.py` to download statement PDFs.
+2. Extract spending categories via `python scripts/extract.py`.
+3. Summarize the month's spending in Markdown.
+4. Send the summary to Telegram via `[pa notify --subject "Expenses" --body-stdin]`.
 
 If any step fails, emit `[PA_META]: {"actions":[{"type":"retry_with_worker","reason":"..."}]}`.
 ```
