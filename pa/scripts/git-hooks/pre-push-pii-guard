@@ -30,6 +30,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 # Windows consoles may be cp1252 — the emoji status output must never crash the guard.
 for _stream in (sys.stdout, sys.stderr):
@@ -142,15 +143,64 @@ def resolve_gemini_argv() -> list[str] | None:
     return [candidate]
 
 
-def gemini_check(content: str, tripwires: list[str]) -> tuple[bool, str]:
+GEMINI_TIMEOUT = 120  # seconds per call (healthy shim answers in ~40s)
+
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """Kill proc and every descendant. On Windows the resolved Gemini argv is
+    `cmd /c shim.cmd` — killing only the direct child (cmd.exe) orphans the
+    node grandchild, which busy-spins at 100% CPU forever with its stdin pipe
+    broken (observed 2026-07-20: six orphans burning six cores, leaked one per
+    timed-out audit chunk)."""
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+            capture_output=True, timeout=30,
+        )
+    else:
+        import signal
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            proc.kill()
+
+
+def _run_gemini(argv: list[str], prompt: str, timeout: float) -> subprocess.CompletedProcess:
+    """subprocess.run() equivalent whose timeout kills the WHOLE process tree.
+    subprocess.run(timeout=...) kills only the direct child — see
+    _kill_process_tree. POSIX gets start_new_session=True so the process group
+    is ours to kill. Raises subprocess.TimeoutExpired like subprocess.run."""
+    kwargs: dict = dict(
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace",
+    )
+    if os.name != "nt":
+        kwargs["start_new_session"] = True
+    proc = subprocess.Popen(argv, **kwargs)
+    try:
+        stdout, stderr = proc.communicate(input=prompt, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc)
+        try:  # reap so the pipes close and no zombie lingers
+            proc.communicate(timeout=10)
+        except Exception:
+            pass
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
+
+
+def gemini_check(content: str, tripwires: list[str]) -> tuple[bool, str, bool]:
     """
-    Ask Gemini to scan content for PII. Returns (is_clean, reason).
-    Fail-open: returns (True, '') on any error.
+    Ask Gemini to scan content for PII. Returns (is_clean, reason, ok) where
+    ok=False means the layer itself failed (timeout/unparseable/missing binary)
+    and the verdict is a fail-open default, not a real CLEAN — callers that
+    loop (full_audit) use it to stop burning time on a dead Gemini.
+    Fail-open: returns (True, '', False) on any error.
     """
     argv = resolve_gemini_argv()
     if argv is None:
         print("⚠  PII guard: no Gemini binary (set GEMINI_CMD) — semantic layer OFF", file=sys.stderr)
-        return True, ""
+        return True, "", False
     tripwire_ctx = ""
     if tripwires:
         tripwire_ctx = "\nAlso specifically flag:\n" + "\n".join(f"- {t}" for t in tripwires)
@@ -193,28 +243,20 @@ Added lines to analyze (capped at 400 lines):
     last_error: Exception | None = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            result = subprocess.run(
-                argv + ["--yolo"],
-                input=prompt,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=120,
-            )
+            result = _run_gemini(argv + ["--yolo"], prompt, GEMINI_TIMEOUT)
             response = result.stdout.strip()
             # Find the verdict line (skip any preamble noise)
             for resp_line in response.splitlines():
                 resp_line = resp_line.strip()
                 if resp_line.startswith("VIOLATION"):
-                    return False, resp_line[len("VIOLATION:"):].strip()
+                    return False, resp_line[len("VIOLATION:"):].strip(), True
                 if resp_line == "CLEAN":
-                    return True, ""
+                    return True, "", True
             # Unparseable — treat like a transient failure and retry once.
             last_error = RuntimeError(f"unparseable response: {response[:200]!r}")
         except FileNotFoundError:
             print(f"⚠  PII guard: '{argv[0]}' not found — skipping LLM check", file=sys.stderr)
-            return True, ""
+            return True, "", False
         except subprocess.TimeoutExpired:
             last_error = TimeoutError("gemini call timed out")
         except Exception as exc:
@@ -224,8 +266,12 @@ Added lines to analyze (capped at 400 lines):
             print(f"⚠  PII guard: Gemini attempt {attempt}/{MAX_ATTEMPTS} failed ({last_error}) — retrying", file=sys.stderr)
 
     print(f"⚠  PII guard: Gemini failed after {MAX_ATTEMPTS} attempts ({last_error}) — skipping LLM check", file=sys.stderr)
-    return True, ""
+    return True, "", False
 
+
+# Consecutive infra-failed chunks (each = MAX_ATTEMPTS timeouts) before the
+# full audit gives up on the LLM layer for the rest of the run.
+LLM_FAILURE_BREAKER = 3
 
 # File extensions that are never worth scanning (binary / generated).
 SKIP_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".db", ".sqlite",
@@ -303,13 +349,39 @@ def full_audit(use_llm: bool) -> int:
     if use_llm:
         # Chunked semantic scan: ~300 lines per Gemini call. Cap sized to fit
         # comfortably inside the pii-audit skill timeout (~40s/call observed).
+        # BUT the worst case is 30 chunks x 2 attempts x 120s = 7200s — double
+        # the skill's 3600s timeout. When Gemini was degraded, every run hit
+        # that wall, was killed by the skill runner (exit 1, no success
+        # recorded), and catchup relaunched it hourly for 34 straight hours
+        # (2026-07-19/20) — each timed-out chunk also leaking a CPU-spinning
+        # orphan. Two guards make the run ALWAYS complete instead: a global
+        # LLM time budget, and a consecutive-failure breaker that stops
+        # hammering a dead Gemini. Both degrade coverage loudly, exit 0, and
+        # let the scheduler record success — partial coverage one week is
+        # recoverable; an infinite retry storm is not.
         all_lines = [f"{p}: {ln}" for p, c in files for ln in c.splitlines() if ln.strip()]
         CHUNK, MAX_CHUNKS = 300, 30
         chunks = [all_lines[i:i + CHUNK] for i in range(0, len(all_lines), CHUNK)][:MAX_CHUNKS]
         if len(all_lines) > CHUNK * MAX_CHUNKS:
             print(f"⚠  PII audit: LLM layer sampled {CHUNK * MAX_CHUNKS} of {len(all_lines)} lines", flush=True)
+        budget = float(os.environ.get("PA_PII_AUDIT_LLM_BUDGET", "2400"))
+        deadline = time.monotonic() + budget
+        consecutive_failures = 0
         for i, chunk in enumerate(chunks):
-            is_clean, reason = gemini_check("\n".join(chunk), tripwires)
+            if time.monotonic() >= deadline:
+                print(f"⚠  PII audit: LLM budget ({budget:.0f}s) exhausted — "
+                      f"stopped after {i}/{len(chunks)} chunks", flush=True)
+                break
+            is_clean, reason, ok = gemini_check("\n".join(chunk), tripwires)
+            if not ok:
+                consecutive_failures += 1
+                if consecutive_failures >= LLM_FAILURE_BREAKER:
+                    print(f"⚠  PII audit: Gemini failed {LLM_FAILURE_BREAKER} chunks in a row — "
+                          f"LLM layer OFF for the rest of this run "
+                          f"({i + 1}/{len(chunks)} chunks attempted)", flush=True)
+                    break
+                continue
+            consecutive_failures = 0
             if not is_clean:
                 violations.append(f"(gemini chunk {i + 1}/{len(chunks)}) {reason}")
 
@@ -361,8 +433,8 @@ def main() -> int:
         except re.error:
             pass  # skip malformed patterns silently
 
-    # Layer 3: Gemini semantic scan
-    is_clean, reason = gemini_check(content, tripwires)
+    # Layer 3: Gemini semantic scan (ok=False → fail-open, warned inside)
+    is_clean, reason, _ok = gemini_check(content, tripwires)
     if not is_clean:
         print("🚫 PII guard (Gemini): personal data detected — push aborted", file=sys.stderr)
         print(f"   Reason: {reason}", file=sys.stderr)

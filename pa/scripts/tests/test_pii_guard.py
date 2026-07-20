@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch, MagicMock
 
@@ -86,12 +87,15 @@ class TestGeminiCheckSturdiness(unittest.TestCase):
     goal — a one-shot timeout/connection blip silently disables the layer
     for the whole push."""
 
-    def test_subprocess_called_with_explicit_utf8_and_replace(self):
-        with patch.object(guard, "resolve_gemini_argv", return_value=["gemini"]):
-            mock_result = MagicMock(stdout="CLEAN", returncode=0)
-            with patch.object(guard.subprocess, "run", return_value=mock_result) as mock_run:
-                guard.gemini_check("some content", [])
-        _, kwargs = mock_run.call_args
+    def test_popen_called_with_explicit_utf8_and_replace(self):
+        """The encoding contract moved from subprocess.run to _run_gemini's
+        Popen when tree-kill landed — same AI-097 stakes, same assertion."""
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = ("CLEAN", "")
+        mock_proc.returncode = 0
+        with patch.object(guard.subprocess, "Popen", return_value=mock_proc) as mock_popen:
+            guard._run_gemini(["gemini", "--yolo"], "prompt", 120)
+        _, kwargs = mock_popen.call_args
         self.assertEqual(kwargs.get("encoding"), "utf-8")
         self.assertEqual(kwargs.get("errors"), "replace")
 
@@ -99,32 +103,157 @@ class TestGeminiCheckSturdiness(unittest.TestCase):
         with patch.object(guard, "resolve_gemini_argv", return_value=["gemini"]):
             mock_result = MagicMock(stdout="CLEAN", returncode=0)
             with patch.object(
-                guard.subprocess, "run",
+                guard, "_run_gemini",
                 side_effect=[subprocess.TimeoutExpired(cmd="gemini", timeout=120), mock_result],
             ) as mock_run:
-                is_clean, _ = guard.gemini_check("content", [])
+                is_clean, _, ok = guard.gemini_check("content", [])
         self.assertTrue(is_clean)
+        self.assertTrue(ok, "a successful retry is a REAL verdict, not fail-open")
         self.assertEqual(mock_run.call_count, 2)
 
     def test_fails_open_with_clear_warning_after_all_retries_exhausted(self):
         with patch.object(guard, "resolve_gemini_argv", return_value=["gemini"]):
             with patch.object(
-                guard.subprocess, "run",
+                guard, "_run_gemini",
                 side_effect=subprocess.TimeoutExpired(cmd="gemini", timeout=120),
             ) as mock_run:
-                is_clean, reason = guard.gemini_check("content", [])
+                is_clean, reason, ok = guard.gemini_check("content", [])
         self.assertTrue(is_clean, "must fail OPEN (never block a push on infra failure)")
         self.assertEqual(reason, "")
+        self.assertFalse(ok, "callers must be able to tell fail-open from a real CLEAN")
         self.assertGreaterEqual(mock_run.call_count, 2, "must have actually retried, not given up on the first failure")
 
     def test_does_not_retry_on_a_parsed_violation(self):
         """A real VIOLATION verdict is not a transient failure — must not retry."""
         with patch.object(guard, "resolve_gemini_argv", return_value=["gemini"]):
             mock_result = MagicMock(stdout="VIOLATION: real name found", returncode=0)
-            with patch.object(guard.subprocess, "run", return_value=mock_result) as mock_run:
-                is_clean, reason = guard.gemini_check("content", [])
+            with patch.object(guard, "_run_gemini", return_value=mock_result) as mock_run:
+                is_clean, reason, ok = guard.gemini_check("content", [])
         self.assertFalse(is_clean)
+        self.assertTrue(ok)
         self.assertEqual(mock_run.call_count, 1)
+
+
+class TestRunGeminiTreeKill(unittest.TestCase):
+    """2026-07-20 orphan leak: the resolved argv on Windows is `cmd /c shim.cmd`,
+    so subprocess.run(timeout=...) killed only cmd.exe and orphaned the node
+    grandchild, which busy-spun at 100% CPU forever (six orphans, six cores).
+    _run_gemini must kill the WHOLE tree on timeout."""
+
+    def test_timeout_kills_grandchild_too(self):
+        # Real-process test: wrapper (child) spawns a sleeper (grandchild) that
+        # writes its own PID to a file first thing. After _run_gemini times out,
+        # that PID must be gone.
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = os.path.join(tmp, "grandchild.pid")
+            sleeper = (
+                "import os,time;"
+                f"f=open({pid_file!r},'w');f.write(str(os.getpid()));f.close();"
+                "time.sleep(60)"
+            )
+            # Wrapper spawns the sleeper as a grandchild then blocks — the same
+            # child->grandchild shape as `cmd /c shim.cmd` -> node, without
+            # cmd.exe's argument-mangling of semicolons in the test script.
+            wrapper = (
+                "import subprocess,sys,time;"
+                f"subprocess.Popen([sys.executable,'-c',{sleeper!r}]);"
+                "time.sleep(60)"
+            )
+            argv = [sys.executable, "-c", wrapper]
+            start = time.monotonic()
+            with self.assertRaises(subprocess.TimeoutExpired):
+                guard._run_gemini(argv, "", timeout=8)
+            self.assertLess(time.monotonic() - start, 30, "tree kill must not hang")
+            self.assertTrue(os.path.exists(pid_file), "grandchild never started — test is vacuous")
+            grandchild_pid = int(open(pid_file).read())
+            time.sleep(1.0)  # let the kill settle
+            self.assertFalse(
+                _pid_alive(grandchild_pid),
+                f"grandchild {grandchild_pid} survived the timeout — orphan leak regressed",
+            )
+
+    def test_normal_completion_returns_stdout(self):
+        script = "import sys; sys.stdout.write('CLEAN'); sys.stdout.flush()"
+        argv = [sys.executable, "-c", script]
+        result = guard._run_gemini(argv, "ignored input", timeout=30)
+        self.assertEqual(result.stdout.strip(), "CLEAN")
+
+
+def _pid_alive(pid: int) -> bool:
+    if os.name == "nt":
+        out = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+            capture_output=True, text=True, timeout=15,
+        ).stdout
+        return str(pid) in out
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+class TestFullAuditLlmGuards(unittest.TestCase):
+    """The 34-hour retry storm (2026-07-19/20): worst-case LLM phase was
+    30 chunks x 2 attempts x 120s = 7200s, double the skill's 3600s timeout,
+    so a degraded Gemini made every run time out -> no success recorded ->
+    catchup relaunched hourly forever. full_audit must ALWAYS complete: a
+    consecutive-failure breaker and a global time budget both stop the LLM
+    phase early (loudly) instead of blowing the skill timeout."""
+
+    def _files(self, n_lines):
+        # one fake tracked file with n_lines non-blank lines -> ceil(n/300) chunks
+        return [("big.txt", "\n".join(f"line {i}" for i in range(n_lines)))]
+
+    def _run_full_audit(self, files, gemini_side_effect, env=None, monotonic=None):
+        patches = [
+            patch.object(guard, "collect_tree", return_value=files),
+            patch.object(guard, "load_tripwires", return_value=["Secretname"]),
+            patch.object(guard, "gemini_check", side_effect=gemini_side_effect),
+            patch.dict(os.environ, env or {}, clear=False),
+        ]
+        if monotonic is not None:
+            patches.append(patch.object(guard.time, "monotonic", side_effect=monotonic))
+        mocks = []
+        for p in patches:
+            mocks.append(p.start())
+        try:
+            rc = guard.full_audit(use_llm=True)
+        finally:
+            for p in patches:
+                p.stop()
+        return rc, mocks[2]  # (exit code, gemini_check mock)
+
+    def test_breaker_stops_after_consecutive_failures(self):
+        # 6 chunks available; gemini always infra-fails -> exactly 3 calls (breaker), rc 0
+        rc, gc = self._run_full_audit(
+            self._files(1800), gemini_side_effect=lambda *a: (True, "", False))
+        self.assertEqual(rc, 0, "a degraded LLM layer must NOT fail the scan — that is the retry storm")
+        self.assertEqual(gc.call_count, guard.LLM_FAILURE_BREAKER)
+
+    def test_success_resets_breaker(self):
+        # fail, fail, success, fail, fail, success -> all 6 chunks attempted
+        verdicts = [(True, "", False), (True, "", False), (True, "", True)] * 2
+        rc, gc = self._run_full_audit(self._files(1800), gemini_side_effect=verdicts)
+        self.assertEqual(rc, 0)
+        self.assertEqual(gc.call_count, 6)
+
+    def test_budget_exhaustion_stops_llm_phase(self):
+        # monotonic: deadline calc at t=0, chunk1 check t=0, chunk2 check t=2401
+        rc, gc = self._run_full_audit(
+            self._files(1800),
+            gemini_side_effect=lambda *a: (True, "", True),
+            env={"PA_PII_AUDIT_LLM_BUDGET": "2400"},
+            monotonic=[0.0, 0.0, 2401.0],
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(gc.call_count, 1, "chunk 2 must not start past the deadline")
+
+    def test_llm_violations_still_reported_when_all_calls_succeed(self):
+        verdicts = [(False, "real name found", True)] + [(True, "", True)] * 5
+        rc, gc = self._run_full_audit(self._files(1800), gemini_side_effect=verdicts)
+        self.assertEqual(rc, 0, "violations are OUTPUT, not an error (exit-code contract)")
+        self.assertEqual(gc.call_count, 6)
 
 
 class TestScanText(unittest.TestCase):
