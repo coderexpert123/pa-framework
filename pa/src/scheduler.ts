@@ -6,7 +6,7 @@ import { join } from 'path';
 import { writeFileSync } from 'fs';
 import { writeFile, unlink } from 'fs/promises';
 import { listSkills } from './skills.js';
-import { getLastSuccessfulRun } from './logger.js';
+import { getLastSuccessfulRun, getFailureState } from './logger.js';
 import { paHome } from './paths.js';
 import type { Skill, RunMeta } from './types.js';
 
@@ -85,6 +85,97 @@ export async function getOverdueSkills(): Promise<OverdueSkill[]> {
   }
 
   return overdue;
+}
+
+// ---------------------------------------------------------------------------
+// AI-098: consecutive-failure-aware retry backoff. getOverdueSkills() (above)
+// is unchanged — a failed run still never resets the overdue clock (AI-024).
+// This layer sits ON TOP of that result and decides, per overdue entry,
+// whether catchup should retry now, wait, or give up until the skill's own
+// cron fires again. Without it, a skill failing every attempt gets relaunched
+// on every catchup pass forever (real incident: pii-audit, 2026-07-19/20,
+// 24+ timeouts over 34 hours — see plans/2026-07-20-autonomous-pii-audit-retry-storm-fix.md).
+// ---------------------------------------------------------------------------
+
+/** Retry-pacing ladder for consecutive failures. Index = failures-1.
+ * failures=1 → immediate retry (transient blips recover fast), 2 → 30m,
+ * 3 → 2h, 4 → 8h, ≥PARK_AFTER_CONSECUTIVE_FAILURES → parked until the next
+ * natural cron occurrence. */
+export const FAILURE_BACKOFF_LADDER_MS = [0, 30 * 60_000, 2 * 3_600_000, 8 * 3_600_000];
+export const PARK_AFTER_CONSECUTIVE_FAILURES = 5;
+
+export type BackoffDecision = 'run' | 'defer' | 'park';
+
+export function failureBackoffDecision(args: {
+  consecutiveFailures: number;
+  lastAttemptAtMs: number | null;
+  missedAtMs: number;
+  nowMs: number;
+}): BackoffDecision {
+  const { consecutiveFailures, lastAttemptAtMs, missedAtMs, nowMs } = args;
+
+  if (consecutiveFailures === 0 || lastAttemptAtMs === null) return 'run';
+
+  // A NEW cron occurrence that fired after the last attempt always grants one
+  // fresh attempt — this also means skills whose cron is more frequent than
+  // their failure cadence (e.g. every-minute reminders) are never throttled
+  // below their natural schedule; backoff only suppresses retries WITHIN one
+  // missed occurrence, which is exactly the storm class.
+  if (missedAtMs > lastAttemptAtMs) return 'run';
+
+  if (consecutiveFailures >= PARK_AFTER_CONSECUTIVE_FAILURES) return 'park';
+
+  const delay = FAILURE_BACKOFF_LADDER_MS[Math.min(consecutiveFailures - 1, FAILURE_BACKOFF_LADDER_MS.length - 1)];
+  return nowMs >= lastAttemptAtMs + delay ? 'run' : 'defer';
+}
+
+export interface BackoffPartition {
+  runnable: OverdueSkill[];
+  deferred: Array<{ entry: OverdueSkill; retryAtMs: number; consecutiveFailures: number }>;
+  parked: Array<{ entry: OverdueSkill; consecutiveFailures: number; lastAttemptAt: string }>;
+}
+
+export async function partitionOverdueByFailureBackoff(
+  overdue: OverdueSkill[],
+  now: Date = new Date()
+): Promise<BackoffPartition> {
+  const nowMs = now.getTime();
+  const partition: BackoffPartition = { runnable: [], deferred: [], parked: [] };
+
+  // One getFailureState() call per unique skill name — on_missed: 'all' can
+  // hold multiple entries for the same skill.
+  const stateCache = new Map<string, Awaited<ReturnType<typeof getFailureState>>>();
+
+  for (const entry of overdue) {
+    let state = stateCache.get(entry.skill.name);
+    if (!state) {
+      state = await getFailureState(entry.skill.name);
+      stateCache.set(entry.skill.name, state);
+    }
+
+    const lastAttemptAtMs = state.lastAttemptAt !== null ? new Date(state.lastAttemptAt).getTime() : null;
+    const decision = failureBackoffDecision({
+      consecutiveFailures: state.consecutiveFailures,
+      lastAttemptAtMs,
+      missedAtMs: entry.missedAt.getTime(),
+      nowMs,
+    });
+
+    if (decision === 'run') {
+      partition.runnable.push(entry);
+    } else if (decision === 'defer') {
+      // lastAttemptAtMs is non-null whenever decision !== 'run' can be reached
+      // via the ladder branch (failureBackoffDecision returns 'run' early for
+      // consecutiveFailures === 0 || lastAttemptAtMs === null).
+      const delay = FAILURE_BACKOFF_LADDER_MS[Math.min(state.consecutiveFailures - 1, FAILURE_BACKOFF_LADDER_MS.length - 1)];
+      partition.deferred.push({ entry, retryAtMs: lastAttemptAtMs! + delay, consecutiveFailures: state.consecutiveFailures });
+    } else {
+      // parked entries only arise when consecutiveFailures > 0 (same reasoning).
+      partition.parked.push({ entry, consecutiveFailures: state.consecutiveFailures, lastAttemptAt: state.lastAttemptAt! });
+    }
+  }
+
+  return partition;
 }
 
 // Sentinel comments that anchor PA-managed cron lines on POSIX

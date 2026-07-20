@@ -1,7 +1,7 @@
 import { readdir, readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
 
-import { getOverdueSkills } from '../scheduler.js';
+import { getOverdueSkills, partitionOverdueByFailureBackoff } from '../scheduler.js';
 import { runCommand } from './run.js';
 import { blackboard } from '../blackboard.js';
 import { paHome, logsDir } from '../paths.js';
@@ -76,6 +76,40 @@ async function runCatchup(opts: CatchupOptions): Promise<void> {
   if (opts.topic) {
     overdue = overdue.filter(o => (o.skill.frontmatter.topic || 'default') === opts.topic);
   }
+
+  // AI-098: partition out skills mid-backoff or parked after repeated
+  // failures, BEFORE the "no overdue skills" check so an all-deferred/parked
+  // pass still reports cleanly instead of relaunching every failing skill.
+  const partition = await partitionOverdueByFailureBackoff(overdue);
+
+  for (const { entry, retryAtMs, consecutiveFailures } of partition.deferred) {
+    const retryAtISO = new Date(retryAtMs).toISOString();
+    console.log(`[catchup] ${entry.skill.name}: deferred by failure backoff (${consecutiveFailures} consecutive failures, retry after ${retryAtISO})`);
+    log('info', 'catchup', `${entry.skill.name}: deferred by failure backoff`, {
+      skill: entry.skill.name, consecutiveFailures, retryAt: retryAtISO,
+    });
+  }
+
+  const parkedSkillNames = new Set<string>();
+  for (const { entry, consecutiveFailures, lastAttemptAt } of partition.parked) {
+    if (parkedSkillNames.has(entry.skill.name)) continue;
+    parkedSkillNames.add(entry.skill.name);
+
+    const name = entry.skill.name;
+    console.warn(`[catchup] ${name}: parked after ${consecutiveFailures} consecutive failures (last attempt: ${lastAttemptAt})`);
+    log('warn', 'catchup', `${name}: parked after repeated failures`, {
+      skill: name, consecutiveFailures, lastAttemptAt,
+    });
+    await notifyUser(
+      `Skill parked after repeated failures: ${name}`,
+      `${name} has failed ${consecutiveFailures} consecutive runs (last attempt: ${lastAttemptAt}).\n` +
+      `Catchup retries are parked until its next scheduled cron occurrence.\n` +
+      `Run manually with: pa run ${name} (a successful run resets the backoff).`,
+      { dedupKey: `skill-parked-${name}`, severity: 'error', dedupWindowMs: 24 * 3_600_000 },
+    ).catch(() => {});
+  }
+
+  overdue = partition.runnable;
 
   if (overdue.length === 0) {
     console.log('No overdue skills matching the filter.');

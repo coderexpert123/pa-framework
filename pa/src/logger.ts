@@ -29,6 +29,9 @@ interface LatestPointer {
    * brand-new/always-failing skill, or one whose real last success predates
    * this pointer — see the fallback in getLastSuccessfulRun). */
   latestSuccess?: RunMeta;
+  /** Count of consecutive non-success runs ending at `latest`. 0 after a
+   * success. Absent on pre-migration pointers — see getFailureState fallback. */
+  consecutiveFailures?: number;
 }
 
 function latestPointerPath(skillName: string): string {
@@ -178,6 +181,7 @@ export async function writeLog(skillName: string, output: string, meta: RunMeta)
     const pointer: LatestPointer = {
       latest: meta,
       latestSuccess: meta.status === 'success' ? meta : existing?.latestSuccess,
+      consecutiveFailures: meta.status === 'success' ? 0 : (existing?.consecutiveFailures ?? 0) + 1,
     };
     await writeLatestPointer(skillName, pointer);
   } catch {
@@ -240,4 +244,41 @@ export async function getLastSuccessfulRun(skillName: string): Promise<RunMeta |
     if (meta.status === 'success') return meta;
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// AI-098: retry-pacing needs to know HOW MANY consecutive attempts have
+// failed and WHEN the most recent attempt happened — getLastSuccessfulRun
+// answers a different question (last success, ignoring failures entirely) and
+// getLastRun doesn't track a run length. FailureState is derived from the
+// same LatestPointer to stay O(1) in the common case.
+// ---------------------------------------------------------------------------
+
+export interface FailureState {
+  consecutiveFailures: number;
+  /** ISO timestamp of the most recent run attempt (any status), null if no runs. */
+  lastAttemptAt: string | null;
+}
+
+export async function getFailureState(skillName: string): Promise<FailureState> {
+  const pointer = await readLatestPointer(skillName);
+  if (pointer?.latest) {
+    const consecutiveFailures = pointer.consecutiveFailures !== undefined
+      ? pointer.consecutiveFailures
+      // Pre-migration pointer without the field — undercount is fine, it
+      // self-heals on the next writeLog (the field gets populated then).
+      : (pointer.latest.status !== 'success' ? 1 : 0);
+    return { consecutiveFailures, lastAttemptAt: pointer.latest.timestamp };
+  }
+
+  // No pointer — bounded scan, same shape as getLastSuccessfulRun's fallback.
+  const logs = await readLogs(skillName, 20);
+  if (logs.length === 0) return { consecutiveFailures: 0, lastAttemptAt: null };
+
+  let consecutiveFailures = 0;
+  for (const { meta } of logs) {
+    if (meta.status === 'success') break;
+    consecutiveFailures++;
+  }
+  return { consecutiveFailures, lastAttemptAt: logs[0].meta.timestamp };
 }
