@@ -34,7 +34,7 @@ class TestNotifySend(unittest.TestCase):
         """Windows .cmd: argv uses cmd.exe /c wrapper."""
         mock_run.return_value = MagicMock(returncode=0)
         with patch('sys.platform', 'win32'), \
-             patch('shutil.which', return_value='C:\\Users\testuser\\AppData\\Roaming\\npm\\pa.cmd'), \
+             patch('shutil.which', return_value='C:\\Users\\testuser\\AppData\\Roaming\\npm\\pa.cmd'), \
              patch.dict(os.environ, {'COMSPEC': 'C:\\Windows\\System32\\cmd.exe'}, clear=False):
             send("Subj", "Body", "key")
         args = mock_run.call_args[0][0]

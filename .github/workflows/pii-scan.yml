@@ -1,0 +1,83 @@
+# Server-side PII / secret backstop for the PUBLIC mirror.
+#
+# The local pre-push hook (pa/scripts/git-hooks/pre-push-pii-guard) is the
+# primary defense, but it is a LOCAL hook: uninstalled, broken, or bypassed
+# with PA_SKIP_PII_GUARD=1, coverage silently drops to zero and nothing on the
+# server notices. This workflow is the half that cannot be bypassed from a
+# developer machine. It scans the ENTIRE tracked tree at HEAD — file contents
+# AND file PATHS — plus every path that ever existed in history.
+#
+# It is intentionally SEPARATE from ci.yml: ci.yml's two build steps are
+# order-dependent (pa installs + builds before the bot, which imports pa/dist
+# and resolves deps from pa/node_modules) and must not be disturbed. This job
+# needs no Node and no build at all.
+#
+# Scope honesty: without the PII_TRIPWIRES secret this catches structural
+# CLASSES (credential shapes, private home paths, real-looking emails,
+# institution names) — not this maintainer's specific identifiers, and it has
+# no semantic/LLM layer. See the scanner's module docstring.
+name: PII scan
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pii-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: Secret + PII scan (contents and paths)
+    runs-on: ubuntu-latest
+    # Only the public mirror needs this. The same .github/ directory is tracked
+    # in a private deployment repo whose tree legitimately contains personal
+    # data; running there would mean a permanently red build. Tested on the
+    # repository's own visibility rather than its name, so nothing about the
+    # private repo (including its name) has to appear in a public file.
+    if: ${{ github.event.repository.private == false }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: --history-paths re-checks every path that ever
+          # existed. Renaming a badly-named file fixes HEAD but leaves the
+          # name in history forever — that is exactly how a filename naming
+          # the maintainer's bank survived until 2026-07-21.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Scan tracked contents and paths
+        env:
+          # Optional out-of-band personal patterns (one Python regex per line),
+          # mirroring ~/.pa/pii-tripwires.txt, which must NEVER be committed:
+          # publishing the list of things you are hiding is itself a
+          # disclosure. Unset (or a fork PR, which gets no secrets) => the
+          # scanner runs structural classes only and says so loudly.
+          # The scanner reports pattern CLASS NAMES and locations only, never
+          # the matched text or the patterns — CI logs on a public repo are
+          # public, so printing a hit would leak the very thing it caught.
+          PA_PII_TRIPWIRES: ${{ secrets.PII_TRIPWIRES }}
+          PYTHONIOENCODING: utf-8
+        run: python pa/scripts/pii_ci_scan.py --history-paths
+
+      - name: Remediation guidance
+        if: failure()
+        run: |
+          echo "A PII/secret pattern class matched. The report above gives the"
+          echo "file, line and pattern CLASS only — by design. Look the value"
+          echo "up LOCALLY; do not echo it into this log."
+          echo
+          echo "Reproduce locally:"
+          echo "  python pa/scripts/pii_ci_scan.py --git-dir .git-public --history-paths"
+          echo
+          echo "If the finding is in history rather than the current tree, the"
+          echo "fix is a history rewrite, not a follow-up commit."
+          exit 1

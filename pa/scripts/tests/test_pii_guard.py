@@ -1,5 +1,9 @@
 """Unit tests for pa/scripts/git-hooks/pre-push-pii-guard (AI-094, AI-097)."""
+import ast
+import contextlib
 import importlib.util
+import io
+import json
 import os
 import subprocess
 import sys
@@ -211,6 +215,13 @@ class TestFullAuditLlmGuards(unittest.TestCase):
             patch.object(guard, "load_tripwires", return_value=["Secretname"]),
             patch.object(guard, "gemini_check", side_effect=gemini_side_effect),
             patch.dict(os.environ, env or {}, clear=False),
+            # Path scanning added 2026-07-21: full_audit now enumerates every
+            # tracked path (binaries included) separately from readable
+            # contents. Stub it so these tests never touch a real repo.
+            patch.object(guard, "list_tracked_paths",
+                         return_value=[p for p, _ in files]),
+            # Commit-message scanning added 2026-07-21 — stub it too.
+            patch.object(guard, "list_commit_messages", return_value=[]),
         ]
         if monotonic is not None:
             patches.append(patch.object(guard.time, "monotonic", side_effect=monotonic))
@@ -322,6 +333,428 @@ class TestCollectDiffEncoding(unittest.TestCase):
         self._run("+report by Secretname ⚠️\n")
         joined = "\n".join(guard.ADDED)
         self.assertEqual(guard.scan_text("f.md", joined, ["Secretname"]) != [], True)
+
+
+class TestScanPath(unittest.TestCase):
+    """2026-07-21 leak 3: projects/daily-mail-brief/scripts/download_exbank_statement.py
+    shipped to the public mirror for months. The file's CONTENTS were entirely
+    generic — the user's bank was named by the PATH, and every layer of this
+    guard (and the manual audit scans) read contents only. A filename is data."""
+
+    def test_tripwire_in_filename_is_caught(self):
+        violations = guard.scan_path(
+            "projects/daily-mail-brief/scripts/download_exbank_statement.py", [r"\bEXBANK\b"])
+        self.assertEqual(len(violations), 1, "the leak-3 regression test")
+        self.assertIn("download_exbank_statement.py", violations[0])
+
+    def test_path_hit_is_marked_distinctly_from_a_content_hit(self):
+        path_hit = guard.scan_path("docs/secretname_notes.md", ["Secretname"])[0]
+        content_hit = guard.scan_text("docs/notes.md", "Secretname\n", ["Secretname"])[0]
+        self.assertIn("[PATH]", path_hit)
+        self.assertNotIn("[PATH]", content_hit,
+                         "content hits must stay distinguishable from path hits")
+
+    def test_binary_extension_paths_are_still_checked(self):
+        """collect_tree skips .pdf CONTENT — which is exactly why the NAME of a
+        pdf is the one thing that must never be skipped."""
+        self.assertEqual(len(guard.scan_path("exports/2026_exbank_statement.pdf", [r"\bEXBANK\b"])), 1)
+
+    def test_clean_path_no_violations(self):
+        self.assertEqual(guard.scan_path("pa/src/workers.ts", [r"\bEXBANK\b", "Secretname"]), [])
+
+    def test_malformed_tripwire_skipped(self):
+        self.assertEqual(guard.scan_path("a/b.py", ["([bad"]), [])
+
+    def test_case_insensitive(self):
+        self.assertEqual(len(guard.scan_path("scripts/EXBANK_dl.py", [r"\bexbank\b"])), 1)
+
+    def test_word_anchored_tripwire_matches_inside_snake_kebab_and_camel_paths(self):
+        """A filename is not prose: `_` is a \\w char, so `\\bEXBANK\\b` has NO
+        boundary in `download_exbank_statement.py`. Anchored tripwires are the
+        RIGHT style for content (they keep the pattern off ordinary English) —
+        so the path layer normalises separators instead of asking the human to
+        write a second, looser copy of every pattern."""
+        for path in ("a/download_exbank_statement.py",
+                     "a/download-exbank-statement.py",
+                     "a/downloadExbankStatement.py",
+                     "a/exbank.statement.py",
+                     "exbank/statement.py"):
+            with self.subTest(path=path):
+                self.assertEqual(len(guard.scan_path(path, [r"\bEXBANK\b"])), 1, path)
+
+    def test_normalisation_does_not_invent_matches(self):
+        # 'EXBANK' must not be conjured out of adjacent unrelated fragments.
+        self.assertEqual(guard.scan_path("src/hd/fc_helper.py", [r"\bEXBANK\b"]), [])
+        self.assertEqual(guard.scan_path("src/sexbankx.py", [r"\bEXBANK\b"]), [])
+
+    def test_one_violation_per_pattern_not_per_variant(self):
+        hits = guard.scan_path("a/exbank_thing.py", [r"\bEXBANK\b"])
+        self.assertEqual(len(hits), 1, "raw + normalised variants must not double-report")
+
+
+class TestCollectTouched(unittest.TestCase):
+    """The push diff shows ADDED LINES only. A rename into a PII-bearing path
+    adds zero lines, so the entire scan saw an empty string. _collect_touched
+    is what makes the push's file set visible at all."""
+
+    def setUp(self):
+        for lst in (guard.ADDED, guard.TOUCHED_PATHS, guard.TOUCHED_FILES,
+                    guard.UNREADABLE_PATHS, guard.MESSAGES):
+            lst.clear()
+
+    def _run(self, name_status_stdout, blobs=None):
+        mock_result = MagicMock(stdout=name_status_stdout, returncode=0)
+        with patch.object(guard.subprocess, "run", return_value=mock_result) as mock_run:
+            with patch.object(guard, "_read_blobs", return_value=blobs or []):
+                guard._collect_touched("base", "tip")
+        return mock_run
+
+    def test_rename_records_the_new_path_not_the_old(self):
+        self._run("R100\tscripts/generic_name.py\tscripts/download_exbank_statement.py\n")
+        self.assertIn("scripts/download_exbank_statement.py", guard.TOUCHED_PATHS)
+        self.assertNotIn("scripts/generic_name.py", guard.TOUCHED_PATHS)
+
+    def test_modified_and_added_paths_recorded(self):
+        self._run("M\ta.py\nA\tb/c.md\n")
+        self.assertEqual(guard.TOUCHED_PATHS, ["a.py", "b/c.md"])
+
+    def test_deletions_excluded_by_git_and_renames_detected(self):
+        mock_run = self._run("M\ta.py\n")
+        argv = mock_run.call_args[0][0]
+        self.assertIn("--find-renames", argv)
+        self.assertIn("--diff-filter=ACMRT", argv, "a deleted path is not shipped")
+        self.assertIn("--name-status", argv)
+
+    def test_name_status_call_uses_explicit_utf8(self):
+        mock_run = self._run("M\ta.py\n")
+        _, kwargs = mock_run.call_args
+        self.assertEqual(kwargs.get("encoding"), "utf-8")
+        self.assertEqual(kwargs.get("errors"), "replace")
+
+    def test_unreadable_blob_recorded_not_silently_dropped(self):
+        self._run("M\ta.bin\n", blobs=[("a.bin", None)])
+        self.assertIn("a.bin", guard.UNREADABLE_PATHS)
+        self.assertEqual(guard.TOUCHED_FILES, [])
+
+    def test_full_content_stored_for_readable_blob(self):
+        self._run("M\ta.py\n", blobs=[("a.py", "line1\nline2\n")])
+        self.assertEqual(guard.TOUCHED_FILES, [("a.py", "line1\nline2\n")])
+
+    def test_name_status_failure_warns_loudly(self):
+        buf = io.StringIO()
+        with patch.object(guard.subprocess, "run", side_effect=OSError("boom")):
+            with contextlib.redirect_stderr(buf):
+                guard._collect_touched("base", "tip")
+        self.assertIn("FAIL-OPEN", buf.getvalue())
+        self.assertEqual(guard.TOUCHED_PATHS, [])
+
+
+class TestPushScanCoverage(unittest.TestCase):
+    """End-to-end main() in pre-push mode. Every case here is a leak that
+    actually reached github.com/coderexpert123/pa-framework."""
+
+    def setUp(self):
+        for lst in (guard.ADDED, guard.TOUCHED_PATHS, guard.TOUCHED_FILES,
+                    guard.UNREADABLE_PATHS, guard.MESSAGES):
+            lst.clear()
+
+    def _main(self, added=(), touched_paths=(), touched_files=(), tripwires=(),
+              messages=(), gemini=(True, "", True)):
+        def fake_collect():
+            guard.ADDED.extend(added)
+            guard.TOUCHED_PATHS.extend(touched_paths)
+            guard.TOUCHED_FILES.extend(touched_files)
+            guard.MESSAGES.extend(messages)
+
+        env = {k: v for k, v in os.environ.items() if k != "PA_SKIP_PII_GUARD"}
+        buf = io.StringIO()
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(guard.sys, "argv", ["pre-push-pii-guard", "origin", "git@x:y.git"]), \
+             patch.object(guard, "collect_diff", side_effect=fake_collect), \
+             patch.object(guard, "load_tripwires", return_value=list(tripwires)), \
+             patch.object(guard, "gemini_check", return_value=gemini) as gc, \
+             contextlib.redirect_stderr(buf):
+            rc = guard.main()
+        return rc, buf.getvalue(), gc
+
+    def test_tripwire_in_a_shipped_filename_blocks_the_push(self):
+        """Leak 3 regression: contents generic, PATH names the bank, zero added lines."""
+        rc, err, _ = self._main(
+            touched_paths=["projects/daily-mail-brief/scripts/download_exbank_statement.py"],
+            tripwires=[r"\bEXBANK\b"])
+        self.assertEqual(rc, 1)
+        self.assertIn("[PATH]", err)
+
+    def test_rename_into_a_bad_path_blocks_even_with_no_added_lines(self):
+        rc, err, _ = self._main(added=[], touched_paths=["scripts/acmebank_statement_dl.py"],
+                                tripwires=[r"\bAcmeBank\b"])
+        self.assertEqual(rc, 1)
+        self.assertIn("acmebank_statement_dl.py", err)
+
+    def test_preexisting_unchanged_content_in_a_touched_file_blocks(self):
+        """Leak 2 regression: the provider names were committed long before this
+        push; the diff's '+' lines are clean, the file is not."""
+        rc, err, _ = self._main(
+            added=["# unrelated new comment"],
+            touched_paths=["scripts/run_brief.py"],
+            touched_files=[("scripts/run_brief.py",
+                            "import os\nPROVIDER = 'Secretname Wealth'\n")],
+            tripwires=["Secretname"])
+        self.assertEqual(rc, 1)
+        self.assertIn("scripts/run_brief.py:2", err,
+                      "must point at the pre-existing line, not just say 'somewhere'")
+
+    def test_added_line_scan_still_runs(self):
+        rc, err, _ = self._main(added=["contact Secretname today"],
+                                touched_paths=["a.py"], tripwires=["Secretname"])
+        self.assertEqual(rc, 1)
+        self.assertIn("(added lines)", err)
+
+    def test_commit_message_alone_blocks_the_push(self):
+        """Tree, diff and paths all clean; only the message names the provider."""
+        rc, err, _ = self._main(
+            added=["# generic"], touched_paths=["scripts/generic.py"],
+            touched_files=[("scripts/generic.py", "# generic\n")],
+            messages=[("f" * 40, "rename download_exbank_statement.py -> generic.py")],
+            tripwires=[r"\bEXBANK\b"])
+        self.assertEqual(rc, 1)
+        self.assertIn("[COMMIT MSG]", err)
+
+    def test_clean_push_passes_and_discloses_layer_scope(self):
+        rc, err, gc = self._main(added=["x = 1"], touched_paths=["a.py"],
+                                 touched_files=[("a.py", "x = 1\n")],
+                                 tripwires=["Secretname"])
+        self.assertEqual(rc, 0)
+        self.assertIn("ADDED LINES ONLY", err,
+                      "the LLM layer's true (narrower) scope must be stated, not implied")
+        self.assertEqual(gc.call_count, 1)
+
+    def test_gemini_infra_failure_warns_loudly_and_still_exits_zero(self):
+        rc, err, _ = self._main(added=["x = 1"], touched_paths=["a.py"],
+                                gemini=(True, "", False))
+        self.assertEqual(rc, 0, "fail-open is deliberate — an infra failure must not wedge a push")
+        self.assertIn("FAIL-OPEN", err)
+        self.assertIn("Gemini semantic scan", err)
+
+    def test_gemini_violation_still_blocks(self):
+        rc, err, _ = self._main(added=["x = 1"], touched_paths=["a.py"],
+                                gemini=(False, "real name found", True))
+        self.assertEqual(rc, 1)
+        self.assertIn("real name found", err)
+
+    def test_missing_tripwire_file_warns_loudly(self):
+        rc, err, _ = self._main(added=["x = 1"], touched_paths=["a.py"], tripwires=[])
+        self.assertEqual(rc, 0)
+        self.assertIn("FAIL-OPEN", err)
+        self.assertIn("pii-tripwires.txt", err)
+
+    def test_credential_pattern_in_touched_file_content_blocks(self):
+        rc, err, _ = self._main(
+            touched_paths=["bot.py"],
+            touched_files=[("bot.py", "TOKEN = '1234567890:" + "A" * 35 + "'\n")])
+        self.assertEqual(rc, 1)
+        self.assertIn("credential", err)
+
+    def test_empty_push_is_a_no_op(self):
+        rc, _, gc = self._main()
+        self.assertEqual(rc, 0)
+        self.assertEqual(gc.call_count, 0)
+
+
+class TestBypassRecord(unittest.TestCase):
+    """PA_SKIP_PII_GUARD stays a working escape hatch (it is how a verified-clean
+    history rewrite gets pushed), but it used to vanish without trace, so
+    'was anything ever pushed unscanned?' was unanswerable after the fact."""
+
+    def _bypass(self, pa_home, stdin_lines):
+        buf = io.StringIO()
+        with patch.dict(os.environ, {"PA_SKIP_PII_GUARD": "1"}), \
+             patch.object(guard, "PA_HOME", pa_home), \
+             patch.object(guard.sys, "argv", ["pre-push-pii-guard", "origin", "git@github.com:x/y.git"]), \
+             patch.object(guard.sys, "stdin", list(stdin_lines)), \
+             contextlib.redirect_stderr(buf):
+            rc = guard.main()
+        return rc, buf.getvalue()
+
+    def test_bypass_writes_a_durable_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stdin = ["refs/heads/main " + "a" * 40 + " refs/heads/main " + "b" * 40 + "\n"]
+            rc, err = self._bypass(tmp, stdin)
+            self.assertEqual(rc, 0, "the bypass must still bypass")
+            log = os.path.join(tmp, "pii-guard-bypass.jsonl")
+            self.assertTrue(os.path.exists(log), "no durable record written")
+            with open(log, encoding="utf-8") as f:
+                entry = json.loads(f.read().strip())
+        self.assertEqual(entry["event"], "pii-guard-bypass")
+        self.assertTrue(entry["ts"], "a record with no timestamp is not an audit trail")
+        self.assertEqual(entry["remote"], "origin")
+        self.assertEqual(len(entry["refs"]), 1)
+        self.assertIn("refs/heads/main", entry["refs"][0])
+
+    def test_bypass_prints_an_unmissable_warning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, err = self._bypass(tmp, [])
+        self.assertIn("BYPASSED", err)
+        self.assertIn("PA_SKIP_PII_GUARD", err)
+
+    def test_bypass_appends_rather_than_overwrites(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._bypass(tmp, [])
+            self._bypass(tmp, [])
+            with open(os.path.join(tmp, "pii-guard-bypass.jsonl"), encoding="utf-8") as f:
+                lines = [ln for ln in f.read().splitlines() if ln.strip()]
+        self.assertEqual(len(lines), 2)
+
+    def test_unwritable_log_does_not_break_the_bypass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(guard.os, "makedirs", side_effect=OSError("read-only")):
+                rc, err = self._bypass(tmp, [])
+        self.assertEqual(rc, 0, "bookkeeping failure must never wedge the push")
+
+
+class TestFullAuditPathScan(unittest.TestCase):
+    def _audit(self, paths, files, tripwires, messages=()):
+        buf = io.StringIO()
+        with patch.object(guard, "list_tracked_paths", return_value=list(paths)), \
+             patch.object(guard, "collect_tree", return_value=list(files)), \
+             patch.object(guard, "load_tripwires", return_value=list(tripwires)), \
+             patch.object(guard, "list_commit_messages", return_value=list(messages)), \
+             contextlib.redirect_stdout(buf):
+            rc = guard.full_audit(use_llm=False)
+        return rc, buf.getvalue()
+
+    def test_full_audit_scans_paths_including_unreadable_binaries(self):
+        rc, out = self._audit(
+            paths=["docs/notes.md", "exports/2026_exbank_statement.pdf"],
+            files=[("docs/notes.md", "clean\n")],
+            tripwires=[r"\bEXBANK\b"])
+        self.assertEqual(rc, 0, "violations are OUTPUT, not an error (exit-code contract)")
+        self.assertIn("[PATH]", out)
+        self.assertIn("2026_exbank_statement.pdf", out)
+        self.assertIn("in file NAMES", out)
+
+    def test_full_audit_scans_commit_messages(self):
+        rc, out = self._audit(
+            paths=["a.md"], files=[("a.md", "clean\n")], tripwires=[r"\bEXBANK\b"],
+            messages=[("a" * 40, "rename download_exbank_statement.py -> generic.py\n")])
+        self.assertIn("[COMMIT MSG]", out)
+        self.assertIn("in COMMIT MESSAGES", out)
+
+    def test_no_llm_flag_announces_the_skipped_layer(self):
+        rc, out = self._audit(paths=["a.md"], files=[("a.md", "clean\n")],
+                              tripwires=["Secretname"])
+        self.assertIn("FAIL-OPEN", out)
+        self.assertIn("--no-llm", out)
+
+
+class TestCommitMessageScan(unittest.TestCase):
+    """2026-07-21, found while hardening this guard: the commit that renamed
+    download_<bank>_statement.py away put that exact filename in its own SUBJECT
+    line, and that commit is public on origin/main. Diff clean, tree clean, path
+    clean — and `git log` publishes the term anyway. Nothing had ever scanned a
+    commit message."""
+
+    def setUp(self):
+        guard.MESSAGES.clear()
+
+    def test_message_tripwire_is_marked_as_a_commit_hit(self):
+        hits = guard.scan_messages(
+            [("deadbeefcafe0000", "rename download_exbank_statement.py -> generic.py")],
+            [r"\bEXBANK\b"])
+        self.assertEqual(len(hits), 1)
+        self.assertIn("[COMMIT MSG]", hits[0])
+        self.assertIn("deadbeefcafe", hits[0], "must name the commit to rewrite")
+
+    def test_clean_message_no_hits(self):
+        self.assertEqual(guard.scan_messages([("a" * 40, "fix a typo")], [r"\bEXBANK\b"]), [])
+
+    def test_credential_in_a_commit_message_is_caught(self):
+        hits = guard.scan_messages([("a" * 40, "oops token 1234567890:" + "A" * 35)], [])
+        self.assertEqual(len(hits), 1)
+        self.assertIn("credential", hits[0])
+
+    def test_new_branch_push_uses_the_bare_sha_range(self):
+        mock_result = MagicMock(stdout="", returncode=0)
+        with patch.object(guard.subprocess, "run", return_value=mock_result) as mock_run:
+            guard._collect_messages("0" * 40, "b" * 40)
+        self.assertIn("b" * 40, mock_run.call_args[0][0])
+        self.assertNotIn("0" * 40 + ".." + "b" * 40, mock_run.call_args[0][0])
+
+    def test_incremental_push_uses_a_two_dot_range(self):
+        mock_result = MagicMock(stdout="", returncode=0)
+        with patch.object(guard.subprocess, "run", return_value=mock_result) as mock_run:
+            guard._collect_messages("a" * 40, "b" * 40)
+        self.assertIn("a" * 40 + ".." + "b" * 40, mock_run.call_args[0][0])
+
+    def test_log_call_uses_explicit_utf8(self):
+        mock_result = MagicMock(stdout="", returncode=0)
+        with patch.object(guard.subprocess, "run", return_value=mock_result) as mock_run:
+            guard._collect_messages("a" * 40, "b" * 40)
+        _, kwargs = mock_run.call_args
+        self.assertEqual(kwargs.get("encoding"), "utf-8")
+        self.assertEqual(kwargs.get("errors"), "replace")
+
+    def test_multiline_messages_parse_into_separate_records(self):
+        stdout = (f"sha1{guard._FLD}subject one\n\nbody line\n{guard._REC}"
+                  f"sha2{guard._FLD}subject two\n{guard._REC}")
+        mock_result = MagicMock(stdout=stdout, returncode=0)
+        with patch.object(guard.subprocess, "run", return_value=mock_result):
+            guard._collect_messages("a" * 40, "b" * 40)
+        self.assertEqual([s for s, _ in guard.MESSAGES], ["sha1", "sha2"])
+        self.assertIn("body line", guard.MESSAGES[0][1])
+
+    def test_git_log_failure_warns_loudly(self):
+        buf = io.StringIO()
+        mock_result = MagicMock(stdout="", stderr="fatal: bad revision", returncode=128)
+        with patch.object(guard.subprocess, "run", return_value=mock_result):
+            with contextlib.redirect_stderr(buf):
+                guard._collect_messages("a" * 40, "b" * 40)
+        self.assertIn("FAIL-OPEN", buf.getvalue())
+        self.assertEqual(guard.MESSAGES, [])
+
+
+class TestSubprocessEncodingInvariant(unittest.TestCase):
+    """Do-not-regress (2026-07-08, re-broken and re-fixed 2026-07-12): ANY
+    subprocess call in the guard that decodes output (text=True) must pass
+    encoding='utf-8', errors='replace'. Without it Windows decodes with cp1252,
+    where byte 0x8f (in the ⚠️ variation selector) is undefined — the call
+    raises, a blanket `except` swallows it, and the scan silently vets nothing.
+    A source-level assertion is what makes this hold for call sites that do not
+    exist yet. Calls WITHOUT text=True (e.g. taskkill) return bytes and are
+    exempt — there is no decode to get wrong."""
+
+    def test_every_decoding_subprocess_call_pins_utf8(self):
+        with open(GUARD_PATH, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            if not (isinstance(fn, ast.Attribute) and fn.attr in ("run", "Popen")):
+                continue
+            if not (isinstance(fn.value, ast.Name) and fn.value.id == "subprocess"):
+                continue
+            kw = {k.arg: k.value for k in node.keywords if k.arg}
+            decodes = "text" in kw or "encoding" in kw or "universal_newlines" in kw
+            if not decodes:
+                continue  # bytes mode — nothing to decode wrongly
+            enc = kw.get("encoding")
+            errs = kw.get("errors")
+            ok = (isinstance(enc, ast.Constant) and enc.value == "utf-8"
+                  and isinstance(errs, ast.Constant) and errs.value == "replace")
+            if not ok:
+                offenders.append(f"line {node.lineno}: subprocess.{fn.attr}")
+        self.assertEqual(offenders, [], f"missing encoding='utf-8', errors='replace': {offenders}")
+
+    def test_kwargs_dict_call_sites_are_covered_by_the_popen_test(self):
+        """_run_gemini builds its kwargs in a dict, so the AST check above
+        cannot see them — the live assertion in
+        TestGeminiCheckSturdiness.test_popen_called_with_explicit_utf8_and_replace
+        is what covers it. This test exists so that pairing is not accidental."""
+        with open(GUARD_PATH, encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn('encoding="utf-8", errors="replace"', src)
 
 
 if __name__ == "__main__":

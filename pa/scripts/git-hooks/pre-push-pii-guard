@@ -2,35 +2,56 @@
 """
 pre-push PII guard for the public pa-framework mirror.
 
-Strategy (three layers, fastest-first):
+Strategy (layers, fastest-first). Every regex layer scans PATHS as well as
+contents — the 2026-07-21 leak shipped a bank's name in a FILENAME
+(download_exbank_statement.py) whose contents were entirely generic, and passed
+every content-only layer.
+
+  0. Path + commit-message tripwire regex — the file NAMES a push ships
+     (post-rename NEW path) and the messages it publishes. Both are content
+     GitHub serves and neither was ever scanned before 2026-07-21.
   1. Structural regex — catches unambiguous credentials immediately (no LLM).
   2. Personal tripwire regex — patterns from ~/.pa/pii-tripwires.txt (outside repo).
   3. Gemini semantic scan — catches personal data that doesn't match a regex.
 
-Fail-open on LLM errors: a Gemini timeout or missing binary produces a warning
-but does NOT block the push. Regex layers always run.
+SCOPE, per layer (this asymmetry is deliberate — say it out loud in the output
+so nobody re-learns it the hard way):
+  * Layers 0-2 (regex, free) scan the FULL resulting content of every file the
+    push touches, plus the added lines, plus every touched path, plus every
+    commit message. Scanning only the '+' lines of a diff — what this hook did
+    until 2026-07-21 — makes PII that was already committed permanently
+    invisible, which is how three separate leaks survived every push for months.
+  * Layer 3 (Gemini, metered) stays ADDED-LINES ONLY, for budget. It is not a
+    full-content scan and must never be described as one. The weekly `--full`
+    audit is what gives the semantic layer whole-tree coverage.
 
-Set PA_SKIP_PII_GUARD=1 to bypass entirely (logged loudly).
+Fail-open on LLM errors: a Gemini timeout or missing binary produces a LOUD
+banner but does NOT block the push. Regex layers always run.
+
+Set PA_SKIP_PII_GUARD=1 to bypass entirely — printed as a banner AND appended
+to ~/.pa/pii-guard-bypass.jsonl, so a bypass is never invisible after the fact.
 
 Modes:
-  (default)      pre-push hook — scans ADDED lines of the outgoing push only.
-  --full         audit mode — scans EVERY tracked file of the repo the
+  (default)      pre-push hook — scans the outgoing push (see SCOPE above).
+  --full         audit mode — scans EVERY tracked path + file of the repo the
                  GIT_DIR env var points at (default: .git-public relative to
-                 cwd). Reports all violations, exits 1 if any. Use for the
-                 scheduled pii-audit skill / manual full-tree sweeps; the
-                 per-push diff scan never re-checks pre-existing lines.
+                 cwd). Reports all violations. Use for the scheduled pii-audit
+                 skill / manual full-tree sweeps.
   --no-llm       with --full: skip the Gemini layer (regex + tripwires only).
 
 Install:
   cp pa/scripts/git-hooks/pre-push-pii-guard .git-public/hooks/pre-push
   chmod +x .git-public/hooks/pre-push
 """
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 
 # Windows consoles may be cp1252 — the emoji status output must never crash the guard.
 for _stream in (sys.stdout, sys.stderr):
@@ -70,12 +91,101 @@ CREDENTIAL_PATTERNS = [
     r"CHAT_ID\s*=\s*[\"']-?[0-9]{7,}",      # Hardcoded chat ID assignment
 ]
 
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
 # Added lines from this push (content only, no leading +).
 ADDED: list[str] = []
+# Every path the push ships (post-rename NEW path; deletions excluded).
+TOUCHED_PATHS: list[str] = []
+# (path, FULL content at the pushed tip) for every touched text file we could
+# read. Not the diff — the whole file, so pre-existing PII in a touched file
+# is caught instead of being permanently invisible.
+TOUCHED_FILES: list[tuple[str, str]] = []
+# Touched paths whose content could not be read (binary/oversized/error).
+UNREADABLE_PATHS: list[str] = []
+# (sha, message) for every commit the push introduces.
+MESSAGES: list[tuple[str, str]] = []
+
+# A brand-new branch push has no remote base, so the whole history is "new".
+MAX_SCANNED_COMMITS = 1000
+# git log record/field separators — ASCII RS/US, which cannot occur in a message.
+_REC, _FLD = "\x1e", "\x1f"
+
+# Content-scan budget for a single push. Path scanning is unbounded (it is a
+# regex over a string). 500 `git show` calls across 8 threads is ~2-4s.
+MAX_TOUCHED_FILES = 500
+BLOB_READ_WORKERS = 8
+
+
+def warn_layer_skipped(layer: str, why: str, stream=None) -> None:
+    """Unmissable fail-open banner. Silence is the failure mode this whole
+    module exists to prevent: a layer that quietly does not run looks exactly
+    like a layer that ran and found nothing."""
+    out = stream if stream is not None else sys.stderr
+    bar = "!" * 74
+    for line in (
+        bar,
+        f"!! PII GUARD FAIL-OPEN — layer did NOT run: {layer}",
+        f"!! Why: {why}",
+        "!! This content was NOT checked by that layer. Proceeding by design",
+        "!! (an infra failure must never wedge a push), but do not read the",
+        "!! absence of findings as a clean verdict. Re-check manually with:",
+        "!!   python pa/scripts/git-hooks/pre-push-pii-guard --full",
+        bar,
+    ):
+        print(line, file=out, flush=True)
+
+
+def _read_push_refs() -> list[str]:
+    """Consume the pre-push stdin protocol into human-readable ref lines."""
+    refs: list[str] = []
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) >= 4:
+                refs.append(f"{parts[0]} {parts[1][:12]} -> {parts[2]} {parts[3][:12]}")
+            else:
+                refs.append(line)
+    except Exception:
+        pass
+    return refs
+
+
+def record_bypass(refs: list[str]) -> str | None:
+    """Append a durable record of a PA_SKIP_PII_GUARD bypass to ~/.pa/.
+
+    Deliberately OUTSIDE the repo: the record must not itself become something
+    that has to be reviewed before a public push. Returns the log path on
+    success, None on failure (never raises — a bookkeeping failure must not
+    block the push the user already chose to force through)."""
+    path = os.path.join(PA_HOME, "pii-guard-bypass.jsonl")
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "event": "pii-guard-bypass",
+        "env_var": "PA_SKIP_PII_GUARD",
+        "refs": refs,
+        "cwd": os.getcwd(),
+        "git_dir": os.environ.get("GIT_DIR", ""),
+        # git passes the remote name + URL as argv to a pre-push hook.
+        "remote": sys.argv[1] if len(sys.argv) > 1 else "",
+        "remote_url": sys.argv[2] if len(sys.argv) > 2 else "",
+    }
+    try:
+        os.makedirs(PA_HOME, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+        return path
+    except Exception as exc:
+        print(f"⚠  PII guard: could not record bypass to {path} ({exc})", file=sys.stderr)
+        return None
 
 
 def collect_diff():
-    """Read push info from stdin, populate ADDED with new content lines."""
+    """Read push info from stdin; populate ADDED (new content lines),
+    TOUCHED_PATHS (names the push ships) and TOUCHED_FILES (full content)."""
     for line in sys.stdin:
         parts = line.strip().split()
         if len(parts) < 4:
@@ -83,30 +193,183 @@ def collect_diff():
         local_sha, remote_sha = parts[1], parts[3]
         if local_sha == "0" * 40:
             continue  # branch deletion
-        empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
-        base = empty_tree if remote_sha == "0" * 40 else remote_sha
-        try:
-            # encoding="utf-8", errors="replace" is load-bearing (same AI-097
-            # class as gemini_check below): without it, Windows decodes the diff
-            # with the system codepage (cp1252), which silently mojibakes
-            # em-dashes and HARD-CRASHES on the undefined byte 0x8f in a ⚠️
-            # variation selector (EF B8 8F). Caught by the except below, that
-            # crash empties ADDED → the whole per-push scan silently vets nothing
-            # and the push proceeds unchecked (observed 2026-07-12).
-            result = subprocess.run(
-                ["git", "diff", "--unified=0", base, local_sha],
-                capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=30,
-            )
-            for dl in result.stdout.splitlines():
-                if dl.startswith("+") and not dl.startswith("+++"):
-                    ADDED.append(dl[1:])
-        except Exception as e:
-            # Fail-open (never wedge a push on a git hiccup) but LOUD — a silent
-            # empty-ADDED here means the guard vetted nothing, the exact
-            # silent-failure class this hook exists to prevent.
-            print(f"⚠  PII guard: could not diff {base[:12]}..{local_sha[:12]} "
-                  f"({e}); this ref's added lines were NOT scanned", file=sys.stderr)
+        base = EMPTY_TREE if remote_sha == "0" * 40 else remote_sha
+        _collect_added(base, local_sha)
+        _collect_touched(base, local_sha)
+        _collect_messages(remote_sha, local_sha)
+
+
+def _collect_added(base: str, local_sha: str) -> None:
+    try:
+        # encoding="utf-8", errors="replace" is load-bearing (same AI-097
+        # class as gemini_check below): without it, Windows decodes the diff
+        # with the system codepage (cp1252), which silently mojibakes
+        # em-dashes and HARD-CRASHES on the undefined byte 0x8f in a ⚠️
+        # variation selector (EF B8 8F). Caught by the except below, that
+        # crash empties ADDED → the whole per-push scan silently vets nothing
+        # and the push proceeds unchecked (observed 2026-07-12).
+        result = subprocess.run(
+            ["git", "diff", "--unified=0", base, local_sha],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=30,
+        )
+        for dl in result.stdout.splitlines():
+            if dl.startswith("+") and not dl.startswith("+++"):
+                ADDED.append(dl[1:])
+    except Exception as e:
+        # Fail-open (never wedge a push on a git hiccup) but LOUD — a silent
+        # empty-ADDED here means the guard vetted nothing, the exact
+        # silent-failure class this hook exists to prevent.
+        print(f"⚠  PII guard: could not diff {base[:12]}..{local_sha[:12]} "
+              f"({e}); this ref's added lines were NOT scanned", file=sys.stderr)
+
+
+def _collect_touched(base: str, local_sha: str) -> None:
+    """Name-status the push and read the FULL content of what it ships.
+
+    Two gaps closed here, both of which shipped real PII in 2026-07:
+      * the diff only shows ADDED lines, so PII already committed in a file the
+        push touches is never re-examined;
+      * nothing ever looked at the file NAMES — a rename INTO a bad path adds
+        zero lines and therefore produced an entirely empty diff scan.
+    --find-renames + parts[-1] means the NEW path is what gets checked;
+    --diff-filter excludes D, because a deleted path is not shipped.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-c", "core.quotepath=false", "diff", "--name-status",
+             "--find-renames", "--diff-filter=ACMRT", base, local_sha],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=30,
+        )
+    except Exception as e:
+        warn_layer_skipped(
+            "path + full-content regex scan",
+            f"could not name-status {base[:12]}..{local_sha[:12]} ({e}) — "
+            f"only this ref's ADDED lines were scanned",
+        )
+        return
+
+    paths: list[str] = []
+    for dl in result.stdout.splitlines():
+        fields = [f for f in dl.split("\t") if f.strip()]
+        if len(fields) < 2:
+            continue
+        path = fields[-1].strip()  # rename/copy → NEW path
+        if path and path not in TOUCHED_PATHS:
+            TOUCHED_PATHS.append(path)
+            paths.append(path)
+
+    readable = [p for p in paths if not p.lower().endswith(SKIP_EXTENSIONS)]
+    if len(readable) > MAX_TOUCHED_FILES:
+        print(f"⚠  PII guard: {len(readable)} touched files exceeds the "
+              f"{MAX_TOUCHED_FILES}-file full-content budget — the remainder "
+              f"were PATH-scanned and added-line-scanned only", file=sys.stderr)
+        skipped = readable[MAX_TOUCHED_FILES:]
+        UNREADABLE_PATHS.extend(skipped)
+        readable = readable[:MAX_TOUCHED_FILES]
+
+    for path, content in _read_blobs(local_sha, readable):
+        if content is None:
+            UNREADABLE_PATHS.append(path)
+        else:
+            TOUCHED_FILES.append((path, content))
+
+
+def _parse_log_records(stdout: str) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    for record in stdout.split(_REC):
+        if _FLD not in record:
+            continue
+        sha, _, body = record.partition(_FLD)
+        sha = sha.strip()
+        if sha:
+            out.append((sha, body))
+    return out
+
+
+def _collect_messages(remote_sha: str, local_sha: str) -> None:
+    """Scan the COMMIT MESSAGES the push introduces.
+
+    A third unscanned channel, proven live on 2026-07-21: the very commit that
+    renamed the bank-named file away carried that filename in its own subject
+    line, so `git log` on the public mirror still published the term the rename
+    was removing. Diffs, file contents and paths were all clean; the message
+    was not, and nothing had ever looked at one."""
+    rng = local_sha if remote_sha == "0" * 40 else f"{remote_sha}..{local_sha}"
+    try:
+        result = subprocess.run(
+            ["git", "log", f"--format={_FLD.join(['%H', '%B'])}{_REC}",
+             f"--max-count={MAX_SCANNED_COMMITS}", rng],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=30,
+        )
+    except Exception as e:
+        warn_layer_skipped(
+            "commit-message regex scan",
+            f"could not read the log for {rng} ({e})",
+        )
+        return
+    if result.returncode != 0:
+        warn_layer_skipped(
+            "commit-message regex scan",
+            f"git log {rng} failed: {result.stderr.strip()[:200]}",
+        )
+        return
+    MESSAGES.extend(_parse_log_records(result.stdout))
+
+
+def list_commit_messages(git_dir: str) -> list[tuple[str, str]]:
+    """Every commit message in the audited repo's history — the --full-mode
+    counterpart to _collect_messages."""
+    try:
+        result = subprocess.run(
+            ["git", "--git-dir", git_dir, "--work-tree", ".", "log", "--all",
+             f"--format={_FLD.join(['%H', '%B'])}{_REC}",
+             f"--max-count={MAX_SCANNED_COMMITS}"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=60,
+        )
+    except Exception as e:
+        warn_layer_skipped("commit-message regex scan",
+                           f"could not read the log ({e})", stream=sys.stdout)
+        return []
+    return _parse_log_records(result.stdout)
+
+
+def scan_messages(messages: list[tuple[str, str]], tripwires: list[str]) -> list[str]:
+    """Regex layers against commit messages, marked `[COMMIT MSG]` so it is
+    obvious the fix is a history rewrite, not a file edit."""
+    violations: list[str] = []
+    for sha, body in messages:
+        violations.extend(scan_text(f"[COMMIT MSG] {sha[:12]}", body, tripwires))
+    return violations
+
+
+def _read_blob(local_sha: str, path: str) -> tuple[str, str | None]:
+    try:
+        result = subprocess.run(
+            ["git", "show", f"{local_sha}:{path}"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=30,
+        )
+    except Exception:
+        return path, None
+    if result.returncode != 0:
+        return path, None
+    if len(result.stdout) > FULL_SCAN_MAX_BYTES:
+        return path, None
+    return path, result.stdout
+
+
+def _read_blobs(local_sha: str, paths: list[str]) -> list[tuple[str, str | None]]:
+    """Fetch blob contents concurrently — these are I/O-bound subprocess calls,
+    and a 200-file push must still finish in seconds."""
+    if not paths:
+        return []
+    workers = min(BLOB_READ_WORKERS, len(paths))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(lambda p: _read_blob(local_sha, p), paths))
 
 
 def load_tripwires() -> list[str]:
@@ -189,16 +452,28 @@ def _run_gemini(argv: list[str], prompt: str, timeout: float) -> subprocess.Comp
     return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
 
 
+# Why the last gemini_check() failed, for the caller's fail-open banner. The
+# (is_clean, reason, ok) contract is fixed by callers/tests, so the detail
+# rides alongside it instead of widening the tuple.
+LLM_SKIP_REASON = ""
+
+
 def gemini_check(content: str, tripwires: list[str]) -> tuple[bool, str, bool]:
     """
     Ask Gemini to scan content for PII. Returns (is_clean, reason, ok) where
     ok=False means the layer itself failed (timeout/unparseable/missing binary)
     and the verdict is a fail-open default, not a real CLEAN — callers that
     loop (full_audit) use it to stop burning time on a dead Gemini.
-    Fail-open: returns (True, '', False) on any error.
+    Fail-open: returns (True, '', False) on any error. On ok=False the module
+    global LLM_SKIP_REASON holds the human-readable cause.
     """
+    global LLM_SKIP_REASON
+    LLM_SKIP_REASON = ""
     argv = resolve_gemini_argv()
     if argv is None:
+        LLM_SKIP_REASON = ("no Gemini binary resolvable — GEMINI_CMD unset in env "
+                           "and in ~/.pa/secrets.env, and 'gemini' is not on PATH "
+                           "(git hooks inherit a minimal environment)")
         print("⚠  PII guard: no Gemini binary (set GEMINI_CMD) — semantic layer OFF", file=sys.stderr)
         return True, "", False
     tripwire_ctx = ""
@@ -255,16 +530,18 @@ Added lines to analyze (capped at 400 lines):
             # Unparseable — treat like a transient failure and retry once.
             last_error = RuntimeError(f"unparseable response: {response[:200]!r}")
         except FileNotFoundError:
+            LLM_SKIP_REASON = f"'{argv[0]}' not found on this machine"
             print(f"⚠  PII guard: '{argv[0]}' not found — skipping LLM check", file=sys.stderr)
             return True, "", False
         except subprocess.TimeoutExpired:
-            last_error = TimeoutError("gemini call timed out")
+            last_error = TimeoutError(f"gemini call timed out after {GEMINI_TIMEOUT}s")
         except Exception as exc:
             last_error = exc
 
         if attempt < MAX_ATTEMPTS:
             print(f"⚠  PII guard: Gemini attempt {attempt}/{MAX_ATTEMPTS} failed ({last_error}) — retrying", file=sys.stderr)
 
+    LLM_SKIP_REASON = f"Gemini failed {MAX_ATTEMPTS} consecutive attempts ({last_error})"
     print(f"⚠  PII guard: Gemini failed after {MAX_ATTEMPTS} attempts ({last_error}) — skipping LLM check", file=sys.stderr)
     return True, "", False
 
@@ -279,15 +556,26 @@ SKIP_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".db", ".sql
 FULL_SCAN_MAX_BYTES = 1_000_000  # skip pathological single files
 
 
-def collect_tree(git_dir: str) -> list[tuple[str, str]]:
-    """All tracked (path, content) pairs of the repo at git_dir. Skips binaries."""
+def list_tracked_paths(git_dir: str) -> list[str]:
+    """Every tracked path of the repo at git_dir — INCLUDING binaries and
+    oversized files that collect_tree skips. Path scanning must see the whole
+    name list: `2026_exbank_statement.pdf` is a leak whose content nobody would
+    ever scan."""
     result = subprocess.run(
-        ["git", "--git-dir", git_dir, "--work-tree", ".", "ls-files"],
+        ["git", "-c", "core.quotepath=false", "--git-dir", git_dir,
+         "--work-tree", ".", "ls-files"],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         timeout=60,
     )
+    return [p.strip() for p in result.stdout.splitlines() if p.strip()]
+
+
+def collect_tree(git_dir: str, paths: list[str] | None = None) -> list[tuple[str, str]]:
+    """All tracked (path, content) pairs of the repo at git_dir. Skips binaries."""
+    if paths is None:
+        paths = list_tracked_paths(git_dir)
     files: list[tuple[str, str]] = []
-    for path in result.stdout.splitlines():
+    for path in paths:
         path = path.strip()
         if not path or path.lower().endswith(SKIP_EXTENSIONS):
             continue
@@ -301,18 +589,84 @@ def collect_tree(git_dir: str) -> list[tuple[str, str]]:
     return files
 
 
+def _token_variants(text: str) -> list[str]:
+    """The forms a tripwire must be matched against.
+
+    Identifiers are not prose. `download_exbank_statement.py` has NO word
+    boundary before `exbank`, because `_` is a \\w character — so a perfectly
+    sensible `\\bEXBANK\\b` tripwire (exactly the anchoring style you want, to
+    keep a pattern off ordinary English) silently misses it. That is not a
+    hypothetical: it is leak 3, in a filename, and it is also how the same term
+    hid inside a commit message that referenced that filename.
+
+    The fix is here rather than in the tripwire file, because the alternative
+    is asking a human to hand-maintain a second, looser copy of every pattern —
+    and a looser pattern is the thing that produces false positives and gets
+    the whole list switched off.
+
+    Two extra views, both cheap:
+      * separators (_ - . / \\) -> spaces. LENGTH-PRESERVING, so match offsets
+        still map to the right line number.
+      * camelCase humps split. Insertion-only, adds no newlines, so line
+        numbers still count correctly.
+    Splitting can only ADD word boundaries, never merge tokens, so it cannot
+    invent a match that the raw text does not contain.
+    """
+    variants = [text]
+    spaced = re.sub(r"[_\-./\\]", " ", text)
+    if spaced != text:
+        variants.append(spaced)
+    camel = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", spaced)
+    if camel != spaced:
+        variants.append(camel)
+    return variants
+
+
+def scan_path(path: str, tripwires: list[str]) -> list[str]:
+    """Tripwire layer against a file NAME. Reported with a `[PATH]` marker so a
+    human can tell instantly that the offending string is the filename, not
+    something inside it — the distinction that cost a full history rewrite on
+    2026-07-21, when download_exbank_statement.py sailed through every
+    content-only layer with entirely generic contents.
+
+    Credential patterns are not applied here: they are all shapes that cannot
+    occur in a path (a Telegram token contains ':', illegal on Windows), and
+    running them would only add false-positive surface."""
+    violations: list[str] = []
+    variants = _token_variants(path)
+    for pattern in tripwires:
+        try:
+            if any(re.search(pattern, v, re.IGNORECASE) for v in variants):
+                violations.append(f"{path} [PATH] tripwire: {pattern}")
+        except re.error:
+            pass
+    return violations
+
+
 def scan_text(path: str, content: str, tripwires: list[str]) -> list[str]:
     """Regex layers 1+2 against one file. Returns violation descriptions."""
     violations: list[str] = []
+    seen: set[str] = set()
+
+    def add(v: str) -> None:
+        if v not in seen:
+            seen.add(v)
+            violations.append(v)
+
+    # Credentials are matched on the RAW text only: a token is a contiguous
+    # blob whose own characters include '-' and '_', so normalising separators
+    # would break it apart rather than reveal it.
     for pattern in CREDENTIAL_PATTERNS:
         for m in re.finditer(pattern, content):
             line_no = content.count("\n", 0, m.start()) + 1
-            violations.append(f"{path}:{line_no} credential pattern: {pattern}")
+            add(f"{path}:{line_no} credential pattern: {pattern}")
+    variants = _token_variants(content)
     for pattern in tripwires:
         try:
-            for m in re.finditer(pattern, content, re.IGNORECASE):
-                line_no = content.count("\n", 0, m.start()) + 1
-                violations.append(f"{path}:{line_no} tripwire: {pattern}")
+            for variant in variants:
+                for m in re.finditer(pattern, variant, re.IGNORECASE):
+                    line_no = variant.count("\n", 0, m.start()) + 1
+                    add(f"{path}:{line_no} tripwire: {pattern}")
         except re.error:
             pass
     return violations
@@ -325,27 +679,52 @@ def full_audit(use_llm: bool) -> int:
     residual leaks survive until the 2026-06-24 manual audit (AI-094).
     """
     git_dir = os.environ.get("GIT_DIR", ".git-public")
-    files = collect_tree(git_dir)
+    all_paths = list_tracked_paths(git_dir)
+    files = collect_tree(git_dir, all_paths)
     if not files:
         print(f"⚠  PII audit: no tracked files found via git-dir '{git_dir}'", file=sys.stderr)
         return 1
 
     tripwires = load_tripwires()
     if not tripwires:
-        print("⚠  PII audit: no tripwires loaded (~/.pa/pii-tripwires.txt) — personal-name layer OFF", file=sys.stderr)
+        warn_layer_skipped(
+            "tripwire regex (personal identifiers), CONTENT and PATH",
+            "no patterns loaded from ~/.pa/pii-tripwires.txt",
+            stream=sys.stdout,
+        )
 
     violations: list[str] = []
+    # Layer 0: PATHS of every tracked file, binaries included.
+    for path in all_paths:
+        violations.extend(scan_path(path, tripwires))
+    path_hits = len(violations)
+    # Layers 1+2: contents of every readable tracked file.
     for path, content in files:
         violations.extend(scan_text(path, content, tripwires))
+    # Commit messages — a channel a working-tree scan can never see. On
+    # 2026-07-21 the public mirror's tip commit SUBJECT still carried the bank
+    # filename the commit itself had just removed.
+    messages = list_commit_messages(git_dir)
+    msg_violations = scan_messages(messages, tripwires)
+    violations.extend(msg_violations)
 
     # Print (and flush) the regex verdict BEFORE the slow LLM phase: if the
     # skill runner kills a long LLM run at its timeout, everything already on
     # stdout is still captured — the regex findings must never die with it.
-    print(f"PII audit: scanned {len(files)} tracked files — "
-          f"regex layers: {len(violations)} violation(s)", flush=True)
+    print(f"PII audit: scanned {len(all_paths)} tracked paths + contents of "
+          f"{len(files)} readable files + {len(messages)} commit messages — "
+          f"regex layers: {len(violations)} violation(s) "
+          f"({path_hits} in file NAMES, {len(msg_violations)} in COMMIT MESSAGES)",
+          flush=True)
     for v in violations:
         print(f"   {v}", flush=True)
 
+    if not use_llm:
+        warn_layer_skipped(
+            "Gemini semantic scan (layer 3)",
+            "--no-llm was passed; regex + tripwire layers only",
+            stream=sys.stdout,
+        )
     if use_llm:
         # Chunked semantic scan: ~300 lines per Gemini call. Cap sized to fit
         # comfortably inside the pii-audit skill timeout (~40s/call observed).
@@ -369,16 +748,26 @@ def full_audit(use_llm: bool) -> int:
         consecutive_failures = 0
         for i, chunk in enumerate(chunks):
             if time.monotonic() >= deadline:
-                print(f"⚠  PII audit: LLM budget ({budget:.0f}s) exhausted — "
-                      f"stopped after {i}/{len(chunks)} chunks", flush=True)
+                warn_layer_skipped(
+                    "Gemini semantic scan (layer 3), PARTIAL",
+                    f"LLM time budget ({budget:.0f}s, PA_PII_AUDIT_LLM_BUDGET) "
+                    f"exhausted after {i}/{len(chunks)} chunks — the remaining "
+                    f"{len(chunks) - i} chunks were never semantically scanned",
+                    stream=sys.stdout,
+                )
                 break
             is_clean, reason, ok = gemini_check("\n".join(chunk), tripwires)
             if not ok:
                 consecutive_failures += 1
                 if consecutive_failures >= LLM_FAILURE_BREAKER:
-                    print(f"⚠  PII audit: Gemini failed {LLM_FAILURE_BREAKER} chunks in a row — "
-                          f"LLM layer OFF for the rest of this run "
-                          f"({i + 1}/{len(chunks)} chunks attempted)", flush=True)
+                    warn_layer_skipped(
+                        "Gemini semantic scan (layer 3), PARTIAL",
+                        f"Gemini infra-failed {LLM_FAILURE_BREAKER} chunks in a row "
+                        f"({LLM_SKIP_REASON or 'unknown cause'}) — breaker tripped at "
+                        f"chunk {i + 1}/{len(chunks)}; the rest were never "
+                        f"semantically scanned",
+                        stream=sys.stdout,
+                    )
                     break
                 continue
             consecutive_failures = 0
@@ -404,41 +793,88 @@ def main() -> int:
         return full_audit(use_llm="--no-llm" not in sys.argv)
 
     if os.environ.get("PA_SKIP_PII_GUARD"):
-        print("⚠  PII guard: bypassed via PA_SKIP_PII_GUARD", file=sys.stderr)
+        # Deliberate escape hatch (documented for verified-clean force-rewrites)
+        # — but it used to vanish without trace, so nobody could later answer
+        # "was this ever pushed unchecked?". Loud now, and durably recorded.
+        refs = _read_push_refs()
+        bar = "!" * 74
+        for line in (
+            bar,
+            "!! PII GUARD BYPASSED — PA_SKIP_PII_GUARD is set",
+            "!! NOTHING in this push was scanned: no credential regex, no",
+            "!! tripwires, no path check, no semantic scan.",
+            *(f"!!   ref: {r}" for r in refs),
+            bar,
+        ):
+            print(line, file=sys.stderr)
+        log_path = record_bypass(refs)
+        if log_path:
+            print(f"   bypass recorded to {log_path}", file=sys.stderr)
         return 0
 
     collect_diff()
-    if not ADDED:
+    if not ADDED and not TOUCHED_PATHS and not MESSAGES:
         return 0
 
-    content = "\n".join(ADDED)
-
-    # Layer 1: structural credential regex (instant, always runs)
-    for pattern in CREDENTIAL_PATTERNS:
-        matches = re.findall(pattern, content)
-        if matches:
-            print("🚫 PII guard: credential pattern detected — push aborted", file=sys.stderr)
-            print(f"   Pattern: {pattern}", file=sys.stderr)
-            print(f"   Match:   {str(matches[0])[:60]}", file=sys.stderr)
-            return 1
-
-    # Layer 2: personal tripwire regex (fast, from ~/.pa/pii-tripwires.txt)
+    added_content = "\n".join(ADDED)
     tripwires = load_tripwires()
-    for pattern in tripwires:
-        try:
-            if re.search(pattern, content, re.IGNORECASE):
-                print("🚫 PII guard: personal identifier matched — push aborted", file=sys.stderr)
-                print(f"   Pattern: {pattern}", file=sys.stderr)
-                return 1
-        except re.error:
-            pass  # skip malformed patterns silently
+    if not tripwires:
+        warn_layer_skipped(
+            "tripwire regex (personal identifiers), CONTENT and PATH",
+            "no patterns loaded from ~/.pa/pii-tripwires.txt",
+        )
 
-    # Layer 3: Gemini semantic scan (ok=False → fail-open, warned inside)
-    is_clean, reason, _ok = gemini_check(content, tripwires)
-    if not is_clean:
-        print("🚫 PII guard (Gemini): personal data detected — push aborted", file=sys.stderr)
-        print(f"   Reason: {reason}", file=sys.stderr)
+    violations: list[str] = []
+
+    # Layer 0: PATHS the push ships. The name is data too.
+    for path in TOUCHED_PATHS:
+        violations.extend(scan_path(path, tripwires))
+
+    # Layers 1+2 over the FULL resulting content of every touched file — not
+    # just the '+' lines. Pre-existing PII in a file this push touches is the
+    # single largest blind spot the added-lines-only scan ever had.
+    for path, content in TOUCHED_FILES:
+        violations.extend(scan_text(path, content, tripwires))
+
+    # Layers 1+2 over the added lines as well. Cheap, catches the common case,
+    # and it is the ONLY coverage for files whose blob could not be read.
+    if added_content:
+        violations.extend(scan_text("(added lines)", added_content, tripwires))
+
+    # Layers 1+2 over the commit messages the push publishes.
+    violations.extend(scan_messages(MESSAGES, tripwires))
+
+    violations = list(dict.fromkeys(violations))  # stable dedupe
+
+    print(f"ℹ  PII guard scope: {len(TOUCHED_PATHS)} path(s), full content of "
+          f"{len(TOUCHED_FILES)} file(s), {len(ADDED)} added line(s), "
+          f"{len(MESSAGES)} commit message(s). "
+          f"Gemini layer sees ADDED LINES ONLY (budget) — whole-tree semantic "
+          f"coverage comes from the weekly --full audit.", file=sys.stderr)
+    if UNREADABLE_PATHS:
+        print(f"ℹ  PII guard: {len(UNREADABLE_PATHS)} touched path(s) were not "
+              f"content-scanned (binary/oversized/unreadable): "
+              f"{', '.join(UNREADABLE_PATHS[:5])}"
+              f"{' …' if len(UNREADABLE_PATHS) > 5 else ''}", file=sys.stderr)
+
+    if violations:
+        print("🚫 PII guard: personal data detected — push aborted", file=sys.stderr)
+        for v in violations:
+            print(f"   {v}", file=sys.stderr)
         return 1
+
+    # Layer 3: Gemini semantic scan of the ADDED LINES (ok=False → fail-open).
+    if added_content:
+        is_clean, reason, ok = gemini_check(added_content, tripwires)
+        if not ok:
+            warn_layer_skipped(
+                "Gemini semantic scan (layer 3)",
+                LLM_SKIP_REASON or "unknown cause",
+            )
+        if not is_clean:
+            print("🚫 PII guard (Gemini): personal data detected — push aborted", file=sys.stderr)
+            print(f"   Reason: {reason}", file=sys.stderr)
+            return 1
 
     print("✓  PII guard: clean", file=sys.stderr)
     return 0
