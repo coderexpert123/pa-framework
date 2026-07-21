@@ -9,6 +9,9 @@ import {
   isExistingTestFile,
   touchesGuardedDataPath,
   buildCodeFixBrief,
+  isChurnPath,
+  stashChurn,
+  popChurn,
 } from '../src/code-fixer.js';
 import type { ExecFn, ExecResult } from '../src/code-fixer.js';
 import { resolvePythonCommand } from '../src/lib/python.js';
@@ -82,6 +85,55 @@ describe('isExistingTestFile', () => {
   it('does not match a non-test source file', () => {
     assert.equal(isExistingTestFile('projects/daily-mail-brief/scripts/run_brief.py'), false);
     assert.equal(isExistingTestFile('pa/src/code-fixer.ts'), false);
+  });
+});
+
+describe('isChurnPath', () => {
+  it('matches the pa/data/profile* files learn_agent/oracle rewrite nightly', () => {
+    assert.equal(isChurnPath('pa/data/profile.json'), true);
+    assert.equal(isChurnPath('pa/data/profile-history-archive.jsonl'), true);
+    assert.equal(isChurnPath('pa\\data\\profile.json'), true);
+  });
+
+  it('does not match ordinary code or other data files', () => {
+    assert.equal(isChurnPath('pa/src/code-fixer.ts'), false);
+    assert.equal(isChurnPath('pa/data/other.json'), false);
+  });
+});
+
+describe('stashChurn / popChurn', () => {
+  it('does not stash when the churn paths are clean', async () => {
+    const calls: ExecCall[] = [];
+    const exec = makeExec([{ match: 'git status --porcelain', stdout: '' }], calls);
+    assert.equal(await stashChurn(exec, 'label'), false);
+    assert.equal(calls.some((c) => c.command.startsWith('git stash')), false);
+  });
+
+  it('stashes ONLY the churn pathspecs (never a bare stash of the whole tree)', async () => {
+    const calls: ExecCall[] = [];
+    const exec = makeExec([
+      { match: 'git status --porcelain', stdout: ' M pa/data/profile.json\n' },
+      { match: 'git stash', stdout: '' },
+    ], calls);
+
+    assert.equal(await stashChurn(exec, 'pa-self-improver-revert-abc1234'), true);
+    const push = calls.find((c) => c.command.startsWith('git stash push'));
+    assert.ok(push, 'expected a git stash push');
+    assert.match(push!.command, /-- "pa\/data\/profile\*"/);
+    // Never checkout/clean the user's profile data — that would destroy it outright.
+    assert.equal(calls.some((c) => c.command.startsWith('git checkout')), false);
+    assert.equal(calls.some((c) => c.command.startsWith('git clean')), false);
+  });
+
+  it('never throws and never drops the stash when the pop fails — it reports how to recover', async () => {
+    const calls: ExecCall[] = [];
+    const exec = makeExec([{ match: 'git stash pop', reject: 'CONFLICT (content): merge conflict in pa/data/profile.json' }], calls);
+
+    const err = await popChurn(exec);
+    assert.ok(err, 'expected an error string, not a throw');
+    assert.match(err!, /still in the git stash/i);
+    assert.match(err!, /git stash pop/);
+    assert.equal(calls.some((c) => c.command.includes('stash drop')), false);
   });
 });
 
@@ -159,6 +211,11 @@ function makeExec(
 const baseHandlers = () => [
   { match: 'git rev-parse --show-toplevel', stdout: `${REPO_ROOT}\n` },
   { match: 'git rev-parse --abbrev-ref HEAD', stdout: 'master\n' },
+  // hardRevert() brackets its reset/clean with a churn stash/pop so the nightly
+  // pa/data/profile* data survives a revert, and the commit path unstages any already-staged
+  // churn before adding the worker's own paths (2026-07-21).
+  { match: 'git stash', stdout: '' },
+  { match: 'git reset -q HEAD', stdout: '' },
 ];
 
 function makeProposal(overrides: Partial<DraftProposal> = {}): DraftProposal {
@@ -485,6 +542,91 @@ describe('attemptCodeFix', () => {
     assert.equal(record.commit_hash, 'abc9999');
     assert.deepEqual(record.files_changed, ['projects/daily-mail-brief/scripts/run_brief.py']);
     assert.match(record.evidence_excerpt, /Missing BRIEFING marker/);
+  });
+
+  it('stages and commits ONLY the worker paths — a fix commit never carries pa/data/profile* (2026-07-21)', async () => {
+    // Regression guard for the un-revertable-fix-commit bug: `git add -A` swept the nightly
+    // learn_agent/oracle churn into the commit, so `git revert` of that commit later aborted
+    // on "local changes to pa/data/profile.json would be overwritten by merge" (audit:
+    // rollback-failed for 7b82c88, twice) and the condemned fix stayed live forever.
+    await createTempSkill(dir, 'daily-mail-brief', '---\ncwd: "D:/fake-repo/projects/daily-mail-brief"\ncmd: "python scripts/run_brief.py"\n---\n\nBody.');
+    let statusCall = 0;
+    const calls: ExecCall[] = [];
+    const exec = makeExec([
+      ...baseHandlers(),
+      {
+        match: 'git status --porcelain', stdout: () => {
+          statusCall++;
+          // F4 sees churn-only drift (allowed); post-worker sees the fix PLUS more churn.
+          return statusCall === 1
+            ? ' M pa/data/profile.json\n'
+            : ' M projects/daily-mail-brief/scripts/run_brief.py\n M pa/data/profile.json\n M pa/data/profile-history-archive.jsonl\n';
+        },
+      },
+      { match: 'git rev-parse HEAD', stdout: 'abc1111\n' },
+      { match: 'git diff --numstat', stdout: '5\t1\tprojects/daily-mail-brief/scripts/run_brief.py\n' },
+      { match: 'npm run build', stdout: '' },
+      { match: 'npm test', stdout: '# tests 1\n# pass 1\n# fail 0\n# skipped 0\n' },
+      { match: 'git ls-files', stdout: '' },
+      { match: 'git add -A', stdout: '' },
+      { match: 'git commit -F', stdout: '[master abc9999] autonomous-code-fix: daily-mail-brief-fix\n' },
+      { match: 'git push origin master', stdout: '' },
+    ], calls);
+
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner });
+
+    assert.equal(result.outcome, 'applied-code-fix');
+    assert.deepEqual(result.filesChanged, ['projects/daily-mail-brief/scripts/run_brief.py']);
+
+    const cmds = calls.map((c) => c.command);
+
+    const add = cmds.find((c) => c.startsWith('git add'));
+    assert.ok(add, `expected a git add, got: ${cmds.join(' | ')}`);
+    assert.equal(add, 'git add -A -- "projects/daily-mail-brief/scripts/run_brief.py"');
+    // The bare `git add -A` this replaced is what made fix commits un-revertable.
+    assert.equal(cmds.some((c) => c === 'git add -A'), false);
+
+    // Any already-staged churn is unstaged first — index only, so the file on disk (and the
+    // user's profile data) is never touched.
+    const unstageIdx = cmds.findIndex((c) => c.startsWith('git reset -q HEAD -- "pa/data/profile*"'));
+    assert.ok(unstageIdx >= 0, `expected the churn to be unstaged, got: ${cmds.join(' | ')}`);
+    assert.ok(unstageIdx < cmds.findIndex((c) => c.startsWith('git add')));
+
+    const commit = cmds.find((c) => c.startsWith('git commit'));
+    assert.ok(commit, 'expected a git commit');
+    assert.doesNotMatch(commit!, /pa\/data\/profile/);
+  });
+
+  it('preserves pa/data/profile* churn across a hard revert: stash → reset → pop, never checkout/clean on it', async () => {
+    await createTempSkill(dir, 'daily-mail-brief', '---\ncwd: "D:/fake-repo/projects/daily-mail-brief"\ncmd: "python scripts/run_brief.py"\n---\n\nBody.');
+    let postWorkerStatus = false;
+    const calls: ExecCall[] = [];
+    const exec = makeExec([
+      ...baseHandlers(),
+      {
+        match: 'git status --porcelain', stdout: () => {
+          if (!postWorkerStatus) { postWorkerStatus = true; return ''; }
+          return ' M pa/src/validator.ts\n M pa/data/profile.json\n';
+        },
+      },
+      { match: 'git rev-parse HEAD', stdout: 'abc1111\n' },
+      { match: 'git reset --hard', stdout: '' },
+      { match: 'git clean -fd', stdout: '' },
+    ], calls);
+
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner });
+
+    assert.equal(result.outcome, 'code-fix-reverted');
+    const cmds = calls.map((c) => c.command);
+    const pushIdx = cmds.findIndex((c) => c.startsWith('git stash push'));
+    const resetIdx = cmds.findIndex((c) => c.startsWith('git reset --hard'));
+    const popIdx = cmds.findIndex((c) => c.startsWith('git stash pop'));
+    assert.ok(pushIdx >= 0, `expected a churn stash push, got: ${cmds.join(' | ')}`);
+    assert.ok(resetIdx > pushIdx, 'the churn must be stashed BEFORE the destructive reset');
+    assert.ok(popIdx > resetIdx, 'the churn must be restored AFTER the reset/clean');
+    // The profile data is never restored-from-HEAD or deleted outright.
+    assert.equal(cmds.some((c) => c.startsWith('git checkout')), false);
+    assert.equal(cmds.some((c) => c.startsWith('git clean') && c.includes('profile')), false);
   });
 
   it('builds+tests+restarts+polls the bot when projects/telegram-bot is touched', async () => {

@@ -3,7 +3,7 @@ import { loadSecrets } from '../secrets.js';
 import { runWithFailover, executeWorker } from '../workers.js';
 import { loadConfig } from '../config.js';
 import { writeLog } from '../logger.js';
-import { sendToTelegram } from '../telegram.js';
+import { sendToTelegram, type SendResult } from '../telegram.js';
 import { addWorkerPid, removeWorkerPid } from '../worker-pids.js';
 import { killProcessTree } from '../process-tree.js';
 import { log } from '../lib/log.js';
@@ -37,6 +37,46 @@ export function isNoOutputSentinel(output: string): boolean {
 }
 
 /**
+ * A skill that declares `telegram_output` exists to DELIVER something. If it exits 0
+ * with empty/whitespace-only stdout, nothing is sent AND the run is recorded 'success'
+ * — a completely silent no-op that no alert, log, or backoff ever notices. Reference
+ * case from the 2026-07-16..21 audit: ~/.pa/logs/oracle/20260717-081242-b56c4e.log is
+ * 0 BYTES after 436s of runtime, recorded status 'success', delivered nothing.
+ * Treat that shape as a failure so it reaches consecutiveFailures / the AI-098 backoff.
+ *
+ * DO NOT WIDEN THIS SCOPE. The `telegramOutput` guard is load-bearing, not cosmetic:
+ * `reminders` runs on `* * * * *` (1440 runs/day) and legitimately produces no output
+ * on the overwhelming majority of them — it declares no telegram_output, and applying
+ * this rule to it would manufacture a 1440-failures-per-day outage.
+ *
+ * The designed escape hatch for a telegram_output skill that legitimately has nothing
+ * to say is the NO_OUTPUT sentinel (isNoOutputSentinel above) — an explicit "I ran, I
+ * decided there is nothing to send". EMPTY output is not the sentinel; it is silence,
+ * and silence is indistinguishable from a crashed pipeline.
+ */
+export function isSilentNoOp(
+  success: boolean,
+  output: string | undefined,
+  telegramOutput?: TelegramOutput,
+): boolean {
+  if (!success) return false; // already recorded as a failure — nothing to reclassify
+  if (!telegramOutput) return false; // SCOPE GUARD — see the 'reminders' note above
+  return !output || output.trim() === '';
+}
+
+/**
+ * One-line, log-safe description of a REJECTED `sendToTelegram` result. Used in
+ * both the run's `error` (which lands in the .meta) and the app.log.jsonl row,
+ * so "why didn't this arrive" is answerable from either.
+ */
+export function describeSendFailure(send: Extract<SendResult, { ok: false }>): string {
+  const parts: string[] = [send.reason];
+  if (send.status !== undefined) parts.push(`status ${send.status}`);
+  if (send.detail) parts.push(send.detail.slice(0, 200));
+  return parts.join(': ');
+}
+
+/**
  * For cmd: shell skills, only inject explicitly declared secrets into the child env.
  * Returns empty object if no secrets declared — least-privilege by default.
  */
@@ -55,8 +95,35 @@ export function filterSecretsForShell(
 }
 
 /**
- * Post-execution handler: log result, print output, detect and run trigger skills.
- * Extracted to avoid duplicating this logic across the preferred-worker and failover paths.
+ * Turn an undelivered telegram_output run into a recorded failure. Mutating
+ * `result` in place is deliberate for the same reason the silent-no-op rule
+ * above does it: `result` IS the object runCommand returns, so the caller,
+ * `writeLog`, and catchup all see one consistent verdict.
+ */
+function recordDeliveryFailure(
+  result: CommandResult,
+  skillName: string,
+  worker: string,
+  duration: number,
+  detail: string,
+  extra: Record<string, unknown> = {},
+): void {
+  log('error', 'run', `Skill ${skillName} Telegram delivery failed — ${detail}`, {
+    skill: skillName,
+    worker,
+    duration,
+    deliveryFailed: true,
+    ...extra,
+  });
+  const line = `Telegram delivery failed (${detail}). The skill produced output but it was never delivered.`;
+  result.success = false;
+  result.error = result.error ? `${result.error}\n${line}` : line;
+}
+
+/**
+ * Post-execution handler: deliver output, log result, print output, detect and run
+ * trigger skills. Extracted to avoid duplicating this logic across the
+ * preferred-worker and failover paths.
  */
 async function handleSkillResult(
   result: CommandResult,
@@ -69,6 +136,79 @@ async function handleSkillResult(
   telegramOutput?: TelegramOutput,
   secrets?: Record<string, string>,
 ): Promise<void> {
+  // Silent no-op detection (see isSilentNoOp for the scope guard and why it matters).
+  // Mutating `result` in place is deliberate: it IS the object runCommand returns, so
+  // catchup sees the same verdict writeLog records. Done before `meta` so the run is
+  // logged status 'error' and counts toward consecutiveFailures / AI-098 backoff.
+  if (isSilentNoOp(result.success, result.output, telegramOutput)) {
+    const detail = 'declares telegram_output but produced no output (silent no-op)';
+    log('error', 'run', `Skill ${skillName} ${detail}`, {
+      skill: skillName,
+      worker,
+      exitCode: result.exitCode, // kept as-is: exit 0 with no output IS the finding
+      duration,
+      silentNoOp: true,
+    });
+    result.success = false;
+    result.error = result.error
+      ? `${result.error}\nSkill ${detail}.`
+      : `Skill ${detail}. Emit NO_OUTPUT as the last line if this run legitimately had nothing to send.`;
+  }
+
+  // --- Telegram delivery, BEFORE the run is recorded -------------------------
+  // Suppression check: the NO_OUTPUT sentinel (last non-empty line) means "I ran
+  // and decided there is nothing to send" — a success that delivers nothing on
+  // purpose. Checking the last line rather than the whole output handles workers
+  // like Gemini that prefix reasoning/preamble before the sentinel.
+  //
+  // Everything else that declares telegram_output exists to DELIVER. Until
+  // 2026-07-21 this call DISCARDED sendToTelegram's return value, so a send
+  // Telegram REJECTED (400 chat not found, network error, empty chat_id) was
+  // still recorded status 'success' — the same "recorded success, delivered
+  // nothing" class the silent-no-op rule above closes, one branch away from it.
+  //
+  // Two deliberate choices here; do NOT regress either:
+  //  1. Delivery runs BEFORE `meta`/writeLog. Recording first and sending after
+  //     is exactly what made the failure invisible: the .meta, the latest.json
+  //     pointer and consecutiveFailures were all already written 'success' by
+  //     the time the send was rejected. writeLog is not idempotent (a second
+  //     call appends another run and double-counts the pointer), so the only
+  //     honest order is deliver → record.
+  //  2. A rejected delivery marks the RUN failed. The skill's own work did
+  //     happen, but for a telegram_output skill the delivery IS the deliverable
+  //     — a briefing nobody received is not a success anyone can act on. Failing
+  //     it is also the only thing that buys a retry (transient network) and,
+  //     once AI-098 backoff exhausts the retries, a pa-alerts page (permanent
+  //     misconfig). A 'success' record buys neither.
+  if (result.success && result.output && !isNoOutputSentinel(result.output) && telegramOutput && secrets) {
+    const token = secrets[telegramOutput.token_secret];
+    if (token) {
+      const send = await sendToTelegram(result.output, telegramOutput, token);
+      if (!send.ok) {
+        recordDeliveryFailure(result, skillName, worker, duration, describeSendFailure(send), {
+          failure: send.reason,
+          status: send.status,
+          detail: send.detail,
+          chatId: telegramOutput.chat_id,
+          threadId: telegramOutput.thread_id,
+        });
+      }
+    } else {
+      // Declared telegram_output but the token secret is absent: nothing can be
+      // delivered, now or ever. Same class as a rejected send — a console.warn
+      // on an unattended scheduled run is indistinguishable from silence.
+      console.warn(`[run] telegram_output: secret '${telegramOutput.token_secret}' not found — skipping Telegram delivery`);
+      recordDeliveryFailure(
+        result,
+        skillName,
+        worker,
+        duration,
+        `missing-token: secret '${telegramOutput.token_secret}' not found in secrets.env`,
+        { failure: 'missing-token', chatId: telegramOutput.chat_id, threadId: telegramOutput.thread_id },
+      );
+    }
+  }
+
   const meta: RunMeta = {
     worker,
     status: result.success ? 'success' : 'error',
@@ -98,7 +238,13 @@ async function handleSkillResult(
       ).catch(() => {});
     }
 
-    // Always alert the skill's own topic when telegram_output is configured
+    // Always alert the skill's own topic when telegram_output is configured.
+    // Deliberately still attempted when the failure IS a rejected delivery to
+    // this same topic: rejections are frequently content-specific (message
+    // shape, size, parse mode), so the short alert often lands where the full
+    // output did not — and when it doesn't, notifyUser records the miss rather
+    // than claiming a send. The pa-alerts page above is the route that does not
+    // depend on this topic working at all.
     if (telegramOutput && secrets) {
       const token = secrets[telegramOutput.token_secret];
       if (token) {
@@ -112,18 +258,6 @@ async function handleSkillResult(
           },
         ).catch(() => {});
       }
-    }
-  }
-
-  // Check for NO_OUTPUT sentinel: suppress Telegram delivery if the last non-empty line is
-  // exactly "NO_OUTPUT". Checking last-line (not full-output) handles workers like Gemini that
-  // may prefix reasoning/preamble text before emitting the sentinel.
-  if (result.success && result.output && !isNoOutputSentinel(result.output) && telegramOutput && secrets) {
-    const token = secrets[telegramOutput.token_secret];
-    if (token) {
-      await sendToTelegram(result.output, telegramOutput, token);
-    } else {
-      console.warn(`[run] telegram_output: secret '${telegramOutput.token_secret}' not found — skipping Telegram delivery`);
     }
   }
 

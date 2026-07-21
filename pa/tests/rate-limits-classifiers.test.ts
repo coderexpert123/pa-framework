@@ -8,6 +8,8 @@ import { tmpdir } from 'os';
 // resolves into an isolated directory.
 const PA_HOME = join(tmpdir(), `rate-limits-classifiers-test-${process.pid}`);
 process.env.PA_HOME = PA_HOME;
+// The account-exhausted path alerts via notifyUser — keep it off the network.
+process.env.PA_NOTIFY_DISABLED = '1';
 
 import { classifyGeminiError } from '../src/rate-limits-gemini.js';
 import {
@@ -19,6 +21,9 @@ import {
   classifyClaudeText,
   readClaudeSessionErrors,
   findStateFileById,
+  classifyZhipuAccountExhausted,
+  hasZhipuBalanceSignature,
+  ACCOUNT_EXHAUSTED_COOLDOWN_MINUTES,
   type ApiErrorEvent,
 } from '../src/rate-limits-claude.js';
 import {
@@ -28,6 +33,8 @@ import {
   getWorkerCooldown,
   getCooldownStatus,
   isWorkerCoolingDown,
+  clearWorkerCooldown,
+  clearRateLimitCache,
 } from '../src/rate-limits.js';
 
 // ---------------------------------------------------------------------------
@@ -674,5 +681,163 @@ describe('readClaudeSessionErrors — synthetic 429 assistant messages', () => {
 
     const errors = await readClaudeSessionErrors(sessionId, SYNTHETIC_429_DIR, '*.jsonl');
     assert.equal(errors.length, 0, 'innocent synthetic message should not be parsed as an error');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Terminal account-balance fault (Zhipu 1113) — 2026-07-21
+//
+// zclaude is a Zhipu GLM wrapper. An exhausted account balance arrives as HTTP
+// 429 carrying code 1113 — it looks exactly like a transient rate limit but
+// never self-heals. Between 2026-07-11 and 07-19 it produced four
+// 'no-session-evidence' rows in rate-limit-unparseable.jsonl, ZERO cooldown
+// entries, and ~150 doomed spawns of the priority-1 worker.
+// ---------------------------------------------------------------------------
+
+const ZHIPU_1113_RAW =
+  'API Error: Request rejected (429) [1113][Insufficient balance or no resource package. Please recharge and try again.]';
+
+const ACCOUNT_EXHAUSTED_HOME = join(tmpdir(), `rate-limits-account-exhausted-test-${process.pid}`);
+
+describe('Zhipu terminal account-balance fault', () => {
+  before(async () => {
+    process.env.PA_HOME = ACCOUNT_EXHAUSTED_HOME;
+    clearRateLimitCache();
+    await mkdir(ACCOUNT_EXHAUSTED_HOME, { recursive: true });
+  });
+
+  after(async () => {
+    try { await rm(ACCOUNT_EXHAUSTED_HOME, { recursive: true, force: true }); } catch {}
+    process.env.PA_HOME = PA_HOME;
+    clearRateLimitCache();
+  });
+
+  it('classifies the 1113 raw string as account-exhausted with a long cooldown', () => {
+    const result = classifyZhipuAccountExhausted(ZHIPU_1113_RAW);
+    assert.ok(result, 'the 1113 signature must classify');
+    assert.equal(result!.classification, 'account-exhausted');
+    assert.equal(result!.source, 'zhipu-text');
+    assert.equal(result!.minutes, ACCOUNT_EXHAUSTED_COOLDOWN_MINUTES);
+    assert.ok(result!.minutes >= 60, 'cooldown must be long enough to stop per-dispatch re-probing');
+    assert.ok(result!.minutes <= 24 * 60, 'cooldown must not outlast a day, so a recharge is noticed');
+    assert.ok(result!.raw && result!.raw.includes('1113'), 'raw snippet should carry the code');
+  });
+
+  it('matches the message text alone (no bracketed code)', () => {
+    const result = classifyZhipuAccountExhausted(
+      'API Error: Request rejected (429) Insufficient balance or no resource package',
+    );
+    assert.ok(result);
+    assert.equal(result!.classification, 'account-exhausted');
+  });
+
+  it('classifyRateLimit routes zclaude 1113 stdout to account-exhausted', async () => {
+    const result = await classifyRateLimit('zclaude', ZHIPU_1113_RAW, '');
+    assert.ok(result, 'must not return null — null means "not a rate limit", i.e. no cooldown');
+    assert.equal(result!.classification, 'account-exhausted');
+    assert.equal(result!.minutes, ACCOUNT_EXHAUSTED_COOLDOWN_MINUTES);
+  });
+
+  it('classifyRateLimit also detects it on stderr', async () => {
+    const result = await classifyRateLimit('zclaude', '', ZHIPU_1113_RAW);
+    assert.ok(result);
+    assert.equal(result!.classification, 'account-exhausted');
+  });
+
+  it('writes a cooldown for the worker so it stops being re-probed', async () => {
+    try { await unlink(join(ACCOUNT_EXHAUSTED_HOME, 'rate-limit-state.json')); } catch {}
+    clearRateLimitCache();
+
+    // Mirrors the caller contract in workers.ts: classify → recordRateLimit.
+    const cls = await classifyRateLimit('zclaude', ZHIPU_1113_RAW, '');
+    assert.ok(cls);
+    await recordRateLimit('zclaude', cls!.minutes, `[${cls!.classification}] ${cls!.source}`, cls!.classification);
+
+    const entry = await getWorkerCooldown('zclaude');
+    assert.ok(entry, 'a cooldown entry must exist');
+    assert.equal(entry!.classification, 'account-exhausted');
+    assert.equal(await isWorkerCoolingDown('zclaude'), true);
+
+    const remainingMs = new Date(entry!.cooldown_until).getTime() - Date.now();
+    assert.ok(remainingMs > 60 * 60 * 1000, `cooldown should be hours, got ${remainingMs}ms`);
+  });
+
+  it('a successful run clears the state (the long cooldown is overridable)', async () => {
+    await recordRateLimit('zclaude', ACCOUNT_EXHAUSTED_COOLDOWN_MINUTES, 'account exhausted', 'account-exhausted');
+    assert.equal(await isWorkerCoolingDown('zclaude'), true);
+
+    assert.equal(await clearWorkerCooldown('zclaude'), true, 'first clear removes the entry');
+    assert.equal(await getWorkerCooldown('zclaude'), null);
+    assert.equal(await isWorkerCoolingDown('zclaude'), false);
+    assert.equal(await clearWorkerCooldown('zclaude'), false, 'clearing a clean worker is a no-op');
+  });
+
+  it('a genuine transient 429 still gets the existing short cooldown', async () => {
+    // gemini per-minute quota — a real, self-healing rate limit.
+    const result = await classifyRateLimit(
+      'gemini',
+      '',
+      'status: 429 "quotaMetric": "generativelanguage.googleapis.com/generate_content_requests_PerMinutePerProject"',
+    );
+    assert.ok(result);
+    assert.equal(result!.classification, 'quota-per-minute');
+    assert.equal(result!.minutes, 2);
+  });
+
+  it('a claude/zclaude session 429 still in retry budget stays transient', () => {
+    const result = classifyClaudeErrors([
+      {
+        status: 429,
+        code: '1302',
+        message: 'API Error: Request rejected (429) Too many concurrent requests',
+        retryAttempt: 1,
+        maxRetries: 10,
+        timestamp: new Date().toISOString(),
+      },
+    ]);
+    assert.ok(result);
+    assert.equal(result!.minutes, 0);
+    assert.notEqual(result!.classification, 'account-exhausted');
+  });
+
+  it('session event with code 1113 is terminal even inside the retry budget', () => {
+    const result = classifyClaudeErrors([
+      {
+        status: 429,
+        code: '1113',
+        message: 'Insufficient balance or no resource package.',
+        retryAttempt: 1,
+        maxRetries: 10,
+        timestamp: new Date().toISOString(),
+      },
+    ]);
+    assert.ok(result);
+    assert.equal(result!.classification, 'account-exhausted');
+    assert.equal(result!.source, 'claude-session');
+    assert.equal(result!.minutes, ACCOUNT_EXHAUSTED_COOLDOWN_MINUTES);
+  });
+
+  it('is not fooled by the phrase appearing inside unrelated text', async () => {
+    const prose =
+      'The user asked what "Insufficient balance or no resource package" means; explain that it is a billing error.';
+    assert.equal(classifyZhipuAccountExhausted(prose), null, 'prose without 429 framing must not classify');
+    assert.equal(await classifyRateLimit('zclaude', prose, ''), null);
+
+    // 429 framing present, but on a DIFFERENT line from the balance phrase.
+    const distant = [
+      'API Error: Request rejected (429) — gemini hit a per-minute quota earlier today.',
+      'Separately, a teammate asked what "Insufficient balance or no resource package" means.',
+    ].join('\n');
+    assert.equal(classifyZhipuAccountExhausted(distant), null, 'cross-line coincidence must not classify');
+
+    assert.equal(classifyZhipuAccountExhausted(''), null);
+    assert.equal(classifyZhipuAccountExhausted('plain network timeout'), null);
+  });
+
+  it('hasZhipuBalanceSignature only fires on the balance signature', () => {
+    assert.equal(hasZhipuBalanceSignature('Insufficient balance or no resource package.'), true);
+    assert.equal(hasZhipuBalanceSignature('[1113][something]'), true);
+    assert.equal(hasZhipuBalanceSignature('Usage limit reached for 5 hour.'), false);
+    assert.equal(hasZhipuBalanceSignature(''), false);
   });
 });

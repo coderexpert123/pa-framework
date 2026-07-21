@@ -133,9 +133,27 @@ export function touchesGuardedDataPath(path: string): boolean {
 
 // Runtime drift that isn't human WIP and shouldn't block F4's dirty-worktree check — the
 // learn_agent/oracle skill can rewrite these between the last commit and a nightly run.
-const DIRTY_IGNORE_PREFIXES = ['pa/data/profile'];
+//
+// EXPORTED (2026-07-21) because the carve-out has to hold at BOTH ends of the safety model,
+// not just at the F4 gate. Until then `git add -A` below swept these churning data files into
+// every autonomous fix commit, and self-improver.ts's recovery path ran a bare
+// `git revert` — which aborts with "Your local changes to the following files would be
+// overwritten by merge: pa/data/profile.json" the moment learn_agent has rewritten it again.
+// Result: audit action 'rollback-failed' for commit 7b82c88 on BOTH 2026-07-13 and
+// 2026-07-16, the condemned fix still an ancestor of HEAD, and the loop's stated guarantee
+// ("a bad fix is always one `git revert` away") quietly false. Do not regress either half.
+export const DIRTY_IGNORE_PREFIXES = ['pa/data/profile'];
 
-function parsePorcelainPaths(porcelain: string): string[] {
+/** The churn paths above as pre-quoted git pathspecs, ready to append to a command line. */
+export const CHURN_PATHSPEC_ARGS = DIRTY_IGNORE_PREFIXES.map((p) => `"${p}*"`).join(' ');
+
+/** True when `path` is nightly runtime churn (see DIRTY_IGNORE_PREFIXES), not human WIP. */
+export function isChurnPath(path: string): boolean {
+  const norm = normalizePath(path);
+  return DIRTY_IGNORE_PREFIXES.some((pre) => norm.startsWith(pre));
+}
+
+export function parsePorcelainPaths(porcelain: string): string[] {
   const paths: string[] = [];
   for (const rawLine of porcelain.split('\n')) {
     const line = rawLine.replace(/\r$/, '');
@@ -152,7 +170,44 @@ function parsePorcelainPaths(porcelain: string): string[] {
 
 async function getWorkingTreePaths(exec: ExecFn, repoRoot: string): Promise<string[]> {
   const { stdout } = await exec('git status --porcelain', { cwd: repoRoot });
-  return parsePorcelainPaths(stdout).filter((p) => !DIRTY_IGNORE_PREFIXES.some((pre) => p.startsWith(pre)));
+  return parsePorcelainPaths(stdout).filter((p) => !isChurnPath(p));
+}
+
+// --- Churn preservation across destructive git operations (2026-07-21) --------------------
+// `git reset --hard` / `git revert` both clobber the tracked pa/data/profile* files, which
+// carry a day of learn_agent-written user data that is NOT reproducible. Stash exactly those
+// paths across the destructive step and put them back afterwards. Deliberately never
+// `git checkout` / `git clean` them, and never `git stash drop` — worst case the data sits in
+// the stash and the caller says so out loud. Crash-safe by construction: between the stash
+// and the pop, profile.json holds its last COMMITTED content (valid JSON, never truncated)
+// and the newer content lives in git's object store.
+
+/** True when any DIRTY_IGNORE_PREFIXES file currently has uncommitted changes. */
+export async function churnIsDirty(exec: ExecFn, opts?: { cwd?: string }): Promise<boolean> {
+  const { stdout } = await exec(`git status --porcelain -- ${CHURN_PATHSPEC_ARGS}`, opts);
+  return stdout.trim().length > 0;
+}
+
+/** Stashes ONLY the churn paths. Returns true when something was stashed (pop with popChurn). */
+export async function stashChurn(exec: ExecFn, label: string, opts?: { cwd?: string }): Promise<boolean> {
+  if (!(await churnIsDirty(exec, opts))) return false;
+  const safeLabel = label.replace(/[^0-9A-Za-z._-]/g, '-');
+  await exec(`git stash push -u -m "${safeLabel}" -- ${CHURN_PATHSPEC_ARGS}`, opts);
+  return true;
+}
+
+/**
+ * Restores a stashChurn() stash. Never throws and never drops the stash: on failure the data
+ * is still fully recoverable, and the returned string says exactly how — callers surface it
+ * rather than swallowing it.
+ */
+export async function popChurn(exec: ExecFn, opts?: { cwd?: string }): Promise<string | undefined> {
+  try {
+    await exec('git stash pop', opts);
+    return undefined;
+  } catch (err: any) {
+    return `pa/data/profile* changes are still in the git stash and were NOT restored — recover with \`git stash list\` + \`git stash pop\`: ${(err?.message ?? String(err)).slice(0, 200)}`;
+  }
 }
 
 interface NumstatEntry { added: number; deleted: number; path: string; }
@@ -173,10 +228,23 @@ async function getNumstat(exec: ExecFn, repoRoot: string, preFixHead: string): P
 }
 
 async function hardRevert(exec: ExecFn, repoRoot: string, preFixHead: string): Promise<void> {
-  await exec(`git reset --hard ${preFixHead}`, { cwd: repoRoot });
-  // reset --hard doesn't remove new untracked files the worker created — F4 already confirmed
-  // the tree was clean before the worker ran, so anything untracked now is the worker's.
-  await exec('git clean -fd', { cwd: repoRoot });
+  const opts = { cwd: repoRoot };
+  // `git reset --hard` would roll the nightly-churning pa/data/profile* files back to the
+  // pre-fix commit and silently destroy a day of learn_agent-written profile data — the F4
+  // carve-out let that drift through the gate, so it is still present here. Stash just those
+  // paths across the reset/clean and put them back (2026-07-21). Do not regress.
+  const stashed = await stashChurn(exec, `pa-code-fix-revert-${preFixHead}`, opts);
+  try {
+    await exec(`git reset --hard ${preFixHead}`, opts);
+    // reset --hard doesn't remove new untracked files the worker created — F4 already confirmed
+    // the tree was clean before the worker ran, so anything untracked now is the worker's.
+    await exec('git clean -fd', opts);
+  } finally {
+    if (stashed) {
+      const restoreError = await popChurn(exec, opts);
+      if (restoreError) console.warn(`[code-fixer] ${restoreError}`);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -558,7 +626,18 @@ export async function attemptCodeFix(
 
   // F6: commit + push PRIVATE origin only (plain `git` always resolves to .git, never
   // .git-public — this module never invokes git-public.ps1/.cmd or passes --git-dir).
-  await exec('git add -A', { cwd: repoRoot });
+  //
+  // Pathspec-limited staging (2026-07-21, do NOT regress to a bare `git add -A`): the bare
+  // form swept the nightly pa/data/profile* churn into the fix commit itself, which made every
+  // autonomous fix commit UN-REVERTABLE by construction — `git revert` aborts on "local changes
+  // to pa/data/profile.json would be overwritten by merge" as soon as learn_agent has rewritten
+  // it again (see DIRTY_IGNORE_PREFIXES for the 7b82c88 incident). `touchedPaths` already
+  // excludes the churn, so it is exactly the set the coding worker changed. The pathspec-limited
+  // `git reset` first is belt-and-suspenders against churn that was somehow already staged: it
+  // only rewrites the INDEX entry, never the working tree, so no profile data is touched.
+  const commitPathspec = touchedPaths.map((p) => `"${p}"`).join(' ');
+  await exec(`git reset -q HEAD -- ${CHURN_PATHSPEC_ARGS}`, { cwd: repoRoot }).catch(() => {});
+  await exec(`git add -A -- ${commitPathspec}`, { cwd: repoRoot });
   const commitMessage = buildCommitMessage(proposal, evidence);
   const tmpDir = await mkdtemp(join(tmpdir(), 'pa-code-fix-'));
   const msgPath = join(tmpDir, 'commit-message.txt');

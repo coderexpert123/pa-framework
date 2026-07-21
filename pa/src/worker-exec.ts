@@ -660,8 +660,28 @@ export async function executeWorker(
         // Gemini tool-boundary trim: discard all content accumulated before the last
         // tool_result. This strips intermediate planning narration from multi-step
         // tool-use conversations, keeping only the final response segment.
+        //
+        // DO NOT REGRESS the "trimmed still has content" guard. lastToolBoundary is
+        // reset to stdout.length after EVERY tool_result, so any run whose final stream
+        // event is a tool call with no assistant text after it ends with
+        // lastToolBoundary === stdout.length — an unguarded slice then yields '' and pa
+        // deletes the model's entire output. That is the likeliest explanation for the
+        // 0-byte ~/.pa/logs/oracle/20260717-081242-b56c4e.log after a 436s run recorded
+        // as success. It became actively dangerous once run.ts started treating empty
+        // stdout from a telegram_output skill as a hard failure: a CORRECT gemini/agy
+        // run would be scored a failure, and three of those in a row park the skill via
+        // the AI-098 backoff and page the user — a self-inflicted outage. A NO_OUTPUT
+        // sentinel in the skill prompt cannot defend against this, because the trim
+        // happens downstream of whatever the model actually printed.
+        //
+        // Whitespace-only trims fall back too, not just empty ones: every downstream
+        // consumer compares on trimmed output, so a "\n\n" survivor is indistinguishable
+        // from '' — and whitespace is not a final response segment worth paying the
+        // whole output for. Runs that DID emit text after the last tool call are
+        // unaffected; they trim exactly as before.
         if ((worker.name === 'gemini' || worker.name === 'agy') && lastToolBoundary > 0) {
-          stdout = stdout.slice(lastToolBoundary);
+          const trimmed = stdout.slice(lastToolBoundary);
+          if (trimmed.trim()) stdout = trimmed;
         }
 
         // Clear the heartbeat line

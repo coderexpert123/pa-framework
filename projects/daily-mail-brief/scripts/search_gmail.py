@@ -35,7 +35,16 @@ def search_emails(query, max_results=50):
     return emails
 
 if __name__ == "__main__":
-    # Search for examplebank alerts from April 1st to April 3rd
-    query = 'from:examplebank.net OR from:examplebank.com after:2026/04/01'
-    found = search_emails(query)
+    # Query comes from the command line — never hardcode one here. A checked-in
+    # example query names the real senders it filters on, and this file ships to
+    # the public framework mirror (2026-07-21: a hardcoded bank-alert query sat
+    # here and leaked the account provider; the pre-push guard missed it because
+    # it only scans lines ADDED by a push, and this line was already committed).
+    if len(sys.argv) < 2:
+        print('Usage: python search_gmail.py "<gmail-query>" [max_results]', file=sys.stderr)
+        print('  e.g. python search_gmail.py "from:example.com after:2026/04/01" 20', file=sys.stderr)
+        sys.exit(2)
+    query = sys.argv[1]
+    max_results = int(sys.argv[2]) if len(sys.argv) > 2 else 50
+    found = search_emails(query, max_results)
     print(json.dumps(found, indent=2))

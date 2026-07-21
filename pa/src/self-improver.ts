@@ -26,7 +26,7 @@
  */
 import { analyzeConversationPatterns } from './analyzer.js';
 import { analyzeFailurePatterns, checkForRollbacks, readRecentFailures } from './failure-analyzer.js';
-import { attemptCodeFix } from './code-fixer.js';
+import { attemptCodeFix, CHURN_PATHSPEC_ARGS, isChurnPath, parsePorcelainPaths, popChurn, stashChurn } from './code-fixer.js';
 import { analyzeFeedbackPatterns } from './feedback-analyzer.js';
 import { exec as execCb } from 'child_process';
 import { promisify } from 'util';
@@ -36,7 +36,7 @@ import { isProtected, isCriticalChange, hasRealSideEffects, isCmdBasedTarget, va
 import { loadSkill } from './skills.js';
 import { appendAuditRecord, readAuditRecords, skillRunStats, toAuditBaseline, unifiedDiff } from './lib/improvement-audit.js';
 import type { AuditValidation } from './lib/improvement-audit.js';
-import { notifyUser, getPaAlertsChatId, getPaAlertsThreadId } from './lib/notify.js';
+import { notifyUser, resolveNotifyTopic } from './lib/notify.js';
 import { rm, copyFile } from 'fs/promises';
 import { join } from 'path';
 import type { DraftProposal, DraftMeta } from './types.js';
@@ -45,15 +45,22 @@ const SELF_NAME = 'self-improver';
 // Env-driven so the framework is portable (matches lib/notify.ts's own
 // PA_ALERTS_CHAT_ID pattern) — falls back to the general alerts topic when
 // no dedicated self-improvement-loop topic is configured. Resolved lazily
-// (at use, not module-load) for the same reason getPaAlertsChatId() is: CLI
-// invocations may load secrets after this module is first imported.
-function getReportTopic(): { chat_id: string; thread_id: number } {
-  return {
-    chat_id: process.env.PA_SELF_IMPROVER_CHAT_ID || getPaAlertsChatId(),
-    thread_id: process.env.PA_SELF_IMPROVER_THREAD_ID
-      ? Number(process.env.PA_SELF_IMPROVER_THREAD_ID)
-      : getPaAlertsThreadId(),
-  };
+// (at use, not module-load) because CLI invocations may load secrets after
+// this module is first imported.
+//
+// DO NOT REGRESS to `process.env.PA_SELF_IMPROVER_THREAD_ID || ...`: this skill
+// runs as a `cmd:` skill with NO `secrets:` frontmatter, so commands/run.ts
+// hands its child process none of ~/.pa/secrets.env — and that is the only
+// place PA_SELF_IMPROVER_THREAD_ID exists. The env-only read resolved thread 0,
+// and because notify.ts's route repair only covers an empty CHAT id, the
+// nightly report landed in pa-alerts instead of the self-improvement-loop
+// topic. resolveNotifyTopic() applies process.env → secrets.env → pa-alerts
+// default to BOTH ids.
+export async function getReportTopic(): Promise<{ chat_id: string; thread_id: number }> {
+  return resolveNotifyTopic({
+    chatKey: 'PA_SELF_IMPROVER_CHAT_ID',
+    threadKey: 'PA_SELF_IMPROVER_THREAD_ID',
+  });
 }
 // Not 1 day: analyzeConversationPatterns/analyzeFailurePatterns require a pattern to repeat
 // across *different* days (2-3+ occurrences) to qualify — a 1-day window would make that
@@ -140,7 +147,86 @@ export interface RollbackDeps {
   execFn?: (command: string, options?: { cwd?: string }) => Promise<{ stdout: string; stderr: string }>;
 }
 
-const defaultRollbackExec = promisify(execCb);
+type RollbackExec = NonNullable<RollbackDeps['execFn']>;
+
+const execAsync = promisify(execCb);
+const defaultRollbackExec: RollbackExec = (command, options) => execAsync(command, { cwd: options?.cwd });
+
+export interface GitRevertResult {
+  revertCommitHash: string;
+  /** Set when the churn stash could not be popped — the data is still IN the stash, not lost. */
+  churnRestoreError?: string;
+}
+
+/**
+ * `git revert`s a prior applied-code-fix commit without tripping over — or destroying — the
+ * nightly pa/data/profile* churn that learn_agent/oracle writes.
+ *
+ * The bare `git revert --no-edit HASH` this replaces aborted every time that churn was
+ * present ("Your local changes to the following files would be overwritten by merge:
+ * pa/data/profile-history-archive.jsonl, pa/data/profile.json"), leaving the CONDEMNED fix
+ * live: ~/.pa/self-improver-audit.jsonl records action 'rollback-failed' for commit 7b82c88
+ * on both 2026-07-13 and 2026-07-16, and 7b82c88 is still an ancestor of HEAD. The other
+ * half of the fix lives in code-fixer.ts (fix commits no longer CONTAIN those data files).
+ *
+ * Shape of the safe sequence — never `git checkout`/`git clean` the profile files, never
+ * discard them:
+ *   1. refuse outright if there is human WIP in the tree (mirrors code-fixer's F4, and is
+ *      what makes the failure-path `git reset --hard HEAD` below safe);
+ *   2. stash ONLY the churn paths;
+ *   3. `git revert -n` (staged, uncommitted) so the churn paths can be dropped from the
+ *      revert before it becomes a commit — a revert commit carrying pa/data/profile* would
+ *      itself be un-revertable, reproducing the original bug one generation down;
+ *   4. commit, then pop the churn stash back on top.
+ * A crash anywhere between 2 and 4 leaves profile.json at its last COMMITTED content — valid
+ * JSON, never truncated — with the newer content recoverable from `git stash list`.
+ */
+export async function gitRevertPreservingChurn(
+  commitHash: string,
+  execFn: RollbackExec
+): Promise<GitRevertResult> {
+  const { stdout: statusOut } = await execFn('git status --porcelain');
+  const humanWip = parsePorcelainPaths(statusOut).filter((p) => !isChurnPath(p));
+  if (humanWip.length > 0) {
+    throw new Error(
+      `working tree has ${humanWip.length} uncommitted change(s) (${humanWip.slice(0, 5).join(', ')}) — refusing to revert ${commitHash}; the condemned fix is still live.`
+    );
+  }
+
+  const stashed = await stashChurn(execFn, `pa-self-improver-revert-${commitHash}`);
+
+  let revertErr: unknown;
+  try {
+    await execFn(`git revert -n ${commitHash}`);
+    // Drop the churn paths from the staged revert. A pathspec that matches nothing (a repo
+    // without these files) is not a reason to abort an otherwise-good revert.
+    await execFn(`git checkout HEAD -- ${CHURN_PATHSPEC_ARGS}`).catch(() => {});
+    // `-c core.editor=true`: `git revert -n` leaves the revert message in .git/MERGE_MSG for
+    // --no-edit to pick up, but a missing MERGE_MSG would otherwise launch $EDITOR and hang
+    // this unattended nightly process forever. Failing fast beats hanging.
+    await execFn('git -c core.editor=true commit --no-edit');
+    // Clear any lingering sequencer state so the next `git status` doesn't report
+    // "revert in progress". An error here just means there was none.
+    await execFn('git revert --quit').catch(() => {});
+  } catch (err) {
+    revertErr = err;
+    // Leave nothing half-applied. Safe for the churn files: they are in the stash and get
+    // restored immediately below, and step 1 proved there is no human WIP to destroy.
+    await execFn('git revert --quit').catch(() => {});
+    await execFn('git reset --hard HEAD').catch(() => {});
+  }
+
+  const churnRestoreError = stashed ? await popChurn(execFn) : undefined;
+
+  if (revertErr) {
+    const e = revertErr instanceof Error ? revertErr : new Error(String(revertErr));
+    if (churnRestoreError) e.message = `${e.message} | ${churnRestoreError}`;
+    throw e;
+  }
+
+  const { stdout } = await execFn('git rev-parse HEAD');
+  return { revertCommitHash: stdout.trim(), churnRestoreError };
+}
 
 export async function rollback(deps: RollbackDeps = {}): Promise<string[]> {
   const { checkForRollbacksFn = checkForRollbacks, execFn = defaultRollbackExec } = deps;
@@ -169,8 +255,12 @@ export async function rollback(deps: RollbackDeps = {}): Promise<string[]> {
         // recoverability parity with the original fix), and warn when the reverted fix
         // touched code that needs a rebuild/restart to take effect — the fix's own audit
         // record carries files_changed, so no extra git call is needed for that.
-        await execFn(`git revert --no-edit ${flag.commitHash}`);
-        const { stdout: revHash } = await execFn('git rev-parse HEAD');
+        // The revert goes through gitRevertPreservingChurn (2026-07-21) so the nightly
+        // pa/data/profile* churn can neither abort it nor be destroyed by it.
+        if (!flag.commitHash) {
+          throw new Error('git-revert rollback flag carries no commit hash — nothing to revert.');
+        }
+        const { revertCommitHash, churnRestoreError } = await gitRevertPreservingChurn(flag.commitHash, execFn);
         await execFn('git push origin master');
         await markDraftMeta(flag.draftName, { status: 'rejected_post_rollback' }).catch(() => {});
 
@@ -180,7 +270,7 @@ export async function rollback(deps: RollbackDeps = {}): Promise<string[]> {
         const needsRebuild = touched.some((f: string) =>
           f.startsWith('pa/src') || f.startsWith('projects/telegram-bot/src'));
 
-        lines.push(`- **Reverted** code fix \`${flag.commitHash}\` targeting \`${flag.skillName}\` (revert commit \`${revHash.trim()}\`) — elevated failure rate since the fix was applied.${needsRebuild ? ' ⚠️ The reverted fix touched framework/bot source — a rebuild and bot restart may be required for the revert to take effect.' : ''}`);
+        lines.push(`- **Reverted** code fix \`${flag.commitHash}\` targeting \`${flag.skillName}\` (revert commit \`${revertCommitHash}\`) — elevated failure rate since the fix was applied.${needsRebuild ? ' ⚠️ The reverted fix touched framework/bot source — a rebuild and bot restart may be required for the revert to take effect.' : ''}${churnRestoreError ? ` ⚠️ ${churnRestoreError}` : ''}`);
 
         await appendAuditRecord({
           ts: new Date().toISOString(),
@@ -191,7 +281,7 @@ export async function rollback(deps: RollbackDeps = {}): Promise<string[]> {
           risk_flags: meta?.risk_flags ?? [],
           reason: 'Elevated failure rate since the code fix was applied — git-reverted.',
           commit_hash: flag.commitHash,
-          revert_commit_hash: revHash.trim(),
+          revert_commit_hash: revertCommitHash,
           baseline: toAuditBaseline(await skillRunStats(flag.skillName, ANALYSIS_DAYS)),
         });
         continue; // audit written above with the revert-specific fields — skip the shared one
@@ -532,7 +622,7 @@ async function main() {
   console.log(report);
 
   const result = await notifyUser('Self-Improvement Loop — Nightly Report', report, {
-    topic: getReportTopic(),
+    topic: await getReportTopic(),
     severity: 'info',
   });
   if (!result.sent) {

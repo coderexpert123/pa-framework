@@ -110,9 +110,14 @@ pa/data/profile-history-archive.kb-watermark.json
 # text or using its proper output path (run_brief.py has a documented retry
 # for this exact failure mode). No application code writes these filenames —
 # confirmed via full-repo grep 2026-07-09. If a new one recurs, add it here.
+# /output.md added 2026-07-21: a full BRIEFING_START daily-mail-brief landed at
+# root under this new name. /error_log.txt is the same class from the error
+# side — a worker dumping a one-line provider error instead of returning it.
 /message_to_user.md
 /output.json
+/output.md
 /skill_proposals.json
+/error_log.txt
 
 # Scratch workspace — for ad-hoc / WIP / throwaway files (see scratch/README.md)
 /scratch/*
@@ -150,6 +155,14 @@ src_pdfs/
 **/data/legacy_output/
 **/data/query-results/
 **/data/market_cache/
+
+# Send-receipt logs for send-or-silent skills (a watchdog cross-checks
+# "should have sent" against these). Machine-appended runtime state, not source:
+# only the CURRENT window is ever read, so history has no durable value, while
+# tracking it would dirty the tree on every send (and trip the code-fixer's
+# clean-worktree floor). Decision 2026-07-21; note the
+# **/data/{raw,processed,exports}/ globs do NOT cover this path.
+**/data/alerts_sent.jsonl
 
 # Daily-mail-brief runtime artifacts (fetched email payloads + regenerated
 # brief inputs/outputs — personal, recreated each run)

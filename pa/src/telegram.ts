@@ -27,8 +27,41 @@ export function splitMessage(text: string): string[] {
 }
 
 /**
+ * Outcome of a send. Returned (never thrown) so callers — notably
+ * `lib/notify.ts` — can tell a delivered message from a rejected one.
+ *
+ * Before 2026-07-21 this function returned `Promise<void>` and merely
+ * console.error'd failures, so `notifyUser` recorded dedup state and logged
+ * `sent:true` for messages Telegram had rejected (the audit found 293
+ * "400 Bad Request: chat_id is empty" responses and ~97 alerts logged as
+ * delivered that never arrived). Do NOT regress this back to `void`.
+ */
+export type SendResult =
+  | { ok: true; chunks: number }
+  | {
+      ok: false;
+      reason: 'http' | 'network' | 'no-chat-id' | 'empty-text';
+      status?: number;
+      detail?: string;
+    };
+
+const DETAIL_MAX_LEN = 300;
+
+function detailOf(err: unknown): string {
+  return String((err as { message?: string })?.message ?? err).slice(0, DETAIL_MAX_LEN);
+}
+
+function httpFailure(status: number, detail: string): SendResult {
+  return { ok: false, reason: 'http', status, detail: detail.slice(0, DETAIL_MAX_LEN) };
+}
+
+function networkFailure(err: unknown): SendResult {
+  return { ok: false, reason: 'network', detail: detailOf(err) };
+}
+
+/**
  * Send text to a Telegram chat/thread using the given bot token.
- * Never throws — logs errors only.
+ * Never throws — logs errors and returns a `SendResult` describing the outcome.
  *
  * @param parseMode Optional parse mode override. Pass `false` for plain-text
  *  (no parse_mode in payload). Pass `'MarkdownV2'` to route through
@@ -40,8 +73,29 @@ export async function sendToTelegram(
   config: TelegramOutput,
   token: string,
   parseMode?: string | false,
-): Promise<void> {
+): Promise<SendResult> {
   const refId = `s-${randomBytes(6).toString('hex')}`;
+
+  // Preflight guards — both of these produce a guaranteed Telegram 400, so we
+  // refuse to issue the HTTP call at all and report the reason to the caller.
+  if (!String(config.chat_id || '').trim()) {
+    console.error('[pa/telegram] sendToTelegram aborted: chat_id is empty');
+    log('error', 'telegram', 'send aborted — empty chat_id', {
+      refId,
+      threadId: config.thread_id,
+    });
+    return { ok: false, reason: 'no-chat-id' };
+  }
+  if (!text || !text.trim()) {
+    console.error('[pa/telegram] sendToTelegram aborted: message text is empty');
+    log('error', 'telegram', 'send aborted — empty text', {
+      refId,
+      chatId: config.chat_id,
+      threadId: config.thread_id,
+    });
+    return { ok: false, reason: 'empty-text' };
+  }
+
   // For MarkdownV2 callers, sanitize the body so identifiers (node_modules,
   // snake_case), Windows paths, parens, etc. don't trigger parse failures.
   // The italic `_Ref: <id>_` trailer is appended AFTER sanitize so its markers
@@ -55,6 +109,10 @@ export async function sendToTelegram(
   const refTrailer = parseMode === 'MarkdownV2' ? `_Ref: ${refId.replace('-', '\\-')}_` : `_Ref: ${refId}_`;
   const textWithRef = `${safeBody}\n\n${refTrailer}`;
   const chunks = splitMessage(textWithRef);
+
+  // First failure wins; remaining chunks are still attempted (unchanged
+  // behavior) so a mid-message failure doesn't swallow the rest of the output.
+  let failure: SendResult | null = null;
 
   for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
     const chunk = chunks[chunkIndex];
@@ -91,7 +149,17 @@ export async function sendToTelegram(
               body: JSON.stringify(body),
             });
             if (!res2.ok) {
-              console.error(`[pa/telegram] sendToTelegram failed (plain-text fallback): ${res2.status} ${await res2.text()}`);
+              const errorText2 = await res2.text();
+              console.error(`[pa/telegram] sendToTelegram failed (plain-text fallback): ${res2.status} ${errorText2}`);
+              log('error', 'telegram', 'send failed (plain-text fallback)', {
+                refId,
+                chatId: config.chat_id,
+                threadId: config.thread_id,
+                chunkIndex,
+                status: res2.status,
+                detail: errorText2.slice(0, DETAIL_MAX_LEN),
+              });
+              failure ??= httpFailure(res2.status, errorText2);
             } else {
               log('info', 'telegram', 'skill message sent (plain-text fallback)', {
                 refId,
@@ -103,9 +171,26 @@ export async function sendToTelegram(
             }
           } catch (err) {
             console.error('[pa/telegram] sendToTelegram plain-text fallback error:', err);
+            log('error', 'telegram', 'send error (plain-text fallback)', {
+              refId,
+              chatId: config.chat_id,
+              threadId: config.thread_id,
+              chunkIndex,
+              detail: detailOf(err),
+            });
+            failure ??= networkFailure(err);
           }
         } else {
           console.error(`[pa/telegram] sendToTelegram failed: ${res.status} ${errorText}`);
+          log('error', 'telegram', 'send failed', {
+            refId,
+            chatId: config.chat_id,
+            threadId: config.thread_id,
+            chunkIndex,
+            status: res.status,
+            detail: errorText.slice(0, DETAIL_MAX_LEN),
+          });
+          failure ??= httpFailure(res.status, errorText);
         }
       } else {
         log('info', 'telegram', 'skill message sent', {
@@ -118,6 +203,16 @@ export async function sendToTelegram(
       }
     } catch (err) {
       console.error('[pa/telegram] sendToTelegram network error:', err);
+      log('error', 'telegram', 'send network error', {
+        refId,
+        chatId: config.chat_id,
+        threadId: config.thread_id,
+        chunkIndex,
+        detail: detailOf(err),
+      });
+      failure ??= networkFailure(err);
     }
   }
+
+  return failure ?? { ok: true, chunks: chunks.length };
 }

@@ -31,8 +31,18 @@ export async function catchupCommand(opts: CatchupOptions = {}): Promise<void> {
   // Heartbeat the lock while the run is in flight: acquireLock purges any
   // lock whose heartbeat is older than HEARTBEAT_STALE_MS (10 min) even when
   // the holder is alive, and catchup runs can exceed that (skill execution +
-  // rotation + prune). Without this, Task Scheduler's next 15-min invocation
-  // would steal the lock mid-run and two catchups would overlap.
+  // rotation + prune). Without this, Task Scheduler's next invocation would
+  // steal the lock mid-run and two catchups would overlap.
+  //
+  // Catchup's cadence is EVERY MINUTE, not every 15 minutes (this comment
+  // claimed 15m until 2026-07-21 — wrong by 15x). Both registrations say so:
+  // syncSchedulesWindows() uses `/sc minute /mo 1` and syncSchedulesPosix()
+  // uses `* * * * *`, and the live PA-Catchup / PA-Catchup-Reminders triggers
+  // repeat at PT1M. That 1-minute cadence is the AMPLIFIER behind the retry
+  // storms AI-098 exists to stop: a perma-failing skill is relaunched ~60x/h,
+  // so the 2026-07-16 gemini capacity outage turned 5 scheduled occurrences
+  // into ~93 relaunches. Anything reasoning about catchup's blast radius (lock
+  // hold time, worker admission slots, retry pacing) must budget for 1 minute.
   const heartbeat = setInterval(() => {
     void blackboard.updateHeartbeat(lockKey, 'catchup-command').catch(() => {});
   }, 60_000);

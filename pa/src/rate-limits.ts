@@ -4,6 +4,7 @@ import { homedir } from 'os';
 import { randomBytes } from 'crypto';
 import lockfile from 'proper-lockfile';
 import { safeLockOptions } from './lib/safe-lock.js';
+import { log } from './lib/log.js';
 
 export type RateLimitClassification =
   | 'quota-daily'
@@ -12,6 +13,10 @@ export type RateLimitClassification =
   | 'server-overload'
   | 'usage-limit-session'
   | 'auth-error'
+  // Terminal provider-side BILLING fault (e.g. Zhipu 1113 "Insufficient balance
+  // or no resource package") delivered over HTTP 429. Not a rate limit: it never
+  // self-heals, so it earns a long cooldown plus a user alert, not a 2-minute rest.
+  | 'account-exhausted'
   | 'unknown';
 
 export type RateLimitSource =
@@ -78,12 +83,46 @@ export function parseRateLimitDuration(output: string, worker?: string): number 
 }
 
 /**
- * Worker-aware rate-limit classifier. Dispatches to per-worker sub-classifiers
- * that live in rate-limits-{gemini,codex,claude}.ts. Phases 2-4 extend each
- * branch; until wired, returns an unknown/default result.
+ * A dead priority-1 worker is exactly the class of thing the user must be told
+ * about — failover keeps the fleet working, which is precisely why nobody
+ * noticed zclaude was dead for eight days. Alerts once per cooldown window via a
+ * stable dedupKey (so a genuinely dead account nags at the cooldown cadence, not
+ * on every dispatch) and never throws: notification failure must not change
+ * dispatch behaviour.
  */
+async function alertAccountExhausted(worker: string, result: RateLimitParseResult): Promise<void> {
+  log('warn', 'rate-limits', `terminal account fault: ${worker} benched`, {
+    worker,
+    classification: result.classification,
+    minutes: result.minutes,
+    source: result.source,
+    raw: result.raw?.slice(0, 300),
+  });
+  try {
+    const { notifyUser } = await import('./lib/notify.js');
+    await notifyUser(
+      `Worker ${worker} disabled — account balance exhausted`,
+      [
+        `${worker} is returning a terminal billing fault (HTTP 429 carrying Zhipu code 1113, "Insufficient balance or no resource package"). This is NOT a rate limit and will not clear on its own.`,
+        '',
+        `Action required: recharge the Zhipu (z.ai) account. Until then ${worker} is benched for ${result.minutes} minutes and every dispatch fails over to the next worker.`,
+        '',
+        `Raw: ${(result.raw ?? '').slice(0, 300)}`,
+      ].join('\n'),
+      {
+        dedupKey: `worker-account-exhausted:${worker}`,
+        dedupWindowMs: result.minutes * 60 * 1000,
+        severity: 'error',
+      },
+    );
+  } catch (err: any) {
+    log('warn', 'rate-limits', 'account-exhausted alert failed', { worker, error: err?.message });
+  }
+}
+
 /**
- * Worker-aware rate-limit classifier.
+ * Worker-aware rate-limit classifier. Dispatches to per-worker sub-classifiers
+ * that live in rate-limits-{gemini,codex,claude}.ts.
  *
  * Returns null when there is no evidence of a rate limit — the caller should
  * treat the failure as a regular (non-rate-limit) error and stop, not failover.
@@ -92,7 +131,8 @@ export function parseRateLimitDuration(output: string, worker?: string): number 
  * within its internal retry budget — caller should skip to the next worker.
  *
  * Returns { minutes > 0 } for a confirmed, exhausted rate limit — caller should
- * record the cooldown and failover.
+ * record the cooldown and failover. 'account-exhausted' is the terminal variant:
+ * same shape, long cooldown, and the user has already been alerted here.
  */
 export async function classifyRateLimit(
   worker: string,
@@ -105,11 +145,29 @@ export async function classifyRateLimit(
   if (worker === 'claude' || worker === 'zclaude') {
     // Session JSONL is the authoritative mechanism: exact 429 api_error events written by the CLI.
     // No text heuristics. Returns null when no session evidence (= not a rate limit).
-    const { readClaudeSessionErrors, classifyClaudeErrors } = await import('./rate-limits-claude.js');
+    const { readClaudeSessionErrors, classifyClaudeErrors, classifyZhipuAccountExhausted } = await import('./rate-limits-claude.js');
+
+    // Terminal billing faults are checked on the RAW output first, ahead of the
+    // session-JSONL path. The 2026-07 zclaude incident produced no session
+    // evidence at all — the 1113 error landed in stdout only, so the session
+    // classifier returned null, the failure was logged as 'no-session-evidence'
+    // and NO cooldown was ever written. Text heuristics stay banned for ordinary
+    // rate limits; this narrow, unambiguous signature is the sole exception,
+    // because the cost of missing it is an unbounded per-dispatch retry loop.
+    const terminal = classifyZhipuAccountExhausted(`${stdout}\n${stderr}`);
+    if (terminal) {
+      await alertAccountExhausted(worker, terminal);
+      return terminal;
+    }
+
     const errors = stateDir && statePattern
       ? await readClaudeSessionErrors(sessionId, stateDir, statePattern)
       : [];
     const result = classifyClaudeErrors(errors);
+    if (result?.classification === 'account-exhausted') {
+      await alertAccountExhausted(worker, result);
+      return result;
+    }
     if (result === null && /429|rate limit|quota/i.test(stdout + stderr)) {
       const { appendUnparseableRateLimit } = await import('./rate-limit-unparseable-log.js');
       const combined = (stdout + stderr).slice(0, 100);
@@ -258,6 +316,29 @@ export async function recordRateLimit(
     };
     console.log(`[rate-limit] ${worker} cooling down until ${cooldownUntil} (${reason})`);
     await saveState(state);
+  });
+}
+
+/**
+ * Drop a worker's cooldown outright. A successful run is the strongest possible
+ * evidence that the fault is gone, and it must be able to override a cooldown
+ * that outlives it — notably 'account-exhausted', whose deliberately long window
+ * would otherwise keep a freshly recharged account benched for hours.
+ * Returns true when an entry was actually removed.
+ */
+export async function clearWorkerCooldown(worker: string): Promise<boolean> {
+  return withRateLimitLock(async () => {
+    const state = await loadState();
+    if (!state[worker]) return false;
+    const previous = state[worker];
+    delete state[worker];
+    await saveState(state);
+    log('info', 'rate-limits', `cooldown cleared: ${worker}`, {
+      worker,
+      classification: previous.classification,
+      cleared_cooldown_until: previous.cooldown_until,
+    });
+    return true;
   });
 }
 

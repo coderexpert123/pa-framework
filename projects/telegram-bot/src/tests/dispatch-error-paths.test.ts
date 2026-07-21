@@ -1,7 +1,9 @@
 /**
  * Tests for the dispatch error-path changes:
  * - tryClassifyAndNotify tri-state outcomes
- * - dispatchMessage early-return on non-rate-limit failures
+ * - dispatchMessage falls over to the next worker on non-rate-limit failures
+ *   (previously this early-returned an error instead of cascading, the way
+ *   skill runs already do via runWithFailover)
  * - empty-response handling
  * - rate-limit cascade preserved
  *
@@ -119,10 +121,10 @@ describe('tryClassifyAndNotify outcomes', () => {
 });
 
 // ---------------------------------------------------------------------------
-// dispatchMessage early-return paths
+// dispatchMessage failover-cascade paths
 // ---------------------------------------------------------------------------
 
-describe('dispatchMessage non-rate-limit early-return', () => {
+describe('dispatchMessage non-rate-limit failover cascade', () => {
   let testDir: string;
 
   beforeEach(async () => {
@@ -137,32 +139,32 @@ describe('dispatchMessage non-rate-limit early-return', () => {
     await rmRetry(testDir);
   });
 
-  it('default zclaude non-rate-limit failure returns workerError:true', async () => {
+  it('default zclaude non-rate-limit failure falls over to gemini', async () => {
     await writeConfig(testDir, [
       { name: 'zclaude', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 1 },
-      { name: 'gemini', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 2 },
+      { name: 'gemini', command: 'node', args: ['-e', "process.stdout.write('gemini took over'); process.exitCode=0"], priority: 2 },
     ]);
 
     const resource = `topic-999_${testRunId}-1`;
     const result = await dispatchMessage('hello', undefined, undefined, makeState(), {}, resource, 'zclaude');
 
-    assert.equal(result.workerError, true);
-    assert.ok(result.response.startsWith('⚠️ zclaude failed'));
-    assert.equal(result.dispatchedWorker, undefined);
+    assert.equal(result.dispatchedWorker, 'gemini');
+    assert.ok(result.response.includes('gemini took over'));
+    assert.equal(result.workerError, undefined);
   });
 
-  it('default gemini non-rate-limit (empty rate_limit_patterns) returns workerError:true', async () => {
+  it('default gemini non-rate-limit (empty rate_limit_patterns) falls over to zclaude', async () => {
     await writeConfig(testDir, [
-      { name: 'zclaude', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 1 },
+      { name: 'zclaude', command: 'node', args: ['-e', "process.stdout.write('zclaude took over'); process.exitCode=0"], priority: 1 },
       { name: 'gemini', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 2, rate_limit_patterns: [] },
     ]);
 
     const resource = `topic-999_${testRunId}-2`;
     const result = await dispatchMessage('hello', undefined, undefined, makeState(), {}, resource, 'gemini');
 
-    assert.equal(result.workerError, true);
-    assert.ok(result.response.startsWith('⚠️ gemini failed'));
-    assert.equal(result.dispatchedWorker, undefined);
+    assert.equal(result.dispatchedWorker, 'zclaude');
+    assert.ok(result.response.includes('zclaude took over'));
+    assert.equal(result.workerError, undefined);
   });
 
   it('empty response (success=true, empty output) returns workerError:true with empty-response text', async () => {
@@ -179,10 +181,22 @@ describe('dispatchMessage non-rate-limit early-return', () => {
     assert.equal(result.dispatchedWorker, undefined);
   });
 
-  it('session is preserved in non-rate-limit early-return', async () => {
+  it('all workers failing exhausts the cascade and clears the stale session', async () => {
+    // Both configured workers fail (non-rate-limit) -> falls through preferred/default
+    // attempts into the full runWithFailover cascade -> exhausted. workerError is true
+    // (the dispatch genuinely failed end to end) and dispatchedWorker is undefined
+    // (the last-tried worker never actually succeeded, so it must not be reported as
+    // "dispatched" — otherwise the caller would pin the status card to a broken worker).
+    // The original session is dropped rather than kept, matching the pre-existing
+    // behavior of a rate-limit-triggered cascade exhaustion (this code path is now
+    // shared by both failure kinds).
+    // Uses zclaude+claude (not gemini/agy): those two resolve sessionId straight from
+    // CommandResult with no fallback, whereas gemini/agy fall back to scanning the
+    // real local session directory on disk even after a failure, which would leak an
+    // unrelated real session id into this assertion.
     await writeConfig(testDir, [
       { name: 'zclaude', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 1 },
-      { name: 'gemini', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 2 },
+      { name: 'claude', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 2 },
     ]);
 
     const originalSession = { session_id: 'keep-this', worker: 'zclaude', started_at: new Date().toISOString() };
@@ -190,27 +204,32 @@ describe('dispatchMessage non-rate-limit early-return', () => {
     const result = await dispatchMessage('hello', undefined, undefined, makeState({ session: originalSession }), {}, resource, 'zclaude');
 
     assert.equal(result.workerError, true);
-    assert.deepEqual(result.session, originalSession);
+    assert.equal(result.dispatchedWorker, undefined);
+    assert.equal(result.session, undefined);
+    assert.ok(result.response.length > 0, 'still returns a user-facing failure message, not a crash/blank');
   });
 
-  it('preferred zclaude non-rate-limit returns workerError:true', async () => {
+  it('preferred zclaude non-rate-limit falls over to default gemini', async () => {
     await writeConfig(testDir, [
       { name: 'zclaude', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 1 },
-      { name: 'gemini', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 2 },
+      { name: 'gemini', command: 'node', args: ['-e', "process.stdout.write('gemini fallback'); process.exitCode=0"], priority: 2 },
     ]);
 
     const resource = `topic-999_${testRunId}-5`;
     const result = await dispatchMessage('hello', undefined, undefined, makeState({ preferred_worker: 'zclaude' }), {}, resource, 'gemini');
 
-    assert.equal(result.workerError, true);
-    assert.ok(result.response.startsWith('⚠️ zclaude failed'));
-    assert.equal(result.dispatchedWorker, undefined);
+    assert.equal(result.dispatchedWorker, 'gemini');
+    assert.ok(result.response.includes('gemini fallback'));
+    assert.equal(result.workerError, undefined);
   });
 
-  it('rate-limit path preserved: rateLimitedWorker set, no workerError', async () => {
+  it('rate-limit path preserved: rateLimitedWorker set, workerError reflects overall failure', async () => {
     // gemini with RESOURCE_EXHAUSTED in stderr → isRateLimited.hit=true → classifyRateLimit
     // → { minutes: 2, ... } → rate-limit path → rateLimitedWorker set → falls to runWithFailover.
-    // zclaude fails too → buildWorkerResponse returns error string, no workerError.
+    // zclaude (the only fallback) fails too, non-rate-limit → cascade exhausted →
+    // buildWorkerResponse returns a generic error string, and workerError is true
+    // because the dispatch genuinely failed end to end despite rateLimitedWorker
+    // having been recorded along the way.
     await writeConfig(testDir, [
       { name: 'zclaude', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 1 },
       {
@@ -231,7 +250,8 @@ describe('dispatchMessage non-rate-limit early-return', () => {
     const resource = `topic-999_${testRunId}-6`;
     const result = await dispatchMessage('hello', undefined, undefined, makeState(), {}, resource, 'gemini');
 
-    assert.equal(result.workerError, undefined);
+    assert.equal(result.workerError, true);
+    assert.equal(result.dispatchedWorker, undefined);
     assert.equal(result.rateLimitedWorker, 'gemini');
   });
 });
@@ -274,13 +294,14 @@ describe('dispatchMessage stop-marker guard', () => {
   it('does NOT abort a dispatch newer than the /stop (user\'s next message)', async () => {
     await writeConfig(testDir, [
       { name: 'zclaude', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 1 },
+      { name: 'gemini', command: 'node', args: ['-e', "process.stdout.write('gemini reply'); process.exitCode=0"], priority: 2 },
     ]);
     const resource = `topic-999_${testRunId}-stop2`;
     markTopicStopped(resource.replace(/^topic-/, ''), 'stop', 1000);
 
     const result = await dispatchMessage('hello', undefined, undefined, makeState(), {}, resource, 'zclaude', undefined, undefined, 1001 /* newer than /stop */);
 
-    assert.equal(result.workerError, true);
-    assert.ok(result.response.startsWith('⚠️ zclaude failed'), 'spawn actually happened and failed normally');
+    assert.equal(result.dispatchedWorker, 'gemini', 'spawn actually happened, zclaude failed, cascaded to gemini instead of aborting');
+    assert.ok(result.response.includes('gemini reply'));
   });
 });

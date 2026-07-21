@@ -152,12 +152,18 @@ export async function cleanupOrphanedWorkers(excludeSkills?: Set<string>): Promi
       // worker is still actively managed — leave the file alone so it can be
       // cleaned up when the spawner eventually exits normally or crashes.
       if (!isProcessAlive(entry.spawnedBy)) {
-        if (isProcessAlive(entry.pid)) {
+        // Check descendants too, not just the shell wrapper: the wrapper can die
+        // while its CLI child lives (2026-07-04), and taskkill /T on a dead pid
+        // reaches nothing. A dead intermediate also breaks taskkill's tree walk
+        // even when the wrapper is alive, so kill each surviving pid's subtree
+        // individually rather than relying on one walk from the wrapper.
+        const survivors = [entry.pid, ...(entry.descendants ?? [])].filter(isProcessAlive);
+        if (survivors.length > 0) {
           log('warn', 'worker-pids', 'Killing orphaned worker', {
             pid: entry.pid, worker: entry.worker, skill: entry.skill,
-            spawnedBy: entry.spawnedBy,
+            spawnedBy: entry.spawnedBy, survivors,
           });
-          killProcessTree(entry.pid);
+          for (const pid of survivors) killProcessTree(pid);
           killed++;
         }
         // Spawner is dead — remove the file whether or not the worker was alive

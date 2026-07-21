@@ -404,21 +404,24 @@ class TestDetectPortfolioStatementEmails(unittest.TestCase):
         "subject": "Sensex rallies 500 points; Nifty at all-time high",
         "snippet": "Markets surged today as NSE and BSE saw heavy buying in banking stocks.",
     }
-    exampleprovider_EMAIL = {
-        "id": "exampleprovider001",
-        "from": "Example Sender <sender@example.com>",
+    # The tracked provider (BRIEF_STATEMENT_PROVIDER) — the only one that should
+    # fire the trigger. Fixtures stay neutral: the real provider set lives in
+    # ~/.pa/secrets.env, never in this public-tracked file.
+    STATEMENT_EMAIL = {
+        "id": "statement001",
+        "from": "Sam Advisor <sam.advisor@example-wealth.test>",
         "subject": "MONTHLY REPORT- TESTOWNER CLIENT",
         "snippet": "Please find attached your monthly portfolio report from Example Wealth.",
     }
-    examplebank_ALERT_EMAIL = {
-        "id": "examplebank001",
-        "from": "alerts@examplebank.bank.in",
+    BANK_ALERT_EMAIL = {
+        "id": "bankalert001",
+        "from": "alerts@example-bank.test",
         "subject": "A payment was made using your Credit Card",
-        "snippet": "Dear Customer, Rs. 11178.38 has been debited from your examplebank Bank Credit Card.",
+        "snippet": "Dear Customer, Rs. 11178.38 has been debited from your Example Bank Credit Card.",
     }
-    examplebroker2_CONTRACT_NOTE_EMAIL = {
-        "id": "examplebroker2001",
-        "from": "noreply@examplebroker2.com",
+    OTHER_BROKER_CONTRACT_NOTE_EMAIL = {
+        "id": "otherbroker001",
+        "from": "noreply@example-broker.test",
         "subject": "Contract Note for 03-Jul-2026",
         "snippet": "Please find attached your contract note for trades executed today.",
     }
@@ -488,43 +491,44 @@ class TestDetectPortfolioStatementEmails(unittest.TestCase):
         mock_gemini.assert_not_called()  # should fail before reaching call_gemini
 
     @patch("run_brief.call_gemini")
-    def test_exampleprovider_statement_triggers(self, mock_gemini):
-        mock_gemini.return_value = '["exampleprovider001"]'
-        result = run_brief.detect_portfolio_statement_emails([self.exampleprovider_EMAIL])
-        self.assertEqual(result, ["exampleprovider001"])
+    def test_tracked_provider_statement_triggers(self, mock_gemini):
+        mock_gemini.return_value = '["statement001"]'
+        result = run_brief.detect_portfolio_statement_emails([self.STATEMENT_EMAIL])
+        self.assertEqual(result, ["statement001"])
 
     @patch("run_brief.call_gemini")
-    def test_examplebank_bank_alert_does_not_trigger(self, mock_gemini):
-        # Routine examplebank transactional alerts must not be flagged as portfolio statements
+    def test_bank_alert_does_not_trigger(self, mock_gemini):
+        # Routine bank transactional alerts must not be flagged as portfolio statements
         # (this was the primary source of near-daily false triggers before the prompt fix)
         mock_gemini.return_value = "[]"
-        result = run_brief.detect_portfolio_statement_emails([self.examplebank_ALERT_EMAIL])
+        result = run_brief.detect_portfolio_statement_emails([self.BANK_ALERT_EMAIL])
         self.assertEqual(result, [])
 
     @patch("run_brief.call_gemini")
-    def test_examplebroker2_contract_note_does_not_trigger(self, mock_gemini):
-        # Other-broker statements must not fire the ad-hoc trigger — only exampleprovider should
+    def test_other_broker_contract_note_does_not_trigger(self, mock_gemini):
+        # Other-broker statements must not fire the ad-hoc trigger — only the
+        # configured BRIEF_STATEMENT_PROVIDER should
         mock_gemini.return_value = "[]"
-        result = run_brief.detect_portfolio_statement_emails([self.examplebroker2_CONTRACT_NOTE_EMAIL])
+        result = run_brief.detect_portfolio_statement_emails([self.OTHER_BROKER_CONTRACT_NOTE_EMAIL])
         self.assertEqual(result, [])
 
     @patch("run_brief.call_gemini")
     def test_detect_triggers_logs_matched_sender_and_subject(self, mock_gemini):
-        mock_gemini.return_value = '["exampleprovider001"]'
+        mock_gemini.return_value = '["statement001"]'
         stderr = StringIO()
         with redirect_stderr(stderr):
-            run_brief.detect_triggers([self.exampleprovider_EMAIL])
+            run_brief.detect_triggers([self.STATEMENT_EMAIL])
         logged = stderr.getvalue()
         self.assertIn("MONTHLY REPORT- TESTOWNER CLIENT", logged)
-        self.assertIn("Example Sender", logged)
+        self.assertIn("Sam Advisor", logged)
 
     @patch("run_brief.call_gemini")
-    def test_detect_triggers_mixed_batch_only_exampleprovider_triggers(self, mock_gemini):
-        # A batch containing both a genuine exampleprovider email and noise (examplebank alert, news)
-        # should trigger only on the exampleprovider match.
-        mock_gemini.return_value = '["exampleprovider001"]'
+    def test_detect_triggers_mixed_batch_only_tracked_provider_triggers(self, mock_gemini):
+        # A batch containing both a genuine tracked-provider statement and noise
+        # (bank alert, market news) should trigger only on the tracked match.
+        mock_gemini.return_value = '["statement001"]'
         result = run_brief.detect_triggers(
-            [self.exampleprovider_EMAIL, self.examplebank_ALERT_EMAIL, self.NEWS_EMAIL]
+            [self.STATEMENT_EMAIL, self.BANK_ALERT_EMAIL, self.NEWS_EMAIL]
         )
         self.assertIn("portfolio-reports", result)
 
@@ -568,7 +572,7 @@ class TestPreflightFailurePath(RunBriefTestCase):
 
 class TestLoadPortfolioContext(unittest.TestCase):
     """load_portfolio_context() is pure file-I/O + parsing (no LLM call) — must be
-    resilient (fail-soft) and correctly scope to non-exampleprovider, non-examplebroker providers."""
+    resilient (fail-soft) and correctly skip the excluded providers."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -578,10 +582,15 @@ class TestLoadPortfolioContext(unittest.TestCase):
         # Owner has no default (public-repo hygiene, AI-094) — pin a placeholder.
         self._orig_owner = run_brief.PORTFOLIO_CONTEXT_OWNER
         run_brief.PORTFOLIO_CONTEXT_OWNER = "Testowner"
+        # Excluded providers are env-driven with an empty default for the same
+        # reason — pin neutral placeholders instead of the real provider set.
+        self._orig_excluded = run_brief.PORTFOLIO_CONTEXT_EXCLUDED_PROVIDERS
+        run_brief.PORTFOLIO_CONTEXT_EXCLUDED_PROVIDERS = {"Excludedbroker", "Deferredbroker"}
 
     def tearDown(self):
         run_brief.PORTFOLIO_JSON_DIR = self._orig_dir
         run_brief.PORTFOLIO_CONTEXT_OWNER = self._orig_owner
+        run_brief.PORTFOLIO_CONTEXT_EXCLUDED_PROVIDERS = self._orig_excluded
         self._tmp.cleanup()
 
     def _write_snapshot(self, filename, report_date, total_values):
@@ -594,7 +603,7 @@ class TestLoadPortfolioContext(unittest.TestCase):
 
     def test_unset_owner_disables_grounding(self):
         # AI-094: no personal-name default — empty owner must fail soft, not match everything.
-        self._write_snapshot("2026-06-01_Testowner_examplebanksec.pdf_FullData.json", "2026-06-01", [100000])
+        self._write_snapshot("2026-06-01_Testowner_Brokerone.pdf_FullData.json", "2026-06-01", [100000])
         run_brief.PORTFOLIO_CONTEXT_OWNER = ""
         self.assertEqual(run_brief.load_portfolio_context(), "")
 
@@ -605,39 +614,53 @@ class TestLoadPortfolioContext(unittest.TestCase):
     def test_empty_directory_returns_empty_string(self):
         self.assertEqual(run_brief.load_portfolio_context(), "")
 
-    def test_exampleprovider_excluded(self):
-        self._write_snapshot("2026-06-01_Testowner_exampleprovider.pdf_FullData.json", "2026-06-01", [100000])
+    def test_separately_reported_provider_excluded(self):
+        self._write_snapshot("2026-06-01_Testowner_Excludedbroker.pdf_FullData.json", "2026-06-01", [100000])
         result = run_brief.load_portfolio_context()
         self.assertEqual(result, "")
 
-    def test_examplebroker_excluded(self):
-        self._write_snapshot("2026-06-01_Testowner_examplebroker.pdf_FullData.json", "2026-06-01", [50000])
+    def test_deferred_provider_excluded(self):
+        self._write_snapshot("2026-06-01_Testowner_Deferredbroker.pdf_FullData.json", "2026-06-01", [50000])
         result = run_brief.load_portfolio_context()
         self.assertEqual(result, "")
+
+    def test_exclusion_is_case_insensitive(self):
+        # Snapshot filenames carry the provider's own casing; the configured
+        # exclusion list must match regardless of how either side is cased.
+        self._write_snapshot("2026-06-01_Testowner_EXCLUDEDBROKER.pdf_FullData.json", "2026-06-01", [100000])
+        self.assertEqual(run_brief.load_portfolio_context(), "")
+
+    def test_empty_exclusion_list_includes_everything(self):
+        # Default (nothing configured) must not silently drop providers.
+        run_brief.PORTFOLIO_CONTEXT_EXCLUDED_PROVIDERS = set()
+        self._write_snapshot("2026-06-01_Testowner_Excludedbroker.pdf_FullData.json", "2026-06-01", [100000])
+        result = run_brief.load_portfolio_context()
+        self.assertIn("Excludedbroker", result)
+        self.assertNotIn("excludes", result, "no scope note when nothing is excluded")
 
     def test_other_owner_excluded(self):
-        self._write_snapshot("2026-06-01_Otherperson_exampleprovider.pdf_FullData.json", "2026-06-01", [100000])
-        self._write_snapshot("2026-06-01_Otherperson_examplebanksec.pdf_FullData.json", "2026-06-01", [200000])
+        self._write_snapshot("2026-06-01_Otherperson_Excludedbroker.pdf_FullData.json", "2026-06-01", [100000])
+        self._write_snapshot("2026-06-01_Otherperson_Brokerone.pdf_FullData.json", "2026-06-01", [200000])
         result = run_brief.load_portfolio_context()
         self.assertEqual(result, "", "Only the primary user's own snapshots should be used for grounding")
 
     def test_picks_most_recent_file_per_provider(self):
-        self._write_snapshot("2026-01-01_Testowner_examplebanksec.pdf_FullData.json", "2026-01-01", [100000])
-        self._write_snapshot("2026-06-01_Testowner_examplebanksec.pdf_FullData.json", "2026-06-01", [150000])
+        self._write_snapshot("2026-01-01_Testowner_Brokerone.pdf_FullData.json", "2026-01-01", [100000])
+        self._write_snapshot("2026-06-01_Testowner_Brokerone.pdf_FullData.json", "2026-06-01", [150000])
         result = run_brief.load_portfolio_context()
         self.assertIn("150,000", result)
         self.assertIn("2026-06-01", result)
         self.assertNotIn("100,000", result)
 
     def test_multiple_providers_all_included(self):
-        self._write_snapshot("2026-06-01_Testowner_examplebanksec.pdf_FullData.json", "2026-06-01", [100000])
+        self._write_snapshot("2026-06-01_Testowner_Brokerone.pdf_FullData.json", "2026-06-01", [100000])
         self._write_snapshot("2026-06-01_Testowner_Portfolio.pdf_FullData.json", "2026-06-01", [200000])
         result = run_brief.load_portfolio_context()
-        self.assertIn("examplebanksec", result)
+        self.assertIn("Brokerone", result)
         self.assertIn("Portfolio", result)
 
     def test_malformed_json_skipped_without_crashing(self):
-        with open(os.path.join(self.json_dir, "2026-06-01_Testowner_examplebanksec.pdf_FullData.json"), "w") as f:
+        with open(os.path.join(self.json_dir, "2026-06-01_Testowner_Brokerone.pdf_FullData.json"), "w") as f:
             f.write("{not valid json")
         result = run_brief.load_portfolio_context()
         self.assertEqual(result, "")
@@ -651,7 +674,7 @@ class TestLoadPortfolioContext(unittest.TestCase):
         self.assertEqual(result, "")
 
     def test_one_malformed_schema_does_not_wipe_out_other_providers(self):
-        # examplebanksec has a schema that would raise (report_metadata is null, and a
+        # Brokerone has a schema that would raise (report_metadata is null, and a
         # non-numeric current_value) — Portfolio is well-formed. The malformed
         # one must be skipped without discarding the valid one.
         bad_data = {
@@ -659,7 +682,7 @@ class TestLoadPortfolioContext(unittest.TestCase):
             "summary": [{"asset_class": "Equity", "current_value": "not-a-number"}],
         }
         with open(
-            os.path.join(self.json_dir, "2026-06-01_Testowner_examplebanksec.pdf_FullData.json"),
+            os.path.join(self.json_dir, "2026-06-01_Testowner_Brokerone.pdf_FullData.json"),
             "w", encoding="utf-8",
         ) as f:
             json.dump(bad_data, f)
@@ -668,7 +691,74 @@ class TestLoadPortfolioContext(unittest.TestCase):
         result = run_brief.load_portfolio_context()
         self.assertIn("Portfolio", result)
         self.assertIn("200,000", result)
-        self.assertNotIn("examplebanksec", result)
+        self.assertNotIn("Brokerone", result)
+
+
+class TestProviderIdentifiersAreEnvDriven(unittest.TestCase):
+    """The provider set is personal data and this file ships to the public mirror,
+    so every provider name in a prompt must come from the env-driven module
+    globals — never a literal in the source."""
+
+    def setUp(self):
+        self._orig = {
+            name: getattr(run_brief, name)
+            for name in (
+                "STATEMENT_PROVIDER", "STATEMENT_SENDER_NAMES",
+                "STATEMENT_EXAMPLE_SUBJECT", "STATEMENT_EXAMPLE_SENDER",
+                "OTHER_PROVIDERS", "BANK_ALERT_SENDERS",
+            )
+        }
+        run_brief.STATEMENT_PROVIDER = "Examplewealth"
+        run_brief.STATEMENT_SENDER_NAMES = "Sam Advisor"
+        run_brief.STATEMENT_EXAMPLE_SUBJECT = "MONTHLY REPORT- TESTOWNER CLIENT"
+        run_brief.STATEMENT_EXAMPLE_SENDER = "Sam Advisor"
+        run_brief.OTHER_PROVIDERS = ["Examplebroker", "Exampleplatform"]
+        run_brief.BANK_ALERT_SENDERS = ["Examplebank"]
+
+    def tearDown(self):
+        for name, value in self._orig.items():
+            setattr(run_brief, name, value)
+
+    def _classifier_prompt(self):
+        with patch("run_brief.call_gemini", return_value="[]") as mock_gemini:
+            run_brief.detect_portfolio_statement_emails(
+                [{"id": "x", "from": "a@b.test", "subject": "s", "snippet": "n"}]
+            )
+        return mock_gemini.call_args.args[0]
+
+    def test_classifier_prompt_uses_configured_provider(self):
+        prompt = self._classifier_prompt()
+        self.assertIn("EXAMPLEWEALTH", prompt, "tracked provider named in upper case")
+        self.assertIn("Sam Advisor", prompt)
+        self.assertIn("MONTHLY REPORT- TESTOWNER CLIENT", prompt)
+        self.assertIn("Examplebroker, Exampleplatform", prompt)
+        self.assertIn("Examplebank", prompt)
+        self.assertIn("not Examplewealth", prompt)
+
+    def test_classifier_prompt_degrades_cleanly_when_lists_unset(self):
+        run_brief.OTHER_PROVIDERS = []
+        run_brief.BANK_ALERT_SENDERS = []
+        prompt = self._classifier_prompt()
+        # Still a usable instruction, just without the deployment's specifics.
+        self.assertIn("any provider that is not Examplewealth", prompt)
+        self.assertIn("e-mandate notices\n", prompt)
+        self.assertIn("Return ONLY a JSON array", prompt)
+
+    def test_grounding_rule_names_configured_providers(self):
+        rule = run_brief.build_grounding_rule()
+        self.assertIn("Examplebroker, Exampleplatform", rule)
+        self.assertIn("NOT Examplewealth", rule)
+        self.assertIn("NOT a routine Examplebank transactional alert", rule)
+
+    def test_grounding_rule_omits_bank_caveat_when_unset(self):
+        run_brief.BANK_ALERT_SENDERS = []
+        rule = run_brief.build_grounding_rule()
+        self.assertIn("NOT Examplewealth", rule)
+        self.assertNotIn("transactional alert", rule)
+
+    def test_build_prompt_embeds_the_grounding_rule(self):
+        prompt = run_brief.build_prompt("some window", 3, "emails here")
+        self.assertIn(run_brief.build_grounding_rule(), prompt)
 
 
 if __name__ == "__main__":

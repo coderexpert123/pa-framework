@@ -287,3 +287,89 @@ describe('partitionOverdueByFailureBackoff', () => {
     assert.equal(partition.runnable.length, 1);
   });
 });
+
+/**
+ * The pacing contract as DOCUMENTED (CLAUDE.md "Scheduler -> Catchup", and
+ * scheduler.ts's own comment on FAILURE_BACKOFF_LADDER_MS): 0 / 30m / 2h / 8h,
+ * then park at 5. The per-rung tests above check the rungs individually; these
+ * pin the sequence as a whole plus the invariant that makes backoff safe to
+ * ship — so a future edit to the ladder has to come here and change the
+ * documented numbers deliberately rather than drift silently.
+ */
+describe('AI-098 documented pacing contract', () => {
+  const base = Date.now();
+  // missedAt BEFORE the last attempt = a retry within the same missed
+  // occurrence, which is the only situation backoff is allowed to suppress.
+  const missedAtMs = base - 1000;
+
+  const DOCUMENTED: Array<number | 'park'> = [
+    0,             // 1 consecutive failure — immediate retry
+    30 * 60_000,   // 2
+    2 * 3_600_000, // 3
+    8 * 3_600_000, // 4
+    'park',        // 5 and beyond
+  ];
+
+  it('each rung defers until exactly its delay has elapsed, then runs', () => {
+    for (let failures = 1; failures <= DOCUMENTED.length; failures++) {
+      const expected = DOCUMENTED[failures - 1];
+      if (expected === 'park') {
+        assert.equal(
+          failureBackoffDecision({
+            consecutiveFailures: failures, lastAttemptAtMs: base, missedAtMs,
+            nowMs: base + 365 * 24 * 3_600_000,
+          }),
+          'park',
+          `${failures} consecutive failures must park, not merely defer`,
+        );
+        continue;
+      }
+      if (expected > 0) {
+        assert.equal(
+          failureBackoffDecision({
+            consecutiveFailures: failures, lastAttemptAtMs: base, missedAtMs,
+            nowMs: base + expected - 1000,
+          }),
+          'defer',
+          `${failures} failures: must still be deferred 1s before the ${expected}ms rung`,
+        );
+      }
+      assert.equal(
+        failureBackoffDecision({
+          consecutiveFailures: failures, lastAttemptAtMs: base, missedAtMs,
+          nowMs: base + expected,
+        }),
+        'run',
+        `${failures} failures: must run once ${expected}ms has elapsed`,
+      );
+    }
+  });
+
+  it('ladder length and park threshold stay in lockstep', () => {
+    assert.deepEqual(FAILURE_BACKOFF_LADDER_MS, DOCUMENTED.slice(0, -1));
+    assert.equal(
+      FAILURE_BACKOFF_LADDER_MS.length + 1,
+      PARK_AFTER_CONSECUTIVE_FAILURES,
+      'park must kick in exactly one step past the last ladder rung — otherwise a rung is unreachable or a gap opens',
+    );
+  });
+
+  it('backoff never throttles a skill below its own cron schedule', () => {
+    // A minutely skill that fails every single attempt: each catchup pass sees
+    // a FRESH occurrence (the minute boundary that fired after the previous
+    // attempt), so the decision must stay 'run' no matter how high the failure
+    // count climbs. This is the guardrail that keeps AI-098 from turning a
+    // storm fix into a silent outage.
+    let lastAttemptAtMs = base;
+    for (let failures = 1; failures <= 120; failures++) {
+      const freshMissedAtMs = lastAttemptAtMs + 60_000; // next minute boundary
+      const nowMs = freshMissedAtMs + 5_000;            // catchup notices it 5s later
+      assert.equal(
+        failureBackoffDecision({ consecutiveFailures: failures, lastAttemptAtMs, missedAtMs: freshMissedAtMs, nowMs }),
+        'run',
+        `failure #${failures}: a fresh cron occurrence must always grant one attempt`,
+      );
+      lastAttemptAtMs = nowMs; // that attempt fails too
+    }
+  });
+});

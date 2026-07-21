@@ -80,10 +80,14 @@ projects/daily-mail-brief/scripts/draft_reply.py
 **/test_repro.*
 **/test_real_login.*
 
-# LLM-agentic scratch writes at repo root (see private .gitignore for detail)
+# LLM-agentic scratch writes at repo root (see private .gitignore for detail).
+# /output.md + /error_log.txt added 2026-07-21 after the same failure mode
+# recurred under new names (a full daily-brief body; a one-line provider error).
 /message_to_user.md
 /output.json
+/output.md
 /skill_proposals.json
+/error_log.txt
 
 # Project data subdirectories (each project keeps its own data outside the repo)
 **/data/raw/

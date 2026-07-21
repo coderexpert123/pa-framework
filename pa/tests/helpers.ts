@@ -2,6 +2,7 @@ import { mkdtemp, mkdir, writeFile, rm } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { stringify as yamlStringify } from 'yaml';
+import { flushLog } from '../src/lib/log.js';
 import type { DraftMeta } from '../src/types.js';
 
 /**
@@ -54,7 +55,21 @@ export async function createTempSecrets(dir: string, content: string): Promise<v
 
 /** Clean up temp directory and reset PA_HOME. */
 export async function cleanup(dir: string): Promise<void> {
-  delete process.env.PA_HOME;
+  // Drain the logger's fire-and-forget queue FIRST. Entries are pinned to the
+  // PA_HOME captured at enqueue time (pa/src/lib/log.ts), so a still-queued
+  // append targets `dir` — and ensureLogFile() does a recursive mkdir, which
+  // would RECREATE the directory we are about to remove (or race the rm and
+  // leave a half-deleted tree behind).
+  await flushLog();
+
+  // DO NOT REGRESS: reset to the suite-wide temp PA_HOME set by
+  // tests/test-env-setup.ts rather than deleting the variable. Deleting it
+  // reopened a window — until the next beforeEach — in which paHome() fell
+  // back to the REAL ~/.pa, and any late fire-and-forget log (worker-exec's
+  // exit alert, the bg-task orphan sweep, a killed worker's late 'close'
+  // event) wrote synthetic records into the production forensic log.
+  if (process.env.PA_TEST_LOG_HOME) process.env.PA_HOME = process.env.PA_TEST_LOG_HOME;
+  else delete process.env.PA_HOME;
   delete process.env.PA_BOT_PID;
   try {
     await rm(dir, { recursive: true, force: true });

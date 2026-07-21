@@ -114,6 +114,44 @@ describe('worker-pids', () => {
     await removeWorkerPid(999996);
   });
 
+  it('cleanupOrphanedWorkers kills surviving descendants when the wrapper pid is dead', async () => {
+    const { cleanupOrphanedWorkers, isProcessAlive } = await import('../src/worker-pids.js');
+    const { spawn } = await import('child_process');
+
+    // A real live process standing in for a CLI child that outlived its shell
+    // wrapper (2026-07-04: cmd wrapper dead, claude alive → reaper false-negative)
+    const orphan = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    try {
+      await new Promise((r) => setTimeout(r, 200));
+      assert.ok(orphan.pid && isProcessAlive(orphan.pid), 'stand-in orphan must be running');
+
+      const pidsDir = join(dir, 'worker-pids');
+      await mkdir(pidsDir, { recursive: true });
+      // Wrapper 999993 and spawner 999999 both dead; descendant is the live stand-in
+      await writeFile(
+        join(pidsDir, '999993.json'),
+        JSON.stringify({
+          pid: 999993, spawnedBy: 999999, worker: 'gemini', skill: 'test',
+          startedAt: new Date().toISOString(), descendants: [orphan.pid],
+        }),
+        'utf8'
+      );
+
+      const killed = await cleanupOrphanedWorkers();
+      assert.equal(killed, 1, 'entry with a surviving descendant counts as one orphaned worker');
+
+      // killProcessTree is fire-and-forget — poll until the descendant dies
+      const deadline = Date.now() + 5000;
+      while (isProcessAlive(orphan.pid!) && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      assert.equal(isProcessAlive(orphan.pid!), false, 'surviving descendant must be killed');
+      await assert.rejects(access(join(pidsDir, '999993.json')), 'PID file removed after reap');
+    } finally {
+      try { orphan.kill('SIGKILL'); } catch { /* already dead — the expected case */ }
+    }
+  });
+
   it('updateWorkerPidDescendants persists the live tree; no-op for unknown pid', async () => {
     const { addWorkerPid, updateWorkerPidDescendants, listWorkerPids, removeWorkerPid } = await import('../src/worker-pids.js');
 

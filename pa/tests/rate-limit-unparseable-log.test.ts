@@ -8,6 +8,7 @@ const PA_HOME_DIR = join(tmpdir(), `unparseable-log-test-${process.pid}`);
 process.env.PA_HOME = PA_HOME_DIR;
 
 import { appendUnparseableRateLimit } from '../src/rate-limit-unparseable-log.js';
+import { flushLog } from '../src/lib/log.js';
 
 describe('appendUnparseableRateLimit', () => {
   before(async () => {
@@ -53,6 +54,28 @@ describe('appendUnparseableRateLimit', () => {
     const lines = content.trim().split('\n').filter(Boolean);
     const lastLine = JSON.parse(lines[lines.length - 1]);
     assert.equal(lastLine.raw.length, 2000, `raw should be truncated to 2000 chars, got ${lastLine.raw.length}`);
+  });
+
+  // The JSONL file alone is write-only in practice: zclaude's terminal 1113 fault
+  // landed there four times over eight days and nobody saw it. Every unparseable
+  // signal must also reach app.log.jsonl at warn, tagged with the worker name.
+  it('also emits a warn-level structured log naming the worker', async () => {
+    await appendUnparseableRateLimit({
+      timestamp: new Date().toISOString(),
+      worker: 'zclaude',
+      raw: 'API Error: Request rejected (429) [9999][something new]',
+      session_id: 'sess-warn-1',
+      reason: 'no-session-evidence',
+    });
+    await flushLog();
+
+    const content = await readFile(join(PA_HOME_DIR, 'app.log.jsonl'), 'utf8');
+    const entries = content.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const hit = entries.find((e) => e.level === 'warn' && e.worker === 'zclaude' && e.session_id === 'sess-warn-1');
+    assert.ok(hit, 'a warn entry naming the worker must be present in app.log.jsonl');
+    assert.equal(hit.module, 'rate-limits');
+    assert.equal(hit.reason, 'no-session-evidence');
+    assert.ok(String(hit.message).includes('zclaude'), 'message should be greppable by worker name');
   });
 
   it('does not throw on I/O failure (bad path)', async () => {

@@ -91,11 +91,18 @@ def call_gemini(prompt: str) -> str:
 PORTFOLIO_JSON_DIR = os.path.normpath(
     os.path.join(PROJECT_ROOT, "..", "portfolio-reports", "data", "prompt_processed", "json")
 )
-# Providers excluded from grounding context: exampleprovider has its own full monthly
-# pipeline already (no grounding needed here); examplebroker processing is an
-# intentional, documented deferral (portfolio-reports/README.md) — surfacing
-# stale/absent examplebroker context here would be misleading.
-PORTFOLIO_CONTEXT_EXCLUDED_PROVIDERS = {"exampleprovider", "examplebroker"}
+
+
+def _env_list(name: str) -> list:
+    """Comma-separated env var → stripped, non-empty items ([] when unset)."""
+    return [p.strip() for p in os.environ.get(name, "").split(",") if p.strip()]
+
+
+# Providers excluded from grounding context: ones that already have their own
+# full dedicated pipeline (no grounding needed here), plus ones whose processing
+# is an intentional, documented deferral (portfolio-reports/README.md) —
+# surfacing stale/absent context for either would be misleading.
+PORTFOLIO_CONTEXT_EXCLUDED_PROVIDERS = set(_env_list("PORTFOLIO_CONTEXT_EXCLUDED_PROVIDERS"))
 # Deliberately NOT aliased to PA_USER_NAME (used elsewhere for the brief's greeting,
 # with a different "the user" fallback) — this must match the literal `owner` field
 # portfolio-reports writes into its JSON snapshot filenames/report_metadata, which is
@@ -105,10 +112,19 @@ PORTFOLIO_CONTEXT_EXCLUDED_PROVIDERS = {"exampleprovider", "examplebroker"}
 # this file is tracked by the public mirror). Empty → grounding disabled.
 PORTFOLIO_CONTEXT_OWNER = os.environ.get("PORTFOLIO_CONTEXT_OWNER", "")
 
-# exampleprovider classifier prompt identifiers — env-driven for the same reason.
-BRIEF_STATEMENT_SENDER_NAMES = os.environ.get("BRIEF_STATEMENT_SENDER_NAMES", "your relationship manager")
-BRIEF_STATEMENT_EXAMPLE_SUBJECT = os.environ.get("BRIEF_STATEMENT_EXAMPLE_SUBJECT", "MONTHLY REPORT- <CLIENT FULL NAME>")
-BRIEF_STATEMENT_EXAMPLE_SENDER = os.environ.get("BRIEF_STATEMENT_EXAMPLE_SENDER", "<relationship manager name>")
+# Statement-classifier identifiers — env-driven for the same reason. The provider
+# set itself is personal data (which wealth manager sends the monthly statement,
+# which brokers and banks must not be mistaken for it), so no real name may appear
+# here. Deployments supply their own via ~/.pa/secrets.env; the placeholder
+# defaults keep a fresh clone runnable, just less precise.
+STATEMENT_PROVIDER = os.environ.get("BRIEF_STATEMENT_PROVIDER", "your wealth manager")
+STATEMENT_SENDER_NAMES = os.environ.get("BRIEF_STATEMENT_SENDER_NAMES", "your relationship manager")
+STATEMENT_EXAMPLE_SUBJECT = os.environ.get("BRIEF_STATEMENT_EXAMPLE_SUBJECT", "MONTHLY REPORT- <CLIENT FULL NAME>")
+STATEMENT_EXAMPLE_SENDER = os.environ.get("BRIEF_STATEMENT_EXAMPLE_SENDER", "<relationship manager name>")
+# Other brokers/platforms whose statements must NOT trigger portfolio-reports.
+OTHER_PROVIDERS = _env_list("BRIEF_OTHER_PROVIDERS")
+# Banks whose routine transactional alerts must NOT trigger it either.
+BANK_ALERT_SENDERS = _env_list("BRIEF_BANK_ALERT_SENDERS")
 
 _SNAPSHOT_FILENAME_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2})_([A-Za-z]+)_([A-Za-z]+)"
@@ -117,7 +133,7 @@ _SNAPSHOT_FILENAME_RE = re.compile(
 
 def load_portfolio_context() -> str:
     """Build a compact grounding block: most recent known total value per
-    non-exampleprovider, non-examplebroker portfolio provider, for the given user.
+    portfolio provider for the given user, skipping the excluded providers.
 
     Fails soft on any error (missing directory, malformed JSON, unexpected
     schema) — returns "" rather than raising, since a grounding-context
@@ -130,6 +146,7 @@ def load_portfolio_context() -> str:
         if not os.path.isdir(PORTFOLIO_JSON_DIR):
             return ""
 
+        excluded = {p.lower() for p in PORTFOLIO_CONTEXT_EXCLUDED_PROVIDERS}
         latest_by_provider = {}  # provider -> (report_date_str, filename)
         for filename in os.listdir(PORTFOLIO_JSON_DIR):
             if not filename.endswith(".json"):
@@ -140,7 +157,7 @@ def load_portfolio_context() -> str:
             date_str, owner, provider = m.group(1), m.group(2), m.group(3)
             if owner != PORTFOLIO_CONTEXT_OWNER:
                 continue
-            if provider.lower() in PORTFOLIO_CONTEXT_EXCLUDED_PROVIDERS:
+            if provider.lower() in excluded:
                 continue
             existing = latest_by_provider.get(provider)
             if existing is None or date_str > existing[0]:
@@ -177,11 +194,15 @@ def load_portfolio_context() -> str:
         if not lines:
             return ""
 
+        scope_note = ""
+        if PORTFOLIO_CONTEXT_EXCLUDED_PROVIDERS:
+            scope_note = (
+                " (excludes " + ", ".join(sorted(PORTFOLIO_CONTEXT_EXCLUDED_PROVIDERS))
+                + " — those are covered by a separate report or intentionally not tracked)"
+            )
         return (
-            f"Portfolio snapshots on file for {PORTFOLIO_CONTEXT_OWNER} "
-            f"(examplebroker2/Example Securities/other non-exampleprovider providers only — "
-            f"exampleprovider has its own separate monthly report, examplebroker is "
-            f"intentionally not tracked):\n" + "\n".join(lines)
+            f"Portfolio snapshots on file for {PORTFOLIO_CONTEXT_OWNER}{scope_note}:\n"
+            + "\n".join(lines)
         )
     except Exception as e:
         print(f"[WARN] load_portfolio_context failed: {e}", file=sys.stderr)
@@ -209,20 +230,28 @@ def detect_portfolio_statement_emails(emails: list) -> list:
             )
         email_text = "\n".join(lines)
 
+        bank_alert_hint = (
+            f" (e.g. from {', '.join(BANK_ALERT_SENDERS)} alerts)" if BANK_ALERT_SENDERS else ""
+        )
+        other_provider_hint = (
+            f"{', '.join(OTHER_PROVIDERS)}, or any provider" if OTHER_PROVIDERS else "any provider"
+        )
+
         prompt = (
             "You are reviewing emails for a personal finance assistant.\n\n"
             "From the following emails, identify any that are the monthly portfolio statement "
-            f"from Example Wealth, sent directly to the user by {BRIEF_STATEMENT_SENDER_NAMES} (or another "
-            "Example Wealth relationship manager). Example of a qualifying email: subject "
-            f"\"{BRIEF_STATEMENT_EXAMPLE_SUBJECT}\", sender \"{BRIEF_STATEMENT_EXAMPLE_SENDER}\".\n\n"
+            f"from {STATEMENT_PROVIDER.upper()}, sent directly to the user by "
+            f"{STATEMENT_SENDER_NAMES} (or another {STATEMENT_PROVIDER} relationship manager). "
+            "Example of a qualifying email: subject "
+            f"\"{STATEMENT_EXAMPLE_SUBJECT}\", sender \"{STATEMENT_EXAMPLE_SENDER}\".\n\n"
             "Do NOT flag any of the following, even though they may look account/portfolio-related:\n"
             "- Routine bank transactional alerts: OTPs, balance updates, bill/EMI payment "
-            "confirmations, e-mandate notices (e.g. from examplebank Bank alerts)\n"
-            "- Statements or contract notes from OTHER brokers/platforms — examplebroker2, examplebank "
-            "Securities, examplebroker, or any provider that is not Example Wealth\n"
+            f"confirmations, e-mandate notices{bank_alert_hint}\n"
+            f"- Statements or contract notes from OTHER brokers/platforms — {other_provider_hint} "
+            f"that is not {STATEMENT_PROVIDER}\n"
             "- General market news, newsletters, promotional offers, Sensex/Nifty/stock price "
             "alerts, company earnings results, dividend announcements\n"
-            "- Any email not specifically the Example Wealth monthly statement\n\n"
+            f"- Any email not specifically the {STATEMENT_PROVIDER} monthly statement\n\n"
             "Return ONLY a JSON array of the email IDs that qualify. Return [] if none qualify.\n"
             "Example valid response: [\"18f3a2b1c4d\"]\n\n"
             f"Emails:\n{email_text}"
@@ -291,6 +320,31 @@ def format_emails_for_prompt(emails: list) -> str:
     return "\n".join(lines)
 
 
+def build_grounding_rule() -> str:
+    """The triage rule forcing portfolio-statement summaries to be grounded in the
+    Recent Portfolio Context. Provider names are env-driven (see module top)."""
+    subject = (
+        f"a {', '.join(OTHER_PROVIDERS)}, or other portfolio/holdings/demat"
+        if OTHER_PROVIDERS
+        else "a portfolio/holdings/demat"
+    )
+    caveats = [f"NOT {STATEMENT_PROVIDER} — that has its own separate pipeline"]
+    if BANK_ALERT_SENDERS:
+        caveats.append(
+            f"and NOT a routine {', '.join(BANK_ALERT_SENDERS)} transactional alert like an OTP, "
+            "balance update, or credit card payment confirmation — those are just bank alerts, "
+            "not investment holdings"
+        )
+    return (
+        f"- If an email is {subject}\n"
+        f"  statement or investment announcement ({', '.join(caveats)})\n"
+        "  and you classify it NOTEWORTHY or ACTION_REQUIRED, ground\n"
+        "  your summary in the Recent Portfolio Context above: state what changed vs. the\n"
+        "  last known figure for that provider. If no context is available for that\n"
+        "  provider, say so explicitly rather than inventing a comparison."
+    )
+
+
 def build_prompt(window: str, total_count: int, emails_text: str, portfolio_context: str = "") -> str:
     user_name = os.environ.get("PA_USER_NAME", "the user")
     portfolio_context_section = ""
@@ -311,14 +365,7 @@ Classify each email as ACTION_REQUIRED, NOTEWORTHY, or SKIP:
 - SKIP: Clear marketing/promos, mass newsletters, automated system-only notifications
 - Bank/UPI alerts: declined → ACTION_REQUIRED; ≥₹5000 → NOTEWORTHY; <₹5000 → SKIP
 - gmail_category is a weak hint only — never auto-skip based on category alone
-- If an email is a examplebroker2, Example Securities, or other portfolio/holdings/demat
-  statement or investment announcement (NOT exampleprovider — that has its own separate
-  pipeline, and NOT a routine examplebank Bank transactional alert like an OTP, balance
-  update, or credit card payment confirmation — those are just bank alerts, not
-  investment holdings) and you classify it NOTEWORTHY or ACTION_REQUIRED, ground
-  your summary in the Recent Portfolio Context above: state what changed vs. the
-  last known figure for that provider. If no context is available for that
-  provider, say so explicitly rather than inventing a comparison.
+{build_grounding_rule()}
 
 ## Output Format
 Output exactly two sections separated by these markers (include the markers verbatim):

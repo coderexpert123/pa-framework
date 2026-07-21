@@ -1,10 +1,13 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildReport, gateAndApprove, rollback, hasPendingDraftForTarget, wasRecentlyChanged, sweepStaleDrafts } from '../src/self-improver.js';
+import { buildReport, gateAndApprove, rollback, hasPendingDraftForTarget, wasRecentlyChanged, sweepStaleDrafts, getReportTopic } from '../src/self-improver.js';
 import type { ReportEntry } from '../src/self-improver.js';
-import { createTempPaHome, createTempSkill, createTempDraft, cleanup } from './helpers.js';
-import { readFile, mkdir, writeFile } from 'fs/promises';
+import { createTempPaHome, createTempSkill, createTempDraft, createTempSecrets, cleanup } from './helpers.js';
+import { readFile, mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
+import { tmpdir } from 'os';
+import { exec as execCb } from 'child_process';
+import { promisify } from 'util';
 import { computeFingerprint } from '../src/drafts.js';
 import { appendAuditRecord } from '../src/lib/improvement-audit.js';
 import type { DraftMeta, DraftProposal, RunMeta } from '../src/types.js';
@@ -690,7 +693,12 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
       },
     });
 
-    assert.ok(cmds.some((c) => c.includes('git revert --no-edit abc1234')), `expected a git revert, got: ${cmds.join(' | ')}`);
+    // `-n` (staged, not committed) since 2026-07-21 so the pa/data/profile* churn can be
+    // dropped from the revert before it becomes a commit — see gitRevertPreservingChurn.
+    assert.ok(cmds.some((c) => c.includes('git revert -n abc1234')), `expected a git revert, got: ${cmds.join(' | ')}`);
+    assert.ok(cmds.some((c) => c.includes('commit --no-edit')), 'expected the staged revert to be committed');
+    // Nothing was dirty here, so nothing should have been stashed.
+    assert.equal(cmds.some((c) => c.startsWith('git stash push')), false);
     assert.ok(cmds.some((c) => c.includes('git push')), 'expected the revert to be pushed (offsite recoverability)');
     assert.equal(lines.length, 1);
     assert.match(lines[0], /Reverted/);
@@ -744,5 +752,187 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
     });
 
     assert.match(lines[0], /bot restart|rebuild/i);
+  });
+
+  it('refuses to revert (and audits rollback-failed) when the tree carries human WIP', async () => {
+    // Precondition mirroring code-fixer's F4 — an autonomous `git revert` must never be
+    // mixed with, or run destructive cleanup over, a human's uncommitted work. Churn in
+    // pa/data/profile* alone does NOT count as WIP (that's the whole point of the carve-out).
+    await seedDraft();
+    const cmds: string[] = [];
+    const lines = await rollback({
+      checkForRollbacksFn: async () => [gitRevertFlag()],
+      execFn: async (cmd: string) => {
+        cmds.push(cmd);
+        if (cmd === 'git status --porcelain') {
+          return { stdout: ' M pa/src/workers.ts\n M pa/data/profile.json\n', stderr: '' };
+        }
+        return { stdout: '', stderr: '' };
+      },
+    });
+
+    assert.match(lines[0], /Rollback FAILED/);
+    assert.match(lines[0], /pa\/src\/workers\.ts/);
+    assert.equal(cmds.some((c) => c.startsWith('git revert')), false);
+    assert.equal(cmds.some((c) => c.startsWith('git reset --hard')), false);
+
+    const rec = (await readAuditRecords(dir)).find((r) => r.action === 'rollback-failed');
+    assert.ok(rec, 'expected a rollback-failed audit record');
+    assert.equal(rec.commit_hash, 'abc1234');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Real-git-repo fixture: the 2026-07-21 un-revertable-fix-commit fix, end to end.
+// A bare `git revert` aborted on "Your local changes to the following files would be
+// overwritten by merge: pa/data/profile.json" every night the learn_agent/oracle churn was
+// present — ~/.pa/self-improver-audit.jsonl recorded 'rollback-failed' for commit 7b82c88 on
+// both 2026-07-13 and 2026-07-16, and 7b82c88 stayed an ancestor of HEAD. Faked exec can't
+// prove the git semantics here, so this one drives real git in a throwaway repo.
+// ---------------------------------------------------------------------------
+describe('rollback: git-revert survives (and preserves) nightly pa/data/profile churn', () => {
+  let paHome: string;
+  let repo: string;
+  const runShell = promisify(execCb);
+  const CHURN = '{"v":3,"learned":"today"}\n';
+  let badFix: string;
+
+  const git = async (cmd: string): Promise<{ stdout: string; stderr: string }> => {
+    const { stdout, stderr } = await runShell(cmd, { cwd: repo });
+    return { stdout: String(stdout), stderr: String(stderr) };
+  };
+
+  beforeEach(async () => {
+    paHome = await createTempPaHome();
+    repo = await mkdtemp(join(tmpdir(), 'pa-revert-repo-'));
+
+    await git('git init -q');
+    await git('git config user.email pa-test@example.com');
+    await git('git config user.name "pa test"');
+    await git('git config commit.gpgsign false');
+    await git('git config core.autocrlf false'); // byte-for-byte assertions below
+
+    await mkdir(join(repo, 'pa', 'data'), { recursive: true });
+    await mkdir(join(repo, 'projects', 'x'), { recursive: true });
+    await writeFile(join(repo, 'pa', 'data', 'profile.json'), '{"v":1}\n', 'utf8');
+    await writeFile(join(repo, 'projects', 'x', 'script.py'), 'original\n', 'utf8');
+    await git('git add -A');
+    await git('git commit -q -m base');
+
+    // A legacy-shaped autonomous fix commit: code change PLUS the profile churn baked in —
+    // exactly what made 7b82c88 un-revertable. The revert path must cope with it.
+    await writeFile(join(repo, 'projects', 'x', 'script.py'), 'fixed\n', 'utf8');
+    await writeFile(join(repo, 'pa', 'data', 'profile.json'), '{"v":2}\n', 'utf8');
+    await git('git add -A');
+    await git('git commit -q -m "autonomous-code-fix: x-fix"');
+    badFix = (await git('git rev-parse HEAD')).stdout.trim();
+
+    // Tonight's learn_agent/oracle write — uncommitted, and irreplaceable.
+    await writeFile(join(repo, 'pa', 'data', 'profile.json'), CHURN, 'utf8');
+  });
+
+  afterEach(async () => {
+    await cleanup(paHome);
+    await rm(repo, { recursive: true, force: true }).catch(() => {});
+  });
+
+  async function runRollback(): Promise<string[]> {
+    return rollback({
+      checkForRollbacksFn: async () => [
+        { kind: 'git-revert' as const, skillName: 'x', draftName: 'x-fix', commitHash: badFix },
+      ],
+      execFn: async (cmd: string) => {
+        if (cmd.startsWith('git push')) return { stdout: '', stderr: '' }; // no remote in the fixture
+        return git(cmd);
+      },
+    });
+  }
+
+  it('reverts the fix even though pa/data/profile.json is dirty', async () => {
+    const lines = await runRollback();
+
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /Reverted/, `expected a successful revert, got: ${lines[0]}`);
+    assert.equal(await readFile(join(repo, 'projects', 'x', 'script.py'), 'utf8'), 'original\n');
+
+    const records = await readAuditRecords(paHome);
+    assert.equal(records.some((r) => r.action === 'rollback-failed'), false);
+    const rec = records.find((r) => r.action === 'rolled-back');
+    assert.ok(rec, 'expected a rolled-back audit record');
+    assert.equal(rec.commit_hash, badFix);
+    assert.equal(rec.revert_commit_hash, (await git('git rev-parse HEAD')).stdout.trim());
+  });
+
+  it('leaves the uncommitted profile data byte-for-byte intact, with nothing stranded in the stash', async () => {
+    await runRollback();
+
+    assert.equal(await readFile(join(repo, 'pa', 'data', 'profile.json'), 'utf8'), CHURN);
+    assert.equal((await git('git stash list')).stdout.trim(), '');
+  });
+
+  it('produces a revert commit that touches only code — never pa/data/profile*', async () => {
+    await runRollback();
+
+    const { stdout: names } = await git('git show --name-only --format= HEAD');
+    assert.match(names, /projects\/x\/script\.py/);
+    assert.doesNotMatch(names, /pa\/data\/profile/, 'a revert commit carrying the churn would itself be un-revertable');
+  });
+});
+
+// The nightly report's own routing. self-improver runs as a `cmd:` skill with no
+// `secrets:` frontmatter, so its process gets NONE of ~/.pa/secrets.env in the
+// environment — and PA_SELF_IMPROVER_THREAD_ID lives only there. The env-only
+// read resolved thread 0 and the report landed in pa-alerts.
+describe('getReportTopic (report routing)', () => {
+  const KEYS = [
+    'PA_SELF_IMPROVER_CHAT_ID',
+    'PA_SELF_IMPROVER_THREAD_ID',
+    'PA_ALERTS_CHAT_ID',
+    'PA_ALERTS_THREAD_ID',
+    'TELEGRAM_CHAT_ID',
+  ];
+  let dir: string;
+  let savedEnv: Record<string, string | undefined>;
+
+  beforeEach(async () => {
+    dir = await createTempPaHome();
+    savedEnv = {};
+    for (const key of KEYS) {
+      savedEnv[key] = process.env[key];
+      delete process.env[key];
+    }
+  });
+
+  afterEach(async () => {
+    for (const key of KEYS) {
+      if (savedEnv[key] !== undefined) process.env[key] = savedEnv[key];
+      else delete process.env[key];
+    }
+    await cleanup(dir);
+  });
+
+  it('resolves the report thread from secrets.env when process.env has nothing', async () => {
+    await createTempSecrets(dir, 'PA_ALERTS_CHAT_ID=-100777\nPA_ALERTS_THREAD_ID=42\nPA_SELF_IMPROVER_THREAD_ID=1234\n');
+
+    assert.deepEqual(await getReportTopic(), { chat_id: '-100777', thread_id: 1234 });
+  });
+
+  it('lets process.env win over the secrets record', async () => {
+    await createTempSecrets(dir, 'PA_ALERTS_CHAT_ID=-100777\nPA_SELF_IMPROVER_THREAD_ID=1234\n');
+    process.env.PA_SELF_IMPROVER_THREAD_ID = '77';
+
+    assert.equal((await getReportTopic()).thread_id, 77);
+  });
+
+  it('falls back to the pa-alerts topic only when no self-improver key is set anywhere', async () => {
+    await createTempSecrets(dir, 'PA_ALERTS_CHAT_ID=-100777\nPA_ALERTS_THREAD_ID=42\n');
+
+    assert.deepEqual(await getReportTopic(), { chat_id: '-100777', thread_id: 42 });
+  });
+
+  it('honors a dedicated self-improver chat id when one is configured', async () => {
+    await createTempSecrets(dir, 'PA_ALERTS_CHAT_ID=-100777\nPA_SELF_IMPROVER_CHAT_ID=-100222\nPA_SELF_IMPROVER_THREAD_ID=1234\n');
+
+    assert.deepEqual(await getReportTopic(), { chat_id: '-100222', thread_id: 1234 });
   });
 });

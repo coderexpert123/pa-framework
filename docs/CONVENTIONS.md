@@ -83,7 +83,9 @@ These never live at the root and are caught by `.gitignore`:
 | `/analyze_*.py`, `/check_*.py`, `/find_*.py` | ad-hoc scripts | `scratch/` or `<project>/scripts/` |
 | `/fetch_*.py`, `/search_*.py`, `/extract_*.py` | ad-hoc fetchers | `scratch/` or `<project>/scripts/` |
 | `/Action Items.md`, `/Preferences.md`, etc. | Ecosystem KB files | `<KB-root>/Ecosystem KB/` (outside the repo) |
-| `/message_to_user.md`, `/output.json`, `/skill_proposals.json` | LLM worker "going agentic" — writes its response to a file at cwd instead of returning text | delete; not a real output path for any script (confirmed via full-repo grep) |
+| `/message_to_user.md`, `/output.json`, `/output.md`, `/skill_proposals.json`, `/error_log.txt` | LLM worker "going agentic" — writes its response (or its error) to a file at cwd instead of returning text | delete; not a real output path for any script (confirmed via full-repo grep) |
+
+The last row keeps growing because the failure mode keeps resurfacing under new filenames — `/output.md` and `/error_log.txt` were added on 2026-07-21. When you find a new one, add it to `.gitignore`, `.gitignore-public`, this table, and the private brain's hygiene section in the same edit. A partial update is how the pattern list falls behind reality.
 
 ### Patterns auto-gitignored everywhere (any depth)
 

@@ -152,6 +152,102 @@ describe('sendToTelegram', () => {
 });
 
 // ---------------------------------------------------------------------------
+// sendToTelegram — observable outcome (SendResult, 2026-07-21 alerting fix)
+// ---------------------------------------------------------------------------
+
+describe('sendToTelegram — SendResult', () => {
+  const cfg: TelegramOutput = { chat_id: '-1001234567', token_secret: 'T' };
+
+  it('returns ok:true with the chunk count on success', async () => {
+    setupFetchMock([{ ok: true }]);
+    const result = await sendToTelegram('hello', cfg, 'tok');
+    if (!result.ok) assert.fail(`expected ok, got reason=${result.reason}`);
+    assert.equal(result.chunks, 1);
+  });
+
+  it('counts every chunk of a multi-chunk message', async () => {
+    const calls = setupFetchMock([{ ok: true }]);
+    const result = await sendToTelegram('x'.repeat(5000), cfg, 'tok');
+    if (!result.ok) assert.fail(`expected ok, got reason=${result.reason}`);
+    assert.equal(result.chunks, 2);
+    assert.equal(calls.length, 2);
+  });
+
+  it('returns ok:true when the plain-text fallback succeeds', async () => {
+    setupFetchMock([
+      { ok: false, status: 400, bodyText: "can't parse entities" },
+      { ok: true },
+    ]);
+    const result = await sendToTelegram('hello', cfg, 'tok');
+    assert.equal(result.ok, true, 'a recovered send is a success');
+  });
+
+  it('returns ok:false reason=http with the status on a non-parse failure', async () => {
+    setupFetchMock([{ ok: false, status: 400, bodyText: 'Bad Request: chat not found' }]);
+    const result = await sendToTelegram('hello', cfg, 'tok');
+    if (result.ok) assert.fail('expected failure');
+    assert.equal(result.reason, 'http');
+    assert.equal(result.status, 400);
+    assert.match(result.detail ?? '', /chat not found/);
+  });
+
+  it('returns ok:false reason=http when the plain-text fallback also fails', async () => {
+    setupFetchMock([
+      { ok: false, status: 400, bodyText: "can't parse entities" },
+      { ok: false, status: 403, bodyText: 'Forbidden: bot was blocked' },
+    ]);
+    const result = await sendToTelegram('hello', cfg, 'tok');
+    if (result.ok) assert.fail('expected failure');
+    assert.equal(result.reason, 'http');
+    assert.equal(result.status, 403);
+  });
+
+  it('returns ok:false reason=network when the request throws', async () => {
+    const saved = process.env.PA_NOTIFY_DISABLED;
+    process.env.PA_NOTIFY_DISABLED = '1'; // telegramFetch test mode — never touches the proxy pool
+    try {
+      (globalThis as Record<string, unknown>).fetch = async () => { throw new Error('socket hang up'); };
+      const result = await sendToTelegram('hello', cfg, 'tok');
+      if (result.ok) assert.fail('expected failure');
+      assert.equal(result.reason, 'network');
+      assert.match(result.detail ?? '', /socket hang up/);
+    } finally {
+      if (saved !== undefined) process.env.PA_NOTIFY_DISABLED = saved;
+      else delete process.env.PA_NOTIFY_DISABLED;
+    }
+  });
+
+  it('returns ok:false reason=no-chat-id WITHOUT issuing an HTTP call', async () => {
+    const calls = setupFetchMock([{ ok: true }]);
+    const result = await sendToTelegram('hello', { chat_id: '', token_secret: 'T' }, 'tok');
+    if (result.ok) assert.fail('expected failure');
+    assert.equal(result.reason, 'no-chat-id');
+    assert.equal(calls.length, 0, 'no request may be issued for an empty chat_id');
+  });
+
+  it('treats a whitespace-only chat_id as empty', async () => {
+    const calls = setupFetchMock([{ ok: true }]);
+    const result = await sendToTelegram('hello', { chat_id: '   ', token_secret: 'T' }, 'tok');
+    if (result.ok) assert.fail('expected failure');
+    assert.equal(result.reason, 'no-chat-id');
+    assert.equal(calls.length, 0);
+  });
+
+  it('returns ok:false reason=empty-text WITHOUT issuing an HTTP call', async () => {
+    const calls = setupFetchMock([{ ok: true }]);
+    const result = await sendToTelegram('   \n  ', cfg, 'tok');
+    if (result.ok) assert.fail('expected failure');
+    assert.equal(result.reason, 'empty-text');
+    assert.equal(calls.length, 0, 'a ref-trailer-only message is not worth sending');
+  });
+
+  it('still does not throw on failure', async () => {
+    setupFetchMock([{ ok: false, status: 500, bodyText: 'error' }]);
+    await assert.doesNotReject(() => sendToTelegram('hello', cfg, 'tok'));
+  });
+});
+
+// ---------------------------------------------------------------------------
 // sendToTelegram — textPreview in app.log entry (Phase 3)
 // ---------------------------------------------------------------------------
 

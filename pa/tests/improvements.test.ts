@@ -98,6 +98,48 @@ describe('buildEvalReport', () => {
     assert.match(report, /delta: \+0 success, \+0 fail/);
   });
 
+  it('leads with a FAILED ROLLBACK banner and does not gloss a rollback-failed as "newly created"', () => {
+    const entries: EvalEntry[] = [{
+      record: makeRecord({
+        draft: 'pii-audit-fix', action: 'rollback-failed', target_skill: 'pii-audit',
+        commit_hash: '7b82c88', baseline: undefined,
+        reason: 'git revert 7b82c88 failed: Your local changes to pa/data/profile.json would be overwritten by merge',
+      }),
+      current: { windowDays: 30, runs: 3, successes: 0, failures: 3 },
+    }];
+    const report = buildEvalReport(entries, 30);
+
+    // The banner must come before the per-entry listing — a live+condemned commit outranks
+    // every delta in the report.
+    const bannerIdx = report.indexOf('FAILED ROLLBACKS');
+    assert.ok(bannerIdx >= 0, `expected a FAILED ROLLBACKS banner, got:\n${report}`);
+    assert.ok(bannerIdx < report.indexOf('pii-audit-fix  [rollback-failed]'));
+    assert.match(report, /STILL LIVE/);
+    assert.match(report, /7b82c88/);
+    assert.doesNotMatch(report, /newly created/);
+  });
+
+  it('groups repeated failed reverts of the SAME commit and counts the attempts', () => {
+    // 7b82c88's revert failed on both 2026-07-13 and 2026-07-16 — a perma-failing revert is
+    // retried nightly, so the attempt count is the signal that it is stuck, not transient.
+    const mk = (ts: string) => ({
+      record: makeRecord({ draft: 'pii-audit-fix', action: 'rollback-failed' as const, target_skill: 'pii-audit', ts, commit_hash: '7b82c88', baseline: undefined }),
+      current: { windowDays: 30, runs: 0, successes: 0, failures: 0 },
+    });
+    const report = buildEvalReport([mk('2026-07-16T05:22:56.000Z'), mk('2026-07-13T03:49:38.000Z')], 30);
+
+    assert.match(report, /1 commit\(s\), 2 failed attempt\(s\)/);
+    assert.match(report, /2 failed attempt\(s\), last 2026-07-16/);
+  });
+
+  it('emits no banner at all when nothing failed to roll back', () => {
+    const entries: EvalEntry[] = [{
+      record: makeRecord({ draft: 'ok-fix', action: 'applied-fix', target_skill: 'ok', baseline: { window_days: 14, runs: 2, successes: 2, failures: 0 } }),
+      current: { windowDays: 14, runs: 2, successes: 2, failures: 0 },
+    }];
+    assert.doesNotMatch(buildEvalReport(entries, 30), /FAILED ROLLBACK/);
+  });
+
   it('includes the record date and omits the risk-flag suffix when there are none', () => {
     const entries: EvalEntry[] = [{
       record: makeRecord({ ts: '2026-07-01T12:00:00.000Z', draft: 'plain-fix', target_skill: 'plain', risk_flags: [], baseline: { window_days: 14, runs: 1, successes: 1, failures: 0 } }),
@@ -181,6 +223,39 @@ describe('improvementsCommand', () => {
     assert.match(text, /commit abc1234/);
     assert.match(text, /2 file\(s\) changed/);
     assert.match(text, /4 runs, 1 success, 3 fail/); // baseline still shown
+  });
+
+  it('counts and displays rollback-failed records alongside the fix they failed to undo (2026-07-21)', async () => {
+    // The exact production shape this fixes: 7b82c88 was applied, condemned, and its revert
+    // failed twice — yet the report used to render only the applied-code-fix line, reading as
+    // a clean win while the condemned commit was still live.
+    await appendAuditRecord(makeRecord({
+      draft: 'pii-audit-fix', action: 'applied-code-fix', target_skill: 'pii-audit',
+      commit_hash: '7b82c88', files_changed: ['pa/scripts/pii_guard.py'],
+      baseline: { window_days: 14, runs: 24, successes: 0, failures: 23 },
+    }));
+    await appendAuditRecord(makeRecord({
+      draft: 'pii-audit-fix', action: 'rollback-failed', target_skill: 'pii-audit',
+      commit_hash: '7b82c88',
+      reason: 'git revert 7b82c88 failed: Your local changes to the following files would be overwritten by merge: pa/data/profile.json',
+    }));
+    await appendAuditRecord(makeRecord({
+      draft: 'pii-audit-fix', action: 'rollback-failed', target_skill: 'pii-audit',
+      commit_hash: '7b82c88',
+      reason: 'git revert 7b82c88 failed: Your local changes to the following files would be overwritten by merge: pa/data/profile.json',
+    }));
+    await createTempMeta('pii-audit', makeMeta({ status: 'success' }), 'n1');
+
+    await improvementsCommand(30);
+
+    const text = output.join('\n');
+    assert.match(text, /FAILED ROLLBACKS/);
+    assert.match(text, /1 commit\(s\), 2 failed attempt\(s\)/);
+    assert.match(text, /STILL LIVE/);
+    assert.match(text, /7b82c88/);
+    // The applied-code-fix line is still there — the point is that it is no longer the ONLY
+    // thing the reader sees.
+    assert.match(text, /applied-code-fix/);
   });
 
   it('shows the revert commit hash on a rolled-back code-fix record (2026-07-11)', async () => {

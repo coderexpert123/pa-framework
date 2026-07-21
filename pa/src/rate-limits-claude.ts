@@ -180,6 +180,75 @@ export async function readClaudeSessionErrors(
   return withTimeout(inner(), SESSION_FILE_SEARCH_TIMEOUT_MS, []);
 }
 
+// ---------------------------------------------------------------------------
+// Zhipu terminal billing fault (account balance exhausted)
+// ---------------------------------------------------------------------------
+
+/**
+ * How long to bench a worker whose ACCOUNT is exhausted (as opposed to a
+ * transient rate limit). Six hours is the deliberate middle of two failure
+ * modes: too short and we are back to re-probing a dead worker on every
+ * dispatch (2026-07-11..19: zclaude never got a cooldown at all — 150
+ * `spawn-failed` rows and ~2.1h of wall clock burned on doomed attempts, all
+ * silently absorbed by failover); too long and a recharge that the user
+ * performs quietly goes unnoticed for a whole day. At 6h the worst case is
+ * ~4 wasted probes/day, and a recharge is picked up automatically within a
+ * quarter of a day even if nobody clears the cooldown by hand.
+ */
+export const ACCOUNT_EXHAUSTED_COOLDOWN_MINUTES = 6 * 60;
+
+// Zhipu (GLM) returns `[1113][Insufficient balance or no resource package...]`
+// for an exhausted account balance. Either half of the signature is sufficient
+// evidence ONCE we already know we are looking at a 429 error payload.
+const ZHIPU_BALANCE_SIGNATURE = /\[\s*1113\s*\]|Insufficient balance or no resource package/i;
+
+// The error framing that must accompany the signature ON THE SAME LINE when we
+// are scanning raw worker output (as opposed to a parsed api_error event).
+// Without this second half, the phrase appearing in ordinary prose — a user
+// asking what the error means, a doc snippet quoting it, a transcript that also
+// happens to mention a 429 elsewhere — would classify a healthy worker as dead.
+const ZHIPU_ERROR_FRAME = /(?:API\s*Error|Request\s+rejected|status)[^\n]{0,80}\b429\b/i;
+
+/**
+ * True when `text` (already known to be a 429 error payload, e.g. the message of
+ * a session api_error event) carries Zhipu's balance-exhausted signature.
+ */
+export function hasZhipuBalanceSignature(text: string): boolean {
+  return !!text && ZHIPU_BALANCE_SIGNATURE.test(text);
+}
+
+/**
+ * Classify raw zclaude/claude output as a TERMINAL account-balance fault.
+ *
+ * zclaude is a Zhipu GLM wrapper (ANTHROPIC_BASE_URL → api.z.ai). Zhipu reports
+ * an exhausted account balance as error 1113 over HTTP **429** — the same status
+ * a transient rate limit uses — so the generic path treats a permanent billing
+ * fault as something that will heal in two minutes. It never heals: only a human
+ * recharge clears it. Returns null when the signature is absent or when it
+ * appears without the accompanying 429 error framing.
+ */
+export function classifyZhipuAccountExhausted(text: string): RateLimitParseResult | null {
+  if (!text) return null;
+  const idx = text.search(ZHIPU_BALANCE_SIGNATURE);
+  if (idx < 0) return null;
+
+  // Both halves must sit on the same line — a worker's error output emits the
+  // whole payload as one line, whereas prose that merely mentions the phrase
+  // does not carry the 429 framing alongside it.
+  const lineStart = text.lastIndexOf('\n', idx) + 1;
+  const nextNewline = text.indexOf('\n', idx);
+  const lineEnd = nextNewline === -1 ? text.length : nextNewline;
+  const line = text.slice(lineStart, lineEnd);
+  if (!ZHIPU_ERROR_FRAME.test(line)) return null;
+
+  return {
+    minutes: ACCOUNT_EXHAUSTED_COOLDOWN_MINUTES,
+    classification: 'account-exhausted',
+    source: 'zhipu-text',
+    raw: line.slice(0, 300).replace(/\s+/g, ' ').trim(),
+  };
+}
+
 function extractMinutesFromText(text: string): { minutes: number; source: 'zhipu-text' | 'claude-text'; resetsAtIST?: string } | null {
   // 1. Zhipu "Usage limit reached for N hour" — preferred (unambiguous)
   const hourMatch = text.match(/Usage limit reached for\s+(\d+)\s+hour/i);
@@ -280,8 +349,22 @@ export function classifyClaudeErrors(
     return null;
   }
 
-  // 3. All fresh events still within retry budget → transient no-op
   const latest = fresh[fresh.length - 1];
+
+  // 3. Terminal account-balance fault — checked BEFORE the retry-budget gate.
+  // Retrying an exhausted balance is pointless: it is not a window that reopens,
+  // it is a bill that has to be paid. Returning the transient no-op here would
+  // leave the worker un-cooled and re-probed on every dispatch.
+  if (latest.code === '1113' || hasZhipuBalanceSignature(latest.message)) {
+    return {
+      minutes: ACCOUNT_EXHAUSTED_COOLDOWN_MINUTES,
+      classification: 'account-exhausted',
+      source: 'claude-session',
+      raw: latest.message,
+    };
+  }
+
+  // 4. All fresh events still within retry budget → transient no-op
   if (latest.retryAttempt < latest.maxRetries) {
     return {
       minutes: 0,
@@ -290,7 +373,7 @@ export function classifyClaudeErrors(
     };
   }
 
-  // 4. Latest fresh event exhausted retries → flag
+  // 5. Latest fresh event exhausted retries → flag
   const fromMessage = extractMinutesFromText(latest.message);
   if (fromMessage) {
     return {

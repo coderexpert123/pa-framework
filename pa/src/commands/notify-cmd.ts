@@ -1,5 +1,5 @@
 import { readFile } from 'fs/promises';
-import { notifyUser, getPaAlertsChatId } from '../lib/notify.js';
+import { notifyUser, resolveNotifyTopic } from '../lib/notify.js';
 import { loadSecrets } from '../secrets.js';
 
 /**
@@ -75,11 +75,19 @@ export async function notifyCommand(args: string[] = process.argv.slice(2)): Pro
     process.exit(2);
   }
 
+  // An explicit --topic-thread only overrides the THREAD; the chat still comes
+  // from the secrets-aware resolver. The old env-only getter returned '' for any
+  // deployment whose PA_ALERTS_CHAT_ID lives in secrets.env, so `pa notify
+  // --topic-thread N` handed notifyUser a chat-less override.
+  let topic: { chat_id: string; thread_id: number } | undefined;
+  if (topicThread !== undefined && !isNaN(topicThread)) {
+    const resolved = await resolveNotifyTopic();
+    topic = { chat_id: resolved.chat_id, thread_id: topicThread };
+  }
+
   const result = await notifyUser(subject, body, {
     dedupKey,
-    ...(topicThread !== undefined && !isNaN(topicThread)
-      ? { topic: { chat_id: getPaAlertsChatId(), thread_id: topicThread } }
-      : {}),
+    ...(topic ? { topic } : {}),
     severity,
   });
 

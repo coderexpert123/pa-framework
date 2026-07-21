@@ -588,11 +588,6 @@ export async function dispatchMessage(
           dispatchResult = { result, worker: activeSession.worker, session: activeSession };
         } else {
           const co = await tryClassifyAndNotify(activeSession.worker, result, result.sessionId ?? activeSession.session_id, worker, config, state, defaultWorker, onNotify);
-          if (co.outcome === 'not-rate-limit') {
-            const suggestedWorker = await findNextAvailableWorker(activeSession.worker, defaultWorker, state.preferred_worker, config);
-            const errorText = buildWorkerErrorResponse({ worker: activeSession.worker, exitCode: result.exitCode, stderr: result.error, suggestedWorker });
-            return { response: errorText, session: state.session, meta: null, workerError: true };
-          }
           if (co.outcome === 'rate-limit') rateLimitedWorker = activeSession.worker;
           lastFailedSession = { worker: activeSession.worker, sessionId: result.sessionId ?? activeSession.session_id };
           failedWorkers.add(activeSession.worker);
@@ -618,11 +613,6 @@ export async function dispatchMessage(
         if (prefResult.success) freshResult = { result: prefResult, worker: preferredWorkerConfig.name };
         else {
           const co = await tryClassifyAndNotify(state.preferred_worker, prefResult, prefResult.sessionId, preferredWorkerConfig, config, state, defaultWorker, onNotify);
-          if (co.outcome === 'not-rate-limit') {
-            const suggestedWorker = await findNextAvailableWorker(state.preferred_worker, defaultWorker, state.preferred_worker, config);
-            const errorText = buildWorkerErrorResponse({ worker: state.preferred_worker, exitCode: prefResult.exitCode, stderr: prefResult.error, suggestedWorker });
-            return { response: errorText, session: state.session, meta: null, workerError: true };
-          }
           if (co.outcome === 'rate-limit') rateLimitedWorker = state.preferred_worker;
           lastFailedSession = { worker: state.preferred_worker!, sessionId: prefResult.sessionId ?? '' };
           failedWorkers.add(state.preferred_worker);
@@ -639,11 +629,6 @@ export async function dispatchMessage(
         if (defResult.success) freshResult = { result: defResult, worker: defaultWorkerConfig.name };
         else {
           const co = await tryClassifyAndNotify(defaultWorker, defResult, defResult.sessionId, defaultWorkerConfig, config, state, defaultWorker, onNotify);
-          if (co.outcome === 'not-rate-limit') {
-            const suggestedWorker = await findNextAvailableWorker(defaultWorker, defaultWorker, state.preferred_worker, config);
-            const errorText = buildWorkerErrorResponse({ worker: defaultWorker, exitCode: defResult.exitCode, stderr: defResult.error, suggestedWorker });
-            return { response: errorText, session: state.session, meta: null, workerError: true };
-          }
           if (co.outcome === 'rate-limit') rateLimitedWorker = rateLimitedWorker ?? defaultWorker;
           lastFailedSession = { worker: defaultWorker!, sessionId: defResult.sessionId ?? '' };
           failedWorkers.add(defaultWorker);
@@ -675,7 +660,10 @@ export async function dispatchMessage(
     const suggestedWorker = await findNextAvailableWorker(workerName, defaultWorker, state.preferred_worker, config);
     return { response: buildWorkerErrorResponse({ worker: workerName, emptyResponse: true, suggestedWorker }), session: state.session, meta: null, workerError: true };
   }
-  return { response: buildWorkerResponse({ ...result, output: cleaned }, workerName), session: capturedSession, meta, rateLimitedWorker, dispatchedWorker: workerName, rateLimitTelemetry: result.rateLimitTelemetry };
+  // Only report a dispatchedWorker when it actually succeeded — on full cascade
+  // exhaustion, `workerName` is the last worker tried, which still failed. Reporting
+  // it here would make main.ts's caller pin the status card to a broken worker.
+  return { response: buildWorkerResponse({ ...result, output: cleaned }, workerName), session: capturedSession, meta, rateLimitedWorker, dispatchedWorker: result.success ? workerName : undefined, rateLimitTelemetry: result.rateLimitTelemetry, workerError: result.success ? undefined : true };
 }
 
 /**
