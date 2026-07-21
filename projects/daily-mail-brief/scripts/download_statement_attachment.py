@@ -56,7 +56,7 @@ def download_attachment(msg_id, store_dir):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python download_examplebank_statement.py <msg_id>")
+        print("Usage: python download_statement_attachment.py <msg_id>")
         sys.exit(1)
         
     msg_id = sys.argv[1]
