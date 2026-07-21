@@ -35,7 +35,7 @@ workers:
       - "rate limit"
       - "429"
       - "Resource exhausted"
-    priority: 2
+    priority: 3
     state_dir: "~/.gemini/tmp/personal-assistant/chats"
     state_pattern: "*.json"
 
@@ -51,7 +51,7 @@ workers:
       - "rate limit"
       - "quota exceeded"
       - "429"
-    priority: 3
+    priority: 4
     state_dir: "~/.codex"
     state_pattern: "state_5.sqlite"
 
@@ -68,23 +68,21 @@ workers:
       - "Usage limit"
       - "over your limit"
       - "hit your limit"
-    priority: 4
+    priority: 5
     state_dir: "~/.claude/projects"
     state_pattern: "*.jsonl"
 
   - name: agy
     command: agy
-    args: ["--yolo", "--output-format", "stream-json"]
-    input_mode: stdin-text
-    output_format: stream-json
+    args: ["--dangerously-skip-permissions", "--print-timeout", "65m", "-p", "{prompt}"]
+    input_mode: arg
+    output_format: plain-text
     check: agy --version
     check_timeout: 10
     rate_limit_patterns:
-      - "quota"
-      - "rate limit"
+      - "RESOURCE_EXHAUSTED"
       - "429"
-      - "Resource exhausted"
-    priority: 5
+    priority: 2
     state_dir: "~/.gemini/antigravity-cli/conversations"
     state_pattern: "*.pb"  # protobuf conversation files (.db = pre-2026 legacy SQLite)
 
