@@ -16,7 +16,14 @@ survived every push for months.
 | 0. Commit-message tripwires + credentials | every commit message the push publishes | yes |
 | 1. Structural credential regex | full content of every touched file, + added lines, + commit messages | yes |
 | 2. Personal tripwire regex | full content of every touched file, + touched paths, + added lines, + commit messages | yes |
-| 3. Gemini semantic scan | **added lines only** | yes on VIOLATION, fail-open on infra failure |
+| 3. agy semantic scan | **added lines only** | yes on VIOLATION; on infra failure, **blocks on push (fail-closed), lets through on `--full` (fail-open)** — see below |
+
+**Migrated from Gemini to agy (2026-07-22).** agy (Antigravity CLI) is the
+framework's own default worker (see `~/.pa/config.yaml`) — faster and a
+stronger model than gemini-cli's Gemini 2.5 Pro, so the infra-failure path
+below triggers far less often than it did under Gemini's frequent timeouts.
+It does not eliminate LLM fallibility (any model can hallucinate a verdict) —
+layers 0-2 are still the guard's floor, not layer 3.
 
 Three things that are easy to get wrong, and were:
 
@@ -71,13 +78,29 @@ word that also means something else. Anchoring with `\b` is safe here: the path
 and content layers normalise separators before matching (see above), so an
 anchored pattern still catches `acme_report.py` and `AcmeBank` in `snake_case`.
 
-**Fail-open warnings.** Layer 3 never blocks a push on its own failure — a
-Gemini timeout, an unresolvable binary, an unparseable verdict, an exhausted
-budget or a tripped breaker all let the push through by design. Each of those
-now prints a `!!!!` banner naming **which** layer did not run and **why**.
-Silence used to be indistinguishable from "ran and found nothing"; it isn't any
-more. `gemini_check()` returns `(is_clean, reason, ok)` — `ok=False` means
-fail-open, **not** a real CLEAN — and the human-readable cause is in
+**Layer 3 failure policy — fail-CLOSED on push, fail-open on `--full` (deliberate asymmetry, changed 2026-07-22).**
+`agy_check()` returns `(is_clean, reason, ok)` — `ok=False` means the layer
+itself could not produce a verdict (unreachable, two timeouts, or an
+unparseable response), **not** a real CLEAN. What happens next depends on the
+mode, on purpose:
+
+- **Pre-push hook (default mode):** an interactive gate. `ok=False` now
+  **blocks the push** (exit 1) — "the semantic layer might have caught
+  something we'll never know about" is not an acceptable state for content
+  about to go public. The only sanctioned way past it is the
+  `PA_SKIP_PII_GUARD=1` escape hatch below; there is no other bypass.
+- **`--full` (the scheduled `pii-audit` skill):** a reporting job, not a gate.
+  It keeps the pre-existing fail-open design — time budget + consecutive-
+  failure breaker (below) — on purpose, because forcing a scheduled report to
+  fail-closed would resurrect the exact 34-hour hourly-retry storm this repo
+  already suffered once (2026-07-19/20) when a scheduled skill could not
+  complete inside its timeout. A parked/incomplete weekly report is
+  recoverable next week; blocking every public push indefinitely because one
+  weekly job hung is not the same class of problem.
+
+Either way, every infra failure prints a `!!!!` banner naming **which** layer
+did not run and **why** — silence used to be indistinguishable from "ran and
+found nothing"; it isn't any more. The human-readable cause is in
 `LLM_SKIP_REASON`.
 
 **Override for deliberate pushes (recorded):**
@@ -114,14 +137,22 @@ scan itself failed. (The scheduled skill only delivers stdout on success, so
 findings are output, not an error exit.) Schedule it — this deployment runs it
 weekly via the `pii-audit` skill.
 
-**Gemini binary:** resolved via `$GEMINI_CMD` env var, then `gemini` on PATH,
-then `GEMINI_CMD` in `~/.pa/secrets.env` — a git hook runs with a minimal
-inherited environment, so the secrets.env fallback is what makes the layer
-actually run in practice rather than silently reporting "no Gemini binary."
-Must support `gemini --yolo` (non-interactive, reads prompt from stdin).
-Windows: a `.cmd`/`.bat` shim is invoked through `cmd /c` automatically —
-plain `subprocess` cannot exec batch files, which is how the semantic layer
-ended up silently disabled for weeks.
+**agy binary:** resolved via `$AGY_CMD` env var, then `agy` on PATH, then
+`AGY_CMD` in `~/.pa/secrets.env` — a git hook runs with a minimal inherited
+environment, so the secrets.env fallback is what makes the layer actually run
+in practice rather than silently reporting "no agy binary." Windows: a
+`.cmd`/`.bat` shim is invoked through `cmd /c` automatically — plain
+`subprocess` cannot exec batch files, which is how the semantic layer ended up
+silently disabled for weeks under the prior Gemini invocation.
+
+**agy invocation shape.** Unlike the old Gemini call, the prompt is **not**
+piped over stdin: `agy_check()` writes it to a temp file and passes
+`-p @<path>`, matching how `~/.pa/config.yaml`'s agy worker and
+`pa/src/worker-exec.ts` already invoke agy (`input_mode: arg`). The full argv
+is `<agy> --dangerously-skip-permissions --effort high --print-timeout 10m
+-p @<tempfile>`. `--print-timeout` is set to 10 minutes — well above the
+guard's own `AGY_TIMEOUT` (150s) — specifically so the guard's own
+tree-killing timeout always wins the race, never agy's internal one.
 
 **Reliability invariants (do not regress):**
 
@@ -131,20 +162,24 @@ ended up silently disabled for weeks.
   the variation selector in `⚠️` (byte `0x8f`, undefined in cp1252) raises —
   which a blanket `except` then swallows, emptying the scan input so the guard
   silently vets **nothing** while the push proceeds (observed 2026-07-08 on the
-  Gemini call, again 2026-07-12 on `git diff`/`ls-files`). Calls without
+  LLM call — then Gemini, now agy, the failure class is CLI-agnostic — again
+  2026-07-12 on `git diff`/`ls-files`). Calls without
   `text=True` return bytes and are exempt. Enforced at source level by
   `TestSubprocessEncodingInvariant` so future call sites inherit the rule.
-- **Tree-kill on timeout.** All Gemini invocations go through `_run_gemini()`,
-  whose timeout kills the whole process **tree** (`taskkill /F /T` on Windows,
-  `killpg` on POSIX). Plain `subprocess.run(timeout=)` kills only the `cmd /c`
-  wrapper and orphans the node grandchild, which then busy-spins at 100% CPU
-  forever (2026-07-20: six orphans, six cores).
+- **Tree-kill on timeout.** All agy invocations go through `_run_agy()`, whose
+  timeout kills the whole process **tree** (`taskkill /F /T` on Windows,
+  `killpg` on POSIX) — CLI-agnostic; it was true for Gemini and remains
+  equally true for agy. Plain `subprocess.run(timeout=)` kills only the
+  `cmd /c` wrapper and orphans the node grandchild, which then busy-spins at
+  100% CPU forever (observed 2026-07-20 under the prior Gemini invocation: six
+  orphans, six cores).
 - **Bounded LLM phase.** `--full`'s semantic phase self-bounds via a
   3-consecutive-failure breaker plus `PA_PII_AUDIT_LLM_BUDGET` (default 2400s),
   so the weekly skill always finishes inside its 3600s timeout. A timed-out run
   records no success, and catchup then retries a still-overdue skill forever
-  (the 34-hour hourly retry storm of 2026-07-19/20).
-- **One retry on a transient Gemini failure** (timeout, subprocess error,
+  (the 34-hour hourly retry storm of 2026-07-19/20). This fail-open design is
+  unchanged by the agy migration — see the fail-closed/fail-open split above.
+- **One retry on a transient agy failure** (timeout, subprocess error,
   unparseable response) before the layer gives up — a one-off blip must not
   silently disable the semantic scan for a whole push. A real parsed
   `VIOLATION` is a verdict, not a failure, and is never retried.

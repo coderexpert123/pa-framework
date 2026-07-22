@@ -1,6 +1,15 @@
-"""Unit tests for pa/scripts/git-hooks/pre-push-pii-guard (AI-094, AI-097)."""
+"""Unit tests for pa/scripts/git-hooks/pre-push-pii-guard (AI-094, AI-097).
+
+Migrated 2026-07-22 along with the guard itself: the semantic layer moved from
+Gemini to agy (Antigravity CLI), and the pre-push (interactive) mode's failure
+policy moved from fail-open to fail-CLOSED when that layer cannot render a
+verdict. `--full` (the scheduled weekly audit) deliberately KEEPS fail-open —
+see TestFullAuditLlmGuards and the guard's own module docstring for why that
+asymmetry is intentional, not an oversight.
+"""
 import ast
 import contextlib
+import glob
 import importlib.util
 import io
 import json
@@ -23,55 +32,60 @@ with open(GUARD_PATH, encoding="utf-8") as f:
 exec(compile(code.replace('if __name__ == "__main__":', 'if False:'), GUARD_PATH, "exec"), guard.__dict__)
 
 
-class TestResolveGeminiArgv(unittest.TestCase):
+class TestResolveAgyArgv(unittest.TestCase):
+    """Was TestResolveGeminiArgv — same cases, AGY_CMD/'agy' instead of
+    GEMINI_CMD/'gemini'. Order is unchanged: $AGY_CMD env, then 'agy' on
+    PATH, then AGY_CMD in ~/.pa/secrets.env (AI-097: git hooks inherit a
+    minimal environment)."""
+
     def test_env_var_plain_binary(self):
-        with patch.dict(os.environ, {"GEMINI_CMD": "/usr/bin/gemini"}):
-            self.assertEqual(guard.resolve_gemini_argv(), ["/usr/bin/gemini"])
+        with patch.dict(os.environ, {"AGY_CMD": "/usr/bin/agy"}):
+            self.assertEqual(guard.resolve_agy_argv(), ["/usr/bin/agy"])
 
     def test_env_var_cmd_shim_gets_cmd_interpreter(self):
         """The AI-094 bug: .cmd shims can't be exec'd directly by subprocess."""
-        with patch.dict(os.environ, {"GEMINI_CMD": r"D:\gemini-shim\gemini.cmd"}):
-            self.assertEqual(guard.resolve_gemini_argv(), ["cmd", "/c", r"D:\gemini-shim\gemini.cmd"])
+        with patch.dict(os.environ, {"AGY_CMD": r"D:\gemini-shim\agy.cmd"}):
+            self.assertEqual(guard.resolve_agy_argv(), ["cmd", "/c", r"D:\gemini-shim\agy.cmd"])
 
     def test_bat_shim_also_wrapped(self):
-        with patch.dict(os.environ, {"GEMINI_CMD": "gemini.BAT"}):
-            self.assertEqual(guard.resolve_gemini_argv(), ["cmd", "/c", "gemini.BAT"])
+        with patch.dict(os.environ, {"AGY_CMD": "agy.BAT"}):
+            self.assertEqual(guard.resolve_agy_argv(), ["cmd", "/c", "agy.BAT"])
 
     def test_falls_back_to_path_lookup(self):
-        env = {k: v for k, v in os.environ.items() if k != "GEMINI_CMD"}
+        env = {k: v for k, v in os.environ.items() if k != "AGY_CMD"}
         with patch.dict(os.environ, env, clear=True):
             with patch.object(guard.shutil, "which", return_value=None):
                 with patch.object(guard, "_load_secrets", return_value={}):
-                    self.assertIsNone(guard.resolve_gemini_argv())
-            with patch.object(guard.shutil, "which", return_value="/opt/gemini"):
+                    self.assertIsNone(guard.resolve_agy_argv())
+            with patch.object(guard.shutil, "which", return_value="/opt/agy"):
                 with patch.object(guard, "_load_secrets", return_value={}):
-                    self.assertEqual(guard.resolve_gemini_argv(), ["/opt/gemini"])
+                    self.assertEqual(guard.resolve_agy_argv(), ["/opt/agy"])
 
     def test_falls_back_to_secrets_env_when_path_lookup_fails(self):
-        """AI-097: git hooks run with a minimal env — GEMINI_CMD is set in
+        """AI-097: git hooks run with a minimal env — AGY_CMD is set in
         ~/.pa/secrets.env but not exported into the hook's process env. The
         hook must consult secrets.env before giving up, same as
         projects/coding-dirs-updater/update_coding_dirs.py's reference pattern."""
-        env = {k: v for k, v in os.environ.items() if k != "GEMINI_CMD"}
+        env = {k: v for k, v in os.environ.items() if k != "AGY_CMD"}
         with patch.dict(os.environ, env, clear=True):
             with patch.object(guard.shutil, "which", return_value=None):
-                with patch.object(guard, "_load_secrets", return_value={"GEMINI_CMD": r"D:\gemini-shim\gemini.cmd"}):
-                    self.assertEqual(guard.resolve_gemini_argv(), ["cmd", "/c", r"D:\gemini-shim\gemini.cmd"])
+                with patch.object(guard, "_load_secrets", return_value={"AGY_CMD": r"D:\gemini-shim\agy.cmd"}):
+                    self.assertEqual(guard.resolve_agy_argv(), ["cmd", "/c", r"D:\gemini-shim\agy.cmd"])
 
     def test_env_var_still_wins_over_secrets_env(self):
-        with patch.dict(os.environ, {"GEMINI_CMD": "/from/env"}):
-            with patch.object(guard, "_load_secrets", return_value={"GEMINI_CMD": "/from/secrets/file"}):
-                self.assertEqual(guard.resolve_gemini_argv(), ["/from/env"])
+        with patch.dict(os.environ, {"AGY_CMD": "/from/env"}):
+            with patch.object(guard, "_load_secrets", return_value={"AGY_CMD": "/from/secrets/file"}):
+                self.assertEqual(guard.resolve_agy_argv(), ["/from/env"])
 
 
 class TestLoadSecrets(unittest.TestCase):
     def test_parses_key_value_pairs_and_ignores_comments(self):
         with tempfile.TemporaryDirectory() as tmp:
             with open(os.path.join(tmp, "secrets.env"), "w", encoding="utf-8") as f:
-                f.write("# comment\nGEMINI_CMD=D:/gemini-shim/gemini.cmd\nEMPTY=\n\nQUOTED=\"value\"\n")
+                f.write("# comment\nAGY_CMD=D:/gemini-shim/agy.cmd\nEMPTY=\n\nQUOTED=\"value\"\n")
             with patch.object(guard, "PA_HOME", tmp):
                 secrets = guard._load_secrets()
-        self.assertEqual(secrets.get("GEMINI_CMD"), "D:/gemini-shim/gemini.cmd")
+        self.assertEqual(secrets.get("AGY_CMD"), "D:/gemini-shim/agy.cmd")
         self.assertEqual(secrets.get("QUOTED"), "value")
 
     def test_missing_file_returns_empty_dict(self):
@@ -80,73 +94,162 @@ class TestLoadSecrets(unittest.TestCase):
                 self.assertEqual(guard._load_secrets(), {})
 
 
-class TestGeminiCheckSturdiness(unittest.TestCase):
-    """AI-097: the 2026-07-08 crash — Windows subprocess.run() without an
-    explicit encoding= defaults to the system codepage (cp1252), and Gemini's
-    UTF-8 output (emoji, smart quotes) crashes a background reader thread with
-    an exception that escapes gemini_check()'s own try/except entirely (the
-    reader thread isn't the calling thread) — the push proceeded, but by
-    accident, not by the intended fail-open design. Also: no retry on a
-    single transient failure, despite the module's stated 'sturdy, relied on'
-    goal — a one-shot timeout/connection blip silently disables the layer
-    for the whole push."""
+def _leaked_prompt_files():
+    """Any pa-pii-guard-prompt-*.txt files currently sitting in the temp dir.
+    Used to prove agy_check's temp prompt file is cleaned up on EVERY code
+    path (success, timeout, unparseable-retry-exhausted) — not just the
+    happy path."""
+    return set(glob.glob(os.path.join(tempfile.gettempdir(), "pa-pii-guard-prompt-*.txt")))
+
+
+class TestAgyCheckSturdiness(unittest.TestCase):
+    """Was TestGeminiCheckSturdiness. AI-097: Windows subprocess.run() without
+    an explicit encoding= defaults to the system codepage (cp1252), and a
+    CLI's UTF-8 output (emoji, smart quotes) crashes a background reader
+    thread with an exception that escapes agy_check()'s own try/except
+    entirely (the reader thread isn't the calling thread) — a push would
+    proceed, but by accident, not by the intended design. Also covers: no
+    retry on a single transient failure would silently disable the layer for
+    a whole push despite the module's stated 'sturdy, relied on' goal; and
+    the prompt-file lifecycle introduced by the 2026-07-22 migration to
+    argv-based (`-p @<file>`) prompting instead of stdin piping."""
 
     def test_popen_called_with_explicit_utf8_and_replace(self):
-        """The encoding contract moved from subprocess.run to _run_gemini's
-        Popen when tree-kill landed — same AI-097 stakes, same assertion."""
+        """The encoding contract lives on _run_agy's Popen kwargs."""
         mock_proc = MagicMock()
         mock_proc.communicate.return_value = ("CLEAN", "")
         mock_proc.returncode = 0
         with patch.object(guard.subprocess, "Popen", return_value=mock_proc) as mock_popen:
-            guard._run_gemini(["gemini", "--yolo"], "prompt", 120)
+            guard._run_agy(["agy", "--yolo"], 120)
         _, kwargs = mock_popen.call_args
         self.assertEqual(kwargs.get("encoding"), "utf-8")
         self.assertEqual(kwargs.get("errors"), "replace")
 
+    def test_no_agy_binary_resolvable_fails_open_with_reason_naming_agy_cmd(self):
+        with patch.object(guard, "resolve_agy_argv", return_value=None):
+            is_clean, reason, ok = guard.agy_check("content", [])
+        self.assertTrue(is_clean, "no binary resolvable is a layer failure, not a real CLEAN verdict")
+        self.assertEqual(reason, "")
+        self.assertFalse(ok, "callers must be able to tell 'no binary' from a real verdict")
+        self.assertIn("AGY_CMD", guard.LLM_SKIP_REASON)
+
     def test_retries_once_on_timeout_then_succeeds(self):
-        with patch.object(guard, "resolve_gemini_argv", return_value=["gemini"]):
+        with patch.object(guard, "resolve_agy_argv", return_value=["agy"]):
             mock_result = MagicMock(stdout="CLEAN", returncode=0)
             with patch.object(
-                guard, "_run_gemini",
-                side_effect=[subprocess.TimeoutExpired(cmd="gemini", timeout=120), mock_result],
+                guard, "_run_agy",
+                side_effect=[subprocess.TimeoutExpired(cmd="agy", timeout=150), mock_result],
             ) as mock_run:
-                is_clean, _, ok = guard.gemini_check("content", [])
+                is_clean, _, ok = guard.agy_check("content", [])
         self.assertTrue(is_clean)
         self.assertTrue(ok, "a successful retry is a REAL verdict, not fail-open")
         self.assertEqual(mock_run.call_count, 2)
 
     def test_fails_open_with_clear_warning_after_all_retries_exhausted(self):
-        with patch.object(guard, "resolve_gemini_argv", return_value=["gemini"]):
+        with patch.object(guard, "resolve_agy_argv", return_value=["agy"]):
             with patch.object(
-                guard, "_run_gemini",
-                side_effect=subprocess.TimeoutExpired(cmd="gemini", timeout=120),
+                guard, "_run_agy",
+                side_effect=subprocess.TimeoutExpired(cmd="agy", timeout=150),
             ) as mock_run:
-                is_clean, reason, ok = guard.gemini_check("content", [])
-        self.assertTrue(is_clean, "must fail OPEN (never block a push on infra failure)")
+                is_clean, reason, ok = guard.agy_check("content", [])
+        self.assertTrue(is_clean, "the LAYER still fails open (a real verdict couldn't be produced)")
         self.assertEqual(reason, "")
-        self.assertFalse(ok, "callers must be able to tell fail-open from a real CLEAN")
+        self.assertFalse(ok, "callers must be able to tell layer-failure from a real CLEAN — "
+                             "main() is what turns this ok=False into a BLOCK on a push now")
         self.assertGreaterEqual(mock_run.call_count, 2, "must have actually retried, not given up on the first failure")
 
     def test_does_not_retry_on_a_parsed_violation(self):
         """A real VIOLATION verdict is not a transient failure — must not retry."""
-        with patch.object(guard, "resolve_gemini_argv", return_value=["gemini"]):
+        with patch.object(guard, "resolve_agy_argv", return_value=["agy"]):
             mock_result = MagicMock(stdout="VIOLATION: real name found", returncode=0)
-            with patch.object(guard, "_run_gemini", return_value=mock_result) as mock_run:
-                is_clean, reason, ok = guard.gemini_check("content", [])
+            with patch.object(guard, "_run_agy", return_value=mock_result) as mock_run:
+                is_clean, reason, ok = guard.agy_check("content", [])
         self.assertFalse(is_clean)
         self.assertTrue(ok)
         self.assertEqual(mock_run.call_count, 1)
 
+    def test_unparseable_response_retries_once_then_gives_up(self):
+        with patch.object(guard, "resolve_agy_argv", return_value=["agy"]):
+            mock_result = MagicMock(stdout="uh, I'm not sure what you mean", returncode=0)
+            with patch.object(guard, "_run_agy", return_value=mock_result) as mock_run:
+                is_clean, reason, ok = guard.agy_check("content", [])
+        self.assertTrue(is_clean, "unparseable must fail OPEN, not silently claim a clean verdict forever")
+        self.assertFalse(ok)
+        self.assertEqual(mock_run.call_count, 2, "an unparseable response gets exactly one retry before giving up")
 
-class TestRunGeminiTreeKill(unittest.TestCase):
-    """2026-07-20 orphan leak: the resolved argv on Windows is `cmd /c shim.cmd`,
-    so subprocess.run(timeout=...) killed only cmd.exe and orphaned the node
-    grandchild, which busy-spun at 100% CPU forever (six orphans, six cores).
-    _run_gemini must kill the WHOLE tree on timeout."""
+    def test_prompt_file_written_and_cleaned_up_on_success(self):
+        before = _leaked_prompt_files()
+        with patch.object(guard, "resolve_agy_argv", return_value=["agy"]):
+            mock_result = MagicMock(stdout="CLEAN", returncode=0)
+            with patch.object(guard, "_run_agy", return_value=mock_result):
+                guard.agy_check("content", [])
+        self.assertEqual(_leaked_prompt_files() - before, set(),
+                         "the temp prompt file must not survive a successful call")
+
+    def test_prompt_file_cleaned_up_after_timeout_exhausted(self):
+        before = _leaked_prompt_files()
+        with patch.object(guard, "resolve_agy_argv", return_value=["agy"]):
+            with patch.object(guard, "_run_agy",
+                              side_effect=subprocess.TimeoutExpired(cmd="agy", timeout=150)):
+                guard.agy_check("content", [])
+        self.assertEqual(_leaked_prompt_files() - before, set(),
+                         "the temp prompt file must not leak when every attempt times out")
+
+    def test_prompt_file_cleaned_up_after_unparseable_retry_exhausted(self):
+        before = _leaked_prompt_files()
+        with patch.object(guard, "resolve_agy_argv", return_value=["agy"]):
+            mock_result = MagicMock(stdout="garbage", returncode=0)
+            with patch.object(guard, "_run_agy", return_value=mock_result):
+                guard.agy_check("content", [])
+        self.assertEqual(_leaked_prompt_files() - before, set(),
+                         "the temp prompt file must not leak on the unparseable-exhausted path")
+
+    def test_prompt_file_cleaned_up_when_no_binary_resolvable(self):
+        """No _run_agy call happens at all on this path — _write_agy_prompt is
+        never even reached — but assert the invariant holds regardless (no
+        file should appear from this call)."""
+        before = _leaked_prompt_files()
+        with patch.object(guard, "resolve_agy_argv", return_value=None):
+            guard.agy_check("content", [])
+        self.assertEqual(_leaked_prompt_files() - before, set())
+
+
+class TestWriteAgyPrompt(unittest.TestCase):
+    """_write_agy_prompt is new in the 2026-07-22 migration: the prompt now
+    rides in on argv (`-p @<file>`) instead of stdin, matching how
+    ~/.pa/config.yaml's agy worker and worker-exec.ts already invoke agy."""
+
+    def test_writes_prompt_content_and_returns_a_readable_path(self):
+        path = guard._write_agy_prompt("scan this content for PII")
+        try:
+            self.assertTrue(os.path.exists(path))
+            self.assertIn("pa-pii-guard-prompt-", os.path.basename(path))
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "scan this content for PII")
+        finally:
+            os.unlink(path)
+
+    def test_each_call_gets_its_own_file(self):
+        p1 = guard._write_agy_prompt("a")
+        p2 = guard._write_agy_prompt("b")
+        try:
+            self.assertNotEqual(p1, p2)
+        finally:
+            os.unlink(p1)
+            os.unlink(p2)
+
+
+class TestRunAgyTreeKill(unittest.TestCase):
+    """Was TestRunGeminiTreeKill. 2026-07-20 orphan leak: the resolved argv on
+    Windows is `cmd /c shim.cmd`, so subprocess.run(timeout=...) killed only
+    cmd.exe and orphaned the node grandchild, which busy-spun at 100% CPU
+    forever (six orphans, six cores). _run_agy must kill the WHOLE tree on
+    timeout — this is the single most important test in the file: a real
+    spawned process tree, not a mock, must actually die."""
 
     def test_timeout_kills_grandchild_too(self):
         # Real-process test: wrapper (child) spawns a sleeper (grandchild) that
-        # writes its own PID to a file first thing. After _run_gemini times out,
+        # writes its own PID to a file first thing. After _run_agy times out,
         # that PID must be gone.
         with tempfile.TemporaryDirectory() as tmp:
             pid_file = os.path.join(tmp, "grandchild.pid")
@@ -166,7 +269,7 @@ class TestRunGeminiTreeKill(unittest.TestCase):
             argv = [sys.executable, "-c", wrapper]
             start = time.monotonic()
             with self.assertRaises(subprocess.TimeoutExpired):
-                guard._run_gemini(argv, "", timeout=8)
+                guard._run_agy(argv, timeout=8)
             self.assertLess(time.monotonic() - start, 30, "tree kill must not hang")
             self.assertTrue(os.path.exists(pid_file), "grandchild never started — test is vacuous")
             grandchild_pid = int(open(pid_file).read())
@@ -179,7 +282,7 @@ class TestRunGeminiTreeKill(unittest.TestCase):
     def test_normal_completion_returns_stdout(self):
         script = "import sys; sys.stdout.write('CLEAN'); sys.stdout.flush()"
         argv = [sys.executable, "-c", script]
-        result = guard._run_gemini(argv, "ignored input", timeout=30)
+        result = guard._run_agy(argv, timeout=30)
         self.assertEqual(result.stdout.strip(), "CLEAN")
 
 
@@ -203,17 +306,22 @@ class TestFullAuditLlmGuards(unittest.TestCase):
     so a degraded Gemini made every run time out -> no success recorded ->
     catchup relaunched hourly forever. full_audit must ALWAYS complete: a
     consecutive-failure breaker and a global time budget both stop the LLM
-    phase early (loudly) instead of blowing the skill timeout."""
+    phase early (loudly) instead of blowing the skill timeout.
+
+    2026-07-22: the underlying CLI changed to agy (agy_check instead of
+    gemini_check) but this policy is UNCHANGED ON PURPOSE — full_audit is a
+    scheduled REPORT that must always complete, unlike the push gate below,
+    which now fails closed. Both must still hold with agy_check mocked in."""
 
     def _files(self, n_lines):
         # one fake tracked file with n_lines non-blank lines -> ceil(n/300) chunks
         return [("big.txt", "\n".join(f"line {i}" for i in range(n_lines)))]
 
-    def _run_full_audit(self, files, gemini_side_effect, env=None, monotonic=None):
+    def _run_full_audit(self, files, agy_side_effect, env=None, monotonic=None):
         patches = [
             patch.object(guard, "collect_tree", return_value=files),
             patch.object(guard, "load_tripwires", return_value=["Secretname"]),
-            patch.object(guard, "gemini_check", side_effect=gemini_side_effect),
+            patch.object(guard, "agy_check", side_effect=agy_side_effect),
             patch.dict(os.environ, env or {}, clear=False),
             # Path scanning added 2026-07-21: full_audit now enumerates every
             # tracked path (binaries included) separately from readable
@@ -233,19 +341,20 @@ class TestFullAuditLlmGuards(unittest.TestCase):
         finally:
             for p in patches:
                 p.stop()
-        return rc, mocks[2]  # (exit code, gemini_check mock)
+        return rc, mocks[2]  # (exit code, agy_check mock)
 
     def test_breaker_stops_after_consecutive_failures(self):
-        # 6 chunks available; gemini always infra-fails -> exactly 3 calls (breaker), rc 0
+        # 6 chunks available; agy always infra-fails -> exactly 3 calls (breaker), rc 0
         rc, gc = self._run_full_audit(
-            self._files(1800), gemini_side_effect=lambda *a: (True, "", False))
-        self.assertEqual(rc, 0, "a degraded LLM layer must NOT fail the scan — that is the retry storm")
+            self._files(1800), agy_side_effect=lambda *a: (True, "", False))
+        self.assertEqual(rc, 0, "a degraded LLM layer must NOT fail the scan — that is the retry storm; "
+                               "full_audit keeps fail-open policy after the agy migration, deliberately")
         self.assertEqual(gc.call_count, guard.LLM_FAILURE_BREAKER)
 
     def test_success_resets_breaker(self):
         # fail, fail, success, fail, fail, success -> all 6 chunks attempted
         verdicts = [(True, "", False), (True, "", False), (True, "", True)] * 2
-        rc, gc = self._run_full_audit(self._files(1800), gemini_side_effect=verdicts)
+        rc, gc = self._run_full_audit(self._files(1800), agy_side_effect=verdicts)
         self.assertEqual(rc, 0)
         self.assertEqual(gc.call_count, 6)
 
@@ -253,7 +362,7 @@ class TestFullAuditLlmGuards(unittest.TestCase):
         # monotonic: deadline calc at t=0, chunk1 check t=0, chunk2 check t=2401
         rc, gc = self._run_full_audit(
             self._files(1800),
-            gemini_side_effect=lambda *a: (True, "", True),
+            agy_side_effect=lambda *a: (True, "", True),
             env={"PA_PII_AUDIT_LLM_BUDGET": "2400"},
             monotonic=[0.0, 0.0, 2401.0],
         )
@@ -262,7 +371,7 @@ class TestFullAuditLlmGuards(unittest.TestCase):
 
     def test_llm_violations_still_reported_when_all_calls_succeed(self):
         verdicts = [(False, "real name found", True)] + [(True, "", True)] * 5
-        rc, gc = self._run_full_audit(self._files(1800), gemini_side_effect=verdicts)
+        rc, gc = self._run_full_audit(self._files(1800), agy_side_effect=verdicts)
         self.assertEqual(rc, 0, "violations are OUTPUT, not an error (exit-code contract)")
         self.assertEqual(gc.call_count, 6)
 
@@ -295,7 +404,7 @@ class TestScanText(unittest.TestCase):
 
 class TestCollectDiffEncoding(unittest.TestCase):
     """The per-push diff scan must read `git diff` output as UTF-8. Same AI-097
-    class as the gemini subprocess: without explicit encoding=, Windows
+    class as the LLM subprocess: without explicit encoding=, Windows
     subprocess.run(text=True) decodes with cp1252 — em-dashes silently mojibake
     and the variation selector in ⚠️ (byte 0x8f, undefined in cp1252) raises
     UnicodeDecodeError, which collect_diff's blanket `except` swallows → ADDED
@@ -321,7 +430,7 @@ class TestCollectDiffEncoding(unittest.TestCase):
 
     def test_utf8_added_lines_captured_not_dropped(self):
         # A real diff that would crash cp1252 (⚠️ has byte 0x8f) must still be
-        # parsed into ADDED so the regex/tripwire/gemini layers actually see it.
+        # parsed into ADDED so the regex/tripwire/agy layers actually see it.
         self._run("+warn ⚠️ here\n+em — dash\n-removed old\n")
         self.assertIn("warn ⚠️ here", guard.ADDED)
         self.assertIn("em — dash", guard.ADDED)
@@ -459,7 +568,7 @@ class TestPushScanCoverage(unittest.TestCase):
             lst.clear()
 
     def _main(self, added=(), touched_paths=(), touched_files=(), tripwires=(),
-              messages=(), gemini=(True, "", True)):
+              messages=(), agy=(True, "", True)):
         def fake_collect():
             guard.ADDED.extend(added)
             guard.TOUCHED_PATHS.extend(touched_paths)
@@ -472,7 +581,7 @@ class TestPushScanCoverage(unittest.TestCase):
              patch.object(guard.sys, "argv", ["pre-push-pii-guard", "origin", "git@x:y.git"]), \
              patch.object(guard, "collect_diff", side_effect=fake_collect), \
              patch.object(guard, "load_tripwires", return_value=list(tripwires)), \
-             patch.object(guard, "gemini_check", return_value=gemini) as gc, \
+             patch.object(guard, "agy_check", return_value=agy) as gc, \
              contextlib.redirect_stderr(buf):
             rc = guard.main()
         return rc, buf.getvalue(), gc
@@ -529,16 +638,27 @@ class TestPushScanCoverage(unittest.TestCase):
                       "the LLM layer's true (narrower) scope must be stated, not implied")
         self.assertEqual(gc.call_count, 1)
 
-    def test_gemini_infra_failure_warns_loudly_and_still_exits_zero(self):
+    def test_agy_infra_failure_now_blocks_the_push(self):
+        """CORRECTED 2026-07-22 (was `test_gemini_infra_failure_warns_loudly_and_
+        still_exits_zero`, asserting rc == 0): that assertion encoded the OLD
+        fail-open push policy. The policy changed today — a push is an
+        interactive gate, and a layer-3 verdict failure (unreachable, timed
+        out twice, unparseable) now BLOCKS instead of waving the push through.
+        Kept in place rather than deleted, per this repo's own convention for
+        a test whose ASSERTION encoded now-superseded behavior. The layer
+        itself still prints its own FAIL-OPEN banner (it genuinely could not
+        render a verdict) — what changed is main()'s RESPONSE to that, not
+        whether the banner fires."""
         rc, err, _ = self._main(added=["x = 1"], touched_paths=["a.py"],
-                                gemini=(True, "", False))
-        self.assertEqual(rc, 0, "fail-open is deliberate — an infra failure must not wedge a push")
-        self.assertIn("FAIL-OPEN", err)
-        self.assertIn("Gemini semantic scan", err)
+                                agy=(True, "", False))
+        self.assertEqual(rc, 1, "fail-CLOSED since 2026-07-22 — an infra failure must not wave a push through")
+        self.assertIn("FAIL-OPEN", err, "the layer-skip banner still fires; main()'s reaction to it is what changed")
+        self.assertIn("agy semantic scan", err)
+        self.assertIn("PA_SKIP_PII_GUARD", err, "the only sanctioned escape hatch must be named in the block message")
 
-    def test_gemini_violation_still_blocks(self):
+    def test_agy_violation_still_blocks(self):
         rc, err, _ = self._main(added=["x = 1"], touched_paths=["a.py"],
-                                gemini=(False, "real name found", True))
+                                agy=(False, "real name found", True))
         self.assertEqual(rc, 1)
         self.assertIn("real name found", err)
 
@@ -561,10 +681,59 @@ class TestPushScanCoverage(unittest.TestCase):
         self.assertEqual(gc.call_count, 0)
 
 
+class TestPushModeFailClosed(unittest.TestCase):
+    """NEW 2026-07-22: proves the actual policy change end-to-end via main().
+    agy_check's (is_clean, reason, ok) contract is unchanged; what changed is
+    what the PUSH-mode caller does with ok=False. `--full` (full_audit,
+    covered separately in TestFullAuditLlmGuards) keeps the OLD fail-open
+    behavior on purpose — a scheduled report must always complete, a push
+    gate must not wave through content nobody actually verified. Complements
+    (does not replace) the in-place-corrected regression test in
+    TestPushScanCoverage."""
+
+    def setUp(self):
+        for lst in (guard.ADDED, guard.TOUCHED_PATHS, guard.TOUCHED_FILES,
+                    guard.UNREADABLE_PATHS, guard.MESSAGES):
+            lst.clear()
+
+    def _main(self, agy):
+        def fake_collect():
+            guard.ADDED.extend(["x = 1"])
+            guard.TOUCHED_PATHS.extend(["a.py"])
+
+        env = {k: v for k, v in os.environ.items() if k != "PA_SKIP_PII_GUARD"}
+        buf = io.StringIO()
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(guard.sys, "argv", ["pre-push-pii-guard", "origin", "git@x:y.git"]), \
+             patch.object(guard, "collect_diff", side_effect=fake_collect), \
+             patch.object(guard, "load_tripwires", return_value=["Secretname"]), \
+             patch.object(guard, "agy_check", return_value=agy), \
+             contextlib.redirect_stderr(buf):
+            rc = guard.main()
+        return rc, buf.getvalue()
+
+    def test_layer_could_not_render_a_verdict_blocks_the_push(self):
+        rc, err = self._main(agy=(True, "", False))
+        self.assertEqual(rc, 1, "ok=False must block a push, not pass it")
+        self.assertIn("PA_SKIP_PII_GUARD", err, "the sanctioned escape hatch must be named")
+        self.assertIn("pii-guard-bypass.jsonl", err, "the bypass-is-never-silent property must be advertised here too")
+
+    def test_genuinely_clean_verdict_passes(self):
+        rc, _ = self._main(agy=(True, "", True))
+        self.assertEqual(rc, 0)
+
+    def test_genuine_violation_blocks_with_reason(self):
+        rc, err = self._main(agy=(False, "some reason", True))
+        self.assertEqual(rc, 1)
+        self.assertIn("some reason", err)
+
+
 class TestBypassRecord(unittest.TestCase):
     """PA_SKIP_PII_GUARD stays a working escape hatch (it is how a verified-clean
-    history rewrite gets pushed), but it used to vanish without trace, so
-    'was anything ever pushed unscanned?' was unanswerable after the fact."""
+    history rewrite gets pushed, and — as of 2026-07-22 — the ONLY sanctioned
+    way past a layer-3 verdict failure on a push), but it used to vanish
+    without trace, so 'was anything ever pushed unscanned?' was unanswerable
+    after the fact."""
 
     def _bypass(self, pa_home, stdin_lines):
         buf = io.StringIO()
@@ -721,7 +890,9 @@ class TestSubprocessEncodingInvariant(unittest.TestCase):
     raises, a blanket `except` swallows it, and the scan silently vets nothing.
     A source-level assertion is what makes this hold for call sites that do not
     exist yet. Calls WITHOUT text=True (e.g. taskkill) return bytes and are
-    exempt — there is no decode to get wrong."""
+    exempt — there is no decode to get wrong. Unchanged by the 2026-07-22 agy
+    migration — run it and confirm rather than assume, since a failure here
+    would be a real defect in the core file worth escalating immediately."""
 
     def test_every_decoding_subprocess_call_pins_utf8(self):
         with open(GUARD_PATH, encoding="utf-8") as f:
@@ -748,9 +919,10 @@ class TestSubprocessEncodingInvariant(unittest.TestCase):
         self.assertEqual(offenders, [], f"missing encoding='utf-8', errors='replace': {offenders}")
 
     def test_kwargs_dict_call_sites_are_covered_by_the_popen_test(self):
-        """_run_gemini builds its kwargs in a dict, so the AST check above
-        cannot see them — the live assertion in
-        TestGeminiCheckSturdiness.test_popen_called_with_explicit_utf8_and_replace
+        """_run_agy builds its kwargs in a dict and unpacks with **kwargs, so
+        the AST check above cannot see them (the keyword node's .arg is None
+        for a ** unpack) — the live assertion in
+        TestAgyCheckSturdiness.test_popen_called_with_explicit_utf8_and_replace
         is what covers it. This test exists so that pairing is not accidental."""
         with open(GUARD_PATH, encoding="utf-8") as f:
             src = f.read()

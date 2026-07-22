@@ -12,7 +12,7 @@ every content-only layer.
      GitHub serves and neither was ever scanned before 2026-07-21.
   1. Structural regex — catches unambiguous credentials immediately (no LLM).
   2. Personal tripwire regex — patterns from ~/.pa/pii-tripwires.txt (outside repo).
-  3. Gemini semantic scan — catches personal data that doesn't match a regex.
+  3. agy semantic scan — catches personal data that doesn't match a regex.
 
 SCOPE, per layer (this asymmetry is deliberate — say it out loud in the output
 so nobody re-learns it the hard way):
@@ -21,15 +21,42 @@ so nobody re-learns it the hard way):
     commit message. Scanning only the '+' lines of a diff — what this hook did
     until 2026-07-21 — makes PII that was already committed permanently
     invisible, which is how three separate leaks survived every push for months.
-  * Layer 3 (Gemini, metered) stays ADDED-LINES ONLY, for budget. It is not a
+  * Layer 3 (agy, metered) stays ADDED-LINES ONLY, for budget. It is not a
     full-content scan and must never be described as one. The weekly `--full`
     audit is what gives the semantic layer whole-tree coverage.
 
-Fail-open on LLM errors: a Gemini timeout or missing binary produces a LOUD
-banner but does NOT block the push. Regex layers always run.
+FAIL-CLOSED ON PUSH, FAIL-OPEN ON THE SCHEDULED AUDIT — a deliberate asymmetry,
+changed 2026-07-22 (was fail-open everywhere; see below for why that was wrong
+for this mode specifically):
+  * The pre-push hook is an INTERACTIVE GATE. If agy cannot produce a real
+    verdict — unreachable, times out twice, or returns something unparseable —
+    the push is now BLOCKED, not waved through. "The semantic layer might have
+    caught something we'll never know about" is not an acceptable steady state
+    for content about to become public; a human must either fix agy or
+    consciously choose PA_SKIP_PII_GUARD=1 (below) to proceed anyway. Layers
+    0-2 already ran and already block independently — this only changes what
+    happens when layer 3 itself cannot render a verdict.
+  * `--full` is a REPORTING JOB (the weekly pii-audit skill), not a gate. It
+    keeps the pre-existing fail-open-with-budget-and-breaker design on
+    purpose: forcing IT to fail-closed would resurrect the exact 34-hour
+    hourly-retry storm this repo already suffered once (2026-07-19/20, see
+    CLAUDE.md) when a scheduled skill could not complete inside its timeout.
+    A parked/incomplete WEEKLY REPORT is recoverable next week; blocking every
+    public push indefinitely because one weekly job hung is not the same
+    class of problem and does not need the same fix.
+
+Migrated from Gemini to agy 2026-07-22: agy (Antigravity CLI) is the
+framework's own default worker (see ~/.pa/config.yaml) — faster, cheaper and a
+stronger model than gemini-cli's Gemini 2.5 Pro (Artificial Analysis
+Intelligence Index 50 vs 26, ~3x the throughput), which in practice means the
+fail-open path above triggers far less often than it did under Gemini's
+frequent timeouts. It does not eliminate LLM fallibility (any model can
+hallucinate a verdict) — layers 0-2 are still the guard's floor, not this one.
 
 Set PA_SKIP_PII_GUARD=1 to bypass entirely — printed as a banner AND appended
 to ~/.pa/pii-guard-bypass.jsonl, so a bypass is never invisible after the fact.
+This is the ONLY sanctioned way past a broken layer 3 on a push; there is no
+other escape hatch, by design.
 
 Modes:
   (default)      pre-push hook — scans the outgoing push (see SCOPE above).
@@ -37,7 +64,7 @@ Modes:
                  GIT_DIR env var points at (default: .git-public relative to
                  cwd). Reports all violations. Use for the scheduled pii-audit
                  skill / manual full-tree sweeps.
-  --no-llm       with --full: skip the Gemini layer (regex + tripwires only).
+  --no-llm       with --full: skip the agy layer (regex + tripwires only).
 
 Install:
   cp pa/scripts/git-hooks/pre-push-pii-guard .git-public/hooks/pre-push
@@ -202,7 +229,7 @@ def collect_diff():
 def _collect_added(base: str, local_sha: str) -> None:
     try:
         # encoding="utf-8", errors="replace" is load-bearing (same AI-097
-        # class as gemini_check below): without it, Windows decodes the diff
+        # class as agy_check below): without it, Windows decodes the diff
         # with the system codepage (cp1252), which silently mojibakes
         # em-dashes and HARD-CRASHES on the undefined byte 0x8f in a ⚠️
         # variation selector (EF B8 8F). Caught by the except below, that
@@ -382,22 +409,25 @@ def load_tripwires() -> list[str]:
         return []
 
 
-def resolve_gemini_argv() -> list[str] | None:
+def resolve_agy_argv() -> list[str] | None:
     """
-    Resolve the Gemini invocation, Windows-aware.
+    Resolve the agy invocation, Windows-aware.
 
-    Order: $GEMINI_CMD, then `gemini` on PATH. Returns the argv prefix (before
-    flags) or None when nothing resolvable — the caller fail-opens with a
-    warning either way, but None makes the "layer silently off" state explicit.
+    Order: $AGY_CMD, then `agy` on PATH, then AGY_CMD in ~/.pa/secrets.env —
+    the same order and reasoning as the prior Gemini resolver (AI-097: git
+    hooks inherit a minimal environment, so PATH-only resolution silently
+    left the semantic layer off in practice). Returns the argv prefix (before
+    flags) or None when nothing resolvable — the caller still fails CLOSED on
+    a push either way (see FAIL-CLOSED note at module top); None just makes
+    the "layer could not even be located" cause explicit in the message.
 
     Windows: a `.cmd`/`.bat` shim cannot be exec'd directly by subprocess with
-    a list argv — it needs the cmd.exe interpreter. This was the bug that kept
-    the semantic layer silently disabled (AI-094).
+    a list argv — it needs the cmd.exe interpreter (AI-094).
     """
     candidate = (
-        os.environ.get("GEMINI_CMD")
-        or shutil.which("gemini")
-        or _load_secrets().get("GEMINI_CMD")
+        os.environ.get("AGY_CMD")
+        or shutil.which("agy")
+        or _load_secrets().get("AGY_CMD")
     )
     if not candidate:
         return None
@@ -406,15 +436,22 @@ def resolve_gemini_argv() -> list[str] | None:
     return [candidate]
 
 
-GEMINI_TIMEOUT = 120  # seconds per call (healthy shim answers in ~40s)
+# agy has been reliably fast in practice (observed 11-101s per real call,
+# 2026-07-22) — this ceiling is generous headroom over that, not a tight
+# bound tuned to agy's typical latency. --print-timeout is set well ABOVE
+# this so agy's OWN internal timeout never wins the race; this outer,
+# tree-killing timeout must always be the one that fires (same reasoning as
+# ~/.pa/config.yaml's agy worker: pa's own timeout stays attributable).
+AGY_TIMEOUT = 150  # seconds per call
+AGY_PRINT_TIMEOUT = "10m"  # agy's own --print-timeout; must exceed AGY_TIMEOUT
 
 
 def _kill_process_tree(proc: subprocess.Popen) -> None:
-    """Kill proc and every descendant. On Windows the resolved Gemini argv is
+    """Kill proc and every descendant. On Windows the resolved argv is
     `cmd /c shim.cmd` — killing only the direct child (cmd.exe) orphans the
     node grandchild, which busy-spins at 100% CPU forever with its stdin pipe
-    broken (observed 2026-07-20: six orphans burning six cores, leaked one per
-    timed-out audit chunk)."""
+    broken (observed 2026-07-20 under the prior Gemini invocation: six
+    orphans burning six cores, leaked one per timed-out audit chunk)."""
     if os.name == "nt":
         subprocess.run(
             ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
@@ -428,20 +465,45 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
             proc.kill()
 
 
-def _run_gemini(argv: list[str], prompt: str, timeout: float) -> subprocess.CompletedProcess:
+def _write_agy_prompt(prompt: str) -> str:
+    """Write the prompt to a temp file and return its path.
+
+    agy's shim is invoked with input_mode 'arg' throughout this repo (see
+    ~/.pa/config.yaml's agy worker) — the prompt goes in as `-p @<path>`, not
+    piped over stdin. This is the SAME convention pa's own worker-exec.ts
+    uses for every arg-mode worker (writeTempPrompt there), reused here
+    rather than inventing a second way to hand agy a prompt. Verified
+    directly: `agy --dangerously-skip-permissions -p "@<file>"` reads the
+    file's content as the prompt (2026-07-22)."""
+    import tempfile
+    fd, path = tempfile.mkstemp(prefix="pa-pii-guard-prompt-", suffix=".txt")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(prompt)
+    except BaseException:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def _run_agy(argv: list[str], timeout: float) -> subprocess.CompletedProcess:
     """subprocess.run() equivalent whose timeout kills the WHOLE process tree.
     subprocess.run(timeout=...) kills only the direct child — see
     _kill_process_tree. POSIX gets start_new_session=True so the process group
-    is ours to kill. Raises subprocess.TimeoutExpired like subprocess.run."""
+    is ours to kill. Raises subprocess.TimeoutExpired like subprocess.run.
+    No stdin is piped — the prompt already rode in on argv as `-p @<file>`."""
     kwargs: dict = dict(
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, encoding="utf-8", errors="replace",
     )
     if os.name != "nt":
         kwargs["start_new_session"] = True
     proc = subprocess.Popen(argv, **kwargs)
     try:
-        stdout, stderr = proc.communicate(input=prompt, timeout=timeout)
+        stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         _kill_process_tree(proc)
         try:  # reap so the pipes close and no zombie lingers
@@ -452,29 +514,30 @@ def _run_gemini(argv: list[str], prompt: str, timeout: float) -> subprocess.Comp
     return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
 
 
-# Why the last gemini_check() failed, for the caller's fail-open banner. The
-# (is_clean, reason, ok) contract is fixed by callers/tests, so the detail
-# rides alongside it instead of widening the tuple.
+# Why the last agy_check() failed, for the caller's fail-open/fail-closed
+# banner. The (is_clean, reason, ok) contract is fixed by callers/tests, so
+# the detail rides alongside it instead of widening the tuple.
 LLM_SKIP_REASON = ""
 
 
-def gemini_check(content: str, tripwires: list[str]) -> tuple[bool, str, bool]:
+def agy_check(content: str, tripwires: list[str]) -> tuple[bool, str, bool]:
     """
-    Ask Gemini to scan content for PII. Returns (is_clean, reason, ok) where
-    ok=False means the layer itself failed (timeout/unparseable/missing binary)
-    and the verdict is a fail-open default, not a real CLEAN — callers that
-    loop (full_audit) use it to stop burning time on a dead Gemini.
-    Fail-open: returns (True, '', False) on any error. On ok=False the module
-    global LLM_SKIP_REASON holds the human-readable cause.
+    Ask agy to scan content for PII. Returns (is_clean, reason, ok) where
+    ok=False means the layer itself failed (timeout/unparseable/missing
+    binary) and is_clean is a placeholder default, NOT a real CLEAN verdict —
+    callers decide what ok=False means for them: full_audit() fails open (a
+    scheduled report must always complete — see module docstring), the
+    pre-push hook fails CLOSED (a push is not a report, it is a gate). On
+    ok=False the module global LLM_SKIP_REASON holds the human-readable cause.
     """
     global LLM_SKIP_REASON
     LLM_SKIP_REASON = ""
-    argv = resolve_gemini_argv()
+    argv = resolve_agy_argv()
     if argv is None:
-        LLM_SKIP_REASON = ("no Gemini binary resolvable — GEMINI_CMD unset in env "
-                           "and in ~/.pa/secrets.env, and 'gemini' is not on PATH "
+        LLM_SKIP_REASON = ("no agy binary resolvable — AGY_CMD unset in env "
+                           "and in ~/.pa/secrets.env, and 'agy' is not on PATH "
                            "(git hooks inherit a minimal environment)")
-        print("⚠  PII guard: no Gemini binary (set GEMINI_CMD) — semantic layer OFF", file=sys.stderr)
+        print("⚠  PII guard: no agy binary (set AGY_CMD) — semantic layer OFF", file=sys.stderr)
         return True, "", False
     tripwire_ctx = ""
     if tripwires:
@@ -503,46 +566,62 @@ VIOLATION: <short description>
 Added lines to analyze (capped at 400 lines):
 {chr(10).join(content.splitlines()[:400])}
 """
-    # AI-097: "sturdy, relied-on" means transient failures (timeout, a network
-    # blip surfacing as a generic subprocess error) get ONE retry before this
+    # "Sturdy, relied-on" means transient failures (timeout, a network blip
+    # surfacing as a generic subprocess error) get ONE retry before this
     # layer gives up — a single hiccup silently disabling the semantic scan
     # for an entire push defeats the point of relying on it. A genuinely
     # missing binary is not transient — that fails open immediately, no
-    # retry. Explicit encoding="utf-8", errors="replace" is the 2026-07-08
-    # crash fix: without it, subprocess.run() on Windows decodes with the
-    # system codepage (cp1252), and Gemini's UTF-8 output (emoji, smart
-    # quotes) throws inside a background reader thread — an exception that
-    # escapes this try/except entirely (wrong thread) and crashes the hook
-    # with a raw traceback instead of failing open by design.
+    # retry. Explicit encoding="utf-8", errors="replace" is a hard-won fix
+    # (2026-07-08, originally against Gemini's output but the failure class
+    # is CLI-agnostic): without it, subprocess.run() on Windows decodes with
+    # the system codepage (cp1252), and UTF-8 output (emoji, smart quotes)
+    # throws inside a background reader thread — an exception that escapes
+    # this try/except entirely (wrong thread) and crashes the hook with a
+    # raw traceback instead of failing safely by design.
     MAX_ATTEMPTS = 2
     last_error: Exception | None = None
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        try:
-            result = _run_gemini(argv + ["--yolo"], prompt, GEMINI_TIMEOUT)
-            response = result.stdout.strip()
-            # Find the verdict line (skip any preamble noise)
-            for resp_line in response.splitlines():
-                resp_line = resp_line.strip()
-                if resp_line.startswith("VIOLATION"):
-                    return False, resp_line[len("VIOLATION:"):].strip(), True
-                if resp_line == "CLEAN":
-                    return True, "", True
-            # Unparseable — treat like a transient failure and retry once.
-            last_error = RuntimeError(f"unparseable response: {response[:200]!r}")
-        except FileNotFoundError:
-            LLM_SKIP_REASON = f"'{argv[0]}' not found on this machine"
-            print(f"⚠  PII guard: '{argv[0]}' not found — skipping LLM check", file=sys.stderr)
-            return True, "", False
-        except subprocess.TimeoutExpired:
-            last_error = TimeoutError(f"gemini call timed out after {GEMINI_TIMEOUT}s")
-        except Exception as exc:
-            last_error = exc
+    prompt_file: str | None = None
+    try:
+        prompt_file = _write_agy_prompt(prompt)
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            try:
+                full_argv = argv + [
+                    "--dangerously-skip-permissions",
+                    "--effort", "high",
+                    "--print-timeout", AGY_PRINT_TIMEOUT,
+                    "-p", f"@{prompt_file}",
+                ]
+                result = _run_agy(full_argv, AGY_TIMEOUT)
+                response = result.stdout.strip()
+                # Find the verdict line (skip any preamble noise)
+                for resp_line in response.splitlines():
+                    resp_line = resp_line.strip()
+                    if resp_line.startswith("VIOLATION"):
+                        return False, resp_line[len("VIOLATION:"):].strip(), True
+                    if resp_line == "CLEAN":
+                        return True, "", True
+                # Unparseable — treat like a transient failure and retry once.
+                last_error = RuntimeError(f"unparseable response: {response[:200]!r}")
+            except FileNotFoundError:
+                LLM_SKIP_REASON = f"'{argv[0]}' not found on this machine"
+                print(f"⚠  PII guard: '{argv[0]}' not found — skipping LLM check", file=sys.stderr)
+                return True, "", False
+            except subprocess.TimeoutExpired:
+                last_error = TimeoutError(f"agy call timed out after {AGY_TIMEOUT}s")
+            except Exception as exc:
+                last_error = exc
 
-        if attempt < MAX_ATTEMPTS:
-            print(f"⚠  PII guard: Gemini attempt {attempt}/{MAX_ATTEMPTS} failed ({last_error}) — retrying", file=sys.stderr)
+            if attempt < MAX_ATTEMPTS:
+                print(f"⚠  PII guard: agy attempt {attempt}/{MAX_ATTEMPTS} failed ({last_error}) — retrying", file=sys.stderr)
+    finally:
+        if prompt_file:
+            try:
+                os.unlink(prompt_file)
+            except OSError:
+                pass
 
-    LLM_SKIP_REASON = f"Gemini failed {MAX_ATTEMPTS} consecutive attempts ({last_error})"
-    print(f"⚠  PII guard: Gemini failed after {MAX_ATTEMPTS} attempts ({last_error}) — skipping LLM check", file=sys.stderr)
+    LLM_SKIP_REASON = f"agy failed {MAX_ATTEMPTS} consecutive attempts ({last_error})"
+    print(f"⚠  PII guard: agy failed after {MAX_ATTEMPTS} attempts ({last_error}) — skipping LLM check", file=sys.stderr)
     return True, "", False
 
 
@@ -721,23 +800,26 @@ def full_audit(use_llm: bool) -> int:
 
     if not use_llm:
         warn_layer_skipped(
-            "Gemini semantic scan (layer 3)",
+            "agy semantic scan (layer 3)",
             "--no-llm was passed; regex + tripwire layers only",
             stream=sys.stdout,
         )
     if use_llm:
-        # Chunked semantic scan: ~300 lines per Gemini call. Cap sized to fit
-        # comfortably inside the pii-audit skill timeout (~40s/call observed).
-        # BUT the worst case is 30 chunks x 2 attempts x 120s = 7200s — double
-        # the skill's 3600s timeout. When Gemini was degraded, every run hit
-        # that wall, was killed by the skill runner (exit 1, no success
+        # Chunked semantic scan: ~300 lines per agy call. Cap sized to fit
+        # comfortably inside the pii-audit skill timeout. Worst case is
+        # 30 chunks x 2 attempts x AGY_TIMEOUT(150s) = 9000s — well over the
+        # skill's 3600s timeout on paper, but in practice agy answers in
+        # 11-101s (2026-07-22 observed), so this ceiling is rarely approached.
+        # When the underlying CLI (formerly Gemini) was degraded, every run
+        # hit that wall, was killed by the skill runner (exit 1, no success
         # recorded), and catchup relaunched it hourly for 34 straight hours
         # (2026-07-19/20) — each timed-out chunk also leaking a CPU-spinning
         # orphan. Two guards make the run ALWAYS complete instead: a global
         # LLM time budget, and a consecutive-failure breaker that stops
-        # hammering a dead Gemini. Both degrade coverage loudly, exit 0, and
-        # let the scheduler record success — partial coverage one week is
-        # recoverable; an infinite retry storm is not.
+        # hammering a dead LLM layer. Both degrade coverage loudly, exit 0,
+        # and let the scheduler record success — partial coverage one week is
+        # recoverable; an infinite retry storm is not. This is THIS mode's
+        # deliberate fail-open; the pre-push hook below is fail-CLOSED.
         all_lines = [f"{p}: {ln}" for p, c in files for ln in c.splitlines() if ln.strip()]
         CHUNK, MAX_CHUNKS = 300, 30
         chunks = [all_lines[i:i + CHUNK] for i in range(0, len(all_lines), CHUNK)][:MAX_CHUNKS]
@@ -749,20 +831,20 @@ def full_audit(use_llm: bool) -> int:
         for i, chunk in enumerate(chunks):
             if time.monotonic() >= deadline:
                 warn_layer_skipped(
-                    "Gemini semantic scan (layer 3), PARTIAL",
+                    "agy semantic scan (layer 3), PARTIAL",
                     f"LLM time budget ({budget:.0f}s, PA_PII_AUDIT_LLM_BUDGET) "
                     f"exhausted after {i}/{len(chunks)} chunks — the remaining "
                     f"{len(chunks) - i} chunks were never semantically scanned",
                     stream=sys.stdout,
                 )
                 break
-            is_clean, reason, ok = gemini_check("\n".join(chunk), tripwires)
+            is_clean, reason, ok = agy_check("\n".join(chunk), tripwires)
             if not ok:
                 consecutive_failures += 1
                 if consecutive_failures >= LLM_FAILURE_BREAKER:
                     warn_layer_skipped(
-                        "Gemini semantic scan (layer 3), PARTIAL",
-                        f"Gemini infra-failed {LLM_FAILURE_BREAKER} chunks in a row "
+                        "agy semantic scan (layer 3), PARTIAL",
+                        f"agy infra-failed {LLM_FAILURE_BREAKER} chunks in a row "
                         f"({LLM_SKIP_REASON or 'unknown cause'}) — breaker tripped at "
                         f"chunk {i + 1}/{len(chunks)}; the rest were never "
                         f"semantically scanned",
@@ -772,7 +854,7 @@ def full_audit(use_llm: bool) -> int:
                 continue
             consecutive_failures = 0
             if not is_clean:
-                violations.append(f"(gemini chunk {i + 1}/{len(chunks)}) {reason}")
+                violations.append(f"(agy chunk {i + 1}/{len(chunks)}) {reason}")
 
     # Exit-code contract: 0 = scan COMPLETED (clean or not), non-zero = the scan
     # itself failed. The scheduled pii-audit skill delivers stdout to Telegram
@@ -849,7 +931,7 @@ def main() -> int:
     print(f"ℹ  PII guard scope: {len(TOUCHED_PATHS)} path(s), full content of "
           f"{len(TOUCHED_FILES)} file(s), {len(ADDED)} added line(s), "
           f"{len(MESSAGES)} commit message(s). "
-          f"Gemini layer sees ADDED LINES ONLY (budget) — whole-tree semantic "
+          f"agy layer sees ADDED LINES ONLY (budget) — whole-tree semantic "
           f"coverage comes from the weekly --full audit.", file=sys.stderr)
     if UNREADABLE_PATHS:
         print(f"ℹ  PII guard: {len(UNREADABLE_PATHS)} touched path(s) were not "
@@ -863,16 +945,36 @@ def main() -> int:
             print(f"   {v}", file=sys.stderr)
         return 1
 
-    # Layer 3: Gemini semantic scan of the ADDED LINES (ok=False → fail-open).
+    # Layer 3: agy semantic scan of the ADDED LINES.
+    #
+    # FAIL-CLOSED, changed 2026-07-22 (was fail-open — see module docstring
+    # for the full reasoning and why --full below keeps the OLD behavior).
+    # ok=False means agy could not produce a real verdict at all — not "agy
+    # said clean," but "nobody knows what agy would have said." Waving a push
+    # through on that basis is exactly the silent gap this whole file exists
+    # to close, and it is now a HARD BLOCK: a human must either get agy
+    # working again, or explicitly set PA_SKIP_PII_GUARD=1 (recorded to
+    # ~/.pa/pii-guard-bypass.jsonl — never a silent pass). Layers 0-2 already
+    # ran and already blocked independently above; this only changes what
+    # happens when layer 3 itself cannot render a verdict.
     if added_content:
-        is_clean, reason, ok = gemini_check(added_content, tripwires)
+        is_clean, reason, ok = agy_check(added_content, tripwires)
         if not ok:
             warn_layer_skipped(
-                "Gemini semantic scan (layer 3)",
+                "agy semantic scan (layer 3)",
                 LLM_SKIP_REASON or "unknown cause",
             )
+            print("🚫 PII guard: agy could not verify this push — BLOCKING by policy "
+                  "(fail-closed since 2026-07-22)", file=sys.stderr)
+            print(f"   Cause: {LLM_SKIP_REASON or 'unknown'}", file=sys.stderr)
+            print("   Fix agy and re-push, OR if you have manually verified this "
+                  "content is clean, force through with:", file=sys.stderr)
+            print("     PA_SKIP_PII_GUARD=1 git-public push origin main", file=sys.stderr)
+            print("   (this is recorded to ~/.pa/pii-guard-bypass.jsonl — it is never silent)",
+                  file=sys.stderr)
+            return 1
         if not is_clean:
-            print("🚫 PII guard (Gemini): personal data detected — push aborted", file=sys.stderr)
+            print("🚫 PII guard (agy): personal data detected — push aborted", file=sys.stderr)
             print(f"   Reason: {reason}", file=sys.stderr)
             return 1
 
