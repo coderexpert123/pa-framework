@@ -147,10 +147,12 @@ function effectiveCwd(state: ConversationState): string {
  * `--resume <id>`) with this topic's resolved tunables APPENDED.
  *
  * The order is load-bearing in two independent ways, so do not flip it:
- *   1. worker-exec.ts special-cases codex resume by checking `extraArgs[0] ===
- *      'resume'` and splicing the block in before the trailing '-' stdin marker.
- *      Prepending tunables would break that test, and the args would land AFTER
- *      the '-' — a silently malformed codex command line.
+ *   1. worker-exec.ts splices extraArgs in before a trailing bare '-' stdin
+ *      marker (codex's shape) whenever extraArgs is non-empty — fixed
+ *      2026-07-22 to fire for ANY non-empty extraArgs there, not just a
+ *      leading 'resume' token, because a fresh (non-resume) dispatch with
+ *      only tunable args used to fall through to plain appending and land
+ *      AFTER the '-' — a silently malformed codex command line.
  *   2. Every CLI here is last-wins on a repeated flag, and worker.args already
  *      pins `--model opusplan` for claude/zclaude. Appending is what lets an
  *      explicitly set value beat the static default.

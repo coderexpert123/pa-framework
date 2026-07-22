@@ -63,8 +63,31 @@ export function collectBgAlerts(
 // Quote args containing spaces or metacharacters to prevent word-splitting.
 function quoteArg(a: string): string {
   if (process.platform === 'win32') {
-    // cmd.exe: wrap in double quotes, escape embedded double quotes
-    return /[\s"]/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a;
+    // SECURITY (do not regress, 2026-07-22): this used to quote only on
+    // whitespace or '"' (/[\s"]/). Worker tunables (/llm, /effort) are
+    // deliberately "free on value" — a value is NEVER rejected, only the
+    // setting NAME is validated, because model catalogues move faster than
+    // an allowlist could track — so a Telegram message like "/effort
+    // high&calc.exe" (no whitespace around '&') reached spawn(shell:true)
+    // UNQUOTED, and cmd.exe treats a bare '&' as a command separator: a live
+    // command-injection path from a chat message. Quote UNCONDITIONALLY
+    // rather than enumerating cmd.exe's metacharacters (&|<>^%!()) one by
+    // one — that enumeration is exactly how the original gap happened.
+    // '%' needs its OWN escape: cmd.exe expands %VAR% (including secrets
+    // this worker's env carries, e.g. TELEGRAM_BOT_TOKEN) even inside a
+    // quoted span — quoting alone does not suppress it. Doubling ("%%")
+    // does NOT work either at this "cmd /c <line>" call shape (verified
+    // empirically 2026-07-22: %%PATH%% still expanded, just with stray
+    // literal '%' around the leaked value) — that folklore is for escaping
+    // '%' inside a .bat file's own body, a different parsing context.
+    // The escape that DOES work here is the close-quote/caret/reopen-quote
+    // splice ("^%"): it forces the '%' outside any quoted span so cmd.exe's
+    // caret-escape actually applies, while the surrounding quotes still
+    // protect against whitespace/'&'/'|' etc. Verified end-to-end via a
+    // real spawned process, not just reasoned about (see
+    // pa/tests/worker-exec-arg-injection.test.ts).
+    const escaped = a.replace(/"/g, '\\"').split('%').join('"^%"');
+    return `"${escaped}"`;
   }
   // POSIX sh: wrap in single quotes, escape embedded single quotes via '\''
   return /[\s'"\\$`!|&;()<>]/.test(a) ? `'${a.replace(/'/g, "'\\''")}'` : a;
@@ -147,10 +170,19 @@ export async function executeWorker(
     let args: string[];
     const extraArgs = options.extraArgs || [];
     if (useStdin) {
-      // Codex resume uses subcommand syntax ('resume', no dashes).
-      // Insert before the trailing stdin marker '-' instead of appending after it.
-      if (extraArgs.length > 0 && extraArgs[0] === 'resume'
-          && worker.args[worker.args.length - 1] === '-') {
+      // Codex uses a trailing bare '-' as its stdin marker, and (on resume)
+      // subcommand syntax ('resume', no dashes) ahead of it. Anything appended
+      // AFTER that trailing '-' is not a valid position for codex args, so both
+      // a resume subcommand and/or worker tunables (e.g. `-c model_reasoning_effort=high`
+      // from a fresh, non-resume dispatch) must be spliced in BEFORE it instead
+      // of appended after. This must fire for ANY non-empty extraArgs — not just
+      // when extraArgs[0] === 'resume' — otherwise a fresh (non-resume) dispatch
+      // carrying only tunable args falls into the `else` branch below and lands
+      // after the stdin marker, where codex silently ignores or errors on it.
+      // buildDispatchExtraArgs (telegram-bot/src/main.ts) already orders extraArgs
+      // as [...baseArgs (e.g. resume args), ...tunableArgs], so no reordering is
+      // needed here — the whole array goes in before the trailing '-' as-is.
+      if (extraArgs.length > 0 && worker.args[worker.args.length - 1] === '-') {
         args = [...worker.args.slice(0, -1), ...extraArgs, '-'];
       } else {
         args = [...worker.args, ...extraArgs];

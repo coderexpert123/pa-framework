@@ -79,6 +79,15 @@ export interface DashboardSettingCapability {
   values: string[];
   /** Values seen in real run history that aren't already declared; [] when none. */
   observed: string[];
+  /**
+   * Settings THIS one suppresses when set (e.g. agy's `model` supersedes
+   * `effort` — the CLI rejects a base model name without an effort suffix
+   * AND rejects --effort together with an already-suffixed model). [] when
+   * this setting conflicts with nothing. Rendered so the two settings don't
+   * read as independent when they aren't — see config.yaml's agy tunables
+   * comment for the underlying CLI behaviour this documents.
+   */
+  supersedes: string[];
 }
 
 export interface DashboardWorkerCapability {
@@ -88,9 +97,15 @@ export interface DashboardWorkerCapability {
   settings: DashboardSettingCapability[];
 }
 
-/** Post-sanitize length — the number Telegram actually enforces. */
+/**
+ * Post-sanitize length — the number Telegram actually enforces. Trims before
+ * sanitizing, exactly like the real send path (sendMessageWithId/editMessageText
+ * both sanitize `text.trim()`) and the test helper `sent()` — so the yardstick
+ * this budget algorithm uses can never diverge from the one that validates the
+ * real send.
+ */
 function measure(text: string): number {
-  return sanitizeMdV2(text).length;
+  return sanitizeMdV2(text.trim()).length;
 }
 
 function joinCapped(values: string[], max: number): string {
@@ -135,8 +150,11 @@ function renderAtDetail(caps: DashboardWorkerCapability[], detail: 0 | 1 | 2 | 3
       if (detail === 0 && s.observed.length > 0) {
         parts.push(`recent: ${joinCapped(s.observed, MAX_OBSERVED_SHOWN)}`);
       }
+      // Setting one silently suppresses another's args (agy: model
+      // supersedes effort) — say so, or the two read as independent knobs.
+      const supersedeNote = s.supersedes.length > 0 ? ` (supersedes ${s.supersedes.join(', ')})` : '';
       // One setting per line, indented — Telegram wraps dense tables badly on a phone.
-      lines.push(`   • ${s.setting}: ${parts.join(' · ')}`);
+      lines.push(`   • ${s.setting}: ${parts.join(' · ')}${supersedeNote}`);
     }
   });
   return lines;
@@ -192,6 +210,7 @@ async function collectWorkerCapabilities(workers: WorkerConfig[]): Promise<Dashb
           // Only show history that ADDS something — repeating declared values
           // as "recent" is noise.
           observed: (observed[d.setting] ?? []).filter((v) => !declaredLower.includes(v.toLowerCase())),
+          supersedes: d.supersedes,
         };
       }),
     };

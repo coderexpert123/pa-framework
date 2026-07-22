@@ -97,7 +97,11 @@ const CAP_CONFIG = {
     {
       name: 'zclaude', priority: 1, command: 'z', args: [], check: 'c', rate_limit_patterns: [],
       tunables: {
-        model: { args: ['--model', '{value}'] },
+        // supersedes here is what closes the collection-half coverage gap
+        // below: collectWorkerCapabilities must carry describeTunables()'s
+        // `supersedes` through to the render, not just the pure renderer
+        // (which is already covered separately, fed hand-built objects).
+        model: { args: ['--model', '{value}'], supersedes: ['effort'] },
         effort: { args: ['--effort', '{value}'], values: ['low', 'medium', 'high', 'xhigh', 'max'] }
       }
     },
@@ -115,10 +119,10 @@ const CAP_CONFIG = {
   ]
 };
 
-const cap = (name: string, priority: number, settings: Array<{ setting: string; values?: string[]; observed?: string[] }> = []) => ({
+const cap = (name: string, priority: number, settings: Array<{ setting: string; values?: string[]; observed?: string[]; supersedes?: string[] }> = []) => ({
   name,
   priority,
-  settings: settings.map(s => ({ setting: s.setting, values: s.values ?? [], observed: s.observed ?? [] }))
+  settings: settings.map(s => ({ setting: s.setting, values: s.values ?? [], observed: s.observed ?? [], supersedes: s.supersedes ?? [] }))
 });
 
 describe('Dashboard capability matrix (pure renderer)', () => {
@@ -135,6 +139,62 @@ describe('Dashboard capability matrix (pure renderer)', () => {
     assert.ok(text.includes('model: any value'), text);          // values are never gated
     assert.ok(text.includes('recent: gpt-5.4'), text);           // observed history
     assert.ok(text.includes('effort: minimal, low, medium, high'), text);
+  });
+
+  it('renders a supersedes relationship so two settings do not read as independent', () => {
+    const lines = renderWorkerCapabilityMatrix(
+      [cap('agy', 1, [
+        { setting: 'model', values: ['gemini-3.6-flash-high', 'claude-sonnet-4-6'], supersedes: ['effort'] },
+        { setting: 'effort', values: ['low', 'medium', 'high'] }
+      ])],
+      4000
+    );
+    const text = lines.join('\n');
+    assert.ok(text.includes('model: gemini-3.6-flash-high, claude-sonnet-4-6 (supersedes effort)'), text);
+    // The superseded setting's own line carries no note — only the winner does.
+    assert.ok(text.includes('effort: low, medium, high') && !text.includes('effort: low, medium, high (supersedes'), text);
+  });
+
+  it('renders a setting with no supersedes relationship without any suffix', () => {
+    const lines = renderWorkerCapabilityMatrix(
+      [cap('codex', 3, [{ setting: 'model', values: [] }])],
+      4000
+    );
+    assert.ok(!lines.join('\n').includes('supersedes'), lines.join('\n'));
+  });
+
+  it('truncates declared values past MAX_DECLARED_SHOWN (8) and observed past MAX_OBSERVED_SHOWN (3)', () => {
+    // Mirrors the REAL, currently-deployed config.yaml: agy declares 11 model
+    // values — already past the 8-item cap — so this path is live in
+    // production today.
+    const declared = [
+      'gemini-3.6-flash-high', 'gemini-3.6-flash-medium', 'gemini-3.6-flash-low',
+      'gemini-3.5-flash-high', 'gemini-3.5-flash-medium', 'gemini-3.5-flash-low',
+      'gemini-3.1-pro-high', 'gemini-3.1-pro-low', 'claude-sonnet-4-6',
+      'claude-opus-4-6-thinking', 'gpt-oss-120b-medium'
+    ];
+    assert.equal(declared.length, 11);
+    const observed = ['opusplan', 'sonnet-legacy', 'gpt-5.4', 'gemini-2.9-flash'];
+    assert.equal(observed.length, 4);
+
+    const lines = renderWorkerCapabilityMatrix(
+      [cap('agy', 1, [{ setting: 'model', values: declared, observed }])],
+      4000
+    );
+    const text = lines.join('\n');
+
+    // First 8 declared values shown, joined, then an ellipsis marker — the 9th+
+    // never appear in the declared segment.
+    const declaredLine = `model: ${declared.slice(0, 8).join(', ')}, …`;
+    assert.ok(text.includes(declaredLine), text);
+    assert.ok(!text.includes(declared[8]), text);      // 'claude-sonnet-4-6' capped out
+    assert.ok(!text.includes(declared[9]), text);
+    assert.ok(!text.includes(declared[10]), text);
+
+    // First 3 observed values shown, then an ellipsis marker — the 4th never appears.
+    const observedLine = `recent: ${observed.slice(0, 3).join(', ')}, …`;
+    assert.ok(text.includes(observedLine), text);
+    assert.ok(!text.includes(observed[3]), text);      // 'gemini-2.9-flash' capped out
   });
 
   it('renders a worker with no tunables cleanly on one line', () => {
@@ -209,6 +269,12 @@ describe('Dashboard capability matrix (integration)', () => {
     assert.ok(content.includes('• model: any value'), content);
     assert.ok(content.includes('• effort: low, medium, high, xhigh, max'), content);
     assert.ok(content.includes('• effort: minimal, low, medium, high'), content);
+
+    // supersedes propagated through the REAL collection path
+    // (collectWorkerCapabilities), not just the pure renderer fed hand-built
+    // objects — a regression in that one-line wiring would otherwise pass
+    // the whole suite silently (found in review, 2026-07-22).
+    assert.ok(content.includes('• model: any value (supersedes effort)'), content);
 
     // Worker WITHOUT tunables.
     assert.ok(content.includes('2. gemini (priority 2) — no settable options'), content);

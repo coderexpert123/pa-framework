@@ -114,4 +114,77 @@ describe('loadConfig', () => {
     const config = await loadConfig();
     assert.deepEqual(config.evaluator, { worker: 'claude', timeout: 60 });
   });
+
+  it('wires a well-formed tunables block from real YAML into the returned WorkerConfig', async () => {
+    // Exercises the actual YAML-parse -> loadConfig() path, not parseTunables()
+    // in isolation (that isolated coverage lives in tunables.test.ts). Nothing
+    // proved loadConfig() itself hands the parsed block through correctly.
+    await createTempConfig(tempDir, [
+      {
+        name: 'agy',
+        command: 'agy',
+        args: ['-p', '{prompt}'],
+        check: 'agy --version',
+        tunables: {
+          model: {
+            args: ['--model', '{value}'],
+            supersedes: ['effort'],
+            values: ['gemini-3.6-flash-high', 'claude-sonnet-4-6'],
+            description: 'Model for this CLI session.',
+          },
+          effort: {
+            args: ['--effort', '{value}'],
+            values: ['low', 'medium', 'high'],
+          },
+        },
+      },
+    ]);
+    const config = await loadConfig();
+    assert.deepEqual(config.workers[0].tunables, {
+      model: {
+        args: ['--model', '{value}'],
+        supersedes: ['effort'],
+        values: ['gemini-3.6-flash-high', 'claude-sonnet-4-6'],
+        description: 'Model for this CLI session.',
+      },
+      effort: {
+        args: ['--effort', '{value}'],
+        values: ['low', 'medium', 'high'],
+      },
+    });
+  });
+
+  it('resolves normally when tunables is malformed, dropping only the bad entries', async () => {
+    const cap = { warnings: [] as string[], original: console.warn };
+    console.warn = (...args: unknown[]) => { cap.warnings.push(args.map(String).join(' ')); };
+    try {
+      await createTempConfig(tempDir, [
+        {
+          name: 'w1',
+          command: 'echo',
+          args: ['x'],
+          check: 'echo ok',
+          tunables: 'not-a-mapping', // bare string instead of a mapping
+        },
+        {
+          name: 'w2',
+          command: 'echo',
+          args: ['x'],
+          check: 'echo ok',
+          priority: 2,
+          tunables: {
+            model: { description: 'missing args entirely' }, // no `args`
+            effort: { args: ['--effort', '{value}'] },        // well-formed sibling
+          },
+        },
+      ]);
+      const config = await loadConfig(); // must not throw/reject
+      assert.equal(config.workers[0].tunables, undefined);
+      assert.deepEqual(config.workers[1].tunables, {
+        effort: { args: ['--effort', '{value}'] },
+      });
+    } finally {
+      console.warn = cap.original;
+    }
+  });
 });

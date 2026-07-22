@@ -195,6 +195,30 @@ describe('parseTunableCommand', () => {
     assert.equal(parseTunableCommand('what model are you'), undefined);
     assert.equal(parseTunableCommand('/model agy'), undefined);
   });
+
+  // Regression, 2026-07-22: DEFAULT_SWITCH_PATTERN is end-anchored, so a
+  // worker name followed by trailing chat text does NOT match it (only a
+  // bare "/default <worker>" does) — that text used to fall through to
+  // DEFAULT_TUNABLE_PATTERN, which treated the worker name as an attempted
+  // (and unsupported) setting, where before this feature existed the whole
+  // message reached the LLM as ordinary chat. A worker name must always
+  // defer to the worker-switch form, with or without trailing text.
+  it('does not hijack a worker name followed by ordinary chat text', () => {
+    assert.equal(parseTunableCommand('/default agy can you check the logs'), undefined);
+    assert.equal(parseTunableCommand('/default claude what do you think'), undefined);
+  });
+
+  // A non-worker word is a genuinely different case: it's still treated as an
+  // attempted (unsupported) setting name, not passed through to chat — that
+  // is deliberate, existing behavior ("/default temperature 0.7" must still
+  // produce a command that renders "no setting called 'temperature'";
+  // silently swallowing it as chat would be a worse UX than the helpful
+  // rejection). Only a WORKER NAME gets the pass-through treatment above.
+  it('still treats a non-worker word as an attempted (rejectable) setting, not chat', () => {
+    const cmd = parseTunableCommand('/default banana split');
+    assert.ok(cmd, 'a non-worker word must still parse as a tunable-command attempt');
+    assert.equal(cmd?.label, 'banana');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -694,7 +718,7 @@ describe('buildDispatchExtraArgs merge', () => {
     );
   });
 
-  it('keeps extraArgs[0] === "resume" so worker-exec\'s codex splice still fires', () => {
+  it('puts the resume token first, tunable args after (worker-exec splices both before the trailing "-")', () => {
     const state = makeState();
     setSessionTunable(state, 'codex', 'effort', 'high');
     const args = buildDispatchExtraArgs(state, CODEX, ['resume', 'session-id']);

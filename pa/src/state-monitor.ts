@@ -121,6 +121,22 @@ export async function readStateTail(dir: string, pattern: string): Promise<strin
   }
 }
 
+// Known-binary state_pattern suffixes. A worker whose config.yaml declares
+// one of these (agy: "*.db", codex: "state_5.sqlite") has ALREADY told us its
+// conversation store is binary — no content sniffing is needed, or safe to
+// rely on. Add to this list if a new worker's state_pattern names another
+// binary format.
+const KNOWN_BINARY_STATE_SUFFIXES = ['.db', '.sqlite'];
+
+/**
+ * True when a worker's state_pattern glob names a format known ahead of time
+ * to be binary (SQLite, etc.), independent of what the content sniff would say.
+ */
+export function isKnownBinaryStatePattern(pattern: string): boolean {
+  const lower = pattern.toLowerCase();
+  return KNOWN_BINARY_STATE_SUFFIXES.some((suffix) => lower.endsWith(suffix));
+}
+
 /**
  * Sniff whether a state-file tail is binary rather than text.
  *
@@ -138,8 +154,20 @@ export async function readStateTail(dir: string, pattern: string): Promise<strin
  * gemini's single-JSON session file is legitimately unparseable once tail-read
  * at 32KB, and the evaluator prompt explicitly tells the model that truncated
  * JSON is fine. Gating on parseability would break that path.
+ *
+ * CATEGORICAL SHORT-CIRCUIT (do not regress): the ratio-based sniff below is a
+ * heuristic over the first 4096 chars and can UNDERCOUNT a realistic, dense
+ * agy/codex database page — mostly printable conversational text with only
+ * sparse protobuf tag/varint framing bytes interleaved — easily staying under
+ * the 2% "bad byte" threshold and slipping through as "not binary". When the
+ * caller knows the worker's state_pattern names a known-binary format
+ * (statePattern param), that is authoritative and the ratio heuristic is
+ * skipped entirely — no sniffing needed when the format is already known.
+ * statePattern is optional so existing pure content-sniff callers/tests keep
+ * working; omit it only when the pattern truly isn't known.
  */
-export function isBinaryStateContent(content: string): boolean {
+export function isBinaryStateContent(content: string, statePattern?: string): boolean {
+  if (statePattern && isKnownBinaryStatePattern(statePattern)) return true;
   if (content.length === 0) return false;
   // Whole-file read of a small SQLite db still carries the magic header.
   if (content.startsWith('SQLite format 3')) return true;
@@ -205,7 +233,7 @@ export async function readUsableStateTail(
     const content = await readTailOfFile(found.path);
     if (content === null) return { content: null, path: found.path };
 
-    if (isBinaryStateContent(content)) {
+    if (isBinaryStateContent(content, pattern)) {
       reportUnusableState(
         workerName,
         pattern,

@@ -140,6 +140,19 @@ export function parseTunables(raw: any, workerName: string): Record<string, Tuna
       console.warn(`${where}: args template ${JSON.stringify(argList)} has no {value} placeholder; ignoring this tunable`);
       continue;
     }
+    const totalPlaceholders = argList.reduce((n, a) => n + a.split('{value}').length - 1, 0);
+    if (totalPlaceholders > 1) {
+      // expandTemplate substitutes EVERY occurrence (correct dispatch), but
+      // extractTunableValues — the reverse parser observed-values mines
+      // history through — only recovers the FIRST occurrence's value; for a
+      // template with a second placeholder it can never match a real
+      // expanded arg again and silently returns no observed values forever.
+      // Refuse rather than ship a knob whose history-mining is permanently
+      // and invisibly broken (found 2026-07-22; no live worker declares one
+      // today, but nothing stopped a future one from doing so).
+      console.warn(`${where}: args template ${JSON.stringify(argList)} has more than one {value} placeholder, which observed-value extraction cannot round-trip; ignoring this tunable`);
+      continue;
+    }
     const values = parseTunableValues(rawSpec.values, where);
     const rawDefault = rawSpec.default;
     const def = rawDefault === undefined || rawDefault === null || String(rawDefault).trim() === ''

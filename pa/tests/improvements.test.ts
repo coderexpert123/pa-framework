@@ -3,10 +3,10 @@ import assert from 'node:assert/strict';
 import { mkdir, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { createTempPaHome, cleanup } from './helpers.js';
-import { appendAuditRecord } from '../src/lib/improvement-audit.js';
+import { appendAuditRecord, readAuditRecords } from '../src/lib/improvement-audit.js';
 import type { AuditRecord } from '../src/lib/improvement-audit.js';
 import type { RunMeta } from '../src/types.js';
-import { buildEvalReport, buildFailedRollbackBanner, improvementsCommand } from '../src/commands/improvements.js';
+import { acceptRollbackCommand, buildAcceptedRollbackBanner, buildEvalReport, buildFailedRollbackBanner, improvementsCommand } from '../src/commands/improvements.js';
 import type { EvalEntry } from '../src/commands/improvements.js';
 
 let dir: string;
@@ -234,6 +234,88 @@ describe('accepted failed rollbacks', () => {
     const report = buildEvalReport([{ record: failedFor('7b82c88'), current: zero }], 30);
     assert.doesNotMatch(report, /ACCEPTED FAILED ROLLBACKS/);
     assert.match(report, /STILL LIVE/);
+  });
+
+  // Regression for the case-sensitivity mismatch: suppression (acceptedRollbackCommits/
+  // findAcceptance) is deliberately case-insensitive, but the attempts count shown in the
+  // ACCEPTED banner used to look up `failedByCommit` with the RAW (un-normalized) commit_hash,
+  // so a case mismatch between the acceptance record and the rollback-failed record it covers
+  // silently produced 0 attempts instead of the real count.
+  it('reports the correct attempt count even when the acceptance record\'s commit hash differs in case from the rollback-failed record', () => {
+    const banner = buildAcceptedRollbackBanner([
+      failedFor('7b82c88'),
+      failedFor('7b82c88'),
+      acceptanceFor('7B82C88'), // human hand-typed uppercase
+    ]).join('\n');
+    assert.match(banner, /after 2 failed revert attempt\(s\)/);
+  });
+
+  it('reports the correct attempt count when the rollback-failed record\'s commit hash differs in case from the acceptance', () => {
+    const banner = buildAcceptedRollbackBanner([
+      { ...failedFor('7b82c88'), commit_hash: '7B82C88' },
+      acceptanceFor('7b82c88'),
+    ]).join('\n');
+    assert.match(banner, /after 1 failed revert attempt\(s\)/);
+  });
+});
+
+describe('acceptRollbackCommand', () => {
+  it('writes a rollback-accepted record when a matching rollback-failed record exists', async () => {
+    await appendAuditRecord(makeRecord({
+      draft: 'daily-mail-brief-fix-10', action: 'rollback-failed', target_skill: 'daily-mail-brief',
+      commit_hash: '7b82c88', reason: 'git revert 7b82c88 failed: local changes to pa/data/profile.json',
+    }));
+
+    await acceptRollbackCommand('7b82c88', 'Reviewed by hand: diff is purely additive.');
+
+    const records = await readAuditRecords();
+    const accepted = records.find((r) => r.action === 'rollback-accepted');
+    assert.ok(accepted, 'expected a rollback-accepted record to have been written');
+    assert.equal(accepted!.commit_hash, '7b82c88');
+    assert.equal(accepted!.target_skill, 'daily-mail-brief');
+    assert.equal(accepted!.draft, 'daily-mail-brief-fix-10');
+    assert.equal(accepted!.accepted_by, 'human');
+    assert.equal(accepted!.reason, 'Reviewed by hand: diff is purely additive.');
+    assert.ok(accepted!.accepted_at);
+    assert.ok(accepted!.ts);
+  });
+
+  it('matches the rollback-failed record case-insensitively', async () => {
+    await appendAuditRecord(makeRecord({
+      draft: 'x-fix', action: 'rollback-failed', target_skill: 'x', commit_hash: '7B82C88', reason: 'failed',
+    }));
+
+    await acceptRollbackCommand('7b82c88', 'ok');
+
+    const records = await readAuditRecords();
+    assert.ok(records.some((r) => r.action === 'rollback-accepted' && r.target_skill === 'x'));
+  });
+
+  it('fails loudly (throws, writes nothing) when there is no matching rollback-failed record', async () => {
+    await appendAuditRecord(makeRecord({
+      draft: 'unrelated-fix', action: 'rollback-failed', target_skill: 'unrelated', commit_hash: 'deadbee', reason: 'failed',
+    }));
+
+    await assert.rejects(() => acceptRollbackCommand('7b82c88', 'typo attempt'), /no rollback-failed record found/);
+
+    const records = await readAuditRecords();
+    assert.equal(records.filter((r) => r.action === 'rollback-accepted').length, 0);
+  });
+
+  it('fails loudly when no commit hash is given at all', async () => {
+    await assert.rejects(() => acceptRollbackCommand(undefined, undefined), /Usage: pa improvements accept/);
+  });
+
+  it('defaults the reason when none is given, rather than writing an empty/undefined reason', async () => {
+    await appendAuditRecord(makeRecord({
+      draft: 'y-fix', action: 'rollback-failed', target_skill: 'y', commit_hash: 'cafef00d', reason: 'failed',
+    }));
+
+    await acceptRollbackCommand('cafef00d', undefined);
+
+    const records = await readAuditRecords();
+    const accepted = records.find((r) => r.action === 'rollback-accepted');
+    assert.ok(accepted!.reason.length > 0);
   });
 });
 

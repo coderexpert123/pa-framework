@@ -541,6 +541,19 @@ export function parseTunableCommand(userText: string): TunableCommand | undefine
   const def = DEFAULT_TUNABLE_PATTERN.exec(text);
   if (def) {
     const label = def[1].toLowerCase();
+    // A WORKER NAME always belongs to the worker-switch form, even with
+    // trailing text. Fixed 2026-07-22: DEFAULT_SWITCH_PATTERN is end-anchored
+    // ("/default agy" only, nothing after), so `/default agy can you check
+    // the logs` fell through to here, which previously accepted ANY
+    // word-like first token — rejecting a worker name as if it were an
+    // unrecognized setting, where before this feature existed the whole
+    // message reached the LLM as ordinary chat. Re-use MODEL_SWITCH_PATTERN's
+    // worker list so this can't drift from the worker-switch form it defers
+    // to. A genuinely unknown word (not a worker name) still becomes a
+    // TunableCommand and gets handleTunableCommand's helpful "no setting
+    // called '<x>'" rejection — that behavior is deliberate and tested
+    // (e.g. "/default temperature 0.7") and must not be suppressed too.
+    if (/^(claude|gemini|zclaude|codex|agy)$/i.test(label)) return undefined;
     const setting = TUNABLE_COMMAND_SETTINGS[label] ?? normalizeTunableName(label);
     return build('topic', label, setting, def[2]);
   }

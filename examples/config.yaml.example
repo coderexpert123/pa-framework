@@ -234,7 +234,7 @@ workers:
         # Declared here (unusually for a model knob) precisely because the
         # effort suffix makes the vocabulary worth showing. Still a hint: an
         # unlisted id passes through, so a model that ships tomorrow works.
-        values: ["gemini-3.6-flash-high", "gemini-3.6-flash-low", "claude-sonnet-4-6", "gpt-oss-120b-medium"]
+        values: ["gemini-3.6-flash-high", "gemini-3.6-flash-medium", "gemini-3.6-flash-low", "gemini-3.5-flash-high", "gemini-3.5-flash-medium", "gemini-3.5-flash-low", "gemini-3.1-pro-high", "gemini-3.1-pro-low", "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium"]
         description: "Model for this CLI session (run `agy models` for the current list — from PowerShell/cmd, not Git Bash, where it hangs). Effort is embedded in the gemini names; a base name with no -high/-medium/-low suffix is rejected."
       effort:
         args: ["--effort", "{value}"]

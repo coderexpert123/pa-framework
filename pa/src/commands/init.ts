@@ -150,6 +150,18 @@ workers:
       model:
         args: ["--model", "{value}"]
         supersedes: [effort]
+        values:
+          - gemini-3.6-flash-high
+          - gemini-3.6-flash-medium
+          - gemini-3.6-flash-low
+          - gemini-3.5-flash-high
+          - gemini-3.5-flash-medium
+          - gemini-3.5-flash-low
+          - gemini-3.1-pro-high
+          - gemini-3.1-pro-low
+          - claude-sonnet-4-6
+          - claude-opus-4-6-thinking
+          - gpt-oss-120b-medium
         description: "Model for this CLI session; agy's reasoning effort is EMBEDDED in its gemini model names (-high/-medium/-low), and a base name with no suffix is rejected. Setting a model supersedes the effort knob. Run 'agy models' for the current list - from PowerShell/cmd, not Git Bash, where it hangs (verified 2026-07-22: 242s, rc=124, 0 bytes; NOT a TTY gate - it works with stdout redirected)."
       effort:
         args: ["--effort", "{value}"]

@@ -6,6 +6,7 @@ import { createTempPaHome, createTempConfig, cleanup } from './helpers.js';
 import { flushLog } from '../src/lib/log.js';
 import {
   isBinaryStateContent,
+  isKnownBinaryStatePattern,
   readUsableStateTail,
   readStateTail,
   analyzeAgentState,
@@ -48,6 +49,36 @@ function largeSqliteFile(): Buffer {
 function invalidUtf8File(): Buffer {
   // Bare continuation bytes: every one decodes to U+FFFD.
   return Buffer.from(new Array(2048).fill(0x9f));
+}
+
+/**
+ * A REALISTIC dense agy/codex database page: mostly printable conversational
+ * prose in ~150-200 char segments, with only SPARSE protobuf-style tag/varint
+ * framing bytes (single low-ASCII control bytes < 0x20) interleaved every few
+ * segments — not padded with long NUL runs the way a small/mostly-empty
+ * SQLite page is. This keeps the "bad byte" ratio over the first 4096 chars
+ * of isBinaryStateContent's sample WELL under the 2% threshold, which is
+ * exactly why the ratio-only heuristic used to miss this content class even
+ * though it comes from a KNOWN-binary store (agy's *.db / codex's *.sqlite).
+ * See the "REGRESSION: dense realistic protobuf tail" tests below.
+ */
+function denseRealisticProtobufTail(): string {
+  const prose =
+    'The user asked to refactor the payment retry logic so that transient ' +
+    'network errors are retried with backoff, while permanent validation ' +
+    'errors surface immediately to the caller without any retry at all. ';
+  let out = '';
+  let segments = 0;
+  while (out.length < 6000) {
+    out += prose;
+    segments++;
+    // Sparse protobuf-style framing: one tag byte + one varint length byte
+    // every 5 segments — mimicking real, infrequent interleaving.
+    if (segments % 5 === 0) {
+      out += String.fromCharCode(0x02) + String.fromCharCode(0x0b);
+    }
+  }
+  return out;
 }
 
 const PENDING_TOOL_JSONL =
@@ -105,6 +136,63 @@ describe('isBinaryStateContent', () => {
   });
 });
 
+describe('isKnownBinaryStatePattern', () => {
+  it('flags agy and codex state_pattern suffixes', () => {
+    assert.equal(isKnownBinaryStatePattern('*.db'), true);
+    assert.equal(isKnownBinaryStatePattern('state_5.sqlite'), true);
+  });
+
+  it('is case-insensitive', () => {
+    assert.equal(isKnownBinaryStatePattern('*.DB'), true);
+    assert.equal(isKnownBinaryStatePattern('STATE.SQLITE'), true);
+  });
+
+  it('does NOT flag JSON/JSONL patterns', () => {
+    assert.equal(isKnownBinaryStatePattern('*.jsonl'), false);
+    assert.equal(isKnownBinaryStatePattern('*.json'), false);
+  });
+});
+
+describe('isBinaryStateContent categorical short-circuit (do-not-regress)', () => {
+  it('REGRESSION: the ratio-only heuristic misses a realistic dense protobuf tail', () => {
+    const tail = denseRealisticProtobufTail();
+    assert.ok(tail.length > 4096, 'fixture must exceed the ratio sample window');
+    assert.ok(!tail.includes(String.fromCharCode(0)), 'fixture deliberately has no NUL runs (unlike a small/empty db page)');
+    assert.ok(!tail.startsWith('SQLite format 3'), 'fixture must not hit the magic-header shortcut either');
+    // This is the bug this fix closes: called WITHOUT a statePattern (i.e. the
+    // pre-fix call shape), the ratio-only sniff says "not binary" — a false
+    // negative for content that in reality came from agy's SQLite store.
+    assert.equal(
+      isBinaryStateContent(tail),
+      false,
+      'documents the pre-fix false negative — sparse framing bytes stay under the 2% ratio threshold',
+    );
+  });
+
+  it('the categorical check catches the same tail unconditionally when statePattern is known-binary', () => {
+    const tail = denseRealisticProtobufTail();
+    assert.equal(isBinaryStateContent(tail, '*.db'), true);
+    assert.equal(isBinaryStateContent(tail, 'state_5.sqlite'), true);
+  });
+
+  it('the categorical check is truly unconditional — even plain ASCII prose with zero bad bytes', () => {
+    const plain = 'nothing but ordinary printable ascii text, no control bytes at all here.';
+    assert.equal(isBinaryStateContent(plain), false, 'sanity: ratio-only sniff correctly says not-binary');
+    assert.equal(isBinaryStateContent(plain, '*.db'), true, 'known-binary state_pattern overrides regardless');
+  });
+
+  it('REGRESSION GUARD: a non-known-binary statePattern still falls back to the ratio heuristic', () => {
+    // gemini/claude JSON transcripts must not newly get flagged as binary
+    // just because a statePattern argument is now being passed through.
+    assert.equal(isBinaryStateContent(PENDING_TOOL_JSONL, '*.jsonl'), false);
+    assert.equal(isBinaryStateContent(GEMINI_SESSION_JSON, '*.json'), false);
+    // ...and genuinely bad content on a non-known-binary pattern is still
+    // caught by the ratio heuristic, not silently waved through.
+    const decoded = invalidUtf8File().toString('utf8');
+    assert.equal(isBinaryStateContent(decoded, '*.jsonl'), true);
+  });
+});
+
 describe('state-monitor binary state files', () => {
   let dir: string;
   let n = 0;
@@ -138,6 +226,27 @@ describe('state-monitor binary state files', () => {
     const tail = await readUsableStateTail(stateDir, '*.db', 'agy');
     assert.equal(tail.content, null);
     assert.equal(tail.problem, 'binary');
+  });
+
+  it('readUsableStateTail catches a realistic dense protobuf tail via the categorical check (not the ratio sniff)', async () => {
+    // This is the end-to-end version of the "categorical short-circuit" unit
+    // tests above: the dense fixture would NOT trip the ratio heuristic on
+    // its own (see the REGRESSION test), so this proves the state_pattern
+    // ('*.db', known-binary) is what catches it here, not content sniffing.
+    const stateDir = await stateDirWith('dense-agy', denseRealisticProtobufTail());
+    const tail = await readUsableStateTail(stateDir, '*.db', 'agy');
+    assert.equal(tail.content, null, 'must be gated even though the ratio heuristic alone would miss it');
+    assert.equal(tail.problem, 'binary');
+  });
+
+  it('analyzeAgentState catches the same dense tail for a *.sqlite (codex-style) state_pattern', async () => {
+    const stateDir = join(dir, `state-dense-codex-${n++}`);
+    await mkdir(stateDir, { recursive: true });
+    await writeFile(join(stateDir, 'state_5.sqlite'), denseRealisticProtobufTail(), 'utf8');
+
+    const state = await analyzeAgentState(stateDir, 'state_5.sqlite', 'codex');
+    assert.equal(state.verdict, 'unknown');
+    assert.equal(state.degraded, 'binary');
   });
 
   it('readUsableStateTail does not throw and reports no problem when the dir is missing', async () => {
@@ -311,6 +420,17 @@ describe('evaluateWorkerState never receives binary state', () => {
     assert.ok(!joined.includes('\u0000'), 'no NUL byte may appear in an evaluator prompt');
     assert.ok(!joined.includes('�'), 'no replacement character may appear in an evaluator prompt');
     assert.ok(!joined.includes('trajectory-3'), 'no fragment of the binary store may appear in a prompt');
+  });
+
+  it('never sends a realistic dense protobuf tail to the evaluator either (categorical check, not ratio sniff)', async () => {
+    const { evaluateWorkerState } = await import('../src/worker-evaluator.js');
+    const stateDir = join(dir, 'eval-binary-dense');
+    await mkdir(stateDir, { recursive: true });
+    await writeFile(join(stateDir, 'conversation.db'), denseRealisticProtobufTail(), 'utf8');
+
+    const result = await evaluateWorkerState(stateDir, '*.db', 'agy', {}, recordingExecutor);
+    assert.equal(result, null, 'the dense fixture must still be gated even though its bad-byte ratio is low');
+    assert.equal(prompts.length, 0, 'the evaluator must not be spawned for this state_pattern regardless of content');
   });
 
   it('still sends a valid JSONL state tail to the evaluator', async () => {

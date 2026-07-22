@@ -1,4 +1,4 @@
-import { acceptedRollbackCommits, findAcceptance, readAuditRecords, skillRunStats } from '../lib/improvement-audit.js';
+import { acceptedRollbackCommits, appendAuditRecord, findAcceptance, normalizeCommitKey, readAuditRecords, skillRunStats } from '../lib/improvement-audit.js';
 import type { AuditRecord, SkillRunStats } from '../lib/improvement-audit.js';
 
 const DEFAULT_SINCE_DAYS = 30;
@@ -61,6 +61,26 @@ function latestOf(records: AuditRecord[]): AuditRecord {
 }
 
 /**
+ * Same grouping as groupByCommit, but keyed by normalizeCommitKey (trim+lowercase) instead of
+ * the raw commit_hash string. Needed anywhere a lookup has to agree with acceptedRollbackCommits/
+ * findAcceptance's case-insensitive keying (improvement-audit.ts) — groupByCommit's raw keys do
+ * NOT agree with those when a human-typed acceptance record's commit hash differs in case from
+ * the matching rollback-failed record (git hashes are conventionally lowercase, but nothing
+ * enforces that on a hand-written acceptance). A raw-key lookup there silently misses and
+ * reports 0/undefined attempts instead of the real count.
+ */
+function groupByCommitNormalized(records: AuditRecord[]): Map<string, AuditRecord[]> {
+  const byCommit = new Map<string, AuditRecord[]>();
+  for (const r of records) {
+    const key = normalizeCommitKey(r.commit_hash) ?? '(unknown commit)';
+    const bucket = byCommit.get(key);
+    if (bucket) bucket.push(r);
+    else byCommit.set(key, [r]);
+  }
+  return byCommit;
+}
+
+/**
  * Builds the top-of-report banner for failed rollbacks — commits the loop itself decided were
  * bad, tried to `git revert`, and could not. Grouped by commit because a perma-failing revert
  * is retried every night (7b82c88 produced one record on 2026-07-13 and another on
@@ -105,12 +125,14 @@ export function buildAcceptedRollbackBanner(records: AuditRecord[], acceptances:
   const accepted = acceptedRollbackCommits(acceptances);
   if (accepted.size === 0) return [];
 
-  const failedByCommit = groupByCommit(records.filter((r) => r.action === 'rollback-failed'));
+  // Normalized (not groupByCommit's raw keying) so this agrees with `accepted`'s
+  // case-insensitive keys — see groupByCommitNormalized's doc comment.
+  const failedByCommit = groupByCommitNormalized(records.filter((r) => r.action === 'rollback-failed'));
 
   const lines: string[] = [];
   lines.push(`ℹ️  ACCEPTED FAILED ROLLBACKS — ${accepted.size} commit(s) the loop condemned and could not revert, KEPT by human decision. Still live, on purpose.`);
   for (const [commit, record] of accepted) {
-    const attempts = failedByCommit.get(record.commit_hash ?? commit)?.length ?? 0;
+    const attempts = failedByCommit.get(normalizeCommitKey(record.commit_hash) ?? commit)?.length ?? 0;
     const target = record.target_skill ?? record.draft;
     const who = record.accepted_by ?? 'human';
     const when = (record.accepted_at ?? record.ts).slice(0, 10);
@@ -219,4 +241,61 @@ export async function improvementsCommand(sinceDays: number = DEFAULT_SINCE_DAYS
   const acceptances = all.filter((r) => r.action === 'rollback-accepted');
 
   console.log(buildEvalReport(entries, sinceDays, acceptances));
+}
+
+/**
+ * `pa improvements accept <commit_hash> [--reason "..."]` — the missing write path for a
+ * 'rollback-accepted' record (2026-07-22). Until now the only way to close out a perma-failing
+ * rollback (see EVALUABLE_ACTIONS' comment on 7b82c88) was to hand-append a raw JSON line to
+ * the audit log, matching AuditRecord's exact field names with nothing validating that the
+ * commit hash typed actually corresponds to a real rollback-failed record — a typo (e.g. a
+ * truncated hash) would silently accept nothing while looking like it worked.
+ *
+ * This command closes that gap: it REQUIRES an existing rollback-failed record for the exact
+ * (case-insensitively normalized) commit hash and fails loudly — non-zero exit via a thrown
+ * Error, matching every other command in this file (see reject.ts) — when there is none. On a
+ * match it auto-fills target_skill/draft from that record (the human never re-types them) and
+ * writes the acceptance through appendAuditRecord, so the JSON shape, atomic-append behavior,
+ * and timestamp field naming are guaranteed correct rather than hand-constructed.
+ */
+export async function acceptRollbackCommand(commitHash: string | undefined, reason: string | undefined): Promise<void> {
+  const key = normalizeCommitKey(commitHash);
+  if (!key) {
+    throw new Error('Usage: pa improvements accept <commit_hash> [--reason "..."]');
+  }
+
+  const all = await readAuditRecords();
+  const failedRecords = all.filter((r) => r.action === 'rollback-failed' && normalizeCommitKey(r.commit_hash) === key);
+
+  if (failedRecords.length === 0) {
+    throw new Error(
+      `no rollback-failed record found for commit '${commitHash}'. Nothing was accepted — ` +
+      `check the hash against \`pa improvements\`'s FAILED ROLLBACKS banner and try again.`
+    );
+  }
+
+  // Latest attempt carries the most current target_skill/draft/reason context for a commit
+  // that (per the module doc above) is retried nightly and can accumulate several attempts.
+  const matched = latestOf(failedRecords);
+  const now = new Date().toISOString();
+  const record: AuditRecord = {
+    ts: now,
+    draft: matched.draft,
+    source_type: matched.source_type,
+    target_skill: matched.target_skill,
+    action: 'rollback-accepted',
+    risk_flags: [],
+    reason: reason && reason.trim() ? reason.trim() : 'Accepted via `pa improvements accept` (no reason given).',
+    commit_hash: matched.commit_hash,
+    accepted_at: now,
+    accepted_by: 'human',
+  };
+
+  await appendAuditRecord(record);
+
+  console.log(
+    `Accepted commit ${matched.commit_hash} (target: ${matched.target_skill ?? matched.draft}) — ` +
+    `suppresses the FAILED ROLLBACKS banner for the rollback-failed record from ${matched.ts.slice(0, 10)} ` +
+    `(${failedRecords.length} matching attempt(s) on record).`
+  );
 }

@@ -15,6 +15,16 @@
  * FAILS SOFT, ALWAYS. A missing logs directory, an unreadable skill folder, a
  * truncated or non-JSON .meta — every one of them contributes nothing and
  * throws nothing. This feeds a help message; it must never break a command.
+ *
+ * KNOWN LIMITATION (2026-07-22): this only mines `.meta` files, and only
+ * `pa run <skill>` writes one. The bot's /llm and /effort commands resolve
+ * and dispatch tunable args directly in-process (buildDispatchExtraArgs in
+ * projects/telegram-bot/src/main.ts) and never touch this log path — so for
+ * a worker with no skill declaring matching `worker_args`, "observed values"
+ * will legitimately stay empty forever, no matter how many interactive
+ * dispatches use it. Not a bug to "fix" by guessing at bot-side logging; if
+ * interactive-dispatch history is ever wanted here, the bot's dispatch path
+ * needs its own write side first.
  */
 
 import { readdir, readFile } from 'fs/promises';

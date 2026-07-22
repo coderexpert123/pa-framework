@@ -80,11 +80,14 @@ export interface AuditRecord {
 /**
  * Normalizes a commit hash for comparison. Trim + lowercase only — deliberately NOT
  * prefix-tolerant: a 7-char abbreviation and a 40-char full hash of the same commit will NOT
- * match. That is the safe direction to fail, because the only consumer is suppression of a
- * safety banner (see acceptedRollbackCommits) and a missed match means the banner still
- * WARNS. A prefix match would be the direction that silences warnings by accident.
+ * match. That is the safe direction to fail, because every consumer (acceptedRollbackCommits'
+ * suppression of the safety banner, improvements.ts's attempt-count lookup, and
+ * acceptRollbackCommand's rollback-failed match) treats a missed match as "warn" or "reject",
+ * never "silently accept". A prefix match would be the direction that silences warnings by
+ * accident. Exported (not module-private) so every one of those call sites shares the exact
+ * same normalization instead of risking independent, potentially-diverging reimplementations.
  */
-function normalizeCommitKey(hash: string | undefined): string | undefined {
+export function normalizeCommitKey(hash: string | undefined): string | undefined {
   const trimmed = hash?.trim().toLowerCase();
   return trimmed ? trimmed : undefined;
 }
