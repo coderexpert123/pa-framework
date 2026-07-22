@@ -447,10 +447,23 @@ describe('getPriorSessionPath', () => {
     assert.ok(/\.json\*?$/.test(result!), `should end in a .json/.json* glob suffix, got: ${result}`);
   });
 
-  it('returns .pb path for agy under conversations (live CLI format)', () => {
-    const result = getPriorSessionPath('agy', 'abc-def-123', undefined);
-    assert.ok(result !== null, 'should return a path');
-    assert.ok(result!.endsWith('.gemini/antigravity-cli/conversations/abc-def-123.pb'), `expected .pb path, got: ${result}`);
+  // Corrected 2026-07-22. This previously asserted a `<id>.pb` path and called it
+  // "live CLI format". That was wrong on the facts: agy stores conversations as
+  // `<uuid>.db` — SQLite in WAL mode — and there has never been a `.pb` file on
+  // disk. The old assertion made the bug look intentional, which is why it
+  // survived. agy now behaves like codex: a binary store is not a transcript the
+  // model can read, so there is no path to hand it.
+  it('returns null for agy — its conversation store is binary SQLite, not a readable transcript', () => {
+    assert.equal(getPriorSessionPath('agy', 'abc-def-123', undefined), null);
+  });
+
+  // Regression guard for the empty-sessionId path: main.ts's fresh-dispatch
+  // failure branch passes '' , which previously produced the truthy string
+  // `.../conversations/.pb` and made context.ts instruct the model to read a
+  // file that cannot exist. Null is what lets the "no transcript file available
+  // for this worker type" fallback fire.
+  it('returns null for agy even when the session id is empty', () => {
+    assert.equal(getPriorSessionPath('agy', '', undefined), null);
   });
 
   it('returns null for codex', () => {

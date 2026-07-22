@@ -37,7 +37,7 @@ workers:
       - "Resource exhausted"
     priority: 3
     state_dir: "~/.gemini/tmp/personal-assistant/chats"
-    state_pattern: "*.json"
+    state_pattern: "*.jsonl"   # gemini-cli writes session-<ts>-<id>.jsonl here (verified 2026-07-22)
 
   - name: codex
     command: codex
@@ -74,6 +74,11 @@ workers:
 
   - name: agy
     command: agy
+    # --print-timeout is required: agy's print mode self-kills at 5m0s by default.
+    # 65m sits just above pa's DEFAULT_TIMEOUT (3600s) so pa's own max-timeout is
+    # always the layer that fires (attributable error + failure backoff).
+    # {prompt} is substituted with '@<tempfile>' by worker-exec.ts (arg mode), not
+    # inlined — so there is no command-line length cap on the prompt.
     args: ["--dangerously-skip-permissions", "--print-timeout", "65m", "-p", "{prompt}"]
     input_mode: arg
     output_format: plain-text
@@ -84,7 +89,13 @@ workers:
       - "429"
     priority: 2
     state_dir: "~/.gemini/antigravity-cli/conversations"
-    state_pattern: "*.pb"  # protobuf conversation files (.db = pre-2026 legacy SQLite)
+    # agy stores each conversation as a SQLite database in WAL mode, hence the
+    # sibling <id>.db-shm / <id>.db-wal files (the '*.db' glob deliberately
+    # excludes those — findLatestStateFile matches on suffix). pa's state reader
+    # is line-oriented JSON and cannot parse SQLite, so it degrades to "unknown"
+    # rather than guessing; agy stuck-detection therefore relies on the
+    # process-tree heartbeat, not transcript inspection.
+    state_pattern: "*.db"
 
 bg_tasks:
   alert_seconds: 300

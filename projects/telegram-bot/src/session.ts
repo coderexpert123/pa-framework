@@ -232,11 +232,18 @@ export function getPriorSessionPath(worker: string, sessionId: string, cwd?: str
     // Exact filename requires async dir scan; return a glob pattern the LLM can resolve.
     return `${homedir()}/.gemini/tmp/personal-assistant/chats/session-*-${sessionId.slice(0, 8)}*.json*`;
   }
-  if (worker === 'agy') {
-    // Current CLI writes <uuid>.pb (protobuf); .db was the older format.
-    return `${homedir()}/.gemini/antigravity-cli/conversations/${sessionId}.pb`;
-  }
-  // Codex: stored in SQLite only — no transcript file.
+  // Agy + Codex: conversation state is a binary SQLite store, not a readable
+  // transcript — no path to hand the model. Returning null makes context.ts
+  // emit its "no transcript file available for this worker type" line instead.
+  //
+  // Do NOT reinstate a path here (2026-07-22). The previous version returned
+  // `<id>.pb`, which was wrong twice over: agy writes `<uuid>.db` (SQLite, WAL
+  // mode) and there has never been a single `.pb` on disk; and on the fresh-
+  // dispatch failure path main.ts passes sessionId '', so the string became
+  // `.../conversations/.pb` — still truthy, so the model was told to read a
+  // file that cannot exist. A `.db` path would be no better: it is protobuf
+  // blobs inside SQLite, unreadable by the model and carrying verbatim
+  // fragments of files the prior agent had read.
   return null;
 }
 

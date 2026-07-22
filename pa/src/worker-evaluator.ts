@@ -1,5 +1,5 @@
 import { loadConfig } from './config.js';
-import { readStateTail } from './state-monitor.js';
+import { readUsableStateTail } from './state-monitor.js';
 import { log } from './lib/log.js';
 import { notifyUser } from './lib/notify.js';
 import type { WorkerConfig, CommandResult, RunOptions, EvaluatorConfig } from './types.js';
@@ -55,7 +55,16 @@ export async function evaluateWorkerState(
     const evalWorker = config.workers.find((w) => w.name === evalCfg.worker);
     if (!evalWorker) return null;
 
-    const stateContent = await readStateTail(stateDir, statePattern);
+    // DO NOT REGRESS: readUsableStateTail, never readStateTail. Some workers
+    // (agy) keep their conversation in a binary SQLite/protobuf store, and the
+    // raw tail of that file must never be interpolated into the prompt below —
+    // it is pure noise to the model and it smuggles fragments of whatever files
+    // the stuck agent had read into a different vendor's CLI. No usable state
+    // means no verdict, which the caller already treats as "fall through to
+    // standard behavior".
+    const tail = await readUsableStateTail(stateDir, statePattern, stuckWorkerName);
+    if (tail.problem) return null;
+    const stateContent = tail.content;
     if (!stateContent) return null;
 
     const prompt = `You are evaluating whether an AI agent subprocess should be allowed to continue running or should be terminated.

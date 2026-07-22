@@ -33,7 +33,7 @@ workers:
     state_dir: "~/.claude/projects"   # for session-mode rate-limit detection
     state_pattern: "*.jsonl"
 
-  # ---- gemini (priority 2) ----
+  # ---- gemini (priority 3 — fallback below agy) ----
   - name: gemini
     command: gemini
     # Tip: point command at a small wrapper script if your CLI needs env vars
@@ -55,9 +55,9 @@ workers:
       - "Resource exhausted"
     priority: 3
     state_dir: "~/.gemini/tmp/personal-assistant/chats"  # must match GEMINI_PROJECT_DIR
-    state_pattern: "*.json"
+    state_pattern: "*.jsonl"   # gemini-cli writes session-<ts>-<id>.jsonl (verified 2026-07-22)
 
-  # ---- codex (priority 3) ----
+  # ---- codex (priority 4) ----
   - name: codex
     command: codex
     # Windows (Node-based, path varies by npm setup):
@@ -80,8 +80,10 @@ workers:
       - "quota exceeded"
       - "429"
     priority: 4
+    state_dir: "~/.codex"
+    state_pattern: "state_5.sqlite"   # SQLite; same caveat as agy — heartbeat, not transcript, drives stuck-detection
 
-  # ---- claude (priority 4 — fallback) ----
+  # ---- claude (priority 5 — last resort) ----
   - name: claude
     command: claude
     # Windows: command: C:/Users/<you>/AppData/Roaming/npm/claude.cmd
@@ -108,24 +110,48 @@ workers:
     state_dir: "~/.claude/projects"
     state_pattern: "*.jsonl"
 
-  # ---- agy (priority 5 — Antigravity CLI, Google-internal LLM) ----
+  # ---- agy (priority 2 — Antigravity CLI) ----
+  # Plain-text worker: it has no --output-format flag, so pa never sees
+  # stream-json events from it. Consequence: pa cannot capture a native session
+  # id for agy (worker-exec only reads session ids off stream-json events), so
+  # conversation continuity must come from prompt-injected history, not from
+  # resuming a native session.
   - name: agy
     command: agy
     # Tip: point command at a small wrapper script if your CLI needs env vars
     # set (e.g. GCP project vars, token refresh) or arg-quoting fixes (see
     # docs/WORKERS_GUIDE.md). worker-exec spawns this command verbatim — no
     # name-based rewriting.
-    args: ["--dangerously-skip-permissions", "--print-timeout", "65m", "-p", "{prompt}"]
-    input_mode: arg
-    output_format: plain-text
+    args:
+      - "--dangerously-skip-permissions"
+      # Required: agy's print mode self-kills at 5m0s by default, which is far
+      # below any real synthesis run. 65m sits just ABOVE pa's own
+      # DEFAULT_TIMEOUT (3600s) so pa's max-timeout is always the layer that
+      # fires — pa logs an attributable "exceeded max timeout" and feeds failure
+      # backoff, whereas an agy-side kill surfaces only as an opaque non-zero
+      # exit. If a skill sets `timeout:` above 3600, raise this too.
+      - "--print-timeout"
+      - "65m"
+      # {prompt} is NOT inlined on the command line: worker-exec.ts (arg mode)
+      # writes the prompt to a temp file and substitutes '@<path>', which agy
+      # resolves client-side. So prompt size is not capped by the shell.
+      - "-p"
+      - "{prompt}"
+    input_mode: arg           # prompt passed as a CLI arg, not over stdin
+    output_format: plain-text # agy has no --output-format flag; do not claim stream-json
     check: agy --version
     check_timeout: 10
     rate_limit_patterns:
       - "RESOURCE_EXHAUSTED"
       - "429"
     priority: 2
-    state_dir: "~/.gemini/antigravity-cli/conversations"   # .pb protobuf conversation files (.db = legacy SQLite on older installs)
-    state_pattern: "*.pb"
+    state_dir: "~/.gemini/antigravity-cli/conversations"
+    # Each conversation is a SQLite database in WAL mode, hence the sibling
+    # <id>.db-shm / <id>.db-wal files ('*.db' matches on suffix, so those are
+    # excluded). pa's state reader is line-oriented JSON and cannot parse
+    # SQLite — it reports "unknown" instead of guessing, so agy stuck-detection
+    # relies on the process-tree heartbeat rather than transcript inspection.
+    state_pattern: "*.db"
 
 # ---- evaluator (optional) ----
 # When a worker appears stuck (no output for idle_timeout seconds), the

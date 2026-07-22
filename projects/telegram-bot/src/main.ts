@@ -57,7 +57,6 @@ import {
 import {
   isSessionValid,
   discoverGeminiSessionId,
-  discoverAgySessionId,
   buildResumeArgs,
   cleanupExpiredSessions,
   getPriorSessionPath,
@@ -649,7 +648,19 @@ export async function dispatchMessage(
     let sessionId: string | undefined;
     if (freshResult.worker === 'claude' || freshResult.worker === 'zclaude' || freshResult.worker === 'codex') sessionId = freshResult.result.sessionId;
     else if (freshResult.worker === 'gemini') sessionId = freshResult.result.sessionId ?? (await discoverGeminiSessionId(GEMINI_PROJECT_DIR).catch(() => null)) ?? undefined;
-    else if (freshResult.worker === 'agy') sessionId = freshResult.result.sessionId ?? (await discoverAgySessionId().catch(() => null)) ?? undefined;
+    // agy is deliberately SESSIONLESS — do not reinstate discovery here (2026-07-22).
+    // agy emits plain text, so result.sessionId is never populated (worker-exec only
+    // captures it from stream-json events), which meant this always fell through to
+    // discoverAgySessionId(): "newest .db by mtime". But agy creates its .db at run
+    // START, so under the default concurrency cap of 3 — with agy now the default for
+    // 16 topics plus 5 scheduled skills — any agy run starting mid-dispatch wins the
+    // scan. The topic would then store a FOREIGN conversation id and the next message
+    // would run `agy --conversation <another topic's or a skill's>`, bleeding unrelated
+    // history into the reply. Continuity does not depend on this: context.ts injects
+    // the last 10 turns into every prompt, and topic stickiness lives in
+    // preferred_worker/topic_defaults, not in sessions. Cost of sessionless: the turns
+    // are re-sent as text instead of reusing agy's native context. That is cheap and
+    // correct; cross-topic contamination is neither.
     if (sessionId) newSession = { session_id: sessionId, worker: freshResult.worker, started_at: new Date().toISOString() };
     dispatchResult = { ...freshResult, session: newSession };
   }

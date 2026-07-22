@@ -302,7 +302,7 @@ export async function executeWorker(
         try {
           // Check 1: analyze conversation state file (high-signal heuristics)
           if (stateDir) {
-            const state = await analyzeAgentState(stateDir, statePattern);
+            const state = await analyzeAgentState(stateDir, statePattern, worker.name);
 
             if (state.verdict === 'stuck') {
               // Obvious stuck case — no need to call the LLM evaluator
@@ -452,7 +452,7 @@ export async function executeWorker(
               const currentMtime = await getLatestStateMtime(stateDir, statePattern);
               if (currentMtime && (!lastKnownMtime || currentMtime > lastKnownMtime)) {
                 lastKnownMtime = currentMtime;
-                const state = await analyzeAgentState(stateDir, statePattern);
+                const state = await analyzeAgentState(stateDir, statePattern, worker.name);
                 resetIdleTimer(state.status);
                 return;
               }
