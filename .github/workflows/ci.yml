@@ -1,16 +1,15 @@
 name: CI
 
 on:
-  # main = this mirror's default branch, master = the private deployment
-  # repo's default branch. ci.yml is tracked in BOTH (see CLAUDE.md's Public
-  # CI section) and this trigger must cover both or one repo silently never
-  # runs CI at all. Found 2026-07-22: the private repo (default branch
-  # master) had zero CI runs, ever, despite Actions being enabled and the
-  # workflow file present.
+  # ci.yml is tracked in BOTH repos this project shares a working tree with
+  # (see CLAUDE.md's Public CI section). Both now use `main` as their default
+  # branch (unified 2026-07-22 -- the private deployment repo was previously
+  # on `master`, which is why this trigger silently never ran there at all
+  # despite Actions being enabled and the workflow file present).
   push:
-    branches: [main, master]
+    branches: [main]
   pull_request:
-    branches: [main, master]
+    branches: [main]
 
 jobs:
   test:
