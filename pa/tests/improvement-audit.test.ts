@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdir, writeFile, readFile } from 'fs/promises';
 import { join } from 'path';
 import { createTempPaHome, cleanup } from './helpers.js';
-import { skillRunStats, appendAuditRecord, readAuditRecords, unifiedDiff } from '../src/lib/improvement-audit.js';
+import { skillRunStats, appendAuditRecord, readAuditRecords, unifiedDiff, acceptedRollbackCommits, findAcceptance } from '../src/lib/improvement-audit.js';
 import type { AuditRecord } from '../src/lib/improvement-audit.js';
 import type { RunMeta } from '../src/types.js';
 
@@ -155,6 +155,77 @@ describe('readAuditRecords', () => {
 
     const records = await readAuditRecords();
     assert.deepEqual(records.map((r) => r.draft), ['good', 'good-2']);
+  });
+});
+
+describe('rollback-accepted records', () => {
+  function acceptance(overrides: Partial<AuditRecord> = {}): AuditRecord {
+    return {
+      ts: '2026-07-22T09:00:00.000Z',
+      draft: 'daily-mail-brief-fix-10',
+      source_type: 'failure',
+      target_skill: 'daily-mail-brief',
+      action: 'rollback-accepted',
+      risk_flags: [],
+      reason: 'Human review: keep it.',
+      commit_hash: '7b82c88',
+      accepted_at: '2026-07-22T09:00:00.000Z',
+      accepted_by: 'human',
+      ...overrides,
+    };
+  }
+
+  it('round-trips a rollback-accepted record through append + read (commit, accepted_at, accepted_by, reason)', async () => {
+    const record = acceptance();
+    await appendAuditRecord(record);
+
+    const records = await readAuditRecords();
+    assert.equal(records.length, 1);
+    assert.deepEqual(records[0], record);
+    assert.equal(records[0].action, 'rollback-accepted');
+    assert.equal(records[0].commit_hash, '7b82c88');
+    assert.equal(records[0].accepted_at, '2026-07-22T09:00:00.000Z');
+    assert.equal(records[0].accepted_by, 'human');
+  });
+
+  it('indexes acceptances by commit hash', () => {
+    const accepted = acceptedRollbackCommits([acceptance()]);
+    assert.equal(accepted.size, 1);
+    assert.equal(findAcceptance(accepted, '7b82c88')?.reason, 'Human review: keep it.');
+  });
+
+  it('is COMMIT-SCOPED — an acceptance for one commit does not cover another', () => {
+    const accepted = acceptedRollbackCommits([acceptance({ commit_hash: '7b82c88' })]);
+    assert.ok(findAcceptance(accepted, '7b82c88'));
+    assert.equal(findAcceptance(accepted, 'deadbee'), undefined);
+    assert.equal(findAcceptance(accepted, undefined), undefined);
+  });
+
+  it('ignores an acceptance with no commit hash rather than treating it as a wildcard', () => {
+    const accepted = acceptedRollbackCommits([acceptance({ commit_hash: undefined }), acceptance({ commit_hash: '   ' })]);
+    assert.equal(accepted.size, 0);
+    assert.equal(findAcceptance(accepted, 'anything'), undefined);
+  });
+
+  it('ignores records of every other action', () => {
+    const accepted = acceptedRollbackCommits([
+      { ts: '2026-07-13T00:00:00Z', draft: 'd', source_type: 'failure', action: 'rollback-failed', risk_flags: [], reason: 'r', commit_hash: '7b82c88' },
+      { ts: '2026-07-11T00:00:00Z', draft: 'd', source_type: 'failure', action: 'applied-code-fix', risk_flags: [], reason: 'r', commit_hash: '7b82c88' },
+    ]);
+    assert.equal(accepted.size, 0);
+  });
+
+  it('matches case-insensitively and tolerates surrounding whitespace', () => {
+    const accepted = acceptedRollbackCommits([acceptance({ commit_hash: '7B82C88' })]);
+    assert.ok(findAcceptance(accepted, ' 7b82c88 '));
+  });
+
+  it('keeps the latest acceptance when a commit is accepted more than once', () => {
+    const accepted = acceptedRollbackCommits([
+      acceptance({ ts: '2026-07-22T09:00:00.000Z', reason: 'first' }),
+      acceptance({ ts: '2026-07-23T09:00:00.000Z', reason: 'second' }),
+    ]);
+    assert.equal(findAcceptance(accepted, '7b82c88')?.reason, 'second');
   });
 });
 

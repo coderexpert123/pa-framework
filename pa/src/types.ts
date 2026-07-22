@@ -15,6 +15,73 @@ export interface FailoverNotifyPayload {
   raw?: string;   // unfiltered error text for cases where parsing was partial
 }
 
+/**
+ * Declared values for one tunable — a HINT LIST FOR DISPLAY, NEVER A GATE.
+ *
+ *  - string[]                : the canonical words pass through to the CLI unchanged.
+ *  - Record<canon, native>   : canonical-to-native map, for a CLI whose vocabulary
+ *                              differs (e.g. high -> "3"), so one bot-level word
+ *                              keeps one meaning across every worker.
+ *
+ * A value OUTSIDE this list is still accepted and passed through; the bot may
+ * merely note "not a known value for <worker>". See TunableSpec.
+ */
+export type TunableValues = string[] | Record<string, string>;
+
+/**
+ * One user-settable knob a worker's CLI exposes (e.g. model, reasoning effort),
+ * declared per worker under `tunables:` in config.yaml.
+ *
+ * DECLARING A FLAG A CLI DOES NOT HAVE BREAKS EVERY DISPATCH TO THAT WORKER —
+ * an invalid flag is rejected by the CLI itself, so it looks like a worker
+ * outage, not a settings error (this exact bug shipped in the agy scaffold with
+ * --yolo/--output-format and went unnoticed). Declare only flags verified
+ * against that CLI's own --help. Under-declaring is safe; over-declaring is not.
+ *
+ * Contract: STRICT ON THE KNOB, FREE ON THE VALUE. The setting NAME and its arg
+ * template are validated against this declaration at command time; the VALUE
+ * never is. Model names move fast (agy self-updated from "Gemini 3.5 Flash" to
+ * "Gemini 3.6 Flash" within one afternoon), so any allowlist of values would
+ * ship stale. A bad value fails visibly at the CLI with the CLI's own error.
+ *
+ * `args` IS AN ARG TEMPLATE, NOT flag+value. A flag/value pair cannot express
+ * codex, which has no --effort flag and spells the same concept as a config
+ * override: ["-c", "model_reasoning_effort={value}"]. Every occurrence of the
+ * literal "{value}" in any element is replaced with the (native-mapped) value;
+ * at least one element must contain it, or the user's value would be silently
+ * dropped.
+ */
+export interface TunableSpec {
+  args: string[];          // arg template appended when the setting is SET, e.g. ["--model", "{value}"]
+  default?: string;        // worker-level default (cascade tier 3); omit to fall through to the CLI's own default
+  description?: string;    // human-readable help text (bot + dashboard print it)
+  values?: TunableValues;  // declared values — display hint only, never validated against
+  /**
+   * Settings this one SUPERSEDES: when this setting resolves to a value, each
+   * named setting contributes NO ARGS for that dispatch, even though it is set.
+   *
+   * Knobs are independent for most CLIs, but not all — and where they are not,
+   * emitting both is the worst possible failure: the CLI rejects the command
+   * line, so EVERY dispatch in that topic dies and reads as a worker outage
+   * rather than a settings mistake. Which pairs conflict is CLI knowledge, and
+   * CLI knowledge belongs in config (hardcoding worker names in TypeScript is
+   * exactly what rotted before), so the conflict is declared here rather than
+   * detected in code. Motivating case (agy v1.1.5, verified live 2026-07-22):
+   * its reasoning effort is EMBEDDED in the model name
+   * (gemini-3.6-flash-high), and its Claude-family models reject --effort
+   * outright — so `model: {supersedes: [effort]}`.
+   *
+   * Deliberately tier-INDEPENDENT: a model set at ANY tier supersedes an effort
+   * set at any other. The rule states that the two cannot go on the command line
+   * together at all, which is not a question of who set what more recently.
+   *
+   * The superseded setting keeps its stored value and is still reported to the
+   * user (flagged as superseded) — suppression applies to the ARGS only, so
+   * clearing the winner brings it straight back.
+   */
+  supersedes?: string[];
+}
+
 export interface WorkerConfig {
   name: string;
   command: string;
@@ -27,6 +94,7 @@ export interface WorkerConfig {
   input_mode?: 'arg' | 'stdin-json' | 'stdin-text';  // how to pass prompt: CLI arg (default), stdin stream-json, or stdin plain text
   output_format?: string;  // e.g. "stream-json" for NDJSON output
   check_timeout?: number;  // seconds to wait for version check (default 30)
+  tunables?: Record<string, TunableSpec>;  // per-worker settable knobs (see TunableSpec); absent = worker has none, behaves exactly as before
 }
 
 export interface EvaluatorConfig {

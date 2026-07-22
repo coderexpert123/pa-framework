@@ -6,7 +6,7 @@ import { createTempPaHome, cleanup } from './helpers.js';
 import { appendAuditRecord } from '../src/lib/improvement-audit.js';
 import type { AuditRecord } from '../src/lib/improvement-audit.js';
 import type { RunMeta } from '../src/types.js';
-import { buildEvalReport, improvementsCommand } from '../src/commands/improvements.js';
+import { buildEvalReport, buildFailedRollbackBanner, improvementsCommand } from '../src/commands/improvements.js';
 import type { EvalEntry } from '../src/commands/improvements.js';
 
 let dir: string;
@@ -151,6 +151,92 @@ describe('buildEvalReport', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Human acceptance of a failed rollback (2026-07-22). Commit 7b82c88 was condemned by the
+// loop, its `git revert` failed on 2026-07-13 and again on 2026-07-16 (the commit also
+// carried pa/data/profile*.json, which the learn/oracle skills rewrite nightly), and
+// checkForRollbacks() only looks back 7 days — so the loop will never retry it. A human
+// reviewed it and decided to KEEP it. These tests pin the safety property: suppression is
+// per-commit, never global.
+// ---------------------------------------------------------------------------
+describe('accepted failed rollbacks', () => {
+  const failedFor = (commit: string, ts = '2026-07-16T05:22:56.000Z') => makeRecord({
+    ts, draft: 'daily-mail-brief-fix-10', action: 'rollback-failed' as const,
+    target_skill: 'daily-mail-brief', commit_hash: commit, baseline: undefined,
+    reason: `git revert ${commit} failed: local changes to pa/data/profile.json would be overwritten`,
+  });
+
+  const acceptanceFor = (commit: string, reason = 'Reviewed by hand: diff is purely additive.') => makeRecord({
+    ts: '2026-07-22T09:00:00.000Z', draft: 'daily-mail-brief-fix-10',
+    action: 'rollback-accepted' as const, target_skill: 'daily-mail-brief',
+    commit_hash: commit, accepted_at: '2026-07-22T09:00:00.000Z', accepted_by: 'human',
+    reason, baseline: undefined,
+  });
+
+  const zero = { windowDays: 30, runs: 0, successes: 0, failures: 0 };
+
+  it('suppresses the warning banner for a commit that has a matching acceptance', () => {
+    const banner = buildFailedRollbackBanner([failedFor('7b82c88'), acceptanceFor('7b82c88')]);
+    assert.deepEqual(banner, []);
+  });
+
+  it('still warns for a commit with NO acceptance', () => {
+    const banner = buildFailedRollbackBanner([failedFor('7b82c88')]);
+    assert.match(banner.join('\n'), /FAILED ROLLBACKS/);
+    assert.match(banner.join('\n'), /7b82c88/);
+  });
+
+  it('an acceptance for a DIFFERENT commit does not suppress — the whole safety property', () => {
+    // This is the regression that would turn a per-commit ack into a global mute.
+    const banner = buildFailedRollbackBanner([failedFor('deadbee'), acceptanceFor('7b82c88')]).join('\n');
+    assert.match(banner, /FAILED ROLLBACKS/);
+    assert.match(banner, /1 commit\(s\), 1 failed attempt\(s\)/);
+    assert.match(banner, /deadbee/);
+    assert.doesNotMatch(banner, /7b82c88/);
+  });
+
+  it('warns about only the un-accepted commit when both are present', () => {
+    const banner = buildFailedRollbackBanner([
+      failedFor('7b82c88'), failedFor('deadbee'), acceptanceFor('7b82c88'),
+    ]).join('\n');
+    assert.match(banner, /1 commit\(s\), 1 failed attempt\(s\)/);
+    assert.match(banner, /deadbee/);
+    assert.doesNotMatch(banner, /7b82c88/);
+  });
+
+  it('accepts an acceptance passed separately from the in-window records (outside --since)', () => {
+    // improvementsCommand hands over the UNFILTERED trail as `acceptances`, so an acceptance
+    // older than the report window still silences its commit.
+    assert.deepEqual(buildFailedRollbackBanner([failedFor('7b82c88')], [acceptanceFor('7b82c88')]), []);
+  });
+
+  it('renders the accepted commit as a KEPT decision instead of dropping it silently', () => {
+    const report = buildEvalReport([
+      { record: failedFor('7b82c88'), current: zero },
+      { record: acceptanceFor('7b82c88'), current: zero },
+    ], 30);
+
+    // The alarm banner (its wording is unique to buildFailedRollbackBanner) is gone...
+    assert.doesNotMatch(report, /CONDEMNED by the loop, the revert did NOT succeed/);
+    // ...but the history survives: condemned + un-revertable + deliberately kept, with the reason.
+    assert.match(report, /ACCEPTED FAILED ROLLBACKS/);
+    assert.match(report, /7b82c88/);
+    assert.match(report, /KEPT BY HUMAN DECISION/);
+    assert.match(report, /revert of commit 7b82c88 FAILED/);
+    assert.match(report, /rollback-accepted/);
+    assert.match(report, /purely additive/);
+    assert.match(report, /accepted 2026-07-22 by human/);
+    // Neither record applied anything, so the "newly created" gloss must not appear.
+    assert.doesNotMatch(report, /newly created/);
+  });
+
+  it('emits no ACCEPTED section when there are no acceptances', () => {
+    const report = buildEvalReport([{ record: failedFor('7b82c88'), current: zero }], 30);
+    assert.doesNotMatch(report, /ACCEPTED FAILED ROLLBACKS/);
+    assert.match(report, /STILL LIVE/);
+  });
+});
+
 describe('improvementsCommand', () => {
   it('prints applied-fix, approved-new-skill, and rolled-back records with computed current stats', async () => {
     await appendAuditRecord(makeRecord({
@@ -256,6 +342,75 @@ describe('improvementsCommand', () => {
     // The applied-code-fix line is still there — the point is that it is no longer the ONLY
     // thing the reader sees.
     assert.match(text, /applied-code-fix/);
+  });
+
+  it('suppresses the banner for a human-ACCEPTED failed rollback but still reports it (2026-07-22)', async () => {
+    // End-to-end shape of the 7b82c88 decision: applied, condemned, revert failed twice, then
+    // accepted by a human. The alarm goes quiet; the history does not.
+    await appendAuditRecord(makeRecord({
+      draft: 'daily-mail-brief-fix-10', action: 'applied-code-fix', target_skill: 'daily-mail-brief',
+      commit_hash: '7b82c88', files_changed: ['projects/daily-mail-brief/scripts/run_brief.py'],
+      baseline: { window_days: 14, runs: 39, successes: 13, failures: 26 },
+    }));
+    await appendAuditRecord(makeRecord({
+      draft: 'daily-mail-brief-fix-10', action: 'rollback-failed', target_skill: 'daily-mail-brief',
+      commit_hash: '7b82c88', reason: 'git revert 7b82c88 failed: local changes to pa/data/profile.json',
+    }));
+    await appendAuditRecord(makeRecord({
+      draft: 'daily-mail-brief-fix-10', action: 'rollback-accepted', target_skill: 'daily-mail-brief',
+      commit_hash: '7b82c88', accepted_at: '2026-07-22T09:00:00.000Z', accepted_by: 'human',
+      reason: 'Human decision: keep the commit. Diff is purely additive.',
+    }));
+    await createTempMeta('daily-mail-brief', makeMeta({ status: 'success' }), 'n1');
+
+    await improvementsCommand(30);
+
+    const text = output.join('\n');
+    assert.doesNotMatch(text, /CONDEMNED by the loop, the revert did NOT succeed/);
+    assert.match(text, /ACCEPTED FAILED ROLLBACKS/);
+    assert.match(text, /rollback-accepted/);
+    assert.match(text, /7b82c88/);
+    assert.match(text, /purely additive/);
+  });
+
+  it('a different commit failing to revert still raises the banner despite an existing acceptance', async () => {
+    await appendAuditRecord(makeRecord({
+      draft: 'daily-mail-brief-fix-10', action: 'rollback-accepted', target_skill: 'daily-mail-brief',
+      commit_hash: '7b82c88', accepted_at: '2026-07-22T09:00:00.000Z', accepted_by: 'human',
+      reason: 'Accepted.',
+    }));
+    await appendAuditRecord(makeRecord({
+      draft: 'other-fix', action: 'rollback-failed', target_skill: 'other-skill',
+      commit_hash: 'deadbee', reason: 'git revert deadbee failed: conflict',
+    }));
+
+    await improvementsCommand(30);
+
+    const text = output.join('\n');
+    assert.match(text, /CONDEMNED by the loop, the revert did NOT succeed/);
+    assert.match(text, /deadbee/);
+    assert.match(text, /1 commit\(s\), 1 failed attempt\(s\)/);
+  });
+
+  it('honours an acceptance recorded OUTSIDE the --since window (2026-07-22)', async () => {
+    // The acceptance is 60 days old; the failed revert it closes out is recent. Filtering the
+    // acceptance by the report window would resurrect an alarm a human already answered.
+    const old = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString();
+    await appendAuditRecord(makeRecord({
+      ts: old, draft: 'daily-mail-brief-fix-10', action: 'rollback-accepted',
+      target_skill: 'daily-mail-brief', commit_hash: '7b82c88', accepted_at: old,
+      accepted_by: 'human', reason: 'Accepted long ago.',
+    }));
+    await appendAuditRecord(makeRecord({
+      draft: 'daily-mail-brief-fix-10', action: 'rollback-failed',
+      target_skill: 'daily-mail-brief', commit_hash: '7b82c88', reason: 'git revert 7b82c88 failed',
+    }));
+
+    await improvementsCommand(30);
+
+    const text = output.join('\n');
+    assert.doesNotMatch(text, /CONDEMNED by the loop, the revert did NOT succeed/);
+    assert.match(text, /KEPT BY HUMAN DECISION/);
   });
 
   it('shows the revert commit hash on a rolled-back code-fix record (2026-07-11)', async () => {

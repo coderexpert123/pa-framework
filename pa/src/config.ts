@@ -1,7 +1,182 @@
 import { readFile, writeFile } from 'fs/promises';
 import { parse as parseYaml } from 'yaml';
 import { configPath } from './paths.js';
-import type { PaConfig, WorkerConfig, EvaluatorConfig, BgTasksConfig } from './types.js';
+import type { PaConfig, WorkerConfig, EvaluatorConfig, BgTasksConfig, TunableSpec, TunableValues } from './types.js';
+
+/**
+ * Parse a tunable's optional `values:` — a DISPLAY HINT, never a gate.
+ * Accepts a list (values pass through unchanged) or a mapping
+ * (canonical -> native, for a CLI whose vocabulary differs). Anything else, or
+ * an empty result, yields undefined: "no declared values" simply means the bot
+ * shows no suggestions and never second-guesses what the user typed.
+ */
+function parseTunableValues(raw: any, where: string): TunableValues | undefined {
+  if (raw === undefined || raw === null) return undefined;
+
+  if (Array.isArray(raw)) {
+    const list: string[] = [];
+    for (const v of raw) {
+      if (v === undefined || v === null) continue;
+      const s = String(v).trim();
+      if (s && !list.includes(s)) list.push(s);
+    }
+    if (list.length === 0) {
+      console.warn(`${where}: 'values' list is empty; treating as undeclared`);
+      return undefined;
+    }
+    return list;
+  }
+
+  if (typeof raw === 'object') {
+    const map: Record<string, string> = {};
+    for (const [k, v] of Object.entries(raw as Record<string, any>)) {
+      const canon = String(k).trim();
+      if (!canon) continue;
+      if (v === undefined || v === null || String(v).trim() === '') {
+        console.warn(`${where}: value '${canon}' maps to nothing; ignoring that entry`);
+        continue;
+      }
+      map[canon] = String(v).trim();
+    }
+    if (Object.keys(map).length === 0) {
+      console.warn(`${where}: 'values' mapping is empty; treating as undeclared`);
+      return undefined;
+    }
+    return map;
+  }
+
+  console.warn(`${where}: 'values' must be a list or a canonical->native mapping; treating as undeclared`);
+  return undefined;
+}
+
+/**
+ * Parse a tunable's optional `supersedes:` — the names of settings this one
+ * suppresses when it is set (see TunableSpec.supersedes in types.ts).
+ *
+ * Accepts a single name or a list. Names are normalized exactly like setting
+ * names (trim + lowercase) so `supersedes: [Effort]` matches the `effort` key.
+ * A self-reference is dropped: a setting that suppressed itself could never be
+ * emitted, which no one can have meant.
+ */
+function parseTunableSupersedes(raw: any, where: string, selfName: string): string[] | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  const list = Array.isArray(raw) ? raw : [raw];
+
+  const out: string[] = [];
+  for (const entry of list) {
+    if (entry === undefined || entry === null) continue;
+    if (typeof entry === 'object') {
+      console.warn(`${where}: 'supersedes' entries must be setting names; ignoring ${JSON.stringify(entry)}`);
+      continue;
+    }
+    const name = String(entry).trim().toLowerCase();
+    if (!name) continue;
+    if (name === selfName) {
+      console.warn(`${where}: 'supersedes' lists itself; ignoring that entry`);
+      continue;
+    }
+    if (!out.includes(name)) out.push(name);
+  }
+  if (out.length === 0) {
+    console.warn(`${where}: 'supersedes' declares no usable setting names; treating as absent`);
+    return undefined;
+  }
+  return out;
+}
+
+/**
+ * Parse a worker's optional `tunables:` block (see TunableSpec in types.ts).
+ *
+ * Warn-and-skip rather than throw: a malformed knob must not take the whole
+ * config (and with it the scheduler, the bot, and every skill) down. A skipped
+ * knob is still VISIBLE — the bot rejects `/effort` on that worker with the
+ * list of settings it does support, which is a settings error the user can act
+ * on, unlike a bad flag that would fail every dispatch as a fake worker outage.
+ *
+ * Shape (all optional except `args`):
+ *   tunables:
+ *     effort:
+ *       args: ["-c", "model_reasoning_effort={value}"]
+ *       values: [minimal, low, medium, high]      # or a canonical->native map
+ *       default: medium                           # omit => CLI decides
+ *       description: "..."
+ *     model:
+ *       args: ["--model", "{value}"]
+ *       supersedes: [effort]                      # emit --model alone when both are set
+ */
+export function parseTunables(raw: any, workerName: string): Record<string, TunableSpec> | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    console.warn(`[config] worker '${workerName}': 'tunables' must be a mapping of setting name -> { flag, ... }; ignoring`);
+    return undefined;
+  }
+
+  const out: Record<string, TunableSpec> = {};
+  for (const [rawName, rawSpec] of Object.entries(raw as Record<string, any>)) {
+    const name = String(rawName).trim().toLowerCase();
+    const where = `[config] worker '${workerName}' tunable '${rawName}'`;
+    if (!name) {
+      console.warn(`${where}: empty setting name; ignoring`);
+      continue;
+    }
+    if (!rawSpec || typeof rawSpec !== 'object' || Array.isArray(rawSpec)) {
+      console.warn(`${where}: must be a mapping with at least an 'args' template; ignoring`);
+      continue;
+    }
+    const rawArgs = rawSpec.args;
+    const argList: string[] = Array.isArray(rawArgs)
+      ? rawArgs.filter((a: any) => a !== undefined && a !== null).map((a: any) => String(a))
+      : typeof rawArgs === 'string' || typeof rawArgs === 'number'
+        ? [String(rawArgs)]
+        : [];
+    if (argList.length === 0) {
+      console.warn(`${where}: missing required 'args' template (e.g. ["--model", "{value}"]); ignoring`);
+      continue;
+    }
+    if (!argList.some((a) => a.includes('{value}'))) {
+      // A template with no {value} placeholder would silently DROP the user's
+      // value and pass a constant instead — invisible at command time, wrong
+      // at every dispatch. Refuse the whole knob rather than half-honour it.
+      console.warn(`${where}: args template ${JSON.stringify(argList)} has no {value} placeholder; ignoring this tunable`);
+      continue;
+    }
+    const values = parseTunableValues(rawSpec.values, where);
+    const rawDefault = rawSpec.default;
+    const def = rawDefault === undefined || rawDefault === null || String(rawDefault).trim() === ''
+      ? undefined
+      : String(rawDefault).trim();
+    const desc = typeof rawSpec.description === 'string' && rawSpec.description.trim()
+      ? rawSpec.description.trim()
+      : undefined;
+
+    const supersedes = parseTunableSupersedes(rawSpec.supersedes, where, name);
+
+    if (out[name]) console.warn(`${where}: duplicate setting name; later declaration wins`);
+    out[name] = {
+      args: argList,
+      ...(def !== undefined ? { default: def } : {}),
+      ...(desc ? { description: desc } : {}),
+      ...(values !== undefined ? { values } : {}),
+      ...(supersedes !== undefined ? { supersedes } : {}),
+    };
+  }
+
+  // Cross-check `supersedes` targets only once every setting is known. A name
+  // that matches nothing is a no-op, so it is KEPT (the target may be added to
+  // this worker later) but warned about — silently swallowing a typo here would
+  // leave the user believing a conflict is being handled when it is not.
+  for (const [name, spec] of Object.entries(out)) {
+    for (const target of spec.supersedes ?? []) {
+      if (!out[target]) {
+        console.warn(
+          `[config] worker '${workerName}' tunable '${name}': supersedes unknown setting '${target}'; it has no effect`,
+        );
+      }
+    }
+  }
+
+  return Object.keys(out).length > 0 ? out : undefined;
+}
 
 export async function loadConfig(): Promise<PaConfig> {
   const path = configPath();
@@ -33,6 +208,7 @@ export async function loadConfig(): Promise<PaConfig> {
       input_mode: w.input_mode || 'arg',
       output_format: w.output_format,
       check_timeout: w.check_timeout || 30,
+      tunables: parseTunables(w.tunables, w.name),
     };
   });
 

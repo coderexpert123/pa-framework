@@ -53,7 +53,15 @@ export interface AuditRecord {
     | 'reverted-verification-failed'
     // self-improver.ts's rollback() extension (Commit 3) — a prior applied-code-fix commit
     // whose target skill is now failing at an elevated rate gets `git revert`-ed.
-    | 'rollback-failed';
+    | 'rollback-failed'
+    // HUMAN terminal decision (2026-07-22): a commit whose autonomous revert failed has been
+    // reviewed by a person who decided to KEEP it. This is the only action in this union NOT
+    // written by the loop — it is appended by a human (or by a human-directed session) and it
+    // closes out a 'rollback-failed' that the loop can no longer retry (checkForRollbacks()
+    // only looks back 7 days). Its effect is display-only: it suppresses that ONE commit from
+    // pa improvements' FAILED ROLLBACKS banner. It reverts nothing and changes no code.
+    // Requires commit_hash (which commit), accepted_at (ISO, when) and reason (why).
+    | 'rollback-accepted';
   risk_flags: string[];
   reason: string;
   validation?: AuditValidation;
@@ -65,6 +73,51 @@ export interface AuditRecord {
   files_changed?: string[];     // repo-relative paths touched by a code fix
   evidence_excerpt?: string;    // truncated failure evidence (readRecentFailures) that justified a code fix — ≤2000 chars
   test_run_counts?: AuditTestRunCounts; // F3 verification-gate suite results, when the fix passed far enough to run them
+  accepted_at?: string;         // ISO timestamp of the human acceptance decision (rollback-accepted only)
+  accepted_by?: string;         // who made it — 'human' by default, a name/handle when known (rollback-accepted only)
+}
+
+/**
+ * Normalizes a commit hash for comparison. Trim + lowercase only — deliberately NOT
+ * prefix-tolerant: a 7-char abbreviation and a 40-char full hash of the same commit will NOT
+ * match. That is the safe direction to fail, because the only consumer is suppression of a
+ * safety banner (see acceptedRollbackCommits) and a missed match means the banner still
+ * WARNS. A prefix match would be the direction that silences warnings by accident.
+ */
+function normalizeCommitKey(hash: string | undefined): string | undefined {
+  const trimmed = hash?.trim().toLowerCase();
+  return trimmed ? trimmed : undefined;
+}
+
+/**
+ * Indexes the human 'rollback-accepted' decisions by commit hash (latest per commit wins).
+ * Pure — takes the records, touches no disk — so the commit-scoping property is unit-testable
+ * without fixtures.
+ *
+ * COMMIT-SCOPED BY CONSTRUCTION: an acceptance without a commit_hash is ignored entirely
+ * rather than being treated as a blanket "accept everything". A future rollback-failed on a
+ * different commit must still raise pa improvements' banner at full volume — that is the
+ * safety property this whole mechanism has to preserve.
+ */
+export function acceptedRollbackCommits(records: AuditRecord[]): Map<string, AuditRecord> {
+  const accepted = new Map<string, AuditRecord>();
+  for (const r of records) {
+    if (r.action !== 'rollback-accepted') continue;
+    const key = normalizeCommitKey(r.commit_hash);
+    if (!key) continue; // no commit → accepts nothing (never a wildcard)
+    const prev = accepted.get(key);
+    if (!prev || new Date(r.ts).getTime() >= new Date(prev.ts).getTime()) accepted.set(key, r);
+  }
+  return accepted;
+}
+
+/** The acceptance record covering `commitHash`, or undefined when the commit has none. */
+export function findAcceptance(
+  accepted: Map<string, AuditRecord>,
+  commitHash: string | undefined,
+): AuditRecord | undefined {
+  const key = normalizeCommitKey(commitHash);
+  return key ? accepted.get(key) : undefined;
 }
 
 /**

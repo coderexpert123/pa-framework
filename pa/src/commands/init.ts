@@ -21,6 +21,24 @@ workers:
     priority: 1
     state_dir: "~/.claude/projects"
     state_pattern: "*.jsonl"
+    # tunables: user-settable knobs (the bot's /llm and /effort commands).
+    # "args" is an ARG TEMPLATE — "{value}" is substituted and the whole
+    # template is appended, but ONLY when the setting is actually set.
+    # Only declare flags the CLI actually has — a bogus flag fails EVERY
+    # dispatch to this worker and looks like an outage, not a settings error.
+    # Omit "default:" to leave the CLI's own default in charge (nothing passed).
+    # "values" is a display hint (or a canonical->native map), never an
+    # allowlist: any value the user types is passed through.
+    # "supersedes: [other]" declares that setting THIS knob must suppress
+    # another one's args, for a CLI that rejects the two together (see agy).
+    tunables:
+      model:
+        args: ["--model", "{value}"]
+        description: "Model name passed to the CLI (e.g. opusplan, opus, sonnet)."
+      effort:
+        args: ["--effort", "{value}"]
+        values: [low, medium, high, xhigh, max]
+        description: "Effort level for the session (Claude Code 2.x --effort)."
 
   - name: gemini
     command: gemini
@@ -38,6 +56,12 @@ workers:
     priority: 3
     state_dir: "~/.gemini/tmp/personal-assistant/chats"
     state_pattern: "*.jsonl"   # gemini-cli writes session-<ts>-<id>.jsonl here (verified 2026-07-22)
+    # gemini-cli has -m/--model and NO reasoning-effort flag, so no effort knob
+    # here — the bot uses that absence to explain why /effort is unavailable.
+    tunables:
+      model:
+        args: ["--model", "{value}"]
+        description: "Model name (e.g. gemini-2.5-pro)."
 
   - name: codex
     command: codex
@@ -54,6 +78,16 @@ workers:
     priority: 4
     state_dir: "~/.codex"
     state_pattern: "state_5.sqlite"
+    # codex has no --effort flag; reasoning effort is a -c config override —
+    # which is exactly why "args" is a template array and not flag+value.
+    tunables:
+      model:
+        args: ["--model", "{value}"]
+        description: "Model the agent should use."
+      effort:
+        args: ["-c", "model_reasoning_effort={value}"]
+        values: [minimal, low, medium, high]
+        description: "Reasoning effort, via codex's -c config override."
 
   - name: claude
     command: claude
@@ -71,6 +105,14 @@ workers:
     priority: 5
     state_dir: "~/.claude/projects"
     state_pattern: "*.jsonl"
+    tunables:
+      model:
+        args: ["--model", "{value}"]
+        description: "Model name passed to the CLI (e.g. opusplan, opus, sonnet)."
+      effort:
+        args: ["--effort", "{value}"]
+        values: [low, medium, high, xhigh, max]
+        description: "Effort level for the session (Claude Code 2.x --effort)."
 
   - name: agy
     command: agy
@@ -96,6 +138,23 @@ workers:
     # rather than guessing; agy stuck-detection therefore relies on the
     # process-tree heartbeat, not transcript inspection.
     state_pattern: "*.db"
+    # MODEL AND EFFORT ARE NOT INDEPENDENT ON agy (v1.1.5, verified live
+    # 2026-07-22): '--model gemini-3.6-flash' alone is REJECTED (the CLI demands
+    # an effort), '--model gemini-3.6-flash-high' is fine because the suffix IS
+    # the effort, and '--model claude-sonnet-4-6 --effort high' is rejected with
+    # "--effort is not supported". Every name 'agy models' prints is either
+    # effort-suffixed or an effort-rejecting Claude/GPT model, so sending the
+    # model ALONE is right for all of them - hence "supersedes: [effort]".
+    # Effort on its own is still valid and is still passed.
+    tunables:
+      model:
+        args: ["--model", "{value}"]
+        supersedes: [effort]
+        description: "Model for this CLI session; agy's reasoning effort is EMBEDDED in its gemini model names (-high/-medium/-low), and a base name with no suffix is rejected. Setting a model supersedes the effort knob. Run 'agy models' for the current list - from PowerShell/cmd, not Git Bash, where it hangs (verified 2026-07-22: 242s, rc=124, 0 bytes; NOT a TTY gate - it works with stdout redirected)."
+      effort:
+        args: ["--effort", "{value}"]
+        values: [low, medium, high]
+        description: "Reasoning effort when no model is set (agy's own default is low). Superseded once a model is set, because agy's model names carry the effort."
 
 bg_tasks:
   alert_seconds: 300

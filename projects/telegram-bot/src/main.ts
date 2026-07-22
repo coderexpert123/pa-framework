@@ -42,7 +42,25 @@ import {
   buildModelStatusSnapshot,
   hydrateModelStatus,
   modelStatusNeedsRefresh,
+  parseTunableCommand,
+  setSessionTunable,
+  setTopicTunable,
+  expireTunableOverrides,
+  renderTunableReport,
+  renderTunableSetResult,
+  renderTunableClearResult,
+  type TunableCommand,
 } from './logic.js';
+import {
+  resolveTunable,
+  resolveTunableArgs,
+  selectWorkerTunables,
+  mergeTunableArgs,
+  validateTunable,
+  isKnownValue,
+  extractTunableValues,
+} from '../../../pa/dist/src/lib/tunables.js';
+import { readObservedTunableValues } from '../../../pa/dist/src/lib/tunables-observed.js';
 import { getKeepAwakeStatus, toggleKeepAwake } from './keepawake.js';
 import {
   runWithFailover,
@@ -88,7 +106,7 @@ import { startProxyAutoRefresh } from '../../../pa/dist/src/lib/telegram-proxy.j
 import { cleanupOrphanedWorkers } from '../../../pa/dist/src/worker-pids.js';
 import { blackboard } from '../../../pa/dist/src/blackboard.js';
 import { loadConfig, saveTopicDefault } from '../../../pa/dist/src/config.js';
-import type { CommandResult, FailoverNotifyPayload } from '../../../pa/dist/src/types.js';
+import type { CommandResult, FailoverNotifyPayload, WorkerConfig } from '../../../pa/dist/src/types.js';
 import { logger } from '../../../pa/dist/src/lib/log.js';
 import { formatIST } from '../../../pa/dist/src/ist.js';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
@@ -122,6 +140,35 @@ function workerSupportsSystemPrompt(workerName: string): boolean {
 
 function effectiveCwd(state: ConversationState): string {
   return state.cwd_override || BOT_CWD;
+}
+
+/**
+ * extraArgs for one dispatch: the caller's own args (e.g. buildResumeArgs's
+ * `--resume <id>`) with this topic's resolved tunables APPENDED.
+ *
+ * The order is load-bearing in two independent ways, so do not flip it:
+ *   1. worker-exec.ts special-cases codex resume by checking `extraArgs[0] ===
+ *      'resume'` and splicing the block in before the trailing '-' stdin marker.
+ *      Prepending tunables would break that test, and the args would land AFTER
+ *      the '-' — a silently malformed codex command line.
+ *   2. Every CLI here is last-wins on a repeated flag, and worker.args already
+ *      pins `--model opusplan` for claude/zclaude. Appending is what lets an
+ *      explicitly set value beat the static default.
+ * Returns undefined (not []) when nothing is set, so a topic with no tunables
+ * produces a byte-identical command line to before this feature existed.
+ */
+export function buildDispatchExtraArgs(
+  state: ConversationState,
+  worker: WorkerConfig | undefined,
+  baseArgs?: string[],
+): string[] | undefined {
+  const tunableArgs = resolveTunableArgs(
+    worker,
+    selectWorkerTunables(state.tunable_overrides, worker?.name),
+    selectWorkerTunables(state.tunable_defaults, worker?.name),
+  );
+  const merged = mergeTunableArgs(baseArgs, tunableArgs);
+  return merged.length > 0 ? merged : undefined;
 }
 
 const MODEL_SWEEP_INTERVAL_MS = 60_000;
@@ -301,6 +348,10 @@ export async function runExpiredModelOverrideSweep(
       const topicKey = topicKeyFor(ref.chatId, ref.threadId);
       const effectiveDefault = getEffectiveDefaultWorker(config, topicKey);
       const expired = expirePreferredWorker(topicState);
+      // Same IST-day lifecycle, swept for the same reason: a topic nobody has
+      // messaged since yesterday must not still be running yesterday's knobs
+      // the moment it wakes up.
+      const expiredTunables = expireTunableOverrides(topicState);
 
       if (expired) {
         const snapshot = buildModelStatusSnapshot({
@@ -313,7 +364,7 @@ export async function runExpiredModelOverrideSweep(
       }
 
       const hydrated = hydrateModelStatus(topicState, effectiveDefault);
-      if (modelStatusNeedsRefresh(topicState.model_status, hydrated) || topicState.pinned_worker !== hydrated.current_worker) {
+      if (expiredTunables.length > 0 || modelStatusNeedsRefresh(topicState.model_status, hydrated) || topicState.pinned_worker !== hydrated.current_worker) {
         syncModelStatusState(topicState, hydrated);
         await saveTopicState(topicState);
       }
@@ -504,6 +555,89 @@ async function findNextAvailableWorker(
   return null;
 }
 
+/**
+ * Execute a parsed /llm, /effort or `/default <setting> <value>` command.
+ *
+ * Tunables are resolved against the worker THIS TOPIC WILL ACTUALLY DISPATCH TO
+ * (session override first, then the topic's default worker) — the same choice
+ * dispatchMessage makes — so `/effort high` right after `/model gemini` is
+ * rejected by gemini's own declaration rather than being silently stored against
+ * a worker that has no such flag.
+ *
+ * State is mutated in place; the caller's saveTopicState at the end of
+ * processMessage persists it. `observedReader` is injected for tests.
+ */
+export async function handleTunableCommand(
+  cmd: TunableCommand,
+  state: ConversationState,
+  config: { workers?: WorkerConfig[] } | undefined,
+  effectiveDefault: string,
+  observedReader: (worker: WorkerConfig | undefined, setting: string) => Promise<string[]> =
+    (worker, setting) => readObservedTunableValues(worker, setting),
+): Promise<string> {
+  const workerName = state.preferred_worker || effectiveDefault;
+  const workerConfig = (config?.workers ?? []).find((w) => w.name === workerName);
+
+  // STRICT ON THE KNOB. Rejecting here — not at dispatch — is deliberate: an
+  // undeclared flag would fail every subsequent run in this topic and read as an
+  // outage. validateTunable's error already names what this worker DOES support.
+  const validation = validateTunable(workerConfig, cmd.setting);
+  if (!validation.ok) return validation.error ?? `Unknown setting '${cmd.setting}'.`;
+
+  if (cmd.action === 'set') {
+    if (cmd.scope === 'session') setSessionTunable(state, workerName, cmd.setting, cmd.value);
+    else setTopicTunable(state, workerName, cmd.setting, cmd.value);
+  } else if (cmd.action === 'clear') {
+    if (cmd.scope === 'session') setSessionTunable(state, workerName, cmd.setting, undefined);
+    else setTopicTunable(state, workerName, cmd.setting, undefined);
+  }
+
+  const sessionSlice = selectWorkerTunables(state.tunable_overrides, workerName);
+  const topicSlice = selectWorkerTunables(state.tunable_defaults, workerName);
+  const resolved = resolveTunable(workerConfig, cmd.setting, sessionSlice, topicSlice);
+
+  if (cmd.action === 'set') {
+    // FREE ON THE VALUE — isKnownValue only decides whether to add a note.
+    return renderTunableSetResult({
+      worker: workerName,
+      setting: cmd.setting,
+      scope: cmd.scope,
+      value: cmd.value!,
+      known: isKnownValue(validation.spec, cmd.value!),
+      args: resolved?.args ?? [],
+      // Carries any `supersedes:` outcome, so a value that was stored but will
+      // NOT be sent (or one that just displaced a sibling) says so right here
+      // rather than only on a later bare /llm.
+      resolved,
+    });
+  }
+
+  if (cmd.action === 'clear') {
+    return renderTunableClearResult({
+      worker: workerName, setting: cmd.setting, scope: cmd.scope, resolved,
+      pinned: extractTunableValues(validation.spec, workerConfig?.args),
+    });
+  }
+
+  // Bare command: the discoverability reply. The observed-values read touches
+  // disk and is best-effort — a help message must never fail on it.
+  const observed = await observedReader(workerConfig, cmd.setting).catch(() => [] as string[]);
+  return renderTunableReport({
+    worker: workerName,
+    label: cmd.label,
+    setting: cmd.setting,
+    validation,
+    resolved,
+    observed,
+    sessionValue: sessionSlice[cmd.setting],
+    topicValue: topicSlice[cmd.setting],
+    // Same extractor the observed-values reader uses, pointed at the worker's
+    // STATIC args — that is how `--model opusplan` (pinned in config.yaml for
+    // claude/zclaude) shows up instead of being reported as "nothing passed".
+    pinned: extractTunableValues(validation.spec, workerConfig?.args),
+  });
+}
+
 export type ClassifyOutcome =
   | { outcome: 'rate-limit'; nextWorker: string | null }
   | { outcome: 'transient' }
@@ -582,7 +716,7 @@ export async function dispatchMessage(
       const worker = config.workers.find((w) => w.name === activeSession.worker);
       if (worker) {
         const prompt = await buildResumedPrompt(userText, replyContext, pendingDesc, topicNames, { omitStatic: workerSupportsSystemPrompt(activeSession.worker) });
-        const result = await executeWorker(worker, prompt, { cwd: effectiveCwd(state), env: secrets, extraArgs: buildResumeArgs(activeSession), resource, agentName: activeSession.worker, contextId });
+        const result = await executeWorker(worker, prompt, { cwd: effectiveCwd(state), env: secrets, extraArgs: buildDispatchExtraArgs(state, worker, buildResumeArgs(activeSession)), resource, agentName: activeSession.worker, contextId });
         if (result.success) {
           dispatchResult = { result, worker: activeSession.worker, session: activeSession };
         } else {
@@ -608,7 +742,7 @@ export async function dispatchMessage(
       if (preferredWorkerConfig) {
         const priorCtx = lastFailedSession ? { ...lastFailedSession, sessionPath: getPriorSessionPath(lastFailedSession.worker, lastFailedSession.sessionId, effectiveCwd(state)) } : undefined;
         const prompt = await buildPrompt(userText, state, topicNames, replyContext, pendingDesc, { omitStatic: workerSupportsSystemPrompt(preferredWorkerConfig.name), priorContext: priorCtx });
-        const prefResult = await executeWorker(preferredWorkerConfig, prompt, { cwd: effectiveCwd(state), env: secrets, resource, agentName: state.preferred_worker, contextId });
+        const prefResult = await executeWorker(preferredWorkerConfig, prompt, { cwd: effectiveCwd(state), env: secrets, extraArgs: buildDispatchExtraArgs(state, preferredWorkerConfig), resource, agentName: state.preferred_worker, contextId });
         if (prefResult.success) freshResult = { result: prefResult, worker: preferredWorkerConfig.name };
         else {
           const co = await tryClassifyAndNotify(state.preferred_worker, prefResult, prefResult.sessionId, preferredWorkerConfig, config, state, defaultWorker, onNotify);
@@ -624,7 +758,7 @@ export async function dispatchMessage(
       if (defaultWorkerConfig) {
         const priorCtxDef = lastFailedSession ? { ...lastFailedSession, sessionPath: getPriorSessionPath(lastFailedSession.worker, lastFailedSession.sessionId, effectiveCwd(state)) } : undefined;
         const prompt = await buildPrompt(userText, state, topicNames, replyContext, pendingDesc, { omitStatic: workerSupportsSystemPrompt(defaultWorkerConfig.name), priorContext: priorCtxDef });
-        const defResult = await executeWorker(defaultWorkerConfig, prompt, { cwd: effectiveCwd(state), env: secrets, resource, agentName: defaultWorker, contextId });
+        const defResult = await executeWorker(defaultWorkerConfig, prompt, { cwd: effectiveCwd(state), env: secrets, extraArgs: buildDispatchExtraArgs(state, defaultWorkerConfig), resource, agentName: defaultWorker, contextId });
         if (defResult.success) freshResult = { result: defResult, worker: defaultWorkerConfig.name };
         else {
           const co = await tryClassifyAndNotify(defaultWorker, defResult, defResult.sessionId, defaultWorkerConfig, config, state, defaultWorker, onNotify);
@@ -752,6 +886,13 @@ async function processUpdate(
     let skipWorker = false;
     let archivedUserText = userText;
     const workerExpired = expirePreferredWorker(topicState);
+    // Session-tier tunables share preferred_worker's IST-day lifecycle, but are
+    // expired per entry (see expireTunableOverrides). No status-card change:
+    // they are not part of the pinned model snapshot.
+    const expiredTunables = expireTunableOverrides(topicState);
+    if (expiredTunables.length > 0) {
+      logger.info('tunables', `expired ${expiredTunables.length} session override(s) at the IST day boundary`, { topic: topicKey, cleared: expiredTunables });
+    }
     if (AUTH_PATTERN.test(userText)) {
       const match = AUTH_PATTERN.exec(userText);
       const code = match![1];
@@ -848,6 +989,18 @@ async function processUpdate(
         topicState.session = undefined;
         const nextSnapshot = buildModelStatusSnapshot({ currentWorker: effectiveDefault, defaultWorker: effectiveDefault, reasonCode: 'default_changed' });
         await replacePinnedStatusCard(token, chatId, threadId, topicState, nextSnapshot);
+        skipWorker = true;
+      }
+    }
+
+    // Uniform LLM knobs: /llm and /effort (session tier), plus the /default
+    // <setting> <value> extension (topic tier). Checked AFTER handleDefaultQuery
+    // so `/default <worker>` keeps its existing meaning — parseTunableCommand
+    // also refuses the worker form itself, so the two can never both fire.
+    if (!skipWorker) {
+      const tunableCmd = parseTunableCommand(userText);
+      if (tunableCmd) {
+        response = await handleTunableCommand(tunableCmd, topicState, config, effectiveDefault);
         skipWorker = true;
       }
     }

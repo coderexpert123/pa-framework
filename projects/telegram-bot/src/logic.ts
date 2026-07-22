@@ -6,6 +6,14 @@ import type {
 } from './types.js';
 import { toIST, todayIST, formatIST } from '../../../pa/dist/src/ist.js';
 import { getSkillTranslationPatterns } from '../../../pa/dist/src/lib/skill-translations.js';
+import {
+  TUNABLE_TIER_LABELS,
+  declaredValues,
+  normalizeTunableName,
+  setWorkerTunable,
+  type ResolvedTunable,
+  type TunableValidation,
+} from '../../../pa/dist/src/lib/tunables.js';
 import { BOT_COMMANDS } from './commands.js';
 
 export interface WorkerResult {
@@ -25,6 +33,19 @@ export const KEEP_AWAKE_PATTERN = /^\/keepawake(?:@\w+)?$/i;
 export const SKILLS_PATTERN = /^\/skills(?:@\w+)?$/i;
 export const AUTH_PATTERN = /^\/auth(?:@\w+)?\s+(\S+)(?:\s+(\S+))?$/i;
 export const HELP_PATTERN = /^\/help(?:@\w+)?$/i;
+
+// --- Worker tunables: /llm, /effort, /default <setting> [value] -------------
+// `/model` deliberately stays what it has always been (pick the CLI). These are
+// the uniform knobs that work the same way whichever CLI is active; the
+// per-worker differences (flag name, arg shape, vocabulary) live in config.yaml
+// and are resolved by pa/src/lib/tunables.ts.
+export const LLM_PATTERN = /^\/llm(?:@\w+)?(?:\s+([\s\S]+))?$/i;
+export const EFFORT_PATTERN = /^\/effort(?:@\w+)?(?:\s+([\s\S]+))?$/i;
+// Extends the EXISTING /default surface rather than inventing a parallel idiom.
+// Only reachable for a non-worker first token: DEFAULT_SWITCH_PATTERN (anchored
+// to the worker names) is checked first and wins, so `/default agy` still means
+// "make agy this topic's default worker".
+export const DEFAULT_TUNABLE_PATTERN = /^\/default(?:@\w+)?\s+([A-Za-z][A-Za-z0-9_-]*)(?:\s+([\s\S]+))?$/i;
 
 export interface StatusCardArgs {
   snapshot: ModelStatusSnapshot;
@@ -259,6 +280,10 @@ export function clearTopicContext(state: ConversationState): void {
   state.pending_action = undefined;
   state.pendingDescription = undefined;
   state.turns = [];
+  // Session-tier tunables (/llm, /effort) die with the conversation they were
+  // set for. Topic-tier defaults (`/default <setting> <value>`) survive both
+  // /reset and /new — see clearSessionTunables for the reasoning.
+  clearSessionTunables(state);
 }
 
 export function handleResetCommand(state: ConversationState): { matched: boolean; response: string } {
@@ -444,6 +469,326 @@ export function expirePreferredWorker(state: ConversationState): boolean {
     return true;
   }
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// Worker tunables — /llm, /effort, and the /default <setting> extension
+//
+// ONE bot-level command per knob, whichever CLI is active. The bot word maps to
+// a config SETTING NAME (`/llm` -> `model`), and the worker's own `tunables:`
+// block in config.yaml supplies the arg template. Two rules drive everything
+// here:
+//   STRICT ON THE KNOB — an unknown setting, or one this worker does not
+//   declare, is rejected at command time with the list of what it DOES support.
+//   Validating at dispatch time instead would put a flag the CLI rejects on
+//   EVERY run in the topic, which reads as an outage, not a settings mistake.
+//   FREE ON THE VALUE — a value is never rejected. Model names move faster than
+//   any allowlist (agy went "Gemini 3.5 Flash" -> "3.6 Flash" in an afternoon),
+//   so `values:` is a display hint; an unrecognised value is passed through with
+//   a note. Do not turn declaredValues() into a gate.
+// ---------------------------------------------------------------------------
+
+/**
+ * Bot command word -> config setting name.
+ *
+ * `/llm` is the uniform user-facing word; `model` is what the CLIs call the
+ * knob (and therefore what config.yaml declares). `/model` is NOT in this map —
+ * it keeps its existing meaning of choosing the CLI.
+ */
+export const TUNABLE_COMMAND_SETTINGS: Record<string, string> = {
+  llm: 'model',
+  effort: 'effort',
+};
+
+/** Words that mean "unset this tier and fall through to the next one". */
+export const TUNABLE_CLEAR_TOKENS = new Set(['clear', 'reset', 'default', 'unset', '-']);
+
+export type TunableScope = 'session' | 'topic';
+export type TunableAction = 'show' | 'set' | 'clear';
+
+export interface TunableCommand {
+  scope: TunableScope;   // session = /llm|/effort (expires at IST midnight); topic = /default (persistent)
+  setting: string;       // normalized CONFIG setting name, e.g. 'model'
+  label: string;         // the word the user typed, echoed back in help text ('llm', 'effort', …)
+  action: TunableAction;
+  value?: string;        // present for action === 'set'
+}
+
+/**
+ * Parse /llm, /effort and `/default <setting> [value]` into one shape.
+ *
+ * Deliberately order-independent: `/default <worker>` is excluded here (not just
+ * by call order in main.ts) so this function can never hijack the worker form.
+ * Returns undefined when the text is not a tunable command at all.
+ */
+export function parseTunableCommand(userText: string): TunableCommand | undefined {
+  const text = userText.trim();
+
+  const build = (scope: TunableScope, label: string, setting: string, rawValue: string | undefined): TunableCommand => {
+    const value = rawValue?.trim();
+    if (!value) return { scope, label, setting, action: 'show' };
+    if (TUNABLE_CLEAR_TOKENS.has(value.toLowerCase())) return { scope, label, setting, action: 'clear' };
+    return { scope, label, setting, action: 'set', value };
+  };
+
+  const llm = LLM_PATTERN.exec(text);
+  if (llm) return build('session', 'llm', TUNABLE_COMMAND_SETTINGS['llm']!, llm[1]);
+
+  const effort = EFFORT_PATTERN.exec(text);
+  if (effort) return build('session', 'effort', TUNABLE_COMMAND_SETTINGS['effort']!, effort[1]);
+
+  if (DEFAULT_SWITCH_PATTERN.test(text)) return undefined;   // `/default agy` — the worker form owns this
+  const def = DEFAULT_TUNABLE_PATTERN.exec(text);
+  if (def) {
+    const label = def[1].toLowerCase();
+    const setting = TUNABLE_COMMAND_SETTINGS[label] ?? normalizeTunableName(label);
+    return build('topic', label, setting, def[2]);
+  }
+
+  return undefined;
+}
+
+/** Stamp key for one session override. Worker names never contain ':'. */
+export function tunableStampKey(worker: string, setting: string): string {
+  return `${worker}:${normalizeTunableName(setting)}`;
+}
+
+/**
+ * Set (or clear, with value undefined/blank) a SESSION-tier tunable and stamp it
+ * with the time it was set, so it can expire on its own IST day boundary.
+ */
+export function setSessionTunable(
+  state: ConversationState,
+  worker: string,
+  setting: string,
+  value: string | undefined,
+  nowIso: string = new Date().toISOString(),
+): void {
+  const name = normalizeTunableName(setting);
+  const next = setWorkerTunable(state.tunable_overrides, worker, name, value);
+  state.tunable_overrides = Object.keys(next).length > 0 ? next : undefined;
+
+  const stamps = { ...(state.tunable_overrides_set_at ?? {}) };
+  const key = tunableStampKey(worker, name);
+  if (value && value.trim()) stamps[key] = nowIso;
+  else delete stamps[key];
+  state.tunable_overrides_set_at = Object.keys(stamps).length > 0 ? stamps : undefined;
+}
+
+/** Set (or clear) a TOPIC-tier tunable. Persistent — no stamp, never expires. */
+export function setTopicTunable(
+  state: ConversationState,
+  worker: string,
+  setting: string,
+  value: string | undefined,
+): void {
+  const next = setWorkerTunable(state.tunable_defaults, worker, normalizeTunableName(setting), value);
+  state.tunable_defaults = Object.keys(next).length > 0 ? next : undefined;
+}
+
+/**
+ * Expire session-tier tunables set on a previous IST calendar day — the same
+ * lifecycle as preferred_worker, but evaluated PER ENTRY so that setting one
+ * knob today cannot extend the life of another set yesterday.
+ *
+ * An entry with a missing or unparseable stamp is expired rather than kept: a
+ * temporary override whose provenance cannot be proven is exactly the thing this
+ * tier exists to bound, and every writer (setSessionTunable) always stamps.
+ * Returns the `<worker>:<setting>` keys that were cleared, for logging.
+ */
+export function expireTunableOverrides(state: ConversationState): string[] {
+  const store = state.tunable_overrides;
+  if (!store || Object.keys(store).length === 0) {
+    if (state.tunable_overrides_set_at) state.tunable_overrides_set_at = undefined;  // orphaned stamps
+    return [];
+  }
+
+  const today = todayIST();
+  const stamps = state.tunable_overrides_set_at ?? {};
+  const stale: Array<{ worker: string; setting: string; key: string }> = [];
+
+  for (const [worker, slice] of Object.entries(store)) {
+    for (const setting of Object.keys(slice ?? {})) {
+      const key = tunableStampKey(worker, setting);
+      const setAt = stamps[key];
+      let day: string | undefined;
+      if (setAt) {
+        const parsed = new Date(setAt);
+        if (!Number.isNaN(parsed.getTime())) day = toIST(parsed).toISOString().slice(0, 10);
+      }
+      if (day !== today) stale.push({ worker, setting, key });
+    }
+  }
+
+  for (const entry of stale) setSessionTunable(state, entry.worker, entry.setting, undefined);
+  return stale.map((entry) => entry.key);
+}
+
+/**
+ * Drop every session-tier tunable. Called from clearTopicContext, i.e. by both
+ * /reset and /new: a session override belongs to the conversation being thrown
+ * away. Topic defaults are deliberately NOT touched — they are this topic's
+ * persistent configuration, the exact analogue of `/default <worker>`, which
+ * already survives /reset (it lives in config.yaml and is never cleared here).
+ */
+export function clearSessionTunables(state: ConversationState): boolean {
+  const had = !!state.tunable_overrides && Object.keys(state.tunable_overrides).length > 0;
+  state.tunable_overrides = undefined;
+  state.tunable_overrides_set_at = undefined;
+  return had;
+}
+
+function formatTunableValue(resolved: ResolvedTunable | undefined): string {
+  return resolved?.value ?? '(none — the CLI picks)';
+}
+
+/**
+ * Explain a `supersedes:` resolution instead of applying it silently.
+ *
+ * A setting can be SET and still contribute nothing, when the worker's config
+ * declares another setting supersedes it (agy: the effort is baked into the
+ * model name, and its Claude-family models reject --effort outright). Dropping
+ * the user's value with no word said is the same class of bug as the one the
+ * rule fixes — invisible behaviour that only shows up as "why did nothing
+ * change?". Both directions are rendered, so whichever knob the user asks about
+ * tells the same story. The WHY is deliberately not spelled out here: it is
+ * per-worker CLI knowledge and lives in that setting's config description,
+ * which renderTunableReport already prints.
+ */
+function supersedeNotes(resolved: ResolvedTunable | undefined): string[] {
+  if (!resolved) return [];
+  const notes: string[] = [];
+  if (resolved.supersededBy) {
+    const winner = resolved.supersededByValue
+      ? `\`${resolved.supersededBy}\` (${resolved.supersededByValue})`
+      : `\`${resolved.supersededBy}\``;
+    notes.push(
+      `⚠️ Set, but NOT passed to the CLI: ${winner} supersedes \`${resolved.setting}\` on this worker (config.yaml). ` +
+      `Clear the ${resolved.supersededBy} to use it again.`,
+    );
+  }
+  for (const loser of resolved.superseding ?? []) {
+    notes.push(`Note: \`${loser}\` is set but NOT passed while \`${resolved.setting}\` is — it supersedes it here.`);
+  }
+  return notes;
+}
+
+export interface TunableReportInput {
+  worker: string;
+  label: string;                    // command word to echo in the "set with" hints
+  setting: string;                  // config setting name
+  validation: TunableValidation;    // from validateTunable — carries the rejection text
+  resolved?: ResolvedTunable;       // from resolveTunable; undefined when unsupported
+  observed?: string[];              // values mined from run history (tunables-observed.ts)
+  sessionValue?: string;            // what the session tier currently holds, if anything
+  topicValue?: string;              // what the topic tier currently holds, if anything
+  pinned?: string[];                // value(s) already baked into the worker's STATIC args in config.yaml
+}
+
+/**
+ * The discoverability surface: the reply to a bare /llm or /effort.
+ *
+ * Answers three questions in one message — what is in effect, WHICH TIER put it
+ * there, and what this worker accepts (declared hints plus values actually seen
+ * in past runs, kept visibly separate because the declared list is hand-written
+ * and the observed list is not).
+ */
+export function renderTunableReport(input: TunableReportInput): string {
+  if (!input.validation.ok) {
+    return input.validation.error ?? `Worker '${input.worker}' has no setting called '${input.setting}'.`;
+  }
+
+  const spec = input.resolved?.spec;
+  const tier = input.resolved?.tier ?? 'cli';
+  // A value can also be PINNED in the worker's static args (claude/zclaude ship
+  // `--model opusplan`). Reporting "nothing is passed" there would be a lie in
+  // the one place the user came to get a straight answer, so surface it — it is
+  // still tier 'cli' as far as the cascade is concerned, because nothing the
+  // cascade owns is set.
+  const pinned = (input.pinned ?? []).filter(Boolean);
+  const pinnedApplies = tier === 'cli' && pinned.length > 0;
+  const lines: string[] = [
+    `*${input.setting}* on ${input.worker}`,
+    `Current: ${pinnedApplies ? pinned[0] : formatTunableValue(input.resolved)}`,
+    `Set by: ${pinnedApplies ? "this worker's fixed args in config.yaml" : TUNABLE_TIER_LABELS[tier]}`,
+  ];
+
+  // Before anything else: if what is "current" is not actually reaching the CLI,
+  // say so — that is the one thing the user came here to find out.
+  lines.push(...supersedeNotes(input.resolved));
+
+  // Deliberately NOT wrapped in _italics_: the description is free text from
+  // config.yaml and may contain underscores (`model_reasoning_effort=`). Inside
+  // an italic span an odd number of them unbalances the whole message and
+  // Telegram rejects it with a 400; as plain text the MarkdownV2 sanitizer just
+  // escapes the stray one.
+  if (spec?.description) lines.push(spec.description);
+
+  const declared = declaredValues(spec);
+  lines.push(declared.length > 0
+    ? `Known values: ${declared.join(', ')}`
+    : 'Known values: none declared — any value is accepted.');
+
+  const observed = (input.observed ?? []).filter(
+    (v) => v && !declared.some((d) => d.toLowerCase() === v.toLowerCase()),
+  );
+  if (observed.length > 0) lines.push(`Seen in past runs: ${observed.join(', ')}`);
+
+  const tiers: string[] = [];
+  if (input.sessionValue) tiers.push(`session: ${input.sessionValue}`);
+  if (input.topicValue) tiers.push(`topic default: ${input.topicValue}`);
+  if (spec?.default) tiers.push(`worker default: ${spec.default}`);
+  if (tiers.length > 0) lines.push(`Tiers: ${tiers.join(' · ')}`);
+
+  lines.push(
+    `Set: /${input.label} <value> · Clear: /${input.label} clear · Persist: /default ${input.label} <value>`,
+  );
+  return lines.join('\n');
+}
+
+export interface TunableSetResultInput {
+  worker: string;
+  setting: string;
+  scope: TunableScope;
+  value: string;
+  known: boolean;             // isKnownValue(spec, value) — a NOTE, never a rejection
+  args: string[];             // exactly what will be appended to the worker command
+  resolved?: ResolvedTunable; // resolution AFTER the set — carries any supersede outcome
+}
+
+export function renderTunableSetResult(input: TunableSetResultInput): string {
+  const lifetime = input.scope === 'session'
+    ? 'until midnight IST'
+    : 'topic default — persists';
+  const lines = [`${input.setting} → *${input.value}* on ${input.worker} (${lifetime}).`];
+  if (!input.known) {
+    lines.push(`⚠️ Not a known value for ${input.worker} — passing through anyway.`);
+  }
+  // Accepting the value and then quietly not sending it (or quietly dropping a
+  // sibling setting the user set earlier) would make this reply a lie.
+  lines.push(...supersedeNotes(input.resolved));
+  if (input.args.length > 0) lines.push(`Args: \`${input.args.join(' ')}\``);
+  return lines.join('\n');
+}
+
+export interface TunableClearResultInput {
+  worker: string;
+  setting: string;
+  scope: TunableScope;
+  resolved?: ResolvedTunable;   // resolution AFTER the clear — what it falls back to
+  pinned?: string[];            // value baked into the worker's static args, if any
+}
+
+export function renderTunableClearResult(input: TunableClearResultInput): string {
+  const tier = input.resolved?.tier ?? 'cli';
+  const scopeLabel = input.scope === 'session' ? 'session override' : 'topic default';
+  const pinned = (input.pinned ?? []).filter(Boolean);
+  // Same honesty rule as the report: falling back to "nothing" still means
+  // `--model opusplan` on a worker that pins one in config.yaml.
+  const now = tier === 'cli' && pinned.length > 0
+    ? `${pinned[0]} (this worker's fixed args in config.yaml)`
+    : `${formatTunableValue(input.resolved)} (${TUNABLE_TIER_LABELS[tier]})`;
+  return `Cleared ${scopeLabel} for ${input.setting} on ${input.worker}.\nNow: ${now}.`;
 }
 
 /**

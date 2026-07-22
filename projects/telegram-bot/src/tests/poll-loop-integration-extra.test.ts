@@ -331,6 +331,103 @@ topic_defaults:
   });
 
 
+  // --- Worker tunables wired through the real poll loop ---------------------
+  // The cascade/parse/render layers are unit-tested in tunables-commands.test.ts;
+  // what these two prove is the PROCESSMESSAGE WIRING: that /effort is
+  // intercepted as a local command (no worker dispatch) and that its result is
+  // persisted to topic state.
+
+  async function runOneUpdate(text: string, fetchLog: string[]): Promise<void> {
+    const controller = new AbortController();
+    const state = makeState(123, -1);
+    let getUpdatesCount = 0;
+
+    (globalThis as Record<string, unknown>).fetch = async (url: string, opts?: any) => {
+      fetchLog.push(url + (opts?.body ? ' ' + opts.body : ''));
+      if (url.includes('getUpdates')) {
+        getUpdatesCount++;
+        if (getUpdatesCount === 1) {
+          const payload = { ok: true, result: [{
+            update_id: 1,
+            message: { message_id: 10, chat: { id: 123, type: 'private' }, date: Math.floor(Date.now() / 1000), text },
+          }] };
+          return { ok: true, status: 200, text: async () => JSON.stringify(payload), json: async () => payload };
+        }
+        controller.abort();
+        return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: [] }), json: async () => ({ ok: true, result: [] }) };
+      }
+      if (url.includes('sendMessage')) {
+        return {
+          ok: true, status: 200,
+          text: async () => JSON.stringify({ ok: true, result: { message_id: 200 } }),
+          json: async () => ({ ok: true, result: { message_id: 200 } }),
+        };
+      }
+      return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: true }), json: async () => ({ ok: true, result: true }) };
+    };
+
+    await runPollLoop('token', [123], state, {}, controller.signal, fastSleep);
+  }
+
+  it('/effort <value> is handled locally and persisted as a session override', async () => {
+    // A worker that would FAIL if it were ever dispatched — proving the command
+    // never reaches a worker.
+    await writeFile(join(tempDir, 'config.yaml'), `
+workers:
+  - name: agy
+    command: node
+    args: ["-e", "process.exit(3)"]
+    check: node -e "process.exit(0)"
+    tunables:
+      effort:
+        args: ["--effort", "{value}"]
+        values: [low, medium, high]
+topic_defaults:
+  "123_0": "agy"
+`, 'utf8');
+
+    const topicStateFile = join(tempDir, 'telegram-bot-topic-123_0.json');
+    await writeFile(topicStateFile, JSON.stringify({ chat_id: 123, thread_id: 0, turns: [] }), 'utf8');
+
+    const fetchLog: string[] = [];
+    await runOneUpdate('/effort high', fetchLog);
+
+    const sent = fetchLog.filter((u) => u.includes('sendMessage'));
+    assert.ok(sent.some((c) => c.includes('--effort') && c.includes('high')), 'reply should confirm the value and the args it produces');
+
+    const saved = JSON.parse(await readFile(topicStateFile, 'utf8')) as ConversationState;
+    assert.equal(saved.tunable_overrides?.['agy']?.['effort'], 'high');
+    assert.ok(saved.tunable_overrides_set_at?.['agy:effort'], 'the set-at stamp drives IST-day expiry');
+    assert.equal(saved.tunable_defaults, undefined, 'session tier only — /default writes the topic tier');
+  });
+
+  it('/effort on a worker that declares no effort is rejected with what it DOES support', async () => {
+    await writeFile(join(tempDir, 'config.yaml'), `
+workers:
+  - name: gemini
+    command: node
+    args: ["-e", "process.exit(3)"]
+    check: node -e "process.exit(0)"
+    tunables:
+      model:
+        args: ["--model", "{value}"]
+topic_defaults:
+  "123_0": "gemini"
+`, 'utf8');
+
+    const topicStateFile = join(tempDir, 'telegram-bot-topic-123_0.json');
+    await writeFile(topicStateFile, JSON.stringify({ chat_id: 123, thread_id: 0, turns: [] }), 'utf8');
+
+    const fetchLog: string[] = [];
+    await runOneUpdate('/effort high', fetchLog);
+
+    const sent = fetchLog.filter((u) => u.includes('sendMessage'));
+    assert.ok(sent.some((c) => c.includes('no setting called') && c.includes('model')), 'reply should name what gemini supports');
+
+    const saved = JSON.parse(await readFile(topicStateFile, 'utf8')) as ConversationState;
+    assert.equal(saved.tunable_overrides, undefined, 'a rejected knob stores nothing');
+  });
+
   it('idle steady-state sweep updates hydrated status', async () => {
     // This test checks if the idle sweep (run via a timer in real bot, but we'll mock the time)
     // correctly hydrates status and syncs it.

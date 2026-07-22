@@ -1,3 +1,5 @@
+import type { TunableStore } from '../../../pa/dist/src/lib/tunables.js';
+
 export interface TelegramUser {
   id: number;
   first_name: string;
@@ -80,6 +82,16 @@ export interface ConversationState {
   preferred_worker?: string;      // 'claude' | 'gemini' | 'zclaude' — overrides config priority order
   preferred_worker_set_at?: string; // ISO timestamp when preferred_worker was set — cleared at IST midnight
   cwd_override?: string;          // absolute path — overrides BOT_CWD for all worker dispatches in this topic
+  // --- Worker tunables (/llm, /effort) -------------------------------------
+  // Both stores are WORKER-SCOPED (worker -> setting -> value). Keying by worker
+  // is what makes `/model gemini` unable to inherit agy's effort setting: only
+  // the settings the CURRENT worker declares are ever resolved, and a stale
+  // slice for another worker just sits there inert. See pa/src/lib/tunables.ts.
+  tunable_overrides?: TunableStore;              // SESSION tier — set by /llm and /effort, expires at the IST day boundary
+  tunable_overrides_set_at?: Record<string, string>; // ISO stamp per `<worker>:<setting>` — drives PER-ENTRY expiry (a value set
+                                                 // yesterday must not be kept alive by an unrelated one set today, which a
+                                                 // single shared timestamp — the preferred_worker shape — would do)
+  tunable_defaults?: TunableStore;               // TOPIC tier — set by `/default <setting> <value>`, persistent (never expires)
   model_status?: ModelStatusSnapshot; // canonical snapshot for the topic status card
   pinned_worker?: string;         // legacy mirror of model_status.current_worker for backward compatibility
   pinned_status_message_id?: number; // message_id of the pinned status card (model + keep-awake) — unpinned when context is cleared

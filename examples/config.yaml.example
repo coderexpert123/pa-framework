@@ -32,6 +32,45 @@ workers:
     priority: 1
     state_dir: "~/.claude/projects"   # for session-mode rate-limit detection
     state_pattern: "*.jsonl"
+    # ---- tunables (optional) ----
+    # User-settable knobs this worker's CLI exposes. The bot surfaces them as
+    # ONE uniform command per knob (/llm <name>, /effort <value>) regardless of
+    # which CLI is active; everything CLI-specific lives here.
+    #
+    #   args:        REQUIRED. An ARG TEMPLATE, not a flag+value pair — every
+    #                "{value}" is substituted and the whole template is appended
+    #                to this worker's args, but ONLY when the setting is set.
+    #                A template array is what lets a CLI express the same knob
+    #                as a config override: ["-c", "model_reasoning_effort={value}"].
+    #   default:     optional worker-level default. OMIT to pass nothing at all
+    #                and leave the CLI's own default in charge.
+    #   values:      optional DISPLAY HINT — a list, or a canonical->native map
+    #                ({low: "1", high: "3"}) when the CLI's vocabulary differs
+    #                from the bot-level word. NEVER an allowlist: a value that is
+    #                not listed is still passed through (model names change far
+    #                faster than this file). Declare it only where the CLI itself
+    #                documents a closed vocabulary.
+    #   description: optional help text, shown by the bot and the dashboard.
+    #   supersedes:  optional list of OTHER setting names this one suppresses.
+    #                When this setting has a value, each named setting emits no
+    #                args, even if the user set it. For the CLIs that reject a
+    #                combination outright (see agy below), emitting both would
+    #                fail EVERY dispatch to the worker. The suppressed setting
+    #                keeps its value and the bot reports that it was superseded,
+    #                so clearing this one brings it straight back.
+    #
+    # ONLY DECLARE FLAGS THE CLI ACTUALLY HAS. A flag a CLI does not accept
+    # fails EVERY dispatch to that worker and reads as an outage, not a config
+    # error — verify against the CLI's own --help. Under-declaring is safe: a
+    # worker with no tunables block simply has no settable knobs.
+    tunables:
+      model:
+        args: ["--model", "{value}"]
+        description: "Model name passed to the CLI (e.g. opusplan, opus, sonnet)."
+      effort:
+        args: ["--effort", "{value}"]
+        values: [low, medium, high, xhigh, max]
+        description: "Effort level for the session (Claude Code 2.x --effort)."
 
   # ---- gemini (priority 3 — fallback below agy) ----
   - name: gemini
@@ -56,6 +95,12 @@ workers:
     priority: 3
     state_dir: "~/.gemini/tmp/personal-assistant/chats"  # must match GEMINI_PROJECT_DIR
     state_pattern: "*.jsonl"   # gemini-cli writes session-<ts>-<id>.jsonl (verified 2026-07-22)
+    # gemini-cli has -m/--model and NO reasoning-effort flag, so no effort knob
+    # here — the bot uses that absence to explain why /effort is unavailable.
+    tunables:
+      model:
+        args: ["--model", "{value}"]
+        description: "Model name (e.g. gemini-2.5-pro)."
 
   # ---- codex (priority 4) ----
   - name: codex
@@ -82,6 +127,16 @@ workers:
     priority: 4
     state_dir: "~/.codex"
     state_pattern: "state_5.sqlite"   # SQLite; same caveat as agy — heartbeat, not transcript, drives stuck-detection
+    # codex has no --effort flag; reasoning effort is a -c config override —
+    # which is exactly why "args" is a template array and not flag+value.
+    tunables:
+      model:
+        args: ["--model", "{value}"]
+        description: "Model the agent should use."
+      effort:
+        args: ["-c", "model_reasoning_effort={value}"]
+        values: [minimal, low, medium, high]
+        description: "Reasoning effort, via codex's -c config override."
 
   # ---- claude (priority 5 — last resort) ----
   - name: claude
@@ -109,6 +164,14 @@ workers:
     priority: 5
     state_dir: "~/.claude/projects"
     state_pattern: "*.jsonl"
+    tunables:
+      model:
+        args: ["--model", "{value}"]
+        description: "Model name passed to the CLI (e.g. opusplan, opus, sonnet)."
+      effort:
+        args: ["--effort", "{value}"]
+        values: [low, medium, high, xhigh, max]
+        description: "Effort level for the session (Claude Code 2.x --effort)."
 
   # ---- agy (priority 2 — Antigravity CLI) ----
   # Plain-text worker: it has no --output-format flag, so pa never sees
@@ -152,6 +215,31 @@ workers:
     # SQLite — it reports "unknown" instead of guessing, so agy stuck-detection
     # relies on the process-tree heartbeat rather than transcript inspection.
     state_pattern: "*.db"
+    # THE `supersedes:` CASE. On agy (v1.1.5, every line below is a real
+    # invocation from 2026-07-22) model and effort are NOT independent knobs:
+    #   --model gemini-3.6-flash                  -> ERROR: invalid model selection ... --effort ""
+    #   --model gemini-3.6-flash --effort high    -> OK
+    #   --model gemini-3.6-flash-high             -> OK   (the suffix IS the effort)
+    #   --model claude-sonnet-4-6 --effort high   -> ERROR: --effort is not supported
+    #   --effort high  (no model)                 -> OK
+    # `agy models` lists no bare gemini names — every gemini entry carries an
+    # effort suffix, and the Claude/GPT entries reject --effort. So the model
+    # alone is correct for every name agy offers, and "both" is wrong for half
+    # of them. Without the rule below, a user who set both would break EVERY
+    # dispatch in their topic and see it as a worker outage.
+    tunables:
+      model:
+        args: ["--model", "{value}"]
+        supersedes: [effort]
+        # Declared here (unusually for a model knob) precisely because the
+        # effort suffix makes the vocabulary worth showing. Still a hint: an
+        # unlisted id passes through, so a model that ships tomorrow works.
+        values: ["gemini-3.6-flash-high", "gemini-3.6-flash-low", "claude-sonnet-4-6", "gpt-oss-120b-medium"]
+        description: "Model for this CLI session (run `agy models` for the current list — from PowerShell/cmd, not Git Bash, where it hangs). Effort is embedded in the gemini names; a base name with no -high/-medium/-low suffix is rejected."
+      effort:
+        args: ["--effort", "{value}"]
+        values: [low, medium, high]
+        description: "Reasoning effort when no model is set (agy's own default is low). Superseded once a model is set."
 
 # ---- evaluator (optional) ----
 # When a worker appears stuck (no output for idle_timeout seconds), the

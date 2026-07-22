@@ -7,8 +7,13 @@ export interface BotCommand {
 
 export const BOT_COMMANDS: BotCommand[] = [
   // Local Commands (skipWorker = true)
-  { command: 'model', description: 'Switch AI model (claude, gemini, zclaude, codex)' },
-  { command: 'default', description: 'Show or set default worker for this topic' },
+  // NOTE: /model picks the CLI. /llm picks the model that CLI runs. Keep the
+  // worker list here in sync with MODEL_SWITCH_PATTERN in logic.ts — it read
+  // "(claude, gemini, zclaude, codex)" for weeks after agy became the default.
+  { command: 'model', description: 'Switch CLI for this topic (agy, zclaude, gemini, codex, claude)' },
+  { command: 'llm', description: 'Show or set the model the current CLI runs (/llm <name>, /llm clear)' },
+  { command: 'effort', description: 'Show or set reasoning effort for the current CLI (/effort <value>, /effort clear)' },
+  { command: 'default', description: 'Topic defaults: /default <worker>, /default llm <name>, /default effort <value>' },
   { command: 'code', description: 'Set, show, or reset working directory' },
   { command: 'reset', description: 'Clear conversation and session for this topic' },
   { command: 'new', description: 'Clear context and start a fresh session (optionally seed from replied message)' },
