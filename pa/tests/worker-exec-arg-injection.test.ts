@@ -93,8 +93,14 @@ describe('worker-exec argument injection (quoteArg security)', () => {
     const received = await readFile(resultFile, 'utf8').catch(() => '');
     // Embedded '"' legitimately gets backslash-escaped for the target
     // program's own argv parser, so check the un-escaped substance survived
-    // as one token rather than requiring a byte-identical raw match.
-    assert.ok(received.includes('&echo INJECTED>'),
+    // as one token rather than requiring a byte-identical raw match. Must
+    // branch the same way `payload` above does -- this assertion used to
+    // hardcode the win32 substring unconditionally, so it failed on every
+    // POSIX CI runner (ubuntu/macos) even though no injection occurred there
+    // either; the real security assertion is line 91, this one only checks
+    // the value arrived intact as a single token.
+    const expectedCore = process.platform === 'win32' ? '&echo INJECTED>' : ';touch "';
+    assert.ok(received.includes(expectedCore),
       `stub should have received the payload's core intact as one argument, got: ${JSON.stringify(received)}`);
   });
 
