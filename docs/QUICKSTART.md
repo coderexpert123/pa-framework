@@ -221,7 +221,7 @@ Works on all platforms:
 - **Windows**: registers `PA-Catchup` and `PA-Catchup-Reminders` in Windows Task Scheduler (runs via a hidden VBScript wrapper every minute).
 - **macOS / Linux**: upserts two entries into your user crontab (`crontab -l` / `crontab <file>`): both `PA-Catchup` and `PA-Catchup-Reminders` fire every minute (matches the Windows cadence — `pa catchup` is lock-guarded, so the tighter interval just catches overdue skills sooner, it doesn't duplicate runs).
 
-**Running a second install?** Task/cron names are only the plain `PA-Catchup`/`PA-Catchup-Reminders` for a default (unconfigured) `PA_HOME`. If you set `PA_HOME` explicitly (see [`docs/CONFIGURATION.md`](CONFIGURATION.md#pa_home-env-var) — testing, a second personal/work instance, containers), the names get a short hash suffix unique to that `PA_HOME` instead, so two installs on the same OS user account never overwrite each other's schedule. Use `pa schedules list` to see the exact name your install actually registered.
+**Running a second install?** Task/cron names are only the plain `PA-Catchup`/`PA-Catchup-Reminders` when `PA_HOME` resolves to the default `~/.pa` (whether left unset, or explicitly set to that same path). Any OTHER resolved `PA_HOME` (see [`docs/CONFIGURATION.md`](CONFIGURATION.md#pa_home-env-var) — testing, a second personal/work instance, containers) gets a short hash suffix unique to that path instead, so two installs on the same OS user account never overwrite each other's schedule. Use `pa schedules list` to see the exact name your install actually registered.
 
 The catchup task runs `pa catchup`, which iterates overdue skills and fires them.
 

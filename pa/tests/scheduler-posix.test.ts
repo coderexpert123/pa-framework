@@ -4,7 +4,8 @@
  */
 import { describe, it, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { platform } from 'os';
+import { platform, homedir } from 'os';
+import { join } from 'path';
 import { createTempPaHome, cleanup } from './helpers.js';
 import { resolveWindowsPaPath, resolvePosixPaPath, scheduledTaskName } from '../src/scheduler.js';
 
@@ -172,9 +173,11 @@ describe('resolvePosixPaPath (D4 fail-loud on missing pa)', () => {
 // "PA-Catchup" means the second `pa schedules sync` silently deletes and
 // overwrites the first install's real scheduled task, reporting SUCCESS
 // both times. This is the fix: derive the name from PA_HOME, falling back
-// to the unchanged legacy literal when PA_HOME was never explicitly set
-// (a real production install that never sets PA_HOME must keep producing
-// exactly "PA-Catchup" — zero disruption, zero migration).
+// to the unchanged legacy literal whenever the RESOLVED PA_HOME path
+// equals the implicit default (~/.pa) — whether that's because PA_HOME was
+// never set, or was explicitly set to the same value (a real production
+// install must keep producing exactly "PA-Catchup" either way — zero
+// disruption, zero migration).
 
 describe('scheduledTaskName (multi-instance collision fix)', () => {
   it('returns the base label unchanged when PA_HOME is not set', () => {
@@ -183,7 +186,7 @@ describe('scheduledTaskName (multi-instance collision fix)', () => {
     assert.equal(scheduledTaskName('PA-Catchup-Reminders'), 'PA-Catchup-Reminders');
   });
 
-  it('hash-suffixes the base label when PA_HOME is explicitly set', () => {
+  it('hash-suffixes the base label when PA_HOME resolves to a non-default path', () => {
     process.env.PA_HOME = tempDir;
     const name = scheduledTaskName('PA-Catchup');
     assert.match(name, /^PA-Catchup-[0-9a-f]{8}$/);
@@ -220,5 +223,33 @@ describe('scheduledTaskName (multi-instance collision fix)', () => {
     const slashed = scheduledTaskName('PA-Catchup');
     assert.equal(canonical, upper, 'case must not change the hash on Windows');
     assert.equal(canonical, slashed, 'separator/trailing-slash spelling must not change the hash on Windows');
+  });
+
+  it('PA_HOME explicitly set to the same value as the implicit default still returns the unchanged legacy name', () => {
+    // Compares RESOLVED PATHS, not env-var presence — this is the property
+    // that makes that comparison necessary rather than just checking
+    // `!process.env.PA_HOME`. If a future config change ever explicitly
+    // exports PA_HOME with a value equal to the default, the unchanged-name
+    // guarantee must still hold, or the next sync would silently create a
+    // second, differently-named task and orphan the old one.
+    delete process.env.PA_HOME;
+    const implicitDefault = scheduledTaskName('PA-Catchup');
+    process.env.PA_HOME = join(homedir(), '.pa');
+    const explicitDefault = scheduledTaskName('PA-Catchup');
+    assert.equal(implicitDefault, 'PA-Catchup');
+    assert.equal(explicitDefault, 'PA-Catchup');
+  });
+
+  it('output always contains the base label as a substring — listSchedules() Windows branch depends on this', () => {
+    // listSchedules() filters `schtasks /query` output with
+    // `l.includes('PA-Catchup')`, relying on scheduledTaskName() never
+    // producing a name that DOESN'T contain the base label (e.g. it must
+    // stay a suffix, not become a hash-only replacement). Asserted directly
+    // so a future change to the naming scheme can't silently break that
+    // filter without a test failing here first.
+    delete process.env.PA_HOME;
+    assert.ok(scheduledTaskName('PA-Catchup').includes('PA-Catchup'));
+    process.env.PA_HOME = tempDir;
+    assert.ok(scheduledTaskName('PA-Catchup').includes('PA-Catchup'));
   });
 });
