@@ -146,6 +146,15 @@ If none of these fit, you're probably creating something that shouldn't exist. R
 - **AI agents** editing the codebase consult `CLAUDE.md` § "Repository hygiene" for the rule set; new files land in their proper home by default.
 - **AI-agent entrypoints** should converge on `CLAUDE.md`; if `AGENTS.md` or `GEMINI.md` drift from it, fix the aliasing rather than maintaining parallel prose.
 
+## Merging to `main` (2026-07-23)
+
+`main` is a protected branch: `required_status_checks` (all 3 CI platforms +
+the PII scan) plus `enforce_admins: true`. A direct `git push origin main`
+is rejected outright, for the repo owner too — every change, however small,
+goes through a branch + PR that must show all checks green before it can
+merge. This closes the gap where CI and the PII scan were only ever
+*reporting* status after a push had already landed, not actually gating it.
+
 ## When to update these conventions
 
 Whenever a NEW class of file recurs (e.g., a new export format starts landing at root), add it to the appropriate `.gitignore` pattern + this doc + `CLAUDE.md`. Don't accept "we'll just remember to put it in the right place" — encode it.

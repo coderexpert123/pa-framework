@@ -210,6 +210,47 @@ def record_bypass(refs: list[str]) -> str | None:
         return None
 
 
+def _resolve_new_ref_base(local_sha: str) -> str | None:
+    """For a brand-new ref (remote reports the all-zero sha), git's own
+    pre-push protocol gives no base to diff against -- but blindly using
+    EMPTY_TREE treats the WHOLE tree and WHOLE history as newly added. That
+    is correct for a genuinely first-ever push, but wrong for an ordinary
+    feature branch created off an already-known, already-scanned branch
+    (2026-07-23: pushing a new PR branch off main re-flagged 271 files /
+    63k lines / 57 commits as "new", including this scanner's own source
+    quoting bank names as DETECTION patterns -- a false positive on every
+    single future branch, which would have made the just-adopted PR-gated
+    workflow unusable). Try a merge-base with the remote's default branch
+    first; only the caller's EMPTY_TREE/no-range fallback kicks in when no
+    shared history can be found at all (a true first-ever push, or a
+    genuinely orphaned branch)."""
+    candidates = []
+    try:
+        head = subprocess.run(
+            ["git", "symbolic-ref", "-q", "refs/remotes/origin/HEAD"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=10,
+        )
+        if head.returncode == 0 and head.stdout.strip():
+            candidates.append(head.stdout.strip())
+    except Exception:
+        pass
+    candidates += ["refs/remotes/origin/main", "refs/remotes/origin/master"]
+
+    for ref in candidates:
+        try:
+            result = subprocess.run(
+                ["git", "merge-base", ref, local_sha],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=10,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except Exception:
+            continue
+    return None
+
+
 def collect_diff():
     """Read push info from stdin; populate ADDED (new content lines),
     TOUCHED_PATHS (names the push ships) and TOUCHED_FILES (full content)."""
@@ -220,7 +261,10 @@ def collect_diff():
         local_sha, remote_sha = parts[1], parts[3]
         if local_sha == "0" * 40:
             continue  # branch deletion
-        base = EMPTY_TREE if remote_sha == "0" * 40 else remote_sha
+        if remote_sha == "0" * 40:
+            base = _resolve_new_ref_base(local_sha) or EMPTY_TREE
+        else:
+            base = remote_sha
         _collect_added(base, local_sha)
         _collect_touched(base, local_sha)
         _collect_messages(remote_sha, local_sha)
@@ -323,7 +367,11 @@ def _collect_messages(remote_sha: str, local_sha: str) -> None:
     line, so `git log` on the public mirror still published the term the rename
     was removing. Diffs, file contents and paths were all clean; the message
     was not, and nothing had ever looked at one."""
-    rng = local_sha if remote_sha == "0" * 40 else f"{remote_sha}..{local_sha}"
+    if remote_sha == "0" * 40:
+        merge_base = _resolve_new_ref_base(local_sha)
+        rng = f"{merge_base}..{local_sha}" if merge_base else local_sha
+    else:
+        rng = f"{remote_sha}..{local_sha}"
     try:
         result = subprocess.run(
             ["git", "log", f"--format={_FLD.join(['%H', '%B'])}{_REC}",
