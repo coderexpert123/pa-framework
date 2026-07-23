@@ -130,6 +130,8 @@ schtasks /query /tn PA-Catchup
 crontab -l | grep pa
 ```
 
+> **Non-default `PA_HOME`?** The literal name `PA-Catchup` above is only correct for a default (unconfigured) install. If you set `PA_HOME` explicitly (see [`docs/CONFIGURATION.md`](CONFIGURATION.md#pa_home-env-var)), your task/cron entry is suffixed with a short hash unique to that path instead — run `node pa/dist/bin/pa.js schedules list` to see the exact name your install actually registered, rather than assuming the plain literal.
+
 If the task disappeared, re-register: `node pa/dist/bin/pa.js schedules sync`.
 
 ### `disk-logs` FAIL — "> 500MB"
@@ -236,7 +238,7 @@ implement a new branch in pa/src/scheduler.ts:syncSchedules() that registers
 See syncSchedulesWindows() and syncSchedulesPosix() as reference implementations.
 ```
 
-The two existing implementations in that file are complete references. The contract: register `pa catchup` to run every 15 minutes and `pa catchup --topic reminders` to run every minute.
+The two existing implementations in that file are complete references. The contract: register `pa catchup` and `pa catchup --topic reminders` to both run every minute, under a name derived from `scheduledTaskName()` (not a fixed literal — see the multi-instance note above and in `docs/CONFIGURATION.md`'s `PA_HOME` section) so a new scheduler backend doesn't reintroduce the collision the existing two implementations already fixed.
 
 **Needs `pgrep` / `ps` — warns once if absent:**
 

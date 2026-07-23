@@ -4,8 +4,9 @@
  */
 import { describe, it, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
+import { platform } from 'os';
 import { createTempPaHome, cleanup } from './helpers.js';
-import { resolveWindowsPaPath, resolvePosixPaPath } from '../src/scheduler.js';
+import { resolveWindowsPaPath, resolvePosixPaPath, scheduledTaskName } from '../src/scheduler.js';
 
 let tempDir: string;
 
@@ -163,5 +164,61 @@ describe('resolvePosixPaPath (D4 fail-loud on missing pa)', () => {
     const result = resolvePosixPaPath('/usr/local/bin/pa; rm -rf /\n');
     assert.equal(result.ok, false);
     assert.match(result.errorMessage!, /unsafe characters/);
+  });
+});
+
+// ── scheduledTaskName (2026-07-23 multi-instance collision fix) ────────────
+// Reproduced live: two `pa` installs both registering the literal task name
+// "PA-Catchup" means the second `pa schedules sync` silently deletes and
+// overwrites the first install's real scheduled task, reporting SUCCESS
+// both times. This is the fix: derive the name from PA_HOME, falling back
+// to the unchanged legacy literal when PA_HOME was never explicitly set
+// (a real production install that never sets PA_HOME must keep producing
+// exactly "PA-Catchup" — zero disruption, zero migration).
+
+describe('scheduledTaskName (multi-instance collision fix)', () => {
+  it('returns the base label unchanged when PA_HOME is not set', () => {
+    delete process.env.PA_HOME;
+    assert.equal(scheduledTaskName('PA-Catchup'), 'PA-Catchup');
+    assert.equal(scheduledTaskName('PA-Catchup-Reminders'), 'PA-Catchup-Reminders');
+  });
+
+  it('hash-suffixes the base label when PA_HOME is explicitly set', () => {
+    process.env.PA_HOME = tempDir;
+    const name = scheduledTaskName('PA-Catchup');
+    assert.match(name, /^PA-Catchup-[0-9a-f]{8}$/);
+  });
+
+  it('is deterministic: the same PA_HOME always produces the same name', () => {
+    process.env.PA_HOME = tempDir;
+    const first = scheduledTaskName('PA-Catchup');
+    const second = scheduledTaskName('PA-Catchup');
+    assert.equal(first, second);
+  });
+
+  it('two different PA_HOME values produce two different names — the actual property fixing the bug', async () => {
+    process.env.PA_HOME = tempDir;
+    const nameA = scheduledTaskName('PA-Catchup');
+
+    const otherDir = await createTempPaHome();
+    try {
+      process.env.PA_HOME = otherDir;
+      const nameB = scheduledTaskName('PA-Catchup');
+      assert.notEqual(nameA, nameB, 'two installs must never collide on the same task name');
+    } finally {
+      await cleanup(otherDir);
+      process.env.PA_HOME = tempDir;
+    }
+  });
+
+  it('same real directory, different spelling, hashes identically on Windows', { skip: platform() !== 'win32' }, () => {
+    process.env.PA_HOME = tempDir;
+    const canonical = scheduledTaskName('PA-Catchup');
+    process.env.PA_HOME = tempDir.toUpperCase();
+    const upper = scheduledTaskName('PA-Catchup');
+    process.env.PA_HOME = tempDir.replace(/\\/g, '/') + '/';
+    const slashed = scheduledTaskName('PA-Catchup');
+    assert.equal(canonical, upper, 'case must not change the hash on Windows');
+    assert.equal(canonical, slashed, 'separator/trailing-slash spelling must not change the hash on Windows');
   });
 });
