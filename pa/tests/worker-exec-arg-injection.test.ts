@@ -77,9 +77,19 @@ describe('worker-exec argument injection (quoteArg security)', () => {
     // No spaces around '&' -- this is exactly the shape the old regex
     // /[\s"]/ let through unquoted. On win32, an unpatched quoteArg would
     // let cmd.exe run `echo INJECTED>canaryFile` as a second command.
+    //
+    // injectionMarker is the ONE piece both the payload and the later
+    // assertion are built from -- 2026-07-23 postmortem: an earlier version
+    // hardcoded the win32 marker into the assertion as an independent
+    // literal, so it drifted from this platform branch and always failed on
+    // POSIX CI (ubuntu/macos) even though no injection occurred there
+    // either. Deriving both from one variable makes that class of drift
+    // structurally impossible, not just something to remember to keep in
+    // sync by hand.
+    const injectionMarker = process.platform === 'win32' ? '&echo INJECTED>' : ';touch "';
     const payload = process.platform === 'win32'
-      ? `high&echo INJECTED>"${canaryFile}"`
-      : `high;touch "${canaryFile}"`; // POSIX regex already covered ';' -- regression guard
+      ? `high${injectionMarker}"${canaryFile}"`
+      : `high${injectionMarker}${canaryFile}"`; // POSIX regex already covered ';' -- regression guard
 
     const worker = makeWorker({ name: 'agy', command: stubPath, args: [] });
     const result = await executeWorker(worker, 'test prompt', {
@@ -93,14 +103,10 @@ describe('worker-exec argument injection (quoteArg security)', () => {
     const received = await readFile(resultFile, 'utf8').catch(() => '');
     // Embedded '"' legitimately gets backslash-escaped for the target
     // program's own argv parser, so check the un-escaped substance survived
-    // as one token rather than requiring a byte-identical raw match. Must
-    // branch the same way `payload` above does -- this assertion used to
-    // hardcode the win32 substring unconditionally, so it failed on every
-    // POSIX CI runner (ubuntu/macos) even though no injection occurred there
-    // either; the real security assertion is line 91, this one only checks
-    // the value arrived intact as a single token.
-    const expectedCore = process.platform === 'win32' ? '&echo INJECTED>' : ';touch "';
-    assert.ok(received.includes(expectedCore),
+    // as one token rather than requiring a byte-identical raw match; the
+    // real security assertion is line 91, this one only checks the value
+    // arrived intact as a single token.
+    assert.ok(received.includes(injectionMarker),
       `stub should have received the payload's core intact as one argument, got: ${JSON.stringify(received)}`);
   });
 

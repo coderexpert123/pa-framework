@@ -262,12 +262,18 @@ def collect_diff():
         if local_sha == "0" * 40:
             continue  # branch deletion
         if remote_sha == "0" * 40:
-            base = _resolve_new_ref_base(local_sha) or EMPTY_TREE
+            # Resolve once and reuse for both the content/path diff and the
+            # message range below -- this used to call _resolve_new_ref_base
+            # a second time from inside _collect_messages, redoing the same
+            # symbolic-ref + merge-base subprocess calls for no reason.
+            new_ref_base = _resolve_new_ref_base(local_sha)
+            base = new_ref_base or EMPTY_TREE
         else:
+            new_ref_base = None
             base = remote_sha
         _collect_added(base, local_sha)
         _collect_touched(base, local_sha)
-        _collect_messages(remote_sha, local_sha)
+        _collect_messages(remote_sha, local_sha, new_ref_base)
 
 
 def _collect_added(base: str, local_sha: str) -> None:
@@ -359,17 +365,20 @@ def _parse_log_records(stdout: str) -> list[tuple[str, str]]:
     return out
 
 
-def _collect_messages(remote_sha: str, local_sha: str) -> None:
+def _collect_messages(remote_sha: str, local_sha: str, new_ref_base: str | None) -> None:
     """Scan the COMMIT MESSAGES the push introduces.
 
     A third unscanned channel, proven live on 2026-07-21: the very commit that
     renamed the bank-named file away carried that filename in its own subject
     line, so `git log` on the public mirror still published the term the rename
     was removing. Diffs, file contents and paths were all clean; the message
-    was not, and nothing had ever looked at one."""
+    was not, and nothing had ever looked at one.
+
+    `new_ref_base` is the merge-base collect_diff() already resolved for a
+    brand-new ref (or None if none was found) -- reused here rather than
+    re-resolving it, since it's the same answer for the same push."""
     if remote_sha == "0" * 40:
-        merge_base = _resolve_new_ref_base(local_sha)
-        rng = f"{merge_base}..{local_sha}" if merge_base else local_sha
+        rng = f"{new_ref_base}..{local_sha}" if new_ref_base else local_sha
     else:
         rng = f"{remote_sha}..{local_sha}"
     try:
