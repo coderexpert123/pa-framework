@@ -114,6 +114,8 @@ All others are skill-specific — see individual skill files.
 
 When set, the framework derives all paths from `${PA_HOME}/` instead of `~/.pa/`. Subdirectory names (skills/, logs/, etc.) remain hardcoded.
 
+**Multi-instance and the OS scheduler (2026-07-23):** the file-based state above was always per-`PA_HOME` and safe to run side-by-side, but `pa schedules sync`'s underlying Windows Task Scheduler task / crontab entry used to be registered under a fixed name regardless of `PA_HOME` — a second install's sync would silently delete and overwrite the first install's real scheduled task, reporting success either way. This is now fixed: a default (unset) `PA_HOME` still registers exactly `PA-Catchup`/`PA-Catchup-Reminders` (no change for an existing single-install deployment), but any explicit `PA_HOME` gets its own hash-suffixed name derived from that path, so two installs can never collide. See [`docs/QUICKSTART.md` §11](QUICKSTART.md#11-schedule-recurring-runs) and run `pa schedules list` to see the name actually in effect for your install.
+
 ## Resource tuning env vars
 
 | Variable | Default | Purpose |

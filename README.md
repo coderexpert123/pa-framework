@@ -96,6 +96,7 @@ node pa/dist/bin/pa.js list
 node pa/dist/bin/pa.js health
 
 # Register the catchup scheduler (all platforms)
+# Running a second install? Set PA_HOME first — see docs/CONFIGURATION.md#pa_home-env-var
 node pa/dist/bin/pa.js schedules sync
 
 # Run the bot

@@ -2,7 +2,8 @@ import { parseExpression } from 'cron-parser';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { platform, tmpdir } from 'os';
-import { join } from 'path';
+import { join, resolve } from 'path';
+import { createHash } from 'crypto';
 import { writeFileSync } from 'fs';
 import { writeFile, unlink } from 'fs/promises';
 import { listSkills } from './skills.js';
@@ -178,9 +179,51 @@ export async function partitionOverdueByFailureBackoff(
   return partition;
 }
 
-// Sentinel comments that anchor PA-managed cron lines on POSIX
-const PA_CRON_REMINDERS = '# PA-Catchup-Reminders (managed by pa schedules sync)';
-const PA_CRON_DEFAULT   = '# PA-Catchup (managed by pa schedules sync)';
+/**
+ * 2026-07-23: `PA_HOME` is documented (docs/CONFIGURATION.md) as supporting
+ * "multi-instance: run two pa installs side-by-side" — but the OS-level
+ * scheduler (Windows Task Scheduler task names, POSIX crontab sentinel
+ * comments) is a GLOBAL namespace per OS user account, not scoped to any one
+ * install. Registering both installs under the same fixed literal name
+ * ("PA-Catchup") means the second `pa schedules sync` silently deletes and
+ * overwrites the first install's task/cron entry, reporting SUCCESS with no
+ * warning either time. Reproduced live: a disposable test clone's `pa
+ * schedules sync` overwrote this deployment's real production scheduled
+ * tasks. This resolves the collision by deriving the name from PA_HOME.
+ *
+ * Deliberately NOT a hardcoded check for any specific machine's path: the
+ * rule is "default, unconfigured PA_HOME -> unchanged legacy name; any
+ * explicit PA_HOME override -> hash-suffixed, unique per path." A real
+ * production deployment that never sets PA_HOME keeps producing exactly
+ * "PA-Catchup"/"PA-Catchup-Reminders" (zero disruption, zero migration),
+ * while every other install (testing, a second personal/work instance,
+ * containers — the exact scenarios CONFIGURATION.md already documents) gets
+ * its own name and can never collide with another. Pure function, no I/O —
+ * unit-tested directly, same pattern as resolveWindowsPaPath/resolvePosixPaPath
+ * above.
+ */
+export function scheduledTaskName(baseLabel: string): string {
+  if (!process.env.PA_HOME) return baseLabel;
+  // Windows paths are case-insensitive and accept both separators; fold both
+  // away so two spellings of the same real directory hash identically. POSIX
+  // paths are case-sensitive — no folding there.
+  const canonical = platform() === 'win32'
+    ? resolve(paHome()).replace(/\\/g, '/').toLowerCase()
+    : resolve(paHome());
+  const hash = createHash('sha256').update(canonical).digest('hex').slice(0, 8);
+  return `${baseLabel}-${hash}`;
+}
+
+/** Sentinel comments that anchor PA-managed cron lines on POSIX. Computed at
+ * call time (not a module-level constant) so each call reflects whatever
+ * PA_HOME is set to right now — tests can set process.env.PA_HOME per case
+ * without needing to re-import the module. */
+function cronSentinelReminders(): string {
+  return `# ${scheduledTaskName('PA-Catchup-Reminders')} (managed by pa schedules sync)`;
+}
+function cronSentinelDefault(): string {
+  return `# ${scheduledTaskName('PA-Catchup')} (managed by pa schedules sync)`;
+}
 
 export interface PaPathResolution {
   ok: boolean;
@@ -306,8 +349,8 @@ async function syncSchedulesWindows(): Promise<boolean> {
     }
   };
 
-  await registerTask('PA-Catchup-Reminders', highVbs);
-  await registerTask('PA-Catchup', defaultVbs);
+  await registerTask(scheduledTaskName('PA-Catchup-Reminders'), highVbs);
+  await registerTask(scheduledTaskName('PA-Catchup'), defaultVbs);
   return true;
 }
 
@@ -341,8 +384,8 @@ async function syncSchedulesPosix(): Promise<boolean> {
   // Scheduler's cadence; catchup is lock-guarded so the tighter interval
   // just means overdue skills get caught sooner, not duplicated).
   const lines: Record<string, string> = {
-    [PA_CRON_REMINDERS]: `* * * * * ${paPath} catchup --topic reminders`,
-    [PA_CRON_DEFAULT]:   `* * * * * ${paPath} catchup`,
+    [cronSentinelReminders()]: `* * * * * ${paPath} catchup --topic reminders`,
+    [cronSentinelDefault()]:   `* * * * * ${paPath} catchup`,
   };
 
   // Upsert: replace any existing PA-managed block, or append
@@ -378,8 +421,8 @@ async function syncSchedulesPosix(): Promise<boolean> {
       }
       throw err;
     }
-    console.log(`[+] Registered PA-Catchup-Reminders: * * * * * ${paPath} catchup --topic reminders`);
-    console.log(`[+] Registered PA-Catchup:           * * * * * ${paPath} catchup`);
+    console.log(`[+] Registered ${scheduledTaskName('PA-Catchup-Reminders')}: * * * * * ${paPath} catchup --topic reminders`);
+    console.log(`[+] Registered ${scheduledTaskName('PA-Catchup')}:           * * * * * ${paPath} catchup`);
   } finally {
     await unlink(tmpPath).catch(() => {});
   }
@@ -408,7 +451,7 @@ export async function listSchedules(): Promise<void> {
     try {
       const { stdout } = await execAsync('crontab -l');
       const lines = stdout.split('\n').filter(l =>
-        l.includes(PA_CRON_REMINDERS.slice(2)) || l.includes(PA_CRON_DEFAULT.slice(2)) ||
+        l.includes(cronSentinelReminders().slice(2)) || l.includes(cronSentinelDefault().slice(2)) ||
         l.includes('pa catchup')
       );
       console.log('Registered crontab entries:\n');
