@@ -51,16 +51,22 @@ views of the text: raw, separators (`_ - . / \`) replaced by spaces, and
 camelCase humps split. Splitting only *adds* word boundaries, so it can never
 invent a match — and both extra views preserve line numbers.
 
-**Install / reinstall (required after every change to this file):**
+**Install / reinstall:**
 ```sh
-cp pa/scripts/git-hooks/pre-push-pii-guard .git-public/hooks/pre-push
-chmod +x .git-public/hooks/pre-push
+python pa/scripts/install_git_hooks.py
 ```
-The hook is a **copy**, not a link. Editing the tracked source does nothing
-until you re-copy it. Check for drift with:
+Idempotent and safe to re-run. It installs `.git-public/hooks/pre-push` as a
+**relative symlink** to this tracked source, so editing the source IS the
+install — there is nothing left to re-copy or remember (the old `cp` install
+drifted repeatedly because a copy has to be re-copied by hand after every
+edit). On a machine without symlink privilege it falls back to a hard link, then
+a plain copy, warning loudly at each downgrade. It ends by diffing installed
+content against the source and printing an explicit `drift check:` verdict.
+Check for drift at any time with:
 ```sh
 diff .git-public/hooks/pre-push pa/scripts/git-hooks/pre-push-pii-guard
 ```
+With the symlink install this is now expected to always report clean.
 
 **Configure personal patterns** (`~/.pa/pii-tripwires.txt`, create if absent):
 ```
@@ -183,6 +189,28 @@ tree-killing timeout always wins the race, never agy's internal one.
   unparseable response) before the layer gives up — a one-off blip must not
   silently disable the semantic scan for a whole push. A real parsed
   `VIOLATION` is a verdict, not a failure, and is never retried.
+- **New-branch base resolution (2026-07-23).** Git reports `remote_sha` as
+  all-zeros for ANY brand-new ref, not just a genuinely first-ever push — a
+  naive reading of that ("scan from EMPTY_TREE") treats an ordinary feature
+  branch's WHOLE tree/history as newly added the first time it's pushed. Hit
+  live: pushing a PR branch off an already-scanned `main` re-flagged 271
+  files / 63k lines / one push as "new", including this scanner's own source
+  quoting bank names as detection patterns. `_resolve_new_ref_base()` tries a
+  merge-base with the remote's default branch (`origin/HEAD`, then
+  `origin/main`/`origin/master`) before falling back to EMPTY_TREE, which now
+  only fires when no shared history exists at all (a true first-ever push or
+  an orphaned branch). Resolved once per push in `collect_diff()` and reused
+  for the commit-message range too — don't call it twice.
+
+**Server-side backstop:** `.github/workflows/pii-scan.yml` + `pa/scripts/pii_ci_scan.py`
+scan the ENTIRE tracked tree + full path history on every push/PR to the public
+mirror — independent of whether the local hook is installed, current, or was
+bypassed. Reports file/line/pattern CLASS only, never the matched text (public
+CI logs would otherwise publish exactly what they caught). A 2026-06-24
+full-tree audit (predating this backstop) found 5 residual leaks the per-push
+guard had missed, all in unchanged lines a diff-only scan never re-examines —
+this is why the "full content of every touched file" coverage above exists,
+and why a diff-scoped tool alone is never sufficient.
 
 **Tests:** `pa/scripts/tests/test_pii_guard.py` (pure unit tests, no repo
 mutation). Run with `PYTHONIOENCODING=utf-8` on Windows.
