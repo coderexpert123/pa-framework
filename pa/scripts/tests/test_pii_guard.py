@@ -14,6 +14,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -444,6 +445,73 @@ class TestCollectDiffEncoding(unittest.TestCase):
         self.assertEqual(guard.scan_text("f.md", joined, ["Secretname"]) != [], True)
 
 
+class TestResolveNewRefBase(unittest.TestCase):
+    """Real-repo regression guard for the 2026-07-23 fix: pushing a brand-new
+    branch must not fall back to EMPTY_TREE (scan the whole tree/history) when
+    the branch actually shares history with an already-known remote branch --
+    real git repos + real subprocess calls (clone/branch/commit/merge-base),
+    not mocks, since this is git-plumbing behavior a mock can't meaningfully
+    stand in for. Like the rest of this hook, _resolve_new_ref_base relies on
+    running with cwd == the repo root (the standard git-hook contract); the
+    tests chdir into the temp repo for the call and always restore in
+    tearDown."""
+
+    def setUp(self):
+        self._orig_cwd = os.getcwd()
+        self.tmp = tempfile.mkdtemp(prefix="pa-resolve-base-")
+        remote_dir = os.path.join(self.tmp, "remote")
+        self.local_dir = os.path.join(self.tmp, "local")
+        os.makedirs(remote_dir)
+        self._git(remote_dir, "init", "-q", "-b", "main")
+        self._git(remote_dir, "config", "user.email", "t@t.invalid")
+        self._git(remote_dir, "config", "user.name", "t")
+        self._commit(remote_dir, "README.md", "hello\n", "initial")
+        self._git(self.tmp, "clone", "-q", remote_dir, self.local_dir)
+        self._git(self.local_dir, "config", "user.email", "t@t.invalid")
+        self._git(self.local_dir, "config", "user.name", "t")
+
+    def tearDown(self):
+        os.chdir(self._orig_cwd)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _git(self, cwd, *args):
+        result = subprocess.run(["git", *args], cwd=cwd, capture_output=True,
+                                 text=True, encoding="utf-8", errors="replace", timeout=15)
+        if result.returncode != 0:
+            raise RuntimeError(f"git {args} failed: {result.stderr}")
+        return result
+
+    def _commit(self, repo_dir, filename, content, message):
+        with open(os.path.join(repo_dir, filename), "w", encoding="utf-8") as f:
+            f.write(content)
+        self._git(repo_dir, "add", filename)
+        self._git(repo_dir, "commit", "-q", "-m", message)
+        return self._git(repo_dir, "rev-parse", "HEAD").stdout.strip()
+
+    def test_finds_merge_base_for_a_feature_branch_off_main(self):
+        main_head = self._git(self.local_dir, "rev-parse", "HEAD").stdout.strip()
+        self._git(self.local_dir, "checkout", "-q", "-b", "feature")
+        new_sha = self._commit(self.local_dir, "feature.txt", "x\n", "feature work")
+        os.chdir(self.local_dir)
+        base = guard._resolve_new_ref_base(new_sha)
+        self.assertEqual(base, main_head,
+                         "must resolve to main's HEAD, the true common ancestor -- "
+                         "not None (which would fall back to a full EMPTY_TREE scan)")
+
+    def test_returns_none_when_no_remote_exists(self):
+        # A repo with no 'origin' at all -- the caller's own EMPTY_TREE
+        # fallback must still apply, e.g. a genuine first-ever push to a
+        # brand-new repository with nothing to compare against.
+        orphan_dir = os.path.join(self.tmp, "orphan")
+        os.makedirs(orphan_dir)
+        self._git(orphan_dir, "init", "-q", "-b", "main")
+        self._git(orphan_dir, "config", "user.email", "t@t.invalid")
+        self._git(orphan_dir, "config", "user.name", "t")
+        sha = self._commit(orphan_dir, "a.txt", "x\n", "only commit")
+        os.chdir(orphan_dir)
+        self.assertIsNone(guard._resolve_new_ref_base(sha))
+
+
 class TestScanPath(unittest.TestCase):
     """2026-07-21 leak 3: projects/daily-mail-brief/scripts/download_exbank_statement.py
     shipped to the public mirror for months. The file's CONTENTS were entirely
@@ -843,22 +911,34 @@ class TestCommitMessageScan(unittest.TestCase):
         self.assertIn("credential", hits[0])
 
     def test_new_branch_push_uses_the_bare_sha_range(self):
+        # new_ref_base=None simulates collect_diff() finding no merge-base
+        # (a genuine first-ever push / orphan branch) -- the bare-sha
+        # fallback this test is named for.
         mock_result = MagicMock(stdout="", returncode=0)
         with patch.object(guard.subprocess, "run", return_value=mock_result) as mock_run:
-            guard._collect_messages("0" * 40, "b" * 40)
+            guard._collect_messages("0" * 40, "b" * 40, None)
         self.assertIn("b" * 40, mock_run.call_args[0][0])
         self.assertNotIn("0" * 40 + ".." + "b" * 40, mock_run.call_args[0][0])
+
+    def test_new_branch_push_with_a_resolved_merge_base_uses_a_two_dot_range(self):
+        # 2026-07-23 regression guard: when collect_diff() DOES find a
+        # merge-base for a new branch, _collect_messages must range from
+        # THAT, not fall back to the bare-sha (whole-history) scan.
+        mock_result = MagicMock(stdout="", returncode=0)
+        with patch.object(guard.subprocess, "run", return_value=mock_result) as mock_run:
+            guard._collect_messages("0" * 40, "b" * 40, "m" * 40)
+        self.assertIn("m" * 40 + ".." + "b" * 40, mock_run.call_args[0][0])
 
     def test_incremental_push_uses_a_two_dot_range(self):
         mock_result = MagicMock(stdout="", returncode=0)
         with patch.object(guard.subprocess, "run", return_value=mock_result) as mock_run:
-            guard._collect_messages("a" * 40, "b" * 40)
+            guard._collect_messages("a" * 40, "b" * 40, None)
         self.assertIn("a" * 40 + ".." + "b" * 40, mock_run.call_args[0][0])
 
     def test_log_call_uses_explicit_utf8(self):
         mock_result = MagicMock(stdout="", returncode=0)
         with patch.object(guard.subprocess, "run", return_value=mock_result) as mock_run:
-            guard._collect_messages("a" * 40, "b" * 40)
+            guard._collect_messages("a" * 40, "b" * 40, None)
         _, kwargs = mock_run.call_args
         self.assertEqual(kwargs.get("encoding"), "utf-8")
         self.assertEqual(kwargs.get("errors"), "replace")
@@ -868,7 +948,7 @@ class TestCommitMessageScan(unittest.TestCase):
                   f"sha2{guard._FLD}subject two\n{guard._REC}")
         mock_result = MagicMock(stdout=stdout, returncode=0)
         with patch.object(guard.subprocess, "run", return_value=mock_result):
-            guard._collect_messages("a" * 40, "b" * 40)
+            guard._collect_messages("a" * 40, "b" * 40, None)
         self.assertEqual([s for s, _ in guard.MESSAGES], ["sha1", "sha2"])
         self.assertIn("body line", guard.MESSAGES[0][1])
 
@@ -877,7 +957,7 @@ class TestCommitMessageScan(unittest.TestCase):
         mock_result = MagicMock(stdout="", stderr="fatal: bad revision", returncode=128)
         with patch.object(guard.subprocess, "run", return_value=mock_result):
             with contextlib.redirect_stderr(buf):
-                guard._collect_messages("a" * 40, "b" * 40)
+                guard._collect_messages("a" * 40, "b" * 40, None)
         self.assertIn("FAIL-OPEN", buf.getvalue())
         self.assertEqual(guard.MESSAGES, [])
 

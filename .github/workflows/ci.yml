@@ -53,3 +53,29 @@ jobs:
           npm ci
           npm run build
           npm test
+
+      # 2026-07-23: this CI job (the one required by branch protection) never
+      # ran the Python suite at all -- pre-push-pii-guard, pii_ci_scan.py, and
+      # friends only ever got tested by someone remembering to run them by
+      # hand. Runs across all 3 platforms deliberately: the guard's own
+      # tests exercise both the win32 (.cmd shim) and POSIX (chmod/killpg)
+      # code paths. verify_pii_guard_agy_e2e.py is deliberately NOT run here
+      # -- it needs a real agy binary that doesn't exist on these runners and
+      # is a manual/on-demand harness by design.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # No pa/requirements.txt exists -- these two are the only non-stdlib
+      # imports across all 5 test_*.py files (test_backup_secrets.py needs
+      # cryptography; test_finish_google_telegram_reauth.py needs
+      # google-auth-oauthlib), installed explicitly rather than narrowing
+      # which tests run.
+      - name: Install Python test dependencies
+        run: pip install cryptography google-auth-oauthlib
+
+      - name: Run Python test suite (PII guard + related tooling)
+        run: python -m unittest discover -s pa/scripts/tests -p "test_*.py"
+        env:
+          PYTHONIOENCODING: utf-8

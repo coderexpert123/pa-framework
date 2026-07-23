@@ -64,7 +64,9 @@ class TestPreRun(unittest.TestCase):
         # Redirect to temp paths so tests don't touch the real creds
         self._orig_creds = rgt.CREDS_PATH
         self._orig_stash = rgt.STASH_PATH
-        rgt.CREDS_PATH = os.path.join(os.environ.get("PA_HOME", os.environ["TEMP"]),
+        # os.environ["TEMP"] is Windows-only (KeyError on Linux/macOS) --
+        # tempfile.gettempdir() is the cross-platform equivalent.
+        rgt.CREDS_PATH = os.path.join(os.environ.get("PA_HOME", tempfile.gettempdir()),
                                       "test_oauth_creds.json")
         rgt.STASH_PATH = rgt.CREDS_PATH + ".refresh_token_stash"
 
@@ -160,7 +162,9 @@ class TestPostRun(unittest.TestCase):
     def setUp(self):
         self._orig_creds = rgt.CREDS_PATH
         self._orig_stash = rgt.STASH_PATH
-        rgt.CREDS_PATH = os.path.join(os.environ.get("PA_HOME", os.environ["TEMP"]),
+        # os.environ["TEMP"] is Windows-only (KeyError on Linux/macOS) --
+        # tempfile.gettempdir() is the cross-platform equivalent.
+        rgt.CREDS_PATH = os.path.join(os.environ.get("PA_HOME", tempfile.gettempdir()),
                                       "test_oauth_creds.json")
         rgt.STASH_PATH = rgt.CREDS_PATH + ".refresh_token_stash"
 
@@ -258,7 +262,11 @@ class TestDoRefresh(unittest.TestCase):
 
     def setUp(self):
         self._orig_creds = rgt.CREDS_PATH
-        rgt.CREDS_PATH = os.path.join(os.environ.get("PA_HOME", os.environ["TEMP"]),
+        # 2026-07-23: os.environ["TEMP"] is Windows-only (KeyError on Linux/
+        # macOS, where this test had never actually run until CI grew a
+        # Python step across all 3 platforms) -- tempfile.gettempdir() is
+        # the cross-platform equivalent.
+        rgt.CREDS_PATH = os.path.join(os.environ.get("PA_HOME", tempfile.gettempdir()),
                                       "test_oauth_creds.json")
         # Isolate from the real ~/.pa/secrets.env — _client_id/_client_secret
         # must not depend on this machine's actual OAuth credentials.
