@@ -130,7 +130,7 @@ schtasks /query /tn PA-Catchup
 crontab -l | grep pa
 ```
 
-> **Non-default `PA_HOME`?** The literal name `PA-Catchup` above is only correct for a default (unconfigured) install. If you set `PA_HOME` explicitly (see [`docs/CONFIGURATION.md`](CONFIGURATION.md#pa_home-env-var)), your task/cron entry is suffixed with a short hash unique to that path instead — run `node pa/dist/bin/pa.js schedules list` to see the exact name your install actually registered, rather than assuming the plain literal.
+> **Non-default `PA_HOME`?** The literal name `PA-Catchup` above is only correct when `PA_HOME` resolves to the default `~/.pa` (unset, or explicitly set to that same path). Any other resolved `PA_HOME` (see [`docs/CONFIGURATION.md`](CONFIGURATION.md#pa_home-env-var)) gets a task/cron entry suffixed with a short hash unique to that path instead — run `node pa/dist/bin/pa.js schedules list` to see the exact name your install actually registered, rather than assuming the plain literal.
 
 If the task disappeared, re-register: `node pa/dist/bin/pa.js schedules sync`.
 

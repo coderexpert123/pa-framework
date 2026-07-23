@@ -1,7 +1,7 @@
 import { parseExpression } from 'cron-parser';
 import { exec } from 'child_process';
 import { promisify } from 'util';
-import { platform, tmpdir } from 'os';
+import { platform, tmpdir, homedir } from 'os';
 import { join, resolve } from 'path';
 import { createHash } from 'crypto';
 import { writeFileSync } from 'fs';
@@ -180,6 +180,28 @@ export async function partitionOverdueByFailureBackoff(
 }
 
 /**
+ * resolve() is relative to process.cwd() when its input isn't already
+ * absolute. Every documented PA_HOME example (docs/CONFIGURATION.md:
+ * $tmpdir, a second install's own directory, a container path) is
+ * absolute, so a relative PA_HOME is a narrow, undocumented-usage edge
+ * case — but if someone DID set one and ran `pa schedules sync` from two
+ * different working directories, they'd get two different hashes for what
+ * they intended as one install. Failure mode is safe-direction (an extra
+ * orphaned task, not a silent collision — the actual bug scheduledTaskName()
+ * below exists to prevent), so this is a documented limitation, not a
+ * guard: a relative PA_HOME is already an unsupported configuration.
+ *
+ * Windows paths are case-insensitive and accept both separators; fold both
+ * away so two spellings of the same real directory hash identically. POSIX
+ * paths are case-sensitive — no folding there.
+ */
+function canonicalizeForHash(dir: string): string {
+  return platform() === 'win32'
+    ? resolve(dir).replace(/\\/g, '/').toLowerCase()
+    : resolve(dir);
+}
+
+/**
  * 2026-07-23: `PA_HOME` is documented (docs/CONFIGURATION.md) as supporting
  * "multi-instance: run two pa installs side-by-side" — but the OS-level
  * scheduler (Windows Task Scheduler task names, POSIX crontab sentinel
@@ -192,9 +214,11 @@ export async function partitionOverdueByFailureBackoff(
  * tasks. This resolves the collision by deriving the name from PA_HOME.
  *
  * Deliberately NOT a hardcoded check for any specific machine's path: the
- * rule is "default, unconfigured PA_HOME -> unchanged legacy name; any
- * explicit PA_HOME override -> hash-suffixed, unique per path." A real
- * production deployment that never sets PA_HOME keeps producing exactly
+ * rule is that PA_HOME resolving to the default `~/.pa` — whether left
+ * unset, or explicitly set to that same path — keeps the unchanged legacy
+ * name; any OTHER resolved path gets hash-suffixed, unique per path. A real
+ * production deployment that never sets PA_HOME (or explicitly sets it to
+ * that same default) keeps producing exactly
  * "PA-Catchup"/"PA-Catchup-Reminders" (zero disruption, zero migration),
  * while every other install (testing, a second personal/work instance,
  * containers — the exact scenarios CONFIGURATION.md already documents) gets
@@ -203,13 +227,16 @@ export async function partitionOverdueByFailureBackoff(
  * above.
  */
 export function scheduledTaskName(baseLabel: string): string {
-  if (!process.env.PA_HOME) return baseLabel;
-  // Windows paths are case-insensitive and accept both separators; fold both
-  // away so two spellings of the same real directory hash identically. POSIX
-  // paths are case-sensitive — no folding there.
-  const canonical = platform() === 'win32'
-    ? resolve(paHome()).replace(/\\/g, '/').toLowerCase()
-    : resolve(paHome());
+  // Compare RESOLVED PATHS, not env-var presence: PA_HOME unset is the
+  // common case, but if it were ever explicitly exported with a value that
+  // happens to equal the default (a future "be explicit" config change,
+  // for instance), the unchanged-name guarantee must still hold — checking
+  // `!process.env.PA_HOME` alone would miss that and silently start
+  // producing a second, differently-named task alongside an orphaned old
+  // one under the same real install.
+  const canonical = canonicalizeForHash(paHome());
+  const defaultCanonical = canonicalizeForHash(join(homedir(), '.pa'));
+  if (canonical === defaultCanonical) return baseLabel;
   const hash = createHash('sha256').update(canonical).digest('hex').slice(0, 8);
   return `${baseLabel}-${hash}`;
 }
@@ -434,6 +461,12 @@ export async function listSchedules(): Promise<void> {
   if (platform() === 'win32') {
     try {
       const { stdout } = await execAsync('schtasks /query /fo TABLE /nh', {});
+      // This substring filter relies on an invariant scheduledTaskName() must
+      // preserve: its output always CONTAINS the base label, hash-suffixed
+      // or not (asserted directly in scheduler-posix.test.ts). A future
+      // change to the naming scheme (different separator, prefix instead of
+      // suffix, etc.) that breaks this would make listSchedules() silently
+      // stop finding non-default installs' tasks — update this filter too.
       const lines = stdout.split('\n').filter(l => l.includes('PA-Catchup'));
       console.log('Registered OS tasks:\n');
       console.log('TaskName'.padEnd(25) + '  ' + 'Next Run Time'.padEnd(20) + '  ' + 'Status');
