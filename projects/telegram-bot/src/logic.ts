@@ -33,6 +33,19 @@ export const KEEP_AWAKE_PATTERN = /^\/keepawake(?:@\w+)?$/i;
 export const SKILLS_PATTERN = /^\/skills(?:@\w+)?$/i;
 export const AUTH_PATTERN = /^\/auth(?:@\w+)?\s+(\S+)(?:\s+(\S+))?$/i;
 export const HELP_PATTERN = /^\/help(?:@\w+)?$/i;
+// [Voice message]/[Audio file]/[Video note] re-transcription (WP5 of the
+// hardened voice-transcription plan). Wiring (locate the replied media,
+// call voice.ts's findCachedAudio/transcribeVoiceMessage) is WP6's job in
+// main.ts — this WP only owns the parser + BOT_COMMANDS registration.
+export const RETRANSCRIBE_PATTERN = /^\/retranscribe(?:@\w+)?(?:\s+(\S+))?\s*$/i;
+
+// Deterministic trigger for the commit-and-push skill (~/.pa/skills/commit-and-push/
+// skill.md) — deliberately NOT a "pass-through" command relying on the active LLM
+// worker to infer intent from bare text (that path is unwired dead code today, see
+// isPassThroughCommand's lack of any main.ts call site) and NOT natural-language PA_META
+// inference either, given this can push to origin/main and auto-merge a public PR.
+// Wiring (spawn `pa run commit-and-push`) is main.ts's job — this only owns the parser.
+export const COMMIT_AND_PUSH_PATTERN = /^\/commit_and_push(?:@\w+)?\s*$/i;
 
 // --- Worker tunables: /llm, /effort, /default <setting> [value] -------------
 // `/model` deliberately stays what it has always been (pick the CLI). These are
@@ -319,6 +332,73 @@ export function handleHelpCommand(): { matched: boolean; response: string } {
 
 export function isPassThroughCommand(userText: string): boolean {
   return PASS_THROUGH_PATTERN.test(userText);
+}
+
+export interface RetranscribeCommandResult {
+  matched: boolean;
+  /** Optional engine override, e.g. `/retranscribe groq` — threads to
+   * voice.ts's `engineOverride` (WP4). Undefined = 'auto'. */
+  engine?: string;
+}
+
+/** Parses `/retranscribe [engine]`. Pure — no I/O, no access to the replied
+ * message (WP6 does that: finds the media being replied to, calls
+ * findCachedAudio/transcribeVoiceMessage with this parsed engine override,
+ * and dispatches the result through the normal chain). */
+export function handleRetranscribeCommand(userText: string): RetranscribeCommandResult {
+  const match = RETRANSCRIBE_PATTERN.exec(userText);
+  if (!match) return { matched: false };
+  const engine = match[1]?.trim();
+  return { matched: true, engine: engine || undefined };
+}
+
+/** Duck-typed subset of a forwarded message's origin fields. Deliberately
+ * NOT imported from types.ts — forward_origin/forward_from/forward_sender_name
+ * land there in WP6; a real TelegramMessage satisfies this structurally once
+ * those fields exist. Covers both the modern `forward_origin` shape (Bot API
+ * 7.0+) and the legacy flat fields older clients/updates still send. */
+export interface ForwardableMessageLike {
+  forward_origin?: {
+    type: 'user' | 'hidden_user' | 'chat' | 'channel' | string;
+    sender_user?: { first_name?: string; username?: string };
+    sender_user_name?: string;
+    sender_chat?: { title?: string };
+    chat?: { title?: string };
+  };
+  forward_from?: { first_name?: string; username?: string };
+  forward_sender_name?: string;
+}
+
+/** Feeds voice.ts's `formatTranscriptUserText({ forwardedFrom })` (WP4).
+ * Scope: only wired for voice/audio/video_note forwards in this pass —
+ * forwarded-*text* attribution is deliberately deferred (widest blast radius
+ * of any single-line change in this wave; see the plan's "out of scope"). */
+export function describeForwardOrigin(msg: ForwardableMessageLike): string | undefined {
+  const origin = msg.forward_origin;
+  if (origin) {
+    switch (origin.type) {
+      case 'user':
+        return origin.sender_user?.first_name || origin.sender_user?.username || undefined;
+      case 'hidden_user':
+        return origin.sender_user_name || 'a hidden user';
+      case 'chat':
+        return origin.sender_chat?.title ? `the chat "${origin.sender_chat.title}"` : undefined;
+      case 'channel':
+        return origin.chat?.title ? `the chat "${origin.chat.title}"` : undefined;
+      default:
+        return undefined;
+    }
+  }
+
+  // Legacy fields (pre-forward_origin Bot API updates).
+  if (msg.forward_from) {
+    return msg.forward_from.first_name || msg.forward_from.username || undefined;
+  }
+  if (msg.forward_sender_name) {
+    return msg.forward_sender_name;
+  }
+
+  return undefined;
 }
 
 /**

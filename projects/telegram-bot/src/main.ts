@@ -1,6 +1,6 @@
 import { spawn, execFile } from 'child_process';
 import { randomBytes, randomUUID } from 'crypto';
-import { existsSync, unlinkSync, statSync, writeFileSync, mkdirSync } from 'fs';
+import { existsSync, unlinkSync, writeFileSync, mkdirSync } from 'fs';
 import { readdir, unlink, rename, writeFile, readFile, stat } from 'fs/promises';
 import { join } from 'path';
 import { acquireLock, releaseLock } from './lock.js';
@@ -49,6 +49,9 @@ import {
   renderTunableReport,
   renderTunableSetResult,
   renderTunableClearResult,
+  handleRetranscribeCommand,
+  describeForwardOrigin,
+  COMMIT_AND_PUSH_PATTERN,
   type TunableCommand,
 } from './logic.js';
 import {
@@ -76,18 +79,18 @@ import {
   isSessionValid,
   discoverGeminiSessionId,
   buildResumeArgs,
-  cleanupExpiredSessions,
   getPriorSessionPath,
 } from './session.js';
 import { computeBackoff, computePollOffset, LONG_POLL_TIMEOUT } from './poll.js';
 import { WatermarkTracker } from './watermark.js';
 import { appendDlq, flushDlq } from './dlq.js';
-import { deliveredKey, wasDelivered, markDelivered, compactDelivered } from './delivered-store.js';
+import { deliveredKey, wasDelivered, markDelivered } from './delivered-store.js';
 import { addPendingDispatch, removePendingDispatch, pendingDispatchKey, listPendingDispatches } from './pending-dispatches.js';
 import { reapOrphanedDispatches } from './orphan-reaper.js';
 import { isTopicRecovering } from './recovery-gate.js';
 import { isDegraded, startHealthProbe } from './health.js';
 import { parseStopSteer, stopTopicWorkers, markTopicStopped, unmarkTopicStopped, isTopicStopped, consumeTopicStopped } from './worker-stop.js';
+import { registerQueuedUpdate, dequeueUpdate, drainQueuedText, type QueueEntry } from './topic-queue.js';
 import { updateDashboard } from './dashboard.js';
 import type { ConversationState, SessionInfo, PAMeta, ModelStatusSnapshot, ModelStatusReasonCode } from './types.js';
 import { loadTopicNames, updateTopicName, setTopicDescription, extractTopicEvent, loadBranches, addBranch, removeBranch, findBranchParent, getTopicName, type TopicNameMap, type BranchIndex } from './topic-names.js';
@@ -99,6 +102,16 @@ import {
   normalizeResumeAction,
   redactAuthCommand,
 } from './oauth.js';
+import {
+  transcribeVoiceMessage,
+  formatTranscriptUserText,
+  formatFailedTranscriptUserText,
+  voiceErrorMessage,
+  extractAudioAttachment,
+  findCachedAudio,
+  type AudioAttachmentKind,
+} from './voice.js';
+import { resolveReplyContext } from './reply-context.js';
 
 // Import pa modules
 import { loadSecrets } from '../../../pa/dist/src/secrets.js';
@@ -110,9 +123,11 @@ import type { CommandResult, FailoverNotifyPayload, WorkerConfig } from '../../.
 import { logger } from '../../../pa/dist/src/lib/log.js';
 import { formatIST } from '../../../pa/dist/src/ist.js';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
-import { RUNTIME_ARCHIVE_MAX_BYTES } from '../../../pa/dist/src/lib/archive-files.js';
 import { resolvePythonCommand } from '../../../pa/dist/src/lib/python.js';
 import { paHome } from '../../../pa/dist/src/paths.js';
+import { runDueJobs } from '../../../pa/dist/src/lib/maintenance/runner.js';
+import { updateJobState } from '../../../pa/dist/src/lib/maintenance/state.js';
+import { createBotMaintenanceJobs } from './maintenance-jobs.js';
 
 /** Topic keys created by /branch — signals forum_topic_created to skip description */
 const branchCreatedTopicKeys = new Set<string>();
@@ -173,7 +188,6 @@ export function buildDispatchExtraArgs(
   return merged.length > 0 ? merged : undefined;
 }
 
-const MODEL_SWEEP_INTERVAL_MS = 60_000;
 // Skip topics idle beyond this in the sweep — avoids O(all-topics-ever) lock+
 // read+hydrate work for topics nobody's using. Safe: nothing else discovers
 // topics via directory scan (/branch, /child-of, /merge, ref-lookup all
@@ -184,10 +198,12 @@ const MODEL_SWEEP_INTERVAL_MS = 60_000;
 // status-card refresh on a topic nobody is looking at. See
 // plans/2026-07-08-autonomous-scale-longevity-hardening-phase2.md.
 const TOPIC_SWEEP_STALE_MS = 7 * 24 * 60 * 60 * 1000;
-// Periodic steady-state maintenance (the startup IIFE runs these once; the
-// daemon runs for months, so they must also fire on an interval).
-const MAINTENANCE_INTERVAL_MS = 5 * 60 * 1000;      // DLQ flush/retry + delivered-store compaction
-const SESSION_GC_INTERVAL_MS = 6 * 60 * 60 * 1000;  // worker-session TTL prune (heavier full-tree scan)
+// Cap on how long graceful shutdown waits for an in-flight bot maintenance
+// pass. Bounded because dlq-flush can stall for minutes during a Telegram
+// outage. Uses a real timer, NOT the injected sleepFn — tests inject a
+// fast-forwarding sleep that would win the race instantly and reintroduce the
+// exact ordering flake the drain exists to prevent.
+const MAINTENANCE_DRAIN_MS = 10_000;
 
 function topicKeyFor(chatId: number, threadId: number): string {
   return `${chatId}_${threadId}`;
@@ -321,10 +337,11 @@ async function maybeUpdatePinnedStatusAfterDispatch(
 export async function runExpiredModelOverrideSweep(
   token: string,
   chatIds: number[]
-): Promise<void> {
+): Promise<number> {
   const topicRefs = await listTopicStateRefs();
-  if (topicRefs.length === 0) return;
+  if (topicRefs.length === 0) return 0;
 
+  let touched = 0;
   const allowedChatIds = new Set(chatIds);
   let config: any = { workers: [] };
   try { config = await loadConfig(); } catch {}
@@ -362,6 +379,7 @@ export async function runExpiredModelOverrideSweep(
         });
         await replacePinnedStatusCard(token, ref.chatId, ref.threadId, topicState, snapshot);
         await saveTopicState(topicState);
+        touched++;
         continue;
       }
 
@@ -369,6 +387,7 @@ export async function runExpiredModelOverrideSweep(
       if (expiredTunables.length > 0 || modelStatusNeedsRefresh(topicState.model_status, hydrated) || topicState.pinned_worker !== hydrated.current_worker) {
         syncModelStatusState(topicState, hydrated);
         await saveTopicState(topicState);
+        touched++;
       }
     } catch (err) {
       // Per-topic faults (corrupt JSON, transient send failure) must not abort the
@@ -379,12 +398,14 @@ export async function runExpiredModelOverrideSweep(
       await blackboard.releaseLock(resourceId, agentName, contextId);
     }
   }
+
+  return touched;
 }
 
-// Exported for unit testing.
-export function extractReplyContext(msg: { quote?: { text: string }; reply_to_message?: { text?: string; caption?: string } }): string | undefined {
-  return msg.quote?.text || msg.reply_to_message?.text || msg.reply_to_message?.caption;
-}
+// Moved to reply-context.ts (WP5/WP6, hardened voice-transcription plan) —
+// re-exported here so existing importers (poll-loop.test.ts) and the
+// pending-dispatch death-notice path keep working unchanged.
+export { extractReplyContext } from './reply-context.js';
 
 const NOTIFY_DEBOUNCE_MS = 10_000;
 const notifyDebounce = new Map<string, number>();
@@ -694,6 +715,26 @@ export async function dispatchMessage(
   let lastFailedSession: { worker: string; sessionId: string } | undefined;
   const config = await loadConfig();
 
+  // AI-092: /stop and /steer kill the worker running right now, so EVERY
+  // attempt below has to consult the marker — the between-phase checks alone
+  // left the whole failover cascade uncovered (2026-08-02: a /stop killed
+  // gemini mid-chain and claude answered the cancelled message anyway).
+  // Handed to pa's executor as `isCancelled`, which stops the cascade and
+  // suppresses the worker-exit page for the killed process.
+  const stopKey = resource.replace(/^topic-/, '');
+  // Never let a marker-lookup failure propagate: this predicate is read from
+  // inside a child process's close handler (pa's worker-exec), where a throw
+  // would be an unhandled exception in an event handler. Fail toward "not
+  // cancelled" — that is the pre-AI-092 behaviour — but say so loudly.
+  const isCancelled = () => {
+    try {
+      return isTopicStopped(stopKey, updateId);
+    } catch (err) {
+      logger.warn('worker-stop', `stop-marker check failed: ${(err as Error).message}`, { resource });
+      return false;
+    }
+  };
+
   if (currentSession && await isWorkerCoolingDown(currentSession.worker)) {     
     currentSession = undefined;
   }
@@ -718,10 +759,10 @@ export async function dispatchMessage(
       const worker = config.workers.find((w) => w.name === activeSession.worker);
       if (worker) {
         const prompt = await buildResumedPrompt(userText, replyContext, pendingDesc, topicNames, { omitStatic: workerSupportsSystemPrompt(activeSession.worker) });
-        const result = await executeWorker(worker, prompt, { cwd: effectiveCwd(state), env: secrets, extraArgs: buildDispatchExtraArgs(state, worker, buildResumeArgs(activeSession)), resource, agentName: activeSession.worker, contextId });
+        const result = await executeWorker(worker, prompt, { cwd: effectiveCwd(state), env: secrets, extraArgs: buildDispatchExtraArgs(state, worker, buildResumeArgs(activeSession)), resource, agentName: activeSession.worker, contextId, isCancelled });
         if (result.success) {
           dispatchResult = { result, worker: activeSession.worker, session: activeSession };
-        } else {
+        } else if (!isCancelled()) {
           const co = await tryClassifyAndNotify(activeSession.worker, result, result.sessionId ?? activeSession.session_id, worker, config, state, defaultWorker, onNotify);
           if (co.outcome === 'rate-limit') rateLimitedWorker = activeSession.worker;
           lastFailedSession = { worker: activeSession.worker, sessionId: result.sessionId ?? activeSession.session_id };
@@ -735,7 +776,7 @@ export async function dispatchMessage(
   if (!dispatchResult) {
     // AI-092: if the user /stop'd this topic while the (session) attempt above
     // was being killed, do NOT fail over to a fresh worker for a cancelled request.
-    if (isTopicStopped(resource.replace(/^topic-/, ''), updateId)) {
+    if (isCancelled()) {
       return { response: '', session: state.session, meta: null, workerError: true };
     }
     let freshResult: { result: CommandResult; worker: string } | undefined;
@@ -744,9 +785,9 @@ export async function dispatchMessage(
       if (preferredWorkerConfig) {
         const priorCtx = lastFailedSession ? { ...lastFailedSession, sessionPath: getPriorSessionPath(lastFailedSession.worker, lastFailedSession.sessionId, effectiveCwd(state)) } : undefined;
         const prompt = await buildPrompt(userText, state, topicNames, replyContext, pendingDesc, { omitStatic: workerSupportsSystemPrompt(preferredWorkerConfig.name), priorContext: priorCtx });
-        const prefResult = await executeWorker(preferredWorkerConfig, prompt, { cwd: effectiveCwd(state), env: secrets, extraArgs: buildDispatchExtraArgs(state, preferredWorkerConfig), resource, agentName: state.preferred_worker, contextId });
+        const prefResult = await executeWorker(preferredWorkerConfig, prompt, { cwd: effectiveCwd(state), env: secrets, extraArgs: buildDispatchExtraArgs(state, preferredWorkerConfig), resource, agentName: state.preferred_worker, contextId, isCancelled });
         if (prefResult.success) freshResult = { result: prefResult, worker: preferredWorkerConfig.name };
-        else {
+        else if (!isCancelled()) {
           const co = await tryClassifyAndNotify(state.preferred_worker, prefResult, prefResult.sessionId, preferredWorkerConfig, config, state, defaultWorker, onNotify);
           if (co.outcome === 'rate-limit') rateLimitedWorker = state.preferred_worker;
           lastFailedSession = { worker: state.preferred_worker!, sessionId: prefResult.sessionId ?? '' };
@@ -755,14 +796,19 @@ export async function dispatchMessage(
       }
     }
 
+    // The preferred attempt above may have been the one that got killed.
+    if (!freshResult && isCancelled()) {
+      return { response: '', session: state.session, meta: null, workerError: true };
+    }
+
     if (!freshResult && defaultWorker && !failedWorkers.has(defaultWorker) && !(await isWorkerCoolingDown(defaultWorker))) {
       const defaultWorkerConfig = config.workers.find((w) => w.name === defaultWorker);
       if (defaultWorkerConfig) {
         const priorCtxDef = lastFailedSession ? { ...lastFailedSession, sessionPath: getPriorSessionPath(lastFailedSession.worker, lastFailedSession.sessionId, effectiveCwd(state)) } : undefined;
         const prompt = await buildPrompt(userText, state, topicNames, replyContext, pendingDesc, { omitStatic: workerSupportsSystemPrompt(defaultWorkerConfig.name), priorContext: priorCtxDef });
-        const defResult = await executeWorker(defaultWorkerConfig, prompt, { cwd: effectiveCwd(state), env: secrets, extraArgs: buildDispatchExtraArgs(state, defaultWorkerConfig), resource, agentName: defaultWorker, contextId });
+        const defResult = await executeWorker(defaultWorkerConfig, prompt, { cwd: effectiveCwd(state), env: secrets, extraArgs: buildDispatchExtraArgs(state, defaultWorkerConfig), resource, agentName: defaultWorker, contextId, isCancelled });
         if (defResult.success) freshResult = { result: defResult, worker: defaultWorkerConfig.name };
-        else {
+        else if (!isCancelled()) {
           const co = await tryClassifyAndNotify(defaultWorker, defResult, defResult.sessionId, defaultWorkerConfig, config, state, defaultWorker, onNotify);
           if (co.outcome === 'rate-limit') rateLimitedWorker = rateLimitedWorker ?? defaultWorker;
           lastFailedSession = { worker: defaultWorker!, sessionId: defResult.sessionId ?? '' };
@@ -772,12 +818,24 @@ export async function dispatchMessage(
     }
 
     if (!freshResult) {
-      if (isTopicStopped(resource.replace(/^topic-/, ''), updateId)) {
+      if (isCancelled()) {
         return { response: '', session: state.session, meta: null, workerError: true };
       }
       const priorCtxFo = lastFailedSession ? { ...lastFailedSession, sessionPath: getPriorSessionPath(lastFailedSession.worker, lastFailedSession.sessionId, effectiveCwd(state)) } : undefined;
       const failoverPrompt = await buildPrompt(userText, state, topicNames, replyContext, pendingDesc, { omitStatic: false, priorContext: priorCtxFo });
-      freshResult = await runWithFailover(failoverPrompt, { cwd: effectiveCwd(state), env: secrets, resource, updateId, excludeWorkers: failedWorkers, onWorkerSwitch: async (payload) => { if (onNotify) await onNotify(payload); }, checkAvailable: async (w) => !(await isWorkerCoolingDown(w.name)), preferredWorker: state.preferred_worker, contextId });
+      freshResult = await runWithFailover(failoverPrompt, { cwd: effectiveCwd(state), env: secrets, resource, updateId, excludeWorkers: failedWorkers, onWorkerSwitch: async (payload) => { if (onNotify) await onNotify(payload); }, checkAvailable: async (w) => !(await isWorkerCoolingDown(w.name)), preferredWorker: state.preferred_worker, contextId, isCancelled });
+      // The cascade stopped because the caller cancelled. Return the same shape
+      // as the other three cancellation exits — crucially with the session
+      // UNCHANGED: a killed run's session id must not become the topic's.
+      //
+      // Guarded on FAILURE only. A worker that finished a fraction of a second
+      // before the kill landed produced a real answer, and the reply path's
+      // consumeTopicStopped deliberately keeps it ("if the worker actually
+      // finished before the kill landed, keep its real reply"). Bailing on a
+      // successful result here would throw that answer away.
+      if (!freshResult.result.success && isCancelled()) {
+        return { response: '', session: state.session, meta: null, workerError: true };
+      }
     }
 
     let newSession: SessionInfo | undefined;
@@ -824,9 +882,26 @@ export async function dispatchMessage(
 function isAcceptableUpdate(update: any, allowedChatIds: Set<number>): boolean {
   const msg = update?.message;
   if (!msg) return false;
-  if (!msg.text && !msg.caption) return false;
+  if (!msg.text && !msg.caption && !msg.voice && !msg.audio && !msg.video_note) return false;
   if (!allowedChatIds.has(msg.chat?.id)) return false;
   return true;
+}
+
+/** Same shape isAcceptableUpdate/processUpdate agree on for the real archived
+ * text (hardened plan WP6 item 3): a voice/audio/video_note marker wins over
+ * a caption, matching formatTranscriptUserText's own precedence, rather than
+ * the caption winning as the placeholder previously did. Kept in this file,
+ * next to isAcceptableUpdate, for the same reason that predicate is — so the
+ * two checks can't silently drift apart. An audio-mime document is left as a
+ * plain caption dispatch here too — the "not transcribed" hint text only
+ * exists on the real (post-transcription-attempt) path, not the placeholder. */
+function placeholderDispatchText(msg: any): string {
+  const kind: AudioAttachmentKind | undefined = msg.voice ? 'voice' : msg.audio ? 'audio' : msg.video_note ? 'video_note' : undefined;
+  if (kind) {
+    const label = kind === 'voice' ? '[Voice message]' : kind === 'audio' ? '[Audio file]' : '[Video note]';
+    return msg.caption ? `${label} ${msg.caption}`.trim() : label;
+  }
+  return (msg.text || msg.caption || '').trim();
 }
 
 async function processUpdate(
@@ -862,7 +937,10 @@ async function processUpdate(
   let userText = (msg.text || msg.caption || '').trim();
   const messageId = msg.message_id;
   const timestamp = new Date(msg.date * 1000).toISOString();
-  const replyContext = extractReplyContext(msg);
+  // Resolved later, inside the !skipWorker dispatch block (hardened plan WP6
+  // item 5) — needs topicState (not loaded yet) and is enrichment, not
+  // delivery, so skip-worker commands never pay for it.
+  let replyContext: string | undefined;
   const contextId = randomUUID();
 
   setMessageReaction(token, chatId, messageId, '👍').catch(() => {});
@@ -883,9 +961,51 @@ async function processUpdate(
     try { config = await loadConfig(); } catch {}
     let effectiveDefault = getEffectiveDefaultWorker(config, topicKey);
 
-    
+    // Hoisted above the voice-handling block (hardened plan WP6 item 4) —
+    // load-bearing: without this, a failed note's bracketed error text
+    // (>25 chars) would reach the pendingDescription branch below and
+    // silently rename the topic, since that branch used to be the first
+    // thing to see `userText` after this block ran.
     let response = '';
     let skipWorker = false;
+
+    const audioAttachment = extractAudioAttachment(msg);
+    if (audioAttachment) {
+      const vr = await transcribeVoiceMessage(token, chatId, audioAttachment.media, {
+        repoRoot: BOT_CWD,
+        env: runtimeEnv,
+        transcription: config.transcription,
+        threadId,
+      }, audioAttachment.kind);
+      const forwardedFrom = describeForwardOrigin(msg);
+      if (!vr.ok) {
+        // Archived (not discarded) — hardened plan WP6 item 4: falls through
+        // the SAME addTurn/saveTopicState/delivered-store/DLQ chain as any
+        // other skip-worker command below, instead of the old ad-hoc
+        // sendMessage+return that left zero trace beyond an orphaned .oga.
+        userText = formatFailedTranscriptUserText(audioAttachment.kind, vr.reason, { caption: msg.caption });
+        response = voiceErrorMessage(vr);
+        skipWorker = true;
+      } else {
+        userText = formatTranscriptUserText(vr.text, {
+          truncated: vr.truncated,
+          caption: msg.caption,
+          kind: audioAttachment.kind,
+          fileName: audioAttachment.media.file_name,
+          speakers: vr.speakers,
+          forwardedFrom,
+        });
+      }
+    } else if (msg.document?.mime_type && /^(audio|video)\//.test(msg.document.mime_type)) {
+      // Audio/video uploaded as a generic document — deliberately not routed
+      // through transcription (no `duration` field to pre-download-guard,
+      // and Telegram's own 20MB getFile ceiling makes a large one fail ugly;
+      // hardened plan WP6 item 1). One hint line so the caption isn't
+      // dispatched with no indication the attachment was ignored.
+      const hint = '[An audio file was attached as a document and was not transcribed. Re-send it as a voice note or audio message to have it transcribed.]';
+      userText = userText ? `${userText}\n\n${hint}` : hint;
+    }
+
     let archivedUserText = userText;
     const workerExpired = expirePreferredWorker(topicState);
     // Session-tier tunables share preferred_worker's IST-day lifecycle, but are
@@ -1005,6 +1125,61 @@ async function processUpdate(
         response = await handleTunableCommand(tunableCmd, topicState, config, effectiveDefault);
         skipWorker = true;
       }
+    }
+
+    // Hardened plan WP6 item 6: /retranscribe [engine], replying to a voice/
+    // audio/video_note message. Always re-transcribes AND dispatches the
+    // result through the normal chain (not a show-only mode) — simpler, one
+    // behavior to explain, per the plan.
+    if (!skipWorker) {
+      const rt = handleRetranscribeCommand(userText);
+      if (rt.matched) {
+        const target = extractAudioAttachment(msg.reply_to_message ?? {});
+        if (!target) {
+          response = 'Reply to a voice note or audio message with /retranscribe to try again.';
+          skipWorker = true;
+        } else {
+          const cachedPath = await findCachedAudio(chatId, target.media.file_unique_id).catch(() => undefined);
+          const vr = await transcribeVoiceMessage(token, chatId, target.media, {
+            repoRoot: BOT_CWD,
+            env: runtimeEnv,
+            transcription: config.transcription,
+            threadId,
+            engineOverride: rt.engine,
+            cachedPath,
+          }, target.kind);
+          if (!vr.ok) {
+            response = voiceErrorMessage(vr);
+            skipWorker = true;
+          } else {
+            const engineLabel = rt.engine ?? vr.engine;
+            await sendMessage(token, chatId, `🎙 Re-transcribed (${engineLabel}):\n\n${vr.text}`, messageId, threadId).catch(() => {});
+            userText = formatTranscriptUserText(vr.text, {
+              truncated: vr.truncated,
+              kind: target.kind,
+              fileName: target.media.file_name,
+              speakers: vr.speakers,
+            });
+            archivedUserText = userText;
+          }
+        }
+      }
+    }
+
+    // /commit_and_push — deterministic trigger for the commit-and-push skill
+    // (~/.pa/skills/commit-and-push/skill.md). All the actual git-safety logic
+    // lives in that skill file, not here — this block only spawns it, exactly
+    // like the PA_META run_skill dispatch below (:1221) does for LLM-inferred
+    // triggers, except this one is guaranteed to fire regardless of which
+    // worker/model is active, since a git push + possible public-mirror
+    // auto-merge is consequential enough to not depend on LLM inference from
+    // a bare slash command. The skill's own telegram_output always reports to
+    // the fixed "My PA" general topic (thread 0), not back to wherever this
+    // was triggered from — the ack message below says so explicitly.
+    if (!skipWorker && COMMIT_AND_PUSH_PATTERN.test(userText)) {
+      spawn('pa', ['run', 'commit-and-push'], { cwd: BOT_CWD, detached: true, stdio: 'ignore', shell: true }).unref();
+      response = '🚀 Kicked off `commit-and-push` — it reports back in the main "My PA" topic when done, not necessarily here.';
+      skipWorker = true;
     }
 
     // AI-028: /branch <name> — create a child topic linked to this one.
@@ -1135,6 +1310,11 @@ async function processUpdate(
         userText: archivedUserText, startedAt: new Date().toISOString(),
         cwd: effectiveCwd(topicState), session: topicState.session,
       }).catch((err) => logger.warn('dispatch', 'failed to persist pending dispatch', { error: String(err) }));
+      // Hardened plan WP6 item 5: resolved here (not at receipt) so a slow
+      // archive scan never delays the crash-recovery record above, and so
+      // skip-worker commands (the majority of reply-shaped traffic) never
+      // pay for it at all.
+      replyContext = await resolveReplyContext(msg, topicState).catch(() => undefined);
       if (!isDegraded()) await sendTyping(token, chatId, threadId);
       // Skip typing while DEGRADED (AI-096): under I/O starvation these calls
       // only queue more doomed work ahead of the reply send.
@@ -1211,18 +1391,6 @@ function getUpdateTopicKey(update: any): string {
   return chatId ? `${chatId}_${threadId}` : 'non-message';
 }
 
-async function checkBotLogRotation(): Promise<boolean> {
-  const logPath = join(paHome(), 'logs', 'telegram-bot.log');
-  try {
-    const s = statSync(logPath);
-    if (s.size > RUNTIME_ARCHIVE_MAX_BYTES) {
-      logger.info('bot', `log file exceeded limit (${(s.size / 1024 / 1024).toFixed(1)}MB) — triggering self-restart for rotation`);
-      return true;
-    }
-  } catch {}
-  return false;
-}
-
 export async function runPollLoop(
   token: string,
   chatIds: number[],
@@ -1238,69 +1406,82 @@ export async function runPollLoop(
   let pollOffset = state.last_update_id;
   const inFlight = new Set<Promise<void>>();
   const topicPending = new Map<string, Promise<void>>();
-  let nextSweepAt = 0;
-  let nextLogCheckAt = 0;
-  // Seeded one interval out: the startup IIFE already ran flushDlq + session GC once.
-  let nextMaintenanceAt = Date.now() + MAINTENANCE_INTERVAL_MS;
-  let nextSessionGcAt = Date.now() + SESSION_GC_INTERVAL_MS;
-  // In-flight guard: a flush during a sustained outage retries every queued
-  // entry over the network and can outlive the 5-min interval; without this,
-  // each tick would queue ANOTHER full flush behind dlq.ts's FIFO mutex —
-  // starving live reply-path appendDlq calls that share it. Skipped ticks are
-  // fine: the next free tick picks up the whole queue.
-  let maintFlushInFlight = false;
   let consecutiveErrors = 0; // drives escalating getUpdates backoff (capped at MAX_BACKOFF_MS)
+
+  // Declared bot-host maintenance (AI-100 Wave 2). Replaces the four hand-rolled
+  // next*At timers that used to live in this loop — DLQ flush, delivered-store
+  // compaction, model-override sweep, bot-log rotation check — plus the session
+  // GC tick, which is gone entirely (it is the pa-host `session-gc` job now).
+  // Cadences, retention targets and shed policy: ./maintenance-jobs.ts.
+  const botJobs = createBotMaintenanceJobs({
+    token,
+    chatIds,
+    sentinelPath,
+    runModelSweep: runExpiredModelOverrideSweep,
+  });
+  // Read ONCE: a config.yaml read on every <=30s iteration is not free on this
+  // disk. Changing config.maintenance for a bot job needs a bot restart.
+  let maintenanceOverrides: Record<string, { enabled?: boolean; everyMs?: number }> | undefined;
+  try { maintenanceOverrides = (await loadConfig()).maintenance; } catch {}
+  // Cold-start seeding (AI-100 Wave 2): dlq-flush, delivered-store-compact and
+  // proxy-pool-refresh mirror the OLD setInterval-based timers, none of which
+  // fired on their very first tick (setInterval always waits one full interval
+  // before its first call; nextMaintenanceAt was seeded to now+interval on
+  // EVERY runPollLoop entry, not just once ever). A freshly-created ledger
+  // entry is otherwise ALWAYS due on its first decideJob check
+  // (lastRunAtMs === null) — so without this, these three would fire on every
+  // single bot restart instead of waiting one interval, changing production
+  // behavior and breaking poll-loop.test.ts's protected "does not fire the
+  // tick before the interval elapses" test. model-override-sweep and
+  // bot-log-rotation-check are DELIBERATELY excluded — they mirror
+  // nextSweepAt/nextLogCheckAt, both seeded to 0 in the old code (due
+  // immediately on the very first pass, every restart).
+  const coldStartAt = Date.now();
+  for (const name of ['dlq-flush', 'delivered-store-compact', 'proxy-pool-refresh']) {
+    await updateJobState(name, (prev) => ({ ...prev, lastRunAt: new Date(coldStartAt).toISOString() })).catch(() => {});
+  }
+  // Throttle the KICK, not the pass-in-flight state — deliberately NOT a
+  // "skip if a previous pass hasn't settled yet" guard. `maintenanceKickDueAt`
+  // only advances on an actual kick, so the due-check survives an unsettled
+  // prior pass and keeps re-firing every iteration once due — the OLD
+  // per-timer gates (`Date.now() >= nextXAt`) worked the same way, and this
+  // is required to satisfy poll-loop.test.ts's protected maintenance-tick
+  // tests, whose mocked getUpdates resolves near-instantly (no real 30s
+  // long-poll gap for a settling pass to hide inside, so a settlement-gated
+  // kick can miss a job's only due-check window entirely — verified 2026-08-03
+  // by trying the settlement-gated version against those exact tests).
+  // Safety against duplicate concurrent execution of the SAME job is Wave 1's
+  // existing per-job IN_FLIGHT guard in runner.ts, not a pass-level lock
+  // here; any overlap between two kicks just means some jobs report
+  // skipReason:'in-flight' on the later call, which is harmless and
+  // already-tested runner behavior. dlq-flush is ordered LAST in
+  // maintenance-jobs.ts so a stalled flush never delays the cheap jobs
+  // sharing its pass. The interval is well under the smallest declared job
+  // cadence (model-override-sweep, 60s) so responsiveness is unaffected;
+  // it's there to bound ledger-write frequency when timeout=0 makes
+  // iterations rapid-fire during a message burst.
+  const MAINTENANCE_KICK_INTERVAL_MS = 20_000;
+  let maintenanceKickDueAt = 0; // due on the very first iteration
+  const activeMaintenancePasses = new Set<Promise<unknown>>();
 
   while (!signal.aborted) {
     if (sentinelPath && existsSync(sentinelPath)) break;
 
-    if (!isDegraded() && Date.now() >= nextLogCheckAt) {
-      if (await checkBotLogRotation() && sentinelPath) {
-        writeFileSync(sentinelPath, String(Date.now()));
-        break;
-      }
-      nextLogCheckAt = Date.now() + 10 * 60 * 1000;
-    }
-
-    // Periodic steady-state maintenance. The startup IIFE runs DLQ flush and
-    // session GC once, but on a months-long daemon they must re-run so failed
-    // replies actually retry (fixes silent DLQ loss) and session/delivered-store
-    // growth stays bounded. Fire-and-forget — never delays getUpdates.
-    //
-    // The DLQ flush deliberately runs even while DEGRADED: it IS reply
-    // delivery, not cosmetic work — shedding it for >24h would let queued
-    // replies hit the DLQ TTL and silently expire, the exact invariant
-    // violation Phase 1 fixed. It's network-bound (not the disk pressure
-    // DEGRADED signals) with an ENOENT fast-path when the queue is empty.
-    // compactDelivered and session GC are fs-bound housekeeping and ARE shed.
-    if (Date.now() >= nextMaintenanceAt) {
-      nextMaintenanceAt = Date.now() + MAINTENANCE_INTERVAL_MS;
-      if (!maintFlushInFlight) {
-        maintFlushInFlight = true;
-        void flushDlq(token)
-          .then((r) => { if (r.delivered > 0) logger.info('maintenance', 'DLQ retry delivered queued replies', { delivered: r.delivered, remaining: r.remaining }); })
-          .catch((err) => logger.warn('maintenance', `DLQ flush failed: ${(err as Error).message}`))
-          .finally(() => { maintFlushInFlight = false; });
-      }
-      if (!isDegraded()) {
-        void compactDelivered()
-          .then((n) => { if (n > 0) logger.info('maintenance', 'delivered-store compacted', { dropped: n }); })
-          .catch((err) => logger.warn('maintenance', `delivered-store compaction failed: ${(err as Error).message}`));
-      }
-    }
-    if (!isDegraded() && Date.now() >= nextSessionGcAt) {
-      nextSessionGcAt = Date.now() + SESSION_GC_INTERVAL_MS;
-      void cleanupExpiredSessions()
-        .then((n) => { if (n > 0) logger.info('maintenance', 'session GC pruned expired transcripts', { deleted: n }); })
-        .catch((err) => logger.warn('maintenance', `session GC failed: ${(err as Error).message}`));
+    // Fire-and-forget so it never delays getUpdates. Drained (bounded) at loop
+    // exit below so a shutdown never abandons a pass mid-flight — and so tests
+    // that abort inside the first getUpdates still observe the sweep's effects.
+    if (Date.now() >= maintenanceKickDueAt) {
+      maintenanceKickDueAt = Date.now() + MAINTENANCE_KICK_INTERVAL_MS;
+      const pass: Promise<unknown> = runDueJobs('bot', botJobs, {
+        degraded: isDegraded(),
+        overrides: maintenanceOverrides,
+      })
+        .catch((err) => logger.warn('maintenance', `bot maintenance pass failed: ${(err as Error).message}`))
+        .finally(() => { activeMaintenancePasses.delete(pass); });
+      activeMaintenancePasses.add(pass);
     }
 
     try {
-      // Model sweep is shed while DEGRADED (AI-096) — poll + replies come first.
-      if (!isDegraded() && Date.now() >= nextSweepAt) {
-        await runExpiredModelOverrideSweep(token, chatIds);
-        nextSweepAt = Date.now() + MODEL_SWEEP_INTERVAL_MS;
-      }
       const timeout = inFlight.size > 0 ? 0 : LONG_POLL_TIMEOUT;
       const updates = await getUpdates(token, computePollOffset(pollOffset), timeout, signal);
       consecutiveErrors = 0; // successful poll — reset backoff
@@ -1316,6 +1497,13 @@ export async function runPollLoop(
           const stopReq = stopMsg && allowedChatIds.has(stopMsg.chat?.id)
             ? parseStopSteer((stopMsg.text ?? '').trim())
             : null;
+          // Computed once, up front, and reused for the stop/steer marker key,
+          // the topic-queue key, and the topicPending key below — all three
+          // MUST agree (2026-08-04 steer-queue-context-fold: verified the
+          // pre-existing `${chatId}_${threadId}` marker key already matches
+          // this helper's output exactly, so there's no format drift to
+          // reconcile; this hoist just removes the duplicate computation).
+          const topicKey = getUpdateTopicKey(update);
           if (stopReq && stopMsg) {
             const sChatId = stopMsg.chat.id;
             const sThreadId = stopMsg.message_thread_id ?? 0;
@@ -1338,9 +1526,21 @@ export async function runPollLoop(
               }
             })().catch((err) => logger.warn('worker-stop', `stop/steer failed: ${(err as Error).message}`));
             if (stopReq.kind === 'stop') continue; // fully handled out-of-band
-            stopMsg.text = stopReq.prompt!;        // steer → normal chain with the prompt
+            // Fold every not-yet-started update still queued behind the one
+            // just killed into the steer prompt (shell-flush-on-Ctrl+C
+            // semantics), in arrival order, steer prompt last — instead of
+            // letting them run independently once the kill settles, or
+            // dispatching the steer prompt only after they've all finished.
+            // Deliberately synchronous (does NOT await the kill IIFE above):
+            // drainQueuedText acts on the in-memory topic-queue, not the
+            // OS-process/PID registry the kill touches, so there's nothing to
+            // race — and awaiting it here would serialize this whole batch's
+            // remaining updates behind the kill's PID-list read.
+            const queuedTexts = drainQueuedText(topicKey);
+            stopMsg.text = queuedTexts.length > 0
+              ? [...queuedTexts, stopReq.prompt!].join('\n\n')
+              : stopReq.prompt!;                 // steer → normal chain with the prompt
           }
-          const topicKey = getUpdateTopicKey(update);
           // AI-095 follow-up (deep-recheck 2026-07-08, Phase 1A): persist a
           // minimal placeholder record for this update BEFORE it's chained
           // into topicPending — a same-topic update queued behind a
@@ -1352,17 +1552,24 @@ export async function runPollLoop(
           // the update with zero trace. Awaited here, synchronously within
           // the loop, so it is guaranteed on disk before saveState(state).
           let enqKey: string | undefined;
+          let queueEntry: QueueEntry | undefined;
           if (isAcceptableUpdate(update, allowedChatIds) && update.message) {
             const m = update.message;
             const eChatId = m.chat.id;
             const eThreadId = m.message_thread_id ?? 0;
+            const userText = placeholderDispatchText(m);
             enqKey = pendingDispatchKey(eChatId, eThreadId, update.update_id);
+            // Registered BEFORE addPendingDispatch/chaining so a /steer arriving
+            // later in this same batch (processed further down this same loop)
+            // can already see this update as "queued" and fold it in — see
+            // topic-queue.ts.
+            queueEntry = registerQueuedUpdate(topicKey, update.update_id, userText);
             await addPendingDispatch({
               updateId: update.update_id,
               chatId: eChatId,
               threadId: eThreadId,
               messageId: m.message_id,
-              userText: (m.text || m.caption || '').trim(),
+              userText,
               startedAt: new Date().toISOString(),
               // Deliberately no cwd/session — those aren't known until
               // topicState loads inside processUpdate. The dispatch-time
@@ -1374,16 +1581,26 @@ export async function runPollLoop(
           }
           const prev = topicPending.get(topicKey) ?? Promise.resolve();
           const p: Promise<void> = prev
-            .then(() => processUpdate(update, token, allowedChatIds, secrets, topicNames, branchIndex))
+            .then(() => {
+              // "No longer just queued, now starting" — must run BEFORE the
+              // cancelled check so a stale entry never lingers in the topic
+              // queue past this update's own dispatch turn.
+              if (queueEntry) {
+                dequeueUpdate(topicKey, queueEntry);
+                if (queueEntry.cancelled) return; // folded into an earlier /steer — do not dispatch on its own
+              }
+              return processUpdate(update, token, allowedChatIds, secrets, topicNames, branchIndex);
+            })
             .catch((err) => logger.warn('poll', `processUpdate rejected: ${(err as Error).message}`, { update_id: update.update_id }))
             .finally(async () => {
               inFlight.delete(p);
               if (topicPending.get(topicKey) === p) topicPending.delete(topicKey);
               // Single choke point covering every processUpdate exit path
-              // (dispatch, skip-worker command, or a thrown exception) — a
-              // normal dispatch already removed its own (upgraded) record at
-              // :1018, making this a safe no-op; anything else that left the
-              // placeholder behind gets cleaned up here.
+              // (dispatch, skip-worker command, a cancelled/folded entry, or a
+              // thrown exception) — a normal dispatch already removed its own
+              // (upgraded) record at :1018, making this a safe no-op; anything
+              // else that left the placeholder behind (including a cancelled
+              // entry, which never reaches :1018) gets cleaned up here.
               if (enqKey) await removePendingDispatch(enqKey).catch(() => {});
             });
           topicPending.set(topicKey, p);
@@ -1398,6 +1615,20 @@ export async function runPollLoop(
     }
   }
   if (inFlight.size > 0) await Promise.allSettled(inFlight);
+  // Bounded drain: waits for every currently in-flight maintenance pass (there
+  // can be more than one — kicks are throttled by time, not by whether a prior
+  // pass has settled, see above), not just the most recently kicked one.
+  if (activeMaintenancePasses.size > 0) {
+    let drainTimer: NodeJS.Timeout | undefined;
+    await Promise.race([
+      Promise.allSettled(activeMaintenancePasses),
+      new Promise<void>((resolve) => {
+        drainTimer = setTimeout(resolve, MAINTENANCE_DRAIN_MS);
+        drainTimer.unref?.();
+      }),
+    ]);
+    if (drainTimer) clearTimeout(drainTimer);
+  }
 }
 
 async function main(): Promise<void> {
@@ -1422,7 +1653,8 @@ async function main(): Promise<void> {
       // No-op unless TELEGRAM_PROXY_SOURCE_URL is set. Direct-first fetches work
       // without it, so this need not gate the poll loop.
       await startProxyAutoRefresh(token).catch(() => {});
-      await cleanupExpiredSessions().catch(() => {});
+      // Session GC is the pa-host `session-gc` maintenance job (AI-100 Wave 1);
+      // the bot's own poll-loop tick was removed in Wave 2.
       // AI-095: don't kill orphan workers still serving a crashed-instance dispatch —
       // the reaper below waits for them and harvests their reply instead.
       const pendingAtStartup = await listPendingDispatches().catch(() => [] as Awaited<ReturnType<typeof listPendingDispatches>>);

@@ -27,6 +27,8 @@ export const BOT_COMMANDS: BotCommand[] = [
   { command: 'keepawake', description: 'Toggle machine keep-awake mode' },
   { command: 'stop', description: 'Kill the worker currently running in this topic' },
   { command: 'steer', description: 'Kill the running worker and resume the session with a new prompt (/steer <prompt>; no prompt = /stop)' },
+  { command: 'retranscribe', description: 'Re-transcribe the voice/audio/video note you replied to (optional engine override)' },
+  { command: 'commit_and_push', description: 'Update the brain, commit + push pending work, wait for CI, sync the public mirror if eligible' },
 
   // Pass-through Commands (skipWorker = false)
   { command: 'deep_plan', description: 'Detailed implementation planning skill' },
