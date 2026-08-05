@@ -61,8 +61,17 @@ export function extractFinalAssistantText(jsonl: string, afterIso: string): { te
     if (!Number.isFinite(ts) || ts <= after) continue;
     const content = entry.message?.content;
     let text = '';
-    if (typeof content === 'string') text = content;
-    else if (Array.isArray(content)) {
+    if (typeof content === 'string') {
+      text = content;
+    } else if (Array.isArray(content)) {
+      // A tool_use block anywhere in this message — even alongside text —
+      // means the turn wasn't finished: the model intended to call a tool
+      // and continue, so any text in the SAME message is mid-turn narration
+      // ("Now let me look at X"), not a final answer. Harvesting it as one
+      // (2026-07-27 incident: a narration-then-crash transcript was
+      // delivered to the user as "Recovered reply") is worse than the
+      // death notice — skip the whole entry rather than half of it.
+      if (content.some((b: any) => b?.type === 'tool_use')) continue;
       text = content
         .filter((b: any) => b?.type === 'text' && typeof b.text === 'string')
         .map((b: any) => b.text)

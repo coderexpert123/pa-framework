@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { addTurn, formatHistory, loadState, saveState, loadTopicState, saveTopicState, findHistoricalSessionTurns, findRecentTurnsByTopic, listTopicStateRefs } from '../conversation.js';
+import { addTurn, formatHistory, loadState, saveState, loadTopicState, saveTopicState, findHistoricalSessionTurns, findRecentTurnsByTopic, listTopicStateRefs, findArchivedTurnByMessageId } from '../conversation.js';
 import type { ConversationState, ConversationTurn } from '../types.js';
 
 let tempDir: string;
@@ -980,5 +980,80 @@ describe('findRecentTurnsByTopic', () => {
     assert.equal(result.length, 3);
     assert.equal(result[0].text, 'msg 5');
     assert.equal(result[2].text, 'msg 7');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// findArchivedTurnByMessageId (reply-context.ts's narrow archive fallback, WP5)
+// ---------------------------------------------------------------------------
+
+describe('findArchivedTurnByMessageId', () => {
+  async function writeArchive(turns: ConversationTurn[]): Promise<void> {
+    const archivePath = join(tempDir, 'conversation-history.jsonl');
+    const lines = turns.map((t) => JSON.stringify(t)).join('\n') + '\n';
+    await writeFile(archivePath, lines, 'utf8');
+  }
+
+  it('the message_id pre-filter string matches what JSON.stringify actually produces (no space after colon)', () => {
+    const turn: ConversationTurn = { role: 'user', text: 'hi', timestamp: '2026-01-01T00:00:00Z', message_id: 42, thread_id: 7 };
+    const line = JSON.stringify(turn);
+    const needle = `"message_id":${42}`;
+    assert.ok(line.includes(needle), `expected ${JSON.stringify(line)} to include ${JSON.stringify(needle)}`);
+  });
+
+  it('returns null when the archive does not exist', async () => {
+    assert.equal(await findArchivedTurnByMessageId(5, 42), null);
+  });
+
+  it('finds a matching user turn by thread_id + message_id', async () => {
+    await writeArchive([
+      { role: 'user', text: 'wrong thread', timestamp: '2026-01-01T00:00:00Z', thread_id: 99, message_id: 42 },
+      { role: 'user', text: '[Voice message] hello', timestamp: '2026-01-01T00:00:01Z', thread_id: 5, message_id: 42 },
+      { role: 'assistant', text: 'bot reply', timestamp: '2026-01-01T00:00:02Z', thread_id: 5, message_id: 42 },
+    ]);
+    const result = await findArchivedTurnByMessageId(5, 42);
+    assert.equal(result?.text, '[Voice message] hello');
+    assert.equal(result?.role, 'user');
+  });
+
+  it('never matches an assistant turn even with the same message_id', async () => {
+    await writeArchive([
+      { role: 'assistant', text: 'bot reply', timestamp: '2026-01-01T00:00:00Z', thread_id: 5, message_id: 42 },
+    ]);
+    assert.equal(await findArchivedTurnByMessageId(5, 42), null);
+  });
+
+  it('returns null when no turn matches', async () => {
+    await writeArchive([
+      { role: 'user', text: 'unrelated', timestamp: '2026-01-01T00:00:00Z', thread_id: 5, message_id: 1 },
+    ]);
+    assert.equal(await findArchivedTurnByMessageId(5, 999), null);
+  });
+
+  it('handles malformed JSON lines gracefully, never throwing', async () => {
+    const archivePath = join(tempDir, 'conversation-history.jsonl');
+    const good = JSON.stringify({ role: 'user', text: 'ok', timestamp: '2026-01-01T00:00:00Z', thread_id: 5, message_id: 42 });
+    await writeFile(archivePath, `{"message_id":42 but not valid json}\n${good}\n`, 'utf8');
+    const result = await findArchivedTurnByMessageId(5, 42);
+    assert.equal(result?.text, 'ok');
+  });
+
+  it('stops scanning on the first match (early exit)', async () => {
+    // A duplicate message_id later in the file must not overwrite the first
+    // match — proves streamArchiveLines' `return false` early-exit works.
+    await writeArchive([
+      { role: 'user', text: 'first match', timestamp: '2026-01-01T00:00:00Z', thread_id: 5, message_id: 42 },
+      { role: 'user', text: 'second match — should never be reached', timestamp: '2026-01-01T00:00:01Z', thread_id: 5, message_id: 42 },
+    ]);
+    const result = await findArchivedTurnByMessageId(5, 42);
+    assert.equal(result?.text, 'first match');
+  });
+
+  it('skips (returns null) when the live archive exceeds the 8MiB size guard', async () => {
+    const archivePath = join(tempDir, 'conversation-history.jsonl');
+    const matchingLine = JSON.stringify({ role: 'user', text: 'should not be found', timestamp: '2026-01-01T00:00:00Z', thread_id: 5, message_id: 42 });
+    const padding = 'x'.repeat(9 * 1024 * 1024);
+    await writeFile(archivePath, `${matchingLine}\n// ${padding}\n`, 'utf8');
+    assert.equal(await findArchivedTurnByMessageId(5, 42), null);
   });
 });

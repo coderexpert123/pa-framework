@@ -19,6 +19,7 @@ import { notifyCommand } from '../src/commands/notify-cmd.js';
 import { bgtasksCommand } from '../src/commands/bgtasks.js';
 import { refCommand } from '../src/commands/ref.js';
 import { improvementsCommand, acceptRollbackCommand } from '../src/commands/improvements.js';
+import { maintenanceCommand } from '../src/commands/maintenance.js';
 
 const USAGE = `
 pa — Personal Assistant CLI Dispatcher
@@ -47,6 +48,9 @@ Usage:
   pa ref <refId>              Look up what message produced a Ref ID (e.g. 'pa ref c-a59a')
   pa improvements [--since N] Eval self-improver's applied/rolled-back changes (default 30d)
   pa improvements accept <commit_hash> [--reason "..."]  Record a human decision to KEEP a commit whose rollback failed
+  pa maintenance list         List declared maintenance jobs + resolved target paths
+  pa maintenance status       Show the maintenance ledger (last run, outcome, skips)
+  pa maintenance run <job> [--dry-run]  Run one job now; --dry-run touches nothing
   pa help                     Show this help message
 `.trim();
 
@@ -183,6 +187,10 @@ async function main(): Promise<void> {
         }
         break;
       }
+
+      case 'maintenance':
+        await maintenanceCommand(args.slice(1));
+        break;
 
       case 'help':
       case '--help':

@@ -139,6 +139,24 @@ When you create a new file:
 
 If none of these fit, you're probably creating something that shouldn't exist. Reconsider.
 
+## Declared maintenance jobs
+
+Any recurring work that mutates durable state beyond the lifetime of one in-flight
+operation (deleting files, archiving records, rewriting a durable store) must be declared
+as a `MaintenanceJob` in `pa/src/lib/maintenance/registry.ts` — not a bare `setInterval`
+or a hand-rolled "next run at" timestamp check buried in application code. A destructive
+job declares its target paths, a fail-closed filename filter, a retention window, and
+dated evidence for why the framework is entitled to touch that path; `validateRegistry()`
+rejects a target that resolves outside an explicitly allowed root at build time, not in
+production.
+
+A timer scoped to a single in-flight operation with no durable side effect (a lock
+heartbeat, a typing keep-alive) doesn't need to become a job, but it does need a
+written-reason entry in `pa/tests/timer-inventory.test.ts`'s `TIMER_ALLOWLIST` — that test
+scans the framework source tree for undeclared timers and fails the build on anything
+neither declared nor allowlisted. `pa maintenance list` shows every declared job's
+resolved target paths; `pa maintenance status` shows what actually ran.
+
 ## Enforcement
 
 - **`.gitignore`** catches most patterns automatically — `git add` won't include them.

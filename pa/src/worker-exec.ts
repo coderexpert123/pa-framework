@@ -723,8 +723,13 @@ export async function executeWorker(
           .filter(Boolean).join('\n') || undefined;
         if (code !== 0) {
           logger.warn('worker-exec', 'spawn-failed', { worker: worker.name, exitCode: code, stderr_excerpt: (combinedError ?? '').slice(0, 1000) });
-          // Alert on non-zero exit (suppressed during mid-failover when suppressExitAlert is set)
-          if (!options.suppressExitAlert) {
+          // Alert on non-zero exit (suppressed during mid-failover when
+          // suppressExitAlert is set, and when the caller cancelled the run —
+          // a /stop-killed worker is a user action, not an outage worth paging).
+          // A throwing predicate must not escape this close handler.
+          let exitWasCancelled = false;
+          try { exitWasCancelled = options.isCancelled?.() === true; } catch { /* page as normal */ }
+          if (!options.suppressExitAlert && !exitWasCancelled) {
             const resourceKey = options.resource ?? 'unknown';
             notifyUser(
               `Worker exited with code ${code}: ${worker.name}`,

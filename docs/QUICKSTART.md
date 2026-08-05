@@ -77,6 +77,16 @@ PA_ALERTS_CHAT_ID=<chat ID for failure alerts>        # defaults to TELEGRAM_CHA
 PA_ALERTS_THREAD_ID=<forum thread ID, or 0 for general>
 ```
 
+For Telegram voice notes (optional — speech to text):
+
+```
+GROQ_API_KEY=<free key from https://console.groq.com/keys>   # transcribes voice notes in seconds
+```
+
+Without it, voice notes still work but fall back to a local speech model that takes
+**minutes** per note and needs extra Python packages plus `ffmpeg` — see
+[`BOT_GUIDE.md`](BOT_GUIDE.md#voice-messages-speech-to-text).
+
 See `examples/secrets.env.example` for the full annotated list.
 
 ## 5. OAuth setup (if using Gmail-based skills)

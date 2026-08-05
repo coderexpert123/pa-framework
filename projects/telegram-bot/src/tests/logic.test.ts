@@ -36,6 +36,9 @@ import {
   buildModelStatusSnapshot,
   hydrateModelStatus,
   modelStatusNeedsRefresh,
+  RETRANSCRIBE_PATTERN,
+  handleRetranscribeCommand,
+  describeForwardOrigin,
   type StatusCardArgs,
 } from '../logic.js';
 import type { PAMeta } from '../types.js';
@@ -2089,5 +2092,141 @@ describe('renderStatusCard', () => {
     });
     assert.ok(card.includes('Current: claude'));
     assert.ok(card.includes('Keep-awake: off'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// RETRANSCRIBE_PATTERN / handleRetranscribeCommand
+// ---------------------------------------------------------------------------
+
+describe('RETRANSCRIBE_PATTERN', () => {
+  it('matches bare /retranscribe', () => {
+    assert.ok(RETRANSCRIBE_PATTERN.test('/retranscribe'));
+  });
+
+  it('matches /retranscribe with an engine argument', () => {
+    assert.ok(RETRANSCRIBE_PATTERN.test('/retranscribe groq'));
+  });
+
+  it('matches with a bot-username suffix', () => {
+    assert.ok(RETRANSCRIBE_PATTERN.test('/retranscribe@my_bot'));
+  });
+
+  it('does not match unrelated text', () => {
+    assert.equal(RETRANSCRIBE_PATTERN.test('please retranscribe this'), false);
+  });
+
+  it('does not match a prefix-only command', () => {
+    assert.equal(RETRANSCRIBE_PATTERN.test('/retranscribed'), false);
+  });
+});
+
+describe('handleRetranscribeCommand', () => {
+  it('reports unmatched for non-command text', () => {
+    assert.deepEqual(handleRetranscribeCommand('hello there'), { matched: false });
+  });
+
+  it('matches bare /retranscribe with no engine override', () => {
+    const result = handleRetranscribeCommand('/retranscribe');
+    assert.equal(result.matched, true);
+    assert.equal(result.engine, undefined);
+  });
+
+  it('parses an explicit engine override', () => {
+    const result = handleRetranscribeCommand('/retranscribe groq');
+    assert.equal(result.matched, true);
+    assert.equal(result.engine, 'groq');
+  });
+
+  it('trims whitespace around the engine argument', () => {
+    const result = handleRetranscribeCommand('/retranscribe   openai  ');
+    assert.equal(result.matched, true);
+    assert.equal(result.engine, 'openai');
+  });
+
+  it('matches with a bot-username suffix and an engine', () => {
+    const result = handleRetranscribeCommand('/retranscribe@my_bot deepgram');
+    assert.equal(result.matched, true);
+    assert.equal(result.engine, 'deepgram');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// describeForwardOrigin
+// ---------------------------------------------------------------------------
+
+describe('describeForwardOrigin', () => {
+  it('returns undefined for a non-forwarded message', () => {
+    assert.equal(describeForwardOrigin({}), undefined);
+  });
+
+  it('named user: prefers first_name over username', () => {
+    assert.equal(
+      describeForwardOrigin({ forward_origin: { type: 'user', sender_user: { first_name: 'Alice', username: 'alice99' } } }),
+      'Alice',
+    );
+  });
+
+  it('named user: falls back to username when first_name is absent', () => {
+    assert.equal(
+      describeForwardOrigin({ forward_origin: { type: 'user', sender_user: { username: 'alice99' } } }),
+      'alice99',
+    );
+  });
+
+  it('hidden user: uses sender_user_name when present', () => {
+    assert.equal(
+      describeForwardOrigin({ forward_origin: { type: 'hidden_user', sender_user_name: 'Anonymous Panda' } }),
+      'Anonymous Panda',
+    );
+  });
+
+  it('hidden user: falls back to a generic label when sender_user_name is absent', () => {
+    assert.equal(
+      describeForwardOrigin({ forward_origin: { type: 'hidden_user' } }),
+      'a hidden user',
+    );
+  });
+
+  it('chat title', () => {
+    assert.equal(
+      describeForwardOrigin({ forward_origin: { type: 'chat', sender_chat: { title: 'Family Group' } } }),
+      'the chat "Family Group"',
+    );
+  });
+
+  it('channel title', () => {
+    assert.equal(
+      describeForwardOrigin({ forward_origin: { type: 'channel', chat: { title: 'News Channel' } } }),
+      'the chat "News Channel"',
+    );
+  });
+
+  it('legacy forward_from: prefers first_name over username', () => {
+    assert.equal(
+      describeForwardOrigin({ forward_from: { first_name: 'Bob', username: 'bobby' } }),
+      'Bob',
+    );
+  });
+
+  it('legacy forward_sender_name', () => {
+    assert.equal(
+      describeForwardOrigin({ forward_sender_name: 'Legacy Sender' }),
+      'Legacy Sender',
+    );
+  });
+
+  it('forward_origin takes precedence over legacy fields when both are present', () => {
+    assert.equal(
+      describeForwardOrigin({
+        forward_origin: { type: 'user', sender_user: { first_name: 'Modern' } },
+        forward_from: { first_name: 'Legacy' },
+      }),
+      'Modern',
+    );
+  });
+
+  it('returns undefined for an unknown forward_origin type', () => {
+    assert.equal(describeForwardOrigin({ forward_origin: { type: 'something_new' } }), undefined);
   });
 });

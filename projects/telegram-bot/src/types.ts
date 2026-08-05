@@ -20,11 +20,29 @@ export interface TelegramMessage {
   caption?: string;
   photo?: Array<{ file_id: string; width: number; height: number; file_size?: number }>;
   document?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
+  voice?: { file_id: string; file_unique_id: string; duration: number; mime_type?: string; file_size?: number };
+  audio?: { file_id: string; file_unique_id: string; duration: number; mime_type?: string; file_size?: number; file_name?: string };
+  video_note?: { file_id: string; file_unique_id: string; duration: number; file_size?: number };
   reply_to_message?: TelegramMessage;
   quote?: { text: string; entities?: any[]; offset?: number; is_manual?: boolean };
   message_thread_id?: number;   // set on all messages in non-General forum topics
   forum_topic_created?: { name: string; icon_color: number; icon_custom_emoji_id?: string };
   forum_topic_edited?: { name?: string; icon_custom_emoji_id?: string };
+  // WP5/WP6 (hardened voice-transcription plan): forward attribution for
+  // voice/audio/video_note notes. Modern shape (Bot API 7.0+) is
+  // forward_origin; forward_from/forward_sender_name are the legacy flat
+  // fields older clients/updates still send. See logic.ts's describeForwardOrigin.
+  forward_origin?: {
+    type: 'user' | 'hidden_user' | 'chat' | 'channel' | string;
+    date: number;
+    sender_user?: { first_name?: string; username?: string };
+    sender_user_name?: string;
+    sender_chat?: { title?: string };
+    chat?: { title?: string };
+    author_signature?: string;
+  };
+  forward_from?: TelegramUser;
+  forward_sender_name?: string;
 }
 
 export interface TelegramUpdate {

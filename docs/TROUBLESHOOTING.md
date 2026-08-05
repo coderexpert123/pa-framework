@@ -201,6 +201,125 @@ The bot strips `[PA_META]` envelopes before sending. If your skill's intended Te
 
 Workaround: emit the literal text outside the `[PA_META]` envelope position (anywhere except the LAST line of output).
 
+## Voice-message transcription
+
+### "No transcription engine is set up yet"
+
+The default fresh-install case, and the one every new user hits first: no cloud API key is configured, and the local `transcription` package isn't installed either. The bot replies with the exact message:
+
+> 🎙 I got your voice note, but no transcription engine is set up yet.
+>
+> Quickest fix, about a minute: get a free key at https://console.groq.com/keys, add
+> `GROQ_API_KEY=<your key>` to `~/.pa/secrets.env`, then run `pa bot restart`. Voice notes
+> then transcribe in a few seconds.
+>
+> Prefer fully offline? See docs/TROUBLESHOOTING.md, "No transcription engine is set up yet".
+
+The 60-second fix:
+
+1. Get a free key at https://console.groq.com/keys.
+2. Add `GROQ_API_KEY=<your key>` to `~/.pa/secrets.env`.
+3. Restart the bot: `pa bot restart`.
+
+Fully offline instead (nothing leaves your machine, but slower and heavier): install the `transcription` Python package plus `ffmpeg` on PATH, then set `transcription: {engine_preference: local}` in `~/.pa/config.yaml`. Expect roughly a gigabyte of dependencies and minutes per voice note on CPU.
+
+See [`BOT_GUIDE.md`](BOT_GUIDE.md#voice-messages-speech-to-text) for the full picture.
+
+### "Local transcription needs ffmpeg"
+
+Per-platform install:
+
+```powershell
+# Windows
+choco install ffmpeg
+```
+
+```bash
+# macOS
+brew install ffmpeg
+
+# Linux
+apt install ffmpeg
+```
+
+The gotcha that matters here: the bot is started by Task Scheduler / systemd / launchd and **does not inherit an interactive shell's PATH**, so "it works in my terminal" is not sufficient — install machine-wide, or restart the supervisor after changing PATH.
+
+The cloud engine needs no ffmpeg at all.
+
+### "The transcription service rejected the API key"
+
+Check the `*_API_KEY` line matching the provider you configured (`GROQ_API_KEY`, `OPENAI_API_KEY`, or `DEEPGRAM_API_KEY`) in `~/.pa/secrets.env`. Usual causes: mistyped, expired, or out of quota/billing. Fix it, then `pa bot restart`.
+
+### "Voice notes suddenly got slow"
+
+The non-obvious one. Under `engine_preference: auto`, a dead or exhausted cloud key falls back to local transcription — minutes instead of seconds — so the symptom is latency, not an error.
+
+Diagnose by grepping `~/.pa/app.log.jsonl` for the `voice` component and a `fallback_from` field:
+
+```powershell
+Get-Content ~/.pa/app.log.jsonl | ConvertFrom-Json | Where-Object { $_.component -eq 'voice' -and $_.fallback_from }
+```
+
+```bash
+grep '"component":"voice"' ~/.pa/app.log.jsonl | grep fallback_from
+```
+
+### "Transcribing that voice note took too long and was cancelled"
+
+The 600-second timeout fired. Local transcription is slow because the speech model reloads on every note in `spawn` mode. Fixes, in order of effectiveness:
+
+1. Set a cloud key (`GROQ_API_KEY` etc.) — seconds instead of minutes.
+2. Switch to `transcription.worker_mode: persistent` in `~/.pa/config.yaml` — the model stays loaded between notes.
+3. Send shorter notes.
+
+Do **not** simply raise `PA_VOICE_TRANSCRIBE_TIMEOUT_MS` past 600000 — the bot's per-topic lock goes stale at exactly ten minutes, so a longer timeout lets a second voice note start transcribing concurrently.
+
+### "The first voice note after a break is slow again"
+
+Working as designed: persistent mode shuts down the local worker after `PA_VOICE_WORKER_IDLE_MS` (default 10 minutes) of idleness, so the next note after a gap pays the model-load cost again. Raise `PA_VOICE_WORKER_IDLE_MS` if you can spare the RAM — the trade-off is ~230 MB resident for longer.
+
+### "The background transcriber won't start"
+
+Inspect `~/.pa/voice-worker.json`. Then run the worker in the foreground to see the real error:
+
+```
+python pa/scripts/voice_worker.py
+```
+
+Two things you can't guess: a failed start **falls back to a one-off spawned process**, so the symptom is slowness rather than an error message, and `~/.pa/app.log.jsonl` records `fallback: persistent-unavailable` when that happens. A stale state file left by a hard kill is detected and replaced automatically — deleting it by hand is never required.
+
+To stop the worker deliberately:
+
+```bash
+python -c "import json,socket,os;s=json.load(open(os.path.expanduser('~/.pa/voice-worker.json')));c=socket.create_connection(('127.0.0.1',s['port']),5);c.sendall((json.dumps({'op':'shutdown','token':s['token']})+'\n').encode());print(c.makefile().readline())"
+```
+
+### "Nothing happens at all when I send a voice note"
+
+No 👍, no reply. Causes, in likelihood order:
+
+1. **The bot is running old code** — rebuild, `pa bot restart`, and check the new PID's start time against `dist/`'s mtime (this repo's standing gotcha).
+2. **The chat isn't listed in `TELEGRAM_CHAT_ID`.**
+3. **The bot isn't running at all** — `pa health`.
+
+Point at `~/.pa/app.log.jsonl` filtered to the `voice` component for whichever of the three it turns out to be.
+
+### "This file is too large to transcribe"
+
+The attachment (voice, audio, or video note) is larger than `PA_VOICE_MAX_FILE_BYTES` (default 20 MiB — Telegram's own bot-download ceiling), and is refused before any download happens. There's no way around this for a single attachment; split it or send a shorter clip.
+
+### "`/retranscribe` doesn't seem to do anything"
+
+`/retranscribe` (and `/retranscribe <engine>`, e.g. `/retranscribe groq`) must be sent as a **reply** to the voice/audio/video note you want redone — it has no effect on its own. If the original note's audio has aged out of the 30-day attachment cache, it's re-downloaded from Telegram automatically; if Telegram itself has since expired the file, the retry fails with the same error the original attempt would have hit.
+
+### Non-English notes come out garbled or transliterated instead of erroring
+
+You're on the local engine (`engine_preference: local`, or `auto` with no cloud key configured) — `small.en` is English-only and doesn't refuse non-English audio, it just does its best, which for another language is often a bad transliteration rather than a real transcript. This is expected, not a bug: set `transcription.language` in `~/.pa/config.yaml` and check `~/.pa/app.log.jsonl` for a config-load warning naming the mismatch, or switch to a cloud engine (`GROQ_API_KEY` etc.), which handles other languages properly.
+
+### A multi-speaker note isn't labelled `Speaker 1: / Speaker 2: `
+
+Speaker labelling only happens when **Deepgram** is the provider that actually transcribed the note (`cloud_order` includes `deepgram` and `DEEPGRAM_API_KEY` is set, and Deepgram was actually reached — not, say, Groq because it's earlier in `cloud_order`). Every other provider, and the local engine, always produce unlabelled single-block text, even for a note with multiple speakers.
+
 ## Cross-platform issues
 
 ### Platform capabilities
@@ -284,3 +403,4 @@ Tracked files use LF line endings. Git may warn `LF will be replaced by CRLF` on
 - [`SKILLS_GUIDE.md`](SKILLS_GUIDE.md) — skill authoring
 - [`WORKERS_GUIDE.md`](WORKERS_GUIDE.md) — worker setup
 - [`BOT_GUIDE.md`](BOT_GUIDE.md) — Telegram bot operation
+- [`BOT_GUIDE.md`](BOT_GUIDE.md#voice-messages-speech-to-text) — Voice messages (speech to text)

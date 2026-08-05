@@ -74,6 +74,20 @@ describe('extractFinalAssistantText', () => {
     assert.equal(extractFinalAssistantText(jsonl, T0)?.text, 'real text');
   });
 
+  it('skips a mid-turn narration entry that ALSO contains a tool_use block (2026-07-27 incident)', () => {
+    // The crash happened right after the model wrote narration + queued a
+    // tool call, before any tool_result or further assistant text landed.
+    // That narration must not be harvested as a "final reply".
+    const jsonl =
+      assistantLine('real text', '2026-07-03T15:01:00Z') +
+      line({
+        type: 'assistant',
+        timestamp: '2026-07-03T15:02:00Z',
+        message: { content: [{ type: 'text', text: 'Now let me look at the actual ref command implementation to find the hang.' }, { type: 'tool_use', name: 'Read' }] },
+      });
+    assert.equal(extractFinalAssistantText(jsonl, T0)?.text, 'real text');
+  });
+
   it('joins multiple text blocks and handles string content', () => {
     const jsonl =
       line({ type: 'assistant', timestamp: '2026-07-03T15:01:00Z', message: { content: [{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }] } }) +

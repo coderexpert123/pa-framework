@@ -248,8 +248,11 @@ export async function migrateStalenessAlertFile(): Promise<void> {
 }
 
 // --- Dedup GC ---
-export async function gcAlertState(): Promise<void> {
+/** Returns the number of dedup state files unlinked (including malformed
+ * files, which are always treated as stale and removed). */
+export async function gcAlertState(): Promise<number> {
   const dir = alertStateDir();
+  let removed = 0;
   try {
     const files = readdirSync(dir);
     const now = Date.now();
@@ -265,16 +268,27 @@ export async function gcAlertState(): Promise<void> {
 
         const storedWindow = typeof parsed.windowMs === 'number' ? parsed.windowMs : GC_MAX_AGE_MS;
         if (isNaN(ts) || now - ts > storedWindow) {
-          await unlink(filePath).catch(() => {}); // ENOENT race is fine
+          try {
+            await unlink(filePath);
+            removed++;
+          } catch {
+            // ENOENT race is fine — file already gone
+          }
         }
       } catch {
         // Malformed or corrupt file — treat as stale and delete
-        await unlink(filePath).catch(() => {});
+        try {
+          await unlink(filePath);
+          removed++;
+        } catch {
+          // already gone
+        }
       }
     }
   } catch {
     // Directory doesn't exist yet — nothing to GC
   }
+  return removed;
 }
 
 /**

@@ -255,12 +255,97 @@ Ref-IDs appear in alert bodies as `_Ref: l-AB12_` (italicized). To resolve a ref
 2. **Parallel processing** — `Promise.all` handles the batch concurrently.
 3. **Per-topic serialization** — each topic (`chat_id`+`thread_id`) is serialized via the blackboard lock. Two messages in the same topic are processed sequentially; messages in different topics run in parallel.
 4. **Acknowledge** — the bot reacts to the user's message with 👍 immediately (`setMessageReaction`).
-5. **Build prompt** — `src/context.ts:buildPrompt()` assembles identity + capabilities + conversation history + current message.
-6. **Choose worker** — explicit `/model <name>` per-topic preference > `topic_defaults` map > priority order.
-7. **Spawn worker** — via `pa/src/workers.ts:executeWorker()`.
-8. **Clean output** — `src/logic.ts:parseMetadata()` strips `[PA_META]` envelopes, identifies confirmation patterns, applies sanitization for Telegram markdown.
-9. **Send** — `src/telegram.ts:sendToTelegram()` with auto-chunking for >4000-char messages.
-10. **Persist** — turn appended to `~/.pa/telegram-bot-topic-<ids>.json` (rolling 20-turn window) and `~/.pa/conversation-history.jsonl` (permanent archive).
+5. **Transcribe (voice notes, audio files, video notes)** — if the message carries voice, audio-file, or video-note media rather than plain text, it is downloaded and transcribed first, and the transcript becomes the message text for every step below. See [Voice messages (speech to text)](#voice-messages-speech-to-text).
+6. **Build prompt** — `src/context.ts:buildPrompt()` assembles identity + capabilities + conversation history + current message.
+7. **Choose worker** — explicit `/model <name>` per-topic preference > `topic_defaults` map > priority order.
+8. **Spawn worker** — via `pa/src/workers.ts:executeWorker()`.
+9. **Clean output** — `src/logic.ts:parseMetadata()` strips `[PA_META]` envelopes, identifies confirmation patterns, applies sanitization for Telegram markdown.
+10. **Send** — `src/telegram.ts:sendToTelegram()` with auto-chunking for >4000-char messages.
+11. **Persist** — turn appended to `~/.pa/telegram-bot-topic-<ids>.json` (rolling 20-turn window) and `~/.pa/conversation-history.jsonl` (permanent archive).
+
+## Voice messages (speech to text)
+
+### What happens when you send one
+
+1. The bot reacts with 👍 within a second, same as any text message.
+2. A "typing…" indicator stays up for as long as transcription takes — seconds with a cloud engine, possibly minutes with the local one (see "How long it takes" below).
+3. Once the transcript is ready, it goes through the bot exactly like a typed message, and you get a normal reply from whichever worker the topic uses.
+
+Worth knowing:
+
+- The transcript goes through the **identical** pipeline, so a voice note saying "reset" does exactly what typing `/reset` does — deliberate, not a surprise.
+- The archived turn reads `[Voice message] <transcript>` (or `[Audio file] <transcript>` / `[Video note] <transcript>` for the other supported media — see "What gets transcribed" below), so history stays readable.
+- A caption sent alongside the media survives into that same archived turn instead of being silently dropped.
+- A forwarded voice/audio/video note is attributed to its original sender ("forwarded from Alice") whenever Telegram exposes that information.
+- The audio file is kept at `~/.pa/attachments/<chat_id>/<date>/<id>.<ext>` and auto-deleted after 30 days (the transcript itself lives on in the conversation archive, so the audio is debug-only after that point).
+- Replying to an older voice/audio/video note pulls its transcript into your reply, even if the note has scrolled out of view — the bot resolves it against its own conversation history, not just what Telegram hands back.
+
+### What gets transcribed
+
+- **Voice notes** (the microphone bubble).
+- **Audio-file uploads** (e.g. `.mp3`, `.m4a` sent as a file or audio attachment).
+- **Video notes** (the round video-message bubble) — only the audio track is transcribed; the video itself isn't analyzed.
+- Regular video, animations/GIFs, and stickers aren't dictation idioms and are left alone.
+- A generic file **document** with an audio/video MIME type is not transcribed (no reliable duration to guard against a runaway job) — you get one line noting that instead of silence.
+
+### Turning it on
+
+| Option | Setup | Speed | Trade-off |
+|---|---|---|---|
+| Cloud (recommended) | Free key from https://console.groq.com/keys → `GROQ_API_KEY=<key>` in `~/.pa/secrets.env` → `pa bot restart` | Seconds per note | Audio is uploaded to that provider |
+| Local | Install the `transcription` Python package + `ffmpeg`, set `engine_preference: local` | Minutes per note (see below) | ~1 GB of dependencies; nothing leaves your machine |
+
+With neither configured, a voice note replies with setup instructions rather than failing silently — that's what a new user will actually hit first.
+
+`worker_mode: persistent` only actually starts a background worker when the LOCAL engine is the one doing the work (`engine_preference: local`, or `auto` with no cloud key configured) — a cloud call has no model to keep warm, so persistent mode costs nothing extra once a cloud key is set.
+
+### How the engine is chosen
+
+- An API key is used when present.
+- A cloud failure falls back to local **only** under `engine_preference: auto`.
+- `engine_preference: local` never uploads anything, even if cloud keys are set.
+- `engine_preference: cloud` never silently falls back to a slow local run — it errors instead.
+- Providers are tried in `cloud_order`, and only the ones whose key is actually set.
+
+See [`CONFIGURATION.md`](CONFIGURATION.md#transcriptionconfig) for the full field reference.
+
+### Language
+
+By default the engine auto-detects the spoken language. Set `transcription.language` in `~/.pa/config.yaml` (e.g. `en`, `en-US`, `hi`) to pin it — useful when auto-detection guesses wrong on a short or noisy clip. **The local engine (`small.en`) is English-only**: pairing a non-English `language` with `engine_preference: local` is accepted but logs a config-load warning, since the local model will likely mistranscribe or transliterate rather than error. Use a cloud engine for other languages.
+
+### Speaker labels (diarization)
+
+The Deepgram cloud provider can tell speakers apart. When it detects more than one speaker in a note, the archived and delivered transcript is labelled `Speaker 1: ...` / `Speaker 2: ...` per line; a single-speaker note — the common case, and every note handled by a non-Deepgram engine — is unlabelled exactly as before. Nothing to configure: it only ever applies when Deepgram actually served the note.
+
+### Re-transcribing a note
+
+Reply to a voice/audio/video note with `/retranscribe` (optionally `/retranscribe <engine>`, e.g. `/retranscribe groq`) to run it through transcription again — useful if the first pass misheard something, or you've since changed the configured language or engine. The bot reuses the already-downloaded audio when it's still cached (last 30 days), otherwise re-downloads it. The result is dispatched exactly like a fresh voice note, not just shown to you.
+
+### How long it takes — honestly
+
+| Configuration | Typical wait |
+|---|---|
+| Cloud (any provider) | A few seconds |
+| Local, `worker_mode: spawn` | **Minutes.** Measured 119–582 s for 6–12 s clips on a contended CPU — most of it reloading the speech model on every note |
+| Local, `worker_mode: persistent`, first note | Same as spawn (the model loads once) |
+| Local, `worker_mode: persistent`, later notes | Much faster; the model stays in RAM (~230 MB) until 10 idle minutes pass |
+
+Local transcription on CPU is slow. The numbers above were measured on a busy machine and are upper bounds — if the wait matters, use a cloud key.
+
+### Limits
+
+- Notes/files longer than `PA_VOICE_MAX_DURATION_S` (default 30 min) are refused before download.
+- Files larger than `PA_VOICE_MAX_FILE_BYTES` (default 20 MiB — Telegram's own bot-download ceiling) are refused before download.
+- Transcripts are capped at 40,000 characters as a defensive ceiling — comfortably above anything a real 30-minute note produces, but present in case the speech engine ever gets stuck in a repeating loop on silence or noise (a known Whisper quirk), so a single bad note can't balloon into an enormous prompt. If a transcript is ever cut, the reply says so explicitly rather than silently dropping text.
+- The local model is `small.en` and is English-only in practice — use a cloud engine for other languages (see "Language" above).
+- **Local transcription of a note longer than about 7.5 minutes can lose or garble a word right at a chunk boundary** (the local engine splits long audio into pieces with no overlap between them). The cloud engine has no such limit, since it never chunks.
+- The bot never replies with audio.
+
+### Privacy
+
+What leaves the machine depends on `engine_preference`: `local` never sends audio anywhere; `cloud` and `auto` (when a cloud provider is actually used) upload the note to that provider. The downloaded audio files sit unencrypted under `~/.pa/attachments/` like every other artifact there, and are auto-deleted after 30 days.
+
+See [`CONFIGURATION.md`](CONFIGURATION.md) for the full `transcription:` schema and [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) for setup problems.
 
 ## Per-topic state
 
@@ -349,9 +434,9 @@ For gemini and codex workers, the bot's `context.ts` constructs an equivalent pr
 
 ## Related docs
 
-- [`CONFIGURATION.md`](CONFIGURATION.md) — `topic_defaults` mapping
+- [`CONFIGURATION.md`](CONFIGURATION.md) — `topic_defaults` mapping, `transcription:` schema
 - [`SKILLS_GUIDE.md`](SKILLS_GUIDE.md) — skills that deliver to Telegram via `telegram_output`
-- [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) — bot won't start, DLQ growing, etc.
+- [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) — bot won't start, DLQ growing, voice transcription setup, etc.
 
 ## Google OAuth Setup
 

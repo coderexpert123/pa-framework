@@ -28,6 +28,8 @@ The framework reads configuration from `~/.pa/` (or wherever `PA_HOME` env var p
 | `~/.pa/rate-limit-state.json` | Runtime: per-worker cooldown state | Auto-managed |
 | `~/.pa/telegram-bot-state.json` | Runtime: bot global state (last update ID) | Auto-managed |
 | `~/.pa/telegram-bot.lock` | Runtime: PID file for bot | Auto-managed |
+| `~/.pa/attachments/<chat_id>/<date>/<id>.oga` | Runtime: downloaded Telegram voice notes; auto-deleted after 30 days by the `voice-attachment-gc` maintenance job | Auto-managed |
+| `~/.pa/voice-worker.json` | Runtime: persistent transcription worker's PID/port/token; only present while that worker is running | Auto-managed |
 
 ## `config.yaml` schema
 
@@ -39,6 +41,7 @@ The framework reads configuration from `~/.pa/` (or wherever `PA_HOME` env var p
 | `evaluator` | `EvaluatorConfig` | No | None | LLM consulted when a worker stalls. Without one, stalled workers are killed at idle_timeout. |
 | `topic_defaults` | `Record<string, string>` | No | `{}` | Maps `<chatId>_<threadId>` strings to a preferred worker name. Used by the bot. |
 | `bg_tasks` | `BgTasksConfig` | No | See below | Thresholds for background-leak detection. |
+| `transcription` | `TranscriptionConfig` | No | See below | Voice-note transcription: which engine family to prefer and how the local engine runs. Absent = defaults (auto / spawn). |
 
 ### `WorkerConfig`
 
@@ -70,12 +73,28 @@ The framework reads configuration from `~/.pa/` (or wherever `PA_HOME` env var p
 | `alert_seconds` | number | No | 300 | >= 60 | Alert if a worker's descendant outlives parent by N seconds. |
 | `alert_repeat_seconds` | number | No | 1800 | >= alert_seconds | Repeat the alert every N seconds. |
 
+### TranscriptionConfig
+
+| Field | Type | Required | Default | Effect |
+|---|---|---|---|---|
+| `engine_preference` | `'auto' \| 'cloud' \| 'local'` | No | `'auto'` | `auto`: cloud when an API key is set, else local. `cloud`: cloud only, fails rather than falling back. `local`: local only — audio never leaves the machine even if keys are set. |
+| `worker_mode` | `'spawn' \| 'persistent'` | No | `'spawn'` | Local engine only. `spawn`: a fresh process per note (reloads the model each time). `persistent`: a lazily-started background process that keeps the model in RAM and exits after 10 idle minutes. |
+| `cloud_order` | `string[]` | No | `['groq','openai','deepgram']` | Providers to try, in order. Entries whose API key is unset are skipped; unknown entries are dropped with a warning. |
+| `language` | `string \| null` | No | `null` | ISO 639-1 code, optionally region-qualified (e.g. `en`, `en-US`). `null`/absent = the engine auto-detects. Threaded into cloud provider calls and the local engine's language hint. |
+
+The API keys themselves live in `secrets.env` (they are credentials); the ordering and mode above live here (they are policy) — see [`BOT_GUIDE.md`](BOT_GUIDE.md#voice-messages-speech-to-text) for the user-facing picture.
+
 ### Validation
 
 - Missing `workers` array → `pa run` errors fatally.
 - A worker missing `name`/`command`/`args`/`check` → load error with the missing field named.
 - Non-integer or out-of-range `bg_tasks` values → warning, fall back to defaults (not fatal).
 - Invalid `input_mode` → silently defaults to `'arg'` (be careful — typos here cause behavior breakage without errors).
+- An unknown `transcription.engine_preference` or `transcription.worker_mode` → warning, falls back to its default (not fatal).
+- Unknown `transcription.cloud_order` entries are dropped with a warning; an empty result falls back to the default list.
+- An invalid `transcription.language` (must match ISO 639-1, optionally `-REGION`) → warning, falls back to auto-detect (not fatal).
+- `transcription.language` set to a non-English value while `engine_preference: 'local'` → warning at config-load time (the bundled local model is English-only and will likely mistranscribe or transliterate rather than error) — the value is still accepted and used.
+- A `transcription:` value that is not a mapping → warning, ignored entirely, leaving the rest of the config working.
 
 ## `secrets.env` consumed by framework
 
@@ -101,6 +120,9 @@ The framework itself reads these (independent of any specific skill):
 | `PA_TZ_OFFSET_MINUTES` | No | IST offset override (default 330 = UTC+5:30) |
 | `PA_GEMINI_RESET_TZ` | No | Gemini's daily quota reset timezone (default America/Los_Angeles) |
 | `CLAUDE_CODE_GIT_BASH_PATH` | Win only | Claude Code CLI needs this on Windows |
+| `GROQ_API_KEY` | For cloud voice transcription | Enables the Groq cloud engine for voice-note transcription — free key at https://console.groq.com/keys |
+| `OPENAI_API_KEY` | For cloud voice transcription | Enables the OpenAI cloud engine for voice-note transcription |
+| `DEEPGRAM_API_KEY` | For cloud voice transcription | Enables the Deepgram cloud engine for voice-note transcription |
 
 All others are skill-specific — see individual skill files.
 
@@ -122,6 +144,14 @@ When set, the framework derives all paths from `${PA_HOME}/` instead of `~/.pa/`
 |----------|---------|---------|
 | `PA_MAX_CONCURRENT_WORKERS` | `3` | Machine-wide cap on concurrently running LLM CLI workers (bot dispatches + LLM skills share the pool via blackboard slot locks). Excess dispatches queue until a slot frees. Set `0` or negative to disable limiting. Evaluator calls are exempt (they run while a slot-holding worker awaits their verdict). Shell/`cmd:` skills are unaffected. |
 | `UV_THREADPOOL_SIZE` | Node default `4` | Recommended `16` for the bot and catchup processes: Node's fs and DNS lookups share this libuv pool, so heavy disk I/O can starve DNS and take all networking down with it. Set it in the process launcher (Task Scheduler wrapper, systemd unit, shell profile) — it must exist before Node starts. |
+| `PA_VOICE_TRANSCRIBE_TIMEOUT_MS` | `600000` | Per-note transcription deadline (both modes). Raising it past 600000 is not recommended — the bot's per-topic lock goes stale at exactly that point, letting a second voice note start a concurrent transcription. See [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md). |
+| `PA_VOICE_MAX_DURATION_S` | `1800` | Reject longer voice notes before downloading. |
+| `PA_VOICE_MAX_FILE_BYTES` | `20971520` (20 MiB) | Reject a voice/audio/video-note attachment larger than this before downloading — mirrors Telegram's own bot-download ceiling. |
+| `PA_VOICE_TRANSCRIBE_SCRIPT` | `<repo>/pa/scripts/transcribe_voice.py` | Bridge-script path override. |
+| `PA_VOICE_WORKER_SCRIPT` | `<repo>/pa/scripts/voice_worker.py` | Persistent-worker path override. |
+| `PA_VOICE_WORKER_IDLE_MS` | `600000` | Persistent worker self-shutdown after this much idleness. |
+| `PA_VOICE_WORKER_START_TIMEOUT_MS` | `60000` | How long the client waits for a freshly spawned worker to answer `ping`. |
+| `PA_VOICE_WORKER_PING_TIMEOUT_MS` | `5000` | Health-probe deadline for an already-running worker. |
 
 ## `pa init` defaults
 

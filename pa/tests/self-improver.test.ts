@@ -3,11 +3,8 @@ import assert from 'node:assert/strict';
 import { buildReport, gateAndApprove, rollback, hasPendingDraftForTarget, wasRecentlyChanged, sweepStaleDrafts, getReportTopic } from '../src/self-improver.js';
 import type { ReportEntry } from '../src/self-improver.js';
 import { createTempPaHome, createTempSkill, createTempDraft, createTempSecrets, cleanup } from './helpers.js';
-import { readFile, mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
+import { readFile, mkdir, writeFile } from 'fs/promises';
 import { join } from 'path';
-import { tmpdir } from 'os';
-import { exec as execCb } from 'child_process';
-import { promisify } from 'util';
 import { computeFingerprint } from '../src/drafts.js';
 import { appendAuditRecord } from '../src/lib/improvement-audit.js';
 import type { DraftMeta, DraftProposal, RunMeta } from '../src/types.js';
@@ -93,6 +90,17 @@ describe('buildReport', () => {
 
     const defaultedNoStale = buildReport([], []);
     assert.doesNotMatch(defaultedNoStale, /Stale drafts reaped/);
+  });
+
+  it('includes an old-rejected-drafts-purged count line when purgedCount > 0, omits it otherwise (2026-07-29)', () => {
+    const withPurged = buildReport([], [], 0, 5);
+    assert.match(withPurged, /Old rejected drafts purged \(5\)/);
+
+    const withoutPurged = buildReport([], [], 0, 0);
+    assert.doesNotMatch(withoutPurged, /purged/);
+
+    const defaultedNoPurged = buildReport([], []);
+    assert.doesNotMatch(defaultedNoPurged, /purged/);
   });
 
   it('applied entries with no risk flags show no [risk: ...] suffix', () => {
@@ -244,6 +252,110 @@ describe('gateAndApprove', () => {
     );
     assert.equal(entries[0].outcome, 'validation-failed-pending');
     assert.equal(applyCalled, false);
+  });
+
+  describe('bounded validation retry-with-feedback (2026-07-29 autonomy pass)', () => {
+    it('does NOT retry when regenerateProposalFn is not provided — identical to pre-retry behavior', async () => {
+      await createTempSkill(dir, 'plain-skill', 'Original prompt.');
+      let validateCalls = 0;
+      const entries = await gateAndApprove(
+        [{ proposal: makeProposal({ name: 'plain-skill-fix', target_skill: 'plain-skill' }), sourceType: 'failure' }],
+        { validateSkillFixFn: async () => { validateCalls++; return false; } }
+      );
+      assert.equal(validateCalls, 1, 'no regenerateProposalFn means no retry attempt');
+      assert.equal(entries[0].outcome, 'validation-failed-pending');
+    });
+
+    it('retries a failed FIX validation once with judge feedback, applying the regenerated prompt on success', async () => {
+      await createTempSkill(dir, 'plain-skill', 'Original prompt.');
+      let validateCalls = 0;
+      let regenerateFeedback: string | undefined;
+      let appliedProposal: DraftProposal | undefined;
+
+      const entries = await gateAndApprove(
+        [{ proposal: makeProposal({ name: 'plain-skill-fix', target_skill: 'plain-skill', prompt: 'First attempt.' }), sourceType: 'failure' }],
+        {
+          validateSkillFixFn: async (p, _r, _j, onDetail) => {
+            validateCalls++;
+            onDetail?.({ new_run_ok: true, judge_verdict: false, judge_excerpt: 'Missing the error-handling case.' });
+            return validateCalls >= 2; // fails first, passes on the retried prompt
+          },
+          regenerateProposalFn: async (p, feedback) => {
+            regenerateFeedback = feedback;
+            return { ...p, prompt: 'Second attempt (addresses feedback).' };
+          },
+          applyFixFn: async (p) => { appliedProposal = p; },
+        }
+      );
+
+      assert.equal(validateCalls, 2);
+      assert.equal(regenerateFeedback, 'Missing the error-handling case.');
+      assert.equal(entries[0].outcome, 'applied-fix');
+      assert.equal(appliedProposal?.prompt, 'Second attempt (addresses feedback).', 'must apply the REGENERATED prompt, not the original');
+      assert.match(entries[0].detail ?? '', /validated on retry 2/);
+    });
+
+    it('is bounded to one retry (2 total attempts) even if regeneration keeps failing', async () => {
+      await createTempSkill(dir, 'plain-skill', 'Original prompt.');
+      let validateCalls = 0;
+      let regenerateCalls = 0;
+      const entries = await gateAndApprove(
+        [{ proposal: makeProposal({ name: 'plain-skill-fix', target_skill: 'plain-skill' }), sourceType: 'failure' }],
+        {
+          validateSkillFixFn: async () => { validateCalls++; return false; },
+          regenerateProposalFn: async (p) => { regenerateCalls++; return { ...p, prompt: `retry ${regenerateCalls}` }; },
+          applyFixFn: async () => {},
+        }
+      );
+      assert.equal(validateCalls, 2, 'only 1 initial + 1 retry — never a second retry');
+      assert.equal(regenerateCalls, 1);
+      assert.equal(entries[0].outcome, 'validation-failed-pending');
+    });
+
+    it('stops retrying and parks pending when regenerateProposalFn returns null', async () => {
+      await createTempSkill(dir, 'plain-skill', 'Original prompt.');
+      let validateCalls = 0;
+      const entries = await gateAndApprove(
+        [{ proposal: makeProposal({ name: 'plain-skill-fix', target_skill: 'plain-skill' }), sourceType: 'failure' }],
+        {
+          validateSkillFixFn: async () => { validateCalls++; return false; },
+          regenerateProposalFn: async () => null,
+          applyFixFn: async () => {},
+        }
+      );
+      assert.equal(validateCalls, 1, 'a failed regeneration must not trigger another validation call');
+      assert.equal(entries[0].outcome, 'validation-failed-pending');
+    });
+
+    it('retries a failed NEW-SKILL validation, persisting the regenerated prompt to the draft before approving', async () => {
+      await createTempDraft(dir, 'brand-new-skill', 'First attempt.', {
+        proposed_at: new Date().toISOString(), reason: 'test', source_turns: [],
+        status: 'pending', fingerprint: computeFingerprint('brand-new-skill', 'First attempt.'),
+        source_type: 'conversation',
+      });
+
+      let validateCalls = 0;
+      let approvedName: string | undefined;
+      const entries = await gateAndApprove(
+        [{ proposal: makeProposal({ name: 'brand-new-skill', target_skill: undefined, prompt: 'First attempt.' }), sourceType: 'conversation' }],
+        {
+          validateNewSkillFn: async (p, _r, onDetail) => {
+            validateCalls++;
+            onDetail?.({ new_run_ok: true, judge_verdict: false, judge_excerpt: 'Too vague.' });
+            return validateCalls >= 2;
+          },
+          regenerateProposalFn: async (p) => ({ ...p, prompt: 'Second attempt (more specific).' }),
+          approveDraftFn: async (name) => { approvedName = name; },
+        }
+      );
+
+      assert.equal(entries[0].outcome, 'approved-new-skill');
+      assert.equal(approvedName, 'brand-new-skill');
+
+      const { readFile: readFileFn } = await import('fs/promises');
+      const draftContent = await readFileFn(join(dir, 'skill-drafts', 'brand-new-skill', 'skill.md'), 'utf8');
+      assert.match(draftContent, /Second attempt \(more specific\)/, 'the on-disk draft must be updated to the regenerated prompt before approveDraft deploys it');
+    });
   });
 
   it('approves a validated new-skill proposal (no target_skill) with risk flags recorded', async () => {
@@ -682,24 +794,27 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
     });
   }
 
-  it('executes git revert + push, audits rolled-back with both hashes, marks the draft', async () => {
+  it('executes git revert + push (to whatever branch HEAD tracks), audits rolled-back with both hashes, marks the draft', async () => {
     await seedDraft();
     const cmds: string[] = [];
     const lines = await rollback({
       checkForRollbacksFn: async () => [gitRevertFlag()],
       execFn: async (cmd: string) => {
         cmds.push(cmd);
-        return { stdout: cmd.includes('rev-parse') ? 'def5678\n' : '', stderr: '' };
+        if (cmd === 'git rev-parse HEAD') return { stdout: 'def5678\n', stderr: '' };
+        if (cmd === 'git rev-parse --abbrev-ref HEAD') return { stdout: 'main\n', stderr: '' };
+        return { stdout: '', stderr: '' };
       },
     });
 
-    // `-n` (staged, not committed) since 2026-07-21 so the pa/data/profile* churn can be
-    // dropped from the revert before it becomes a commit — see gitRevertPreservingChurn.
-    assert.ok(cmds.some((c) => c.includes('git revert -n abc1234')), `expected a git revert, got: ${cmds.join(' | ')}`);
-    assert.ok(cmds.some((c) => c.includes('commit --no-edit')), 'expected the staged revert to be committed');
-    // Nothing was dirty here, so nothing should have been stashed.
-    assert.equal(cmds.some((c) => c.startsWith('git stash push')), false);
-    assert.ok(cmds.some((c) => c.includes('git push')), 'expected the revert to be pushed (offsite recoverability)');
+    assert.ok(cmds.some((c) => c.includes('revert --no-edit abc1234')), `expected a git revert, got: ${cmds.join(' | ')}`);
+    assert.ok(
+      cmds.some((c) => c === 'git push origin main'),
+      // Regression guard: a hardcoded `git push origin master` silently failed every
+      // git-revert rollback's push after the repo's default branch was renamed to `main`
+      // (2026-07-23) — the branch MUST be read from HEAD, never hardcoded.
+      `expected a push to the branch resolved from HEAD (main), got: ${cmds.join(' | ')}`
+    );
     assert.equal(lines.length, 1);
     assert.match(lines[0], /Reverted/);
     assert.match(lines[0], /abc1234/);
@@ -716,12 +831,14 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
     assert.equal(meta.status, 'rejected_post_rollback');
   });
 
-  it('reports and audits rollback-failed when the git revert command fails (e.g. conflict)', async () => {
+  it('reports and audits rollback-failed when the git revert command fails (e.g. conflict), and cleans up the conflicted state', async () => {
     await seedDraft();
+    const cmds: string[] = [];
     const lines = await rollback({
       checkForRollbacksFn: async () => [gitRevertFlag()],
       execFn: async (cmd: string) => {
-        if (cmd.includes('git revert')) throw new Error('could not revert: merge conflict in update_coding_dirs.py');
+        cmds.push(cmd);
+        if (cmd.includes('revert --no-edit')) throw new Error('could not revert: merge conflict in update_coding_dirs.py');
         return { stdout: '', stderr: '' };
       },
     });
@@ -729,6 +846,18 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
     assert.equal(lines.length, 1);
     assert.match(lines[0], /Rollback FAILED/);
     assert.match(lines[0], /merge conflict/);
+
+    // gitRevertCommit's failure path must leave nothing half-applied: clear the sequencer
+    // state (a plain `--no-edit` revert that conflicts stops mid-revert, same as the old `-n`
+    // form) and discard any conflict markers left in the working tree.
+    const revertIdx = cmds.findIndex((c) => c.includes('revert --no-edit'));
+    const quitIdx = cmds.findIndex((c) => c === 'git revert --quit');
+    const resetIdx = cmds.findIndex((c) => c === 'git reset --hard HEAD');
+    assert.ok(revertIdx >= 0, `expected the revert attempt, got: ${cmds.join(' | ')}`);
+    assert.ok(quitIdx > revertIdx, `expected git revert --quit after the failed revert, got: ${cmds.join(' | ')}`);
+    assert.ok(resetIdx > revertIdx, `expected git reset --hard HEAD after the failed revert, got: ${cmds.join(' | ')}`);
+    // The push must never happen after a failed revert.
+    assert.equal(cmds.some((c) => c.startsWith('git push')), false);
 
     const records = await readAuditRecords(dir);
     const rec = records.find((r) => r.action === 'rollback-failed');
@@ -756,8 +885,7 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
 
   it('refuses to revert (and audits rollback-failed) when the tree carries human WIP', async () => {
     // Precondition mirroring code-fixer's F4 — an autonomous `git revert` must never be
-    // mixed with, or run destructive cleanup over, a human's uncommitted work. Churn in
-    // pa/data/profile* alone does NOT count as WIP (that's the whole point of the carve-out).
+    // mixed with, or run destructive cleanup over, a human's uncommitted work.
     await seedDraft();
     const cmds: string[] = [];
     const lines = await rollback({
@@ -765,7 +893,7 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
       execFn: async (cmd: string) => {
         cmds.push(cmd);
         if (cmd === 'git status --porcelain') {
-          return { stdout: ' M pa/src/workers.ts\n M pa/data/profile.json\n', stderr: '' };
+          return { stdout: ' M pa/src/workers.ts\n', stderr: '' };
         }
         return { stdout: '', stderr: '' };
       },
@@ -773,109 +901,12 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
 
     assert.match(lines[0], /Rollback FAILED/);
     assert.match(lines[0], /pa\/src\/workers\.ts/);
-    assert.equal(cmds.some((c) => c.startsWith('git revert')), false);
+    assert.equal(cmds.some((c) => c.includes('revert --no-edit')), false);
     assert.equal(cmds.some((c) => c.startsWith('git reset --hard')), false);
 
     const rec = (await readAuditRecords(dir)).find((r) => r.action === 'rollback-failed');
     assert.ok(rec, 'expected a rollback-failed audit record');
     assert.equal(rec.commit_hash, 'abc1234');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Real-git-repo fixture: the 2026-07-21 un-revertable-fix-commit fix, end to end.
-// A bare `git revert` aborted on "Your local changes to the following files would be
-// overwritten by merge: pa/data/profile.json" every night the learn_agent/oracle churn was
-// present — ~/.pa/self-improver-audit.jsonl recorded 'rollback-failed' for commit 7b82c88 on
-// both 2026-07-13 and 2026-07-16, and 7b82c88 stayed an ancestor of HEAD. Faked exec can't
-// prove the git semantics here, so this one drives real git in a throwaway repo.
-// ---------------------------------------------------------------------------
-describe('rollback: git-revert survives (and preserves) nightly pa/data/profile churn', () => {
-  let paHome: string;
-  let repo: string;
-  const runShell = promisify(execCb);
-  const CHURN = '{"v":3,"learned":"today"}\n';
-  let badFix: string;
-
-  const git = async (cmd: string): Promise<{ stdout: string; stderr: string }> => {
-    const { stdout, stderr } = await runShell(cmd, { cwd: repo });
-    return { stdout: String(stdout), stderr: String(stderr) };
-  };
-
-  beforeEach(async () => {
-    paHome = await createTempPaHome();
-    repo = await mkdtemp(join(tmpdir(), 'pa-revert-repo-'));
-
-    await git('git init -q');
-    await git('git config user.email pa-test@example.com');
-    await git('git config user.name "pa test"');
-    await git('git config commit.gpgsign false');
-    await git('git config core.autocrlf false'); // byte-for-byte assertions below
-
-    await mkdir(join(repo, 'pa', 'data'), { recursive: true });
-    await mkdir(join(repo, 'projects', 'x'), { recursive: true });
-    await writeFile(join(repo, 'pa', 'data', 'profile.json'), '{"v":1}\n', 'utf8');
-    await writeFile(join(repo, 'projects', 'x', 'script.py'), 'original\n', 'utf8');
-    await git('git add -A');
-    await git('git commit -q -m base');
-
-    // A legacy-shaped autonomous fix commit: code change PLUS the profile churn baked in —
-    // exactly what made 7b82c88 un-revertable. The revert path must cope with it.
-    await writeFile(join(repo, 'projects', 'x', 'script.py'), 'fixed\n', 'utf8');
-    await writeFile(join(repo, 'pa', 'data', 'profile.json'), '{"v":2}\n', 'utf8');
-    await git('git add -A');
-    await git('git commit -q -m "autonomous-code-fix: x-fix"');
-    badFix = (await git('git rev-parse HEAD')).stdout.trim();
-
-    // Tonight's learn_agent/oracle write — uncommitted, and irreplaceable.
-    await writeFile(join(repo, 'pa', 'data', 'profile.json'), CHURN, 'utf8');
-  });
-
-  afterEach(async () => {
-    await cleanup(paHome);
-    await rm(repo, { recursive: true, force: true }).catch(() => {});
-  });
-
-  async function runRollback(): Promise<string[]> {
-    return rollback({
-      checkForRollbacksFn: async () => [
-        { kind: 'git-revert' as const, skillName: 'x', draftName: 'x-fix', commitHash: badFix },
-      ],
-      execFn: async (cmd: string) => {
-        if (cmd.startsWith('git push')) return { stdout: '', stderr: '' }; // no remote in the fixture
-        return git(cmd);
-      },
-    });
-  }
-
-  it('reverts the fix even though pa/data/profile.json is dirty', async () => {
-    const lines = await runRollback();
-
-    assert.equal(lines.length, 1);
-    assert.match(lines[0], /Reverted/, `expected a successful revert, got: ${lines[0]}`);
-    assert.equal(await readFile(join(repo, 'projects', 'x', 'script.py'), 'utf8'), 'original\n');
-
-    const records = await readAuditRecords(paHome);
-    assert.equal(records.some((r) => r.action === 'rollback-failed'), false);
-    const rec = records.find((r) => r.action === 'rolled-back');
-    assert.ok(rec, 'expected a rolled-back audit record');
-    assert.equal(rec.commit_hash, badFix);
-    assert.equal(rec.revert_commit_hash, (await git('git rev-parse HEAD')).stdout.trim());
-  });
-
-  it('leaves the uncommitted profile data byte-for-byte intact, with nothing stranded in the stash', async () => {
-    await runRollback();
-
-    assert.equal(await readFile(join(repo, 'pa', 'data', 'profile.json'), 'utf8'), CHURN);
-    assert.equal((await git('git stash list')).stdout.trim(), '');
-  });
-
-  it('produces a revert commit that touches only code — never pa/data/profile*', async () => {
-    await runRollback();
-
-    const { stdout: names } = await git('git show --name-only --format= HEAD');
-    assert.match(names, /projects\/x\/script\.py/);
-    assert.doesNotMatch(names, /pa\/data\/profile/, 'a revert commit carrying the churn would itself be un-revertable');
   });
 });
 

@@ -183,7 +183,7 @@ async function handleSkillResult(
   if (result.success && result.output && !isNoOutputSentinel(result.output) && telegramOutput && secrets) {
     const token = secrets[telegramOutput.token_secret];
     if (token) {
-      const send = await sendToTelegram(result.output, telegramOutput, token);
+      const send = await sendToTelegram(result.output, telegramOutput, token, 'MarkdownV2');
       if (!send.ok) {
         recordDeliveryFailure(result, skillName, worker, duration, describeSendFailure(send), {
           failure: send.reason,

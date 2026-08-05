@@ -107,12 +107,65 @@ export interface BgTasksConfig {
   alert_repeat_seconds: number;
 }
 
+/** Operator override for one declared maintenance job (see
+ *  pa/src/lib/maintenance/types.ts). May only DISABLE a job or CHANGE its
+ *  cadence — never add or widen a target, flip `destructive`, or clear
+ *  `shedWhenDegraded: false`. */
+export interface MaintenanceConfig { enabled?: boolean; everyMs?: number; }
+
+/**
+ * Deployment policy for the Telegram voice-transcription feature (see
+ * plans/2026-08-04-telegram-voice-transcription.md, D1/D2). Lives in
+ * config.yaml, not secrets.env: these are choices an operator makes once —
+ * which engine family, which cloud provider order, which local execution
+ * mode — not operational tuning like timeouts, which are PA_VOICE_* env
+ * vars (D1's hard split: a knob with two homes is a knob nobody can predict
+ * the effective value of).
+ */
+export type TranscriptionEnginePreference = 'auto' | 'cloud' | 'local';
+export type TranscriptionWorkerMode = 'spawn' | 'persistent';
+
+/**
+ * `worker_mode` applies to the LOCAL engine only — cloud calls have no model
+ * to load, so there is nothing for a persistent process to amortise.
+ *
+ * Mode switching is a static config edit. No code may choose a mode
+ * per-message based on load, frequency, or recent latency: that would
+ * introduce nondeterminism into a path whose failure modes are already hard
+ * to reproduce, and runs against this repo's move toward declared,
+ * observable configuration over hidden-timer/heuristic behaviour (AI-100).
+ *
+ * `cloud_order` is a config field rather than a hard-coded constant because
+ * which cloud ASR provider to prefer is deployment knowledge, and this
+ * repo's standing discipline is that CLI/provider knowledge lives in
+ * config, not in TypeScript (see the `TunableSpec` doc comment above).
+ */
+export interface TranscriptionConfig {
+  engine_preference: TranscriptionEnginePreference;
+  worker_mode: TranscriptionWorkerMode;
+  cloud_order: string[];
+  /**
+   * ISO 639-1 language code, optionally region-qualified (e.g. "en" or
+   * "en-US") — threaded into every cloud provider call and the local
+   * engine's language hint. `null`/absent means auto-detect (the default).
+   *
+   * Config-load-time validation warns (falls back to auto-detect) on a
+   * malformed value, and separately warns — but still accepts — a
+   * non-English value combined with `engine_preference: 'local'`: the
+   * bundled local model (`small.en`) is English-only and will silently
+   * mistranscribe or transliterate non-English audio rather than error.
+   */
+  language?: string | null;
+}
+
 export interface PaConfig {
   workers: WorkerConfig[];
   evaluator?: EvaluatorConfig;
   topic_defaults?: Record<string, string>;  // topicKey ("chatId_threadId") → worker name
   bg_tasks: BgTasksConfig;
   concurrency_limit?: number; // max parallel skills in catchup
+  maintenance?: Record<string, MaintenanceConfig>;
+  transcription?: TranscriptionConfig;
 }
 
 export const DEFAULT_TIMEOUT = 3600;       // max total seconds
@@ -133,6 +186,12 @@ export interface RunOptions {
   excludeWorkers?: Set<string>; // workers to skip (already failed in earlier dispatch phases)
   updateId?: number; // Telegram update_id for log correlation
   suppressExitAlert?: boolean; // suppress worker-exit notify for intermediate failover attempts
+  // Caller-side cancellation probe, polled by runWithFailover before every
+  // attempt and again after a failed one, and by executeWorker's exit-alert
+  // path. Returns true once the CALLER has abandoned this request (Telegram
+  // /stop, /steer) — distinct from the worker failing on its own. Synchronous
+  // by design: it is read inside the child's close handler.
+  isCancelled?: () => boolean;
   noFallback?: boolean; // when true, stop on first failure instead of continuing to next worker
   priorAttempts?: string[]; // workers that already failed before runWithFailover was invoked
   contextId?: string; // execution-context UUID; allows nested same-context blackboard lock re-entrancy
