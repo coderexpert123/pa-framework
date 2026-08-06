@@ -261,6 +261,7 @@ Ref-IDs appear in alert bodies as `_Ref: l-AB12_` (italicized). To resolve a ref
 8. **Clean output** — `src/logic.ts:parseMetadata()` strips `[PA_META]` envelopes, identifies confirmation patterns, applies sanitization for Telegram markdown.
 9. **Send** — `src/telegram.ts:sendToTelegram()` with auto-chunking for >4000-char messages.
 10. **Persist** — turn appended to `~/.pa/telegram-bot-topic-<ids>.json` (rolling 20-turn window) and `~/.pa/conversation-history.jsonl` (permanent archive).
+11. **Voice notes** — if the incoming message is a voice/audio/video note, it's transcribed to text (see "Voice messages (speech to text)" below) BEFORE step 5's prompt is built — the rest of the pipeline treats it exactly like a typed message from that point on.
 
 ## Per-topic state
 
@@ -346,6 +347,29 @@ To activate it:
 4. Restart the bot.
 
 For gemini and codex workers, the bot's `context.ts` constructs an equivalent prompt at runtime (no static file needed).
+
+## Voice messages (speech to text)
+
+Send the bot a Telegram voice note, audio file, or video note and it transcribes to text before dispatching — from the worker's point of view, it's just a typed message (prefixed `[Voice message]` / `[Audio file]` / `[Video note]` so the LLM knows it may contain recognition errors, especially names and numbers).
+
+You need ONE transcription engine. Two ways to get one:
+
+**Cloud — recommended, about a minute to set up, transcribes in seconds:**
+1. Get a free key at https://console.groq.com/keys.
+2. Add `GROQ_API_KEY=<your key>` to `~/.pa/secrets.env`.
+3. `pa bot restart`.
+
+Nothing to install locally. `OPENAI_API_KEY` and `DEEPGRAM_API_KEY` work the same way — see [`CONFIGURATION.md`](CONFIGURATION.md#voice-transcription-env-vars) for the full list, including Deepgram's speaker-diarization support (multi-speaker labels).
+
+**Local — fully offline, audio never leaves your machine, but slow and heavy:**
+1. Install the `transcription` Python package plus ffmpeg.
+2. Set `transcription: { engine_preference: local }` in `~/.pa/config.yaml` (see `examples/config.yaml.example` for the full annotated block).
+
+Expect ~1 GB of dependencies and one to several **minutes** per voice note on CPU. Set `transcription: { worker_mode: persistent }` to keep the model warm between notes (faster after the first one, ~230MB+ RAM resident).
+
+If no engine is configured at all, the bot replies explaining that and points at this section — see [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md#voice-message-transcription) if something's not working.
+
+Reply to a voice note (even an old one) with a text question and the bot resolves the original transcript from conversation history — you don't need to repeat what you said.
 
 ## Related docs
 

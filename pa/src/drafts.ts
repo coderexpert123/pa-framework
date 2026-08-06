@@ -234,14 +234,41 @@ export async function isDuplicate(proposal: DraftProposal): Promise<boolean> {
   return drafts.some((d) => d.meta.fingerprint === fingerprint);
 }
 
+// Terminal rejection statuses eligible for disk cleanup — 'approved' and 'pending' are never
+// included (approved drafts still back rollback's target-backup.skill.md restores). Broadened
+// beyond literal 'rejected' (2026-07-29) because isDuplicate() below checks fingerprints
+// against every draft still on disk regardless of status: leaving rejected_stale/
+// rejected_auto/rejected_post_rollback drafts around forever meant a legitimately-improved
+// re-proposal for the same target could be silently blocked forever, contradicting the
+// thrash-control design's own stated intent (self-improver.ts's sweepStaleDrafts doc comment).
+const TERMINAL_REJECTED_STATUSES: DraftMeta['status'][] = [
+  'rejected', 'rejected_stale', 'rejected_auto', 'rejected_post_rollback',
+];
+
 export async function cleanRejected(): Promise<number> {
-  const drafts = await listDrafts('rejected');
+  const all = await listDrafts();
   let count = 0;
-  for (const { skill } of drafts) {
+  for (const { skill, meta } of all) {
+    if (!TERMINAL_REJECTED_STATUSES.includes(meta.status)) continue;
     try {
       await rm(join(draftsDir(), skill.name), { recursive: true, force: true });
       count++;
     } catch {}
   }
   return count;
+}
+
+/**
+ * Overwrite a PENDING draft's skill.md with a revised prompt (same frontmatter) — used by
+ * gateAndApprove's bounded validation retry (2026-07-29) to persist a regenerated new-skill
+ * proposal before approveDraft() deploys it, since approveDraft() copies the draft's on-disk
+ * skill.md rather than taking the prompt as an argument. Not needed for the fix/reinforce path
+ * — applyFix() in validator.ts writes the target skill directly from the in-memory proposal.
+ */
+export async function updateDraftPrompt(
+  name: string,
+  frontmatter: Partial<SkillFrontmatter>,
+  newPrompt: string
+): Promise<void> {
+  await writeFile(draftSkillPath(name), serializeSkillMd(frontmatter, newPrompt), 'utf8');
 }

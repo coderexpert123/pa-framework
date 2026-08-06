@@ -11,6 +11,7 @@ import {
   isDuplicate,
   cleanRejected,
   computeFingerprint,
+  updateDraftPrompt,
 } from '../src/drafts.js';
 import { createTempPaHome, createTempDraft, createTempSkill, cleanup } from './helpers.js';
 import type { DraftMeta, DraftProposal } from '../src/types.js';
@@ -346,6 +347,37 @@ describe('drafts', () => {
 
       // Pending draft should still exist
       await assert.doesNotReject(() => loadDraft('clean-pending'));
+    });
+
+    it('also purges rejected_stale, rejected_auto, and rejected_post_rollback (2026-07-29) — not just literal "rejected"', async () => {
+      await createTempDraft(dir, 'clean-stale', 'S.', makeMeta({ status: 'rejected_stale' }));
+      await createTempDraft(dir, 'clean-auto', 'A.', makeMeta({ status: 'rejected_auto' }));
+      await createTempDraft(dir, 'clean-post-rollback', 'PR.', makeMeta({ status: 'rejected_post_rollback' }));
+      await createTempDraft(dir, 'clean-pending', 'P.', makeMeta({ status: 'pending' }));
+      await createTempDraft(dir, 'clean-approved', 'AP.', makeMeta({ status: 'approved' }));
+
+      const count = await cleanRejected();
+      assert.equal(count, 3);
+
+      await assert.rejects(() => loadDraft('clean-stale'));
+      await assert.rejects(() => loadDraft('clean-auto'));
+      await assert.rejects(() => loadDraft('clean-post-rollback'));
+
+      // Never touch pending or approved — approved backs rollback's target-backup.skill.md
+      await assert.doesNotReject(() => loadDraft('clean-pending'));
+      await assert.doesNotReject(() => loadDraft('clean-approved'));
+    });
+  });
+
+  describe('updateDraftPrompt', () => {
+    it('overwrites a draft skill.md with a new prompt, preserving frontmatter', async () => {
+      await createTempDraft(dir, 'revise-me', '---\ntimeout: 300\n---\nOld prompt.', makeMeta({ status: 'pending' }));
+
+      await updateDraftPrompt('revise-me', { timeout: 300 }, 'Revised prompt.');
+
+      const { skill } = await loadDraft('revise-me');
+      assert.equal(skill.prompt.trim(), 'Revised prompt.');
+      assert.equal(skill.frontmatter.timeout, 300);
     });
   });
 });

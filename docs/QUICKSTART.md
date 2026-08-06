@@ -79,6 +79,8 @@ PA_ALERTS_THREAD_ID=<forum thread ID, or 0 for general>
 
 See `examples/secrets.env.example` for the full annotated list.
 
+For Telegram voice notes (optional — the bot works without this, it just won't transcribe voice messages): get a free key at https://console.groq.com/keys and add `GROQ_API_KEY=<your key>`. See [`docs/BOT_GUIDE.md`](BOT_GUIDE.md#voice-messages-speech-to-text) for the full setup, including the fully-offline local alternative.
+
 ## 5. OAuth setup (if using Gmail-based skills)
 
 If you'll run the `daily-mail-brief` sample or any other Gmail-using skill, set up Google OAuth now. Skip this section if you're not using Gmail/Drive/Docs.

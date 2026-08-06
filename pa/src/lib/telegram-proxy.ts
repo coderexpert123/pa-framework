@@ -555,6 +555,12 @@ export async function telegramFetch(input: string, init?: RequestInit): Promise<
 
 const DEFAULT_REFRESH_MIN = 30;
 
+// Seeded by getSourceConfig() on every call so proxyRefreshIntervalMs() (a sync
+// accessor — MaintenanceJob.everyMs must be sync) can report the real
+// secrets.env-configured cadence once the background startup chain has read
+// it. Falls back to the 30m default until then.
+let cachedRefreshIntervalMs = DEFAULT_REFRESH_MIN * 60_000;
+
 /** Read the auto-refresh source + interval from secrets.env. */
 async function getSourceConfig(): Promise<{ sourceUrl?: string; intervalMs: number }> {
   let sourceUrl: string | undefined;
@@ -568,7 +574,47 @@ async function getSourceConfig(): Promise<{ sourceUrl?: string; intervalMs: numb
   } catch {
     /* no secrets — auto-refresh stays disabled */
   }
+  cachedRefreshIntervalMs = intervalMs;
   return { sourceUrl, intervalMs };
+}
+
+/**
+ * Cached auto-refresh cadence, seeded by getSourceConfig(). Sync because
+ * MaintenanceJob.everyMs is sync; falls back to the 30m default until the
+ * background startup chain has read secrets.env.
+ */
+export function proxyRefreshIntervalMs(): number {
+  return cachedRefreshIntervalMs;
+}
+
+/** True while the direct (no-proxy) route to Telegram is believed healthy. */
+export function isDirectRouteHealthy(): boolean {
+  return directHealthy;
+}
+
+/**
+ * One scheduled pool-refresh pass — the exact body of the removed
+ * setInterval, now invoked by the declared `proxy-pool-refresh` bot-host job
+ * (projects/telegram-bot/src/maintenance-jobs.ts) instead of a raw timer.
+ * Returns the number of healthy proxies written (0 when it did no work).
+ * No-ops and returns 0 when: PA_NOTIFY_DISABLED=1 (tests never touch the
+ * network), no TELEGRAM_PROXY_SOURCE_URL is configured, or the direct route
+ * is healthy — the direct-first invariant (zero proxy scans while direct
+ * works) must survive the migration to a declared job.
+ */
+export async function runScheduledPoolRefresh(token: string): Promise<number> {
+  if (process.env.PA_NOTIFY_DISABLED === '1') return 0;
+  try {
+    const { sourceUrl } = await getSourceConfig();
+    if (!sourceUrl) return 0;
+    if (directHealthy) return 0; // direct works → don't waste scans on proxies
+
+    const r = await refreshPoolFromSource(sourceUrl, token);
+    return r.healthy.length;
+  } catch (e) {
+    log('warn', 'telegram-proxy', 'scheduled pool refresh failed', { error: String(e) });
+    return 0;
+  }
 }
 
 /**
@@ -598,17 +644,17 @@ export async function ensureFreshPool(token: string): Promise<number> {
   return r.healthy.length || healthyCount;
 }
 
-let refreshTimer: ReturnType<typeof setInterval> | null = null;
-
 /**
  * Arm the bot's self-reliant proxy maintenance. No-op when
  * TELEGRAM_PROXY_SOURCE_URL is unset, so default deployments are unaffected.
  *
  * Direct-first: does NOT scan at startup (the direct route is preferred and
- * usually works). Instead it registers the token so telegramFetch can trigger an
- * on-demand pool refresh the moment direct first fails, and the periodic timer
- * below scans ONLY while direct is down — so a working direct route costs zero
- * proxy scans.
+ * usually works). Instead it registers the token so telegramFetch can trigger
+ * an on-demand pool refresh the moment direct first fails. The periodic scan
+ * (while direct is down) is no longer a raw timer owned by this function —
+ * it is the declared `proxy-pool-refresh` bot-host job (AI-100 Wave 2, see
+ * projects/telegram-bot/src/maintenance-jobs.ts), which calls
+ * runScheduledPoolRefresh() on the cadence returned by proxyRefreshIntervalMs().
  */
 export async function startProxyAutoRefresh(token: string): Promise<void> {
   if (process.env.PA_NOTIFY_DISABLED === '1') return; // never scan the network in tests
@@ -616,14 +662,6 @@ export async function startProxyAutoRefresh(token: string): Promise<void> {
   if (!sourceUrl) return;
   refreshToken = token; // enable on-demand refresh when the direct route fails
 
-  if (refreshTimer) clearInterval(refreshTimer);
-  refreshTimer = setInterval(() => {
-    if (directHealthy) return; // direct works → don't waste scans on proxies
-    refreshPoolFromSource(sourceUrl, token).catch((e) =>
-      log('warn', 'telegram-proxy', 'scheduled pool refresh failed', { error: String(e) }),
-    );
-  }, intervalMs);
-  refreshTimer.unref?.();
   log('info', 'telegram-proxy', 'proxy auto-refresh armed (direct-first; scans only while direct is blocked)', {
     source: sourceUrl,
     intervalMin: Math.round(intervalMs / 60_000),

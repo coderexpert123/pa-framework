@@ -177,7 +177,7 @@ export const DEFAULT_ARCHIVE_RETENTION: Required<ArchiveRetention> = {
  * this also protects manually-parked files like TROUBLESHOOTING.md's
  * `conv-YYYY-MM-DD.jsonl`.
  */
-const PRUNABLE_ARCHIVE_SUFFIXES = ['-app.log.jsonl', '-telegram-bot.log'];
+export const PRUNABLE_ARCHIVE_SUFFIXES = ['-app.log.jsonl', '-telegram-bot.log'];
 
 function isPrunableArchiveFile(name: string): boolean {
   return PRUNABLE_ARCHIVE_SUFFIXES.some((s) => name.endsWith(s));

@@ -26,7 +26,8 @@
  */
 import { analyzeConversationPatterns } from './analyzer.js';
 import { analyzeFailurePatterns, checkForRollbacks, readRecentFailures } from './failure-analyzer.js';
-import { attemptCodeFix, CHURN_PATHSPEC_ARGS, isChurnPath, parsePorcelainPaths, popChurn, stashChurn } from './code-fixer.js';
+import { attemptCodeFix, CHURN_PATHSPEC_ARGS, isChurnPath, parsePorcelainPaths, popChurn, stashChurn, GIT_WORKFLOW_RESOURCE, GIT_LOCK_WAIT_MS } from './code-fixer.js';
+import type { BlackboardLockClient } from './code-fixer.js';
 import { analyzeFeedbackPatterns } from './feedback-analyzer.js';
 import { exec as execCb } from 'child_process';
 import { promisify } from 'util';
@@ -34,12 +35,20 @@ import { saveDraft, markDraftMeta, approveDraft, loadDraft, listDrafts } from '.
 import { skillsDir, draftsDir } from './paths.js';
 import { isProtected, isCriticalChange, hasRealSideEffects, isCmdBasedTarget, validateNewSkill, validateSkillFix, applyFix } from './validator.js';
 import { loadSkill } from './skills.js';
+import { blackboard } from './blackboard.js';
+import { exclusiveLockKey } from './commands/run.js';
 import { appendAuditRecord, readAuditRecords, skillRunStats, toAuditBaseline, unifiedDiff } from './lib/improvement-audit.js';
 import type { AuditValidation } from './lib/improvement-audit.js';
 import { notifyUser, resolveNotifyTopic } from './lib/notify.js';
 import { rm, copyFile } from 'fs/promises';
 import { join } from 'path';
 import type { DraftProposal, DraftMeta } from './types.js';
+
+// git-workflow lock (2026-08-05) — rollback()'s git-revert path shells out to git directly
+// (git status/revert/reset --hard/push), entirely outside the skill-frontmatter
+// exclusive_resource mechanism. Same lock as code-fixer.ts's attemptCodeFix, acquired here
+// independently (not held across the whole nightly main()) — see plans/federated-booping-hammock.md.
+const ROLLBACK_LOCK_AGENT = 'self-improver-rollback';
 
 const SELF_NAME = 'self-improver';
 // Env-driven so the framework is portable (matches lib/notify.ts's own
@@ -145,6 +154,7 @@ export interface ReportEntry {
 export interface RollbackDeps {
   checkForRollbacksFn?: typeof checkForRollbacks;
   execFn?: (command: string, options?: { cwd?: string }) => Promise<{ stdout: string; stderr: string }>;
+  blackboardFn?: BlackboardLockClient;
 }
 
 type RollbackExec = NonNullable<RollbackDeps['execFn']>;
@@ -229,8 +239,29 @@ export async function gitRevertPreservingChurn(
 }
 
 export async function rollback(deps: RollbackDeps = {}): Promise<string[]> {
-  const { checkForRollbacksFn = checkForRollbacks, execFn = defaultRollbackExec } = deps;
+  const { checkForRollbacksFn = checkForRollbacks, execFn = defaultRollbackExec, blackboardFn } = deps;
   const flags = await checkForRollbacksFn();
+  // The overwhelming common case — checkForRollbacksFn() reads run metadata only, no git —
+  // so this must never pay for or contend on a lock it doesn't need.
+  if (flags.length === 0) return [];
+
+  const bb = blackboardFn ?? blackboard;
+  const lockKey = exclusiveLockKey(GIT_WORKFLOW_RESOURCE);
+  const lockAcquired = await bb.acquireLock(lockKey, ROLLBACK_LOCK_AGENT, process.pid, GIT_LOCK_WAIT_MS);
+  if (!lockAcquired) {
+    // Deliberately NO appendAuditRecord here: a 'rollback-failed' record trips `pa
+    // improvements`' FAILED ROLLBACKS banner, which only clears via a human `pa improvements
+    // accept` — not warranted for a transient, self-healing lock wait that the next run retries.
+    return [`- Rollbacks DEFERRED (${flags.length} flagged) — another skill/process is holding the git-workflow lock; will retry next run.`];
+  }
+
+  try {
+    return await runRollbacks();
+  } finally {
+    await bb.releaseLock(lockKey, ROLLBACK_LOCK_AGENT).catch(() => {});
+  }
+
+  async function runRollbacks(): Promise<string[]> {
   const lines: string[] = [];
 
   for (const flag of flags) {
@@ -261,7 +292,11 @@ export async function rollback(deps: RollbackDeps = {}): Promise<string[]> {
           throw new Error('git-revert rollback flag carries no commit hash — nothing to revert.');
         }
         const { revertCommitHash, churnRestoreError } = await gitRevertPreservingChurn(flag.commitHash, execFn);
-        await execFn('git push origin master');
+        // Push to whatever branch HEAD actually tracks — do NOT hardcode a branch name (the
+        // private repo's default branch was renamed master -> main 2026-07-23; a hardcoded
+        // `master` here silently failed every git-revert rollback's push since that rename).
+        const { stdout: branchRaw } = await execFn('git rev-parse --abbrev-ref HEAD');
+        await execFn(`git push origin ${branchRaw.trim()}`);
         await markDraftMeta(flag.draftName, { status: 'rejected_post_rollback' }).catch(() => {});
 
         const originalFix = (await readAuditRecords()).find(
@@ -321,6 +356,7 @@ export async function rollback(deps: RollbackDeps = {}): Promise<string[]> {
   }
 
   return lines;
+  }
 }
 
 interface GeneratedProposals {

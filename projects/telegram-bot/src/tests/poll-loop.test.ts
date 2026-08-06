@@ -10,6 +10,7 @@ import type { ConversationState } from '../types.js';
 import { rmRetry } from './rm-retry.js';
 import { listPendingDispatches, pendingDispatchKey, _resetPendingDispatchesForTest } from '../pending-dispatches.js';
 import { markTopicRecovering, _resetRecoveryGateForTest } from '../recovery-gate.js';
+import { _clearQueueForTest } from '../topic-queue.js';
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -2293,6 +2294,179 @@ describe('runPollLoop: enqueue-time dispatch persistence', { concurrency: 1 }, (
 
     await assert.doesNotReject(() => runPollLoop('token', [123], state, {}, controller.signal, fastSleep));
     assert.ok(getUpdatesCallCount >= 2, 'poll loop must have continued after the rejected processUpdate');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-08-04 steer-queue-context-fold: /steer folds every not-yet-started
+// update still queued behind the one it kills into the steer prompt, instead
+// of letting them dispatch independently once the kill settles (or dropping
+// them). See plans/2026-08-04-steer-queue-context-fold.md.
+// ---------------------------------------------------------------------------
+
+describe('runPollLoop: /steer folds queued messages into context', { concurrency: 1 }, () => {
+  let tempDir: string;
+  const savedFetch = globalThis.fetch;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'tgbot-poll-steer-fold-'));
+    process.env.PA_HOME = tempDir;
+    _resetPendingDispatchesForTest();
+    _clearQueueForTest();
+  });
+
+  afterEach(async () => {
+    delete process.env.PA_HOME;
+    _resetPendingDispatchesForTest();
+    _clearQueueForTest();
+    await rmRetry(tempDir);
+    (globalThis as Record<string, unknown>).fetch = savedFetch;
+  });
+
+  it('msg1 in-flight + msg2/msg3 queued + queued /reset + /steer: msg2/msg3 fold into one combined dispatch, /reset still runs on its own', async () => {
+    // The "worker" reads the full prompt off stdin and echoes it back wrapped
+    // in GOTPROMPTSTART/GOTPROMPTEND markers — lets the test read back
+    // exactly what dispatchMessage sent as `## Current Message`, in order,
+    // without guessing at prompt-template formatting.
+    const workerScript = join(tempDir, 'echo-worker.mjs');
+    await writeFile(workerScript, [
+      "let d = '';",
+      "process.stdin.on('data', c => { d += c; });",
+      "process.stdin.on('end', () => {",
+      "  process.stdout.write('GOTPROMPTSTART' + d + 'GOTPROMPTEND');",
+      '  process.exit(0);',
+      '});',
+    ].join('\n'), 'utf8');
+
+    await writeFile(join(tempDir, 'config.yaml'), `
+workers:
+  - name: claude
+    input_mode: stdin-text
+    command: node
+    args: ["${workerScript.replace(/\\/g, '/')}"]
+    check: node -e "process.exit(0)"
+topic_defaults:
+  "123_0": "claude"
+`, 'utf8');
+
+    const topicStateFile = join(tempDir, 'telegram-bot-topic-123_0.json');
+    await writeFile(topicStateFile, JSON.stringify({ chat_id: 123, thread_id: 0, turns: [] }), 'utf8');
+
+    const controller = new AbortController();
+    const state = makeState(123, -1);
+
+    const msg1 = { update_id: 1, message: { message_id: 1, chat: { id: 123, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'SEEDMESSAGEONE' } };
+    const msg2 = { update_id: 2, message: { message_id: 2, chat: { id: 123, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'QUEUEDTWO' } };
+    const msg3 = { update_id: 3, message: { message_id: 3, chat: { id: 123, type: 'private' }, date: Math.floor(Date.now() / 1000), text: 'QUEUEDTHREE' } };
+    const queuedReset = { update_id: 4, message: { message_id: 4, chat: { id: 123, type: 'private' }, date: Math.floor(Date.now() / 1000), text: '/reset' } };
+    const steerMsg = { update_id: 5, message: { message_id: 5, chat: { id: 123, type: 'private' }, date: Math.floor(Date.now() / 1000), text: '/steer STEERPROMPT' } };
+
+    let resolveGate!: () => void;
+    const gate = new Promise<void>(resolve => { resolveGate = resolve; });
+    let gateUsed = false;
+    let getUpdatesCallCount = 0;
+    const sentTexts: string[] = [];
+
+    (globalThis as Record<string, unknown>).fetch = async (url: string, opts?: { body?: string }) => {
+      if ((url as string).includes('getUpdates')) {
+        getUpdatesCallCount++;
+        if (getUpdatesCallCount === 1) {
+          const batch = { ok: true, result: [msg1, msg2, msg3, queuedReset, steerMsg] };
+          return { ok: true, status: 200, text: async () => JSON.stringify(batch), json: async () => batch };
+        }
+        controller.abort();
+        return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: [] }), json: async () => ({ ok: true, result: [] }) };
+      }
+      if ((url as string).includes('sendMessage')) {
+        const body = opts?.body ? JSON.parse(opts.body) : {};
+        const text: string = body.text ?? '';
+        // Only the FIRST worker-dispatch reply (msg1's own) is gated. Nothing
+        // else — the steer kill's own system notice, /reset's local reply,
+        // and the eventual combined-dispatch reply — is ever blocked, so
+        // there is no ordering race to manage beyond "msg1 must still be
+        // in-flight when /steer's kill+drain runs", which the topicPending
+        // chain already guarantees deterministically (msg2/msg3/queuedReset/
+        // steer's own registration all happen synchronously earlier in the
+        // SAME poll-loop iteration, well before msg1's real reply attempt).
+        if (text.includes('GOTPROMPTSTART') && !gateUsed) {
+          gateUsed = true;
+          await gate;
+        }
+        sentTexts.push(text);
+        return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: { message_id: 900 + sentTexts.length } }), json: async () => ({ ok: true, result: { message_id: 900 + sentTexts.length } }) };
+      }
+      return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: true }), json: async () => ({ ok: true, result: true }) };
+    };
+
+    const loopDone = runPollLoop('token', [123], state, {}, controller.signal, fastSleep);
+
+    // Wait deterministically for msg1's dispatch to reach the gate.
+    for (let i = 0; i < 500 && !gateUsed; i++) {
+      await new Promise(r => setTimeout(r, 20));
+    }
+
+    let gotPromptCountAtGate = -1;
+    try {
+      assert.ok(gateUsed, 'msg1 must have reached its worker-dispatch reply (gate) within the wait window');
+      gotPromptCountAtGate = sentTexts.filter(t => t.includes('GOTPROMPTSTART')).length;
+      assert.equal(
+        gotPromptCountAtGate, 0,
+        'while msg1 is gated, its own reply has not been pushed yet — msg2/msg3 must not have produced any independent worker dispatch either',
+      );
+    } finally {
+      resolveGate();
+      await loopDone;
+    }
+
+    const gotPromptReplies = sentTexts.filter(t => t.includes('GOTPROMPTSTART'));
+    assert.equal(gotPromptReplies.length, 2, `expected exactly 2 worker dispatches total (msg1, then the combined steer dispatch) — msg2/msg3 must never dispatch on their own. Got: ${JSON.stringify(sentTexts)}`);
+
+    const combined = gotPromptReplies[1];
+    const idxTwo = combined.indexOf('QUEUEDTWO');
+    const idxThree = combined.indexOf('QUEUEDTHREE');
+    const idxSteer = combined.indexOf('STEERPROMPT');
+    assert.ok(idxTwo !== -1, 'combined dispatch must contain msg2 text');
+    assert.ok(idxThree !== -1, 'combined dispatch must contain msg3 text');
+    assert.ok(idxSteer !== -1, 'combined dispatch must contain the steer prompt');
+    assert.ok(idxTwo < idxThree && idxThree < idxSteer, `combined text must be msg2, then msg3, then the steer prompt, in that order — got indices ${idxTwo}, ${idxThree}, ${idxSteer}`);
+    assert.ok(!combined.includes('SEEDMESSAGEONE'), 'the combined dispatch must not carry msg1\'s own text — msg1 already dispatched on its own');
+
+    // The queued /reset must NOT have been folded — it still runs in its own
+    // turn, producing its usual local reply.
+    assert.ok(sentTexts.some(t => t.includes('Conversation and session cleared')), `queued /reset must still dispatch on its own turn. Got: ${JSON.stringify(sentTexts)}`);
+
+    // No leaked enqueue-time pending-dispatch placeholders — the .finally()
+    // cleanup (inFlight.delete / topicPending tail cleanup / removePendingDispatch)
+    // must have run for every entry, including the two cancelled/folded ones.
+    assert.deepEqual(await listPendingDispatches(), [], 'no leftover pending-dispatch placeholders after the loop settles');
+  });
+
+  it('regression: a single queued message behind an in-flight one still dispatches normally (no /steer involved)', async () => {
+    // Guards against the fold logic breaking the plain, no-steer case.
+    await writeFile(join(tempDir, 'config.yaml'), JSON.stringify({ workers: [{ name: 'claude', command: 'node', args: ['-e', '0'], check: 'node -e 0' }] }), 'utf8');
+
+    const controller = new AbortController();
+    const state = makeState(123, -1);
+    const update1 = { update_id: 1, message: { message_id: 1, chat: { id: 123, type: 'private' }, date: Math.floor(Date.now() / 1000), text: '/default' } };
+    const update2 = { update_id: 2, message: { message_id: 2, chat: { id: 123, type: 'private' }, date: Math.floor(Date.now() / 1000), text: '/default' } };
+
+    let sendMessageCallCount = 0;
+    let getUpdatesCallCount = 0;
+    (globalThis as Record<string, unknown>).fetch = async (url: string) => {
+      if ((url as string).includes('getUpdates')) {
+        getUpdatesCallCount++;
+        if (getUpdatesCallCount === 1) {
+          return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: [update1, update2] }), json: async () => ({ ok: true, result: [update1, update2] }) };
+        }
+        controller.abort();
+        return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: [] }), json: async () => ({ ok: true, result: [] }) };
+      }
+      if ((url as string).includes('sendMessage')) sendMessageCallCount++;
+      return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: { message_id: 999 } }), json: async () => ({ ok: true, result: { message_id: 999 } }) };
+    };
+
+    await runPollLoop('token', [123], state, {}, controller.signal, fastSleep);
+    assert.equal(sendMessageCallCount, 2, 'both queued updates must still dispatch independently when no /steer is involved');
   });
 });
 

@@ -1,9 +1,11 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFile, mkdir } from 'fs/promises';
+import { existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { createTempPaHome, createTempConfig, createTempSecrets, cleanup } from './helpers.js';
+import { flushLog } from '../src/lib/log.js';
 import { checkWorker, executeWorker, isRateLimited, runWithFailover, readStateTail, clearRateLimitCache } from '../src/workers.js';
 import type { WorkerConfig } from '../src/types.js';
 import { notifyUser } from '../src/lib/notify.js';
@@ -769,6 +771,162 @@ describe('runWithFailover', () => {
     assert.equal(result.success, false);
     // No exhaustion alert because no workers were attempted and none are cooling
     assert.equal(result.alreadyAlertedPaSupport, undefined);
+  });
+});
+
+// AI-092 gap closed 2026-08-02: a /stop landing mid-chain used to read as an
+// ordinary worker failure, so the cascade answered the cancelled request with
+// the next worker. See the isCancelled block in runWithFailover.
+describe('runWithFailover — caller cancellation', () => {
+  it('stops the cascade when cancellation lands on the running worker', async () => {
+    const marker = join(scriptDir, 'backup-ran.txt');
+    const brokenScript = await writeScript('cancel-broken.js', 'process.stderr.write("killed"); process.exit(1);');
+    const backupScript = await writeScript('cancel-backup.js', `require('fs').writeFileSync(${JSON.stringify(marker)}, 'ran'); process.stdout.write("backup ok");`);
+    await createTempSecrets(tempDir, '');
+    await createTempConfig(tempDir, [
+      { name: 'killed_w', command: 'node', args: [brokenScript], check: 'echo ok', priority: 1, rate_limit_patterns: [] },
+      { name: 'backup_w', command: 'node', args: [backupScript], check: 'echo ok', priority: 2, rate_limit_patterns: [] },
+    ]);
+    let cancelled = false;
+    const switches: string[] = [];
+    const { result, worker } = await runWithFailover('unused', {
+      timeout: 10,
+      resource: 'topic-cancel-1',
+      // Flips the moment the first worker has been spawned — mirrors a /stop
+      // arriving while that worker is mid-run.
+      isCancelled: () => cancelled,
+      checkAvailable: async () => { cancelled = true; return true; },
+      onWorkerSwitch: async (p) => { switches.push(`${p.from}->${p.to}`); },
+    });
+    assert.equal(result.success, false);
+    assert.equal(worker, 'killed_w');
+    assert.equal(existsSync(marker), false, 'backup worker must not run for a cancelled request');
+    assert.deepEqual(switches, [], 'no failover card for a cancelled worker');
+    assert.equal(result.alreadyAlertedPaSupport, undefined, 'no exhaustion alert for a cancelled request');
+  });
+
+  it('attempts nothing when already cancelled before the first worker', async () => {
+    const marker = join(scriptDir, 'first-ran.txt');
+    const script = await writeScript('cancel-first.js', `require('fs').writeFileSync(${JSON.stringify(marker)}, 'ran'); process.stdout.write("ok");`);
+    await createTempSecrets(tempDir, '');
+    await createTempConfig(tempDir, [
+      { name: 'w1', command: 'node', args: [script], check: 'echo ok', priority: 1, rate_limit_patterns: [] },
+    ]);
+    const { result, worker } = await runWithFailover('unused', {
+      timeout: 10,
+      resource: 'topic-cancel-2',
+      isCancelled: () => true,
+    });
+    assert.equal(result.success, false);
+    assert.equal(worker, 'none');
+    assert.equal(existsSync(marker), false);
+    assert.equal(result.alreadyAlertedPaSupport, undefined);
+  });
+
+  it('runs the full cascade when nothing is cancelled', async () => {
+    const brokenScript = await writeScript('nocancel-broken.js', 'process.stderr.write("fail"); process.exit(1);');
+    const backupScript = await writeScript('nocancel-backup.js', 'process.stdout.write("backup ok");');
+    await createTempSecrets(tempDir, '');
+    await createTempConfig(tempDir, [
+      { name: 'broken_w', command: 'node', args: [brokenScript], check: 'echo ok', priority: 1, rate_limit_patterns: [] },
+      { name: 'backup_w', command: 'node', args: [backupScript], check: 'echo ok', priority: 2, rate_limit_patterns: [] },
+    ]);
+    const { result, worker } = await runWithFailover('unused', {
+      timeout: 10,
+      resource: 'topic-cancel-3',
+      isCancelled: () => false,
+    });
+    assert.equal(result.success, true);
+    assert.equal(worker, 'backup_w');
+  });
+
+  // 2026-08-03 deep-recheck fix: isCancelled is read inside a child process's
+  // 'close' event handler (worker-exec.ts), where an uncaught throw is an
+  // unhandled exception in an event emitter callback, not a rejected promise.
+  // A caller-supplied predicate must never be able to take the cascade down —
+  // fail toward "not cancelled" (the pre-AI-092 default) and keep going.
+  it('a throwing isCancelled does not crash the cascade — treated as not cancelled', async () => {
+    const brokenScript = await writeScript('cancel-throws-broken.js', 'process.stderr.write("fail"); process.exit(1);');
+    const backupScript = await writeScript('cancel-throws-backup.js', 'process.stdout.write("backup ok");');
+    await createTempSecrets(tempDir, '');
+    await createTempConfig(tempDir, [
+      { name: 'broken_w', command: 'node', args: [brokenScript], check: 'echo ok', priority: 1, rate_limit_patterns: [] },
+      { name: 'backup_w', command: 'node', args: [backupScript], check: 'echo ok', priority: 2, rate_limit_patterns: [] },
+    ]);
+    const { result, worker } = await runWithFailover('unused', {
+      timeout: 10,
+      resource: 'topic-cancel-throws',
+      isCancelled: () => { throw new Error('marker store unavailable'); },
+    });
+    assert.equal(result.success, true, 'a throwing predicate must not abort the cascade — it must fail over exactly as if nothing were cancelled');
+    assert.equal(worker, 'backup_w');
+  });
+});
+
+describe('executeWorker — cancelled exit alert', () => {
+  // The exit page is fire-and-forget off the child's close handler, so both
+  // tests poll rather than read once: the negative case waits out the same
+  // window the positive case needs before asserting silence.
+  async function exitAlertSubjects(): Promise<string[]> {
+    await flushLog();
+    const logPath = join(tempDir, 'app.log.jsonl');
+    if (!existsSync(logPath)) return [];
+    const { readFile } = await import('fs/promises');
+    const raw = await readFile(logPath, 'utf8');
+    return raw.split('\n').filter(Boolean)
+      .map((l) => { try { return JSON.parse(l) as Record<string, unknown>; } catch { return null; } })
+      .filter((e): e is Record<string, unknown> => !!e && e['module'] === 'notify' && e['message'] === 'attempting'
+        && typeof e['subject'] === 'string' && (e['subject'] as string).startsWith('Worker exited with code'))
+      .map((e) => e['subject'] as string);
+  }
+
+  async function waitForExitAlerts(expected: number, timeoutMs: number): Promise<string[]> {
+    const deadline = Date.now() + timeoutMs;
+    let subjects = await exitAlertSubjects();
+    while (subjects.length < expected && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+      subjects = await exitAlertSubjects();
+    }
+    return subjects;
+  }
+
+  it('suppresses the pa-alerts exit page when the caller cancelled the run', async () => {
+    const script = await writeScript('exit-cancelled.js', 'process.stderr.write("killed"); process.exit(1);');
+    await createTempSecrets(tempDir, '');
+    const result = await executeWorker(makeWorker({ name: 'cancelled_w', command: 'node', args: [script] }), 'unused', {
+      timeout: 10,
+      resource: 'topic-cancel-exit',
+      isCancelled: () => true,
+    });
+    assert.equal(result.success, false);
+    assert.deepEqual(await waitForExitAlerts(1, 3000), []);
+  });
+
+  it('still pages on a genuine non-zero exit', async () => {
+    const script = await writeScript('exit-genuine.js', 'process.stderr.write("boom"); process.exit(1);');
+    await createTempSecrets(tempDir, '');
+    const result = await executeWorker(makeWorker({ name: 'genuine_w', command: 'node', args: [script] }), 'unused', {
+      timeout: 10,
+      resource: 'topic-genuine-exit',
+    });
+    assert.equal(result.success, false);
+    assert.deepEqual(await waitForExitAlerts(1, 5000), ['Worker exited with code 1: genuine_w']);
+  });
+
+  // 2026-08-03 deep-recheck fix: this predicate is read synchronously inside
+  // the child's 'close' event handler. A throw there must not crash the
+  // process, and must not accidentally suppress a real page either — a
+  // marker-store failure is exactly the moment you most want the exit alert.
+  it('a throwing isCancelled does not crash the close handler and still pages', async () => {
+    const script = await writeScript('exit-throws.js', 'process.stderr.write("boom"); process.exit(1);');
+    await createTempSecrets(tempDir, '');
+    const result = await executeWorker(makeWorker({ name: 'throws_w', command: 'node', args: [script] }), 'unused', {
+      timeout: 10,
+      resource: 'topic-throws-exit',
+      isCancelled: () => { throw new Error('marker store unavailable'); },
+    });
+    assert.equal(result.success, false);
+    assert.deepEqual(await waitForExitAlerts(1, 5000), ['Worker exited with code 1: throws_w']);
   });
 });
 

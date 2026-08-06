@@ -2,6 +2,9 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { buildReport, gateAndApprove, rollback, hasPendingDraftForTarget, wasRecentlyChanged, sweepStaleDrafts, getReportTopic } from '../src/self-improver.js';
 import type { ReportEntry } from '../src/self-improver.js';
+import { GIT_WORKFLOW_RESOURCE, GIT_LOCK_WAIT_MS } from '../src/code-fixer.js';
+import type { BlackboardLockClient } from '../src/code-fixer.js';
+import { exclusiveLockKey } from '../src/commands/run.js';
 import { createTempPaHome, createTempSkill, createTempDraft, createTempSecrets, cleanup } from './helpers.js';
 import { readFile, mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
@@ -11,6 +14,39 @@ import { promisify } from 'util';
 import { computeFingerprint } from '../src/drafts.js';
 import { appendAuditRecord } from '../src/lib/improvement-audit.js';
 import type { DraftMeta, DraftProposal, RunMeta } from '../src/types.js';
+
+// ---------------------------------------------------------------------------
+// git-workflow lock fake (2026-08-05) — local per this file's existing
+// per-file-fake convention (code-fixer.test.ts has its own copy too, not a
+// shared/exported helper). Mirrors makeLockFake there.
+// ---------------------------------------------------------------------------
+
+interface LockFakeState {
+  acquireCalls: Array<{ resource: string; agent: string; pid: number; timeoutMs?: number }>;
+  heartbeatCalls: number;
+  releaseCalls: number;
+  held: boolean;
+}
+
+function makeLockFake(opts: { acquire?: boolean } = {}): { bb: BlackboardLockClient; state: LockFakeState } {
+  const state: LockFakeState = { acquireCalls: [], heartbeatCalls: 0, releaseCalls: 0, held: false };
+  const bb: BlackboardLockClient = {
+    acquireLock: async (resource: string, agent: string, pid: number, timeoutMs?: number) => {
+      state.acquireCalls.push({ resource, agent, pid, timeoutMs });
+      const acquired = opts.acquire !== false;
+      if (acquired) state.held = true;
+      return acquired;
+    },
+    updateHeartbeat: async () => {
+      state.heartbeatCalls++;
+    },
+    releaseLock: async () => {
+      state.releaseCalls++;
+      state.held = false;
+    },
+  };
+  return { bb, state };
+}
 
 async function readAuditRecords(dir: string): Promise<any[]> {
   try {
@@ -685,12 +721,14 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
   it('executes git revert + push, audits rolled-back with both hashes, marks the draft', async () => {
     await seedDraft();
     const cmds: string[] = [];
+    const { bb } = makeLockFake();
     const lines = await rollback({
       checkForRollbacksFn: async () => [gitRevertFlag()],
       execFn: async (cmd: string) => {
         cmds.push(cmd);
         return { stdout: cmd.includes('rev-parse') ? 'def5678\n' : '', stderr: '' };
       },
+      blackboardFn: bb,
     });
 
     // `-n` (staged, not committed) since 2026-07-21 so the pa/data/profile* churn can be
@@ -718,12 +756,14 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
 
   it('reports and audits rollback-failed when the git revert command fails (e.g. conflict)', async () => {
     await seedDraft();
+    const { bb } = makeLockFake();
     const lines = await rollback({
       checkForRollbacksFn: async () => [gitRevertFlag()],
       execFn: async (cmd: string) => {
         if (cmd.includes('git revert')) throw new Error('could not revert: merge conflict in update_coding_dirs.py');
         return { stdout: '', stderr: '' };
       },
+      blackboardFn: bb,
     });
 
     assert.equal(lines.length, 1);
@@ -746,9 +786,11 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
       reason: 'x', commit_hash: 'abc1234',
       files_changed: ['projects/telegram-bot/src/logic.ts'],
     });
+    const { bb } = makeLockFake();
     const lines = await rollback({
       checkForRollbacksFn: async () => [gitRevertFlag()],
       execFn: async (cmd: string) => ({ stdout: cmd.includes('rev-parse') ? 'def5678\n' : '', stderr: '' }),
+      blackboardFn: bb,
     });
 
     assert.match(lines[0], /bot restart|rebuild/i);
@@ -760,6 +802,7 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
     // pa/data/profile* alone does NOT count as WIP (that's the whole point of the carve-out).
     await seedDraft();
     const cmds: string[] = [];
+    const { bb } = makeLockFake();
     const lines = await rollback({
       checkForRollbacksFn: async () => [gitRevertFlag()],
       execFn: async (cmd: string) => {
@@ -769,6 +812,7 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
         }
         return { stdout: '', stderr: '' };
       },
+      blackboardFn: bb,
     });
 
     assert.match(lines[0], /Rollback FAILED/);
@@ -779,6 +823,90 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
     const rec = (await readAuditRecords(dir)).find((r) => r.action === 'rollback-failed');
     assert.ok(rec, 'expected a rollback-failed audit record');
     assert.equal(rec.commit_hash, 'abc1234');
+  });
+
+  it('acquires the git-workflow lock (correct resource/agent/pid/timeout) before any git command, and releases it after the last one', async () => {
+    await seedDraft();
+    const cmds: string[] = [];
+    const { bb, state } = makeLockFake();
+
+    await rollback({
+      checkForRollbacksFn: async () => [gitRevertFlag()],
+      execFn: async (cmd: string) => {
+        cmds.push(cmd);
+        if (cmd === 'git rev-parse HEAD') return { stdout: 'def5678\n', stderr: '' };
+        if (cmd === 'git rev-parse --abbrev-ref HEAD') return { stdout: 'main\n', stderr: '' };
+        return { stdout: '', stderr: '' };
+      },
+      blackboardFn: bb,
+    });
+
+    assert.equal(state.acquireCalls.length, 1);
+    assert.equal(state.acquireCalls[0].resource, exclusiveLockKey(GIT_WORKFLOW_RESOURCE));
+    assert.equal(state.acquireCalls[0].resource, 'skill-exclusive:git-workflow');
+    assert.equal(state.acquireCalls[0].agent, 'self-improver-rollback');
+    assert.equal(state.acquireCalls[0].timeoutMs, GIT_LOCK_WAIT_MS);
+    assert.equal(state.releaseCalls, 1);
+    assert.equal(state.held, false, 'the lock must be released after the last git command');
+  });
+
+  it('still releases the lock when the revert fails on the conflict path — the existing rollback-failed audit record and report line are unchanged (regression guard)', async () => {
+    await seedDraft();
+    const { bb, state } = makeLockFake();
+
+    const lines = await rollback({
+      checkForRollbacksFn: async () => [gitRevertFlag()],
+      execFn: async (cmd: string) => {
+        // gitRevertPreservingChurn stages the revert with `-n` (not `--no-edit` — that shape
+        // was replaced by the churn-preservation rewrite, see gitRevertPreservingChurn's own
+        // doc comment) then commits separately; triggering the failure here matches the
+        // actual conflict point (the revert-staging step itself).
+        if (cmd.includes('revert -n')) throw new Error('could not revert: merge conflict in update_coding_dirs.py');
+        return { stdout: '', stderr: '' };
+      },
+      blackboardFn: bb,
+    });
+
+    assert.equal(state.releaseCalls, 1);
+    assert.equal(state.held, false);
+    assert.match(lines[0], /Rollback FAILED/);
+    assert.match(lines[0], /merge conflict/);
+
+    const rec = (await readAuditRecords(dir)).find((r) => r.action === 'rollback-failed');
+    assert.ok(rec, 'expected a rollback-failed audit record (unchanged by the lock restructure)');
+    assert.equal(rec.commit_hash, 'abc1234');
+  });
+
+  it('defers without touching git or writing an audit record when the lock is busy — the returned line mentions the deferral', async () => {
+    await seedDraft();
+    const { bb } = makeLockFake({ acquire: false });
+    let execCalled = false;
+
+    const lines = await rollback({
+      checkForRollbacksFn: async () => [gitRevertFlag()],
+      execFn: async (cmd: string) => { execCalled = true; return { stdout: '', stderr: '' }; },
+      blackboardFn: bb,
+    });
+
+    assert.equal(execCalled, false, 'must not touch git at all when the lock is busy');
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /DEFERRED/i);
+
+    const records = await readAuditRecords(dir);
+    assert.equal(records.length, 0, 'a transient, self-healing lock wait must not write an audit record (no rollback-failed escalation)');
+  });
+
+  it('has zero lock interaction at all when checkForRollbacksFn returns no flags', async () => {
+    const { bb, state } = makeLockFake();
+
+    const lines = await rollback({
+      checkForRollbacksFn: async () => [],
+      blackboardFn: bb,
+    });
+
+    assert.deepEqual(lines, []);
+    assert.equal(state.acquireCalls.length, 0);
+    assert.equal(state.releaseCalls, 0);
   });
 });
 

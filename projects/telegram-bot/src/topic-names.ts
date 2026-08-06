@@ -3,6 +3,11 @@ import { join } from 'path';
 import { homedir } from 'os';
 import type { TelegramMessage } from './types.js';
 
+// Adding a field here also requires updating loadTopicNames's whitelist below
+// (it destructures known fields explicitly — an unlisted key in the JSON file
+// is silently dropped on load, hand-edit or not). The writers (updateTopicName,
+// setTopicDescription) spread the existing entry, so once a field survives the
+// loader it survives every write automatically.
 export interface TopicEntry {
   name: string;
   description?: string;
@@ -123,9 +128,13 @@ export async function updateTopicName(
     inner = new Map();
     map.set(key, inner);
   }
-  // Preserve existing description and guide_message_id
+  // Spread the existing entry rather than reconstructing field-by-field —
+  // reconstruction silently drops any field this function doesn't explicitly
+  // know about (found 2026-08-05: guide_message_id had to be hand-threaded
+  // through this and setTopicDescription individually; any future TopicEntry
+  // field would need the same manual treatment at every call site, or vanish).
   const existing = inner.get(threadId);
-  inner.set(threadId, { name, description: existing?.description, guide_message_id: existing?.guide_message_id });
+  inner.set(threadId, { ...existing, name });
   await saveTopicNames(map);
 }
 
@@ -146,8 +155,10 @@ export async function setTopicDescription(
     inner = new Map();
     map.set(key, inner);
   }
+  // See updateTopicName's comment — spread, don't reconstruct, so any future
+  // TopicEntry field survives a description update automatically.
   const existing = inner.get(threadId);
-  inner.set(threadId, { name: existing?.name ?? '', description, guide_message_id: existing?.guide_message_id });
+  inner.set(threadId, { ...existing, name: existing?.name ?? '', description });
   await saveTopicNames(map);
 }
 

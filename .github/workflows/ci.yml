@@ -54,14 +54,35 @@ jobs:
           npm run build
           npm test
 
-      # 2026-07-23: this CI job (the one required by branch protection) never
-      # ran the Python suite at all -- pre-push-pii-guard, pii_ci_scan.py, and
-      # friends only ever got tested by someone remembering to run them by
-      # hand. Runs across all 3 platforms deliberately: the guard's own
-      # tests exercise both the win32 (.cmd shim) and POSIX (chmod/killpg)
-      # code paths. verify_pii_guard_agy_e2e.py is deliberately NOT run here
-      # -- it needs a real agy binary that doesn't exist on these runners and
-      # is a manual/on-demand harness by design.
+  # Split out of the `test` job on 2026-08-04. Unlike the Node steps above,
+  # this suite has NO dependency on pa or the bot being installed/built
+  # (verified: no test_*.py references pa/dist, node_modules, or shells out
+  # to npm) — it was only ever sequential because it was easiest to write
+  # that way when it was added 2026-07-23. As its own matrix job it runs
+  # CONCURRENTLY with `test` instead of after it, cutting real wall-clock
+  # with no added risk. Do not merge it back into `test` "for simplicity" —
+  # that reintroduces the exact wait this split removes.
+  test-python:
+    name: Python tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 2026-07-23: before this job existed, the Node-only CI job (the one
+      # required by branch protection) never ran the Python suite at all --
+      # pre-push-pii-guard, pii_ci_scan.py, and friends only ever got tested
+      # by someone remembering to run them by hand. Runs across all 3
+      # platforms deliberately: the guard's own tests exercise both the
+      # win32 (.cmd shim) and POSIX (chmod/killpg) code paths.
+      # verify_pii_guard_agy_e2e.py is deliberately NOT run here -- it needs
+      # a real agy binary that doesn't exist on these runners and is a
+      # manual/on-demand harness by design.
       - name: Set up Python
         uses: actions/setup-python@v5
         with:

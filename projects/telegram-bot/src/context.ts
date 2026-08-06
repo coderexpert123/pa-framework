@@ -155,10 +155,11 @@ export async function buildPrompt(
 - Multi-step artifacts (uploads, links, plan summaries) MUST appear in the final response. Never send bare "done". For \`/plan\` or \`/deep-plan\`, include a ~400-char summary (goal, phase count, key risks) and the Google Drive link.
 - Ambiguous intent: ask exactly ONE clarifying question.
 - Never fabricate data. If you don't know, say so.
+- Grounding Sources first: Systems of record: D:/My Repos/notes/Ecosystem KB/ (start with Sources.md). Before answering a date-sensitive or domain-deterministic factual question, check Sources.md and the file(s) it names, and cite them. Never answer such a question from general/parametric knowledge when a named source exists. (Mirrors bot-instructions.md's Factual Integrity item 4 — claude/zclaude get that file via --append-system-prompt-file, agy/codex only get this inline block, so this rule must exist in both places; keep them in sync, enforced by context.test.ts.)
 - PA_META (optional last line, single-line JSON, nothing after it):
   [PA_META]: {"actions":[{"type":"T",...}]}
-  Types: retry_with_worker{reason} | run_skill{skill} | confirm_required
-  retry_with_worker = you cannot complete the task, route to another worker. run_skill = trigger a pa skill automatically after your response (different from telling the user to run it). confirm_required = use instead of the "Reply *yes*" text. Omit PA_META otherwise.`;
+  Types: retry_with_worker{reason} | run_skill{skill} | confirm_required | kb_note{domain,note}
+  retry_with_worker = you cannot complete the task, route to another worker. run_skill = trigger a pa skill automatically after your response (different from telling the user to run it). confirm_required = use instead of the "Reply *yes*" text. kb_note = you changed a deterministic source another topic's domain depends on — records a dated note into Ecosystem KB Sources.md immediately (domain = section name, note = one-line fact, <=300 chars); does not replace your normal response. Omit PA_META otherwise.`;
 
   const identity = omitStatic
     ? ''

@@ -7,9 +7,11 @@ import { loadSkill } from './skills.js';
 import { runWithFailover } from './workers.js';
 import { botRestartCommand } from './commands/bot.js';
 import { checkBotProcess } from './commands/health.js';
+import { exclusiveLockKey } from './commands/run.js';
+import { blackboard } from './blackboard.js';
 import { appendAuditRecord, skillRunStats, toAuditBaseline } from './lib/improvement-audit.js';
 import { resolvePythonCommand } from './lib/python.js';
-import type { DraftProposal } from './types.js';
+import type { DraftProposal, Skill } from './types.js';
 import type { FailureRecord } from './failure-analyzer.js';
 import type { AuditTestRunCounts } from './lib/improvement-audit.js';
 import type { CheckResult } from './commands/health.js';
@@ -48,13 +50,38 @@ export type ExecFn = (command: string, options?: { cwd?: string }) => Promise<Ex
 
 const defaultExec: ExecFn = promisify(execCb);
 
+// ---------------------------------------------------------------------------
+// git-workflow lock (2026-08-05) — attemptCodeFix mutates this repo's shared git
+// working tree directly (git commit/push/reset --hard/clean -fd), entirely
+// outside the skill-frontmatter exclusive_resource mechanism the commit/push/
+// push-public/investigate-flagged/update-brain skill family already uses. It
+// takes the SAME blackboard lock so a nightly autonomous fix can never race a
+// concurrent manual /commit or /push. See plans/federated-booping-hammock.md.
+//
+// Must match the `exclusive_resource:` value in all five git-workflow skill.md
+// files — changing this string without changing them silently disables the
+// mutual exclusion.
+export const GIT_WORKFLOW_RESOURCE = 'git-workflow';
+// Real skill timeouts are commit=600s, push/push-public=3600s,
+// investigate-flagged=1800s — 5 min comfortably outlasts a typical /commit
+// without pretending it could ever outwait a /push; it's 8% of self-improver's
+// own 3600s skill budget; and a missed night self-heals on the next cron.
+export const GIT_LOCK_WAIT_MS = 300_000;
+const LOCK_HEARTBEAT_MS = 60_000;
+const CODE_FIX_LOCK_AGENT = 'self-improver-code-fix';
+
+// Narrowed-Pick DI, mirrors worker-exec.ts's `bb: Pick<typeof blackboard, 'acquireLock'>`
+// precedent. Exported so self-improver.ts's rollback() reuses the same shape.
+export type BlackboardLockClient = Pick<typeof blackboard, 'acquireLock' | 'updateHeartbeat' | 'releaseLock'>;
+
 export type CodeFixOutcome =
   | 'applied-code-fix'
   | 'code-fix-reverted'
   | 'code-fix-skipped-no-target'
   | 'code-fix-skipped-dirty-worktree'
   | 'code-fix-skipped-worker-failed'
-  | 'code-fix-skipped-no-changes';
+  | 'code-fix-skipped-no-changes'
+  | 'code-fix-skipped-git-lock-busy';
 
 export interface CodeFixResult {
   outcome: CodeFixOutcome;
@@ -70,6 +97,9 @@ export interface CodeFixOptions {
   botRestartFn?: typeof botRestartCommand;
   checkBotProcessFn?: () => Promise<CheckResult>;
   sleepFn?: (ms: number) => Promise<void>;
+  blackboardFn?: BlackboardLockClient;
+  /** Test-only: overrides LOCK_HEARTBEAT_MS so heartbeat tests don't need to wait 60s. */
+  lockHeartbeatMs?: number;
 }
 
 // --- F1: protected framework paths — the loop's own execution/audit/rollback chain and the
@@ -282,6 +312,7 @@ ${proposal.reason}
 ${PROTECTED_LIST_TEXT}
 3. Data-destruction guard: do not touch, modify, or delete anything under a data/ directory, any .env file, or anything with "secrets" in its name or path. Do not run the live skill itself as a form of validation — tests only.
 4. Run the relevant test suite yourself before declaring done, and only declare done if it passes.
+5. Do NOT commit, push, or invoke any git-workflow skill (e.g. \`pa run commit\`) — leave your changes uncommitted. The caller already holds this repo's git-workflow lock and will commit and push on your behalf. This overrides this repo's usual CLAUDE.md directive that all commits/pushes go through the git-workflow skill family — that directive does not apply to this task.
 
 Make the minimal change that fixes the recorded failure. Do not refactor unrelated code.`;
 }
@@ -512,8 +543,15 @@ export async function attemptCodeFix(
     await appendAuditRecord({ ...baseAudit, action: 'code-fix-skipped-worker-failed', reason });
     return { outcome: 'code-fix-skipped-no-target', reason };
   }
+  // Captured as its own (non-optional) binding for the same reason as `target` above:
+  // runBody() is a nested closure, so the narrowing this early-return performs on
+  // proposal.target_skill itself doesn't carry across the function boundary.
+  const targetSkillName = proposal.target_skill;
 
-  let target;
+  // Explicitly typed (not inferred) because runBody(), a nested function declared further
+  // down, closes over this variable — TypeScript's control-flow narrowing for a bare `let`
+  // doesn't carry across a function boundary, so an inferred `any` would silently widen.
+  let target: Skill;
   try {
     target = await loadSkill(proposal.target_skill);
   } catch (err: any) {
@@ -526,6 +564,8 @@ export async function attemptCodeFix(
     await appendAuditRecord({ ...baseAudit, action: 'code-fix-skipped-worker-failed', reason });
     return { outcome: 'code-fix-skipped-no-target', reason };
   }
+  // Same cross-closure narrowing reason as `target`/`targetSkillName` above.
+  const targetCwd = target.frontmatter.cwd;
 
   let repoRoot: string;
   try {
@@ -540,6 +580,35 @@ export async function attemptCodeFix(
   const { stdout: branchRaw } = await exec('git rev-parse --abbrev-ref HEAD', { cwd: repoRoot });
   const branch = branchRaw.trim();
 
+  // git-workflow lock: acquired here — right after repoRoot/branch resolve, before F4 —
+  // not just around the final commit/push. F4's clean-tree guarantee means nothing if
+  // another process can dirty the tree right after the check; the coding worker writes
+  // into the shared tree for up to 30 minutes, entirely before any commit happens; and
+  // hardRevert()'s `git reset --hard` + `git clean -fd` (the most destructive operation
+  // in this file) runs on every F1/F2/F3 failure path, not just F6. See buildCodeFixBrief's
+  // requirement 5 (above), which the coding worker's brief cross-references: it must not
+  // invoke a git-workflow skill of its own while this lock is held.
+  const bb = opts.blackboardFn ?? blackboard;
+  const lockKey = exclusiveLockKey(GIT_WORKFLOW_RESOURCE);
+  const lockAcquired = await bb.acquireLock(lockKey, CODE_FIX_LOCK_AGENT, process.pid, GIT_LOCK_WAIT_MS);
+  if (!lockAcquired) {
+    const reason = `Skipped: another skill/process is holding exclusive_resource "${GIT_WORKFLOW_RESOURCE}" — waited ${Math.round(GIT_LOCK_WAIT_MS / 1000)}s.`;
+    await appendAuditRecord({ ...baseAudit, action: 'code-fix-skipped-git-lock-busy', reason });
+    return { outcome: 'code-fix-skipped-git-lock-busy', reason };
+  }
+  const lockHeartbeat = setInterval(() => {
+    void bb.updateHeartbeat(lockKey, CODE_FIX_LOCK_AGENT).catch(() => {});
+  }, opts.lockHeartbeatMs ?? LOCK_HEARTBEAT_MS);
+  lockHeartbeat.unref?.();
+
+  try {
+    return await runBody();
+  } finally {
+    clearInterval(lockHeartbeat);
+    await bb.releaseLock(lockKey, CODE_FIX_LOCK_AGENT).catch(() => {});
+  }
+
+  async function runBody(): Promise<CodeFixResult> {
   // F4: working-tree-clean precondition — never mix an autonomous diff with human WIP.
   const preExisting = await getWorkingTreePaths(exec, repoRoot);
   if (preExisting.length > 0) {
@@ -551,7 +620,7 @@ export async function attemptCodeFix(
   const { stdout: preFixHeadRaw } = await exec('git rev-parse HEAD', { cwd: repoRoot });
   const preFixHead = preFixHeadRaw.trim();
 
-  const projectRelDir = normalizePath(relative(repoRoot, target.frontmatter.cwd));
+  const projectRelDir = normalizePath(relative(repoRoot, targetCwd));
 
   // F3 baseline: capture the target project's PRE-FIX failing tests, on a clean
   // tree, before the worker touches anything — so the post-fix gate can tell a
@@ -660,8 +729,9 @@ export async function attemptCodeFix(
     commit_hash: commitHash,
     files_changed: touchedPaths,
     test_run_counts: verification.testRunCounts,
-    baseline: toAuditBaseline(await skillRunStats(proposal.target_skill, 14)),
+    baseline: toAuditBaseline(await skillRunStats(targetSkillName, 14)),
   });
 
   return { outcome: 'applied-code-fix', reason, commitHash, filesChanged: touchedPaths, testRunCounts: verification.testRunCounts };
+  }
 }

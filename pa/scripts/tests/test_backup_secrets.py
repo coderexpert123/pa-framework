@@ -75,6 +75,9 @@ class TestManifestAndPack(unittest.TestCase):
         home = Path(os.environ["PA_HOME"])
         (home / "secrets.env").write_text("TELEGRAM_BOT_TOKEN=x", encoding="utf-8")
         (home / "google-token.json").write_text("{}", encoding="utf-8")
+        (home / "data").mkdir()
+        (home / "data" / "profile.json").write_text("{}", encoding="utf-8")
+        (home / "data" / "profile-history-archive.jsonl").write_text("", encoding="utf-8")
         shim = Path(os.environ["PA_GEMINI_SHIM_DIR"])
         (shim / "gemini.cmd").write_text("@echo off", encoding="utf-8")
 
@@ -82,6 +85,9 @@ class TestManifestAndPack(unittest.TestCase):
         self.assertIn("pa/secrets.env", arcs)
         self.assertIn("pa/google-token.json", arcs)
         self.assertIn("gemini-shim/gemini.cmd", arcs)
+        # AI-089: the repo-external profile pair rides this bundle for durability
+        self.assertIn("pa/data/profile.json", arcs)
+        self.assertIn("pa/data/profile-history-archive.jsonl", arcs)
 
     def test_manifest_skips_missing_files(self):
         home = Path(os.environ["PA_HOME"])

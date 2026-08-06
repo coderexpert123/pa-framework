@@ -24,6 +24,7 @@ export async function checkWorker(worker: WorkerConfig, env?: Record<string, str
       stdio: ['ignore', 'ignore', 'pipe'],
       timeout: timeoutMs,
       env: { ...process.env, ...env },
+      windowsHide: true,
     });
     child.stderr?.on('data', (d: Buffer) => { stderr += d.toString(); });
     child.on('error', (err) => {
@@ -128,8 +129,39 @@ export async function runWithFailover(
   let finalWorkerName = 'none';
   let anyAttempted = false;
 
+  // AI-092 gap, closed 2026-08-02. A Telegram /stop kills the worker that is
+  // running RIGHT NOW, which surfaces here as an ordinary non-zero exit. The
+  // callers' own stop checks all sit OUTSIDE this loop, so a kill landing
+  // mid-cascade used to read as "that worker failed" and roll on to the next
+  // one: the cancelled request got answered anyway (2026-08-02, thread 29 —
+  // gemini killed at 21:59:22, claude answered at 22:02), plus a false
+  // worker-exit page to pa-alerts and a "switching to" card for a request
+  // nobody was waiting on. Cancellation is therefore polled per candidate,
+  // and again immediately after a failed attempt — the kill almost always
+  // lands mid-run, i.e. between those two points.
+  // A caller-supplied predicate that throws must not take the dispatch down
+  // with it: fail toward "not cancelled" (the behaviour callers get when they
+  // pass nothing at all) rather than rejecting mid-cascade.
+  const cancelled = () => {
+    try {
+      return options.isCancelled?.() === true;
+    } catch (err) {
+      logger.warn('workers', `isCancelled threw — treating as not cancelled: ${(err as Error).message}`, ctx);
+      return false;
+    }
+  };
+
   for (let i = 0; i < workers.length; i++) {
     const worker = workers[i];
+
+    // 0a. Caller abandoned the request — stop, do NOT hand it to another worker.
+    // Returns the last real result so the caller still sees a failed dispatch
+    // (its own reply path swaps in the cancellation confirmation), and skips
+    // the exhaustion/rate-limit-wall alerts below: nothing is wrong with the pool.
+    if (cancelled()) {
+      logger.info('workers', `abort: cancelled by caller before ${worker.name}`, ctx);
+      return { result: finalResult, worker: finalWorkerName };
+    }
 
     // 0. Skip workers excluded by caller (already failed in earlier dispatch phases)
     if (options.excludeWorkers?.has(worker.name)) {
@@ -181,6 +213,14 @@ export async function runWithFailover(
     finalWorkerName = worker.name;
 
     if (result.success) {
+      return { result, worker: worker.name };
+    }
+
+    // Cancelled while this worker was running: the non-zero exit IS the kill.
+    // Return before classification so a killed run can neither record a bogus
+    // rate-limit cooldown nor emit a failover card.
+    if (cancelled()) {
+      logger.info('workers', `abort: ${worker.name} exited ${result.exitCode} after caller cancellation — not failing over`, ctx);
       return { result, worker: worker.name };
     }
 

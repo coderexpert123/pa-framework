@@ -42,9 +42,15 @@ const suiteHome = mkdtempSync(join(tmpdir(), 'pa-suite-'));
 // a test preload — the logger's guard must not fire in production.
 process.env.PA_TEST_LOG_HOME = suiteHome;
 
-if (!process.env.PA_HOME) {
-  process.env.PA_HOME = suiteHome;
-}
+// Unconditional (2026-08-05, no `if (!process.env.PA_HOME)` guard) — code-fixer.ts's
+// attemptCodeFix() and self-improver.ts's rollback() take a REAL blackboard lock
+// (skill-exclusive:git-workflow) during their own tests. If PA_HOME were ever
+// externally set (it isn't today — checked the shell, secrets.env, and CI workflows —
+// but `run.ts` spawns cmd-based skills with `{...process.env, ...secrets}`, so it
+// propagates if it's ever set anywhere upstream), a conditional guard here would let
+// a test process contend for the PRODUCTION lock under a different PID than whatever
+// legitimately holds it, hanging for the full GIT_LOCK_WAIT_MS wait. Always override.
+process.env.PA_HOME = suiteHome;
 
 // Each test file runs in its own process, so each gets (and removes) its own
 // suite home. Best-effort: never let teardown fail a run.

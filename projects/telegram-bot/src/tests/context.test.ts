@@ -266,6 +266,21 @@ describe('bot-instructions.md content', { skip: !BOT_INSTRUCTIONS_EXISTS && 'bot
     assert.ok(content.includes('Reply *yes* to confirm or *no* to cancel.'),
       'confirmation phrase must be verbatim — changing it breaks logic.ts CONFIRMATION_PATTERN');
   });
+
+  // AI-101: bot-instructions.md is only delivered to claude/zclaude
+  // (--append-system-prompt-file); agy/codex — including agy, the priority-1
+  // default worker, and the one that actually answered wrong in the incident
+  // this rule exists to prevent — only ever see context.ts's inline
+  // capabilities block (buildPrompt with omitStatic:false). A grounding rule
+  // added to only one of the two is silently inert for the other worker
+  // family. This test fails if the two drift apart.
+  it('Grounding Sources rule matches context.ts inline capabilities block verbatim', async () => {
+    const content = await readFile(BOT_INSTRUCTIONS_PATH, 'utf8');
+    const GROUNDING_SENTENCE = 'Systems of record: D:/My Repos/notes/Ecosystem KB/ (start with Sources.md). Before answering a date-sensitive or domain-deterministic factual question, check Sources.md and the file(s) it names, and cite them. Never answer such a question from general/parametric knowledge when a named source exists.';
+    assert.ok(content.includes(GROUNDING_SENTENCE), 'bot-instructions.md must contain the Grounding Sources sentence verbatim');
+    const inlinePrompt = await buildPrompt('hello', makeState(), undefined, undefined, undefined, { omitStatic: false });
+    assert.ok(inlinePrompt.includes(GROUNDING_SENTENCE), 'context.ts inline capabilities block must contain the SAME sentence verbatim — keep both in sync');
+  });
 });
 
 // ---------------------------------------------------------------------------

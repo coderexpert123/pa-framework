@@ -69,6 +69,7 @@ async function startKeepAwake(): Promise<KeepAwakeStatus> {
     child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', psHelper()], {
       detached: true,
       stdio: 'ignore',
+      windowsHide: true,
     });
   } else if (platform() === 'darwin') {
     // caffeinate -s: prevent system sleep; ships with macOS, no install needed

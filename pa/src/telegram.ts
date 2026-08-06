@@ -1,7 +1,7 @@
 import { randomBytes } from 'crypto';
 import type { TelegramOutput } from './types.js';
 import { log } from './lib/log.js';
-import { sanitizeMdV2 } from './lib/mdv2.js';
+import { sanitizeMdV2, normalizeMarkdown } from './lib/mdv2.js';
 import { telegramFetch } from './lib/telegram-proxy.js';
 
 const BASE = 'https://api.telegram.org';
@@ -105,7 +105,7 @@ export async function sendToTelegram(
   // appended trailer. That's the desired behavior.
   // The `-` inside the refId (e.g. `s-9b43`) MUST be escaped under MdV2 even
   // inside the italic span — Telegram rejects raw `-` everywhere outside code.
-  const safeBody = parseMode === 'MarkdownV2' ? sanitizeMdV2(text.trim()) : text.trim();
+  const safeBody = parseMode === 'MarkdownV2' ? sanitizeMdV2(normalizeMarkdown(text.trim())) : text.trim();
   const refTrailer = parseMode === 'MarkdownV2' ? `_Ref: ${refId.replace('-', '\\-')}_` : `_Ref: ${refId}_`;
   const textWithRef = `${safeBody}\n\n${refTrailer}`;
   const chunks = splitMessage(textWithRef);
