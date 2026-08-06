@@ -74,6 +74,28 @@ export interface DetectDriftOptions {
   gitRunner?: GitRunner;
 }
 
+/**
+ * `restoreFromHead`/`mergeAgainstHead` are exported functions any caller can invoke
+ * with an arbitrary path string — `reconcile.ts`'s `--restore`/`--merge` CLI flags
+ * pass a user-supplied argument straight through with no validation of their own.
+ * `mergeAgainstHead` does a DIRECT `readFile(join(repoRoot, relPath))`, not a
+ * git-mediated read — unlike `checkFileDrift`'s `relPath` (always sourced from git's
+ * own `status --porcelain` output, already confined to the repo), an unvalidated CLI
+ * arg here is a real path-traversal read (`../../../../whatever` escapes `repoRoot`
+ * entirely). Mirrors `lib/reservations.ts`'s `normalizePath()`, which already defends
+ * the structurally identical `pa claim <path>` input — found via a 2026-08-06
+ * deep-recheck that this file never got the same treatment.
+ */
+function assertSafeRelPath(relPath: string): void {
+  const p = relPath.replace(/\\/g, '/');
+  if (p.startsWith('/') || /^[A-Za-z]:/.test(p)) {
+    throw new Error(`path must be repo-relative, not absolute: "${relPath}"`);
+  }
+  if (p.split('/').some((segment) => segment === '..')) {
+    throw new Error(`path escapes the repo root: "${relPath}"`);
+  }
+}
+
 interface StatusEntry {
   x: string;
   y: string;
@@ -147,6 +169,9 @@ async function checkFileDrift(
   }
 
   const revListRes = await gitRunner(repoRoot, ['rev-list', `--max-count=${maxCommits}`, 'HEAD', '--', relPath]);
+  if (revListRes.code !== 0) {
+    throw new Error(`git rev-list failed for ${relPath} (exit ${revListRes.code}): ${revListRes.stderr.toString('utf8').trim()}`);
+  }
   const shas = revListRes.stdout.toString('utf8').split('\n').map((s) => s.trim()).filter(Boolean);
 
   const queries = [`HEAD:${relPath}`, ...shas.map((sha) => `${sha}:${relPath}`)];
@@ -168,7 +193,15 @@ export async function detectDrift(repoRoot: string, opts: DetectDriftOptions = {
   const gitRunner = opts.gitRunner ?? defaultGitRunner;
   const maxCommits = opts.maxCommits ?? 50;
 
+  // A failed `git status` here must never be read as "no candidates" — this tool
+  // exists to catch silent tree corruption, so silently reporting a clean scan
+  // when the scan itself never ran would be the exact failure mode it's supposed
+  // to prevent. Throw loudly instead of returning an empty (falsely reassuring)
+  // findings array.
   const statusRes = await gitRunner(repoRoot, ['status', '--porcelain']);
+  if (statusRes.code !== 0) {
+    throw new Error(`git status failed (exit ${statusRes.code}): ${statusRes.stderr.toString('utf8').trim()}`);
+  }
   const candidates = parsePorcelainStatus(statusRes.stdout.toString('utf8')).filter(isDriftCandidate);
 
   const findings: DriftFinding[] = [];
@@ -190,6 +223,7 @@ export interface RestoreResult {
 
 /** Restores one path to its exact HEAD content. Explicit and per-path — never automatic. */
 export async function restoreFromHead(repoRoot: string, relPath: string, opts: { gitRunner?: GitRunner } = {}): Promise<RestoreResult> {
+  assertSafeRelPath(relPath);
   const gitRunner = opts.gitRunner ?? defaultGitRunner;
   const res = await gitRunner(repoRoot, ['checkout', 'HEAD', '--', relPath]);
   return { code: res.code, stderr: res.stderr.toString('utf8') };
@@ -233,6 +267,7 @@ export async function mergeAgainstHead(
   relPath: string,
   opts: MergeAgainstHeadOptions = {},
 ): Promise<MergeAgainstHeadResult> {
+  assertSafeRelPath(relPath);
   const gitRunner = opts.gitRunner ?? defaultGitRunner;
   const now = opts.now ?? (() => new Date());
 
