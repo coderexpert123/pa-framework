@@ -21,8 +21,8 @@ repo (.github/workflows/pii-scan.yml) over the ENTIRE tracked tree at HEAD —
 contents AND paths — and optionally over every path that ever existed in
 history. It is also runnable by a human locally against the public mirror:
 
-    python pa/scripts/pii_ci_scan.py --git-dir .git-public
-    python pa/scripts/pii_ci_scan.py --git-dir .git-public --history-paths
+    python pa/scripts/pii_ci_scan.py --git-dir .git
+    python pa/scripts/pii_ci_scan.py --git-dir .git --history-paths
 
 WHAT IT CAN AND CANNOT CATCH  (read this before trusting it)
 ------------------------------------------------------------
@@ -93,8 +93,8 @@ SKIP_EXTENSIONS = (
     ".so", ".dylib", ".class", ".jar", ".mp3", ".mp4", ".wav",
 )
 SKIP_DIR_NAMES = {
-    ".git", ".git-public", "node_modules", "__pycache__", "dist", "build",
-    "venv", ".venv", ".pytest_cache", ".mypy_cache", "coverage",
+    ".git", ".git-public", "pa-public", "node_modules", "__pycache__", "dist",
+    "build", "venv", ".venv", ".pytest_cache", ".mypy_cache", "coverage",
 }
 MAX_FILE_BYTES = 2_000_000
 
@@ -157,6 +157,7 @@ _PLACEHOLDER_SECRET_VALUES = re.compile(
 # a script, a test fixture, or a FILENAME" class that leaked in 2026-07.
 # Ambiguous English words (axis, chase, discover, ally, mint, wise, target)
 # are intentionally EXCLUDED — a false CI failure trains people to ignore it.
+# pii-scan:ignore-start
 _FINANCIAL_INSTITUTIONS = (
     "hdfc", "icici", "kotak", "indusind", "idfc", "yesbank", "canara",
     "andhra bank", "bank of baroda", "punjab national", "federal bank",
@@ -174,6 +175,7 @@ _FINANCIAL_INSTITUTIONS = (
     "razorpay", "payu", "billdesk", "phonepe", "paytm", "bharatpe",
     "policybazaar", "bajaj finserv", "bajaj finance", "cred\\.club",
 )
+# pii-scan:ignore-end
 
 _CLASS_DEFS: list[tuple[str, str, str, int]] = [
     # (class name, regex, scope: content|path|both, extra re flags)
@@ -599,7 +601,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--root", default=".", help="Working tree to scan (default: cwd)")
     p.add_argument("--git-dir", default=None,
-                   help="Scan the repo at this git dir (e.g. .git-public). "
+                   help="Scan the repo at this git dir (e.g. .git). "
                         "Default: the git repo containing --root.")
     p.add_argument("--no-git", action="store_true",
                    help="Ignore git; walk the filesystem under --root instead.")
