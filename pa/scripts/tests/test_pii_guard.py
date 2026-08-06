@@ -402,6 +402,47 @@ class TestScanText(unittest.TestCase):
         self.assertIn("f.txt:1", violations[0])
         self.assertIn("f.txt:3", violations[1])
 
+    def test_ignore_block_suppresses_tripwire_and_credential_hits_inside_it(self):
+        # 2026-08-06: pii_ci_scan.py's own detection dictionaries deliberately
+        # contain many real institution names (e.g. _FINANCIAL_INSTITUTIONS) —
+        # that's the whole point of a detection dictionary — and already wraps
+        # them in pii-scan:ignore-start/-end for the CI backstop. This guard had
+        # no suppression mechanism at all, so any operator tripwire matching one
+        # of those names (their real bank, plausibly) blocked every push that so
+        # much as touched the file, forever, with no way to mark it known-safe.
+        content = (
+            "before\n"
+            "# pii-scan:ignore-start\n"
+            "Secretname lives here, token = '1234567890:" + "A" * 35 + "'\n"
+            "# pii-scan:ignore-end\n"
+            "after Secretname\n"
+        )
+        violations = guard.scan_text("f.txt", content, ["Secretname"])
+        # Only the occurrence OUTSIDE the ignore block is reported.
+        self.assertEqual(len(violations), 1)
+        self.assertIn("f.txt:5", violations[0])
+
+    def test_ignore_line_suppresses_just_that_one_line(self):
+        # ignore-line is a TRAILING marker on the same line as the content it
+        # protects (matches pii_ci_scan.py's own usage, e.g. a fixture literal
+        # commented `# pii-scan:ignore-line`) — not a standalone directive that
+        # protects the line after it.
+        content = (
+            "Secretname line one\n"
+            "Secretname line two  # pii-scan:ignore-line\n"
+            "Secretname line three\n"
+        )
+        violations = guard.scan_text("f.txt", content, ["Secretname"])
+        self.assertEqual(len(violations), 2)
+        self.assertIn("f.txt:1", violations[0])
+        self.assertIn("f.txt:3", violations[1])
+
+    def test_ignore_markers_never_suppress_a_path_tripwire(self):
+        # Matches pii_ci_scan.py's own invariant: "paths are never suppressible" —
+        # a content marker inside a file can't retroactively make its FILENAME safe.
+        violations = guard.scan_path("Secretname-report.py", ["Secretname"])
+        self.assertEqual(len(violations), 1)
+
 
 class TestCollectDiffEncoding(unittest.TestCase):
     """The per-push diff scan must read `git diff` output as UTF-8. Same AI-097

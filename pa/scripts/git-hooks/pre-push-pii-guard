@@ -93,6 +93,37 @@ for _stream in (sys.stdout, sys.stderr):
 
 PA_HOME = os.environ.get("PA_HOME") or os.path.join(os.path.expanduser("~"), ".pa")
 
+# Same three sentinels, same semantics, as pii_ci_scan.py's IGNORE_START/END/LINE
+# (2026-08-06) — this layer had no suppression mechanism at all, so a file that
+# deliberately contains many institution/PII-shaped strings as detection patterns
+# (this guard's own pii_ci_scan.py sibling, _FINANCIAL_INSTITUTIONS) tripped the
+# operator's real personal tripwires on every touch, forever, with no way to mark
+# the block as known-safe — pii_ci_scan.py already wraps that exact block in these
+# markers for the CI backstop; this guard just never recognized them. Paths are
+# NEVER suppressible (matches pii_ci_scan.py) — a content marker can't retroactively
+# make a filename safe.
+IGNORE_START = "pii-scan:ignore-start"
+IGNORE_END = "pii-scan:ignore-end"
+IGNORE_LINE = "pii-scan:ignore-line"
+
+
+def _suppressed_lines(content: str) -> set[int]:
+    """1-based line numbers exempted by the ignore sentinels above."""
+    suppressed: set[int] = set()
+    in_block = False
+    for i, line in enumerate(content.split("\n"), start=1):
+        if IGNORE_START in line:
+            in_block = True
+            suppressed.add(i)
+            continue
+        if IGNORE_END in line:
+            in_block = False
+            suppressed.add(i)
+            continue
+        if in_block or IGNORE_LINE in line:
+            suppressed.add(i)
+    return suppressed
+
 # AI-097: git hooks run with a minimal inherited environment — GEMINI_CMD
 # lives in ~/.pa/secrets.env but is not exported into that environment
 # unless something explicitly does so. Same self-contained-script pattern as
@@ -787,6 +818,7 @@ def scan_text(path: str, content: str, tripwires: list[str]) -> list[str]:
     """Regex layers 1+2 against one file. Returns violation descriptions."""
     violations: list[str] = []
     seen: set[str] = set()
+    suppressed = _suppressed_lines(content)
 
     def add(v: str) -> None:
         if v not in seen:
@@ -799,13 +831,20 @@ def scan_text(path: str, content: str, tripwires: list[str]) -> list[str]:
     for pattern in CREDENTIAL_PATTERNS:
         for m in re.finditer(pattern, content):
             line_no = content.count("\n", 0, m.start()) + 1
+            if line_no in suppressed:
+                continue
             add(f"{path}:{line_no} credential pattern: {pattern}")
+    # variant transforms only replace separators/case-split camelCase, never
+    # inserting or removing '\n' — so a variant's line numbers line up exactly
+    # with `suppressed` (computed from the original, untransformed content).
     variants = _token_variants(content)
     for pattern in tripwires:
         try:
             for variant in variants:
                 for m in re.finditer(pattern, variant, re.IGNORECASE):
                     line_no = variant.count("\n", 0, m.start()) + 1
+                    if line_no in suppressed:
+                        continue
                     add(f"{path}:{line_no} tripwire: {pattern}")
         except re.error:
             pass
