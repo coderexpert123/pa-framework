@@ -12,8 +12,48 @@ on:
     branches: [main]
 
 jobs:
+  # Computes which parts of the tree changed so the heavy jobs below can
+  # skip themselves on docs/plans-only changes. Deliberately conservative:
+  # `pa/scripts/**` (Python) is a SUBSET of `pa/**`, so a Python-only change
+  # still marks `pa=true` and re-runs the Node suite too -- that's an
+  # intentional over-trigger, not a bug; the one thing this must never do is
+  # under-trigger. `workflow=true` forces every job below to run whenever
+  # ci.yml itself changes, so a change to the skip logic is always validated
+  # in full. Branch-protection required checks are matched by job/check
+  # NAME (e.g. "Build + test (windows-latest)"), which comes from `name:` +
+  # the matrix values below and is unaffected by adding `if:` conditions --
+  # do not rename `test`/`test-python` or change their matrix values
+  # without also updating pa-framework's required-status-checks list, or
+  # PRs will block forever on a check that never gets reported. A skipped
+  # required check is treated as passing by GitHub branch protection, which
+  # is the mechanism this whole skip depends on.
+  changes:
+    name: Detect affected paths
+    runs-on: ubuntu-latest
+    outputs:
+      pa: ${{ steps.filter.outputs.pa }}
+      bot: ${{ steps.filter.outputs.bot }}
+      python: ${{ steps.filter.outputs.python }}
+      workflow: ${{ steps.filter.outputs.workflow }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            pa:
+              - 'pa/**'
+            bot:
+              - 'projects/telegram-bot/**'
+            python:
+              - 'pa/scripts/**'
+            workflow:
+              - '.github/workflows/ci.yml'
+
   test:
     name: Build + test (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.pa == 'true' || needs.changes.outputs.bot == 'true' || needs.changes.outputs.workflow == 'true'
     runs-on: ${{ matrix.os }}
 
     strategy:
@@ -64,6 +104,8 @@ jobs:
   # that reintroduces the exact wait this split removes.
   test-python:
     name: Python tests (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.python == 'true' || needs.changes.outputs.workflow == 'true'
     runs-on: ${{ matrix.os }}
 
     strategy:
