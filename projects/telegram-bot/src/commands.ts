@@ -27,6 +27,12 @@ export const BOT_COMMANDS: BotCommand[] = [
   { command: 'keepawake', description: 'Toggle machine keep-awake mode' },
   { command: 'stop', description: 'Kill the worker currently running in this topic' },
   { command: 'steer', description: 'Kill the running worker and resume the session with a new prompt (/steer <prompt>; no prompt = /stop)' },
+  { command: 'retranscribe', description: 'Re-transcribe the voice/audio/video note you replied to (optional engine override)' },
+  { command: 'commit', description: 'Commit pending work locally — fast, no push, no test gate, no CI wait' },
+  { command: 'commit_and_push', description: 'Update the brain, commit + push pending work, wait for CI, sync the public mirror if eligible' },
+  { command: 'push', description: 'Push already-committed local work to origin/main after a full local test gate, wait for CI' },
+  { command: 'push_public', description: 'Sync currently-eligible framework changes to the public mirror via a guarded auto-merge PR' },
+  { command: 'investigate_flagged', description: 'Investigate anomalies push-public flagged and act on safe, reversible corrections only' },
 
   // Pass-through Commands (skipWorker = false)
   { command: 'deep_plan', description: 'Detailed implementation planning skill' },
