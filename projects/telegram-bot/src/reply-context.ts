@@ -1,5 +1,5 @@
 /**
- * Reply-context resolution (hardened plan: C:\Users\hrish\.claude\plans\federated-booping-hammock.md, WP5).
+ * Reply-context resolution (hardened plan: "federated-booping-hammock" (Claude Code plan-mode session), WP5).
  *
  * `extractReplyContext` is moved here verbatim from main.ts (byte-for-byte
  * behaviorally identical — main.ts re-exports it once WP6 lands, so

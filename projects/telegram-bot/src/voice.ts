@@ -1,6 +1,6 @@
 /**
  * Bot-side voice module (plan: plans/2026-08-04-telegram-voice-transcription.md, WP5;
- * hardened plan: C:\Users\hrish\.claude\plans\federated-booping-hammock.md, WP4).
+ * hardened plan: "federated-booping-hammock" (Claude Code plan-mode session), WP4).
  *
  * Downloads a Telegram voice/audio/video-note attachment, hands it to the Python
  * transcription bridge (spawn mode) or the persistent voice worker (persistent
