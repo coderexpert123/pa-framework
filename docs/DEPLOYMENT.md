@@ -85,7 +85,28 @@ If you've modified files that the upstream also changed (e.g., you customized `p
 
 Two `.git` directories in the same working tree. Substrate files tracked by BOTH (so you can push fixes back upstream). Personal additions tracked only by the private repo.
 
-> **CAUTION**: This pattern is the inverse of the maintainer's setup. The maintainer's PRIVATE repo is `.git/`, their PUBLIC mirror is `.git-public/`. For you (a contributor), it's the other way around: public substrate is `.git/`, private companion is `.git-private/`. Pattern A is simpler — use Pattern B only if you genuinely contribute back to substrate.
+> **⚠️ REAL RISK, READ BEFORE YOU BUILD THIS**: the maintainer's own deployment used
+> exactly this pattern — two `git --git-dir=X --work-tree=.` repos pointed at the same
+> physical files — from initial release until 2026-08-06, and it caused **two separate
+> data-loss incidents** (2026-07-21, 2026-08-05): a branch checkout on one repo silently
+> reverted or deleted files the other repo needed, because git has no concept of "this
+> path is also tracked by a different repo I don't know about." The second incident
+> destroyed dozens of files, recovered only because the other repo's `HEAD` still had
+> them. The maintainer migrated OFF this exact topology after that — see
+> `plans/2026-08-05-concurrent-session-safety.md` for the full incident record and the
+> structural fix (a genuinely separate, independently-cloned directory instead of a
+> second git-dir on the same files). **If you build Pattern B as described below, you
+> are adopting the retired, incident-prone version of this pattern** — the instructions
+> are kept here because some contributors may still want the interleaved-whitelist
+> workflow it enables, but the same safety discipline applies: never run a checkout/reset
+> on EITHER side without first confirming the OTHER side's working tree is completely
+> clean (`git status --porcelain` empty), and never leave either repo checked out on a
+> branch other than its intended default between operations. If you don't need
+> substrate files interleaved with personal files in the same directory tree, prefer
+> keeping your private companion at its own separate, independently-cloned directory
+> (sync files between them explicitly, e.g. via `git archive | tar -x` the way
+> `pa public-sync` does) — it cannot suffer this failure mode at all, structurally,
+> because a checkout in one directory can never reach files in another.
 
 ### Step-by-step
 

@@ -78,7 +78,14 @@ export async function claimCommand(args: string[]): Promise<number> {
   }
 
   const note = parsed.note ?? '';
-  const deadline = parsed.waitSeconds !== undefined ? Date.now() + parsed.waitSeconds * 1000 : undefined;
+  // A non-numeric --wait (e.g. a typo'd value) must never become a deadline of NaN:
+  // `now >= NaN` is always false, so the retry loop below would never terminate on
+  // its own — it would only stop when this command's own outer process timeout (or
+  // the calling skill's, e.g. push's 3600s) eventually kills it. Fail fast instead:
+  // an invalid --wait behaves as if --wait were never given (single attempt, no poll).
+  const deadline = parsed.waitSeconds !== undefined && Number.isFinite(parsed.waitSeconds)
+    ? Date.now() + parsed.waitSeconds * 1000
+    : undefined;
 
   for (;;) {
     const result = await claim({

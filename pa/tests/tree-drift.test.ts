@@ -4,7 +4,7 @@ import { execFileSync } from 'child_process';
 import { mkdtemp, mkdir, writeFile, readFile, rm } from 'fs/promises';
 import { join, dirname } from 'path';
 import { tmpdir } from 'os';
-import { detectDrift, mergeAgainstHead, defaultGitRunner } from '../src/lib/tree-drift.js';
+import { detectDrift, mergeAgainstHead, restoreFromHead, defaultGitRunner } from '../src/lib/tree-drift.js';
 import type { GitRunner } from '../src/lib/tree-drift.js';
 
 // ---------------------------------------------------------------------------
@@ -23,6 +23,13 @@ async function initRepo(): Promise<string> {
   git(dir, ['config', 'user.email', 'test@example.com']);
   git(dir, ['config', 'user.name', 'Test']);
   git(dir, ['config', 'commit.gpgsign', 'false']);
+  // Matches public-sync.test.ts's fixture convention. Without this, Windows git
+  // rewrites LF to CRLF on any git-mediated write (checkout, etc.) — didn't matter
+  // for this file's pre-existing tests (they only ever compare direct writeFile/
+  // readFile round-trips, never git checkout), but restoreFromHead's tests do a
+  // real `git checkout HEAD --`, which silently reflowed line endings and produced
+  // 'v1\r\n' !== 'v1\n' — found adding that coverage in a 2026-08-06 deep-recheck.
+  git(dir, ['config', 'core.autocrlf', 'false']);
   return dir;
 }
 
@@ -197,6 +204,45 @@ describe('detectDrift', () => {
       await cleanupRepo(dir);
     }
   });
+
+  it('throws rather than silently reporting "clean" when `git status` itself fails', async () => {
+    const dir = await initRepo();
+    try {
+      await commitFile(dir, 'a.txt', 'v1\n', 'add a');
+      const failingRunner: GitRunner = async (repoRoot, args, input) => {
+        if (args[0] === 'status') {
+          return { stdout: Buffer.alloc(0), stderr: Buffer.from('fatal: not a git repository'), code: 128 };
+        }
+        return defaultGitRunner(repoRoot, args, input);
+      };
+      await assert.rejects(
+        () => detectDrift(dir, { gitRunner: failingRunner }),
+        /git status failed \(exit 128\)/
+      );
+    } finally {
+      await cleanupRepo(dir);
+    }
+  });
+
+  it('throws rather than silently skipping a file when `git rev-list` fails for it', async () => {
+    const dir = await initRepo();
+    try {
+      await commitFile(dir, 'a.txt', 'v1\n', 'add a');
+      await writeFile(join(dir, 'a.txt'), 'v2\n'); // modified — becomes a drift candidate
+      const failingRunner: GitRunner = async (repoRoot, args, input) => {
+        if (args[0] === 'rev-list') {
+          return { stdout: Buffer.alloc(0), stderr: Buffer.from('fatal: bad revision'), code: 128 };
+        }
+        return defaultGitRunner(repoRoot, args, input);
+      };
+      await assert.rejects(
+        () => detectDrift(dir, { gitRunner: failingRunner }),
+        /git rev-list failed for a\.txt \(exit 128\)/
+      );
+    } finally {
+      await cleanupRepo(dir);
+    }
+  });
 });
 
 describe('mergeAgainstHead', () => {
@@ -252,6 +298,57 @@ describe('mergeAgainstHead', () => {
       assert.equal(result.conflictCount, 0);
       const resultOnDisk = await readFile(result.resultPath, 'utf8');
       assert.equal(resultOnDisk, theirs);
+    } finally {
+      await cleanupRepo(dir);
+    }
+  });
+
+  it('rejects a path-traversal argument rather than reading outside the repo (2026-08-06 deep-recheck finding)', async () => {
+    const dir = await initRepo();
+    try {
+      await commitFile(dir, 'a.txt', 'v1\n', 'add a');
+      // Escapes `dir` entirely — this is a DIRECT readFile(join(repoRoot, relPath)),
+      // not git-mediated, so nothing but explicit validation stops it reaching a real
+      // file outside the repo (e.g. a sibling directory's secrets).
+      await assert.rejects(
+        () => mergeAgainstHead(dir, '../../../../etc/passwd'),
+        /escapes the repo root/
+      );
+      await assert.rejects(
+        () => mergeAgainstHead(dir, 'C:/Windows/System32/config/SAM'),
+        /must be repo-relative, not absolute/
+      );
+    } finally {
+      await cleanupRepo(dir);
+    }
+  });
+});
+
+describe('restoreFromHead', () => {
+  it('restores a modified file to HEAD\'s exact content', async () => {
+    const dir = await initRepo();
+    try {
+      await commitFile(dir, 'a.txt', 'v1\n', 'add a');
+      await writeFile(join(dir, 'a.txt'), 'locally modified\n');
+
+      const result = await restoreFromHead(dir, 'a.txt');
+
+      assert.equal(result.code, 0);
+      const onDisk = await readFile(join(dir, 'a.txt'), 'utf8');
+      assert.equal(onDisk, 'v1\n');
+    } finally {
+      await cleanupRepo(dir);
+    }
+  });
+
+  it('rejects a path-traversal argument rather than checking out outside the repo (2026-08-06 deep-recheck finding)', async () => {
+    const dir = await initRepo();
+    try {
+      await commitFile(dir, 'a.txt', 'v1\n', 'add a');
+      await assert.rejects(
+        () => restoreFromHead(dir, '../../../../etc/passwd'),
+        /escapes the repo root/
+      );
     } finally {
       await cleanupRepo(dir);
     }

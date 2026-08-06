@@ -75,23 +75,33 @@ export async function reconcileCommand(args: string[]): Promise<void> {
     return;
   }
 
-  const restoreIdx = args.indexOf('--restore');
-  if (restoreIdx !== -1) {
-    await runRestore(repoRoot, args[restoreIdx + 1]);
-    return;
-  }
-
-  const mergeIdx = args.indexOf('--merge');
-  if (mergeIdx !== -1) {
-    await runMerge(repoRoot, args[mergeIdx + 1]);
-    return;
-  }
-
   if (args.includes('--help') || args.includes('-h')) {
     usage();
     return;
   }
 
-  // Default and explicit --check both scan.
-  await runCheck(repoRoot);
+  // lib/tree-drift.ts's functions throw rather than silently reporting "clean"/
+  // succeeding when something they depend on failed (an unsafe/traversal path, a
+  // git command that itself errored) — caught here, uniformly across all three
+  // subcommands, so any of that surfaces as a normal CLI error, never an unhandled
+  // rejection.
+  try {
+    const restoreIdx = args.indexOf('--restore');
+    if (restoreIdx !== -1) {
+      await runRestore(repoRoot, args[restoreIdx + 1]);
+      return;
+    }
+
+    const mergeIdx = args.indexOf('--merge');
+    if (mergeIdx !== -1) {
+      await runMerge(repoRoot, args[mergeIdx + 1]);
+      return;
+    }
+
+    // Default and explicit --check both scan.
+    await runCheck(repoRoot);
+  } catch (err: any) {
+    console.error(`pa reconcile: ${err.message}`);
+    process.exitCode = 1;
+  }
 }

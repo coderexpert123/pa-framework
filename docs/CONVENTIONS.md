@@ -41,12 +41,26 @@ Maintain one canonical root brain file: `CLAUDE.md`.
 
 ### Maintainer dual-repo topology
 
-The maintainer deployment uses the advanced dual-`.git` pattern described in [`DEPLOYMENT.md`](DEPLOYMENT.md): the same working tree carries a private `.git/` repo and a public `.git-public/` mirror. In that setup:
+The maintainer deployment carries a private `.git/` repo (this working tree) plus a
+public mirror at `pa-public/` — a genuinely separate, independently-cloned git
+repository (own `.git/`, gitignored by the private repo), NOT a second `git-dir`
+sharing this working tree's files. (Migrated to this shape 2026-08-06 after two
+data-loss incidents under the old shared-tree pattern — see
+[`DEPLOYMENT.md`](DEPLOYMENT.md) §3's warning for the full story if you're considering
+that pattern for your own deployment.) In this setup:
 
-- `git-public.ps1` / `git-public.cmd` are the supported interface for public-repo operations.
-- `.gitignore-public` is the whitelist boundary for what can ship to the public framework.
-- Private brain files (`CLAUDE.md`, `AGENTS.md`, `BACKLOG.md`, `plans/`, etc.) remain outside the public mirror even though they share the same filesystem tree.
-- Because the private repo's `.gitignore` deliberately ignores public-only paths like `/docs/` and `/examples/`, brand-new files there may need `git-public add -f <path>` before they show up in the public mirror.
+- `pa public-sync` is the only mechanism that writes into `pa-public/` — it extracts
+  the private repo's committed `HEAD` (never the working tree) via `git archive`, so
+  uncommitted private content can never reach the public mirror by construction.
+- `git-public.ps1` / `git-public.cmd` are thin aliases resolving into `pa-public/`'s
+  own directory — the supported interface for public-repo status/add/commit/push.
+- `.gitignore-public` is the whitelist boundary for what `pa public-sync` extracts.
+- Private brain files (`CLAUDE.md`, `AGENTS.md`, `BACKLOG.md`, `plans/`, etc.) simply
+  never get extracted into `pa-public/` — there's no shared filesystem for them to leak
+  across.
+- The private repo now tracks `docs/` and `examples/` too (a strict superset of what's
+  public, as of 2026-08-06) — a brand-new file there needs a normal private commit,
+  then shows up in the public mirror automatically on the next `pa public-sync`.
 
 ### Per-project structure
 

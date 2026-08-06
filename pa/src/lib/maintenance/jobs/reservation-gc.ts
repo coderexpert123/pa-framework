@@ -1,8 +1,10 @@
-import { gcExpired, reservationsPath } from '../../reservations.js';
+import { gcExpired, reservationsPath, MAX_TTL_MINUTES } from '../../reservations.js';
 import type { MaintenanceJob } from '../types.js';
 
+// Imported, not redefined: a local copy would silently drift from reservations.ts's
+// own clamp if that value ever changed, making this job's GC threshold wrong with
+// nothing to catch it (found in a 2026-08-06 deep-recheck).
 const MINUTE = 60_000;
-const MAX_TTL_MINUTES = 240;
 const MAX_TTL_MS = MAX_TTL_MINUTES * MINUTE;
 
 export const reservationGcJob: MaintenanceJob = {
