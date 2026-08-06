@@ -104,7 +104,7 @@ describe('integration: at-least-once delivery', { concurrency: 1 }, () => {
     restore?.();
     restore = undefined;
     delete process.env.PA_HOME;
-    await rm(tempDir, { recursive: true, force: true });
+    await rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it('processes allowed-chat message end-to-end: user turn saved, offset advanced', async () => {
