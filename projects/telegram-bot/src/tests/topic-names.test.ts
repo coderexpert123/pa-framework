@@ -144,6 +144,22 @@ describe('updateTopicName', () => {
     await updateTopicName(map, 999, 5, 'my-topic');
     assert.equal(map.get('999')?.get(5)?.name, 'my-topic');
   });
+
+  it('preserves guide_message_id across a rename (field-drop regression, 2026-08-05)', async () => {
+    // updateTopicName used to reconstruct the TopicEntry field-by-field, which
+    // silently dropped any field it didn't explicitly know about (this is why
+    // guide_message_id needed to be threaded through by hand at every call
+    // site). Any future field would break the same way. Spreading the
+    // existing entry fixes this generically.
+    const map: TopicNameMap = new Map([
+      ['-100123', new Map([[5, { name: 'old-name', description: 'old-desc', guide_message_id: 2687 }]])],
+    ]);
+    await updateTopicName(map, -100123, 5, 'new-name');
+    assert.equal(map.get('-100123')?.get(5)?.guide_message_id, 2687, 'guide_message_id must survive a rename');
+    assert.equal(map.get('-100123')?.get(5)?.description, 'old-desc', 'description must survive a rename');
+    const loaded = await loadTopicNames();
+    assert.equal(loaded.get('-100123')?.get(5)?.guide_message_id, 2687, 'must survive a reload too');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -356,6 +372,14 @@ describe('setTopicDescription', () => {
     ]);
     await setTopicDescription(map, -100123, 5, 'new desc');
     assert.equal(map.get('-100123')?.get(5)?.description, 'new desc');
+  });
+
+  it('preserves guide_message_id across a description update (field-drop regression, 2026-08-05)', async () => {
+    const map: TopicNameMap = new Map([
+      ['-100123', new Map([[5, { name: 'Topic', description: 'old desc', guide_message_id: 2687 }]])],
+    ]);
+    await setTopicDescription(map, -100123, 5, 'new desc');
+    assert.equal(map.get('-100123')?.get(5)?.guide_message_id, 2687, 'guide_message_id must survive a description update');
   });
 });
 

@@ -111,6 +111,7 @@ export async function loadSkill(name: string): Promise<Skill> {
     worker_args: Array.isArray(meta.worker_args)
       ? meta.worker_args.map((a: unknown) => String(a))
       : undefined,
+    exclusive_resource: meta.exclusive_resource,
   };
 
   return { name, path: skillPath, frontmatter, prompt: body };

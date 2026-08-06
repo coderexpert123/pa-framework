@@ -132,3 +132,68 @@ export function sanitizeMdV2(text: string): string {
 
   return out;
 }
+
+/**
+ * Convert standard Markdown (CommonMark) to Telegram MarkdownV2 formatting.
+ * Models are instructed to write standard Markdown; this does the deterministic conversion.
+ */
+export function normalizeMarkdown(text: string): string {
+  // 1. Protect code spans and blocks — never transform content inside them.
+  const codeChunks: string[] = [];
+  text = text.replace(/```[\s\S]*?```|``[^\n]+?``|`[^`\n]+`/g, (match) => {
+    codeChunks.push(match);
+    return `\x00CODE${codeChunks.length - 1}\x00`;
+  });
+
+  // 1b. Strip pre-existing MarkdownV2 escape sequences.
+  text = text.replace(/\\([_*[\]()~`>#+\-=|{}.!\\])/g, '$1');
+
+  // 2. Headers with **bold** content (e.g. ### **Title**) — strip # and ** together
+  text = text.replace(/^#{1,6}\s+\*\*([^*\n]+)\*\*/gm, '*$1*');
+  // 3. Remaining headers → *bold header*
+  text = text.replace(/^#{1,6}\s+(.+)$/gm, '*$1*');
+  // 4. **bold** → *bold* (CommonMark double-asterisk → MarkdownV2 single)
+  text = text.replace(/\*\*([^*\n]+)\*\*/g, '*$1*');
+  // 5. ~~strikethrough~~ → ~strikethrough~ (CommonMark double-tilde → MarkdownV2 single)
+  text = text.replace(/~~([^~\n]+)~~/g, '~$1~');
+  // 6. Unordered list bullets (- or * at line start) → • bullet
+  text = text.replace(/^[ \t]*[-*][ \t]+/gm, '• ');
+  // 7. Strip horizontal rules
+  text = text.replace(/^-{3,}\s*$/gm, '');
+
+  // 8. Convert markdown tables to preformatted code blocks
+  {
+    const lines = text.split('\n');
+    const resultLines: string[] = [];
+    let tableBuffer: string[] = [];
+
+    const flushTable = () => {
+      const hasSeparator = tableBuffer.some((l) => /^\s*\|[\s:|-]+\|\s*$/.test(l));
+      if (tableBuffer.length >= 2 && hasSeparator) {
+        resultLines.push('```');
+        resultLines.push(...tableBuffer);
+        resultLines.push('```');
+      } else {
+        resultLines.push(...tableBuffer);
+      }
+      tableBuffer = [];
+    };
+
+    for (const line of lines) {
+      if (/^\s*\|/.test(line)) {
+        tableBuffer.push(line);
+      } else {
+        if (tableBuffer.length > 0) flushTable();
+        resultLines.push(line);
+      }
+    }
+    if (tableBuffer.length > 0) flushTable();
+    text = resultLines.join('\n');
+  }
+
+  // 9. Restore code spans/blocks unchanged.
+  text = text.replace(/\x00CODE(\d+)\x00/g, (_, i) => codeChunks[+i]);
+
+  return text.trim();
+}
+

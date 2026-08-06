@@ -16,6 +16,14 @@
  * over to a fresh worker for a request the user just cancelled, and (b) the
  * reply path swaps the error text for a clean "⏹ Stopped." (or silence, for
  * /steer — the steer prompt's own dispatch produces the next reply).
+ *
+ * (a) is NOT a matter of checking the marker between dispatch phases — that was
+ * the original 2026-08-02 bug. A /stop by definition lands while a worker is
+ * mid-run, i.e. inside pa's failover cascade, where a between-phase check never
+ * runs. `dispatchMessage` therefore hands `isTopicStopped` to pa's executor as
+ * `RunOptions.isCancelled`, which is polled per candidate inside
+ * `runWithFailover` and again by `worker-exec` before it pages pa-alerts for a
+ * non-zero exit. Do not regress that to caller-side checks alone.
  */
 import { listWorkerPids, removeWorkerPid, isProcessAlive } from '../../../pa/dist/src/worker-pids.js';
 import { killProcessTree } from '../../../pa/dist/src/process-tree.js';

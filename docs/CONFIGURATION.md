@@ -70,6 +70,19 @@ The framework reads configuration from `~/.pa/` (or wherever `PA_HOME` env var p
 | `alert_seconds` | number | No | 300 | >= 60 | Alert if a worker's descendant outlives parent by N seconds. |
 | `alert_repeat_seconds` | number | No | 1800 | >= alert_seconds | Repeat the alert every N seconds. |
 
+### TranscriptionConfig
+
+Controls how Telegram voice notes become text. Optional — omit the whole `transcription:` block and voice notes just don't get transcribed.
+
+| Field | Type | Required | Default | Effect |
+|---|---|---|---|---|
+| `engine_preference` | `'auto' \| 'cloud' \| 'local'` | No | `'auto'` | `auto` = use a cloud engine when an API key is set, otherwise fall back to local. `cloud` = cloud only; fail rather than fall back to local if every provider fails. `local` = local only; audio NEVER leaves this machine, even if API keys are set. |
+| `worker_mode` | `'spawn' \| 'persistent'` | No | `'spawn'` | How the LOCAL engine runs — ignored entirely when a cloud engine handles the note. `spawn` = one fresh process per note (simple, reloads the model every time). `persistent` = a resident background process (~230MB+ RAM) that keeps the model warm, shuts down after 10 idle minutes. |
+| `cloud_order` | string[] | No | `[groq, openai, deepgram]` | Cloud providers to try, in order. Only providers whose API key is actually set are attempted. |
+| `language` | string \| null | No | `null` (auto-detect) | ISO 639-1 code, optionally region-qualified (`en`, `en-US`). Threaded into every cloud provider call and the local engine's language hint. A non-English value paired with `engine_preference: local` is accepted but warns at config-load time — the bundled local model (`small.en`) is English-only. |
+
+Full walkthrough: docs/BOT_GUIDE.md "Voice messages (speech to text)". Something broken? docs/TROUBLESHOOTING.md "Voice-message transcription". Annotated example: `examples/config.yaml.example`.
+
 ### Validation
 
 - Missing `workers` array → `pa run` errors fatally.
@@ -122,6 +135,31 @@ When set, the framework derives all paths from `${PA_HOME}/` instead of `~/.pa/`
 |----------|---------|---------|
 | `PA_MAX_CONCURRENT_WORKERS` | `3` | Machine-wide cap on concurrently running LLM CLI workers (bot dispatches + LLM skills share the pool via blackboard slot locks). Excess dispatches queue until a slot frees. Set `0` or negative to disable limiting. Evaluator calls are exempt (they run while a slot-holding worker awaits their verdict). Shell/`cmd:` skills are unaffected. |
 | `UV_THREADPOOL_SIZE` | Node default `4` | Recommended `16` for the bot and catchup processes: Node's fs and DNS lookups share this libuv pool, so heavy disk I/O can starve DNS and take all networking down with it. Set it in the process launcher (Task Scheduler wrapper, systemd unit, shell profile) — it must exist before Node starts. |
+
+## Voice transcription env vars
+
+Cloud provider API keys (`~/.pa/secrets.env`) — set at least one to enable cloud transcription; unset entirely and `engine_preference: local` still works fully offline:
+
+| Variable | Purpose |
+|---|---|
+| `GROQ_API_KEY` | Free key from https://console.groq.com/keys — recommended: about a minute to set up, transcribes in seconds. |
+| `OPENAI_API_KEY` | Alternative cloud provider — works the same way as Groq. |
+| `DEEPGRAM_API_KEY` | Alternative cloud provider — also the only one that reports speaker diarization (multi-speaker labels). |
+
+Tuning knobs (`~/.pa/secrets.env`), all optional — sane defaults ship without setting any of these:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PA_VOICE_TRANSCRIBE_TIMEOUT_MS` | `600000` (10 min) | Max time the bot waits for a single transcription (cloud call or local spawn) before giving up. |
+| `PA_VOICE_MAX_DURATION_S` | `1800` (30 min) | Longest voice note the bot will attempt to transcribe at all — longer notes are rejected before download. |
+| `PA_VOICE_MAX_FILE_BYTES` | `20971520` (20 MiB) | Largest audio file the bot will download for transcription — matches Telegram's own bot-download ceiling. |
+| `PA_VOICE_TRANSCRIBE_SCRIPT` | `pa/scripts/transcribe_voice.py` | Override the path to the one-shot transcription script (spawn mode). |
+| `PA_VOICE_WORKER_SCRIPT` | `pa/scripts/voice_worker.py` | Override the path to the persistent-worker script (`worker_mode: persistent`). |
+| `PA_VOICE_WORKER_IDLE_MS` | `600000` (10 min) | How long the persistent worker stays resident with no requests before it shuts itself down. |
+| `PA_VOICE_WORKER_START_TIMEOUT_MS` | `60000` (1 min) | Max time to wait for a freshly-spawned persistent worker to become ready before falling back to spawn mode. |
+| `PA_VOICE_WORKER_PING_TIMEOUT_MS` | `5000` (5 sec) | Max time to wait for a liveness ping against an already-running persistent worker before treating it as busy. |
+
+Full walkthrough: docs/BOT_GUIDE.md "Voice messages (speech to text)". Something broken? docs/TROUBLESHOOTING.md "Voice-message transcription".
 
 ## `pa init` defaults
 

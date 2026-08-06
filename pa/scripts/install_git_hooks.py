@@ -3,45 +3,37 @@
 
 Why this exists
 ---------------
-`.git-public/hooks/pre-push` is the PII guard that stands between this working
-tree and the public mirror. For months it was installed as a plain COPY of the
+`<public mirror>/.git/hooks/pre-push` is the PII guard that stands between
+this working tree and the public mirror. It is installed as a COPY of the
 tracked source `pa/scripts/git-hooks/pre-push-pii-guard`:
 
-    cp pa/scripts/git-hooks/pre-push-pii-guard .git-public/hooks/pre-push
+    cp pa/scripts/git-hooks/pre-push-pii-guard <public mirror>/.git/hooks/pre-push
 
-A copy has to be RE-COPIED after every edit to the source, by hand, forever.
-It was forgotten repeatedly — the installed hook drifted from its source the
-same day it was last reinstalled (source 47,294 B, installed copy 46,715 B),
-meaning the guard actually running against real pushes was NOT the guard in the
-repo. This installer replaces that copy with a filesystem LINK so editing the
-tracked source is the install — there is nothing left to remember.
+Copy-only since 2026-08-06 (was symlink-preferred with hardlink/copy
+fallbacks — see git history if you need the old tiered version). The public
+mirror used to live at `.git-public/` sharing THIS repo's working tree, so a
+relative symlink from the tracked source to the hook target was a
+same-working-tree convenience. It now lives at its own directory — nested at
+`<repo root>/pa-public` by default (own `.git/`, gitignored by the private
+repo), override via the `PA_PUBLIC_DIR` env var or the `--public-dir` flag —
+as a genuinely SEPARATE git repository with its own independent clone/pull
+lifecycle — a symlink or hard link crossing that boundary would silently
+desync the moment either repo is re-cloned, which is now a normal, supported
+recovery path (see plans/2026-08-05-concurrent-session-safety.md). Re-running
+this installer after every edit to the source is the documented, expected
+workflow; the drift-check verdict below is what catches "forgot to re-run" —
+the same failure mode a stale symlink would have masked differently, not
+eliminated.
 
-The repo already proves the pattern works on this machine: `AGENTS.md` and
-`GEMINI.md` at the root are real symlinks to `CLAUDE.md`.
-
-The guard script has zero `__file__`/`os.path.dirname`/`realpath` self-location
-logic (confirmed by grep) — it depends only on the process CWD for git
-operations, and git always invokes a hook with cwd == the working-tree root.
-So a symlinked or hard-linked invocation is fully equivalent to a copy; no
-special handling is needed inside the guard itself.
-
-Fallback ladder (each tier louder than the last, never silently does LESS than
-the old copy behavior):
-  1. Relative symlink (primary). Relative target so the link survives being
-     cloned to a different path.
-  2. Hard link, if symlink privilege is unavailable (no Developer Mode). Warns
-     that a future `git checkout`/merge that rewrites the source as a NEW inode
-     can desync the two names — recommend enabling symlink privilege.
-  3. Plain copy, if hard-linking also fails (e.g. cross-volume). Warns loudly
-     that manual reinstall discipline is required again — this is the exact
-     state we are trying to escape, so it is the last resort and it says so.
+Idempotent: content already matching the source is left untouched (no
+rewrite, no mtime bump) so re-running this on every deploy is cheap and
+side-effect-free when nothing changed.
 
 Always ends with a content diff of installed-vs-source and an explicit
 pass/fail verdict.
 
-Safe to re-run: a correct symlink is left untouched (no-op).
-
     python pa/scripts/install_git_hooks.py
+    python pa/scripts/install_git_hooks.py --public-dir D:/other-location
 """
 from __future__ import annotations
 
@@ -61,59 +53,21 @@ for _stream in (sys.stdout, sys.stderr):
 # so the repo root is two parents up.
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_REL = Path("pa/scripts/git-hooks/pre-push-pii-guard")
-TARGET_REL = Path(".git-public/hooks/pre-push")
+HOOK_TARGET_REL = Path(".git/hooks/pre-push")
+# Nested but independent: <repo root>/pa-public, own .git/, gitignored here.
+DEFAULT_PUBLIC_DIR_NAME = "pa-public"
 
 
-def _relative_link_target(target: Path, source: Path) -> str:
-    """The symlink body: source expressed relative to the target's directory.
-
-    For `.git-public/hooks/pre-push` -> `pa/scripts/git-hooks/pre-push-pii-guard`
-    this is `../../pa/scripts/git-hooks/pre-push-pii-guard`, so the link keeps
-    resolving no matter where the repo is cloned.
-    """
-    return os.path.relpath(source, target.parent)
-
-
-def _is_correct_symlink(target: Path, want: str) -> bool:
-    """True iff `target` is a symlink already pointing at `want` (normalized)."""
-    if not target.is_symlink():
-        return False
-    try:
-        current = os.readlink(target)
-    except OSError:
-        return False
-    return os.path.normpath(current) == os.path.normpath(want)
-
-
-def _same_hard_link(target: Path, source: Path) -> bool:
-    """True iff `target` and `source` are the same inode (an existing hard link).
-
-    On Windows `os.stat().st_ino` is populated for real files, so this is
-    reliable enough to make the hard-link tier idempotent too.
-    """
-    if target.is_symlink() or not target.exists():
-        return False
-    try:
-        ts, ss = target.stat(), source.stat()
-    except OSError:
-        return False
-    return ts.st_ino == ss.st_ino and ts.st_dev == ss.st_dev and ts.st_ino != 0
-
-
-def _remove(target: Path) -> None:
-    """Remove whatever is at `target` (broken symlink, stale copy, wrong link)."""
-    if target.is_symlink() or target.exists():
-        target.unlink()
+def _resolve_public_dir(root: Path, public_dir: Path | None) -> Path:
+    """Explicit argument wins; else PA_PUBLIC_DIR env var; else <root>/pa-public."""
+    if public_dir is not None:
+        return Path(public_dir).resolve()
+    env = os.environ.get("PA_PUBLIC_DIR")
+    return Path(env).resolve() if env else (root / DEFAULT_PUBLIC_DIR_NAME).resolve()
 
 
 def _make_executable(target: Path) -> None:
-    """chmod +x — required on POSIX, a harmless no-op on Windows.
-
-    On a symlink this is skipped: the mode that matters is the source file's,
-    and some platforms reject chmod on the link itself.
-    """
-    if target.is_symlink():
-        return
+    """chmod +x — required on POSIX, a harmless no-op on Windows."""
     try:
         mode = target.stat().st_mode
         target.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
@@ -128,99 +82,46 @@ def _content_matches(target: Path, source: Path) -> bool:
         return False
 
 
-def install(repo_root: Path | None = None) -> dict:
-    """Install the hook, returning a result dict:
+def install(repo_root: Path | None = None, public_dir: Path | None = None) -> dict:
+    """Copy the hook into the public mirror's hooks dir, returning:
 
         {method, changed, verified, target, source, warnings}
 
-    method   one of "symlink" | "hardlink" | "copy"
-    changed  False when an already-correct install was left untouched
-    verified True when installed content matches source content
+    method   always "copy" (kept in the result shape for compatibility with
+             callers/scripts written against the old tiered installer).
+    changed  False when an already-matching install was left untouched.
+    verified True when installed content matches source content.
     """
     root = (repo_root or REPO_ROOT).resolve()
     source = (root / SOURCE_REL).resolve()
-    target = root / TARGET_REL
+    target = _resolve_public_dir(root, public_dir) / HOOK_TARGET_REL
     warnings: list[str] = []
 
     if not source.exists():
         raise FileNotFoundError(f"hook source not found: {source}")
     target.parent.mkdir(parents=True, exist_ok=True)
 
-    link_body = _relative_link_target(target, source)
-
-    # --- idempotent no-ops ---------------------------------------------------
-    if _is_correct_symlink(target, link_body):
-        _make_executable(source)
-        return _result("symlink", False, target, source, warnings)
-    if _same_hard_link(target, source):
+    if target.is_symlink():
+        # Never trust a symlink as-is, even one that happens to resolve to
+        # matching content: a stale relative symlink from the pre-2026-08-06
+        # shared-working-tree topology can coincidentally still resolve (e.g.
+        # to the public repo's own tracked copy of this same script at the
+        # same relative offset), and shutil.copyfile writes THROUGH a live
+        # symlink into whatever it points at — silently mutating tracked
+        # content instead of installing a real, independent copy.
+        target.unlink()
+    elif target.exists() and _content_matches(target, source):
         _make_executable(target)
-        warnings.append(_HARDLINK_WARNING)
-        return _result("hardlink", False, target, source, warnings)
+        return _result(False, target, source, warnings)
 
-    # --- tier 1: relative symlink -------------------------------------------
-    _remove(target)
-    try:
-        os.symlink(link_body, target)
-        _make_executable(source)
-        return _result("symlink", True, target, source, warnings)
-    except (OSError, NotImplementedError) as e:
-        warnings.append(
-            f"symlink creation failed ({e}); falling back to a hard link. "
-            "Enable Windows Developer Mode (or run with symlink privilege) for "
-            "the durable fix."
-        )
-
-    # --- tier 2: hard link ---------------------------------------------------
-    _remove(target)
-    try:
-        os.link(source, target)
-        _make_executable(target)
-        warnings.append(_HARDLINK_WARNING)
-        return _result("hardlink", True, target, source, warnings)
-    except OSError as e:
-        warnings.append(
-            f"hard link failed ({e}); falling back to a PLAIN COPY. "
-            + _COPY_WARNING
-        )
-
-    # --- tier 3: plain copy (last resort) -----------------------------------
-    _remove(target)
     shutil.copyfile(source, target)
     _make_executable(target)
-    return _result("copy", True, target, source, warnings)
+    return _result(True, target, source, warnings)
 
 
-_HARDLINK_WARNING = (
-    "Installed as a HARD LINK, not a symlink. This shares content today, but a "
-    "future `git checkout`/merge that rewrites the source with a NEW inode "
-    "(rather than editing it in place) will silently DESYNC the two names. "
-    "Re-run this installer after such an operation, and prefer enabling symlink "
-    "privilege so the primary (symlink) tier is used instead."
-)
-
-_COPY_WARNING = (
-    "Installed as a PLAIN COPY — the exact drift-prone state this installer "
-    "exists to replace. The hook will NOT track edits to the source; you must "
-    "re-run `python pa/scripts/install_git_hooks.py` after every change to "
-    "pa/scripts/git-hooks/pre-push-pii-guard."
-)
-
-
-def _display_rel(path: Path, start: Path) -> str:
-    """`path` relative to `start` for display, tolerant of Windows cross-drive
-    paths (relpath raises ValueError when they are on different mounts — which
-    happens whenever the repo and cwd sit on different drives, or when a Temp
-    junction resolves onto another drive). Falls back to the absolute path."""
-    try:
-        return os.path.relpath(path, start)
-    except ValueError:
-        return str(path)
-
-
-def _result(method: str, changed: bool, target: Path, source: Path,
-            warnings: list[str]) -> dict:
+def _result(changed: bool, target: Path, source: Path, warnings: list[str]) -> dict:
     return {
-        "method": method,
+        "method": "copy",
         "changed": changed,
         "verified": _content_matches(target, source),
         "target": target,
@@ -229,16 +130,29 @@ def _result(method: str, changed: bool, target: Path, source: Path,
     }
 
 
+def _display_rel(path: Path, start: Path) -> str:
+    """`path` relative to `start` for display, tolerant of Windows cross-drive
+    paths (relpath raises ValueError when they are on different mounts — which
+    is now the COMMON case, since the public mirror is a different directory
+    tree, possibly a different drive). Falls back to the absolute path."""
+    try:
+        return os.path.relpath(path, start)
+    except ValueError:
+        return str(path)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
-        description="Install the public-mirror pre-push PII guard hook "
-                    "(symlink, with hard-link/copy fallbacks).")
-    parser.add_argument("--repo-root", help="Override the repo root (tests).")
+        description="Install the public-mirror pre-push PII guard hook (copy).")
+    parser.add_argument("--repo-root", help="Override the private repo root (tests).")
+    parser.add_argument("--public-dir", help="Override the public mirror directory "
+                                              "(default: $PA_PUBLIC_DIR or <repo root>/pa-public).")
     args = parser.parse_args(argv)
 
     root = Path(args.repo_root) if args.repo_root else REPO_ROOT
+    public_dir = Path(args.public_dir) if args.public_dir else None
     try:
-        res = install(root)
+        res = install(root, public_dir)
     except FileNotFoundError as e:
         print(f"install_git_hooks: {e}", file=sys.stderr)
         return 1
@@ -252,7 +166,6 @@ def main(argv=None) -> int:
     for w in res["warnings"]:
         print(f"!! {w}", file=sys.stderr)
 
-    # Explicit drift verdict — the same content check documented in the README.
     if res["verified"]:
         print(f"drift check: CLEAN (installed content matches {rel_source})")
         return 0

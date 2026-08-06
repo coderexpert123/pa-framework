@@ -48,6 +48,9 @@ export interface AuditRecord {
     | 'code-fix-skipped-dirty-worktree'
     | 'code-fix-skipped-worker-failed'
     | 'code-fix-skipped-no-changes'
+    // The git-workflow blackboard lock (see pa/src/commands/run.ts's exclusive_resource
+    // mechanism) was busy for the whole wait window — nothing was attempted.
+    | 'code-fix-skipped-git-lock-busy'
     | 'reverted-protected-path'
     | 'reverted-test-weakening'
     | 'reverted-verification-failed'

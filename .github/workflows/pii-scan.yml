@@ -76,7 +76,7 @@ jobs:
           echo "up LOCALLY; do not echo it into this log."
           echo
           echo "Reproduce locally:"
-          echo "  python pa/scripts/pii_ci_scan.py --git-dir .git-public --history-paths"
+          echo "  python pa/scripts/pii_ci_scan.py --git-dir .git --history-paths"
           echo
           echo "If the finding is in history rather than the current tree, the"
           echo "fix is a history rewrite, not a follow-up commit."

@@ -33,6 +33,32 @@ export const KEEP_AWAKE_PATTERN = /^\/keepawake(?:@\w+)?$/i;
 export const SKILLS_PATTERN = /^\/skills(?:@\w+)?$/i;
 export const AUTH_PATTERN = /^\/auth(?:@\w+)?\s+(\S+)(?:\s+(\S+))?$/i;
 export const HELP_PATTERN = /^\/help(?:@\w+)?$/i;
+// [Voice message]/[Audio file]/[Video note] re-transcription (WP5 of the
+// hardened voice-transcription plan). Wiring (locate the replied media,
+// call voice.ts's findCachedAudio/transcribeVoiceMessage) is WP6's job in
+// main.ts — this WP only owns the parser + BOT_COMMANDS registration.
+export const RETRANSCRIBE_PATTERN = /^\/retranscribe(?:@\w+)?(?:\s+(\S+))?\s*$/i;
+
+// Deterministic trigger for the commit-and-push skill (~/.pa/skills/commit-and-push/
+// skill.md) — deliberately NOT a "pass-through" command relying on the active LLM
+// worker to infer intent from bare text (that path is unwired dead code today, see
+// isPassThroughCommand's lack of any main.ts call site) and NOT natural-language PA_META
+// inference either, given this can push to origin/main and auto-merge a public PR.
+// Wiring (spawn `pa run commit-and-push`) is main.ts's job — this only owns the parser.
+export const COMMIT_AND_PUSH_PATTERN = /^\/commit_and_push(?:@\w+)?\s*$/i;
+
+// Same deterministic-trigger reasoning as COMMIT_AND_PUSH_PATTERN, for the granular
+// phase skills (~/.pa/skills/{commit,push,push-public}/skill.md) — each independently
+// invokable when the operator only wants part of the pipeline (see the skills' own
+// trigger_description for the split rationale). Mutually exclusive by construction:
+// each pattern's trailing `(?:@\w+)?\s*$` requires end-of-string immediately after the
+// literal command name, so e.g. COMMIT_PATTERN can never match "/commit_and_push" and
+// PUSH_PATTERN can never match "/push_public" — see logic.test.ts's explicit
+// regression tests for this.
+export const COMMIT_PATTERN = /^\/commit(?:@\w+)?\s*$/i;
+export const PUSH_PATTERN = /^\/push(?:@\w+)?\s*$/i;
+export const PUSH_PUBLIC_PATTERN = /^\/push_public(?:@\w+)?\s*$/i;
+export const INVESTIGATE_FLAGGED_PATTERN = /^\/investigate_flagged(?:@\w+)?\s*$/i;
 
 // --- Worker tunables: /llm, /effort, /default <setting> [value] -------------
 // `/model` deliberately stays what it has always been (pick the CLI). These are
@@ -321,6 +347,73 @@ export function isPassThroughCommand(userText: string): boolean {
   return PASS_THROUGH_PATTERN.test(userText);
 }
 
+export interface RetranscribeCommandResult {
+  matched: boolean;
+  /** Optional engine override, e.g. `/retranscribe groq` — threads to
+   * voice.ts's `engineOverride` (WP4). Undefined = 'auto'. */
+  engine?: string;
+}
+
+/** Parses `/retranscribe [engine]`. Pure — no I/O, no access to the replied
+ * message (WP6 does that: finds the media being replied to, calls
+ * findCachedAudio/transcribeVoiceMessage with this parsed engine override,
+ * and dispatches the result through the normal chain). */
+export function handleRetranscribeCommand(userText: string): RetranscribeCommandResult {
+  const match = RETRANSCRIBE_PATTERN.exec(userText);
+  if (!match) return { matched: false };
+  const engine = match[1]?.trim();
+  return { matched: true, engine: engine || undefined };
+}
+
+/** Duck-typed subset of a forwarded message's origin fields. Deliberately
+ * NOT imported from types.ts — forward_origin/forward_from/forward_sender_name
+ * land there in WP6; a real TelegramMessage satisfies this structurally once
+ * those fields exist. Covers both the modern `forward_origin` shape (Bot API
+ * 7.0+) and the legacy flat fields older clients/updates still send. */
+export interface ForwardableMessageLike {
+  forward_origin?: {
+    type: 'user' | 'hidden_user' | 'chat' | 'channel' | string;
+    sender_user?: { first_name?: string; username?: string };
+    sender_user_name?: string;
+    sender_chat?: { title?: string };
+    chat?: { title?: string };
+  };
+  forward_from?: { first_name?: string; username?: string };
+  forward_sender_name?: string;
+}
+
+/** Feeds voice.ts's `formatTranscriptUserText({ forwardedFrom })` (WP4).
+ * Scope: only wired for voice/audio/video_note forwards in this pass —
+ * forwarded-*text* attribution is deliberately deferred (widest blast radius
+ * of any single-line change in this wave; see the plan's "out of scope"). */
+export function describeForwardOrigin(msg: ForwardableMessageLike): string | undefined {
+  const origin = msg.forward_origin;
+  if (origin) {
+    switch (origin.type) {
+      case 'user':
+        return origin.sender_user?.first_name || origin.sender_user?.username || undefined;
+      case 'hidden_user':
+        return origin.sender_user_name || 'a hidden user';
+      case 'chat':
+        return origin.sender_chat?.title ? `the chat "${origin.sender_chat.title}"` : undefined;
+      case 'channel':
+        return origin.chat?.title ? `the chat "${origin.chat.title}"` : undefined;
+      default:
+        return undefined;
+    }
+  }
+
+  // Legacy fields (pre-forward_origin Bot API updates).
+  if (msg.forward_from) {
+    return msg.forward_from.first_name || msg.forward_from.username || undefined;
+  }
+  if (msg.forward_sender_name) {
+    return msg.forward_sender_name;
+  }
+
+  return undefined;
+}
+
 /**
  * Handle the /branch command. Validates the branch name.
  * Pure — no state mutation, no I/O. Topic creation is done in main.ts.
@@ -432,6 +525,65 @@ export function resolveConfirmation(
 
   // Unrelated message — clear pending and let worker handle it
   state.pending_action = undefined;
+  return { skipWorker: false, response: '' };
+}
+
+// AI-029 (hardened 2026-08-05, ekadashi-topic incident): resolves a pending
+// auto-suggested topic description against the user's next message. Pure —
+// mutates state.pendingDescription but performs no I/O; the caller applies
+// `acceptDescriptionText` via setTopicDescription itself. Kept separate from
+// the setTopicDescription call so this can be unit tested without spawning a
+// worker via the caller's dispatch fallthrough.
+export function resolvePendingDescription(
+  state: ConversationState,
+  userText: string,
+  opts: { voiceTranscribed: boolean; now?: number }
+): { response: string; skipWorker: boolean; acceptDescriptionText?: string } {
+  const pd = state.pendingDescription;
+  if (!pd) return { skipWorker: false, response: '' };
+
+  const now = opts.now ?? Date.now();
+  if (now > pd.expiresAt) {
+    // Stale prompt — the type contract says "auto-accept if now > expiresAt".
+    // Resolve it on its own terms rather than on THIS message: a reply may
+    // arrive days late and be unrelated to the original prompt (e.g. a voice
+    // note answering something else entirely). Auto-accept the suggestion if
+    // the bot had one; otherwise there's nothing to accept. Either way, let
+    // this message fall through to normal dispatch instead of being
+    // swallowed as the description.
+    state.pendingDescription = undefined;
+    if (pd.text && pd.text.length > 0) {
+      return { skipWorker: false, response: '', acceptDescriptionText: pd.text };
+    }
+    return { skipWorker: false, response: '' };
+  }
+
+  const short = userText.trim().length <= 25;
+
+  if (short && CONFIRMATION_NO.test(userText)) {
+    state.pendingDescription = undefined;
+    return { skipWorker: true, response: 'OK, skipped.' };
+  }
+
+  if (short && CONFIRMATION_YES.test(userText)) {
+    if (pd.text && pd.text.length > 0) {
+      state.pendingDescription = undefined;
+      return { skipWorker: true, response: 'Description set.', acceptDescriptionText: pd.text };
+    }
+    return { skipWorker: true, response: "Okay — type the description and I'll save it." };
+  }
+
+  if (!short && !opts.voiceTranscribed) {
+    // User typed a substantive line instead of yes/no → treat it as the
+    // description. Voice-transcribed text is excluded: a spoken message is
+    // almost never an intentional answer to "what's this topic for?" and
+    // swallowing it silently drops whatever the user actually asked.
+    state.pendingDescription = undefined;
+    return { skipWorker: true, response: 'Description set.', acceptDescriptionText: userText.trim() };
+  }
+
+  // Short-but-not-yes/no, or a voice-transcribed substantive message: leave
+  // pendingDescription intact and let this message fall through undisturbed.
   return { skipWorker: false, response: '' };
 }
 
@@ -878,13 +1030,29 @@ export function applyMetaActions(
   response: string,
   meta: PAMeta | null,
   state: ConversationState
-): { response: string; skillToRun: string | null; restartBot: boolean } {
+): { response: string; skillToRun: string | null; restartBot: boolean; kbNote: { domain: string; note: string } | null } {
   let out = response;
   let restartBot = false;
+  let kbNote: { domain: string; note: string } | null = null;
 
   if (meta?.actions.some((a) => a.type === 'restart_bot')) {
     restartBot = true;
     out += `\n\n_(Restarting bot for deployment...)_`;
+  }
+
+  // AI-101 Layer 2: a worker that changes a system of record another topic's
+  // domain depends on can record it into Ecosystem KB Sources.md the same
+  // turn, instead of waiting for the nightly ecosystem-kb skill sweep. Pure
+  // extraction/validation only — main.ts performs the actual file write.
+  const kbNoteAction = meta?.actions.find((a) => a.type === 'kb_note');
+  if (kbNoteAction) {
+    const domain = kbNoteAction.domain?.trim();
+    const note = kbNoteAction.note?.trim();
+    if (domain && note && domain.length <= 100 && note.length <= 300) {
+      kbNote = { domain, note };
+    } else {
+      console.warn(`[pa-meta] kb_note rejected — domain/note missing or too long (domain=${domain?.length ?? 0} chars, note=${note?.length ?? 0} chars)`);
+    }
   }
 
   if (CONFIRMATION_PATTERN.test(out)) {
@@ -908,14 +1076,14 @@ export function applyMetaActions(
       const skillName = runSkillAction.skill;
       if (!/^[a-zA-Z0-9_-]+$/.test(skillName)) {
         console.warn(`[pa-meta] run_skill rejected — invalid skill name: ${skillName}`);
-        return { response: out, skillToRun: null, restartBot };
+        return { response: out, skillToRun: null, restartBot, kbNote };
       }
       out += `\n\n_(Triggering skill: ${skillName})_`;
-      return { response: out, skillToRun: skillName, restartBot };
+      return { response: out, skillToRun: skillName, restartBot, kbNote };
     }
   }
 
-  return { response: out, skillToRun: null, restartBot };
+  return { response: out, skillToRun: null, restartBot, kbNote };
 }
 
 /**

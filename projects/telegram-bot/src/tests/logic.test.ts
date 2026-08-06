@@ -7,6 +7,7 @@ import {
   PENDING_ACTION_TTL_MS,
   expirePendingAction,
   resolveConfirmation,
+  resolvePendingDescription,
   buildWorkerResponse,
   MODEL_SWITCH_PATTERN,
   handleModelSwitch,
@@ -36,6 +37,14 @@ import {
   buildModelStatusSnapshot,
   hydrateModelStatus,
   modelStatusNeedsRefresh,
+  RETRANSCRIBE_PATTERN,
+  handleRetranscribeCommand,
+  describeForwardOrigin,
+  COMMIT_PATTERN,
+  COMMIT_AND_PUSH_PATTERN,
+  PUSH_PATTERN,
+  PUSH_PUBLIC_PATTERN,
+  INVESTIGATE_FLAGGED_PATTERN,
   type StatusCardArgs,
 } from '../logic.js';
 import type { PAMeta } from '../types.js';
@@ -50,6 +59,16 @@ function withPending(description: string, ageMs = 0): ConversationState {
   state.pending_action = {
     description,
     proposed_at: new Date(Date.now() - ageMs).toISOString(),
+  };
+  return state;
+}
+
+function withPendingDescription(text: string, expiresInMs = 30 * 60 * 1000): ConversationState {
+  const state = makeState();
+  state.pendingDescription = {
+    text,
+    proposedAt: new Date().toISOString(),
+    expiresAt: Date.now() + expiresInMs,
   };
   return state;
 }
@@ -438,6 +457,133 @@ describe('resolveConfirmation', () => {
     assert.equal(result.skipWorker, true);
     assert.equal(result.response, 'Cancelled.');
     assert.equal(state.pending_action, undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolvePendingDescription (AI-029, hardened 2026-08-05 ekadashi incident)
+// ---------------------------------------------------------------------------
+
+describe('resolvePendingDescription', () => {
+  it('returns no-op when no pendingDescription exists', () => {
+    const state = makeState();
+    const result = resolvePendingDescription(state, 'yes', { voiceTranscribed: false });
+    assert.equal(result.skipWorker, false);
+    assert.equal(result.response, '');
+    assert.equal(result.acceptDescriptionText, undefined);
+  });
+
+  // --- not expired: NO path ---
+
+  it('"no" clears pendingDescription and returns "OK, skipped."', () => {
+    const state = withPendingDescription('Discussions about X');
+    const result = resolvePendingDescription(state, 'no', { voiceTranscribed: false });
+    assert.equal(result.skipWorker, true);
+    assert.equal(result.response, 'OK, skipped.');
+    assert.equal(state.pendingDescription, undefined);
+  });
+
+  // --- not expired: YES path ---
+
+  it('"yes" with suggestion text accepts it and clears pendingDescription', () => {
+    const state = withPendingDescription('Discussions about daily-briefings');
+    const result = resolvePendingDescription(state, 'yes', { voiceTranscribed: false });
+    assert.equal(result.skipWorker, true);
+    assert.equal(result.response, 'Description set.');
+    assert.equal(result.acceptDescriptionText, 'Discussions about daily-briefings');
+    assert.equal(state.pendingDescription, undefined);
+  });
+
+  it('"yes" with empty suggestion text prompts for typed description and keeps pendingDescription', () => {
+    const state = withPendingDescription('');
+    const result = resolvePendingDescription(state, 'yes', { voiceTranscribed: false });
+    assert.equal(result.skipWorker, true);
+    assert.match(result.response, /type the description/);
+    assert.equal(result.acceptDescriptionText, undefined);
+    assert.ok(state.pendingDescription, 'pendingDescription must be kept so the next long message is captured');
+  });
+
+  // --- not expired: substantive-reply path ---
+
+  it('a long typed reply is accepted as the description', () => {
+    const state = withPendingDescription('');
+    const result = resolvePendingDescription(state, 'Research notes for the data-platform project', { voiceTranscribed: false });
+    assert.equal(result.skipWorker, true);
+    assert.equal(result.response, 'Description set.');
+    assert.equal(result.acceptDescriptionText, 'Research notes for the data-platform project');
+    assert.equal(state.pendingDescription, undefined);
+  });
+
+  it('a short reply that is neither yes nor no leaves pendingDescription untouched', () => {
+    const state = withPendingDescription('suggested text');
+    const result = resolvePendingDescription(state, 'hmm ok maybe', { voiceTranscribed: false });
+    assert.equal(result.skipWorker, false);
+    assert.equal(result.acceptDescriptionText, undefined);
+    assert.ok(state.pendingDescription, 'pendingDescription must survive an ambiguous short reply');
+  });
+
+  // --- voice-transcribed guard (2026-08-05 incident: a transcribed voice
+  // question got silently swallowed as the ekadashi topic's description) ---
+
+  it('a long voice-transcribed message is NOT swallowed as the description', () => {
+    const state = withPendingDescription('');
+    const result = resolvePendingDescription(
+      state,
+      '[Voice message] So, what do I need to do for today?',
+      { voiceTranscribed: true }
+    );
+    assert.equal(result.skipWorker, false, 'must fall through to normal dispatch, not swallow the message');
+    assert.equal(result.acceptDescriptionText, undefined);
+    assert.equal(result.response, '');
+    assert.ok(state.pendingDescription, 'pendingDescription must be left pending for a real reply later');
+  });
+
+  it('a short "yes" still works when voice-transcribed', () => {
+    const state = withPendingDescription('Discussions about X');
+    const result = resolvePendingDescription(state, 'yes', { voiceTranscribed: true });
+    assert.equal(result.skipWorker, true);
+    assert.equal(result.acceptDescriptionText, 'Discussions about X');
+  });
+
+  // --- expiry (the field existed but was never enforced before this fix) ---
+
+  it('expired pendingDescription with a suggestion auto-accepts it and falls through to dispatch', () => {
+    const state = withPendingDescription('Auto-suggested description', -1000); // already expired
+    const result = resolvePendingDescription(state, 'unrelated message entirely', { voiceTranscribed: false });
+    assert.equal(result.skipWorker, false, 'THIS message must not be swallowed');
+    assert.equal(result.acceptDescriptionText, 'Auto-suggested description');
+    assert.equal(state.pendingDescription, undefined);
+  });
+
+  it('expired pendingDescription with no suggestion just drops the prompt', () => {
+    const state = withPendingDescription('', -1000); // already expired, open prompt only
+    const result = resolvePendingDescription(state, 'unrelated message entirely', { voiceTranscribed: false });
+    assert.equal(result.skipWorker, false);
+    assert.equal(result.acceptDescriptionText, undefined);
+    assert.equal(state.pendingDescription, undefined);
+  });
+
+  it('expired pendingDescription is not swallowed even when the reply is a stale voice transcript', () => {
+    // Reproduces the actual incident: a topic created 2026-07-27, never answered,
+    // and a voice note finally arrives 9 days later on 2026-08-05.
+    const state = withPendingDescription('', -9 * 24 * 60 * 60 * 1000);
+    const result = resolvePendingDescription(
+      state,
+      '[Voice message] So, what do I need to do for today?',
+      { voiceTranscribed: true }
+    );
+    assert.equal(result.skipWorker, false);
+    assert.equal(result.acceptDescriptionText, undefined);
+    assert.equal(state.pendingDescription, undefined);
+    assert.equal(result.response, '');
+  });
+
+  it('respects an injected `now` instead of the real clock', () => {
+    const state = withPendingDescription('suggestion', 1000); // expires 1s from real now
+    const farFuture = Date.now() + 10_000;
+    const result = resolvePendingDescription(state, 'anything', { voiceTranscribed: false, now: farFuture });
+    assert.equal(result.acceptDescriptionText, 'suggestion');
+    assert.equal(state.pendingDescription, undefined);
   });
 });
 
@@ -1415,6 +1561,77 @@ describe('applyMetaActions', () => {
     assert.equal(restartBot, false);
   });
 
+  // --- kb_note (AI-101 Layer 2: same-turn Sources.md write path) ---
+
+  it('kbNote is null by default', () => {
+    const state = makeState();
+    const { kbNote } = applyMetaActions('Hello.', null, state);
+    assert.equal(kbNote, null);
+  });
+
+  it('kb_note extracts a valid domain/note pair', () => {
+    const state = makeState();
+    const { kbNote, response } = applyMetaActions(
+      'Shifted the fast day.',
+      meta([{ type: 'kb_note', domain: 'Ekadashi / fasting calendar', note: 'Kamika shifted to Thu Aug 6' }]),
+      state
+    );
+    assert.deepEqual(kbNote, { domain: 'Ekadashi / fasting calendar', note: 'Kamika shifted to Thu Aug 6' });
+    assert.equal(response, 'Shifted the fast day.', 'kb_note must not alter the visible response text');
+  });
+
+  it('kb_note trims whitespace on domain and note', () => {
+    const state = makeState();
+    const { kbNote } = applyMetaActions('Done.', meta([{ type: 'kb_note', domain: '  Domain  ', note: '  note  ' }]), state);
+    assert.deepEqual(kbNote, { domain: 'Domain', note: 'note' });
+  });
+
+  it('kb_note rejects a missing domain', () => {
+    const state = makeState();
+    const { kbNote } = applyMetaActions('Done.', meta([{ type: 'kb_note', note: 'note only' }]), state);
+    assert.equal(kbNote, null);
+  });
+
+  it('kb_note rejects a missing note', () => {
+    const state = makeState();
+    const { kbNote } = applyMetaActions('Done.', meta([{ type: 'kb_note', domain: 'Domain only' }]), state);
+    assert.equal(kbNote, null);
+  });
+
+  it('kb_note rejects an oversized domain (>100 chars)', () => {
+    const state = makeState();
+    const { kbNote } = applyMetaActions('Done.', meta([{ type: 'kb_note', domain: 'x'.repeat(101), note: 'note' }]), state);
+    assert.equal(kbNote, null);
+  });
+
+  it('kb_note rejects an oversized note (>300 chars)', () => {
+    const state = makeState();
+    const { kbNote } = applyMetaActions('Done.', meta([{ type: 'kb_note', domain: 'Domain', note: 'x'.repeat(301) }]), state);
+    assert.equal(kbNote, null);
+  });
+
+  it('kb_note coexists with run_skill', () => {
+    const state = makeState();
+    const { kbNote, skillToRun } = applyMetaActions(
+      'Done.',
+      meta([{ type: 'kb_note', domain: 'D', note: 'N' }, { type: 'run_skill', skill: 'fitness-sync' }]),
+      state
+    );
+    assert.deepEqual(kbNote, { domain: 'D', note: 'N' });
+    assert.equal(skillToRun, 'fitness-sync');
+  });
+
+  it('kb_note coexists with restart_bot', () => {
+    const state = makeState();
+    const { kbNote, restartBot } = applyMetaActions(
+      'Done.',
+      meta([{ type: 'kb_note', domain: 'D', note: 'N' }, { type: 'restart_bot' }]),
+      state
+    );
+    assert.deepEqual(kbNote, { domain: 'D', note: 'N' });
+    assert.equal(restartBot, true);
+  });
+
   // --- state isolation ---
 
   it('does not mutate other state fields', () => {
@@ -2089,5 +2306,231 @@ describe('renderStatusCard', () => {
     });
     assert.ok(card.includes('Current: claude'));
     assert.ok(card.includes('Keep-awake: off'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// RETRANSCRIBE_PATTERN / handleRetranscribeCommand
+// ---------------------------------------------------------------------------
+
+describe('RETRANSCRIBE_PATTERN', () => {
+  it('matches bare /retranscribe', () => {
+    assert.ok(RETRANSCRIBE_PATTERN.test('/retranscribe'));
+  });
+
+  it('matches /retranscribe with an engine argument', () => {
+    assert.ok(RETRANSCRIBE_PATTERN.test('/retranscribe groq'));
+  });
+
+  it('matches with a bot-username suffix', () => {
+    assert.ok(RETRANSCRIBE_PATTERN.test('/retranscribe@my_bot'));
+  });
+
+  it('does not match unrelated text', () => {
+    assert.equal(RETRANSCRIBE_PATTERN.test('please retranscribe this'), false);
+  });
+
+  it('does not match a prefix-only command', () => {
+    assert.equal(RETRANSCRIBE_PATTERN.test('/retranscribed'), false);
+  });
+});
+
+describe('handleRetranscribeCommand', () => {
+  it('reports unmatched for non-command text', () => {
+    assert.deepEqual(handleRetranscribeCommand('hello there'), { matched: false });
+  });
+
+  it('matches bare /retranscribe with no engine override', () => {
+    const result = handleRetranscribeCommand('/retranscribe');
+    assert.equal(result.matched, true);
+    assert.equal(result.engine, undefined);
+  });
+
+  it('parses an explicit engine override', () => {
+    const result = handleRetranscribeCommand('/retranscribe groq');
+    assert.equal(result.matched, true);
+    assert.equal(result.engine, 'groq');
+  });
+
+  it('trims whitespace around the engine argument', () => {
+    const result = handleRetranscribeCommand('/retranscribe   openai  ');
+    assert.equal(result.matched, true);
+    assert.equal(result.engine, 'openai');
+  });
+
+  it('matches with a bot-username suffix and an engine', () => {
+    const result = handleRetranscribeCommand('/retranscribe@my_bot deepgram');
+    assert.equal(result.matched, true);
+    assert.equal(result.engine, 'deepgram');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Git-workflow skill triggers: COMMIT_PATTERN, COMMIT_AND_PUSH_PATTERN,
+// PUSH_PATTERN, PUSH_PUBLIC_PATTERN, INVESTIGATE_FLAGGED_PATTERN
+// ---------------------------------------------------------------------------
+
+describe('COMMIT_PATTERN', () => {
+  it('matches bare /commit', () => {
+    assert.ok(COMMIT_PATTERN.test('/commit'));
+  });
+
+  it('matches with a bot-username suffix', () => {
+    assert.ok(COMMIT_PATTERN.test('/commit@my_bot'));
+  });
+
+  it('does NOT match /commit_and_push — the two commands must never shadow each other', () => {
+    assert.equal(COMMIT_PATTERN.test('/commit_and_push'), false);
+  });
+
+  it('does not match unrelated text', () => {
+    assert.equal(COMMIT_PATTERN.test('please commit this'), false);
+  });
+});
+
+describe('COMMIT_AND_PUSH_PATTERN', () => {
+  it('matches bare /commit_and_push', () => {
+    assert.ok(COMMIT_AND_PUSH_PATTERN.test('/commit_and_push'));
+  });
+
+  it('matches with a bot-username suffix', () => {
+    assert.ok(COMMIT_AND_PUSH_PATTERN.test('/commit_and_push@my_bot'));
+  });
+
+  it('does not match unrelated text', () => {
+    assert.equal(COMMIT_AND_PUSH_PATTERN.test('please commit and push this'), false);
+  });
+
+  it('does not match trailing arguments', () => {
+    assert.equal(COMMIT_AND_PUSH_PATTERN.test('/commit_and_push now'), false);
+  });
+});
+
+describe('PUSH_PATTERN', () => {
+  it('matches bare /push', () => {
+    assert.ok(PUSH_PATTERN.test('/push'));
+  });
+
+  it('matches with a bot-username suffix', () => {
+    assert.ok(PUSH_PATTERN.test('/push@my_bot'));
+  });
+
+  it('does NOT match /push_public — the two commands must never shadow each other', () => {
+    // Regression guard: PUSH_PATTERN's trailing `\s*$` requires end-of-string
+    // immediately after the optional @botname, so the literal "_public" tail
+    // can never be consumed and this must fail to match.
+    assert.equal(PUSH_PATTERN.test('/push_public'), false);
+  });
+
+  it('does not match unrelated text', () => {
+    assert.equal(PUSH_PATTERN.test('please push this'), false);
+  });
+});
+
+describe('PUSH_PUBLIC_PATTERN', () => {
+  it('matches bare /push_public', () => {
+    assert.ok(PUSH_PUBLIC_PATTERN.test('/push_public'));
+  });
+
+  it('matches with a bot-username suffix', () => {
+    assert.ok(PUSH_PUBLIC_PATTERN.test('/push_public@my_bot'));
+  });
+
+  it('does not match bare /push', () => {
+    assert.equal(PUSH_PUBLIC_PATTERN.test('/push'), false);
+  });
+});
+
+describe('INVESTIGATE_FLAGGED_PATTERN', () => {
+  it('matches bare /investigate_flagged', () => {
+    assert.ok(INVESTIGATE_FLAGGED_PATTERN.test('/investigate_flagged'));
+  });
+
+  it('matches with a bot-username suffix', () => {
+    assert.ok(INVESTIGATE_FLAGGED_PATTERN.test('/investigate_flagged@my_bot'));
+  });
+
+  it('does not match unrelated text', () => {
+    assert.equal(INVESTIGATE_FLAGGED_PATTERN.test('investigate the flagged files'), false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// describeForwardOrigin
+// ---------------------------------------------------------------------------
+
+describe('describeForwardOrigin', () => {
+  it('returns undefined for a non-forwarded message', () => {
+    assert.equal(describeForwardOrigin({}), undefined);
+  });
+
+  it('named user: prefers first_name over username', () => {
+    assert.equal(
+      describeForwardOrigin({ forward_origin: { type: 'user', sender_user: { first_name: 'Alice', username: 'alice99' } } }),
+      'Alice',
+    );
+  });
+
+  it('named user: falls back to username when first_name is absent', () => {
+    assert.equal(
+      describeForwardOrigin({ forward_origin: { type: 'user', sender_user: { username: 'alice99' } } }),
+      'alice99',
+    );
+  });
+
+  it('hidden user: uses sender_user_name when present', () => {
+    assert.equal(
+      describeForwardOrigin({ forward_origin: { type: 'hidden_user', sender_user_name: 'Anonymous Panda' } }),
+      'Anonymous Panda',
+    );
+  });
+
+  it('hidden user: falls back to a generic label when sender_user_name is absent', () => {
+    assert.equal(
+      describeForwardOrigin({ forward_origin: { type: 'hidden_user' } }),
+      'a hidden user',
+    );
+  });
+
+  it('chat title', () => {
+    assert.equal(
+      describeForwardOrigin({ forward_origin: { type: 'chat', sender_chat: { title: 'Family Group' } } }),
+      'the chat "Family Group"',
+    );
+  });
+
+  it('channel title', () => {
+    assert.equal(
+      describeForwardOrigin({ forward_origin: { type: 'channel', chat: { title: 'News Channel' } } }),
+      'the chat "News Channel"',
+    );
+  });
+
+  it('legacy forward_from: prefers first_name over username', () => {
+    assert.equal(
+      describeForwardOrigin({ forward_from: { first_name: 'Bob', username: 'bobby' } }),
+      'Bob',
+    );
+  });
+
+  it('legacy forward_sender_name', () => {
+    assert.equal(
+      describeForwardOrigin({ forward_sender_name: 'Legacy Sender' }),
+      'Legacy Sender',
+    );
+  });
+
+  it('forward_origin takes precedence over legacy fields when both are present', () => {
+    assert.equal(
+      describeForwardOrigin({
+        forward_origin: { type: 'user', sender_user: { first_name: 'Modern' } },
+        forward_from: { first_name: 'Legacy' },
+      }),
+      'Modern',
+    );
+  });
+
+  it('returns undefined for an unknown forward_origin type', () => {
+    assert.equal(describeForwardOrigin({ forward_origin: { type: 'something_new' } }), undefined);
   });
 });

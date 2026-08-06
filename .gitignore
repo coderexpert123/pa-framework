@@ -34,11 +34,15 @@ __pycache__/
 *.pdf
 *.log
 # Atomic-write crash artifacts (learn_agent.py mkstemp tmps) + the regenerable
-# ecosystem-kb mining watermark. The archive ITSELF (profile-history-archive.jsonl)
-# is deliberately tracked — it's the only durable copy of evicted profile facts,
-# consistent with profile.json being tracked in this private repo.
+# ecosystem-kb mining watermark.
 pa/data/*.tmp
 pa/data/profile-history-archive.kb-watermark.json
+# AI-089 (2026-07-27): profile.json + its eviction archive now live OUTSIDE the
+# repo at ~/.pa/data/ (durability via the weekly secrets-backup skill, not git).
+# These patterns stop accidental re-tracking if a stale PA_PROFILE_PATH override
+# ever recreates them here.
+pa/data/profile.json
+pa/data/profile-history-archive.jsonl
 
 # Secrets
 **/credentials.json
@@ -171,17 +175,24 @@ projects/daily-mail-brief/analysis_input.md
 projects/daily-mail-brief/briefing_output.md
 
 # === Public-repo coexistence ===
-# Separate .git directory + wrapper for the public framework repo
+# TRACKED PRIVATELY since 2026-08-06 (was ignored here before): .gitignore-public,
+# git-public.ps1/.cmd, README.md, LICENSE, docs/, examples/. They had NO recovery
+# path in ANY git history — git-public.ps1/.cmd were tracked by neither repo, and
+# a git-public checkout clobbered docs/+examples/ twice (2026-07-21, 2026-08-05)
+# with nothing to restore from. The private repo is now a strict SUPERSET of the
+# public mirror; .gitignore-public alone still decides what actually gets synced
+# (pa public-sync extracts from private HEAD, filtered by .gitignore-public — see
+# plans/2026-08-05-concurrent-session-safety.md). The old shared .git-public
+# directory itself stays ignored (may still exist on a stale pre-migration clone).
 /.git-public/
-/.gitignore-public
-/git-public.cmd
-/git-public.ps1
-
-# Public-only files (untracked by private repo to avoid pollution)
-/README.md
-/LICENSE
-/docs/
-/examples/
+# The real public mirror: a NESTED but fully independent git repo (own .git/) at
+# pa-public/, fully DERIVED by `pa public-sync` from private HEAD — never authored
+# here. Nesting it (vs. the original sibling D:/pa-public) is safe because the
+# danger was never physical proximity, it was the shared --work-tree=. above;
+# a nested repo's own git commands can't reach outside its own working tree, and
+# this private repo's git commands never recurse into an ignored+untracked dir
+# (only `git clean -fdx` would, and nothing in this stack runs that).
+/pa-public/
 
 # === OAuth artifact hygiene (prevent recurrence of auth_code leak) ===
 **/auth_code.txt
@@ -191,6 +202,45 @@ projects/daily-mail-brief/briefing_output.md
 # === Temp / debug-only files that have leaked before ===
 projects/daily-mail-brief/temp_brief.md
 projects/daily-mail-brief/temp_*.py
+
+# === AI-091 (2026-07-27): personal data untracked under projects/ ===
+# Derived personal outputs from ad-hoc analyses (NOT produced by any scheduled
+# skill — verified). Files stay on disk; untracked so real financial/health
+# values stay out of version control going forward.
+projects/credit-card-bills/audit_report.json
+projects/credit-card-bills/audit_totals.txt
+projects/credit-card-bills/details.txt
+projects/credit-card-bills/final_lapse_result.txt
+projects/credit-card-bills/json_list.txt
+projects/credit-card-bills/artifacts/
+# One-off fitness analysis reports with real physiological data. Explicit list,
+# not a glob — README.md/CLAUDE.md/REAUTH.md in the same directory stay tracked.
+projects/fitness-data-sync/DETAILED_FITNESS_EVOLUTION_REPORT.md
+projects/fitness-data-sync/FITNESS_ANALYSIS.md
+projects/fitness-data-sync/FITNESS_THESIS_2024_2026.md
+projects/fitness-data-sync/FORMAL_PHYSIOLOGICAL_AUDIT_2024_2026.md
+projects/fitness-data-sync/MEGA_PERFORMANCE_THESIS_2024_2026.md
+projects/fitness-data-sync/PRO_LEVEL_PERFORMANCE_AUDIT.md
+projects/fitness-data-sync/THE_EVOLUTION_OF_THE_ENGINE.md
+projects/fitness-data-sync/ULTIMATE_PRO_PERFORMANCE_AUDIT_2024_2026.md
+projects/fitness-data-sync/ULTRATHINK_CARDIAC_REPORT.md
+# One-off scripts whose SOURCE contains hardcoded medical/financial PII
+# (unreferenced by any skill — verified). Untracked as an interim measure;
+# pending a delete-vs-parameterize decision (see BACKLOG AI-091 notes).
+projects/health-reports/scripts/create_clinical_summary_pdf.py
+projects/health-reports/scripts/create_fertility_report.py
+projects/health-reports/scripts/create_hla_health_report.py
+projects/health-reports/scripts/create_knee_recovery_pdf.py
+projects/health-reports/scripts/create_report.py
+projects/health-reports/scripts/knee_recovery_link.txt
+projects/pan-transfer/scripts/create_account_transfer_report.py
+# Captured invoice-template dumps (full PAN/address) moved to
+# ~/Documents/personal-imports/2026-07-27/ — block re-capture at these paths.
+projects/hemir-invoice/template_analysis.txt
+projects/hemir-invoice/scripts/template_content_check.txt
+# No loose code directly under projects/ — every project is a directory (same
+# class of gap as the root /*.py rule; ad-hoc Gmail scripts accumulated here).
+projects/*.py
 
 # === User-personalized prompts (do not auto-stage in public clones) ===
 # bot-instructions.md is the static system prompt appended to claude/zclaude spawns

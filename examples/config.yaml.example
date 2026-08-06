@@ -264,3 +264,57 @@ topic_defaults:
 bg_tasks:
   alert_seconds: 300          # alert if a worker's descendant outlives parent by N seconds; min 60
   alert_repeat_seconds: 1800  # repeat alerts every N seconds (must be >= alert_seconds); default 1800
+
+# ---- maintenance (optional) ----
+# Overrides for declared maintenance jobs. Run `pa maintenance list` for the
+# full table with resolved target paths. A knob may only DISABLE a job or
+# CHANGE its cadence — it can never add or widen a target.
+# maintenance:
+#   session-gc:    { enabled: true, every: 6h }
+#   archive-prune: { every: 1h }
+
+# ---- transcription (optional) ----
+# Controls how Telegram VOICE NOTES become text. If you never send voice notes,
+# ignore this whole block — everything else works exactly as before.
+#
+# You need ONE engine. Two ways to get one:
+#
+#   Cloud — recommended, about a minute to set up, transcribes in seconds:
+#     put GROQ_API_KEY=<free key from https://console.groq.com/keys> in
+#     ~/.pa/secrets.env and restart the bot. Nothing to install locally.
+#     OPENAI_API_KEY and DEEPGRAM_API_KEY work the same way.
+#
+#   Local — fully offline, audio never leaves your machine, but SLOW and heavy:
+#     install the `transcription` Python package plus ffmpeg, then set
+#     engine_preference: local below. Expect ~1 GB of dependencies and one to
+#     several MINUTES per voice note on CPU.
+#
+# Full walkthrough: docs/BOT_GUIDE.md "Voice messages (speech to text)"
+# Something broken?  docs/TROUBLESHOOTING.md "Voice-message transcription"
+#
+# transcription:
+#   # auto  = use a cloud engine when an API key is set, otherwise fall back to local
+#   # cloud = cloud only; fail rather than fall back to local if every provider fails
+#   # local = local only; audio NEVER leaves this machine, even if API keys are set
+#   engine_preference: auto
+#
+#   # How the LOCAL engine runs. Ignored entirely when a cloud engine handles the note.
+#   #   spawn      = one fresh Python process per voice note. Simple, nothing resident,
+#   #                but it reloads the speech model every time — that is where the
+#   #                minutes go.
+#   #   persistent = start a background process on the first voice note that needs it,
+#   #                keep the model in RAM (~230 MB and up) so later notes are much
+#   #                faster, and shut it down after 10 idle minutes.
+#   # A deliberate, static choice: pa never switches modes on its own.
+#   worker_mode: spawn
+#
+#   # Cloud providers to try, in order. Only providers whose API key is actually set
+#   # are attempted, so listing all three is safe.
+#   cloud_order: [groq, openai, deepgram]
+#
+#   # Pin the spoken language instead of auto-detecting (ISO 639-1, optionally
+#   # region-qualified — e.g. "en" or "en-US"). The local model (small.en) is
+#   # English-only: a non-English language here paired with engine_preference: local
+#   # is accepted but logs a config-load warning, since it will likely mistranscribe
+#   # or transliterate rather than fail outright. Leave unset (null) to auto-detect.
+#   language: null

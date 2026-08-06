@@ -61,14 +61,18 @@ other escape hatch, by design.
 Modes:
   (default)      pre-push hook — scans the outgoing push (see SCOPE above).
   --full         audit mode — scans EVERY tracked path + file of the repo the
-                 GIT_DIR env var points at (default: .git-public relative to
-                 cwd). Reports all violations. Use for the scheduled pii-audit
-                 skill / manual full-tree sweeps.
+                 GIT_DIR env var points at (default: .git relative to cwd —
+                 cwd is the public mirror's own root when git invokes this as
+                 a real hook, so plain ".git" is correct there; pass GIT_DIR
+                 explicitly for a manual sweep from elsewhere). Reports all
+                 violations. Use for the scheduled pii-audit skill / manual
+                 full-tree sweeps.
   --no-llm       with --full: skip the agy layer (regex + tripwires only).
 
-Install:
-  cp pa/scripts/git-hooks/pre-push-pii-guard .git-public/hooks/pre-push
-  chmod +x .git-public/hooks/pre-push
+Install (or just run `python pa/scripts/install_git_hooks.py`, which does
+this idempotently and verifies the drift):
+  cp pa/scripts/git-hooks/pre-push-pii-guard <public mirror>/.git/hooks/pre-push
+  chmod +x <public mirror>/.git/hooks/pre-push
 """
 import json
 import os
@@ -814,7 +818,7 @@ def full_audit(use_llm: bool) -> int:
     per-push diff scan this re-checks pre-existing lines — the gap that let 5
     residual leaks survive until the 2026-06-24 manual audit (AI-094).
     """
-    git_dir = os.environ.get("GIT_DIR", ".git-public")
+    git_dir = os.environ.get("GIT_DIR", ".git")
     all_paths = list_tracked_paths(git_dir)
     files = collect_tree(git_dir, all_paths)
     if not files:

@@ -8,7 +8,32 @@ import { addWorkerPid, removeWorkerPid } from '../worker-pids.js';
 import { killProcessTree } from '../process-tree.js';
 import { log } from '../lib/log.js';
 import { notifyUser } from '../lib/notify.js';
+import { blackboard } from '../blackboard.js';
 import type { RunMeta, CommandResult, TelegramOutput, RunOptions } from '../types.js';
+
+const LOCK_HEARTBEAT_MS = 60_000;
+
+/**
+ * Lock key for a skill's `exclusive_resource`. Shared by acquire/heartbeat/release
+ * so the three call sites can't drift into using different key shapes.
+ */
+export function exclusiveLockKey(resource: string): string {
+  return `skill-exclusive:${resource}`;
+}
+
+/**
+ * How long to wait for an `exclusive_resource` lock before giving up: half of the
+ * skill's own timeout budget. This scales automatically — the wait can never eat
+ * the whole budget, so the remaining half is always available for the actual work
+ * regardless of how long the wait took, without hardcoding a number per skill.
+ */
+export function lockWaitBudgetMs(skillTimeoutSec: number | undefined): number {
+  const skillTimeoutMs = (skillTimeoutSec ?? 300) * 1000;
+  // Floor is a defensive minimum only — every real git-workflow skill's own
+  // timeout is >=600s (see their skill.md files), so 50% of that is already
+  // >=300_000ms and this floor never actually engages in production.
+  return Math.max(2_000, Math.floor(skillTimeoutMs * 0.5));
+}
 
 /**
  * Returns true if the skill output should be suppressed (not sent to Telegram).
@@ -183,7 +208,7 @@ async function handleSkillResult(
   if (result.success && result.output && !isNoOutputSentinel(result.output) && telegramOutput && secrets) {
     const token = secrets[telegramOutput.token_secret];
     if (token) {
-      const send = await sendToTelegram(result.output, telegramOutput, token);
+      const send = await sendToTelegram(result.output, telegramOutput, token, 'MarkdownV2');
       if (!send.ok) {
         recordDeliveryFailure(result, skillName, worker, duration, describeSendFailure(send), {
           failure: send.reason,
@@ -350,6 +375,54 @@ export async function runCommand(
 
   console.log(`Running skill: ${skillName}${extraArgs.length > 0 ? ` with extra args: ${extraArgs.join(' ')}` : ''}`);
 
+  // Cross-skill mutual exclusion. Different skill names (e.g. commit/push/
+  // push-public/investigate-flagged, all declaring exclusive_resource:
+  // git-workflow) run as separate `pa run` processes with no shared in-process
+  // state, so nothing but a real lock stops two of them mutating the same
+  // working tree at once. NOT set on commit-and-push itself — it spawns those
+  // as child `pa run` processes and would deadlock waiting on its own child.
+  const exclusiveResource = skill.frontmatter.exclusive_resource;
+  const lockKey = exclusiveResource ? exclusiveLockKey(exclusiveResource) : undefined;
+  let lockHeld = false;
+  let lockHeartbeat: ReturnType<typeof setInterval> | undefined;
+
+  if (lockKey && exclusiveResource) {
+    const waitStart = Date.now();
+    const lockWaitMs = lockWaitBudgetMs(skill.frontmatter.timeout);
+    lockHeld = await blackboard.acquireLock(lockKey, skillName, process.pid, lockWaitMs);
+    if (!lockHeld) {
+      const waitedS = Math.round((Date.now() - waitStart) / 1000);
+      const lockResult: CommandResult = {
+        success: false,
+        alreadyAlertedPaSupport: true, // contention is expected, not a pa-alerts-worthy failure
+        error: `Skipped: another skill holding exclusive_resource "${exclusiveResource}" was still running after waiting ${waitedS}s. Try again once it finishes.`,
+        exitCode: -1,
+        output: '',
+      };
+      await handleSkillResult(lockResult, 'lock', skillName, Date.now() - waitStart, extraArgs, depth, preferredWorker, skill.frontmatter.telegram_output, allSecrets);
+      return lockResult;
+    }
+    // Heartbeat while the run is in flight: acquireLock purges any lock whose
+    // heartbeat is older than HEARTBEAT_STALE_MS (10 min) even when the holder
+    // is alive (see blackboard.ts), and push/push-public/investigate-flagged
+    // can all legitimately run well past that. Without this, a second run
+    // would steal the lock mid-work. Mirrors catchup.ts's own heartbeat.
+    lockHeartbeat = setInterval(() => {
+      void blackboard.updateHeartbeat(lockKey, skillName).catch(() => {});
+    }, LOCK_HEARTBEAT_MS);
+    lockHeartbeat.unref?.();
+  }
+
+  try {
+    return await runSkillBody();
+  } finally {
+    if (lockHeartbeat) clearInterval(lockHeartbeat);
+    if (lockHeld && lockKey) {
+      await blackboard.releaseLock(lockKey, skillName).catch(() => {});
+    }
+  }
+
+  async function runSkillBody(): Promise<CommandResult> {
   // 1. Direct command execution (bypasses LLM)
   if (skill.frontmatter.cmd) {
     const start = Date.now();
@@ -365,6 +438,9 @@ export async function runCommand(
         // POSIX only — see worker-exec.ts spawn for rationale (process-group
         // leader for killProcessTree; Windows keeps taskkill /T).
         detached: process.platform !== 'win32',
+        // shell:true spawns a real cmd.exe console on Windows; without this
+        // every cmd-based skill run flashes a visible window.
+        windowsHide: true,
       });
 
       let output = '';
@@ -501,4 +577,5 @@ export async function runCommand(
 
   await handleSkillResult(result, worker, skillName, Date.now() - start, extraArgs, depth, preferredWorker, skill.frontmatter.telegram_output, secrets);
   return result;
+  }
 }

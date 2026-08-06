@@ -1,7 +1,7 @@
 import { readFile, writeFile } from 'fs/promises';
 import { parse as parseYaml } from 'yaml';
 import { configPath } from './paths.js';
-import type { PaConfig, WorkerConfig, EvaluatorConfig, BgTasksConfig, TunableSpec, TunableValues } from './types.js';
+import type { PaConfig, WorkerConfig, EvaluatorConfig, BgTasksConfig, TunableSpec, TunableValues, MaintenanceConfig, TranscriptionConfig, TranscriptionEnginePreference, TranscriptionWorkerMode } from './types.js';
 
 /**
  * Parse a tunable's optional `values:` — a DISPLAY HINT, never a gate.
@@ -191,6 +191,170 @@ export function parseTunables(raw: any, workerName: string): Record<string, Tuna
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/** Parse a duration like `30s` / `5m` / `6h` / `7d` into ms. Returns null for
+ *  anything else — INCLUDING a bare integer, which is ambiguous (ms? seconds?)
+ *  and would silently pick the wrong one. */
+export function parseDurationMs(raw: unknown): number | null {
+  if (typeof raw !== 'string') return null;
+  const m = /^\s*(\d+(?:\.\d+)?)\s*(ms|s|m|h|d)\s*$/i.exec(raw);
+  if (!m) return null;
+  const n = parseFloat(m[1]);
+  const mult: Record<string, number> = { ms: 1, s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 };
+  const v = n * mult[m[2].toLowerCase()];
+  return Number.isFinite(v) && v > 0 ? v : null;
+}
+
+/** Parse the optional top-level `maintenance:` block. WARN-AND-SKIP, never
+ *  throw — same house style as parseTunables. A malformed knob must not take
+ *  the config, and with it the scheduler, the bot and every skill, down. */
+export function parseMaintenance(raw: any): Record<string, MaintenanceConfig> | undefined {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    console.warn("[config] 'maintenance' must be a mapping of job name -> { enabled, every }; ignoring");
+    return undefined;
+  }
+  const out: Record<string, MaintenanceConfig> = {};
+  for (const [k, v] of Object.entries(raw)) {
+    if (!k) continue;
+    if (typeof v !== 'object' || v === null || Array.isArray(v)) {
+      console.warn(`[config] maintenance '${k}': must be a mapping with 'enabled' and/or 'every'; ignoring`);
+      continue;
+    }
+    const entry: MaintenanceConfig = {};
+    const vv = v as any;
+    if ('enabled' in vv) {
+      if (typeof vv.enabled === 'boolean') entry.enabled = vv.enabled;
+      else console.warn(`[config] maintenance '${k}': 'enabled' must be true/false; ignoring that field`);
+    }
+    if ('every' in vv) {
+      const ms = parseDurationMs(vv.every);
+      if (ms !== null) entry.everyMs = ms;
+      else console.warn(`[config] maintenance '${k}': 'every' must be a duration like 30s/5m/6h/7d (got ${JSON.stringify(vv.every)}); ignoring that field`);
+    }
+    if (Object.keys(entry).length > 0) out[k] = entry;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+const VALID_ENGINE_PREFERENCES: readonly TranscriptionEnginePreference[] = ['auto', 'cloud', 'local'];
+const VALID_WORKER_MODES: readonly TranscriptionWorkerMode[] = ['spawn', 'persistent'];
+const VALID_CLOUD_PROVIDERS = ['groq', 'openai', 'deepgram'] as const;
+// ISO 639-1: exactly two letters, optionally a hyphen and a two-letter region
+// (e.g. "en", "en-US"). Case-insensitive on input; not re-cased on output —
+// the value is passed straight through to each cloud provider's own API.
+const LANGUAGE_PATTERN = /^[a-z]{2}(-[A-Za-z]{2})?$/i;
+const ENGLISH_LANGUAGE_PATTERN = /^en(-|$)/i;
+
+export const DEFAULT_TRANSCRIPTION_CONFIG: TranscriptionConfig = {
+  engine_preference: 'auto',
+  worker_mode: 'spawn',
+  cloud_order: ['groq', 'openai', 'deepgram'],
+  language: null,
+};
+
+/** Merge a (possibly undefined/partial) transcription config field-by-field
+ *  over DEFAULT_TRANSCRIPTION_CONFIG. The only defaulting logic for this
+ *  feature — parseTranscription below delegates to it rather than
+ *  re-implementing it, and so must every other consumer (e.g. `main.ts`
+ *  falls back to `{ workers: [] }` when loadConfig() throws, so
+ *  `config.transcription` really can be undefined at the call site). */
+export function resolveTranscriptionConfig(raw?: Partial<TranscriptionConfig>): TranscriptionConfig {
+  return {
+    engine_preference: raw?.engine_preference ?? DEFAULT_TRANSCRIPTION_CONFIG.engine_preference,
+    worker_mode: raw?.worker_mode ?? DEFAULT_TRANSCRIPTION_CONFIG.worker_mode,
+    cloud_order: raw?.cloud_order ?? DEFAULT_TRANSCRIPTION_CONFIG.cloud_order,
+    language: raw?.language !== undefined ? raw.language : DEFAULT_TRANSCRIPTION_CONFIG.language,
+  };
+}
+
+/** Parse the optional top-level `transcription:` block. WARN-AND-SKIP, same
+ *  house style as parseTunables/parseMaintenance — a malformed knob must not
+ *  take the config, and with it the scheduler, the bot and every skill,
+ *  down. Every warning names the config file, since for a first-time user
+ *  it may only ever be read out of a bot log. */
+export function parseTranscription(raw: any): TranscriptionConfig | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    console.warn("[config] ~/.pa/config.yaml: 'transcription' must be a mapping with 'engine_preference', 'worker_mode', 'cloud_order'; ignoring");
+    return undefined;
+  }
+
+  const partial: Partial<TranscriptionConfig> = {};
+
+  if (raw.engine_preference !== undefined && raw.engine_preference !== null) {
+    const v = String(raw.engine_preference).trim().toLowerCase();
+    if ((VALID_ENGINE_PREFERENCES as readonly string[]).includes(v)) {
+      partial.engine_preference = v as TranscriptionEnginePreference;
+    } else {
+      console.warn(
+        `[config] ~/.pa/config.yaml: transcription.engine_preference must be one of ${VALID_ENGINE_PREFERENCES.join('|')} (got ${JSON.stringify(raw.engine_preference)}); using default '${DEFAULT_TRANSCRIPTION_CONFIG.engine_preference}'`,
+      );
+    }
+  }
+
+  if (raw.worker_mode !== undefined && raw.worker_mode !== null) {
+    const v = String(raw.worker_mode).trim().toLowerCase();
+    if ((VALID_WORKER_MODES as readonly string[]).includes(v)) {
+      partial.worker_mode = v as TranscriptionWorkerMode;
+    } else {
+      console.warn(
+        `[config] ~/.pa/config.yaml: transcription.worker_mode must be one of ${VALID_WORKER_MODES.join('|')} (got ${JSON.stringify(raw.worker_mode)}); using default '${DEFAULT_TRANSCRIPTION_CONFIG.worker_mode}'`,
+      );
+    }
+  }
+
+  if (raw.cloud_order !== undefined && raw.cloud_order !== null) {
+    const rawList = Array.isArray(raw.cloud_order) ? raw.cloud_order : [raw.cloud_order];
+    const list: string[] = [];
+    for (const entry of rawList) {
+      if (entry === undefined || entry === null) continue;
+      const name = String(entry).trim().toLowerCase();
+      if (!name) continue;
+      if (!(VALID_CLOUD_PROVIDERS as readonly string[]).includes(name)) {
+        console.warn(
+          `[config] ~/.pa/config.yaml: transcription.cloud_order entry ${JSON.stringify(entry)} is not one of ${VALID_CLOUD_PROVIDERS.join('|')}; dropping it`,
+        );
+        continue;
+      }
+      if (!list.includes(name)) list.push(name);
+    }
+    if (list.length > 0) {
+      partial.cloud_order = list;
+    } else {
+      console.warn(
+        `[config] ~/.pa/config.yaml: transcription.cloud_order has no usable entries; using default ${JSON.stringify(DEFAULT_TRANSCRIPTION_CONFIG.cloud_order)}`,
+      );
+    }
+  }
+
+  if (raw.language !== undefined && raw.language !== null) {
+    const v = String(raw.language).trim();
+    if (v === '') {
+      // Explicit blank is the same as unset: fall through to the null default,
+      // no warning — nothing was actually asked for.
+    } else if (LANGUAGE_PATTERN.test(v)) {
+      partial.language = v;
+    } else {
+      console.warn(
+        `[config] ~/.pa/config.yaml: transcription.language must be an ISO 639-1 code, optionally region-qualified (e.g. 'en' or 'en-US') (got ${JSON.stringify(raw.language)}); falling back to auto-detect`,
+      );
+    }
+  }
+
+  // The small.en local model is English-only: a non-English language paired
+  // with the local engine is accepted (still passed through as a hint — the
+  // local transcriber may honour it, may not) but warned about, since it will
+  // otherwise silently mistranscribe or transliterate rather than fail loudly.
+  const effectiveEnginePreference = partial.engine_preference ?? DEFAULT_TRANSCRIPTION_CONFIG.engine_preference;
+  if (partial.language && effectiveEnginePreference === 'local' && !ENGLISH_LANGUAGE_PATTERN.test(partial.language)) {
+    console.warn(
+      `[config] ~/.pa/config.yaml: transcription.language is '${partial.language}' but engine_preference is 'local' — the local model (small.en) is English-only and will likely mistranscribe or transliterate rather than error; use a cloud engine for other languages`,
+    );
+  }
+
+  return resolveTranscriptionConfig(partial);
+}
+
 export async function loadConfig(): Promise<PaConfig> {
   const path = configPath();
   let raw: string;
@@ -255,6 +419,8 @@ export async function loadConfig(): Promise<PaConfig> {
       topic_defaults: parsed.topic_defaults,
       bg_tasks,
       concurrency_limit: Number.isInteger(parsed.concurrency_limit) ? parsed.concurrency_limit : 2,
+      maintenance: parseMaintenance(parsed.maintenance),
+      transcription: parseTranscription(parsed.transcription),
     };
 }
 

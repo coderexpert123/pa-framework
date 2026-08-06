@@ -6,7 +6,16 @@ set -euo pipefail
 PA_HOME="${PA_HOME:-$HOME/.pa}"
 LOG_DIR="$PA_HOME/logs"
 LOG_FILE="$LOG_DIR/telegram-bot.log"
-MAX_BYTES=$((2 * 1024 * 1024))   # 2 MB — matches run-bot.ps1
+# Rotation threshold and destination MUST match pa/src/lib/archive-files.ts
+# (RUNTIME_ARCHIVE_MAX_BYTES = 5MB; ~/.pa/archive/<stamp>-<basename>) so the
+# archive-prune maintenance job governs these shards, and run-bot.ps1's policy.
+# Rotating HERE — not in the bot — is load-bearing: the node process holds this
+# file open through shell redirection, so it can only be rotated while the bot
+# is down. Do NOT simply delete this block: bot-log-rotation-check restarts the
+# bot at 5MB, so with no launcher-side rotation the bot would restart every
+# minute forever. AI-100 W2.
+MAX_BYTES=$((5 * 1024 * 1024))
+ARCHIVE_DIR="$PA_HOME/archive"
 
 mkdir -p "$LOG_DIR"
 
@@ -14,8 +23,8 @@ mkdir -p "$LOG_DIR"
 if [ -f "$LOG_FILE" ]; then
   size=$(wc -c < "$LOG_FILE")
   if [ "$size" -gt "$MAX_BYTES" ]; then
-    [ -f "$LOG_FILE.1" ] && rm -f "$LOG_FILE.1"
-    mv "$LOG_FILE" "$LOG_FILE.1"
+    mkdir -p "$ARCHIVE_DIR"
+    mv "$LOG_FILE" "$ARCHIVE_DIR/$(date +%Y-%m-%d-%H%M%S)-telegram-bot.log"
   fi
 fi
 

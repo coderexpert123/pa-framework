@@ -201,6 +201,29 @@ The bot strips `[PA_META]` envelopes before sending. If your skill's intended Te
 
 Workaround: emit the literal text outside the `[PA_META]` envelope position (anywhere except the LAST line of output).
 
+## Voice-message transcription
+
+### "No transcription engine is set up yet"
+
+You sent the bot a voice note, audio file, or video note and no transcription engine is configured — neither a cloud API key nor a local install.
+
+Fastest fix (cloud, ~1 minute, transcribes in seconds):
+1. Get a free key at https://console.groq.com/keys.
+2. Add `GROQ_API_KEY=<your key>` to `~/.pa/secrets.env`.
+3. `node pa/dist/bin/pa.js bot restart`.
+
+`OPENAI_API_KEY` and `DEEPGRAM_API_KEY` work the same way. Fully offline instead: install the `transcription` Python package plus ffmpeg, then set `transcription: { engine_preference: local }` in `~/.pa/config.yaml` — expect one to several minutes per note on CPU. Full walkthrough: [`BOT_GUIDE.md` "Voice messages (speech to text)"](BOT_GUIDE.md#voice-messages-speech-to-text). Every knob: [`CONFIGURATION.md` "Voice transcription env vars"](CONFIGURATION.md#voice-transcription-env-vars).
+
+### Transcription is slow (one to several minutes per note)
+
+Expected on the local engine in `spawn` mode (the default) — it reloads the speech model from disk on every note. Two ways to speed it up:
+- Set `GROQ_API_KEY` (or `OPENAI_API_KEY`/`DEEPGRAM_API_KEY`) in `~/.pa/secrets.env` and switch to cloud transcription — seconds, not minutes.
+- Keep using local, but set `transcription: { worker_mode: persistent }` in `~/.pa/config.yaml` — the model stays resident in memory (~230MB+ RAM) between notes, so only the first one after a restart is slow.
+
+### Transcription timed out or failed
+
+The bot's reply names the reason (timeout, no engine, auth failure, ffmpeg missing, file too large). Reply to the failed voice note with `/retranscribe` to retry — it reuses the cached audio if still available, so you don't need to resend the note.
+
 ## Cross-platform issues
 
 ### Platform capabilities

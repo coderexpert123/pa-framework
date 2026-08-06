@@ -55,18 +55,21 @@ invent a match — and both extra views preserve line numbers.
 ```sh
 python pa/scripts/install_git_hooks.py
 ```
-Idempotent and safe to re-run. It installs `.git-public/hooks/pre-push` as a
-**relative symlink** to this tracked source, so editing the source IS the
-install — there is nothing left to re-copy or remember (the old `cp` install
-drifted repeatedly because a copy has to be re-copied by hand after every
-edit). On a machine without symlink privilege it falls back to a hard link, then
-a plain copy, warning loudly at each downgrade. It ends by diffing installed
+Idempotent and safe to re-run. It installs `<public mirror>/.git/hooks/pre-push`
+(default `<repo root>/pa-public/.git/hooks/pre-push`, override with
+`PA_PUBLIC_DIR` or `--public-dir`) as a **copy** of this tracked source. **Copy,
+not symlink**, since 2026-08-06: the public mirror used to be `.git-public/`
+sharing this repo's working tree, where a relative symlink was a same-tree
+convenience; it now lives in its own independent git repo (nested at
+`pa-public/`, own clone/pull lifecycle), and a symlink or hard link crossing
+that boundary would silently desync the moment either repo is re-cloned. **You
+must re-run the installer after every edit to the source** — the drift check
+below is exactly what catches "forgot to re-run." It ends by diffing installed
 content against the source and printing an explicit `drift check:` verdict.
 Check for drift at any time with:
 ```sh
-diff .git-public/hooks/pre-push pa/scripts/git-hooks/pre-push-pii-guard
+diff pa-public/.git/hooks/pre-push pa/scripts/git-hooks/pre-push-pii-guard
 ```
-With the symlink install this is now expected to always report clean.
 
 **Configure personal patterns** (`~/.pa/pii-tripwires.txt`, create if absent):
 ```
@@ -131,7 +134,8 @@ a file nobody has touched in a year is only ever re-checked here):
 python pa/scripts/git-hooks/pre-push-pii-guard --full           # all layers
 python pa/scripts/git-hooks/pre-push-pii-guard --full --no-llm  # regex layers only (fast, ~4s)
 ```
-Reads the repo via `$GIT_DIR` (default `.git-public` relative to cwd) and scans
+Reads the repo via `$GIT_DIR` (default `.git` relative to cwd — run this from
+inside the public mirror's own directory, e.g. `pa-public/`) and scans
 every tracked **path** (binaries included — a `.pdf` whose *name* names a bank
 is a leak whose content nobody would ever open), the content of every readable
 tracked file, and every commit message in the history. Reports all violations

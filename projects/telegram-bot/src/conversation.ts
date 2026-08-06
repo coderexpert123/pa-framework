@@ -340,20 +340,88 @@ export async function findRecentTurnsByTopic(
 }
 
 /**
- * Stream lines from the archive file, calling `onLine` for each non-empty line.
+ * Stream lines from the archive file, calling `onLine` for each non-empty
+ * line. `onLine` may return `false` to stop the scan early (both pre-existing
+ * callers return `void`/`undefined`, which is unaffected by this widened
+ * type).
  */
 async function streamArchiveLines(
   archivePath: string,
-  onLine: (line: string) => void
+  onLine: (line: string) => void | false
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const stream = fs.createReadStream(archivePath, { encoding: 'utf8' });
     const rl = createInterface({ input: stream, crlfDelay: Infinity });
-    rl.on('line', (line) => { if (line.trim()) onLine(line); });
+    // `stopped` is the actual guarantee: readline may have already buffered
+    // and synchronously queued further 'line' events for the same chunk
+    // before rl.close()/stream.destroy() take effect, so those calls alone
+    // are not sufficient to stop onLine from firing again.
+    let stopped = false;
+    rl.on('line', (line) => {
+      if (stopped) return;
+      if (!line.trim()) return;
+      if (onLine(line) === false) {
+        stopped = true;
+        rl.close();
+        stream.destroy();
+      }
+    });
     rl.on('close', resolve);
     rl.on('error', reject);
     stream.on('error', reject);
   });
+}
+
+// Above the 5MB rotation threshold (CLAUDE.md's Log Rotation invariant) — a
+// safety net, not a normal skip. Rotated shards are never scanned here: they
+// are permanent/unbounded per the repo's own retention invariant, and a
+// message_id lookup only ever needs to search the LIVE file a reply could
+// plausibly reference.
+const FIND_ARCHIVED_TURN_MAX_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Narrow fallback for reply-context resolution (reply-context.ts, WP5) when a
+ * replied-to note has aged out of the topic-state window. Cheap pre-filter
+ * (`line.includes('"message_id":${id}')`) before any JSON.parse — exploits
+ * JSON.stringify's no-space-after-colon output; see the drift test in
+ * conversation.test.ts asserting that coupling. Only scans the LIVE
+ * conversation-history.jsonl. Never throws — every failure path resolves
+ * `null`.
+ */
+export async function findArchivedTurnByMessageId(
+  threadId: number,
+  messageId: number
+): Promise<ConversationTurn | null> {
+  const archivePath = getArchivePath();
+
+  try {
+    const st = await fs.stat(archivePath);
+    if (st.size > FIND_ARCHIVED_TURN_MAX_BYTES) return null;
+  } catch {
+    return null;
+  }
+
+  const needle = `"message_id":${messageId}`;
+  let found: ConversationTurn | null = null;
+
+  try {
+    await streamArchiveLines(archivePath, (line) => {
+      if (!line.includes(needle)) return;
+      try {
+        const turn = JSON.parse(line) as ConversationTurn;
+        if (turn.thread_id === threadId && turn.role === 'user' && turn.message_id === messageId) {
+          found = turn;
+          return false;
+        }
+      } catch {
+        // skip malformed line
+      }
+    });
+  } catch {
+    return null;
+  }
+
+  return found;
 }
 
 export function addTurn(state: ConversationState, turn: ConversationTurn): void {

@@ -2,9 +2,11 @@
 """Weekly encrypted backup of the secret-class files to Google Drive.
 
 The one durability gap git can't close: `~/.pa/secrets.env`, the Google
-OAuth token/credentials, `pii-tripwires.txt`, and the `D:/gemini-shim`
-wrappers are single-copy on local disk and (correctly) never committed to
-any repo. This bundles them, encrypts with AES-256-GCM (scrypt-derived key,
+OAuth token/credentials, `pii-tripwires.txt`, the learn-agent profile pair
+(`~/.pa/data/profile.json` + `profile-history-archive.jsonl` — repo-external
+since AI-089, 2026-07-27; the archive is the only durable copy of evicted
+profile facts), and the `D:/gemini-shim` wrappers are single-copy on local
+disk and (correctly) never committed to any repo. This bundles them, encrypts with AES-256-GCM (scrypt-derived key,
 pure `cryptography` — no external binary), and uploads to Drive.
 
 Threat model — honest about what this does and doesn't do:
@@ -100,6 +102,9 @@ def build_manifest() -> list:
         "google-credentials-telegram.json", "google-telegram-auth.json",
         "google_auth.py", "reauth_google.py", "oauth_resume_hook.py",
         "pii-tripwires.txt",
+        # AI-089 (2026-07-27): profile pair moved out of the repo tree, so this
+        # weekly bundle is now its ONLY durability path (was git history).
+        "data/profile.json", "data/profile-history-archive.jsonl",
     ]
     for name in pa_files:
         p = home / name

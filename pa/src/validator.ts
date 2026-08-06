@@ -122,7 +122,9 @@ Would this candidate output be a good, safe, automated replacement for what the 
 
   const { result: judged } = await runner(judgePrompt, {
     resource: `self-improver-judge-${proposal.name}`,
-    preferredWorker: 'gemini',
+    // Missed by the 2026-07-21 gemini->agy promotion (that pass only touched skill.md
+    // frontmatter, not code); updated 2026-07-29.
+    preferredWorker: 'agy',
     timeout: 120,
     idleTimeout: 60,
   });
@@ -227,7 +229,9 @@ Does the new prompt plausibly address the recorded failures while preserving the
 
   const { result: judged } = await judge(judgePrompt, {
     resource: `self-improver-judge-fix-${proposal.name}`,
-    preferredWorker: 'gemini',
+    // Missed by the 2026-07-21 gemini->agy promotion (that pass only touched skill.md
+    // frontmatter, not code); updated 2026-07-29.
+    preferredWorker: 'agy',
     timeout: 120,
     idleTimeout: 60,
   });
@@ -239,6 +243,46 @@ Does the new prompt plausibly address the recorded failures while preserving the
   const verdict = judged.output.trim().toLowerCase().startsWith('true');
   onDetail?.({ new_run_ok: true, judge_verdict: verdict, judge_excerpt: judged.output.trim().slice(0, 300) });
   return verdict;
+}
+
+/**
+ * Regenerate a proposal's prompt using the validation judge's own stated feedback — used by
+ * gateAndApprove's bounded retry (2026-07-29 autonomy pass) so a fix/proposal that's plausibly
+ * close but not quite right gets one more autonomous shot before parking as
+ * validation-failed-pending, instead of dead-ending on the first judge rejection. Preserves the
+ * original name/target_skill/frontmatter/source_message_ids — only the prompt changes.
+ *
+ * Returns null (never throws) on any failure so the retry loop falls back to the original
+ * parking behavior exactly as if this feature didn't exist — a regeneration hiccup must never
+ * crash the whole nightly run over one proposal.
+ */
+export async function regenerateProposal(
+  proposal: DraftProposal,
+  feedback: string,
+  runner: typeof runWithFailover = runWithFailover
+): Promise<DraftProposal | null> {
+  const revisionPrompt = `A proposed automated-skill prompt failed validation. Revise it to address the feedback below while preserving its original purpose and structure as much as possible.
+
+## Original prompt
+${proposal.prompt.slice(0, 3000)}
+
+## Why it failed validation
+${feedback.slice(0, 1000)}
+
+## Task
+Output ONLY the complete revised prompt text — no commentary, no markdown code fences, nothing else before or after it.`;
+
+  try {
+    const { result } = await runner(revisionPrompt, {
+      resource: `self-improver-regenerate-${proposal.name}`,
+      timeout: 180,
+      idleTimeout: 90,
+    });
+    if (!result.success || !result.output.trim()) return null;
+    return { ...proposal, prompt: result.output.trim() };
+  } catch {
+    return null;
+  }
 }
 
 /**

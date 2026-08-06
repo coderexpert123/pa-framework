@@ -19,6 +19,10 @@ import { notifyCommand } from '../src/commands/notify-cmd.js';
 import { bgtasksCommand } from '../src/commands/bgtasks.js';
 import { refCommand } from '../src/commands/ref.js';
 import { improvementsCommand, acceptRollbackCommand } from '../src/commands/improvements.js';
+import { maintenanceCommand } from '../src/commands/maintenance.js';
+import { publicSyncCommand } from '../src/commands/public-sync.js';
+import { claimCommand, releaseCommand, claimsCommand } from '../src/commands/claim.js';
+import { reconcileCommand } from '../src/commands/reconcile.js';
 
 const USAGE = `
 pa — Personal Assistant CLI Dispatcher
@@ -47,6 +51,16 @@ Usage:
   pa ref <refId>              Look up what message produced a Ref ID (e.g. 'pa ref c-a59a')
   pa improvements [--since N] Eval self-improver's applied/rolled-back changes (default 30d)
   pa improvements accept <commit_hash> [--reason "..."]  Record a human decision to KEEP a commit whose rollback failed
+  pa maintenance list         List declared maintenance jobs + resolved target paths
+  pa maintenance status       Show the maintenance ledger (last run, outcome, skips)
+  pa maintenance run <job> [--dry-run]  Run one job now; --dry-run touches nothing
+  pa public-sync [--public-dir <path>] [--dry-run]  Sync the derived pa-public mirror (nested at <repo root>/pa-public) from private HEAD
+  pa claim <path...> --session <label> --note "<text>" [--ttl <minutes>] [--force] [--wait <seconds>]
+                               Reserve path(s)/@logical-resource for multi-session coordination
+  pa claim --renew <id> [--ttl <minutes>]  Extend an existing reservation
+  pa release <id>             Release a reservation by id
+  pa claims                   Show active reservations + recently modified paths (mtime layer)
+  pa reconcile [--check] [--restore <path>] [--merge <path>]  Detect/restore/diagnose files reverted to an ancestor of HEAD
   pa help                     Show this help message
 `.trim();
 
@@ -183,6 +197,30 @@ async function main(): Promise<void> {
         }
         break;
       }
+
+      case 'maintenance':
+        await maintenanceCommand(args.slice(1));
+        break;
+
+      case 'public-sync':
+        process.exitCode = await publicSyncCommand(args.slice(1));
+        break;
+
+      case 'claim':
+        process.exitCode = await claimCommand(args.slice(1));
+        break;
+
+      case 'release':
+        process.exitCode = await releaseCommand(args.slice(1));
+        break;
+
+      case 'claims':
+        process.exitCode = await claimsCommand();
+        break;
+
+      case 'reconcile':
+        await reconcileCommand(args.slice(1));
+        break;
 
       case 'help':
       case '--help':
