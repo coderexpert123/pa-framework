@@ -87,6 +87,20 @@ word that also means something else. Anchoring with `\b` is safe here: the path
 and content layers normalise separators before matching (see above), so an
 anchored pattern still catches `acme_report.py` and `AcmeBank` in `snake_case`.
 
+**Suppressing a known-false-positive block** (2026-08-06): a file that
+deliberately contains many institution/PII-shaped strings as part of its OWN
+detection logic — this repo's own `pii_ci_scan.py` and its
+`_FINANCIAL_INSTITUTIONS` dictionary — will otherwise trip a personal
+tripwire on every touch, forever, since a tripwire matches literal text with
+no concept of "this occurrence is a detection pattern, not a disclosure."
+Wrap that block in `# pii-scan:ignore-start` / `# pii-scan:ignore-end`
+(content lines only — **paths are never suppressible**, matching
+`pii_ci_scan.py`'s own identical convention, which this guard's content-layer
+suppression is a direct port of). A single line can instead carry a trailing
+`# pii-scan:ignore-line`. Both markers apply to CONTENT matching (credential
+patterns and tripwires) only — nothing here can be used to un-flag a
+dangerous filename.
+
 **Layer 3 failure policy — fail-CLOSED on push, fail-open on `--full` (deliberate asymmetry, changed 2026-07-22).**
 `agy_check()` returns `(is_clean, reason, ok)` — `ok=False` means the layer
 itself could not produce a verdict (unreachable, two timeouts, or an

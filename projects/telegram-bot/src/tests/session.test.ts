@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile, mkdir, unlink } from 'fs/promises';
+import { mkdtemp, rm, writeFile, mkdir, unlink, utimes } from 'fs/promises';
 import { randomUUID } from 'crypto';
 import { join } from 'path';
 import { tmpdir, homedir } from 'os';
@@ -486,7 +486,9 @@ describe('discoverAgySessionId', () => {
     await mkdir(agyDir, { recursive: true });
     const sessionId = randomUUID(); // discovery is UUID-anchored — fixtures must be UUID-shaped
     const testDb = join(agyDir, `${sessionId}.db`);
+    const futureSec = (Date.now() + 60000) / 1000;
     await writeFile(testDb, '', 'utf8');
+    await utimes(testDb, futureSec, futureSec);
     try {
       const result = await discoverAgySessionId();
       assert.equal(result, sessionId);
@@ -500,7 +502,9 @@ describe('discoverAgySessionId', () => {
     await mkdir(agyDir, { recursive: true });
     const sessionId = randomUUID();
     const testPb = join(agyDir, `${sessionId}.pb`);
+    const futureSec = (Date.now() + 60000) / 1000;
     await writeFile(testPb, '', 'utf8');
+    await utimes(testPb, futureSec, futureSec);
     try {
       const result = await discoverAgySessionId();
       assert.equal(result, sessionId);
@@ -519,9 +523,12 @@ describe('discoverAgySessionId', () => {
     // if one ever exists. The regex is fully anchored, so any non-UUID name
     // exercises the same filter branch.
     const artifact = join(agyDir, `test-artifact-${randomUUID()}.pb`);
+    const futureSec = (Date.now() + 60000) / 1000;
     await writeFile(realPb, '', 'utf8');
+    await utimes(realPb, futureSec, futureSec);
     await new Promise((r) => setTimeout(r, 30));
     await writeFile(artifact, '', 'utf8'); // newer than the real conversation
+    await utimes(artifact, futureSec + 1, futureSec + 1);
     try {
       const result = await discoverAgySessionId();
       assert.equal(result, sessionId, 'a non-UUID artifact must never be returned as a session id');
