@@ -213,7 +213,8 @@ describe('docs cross-reference checker', () => {
   // changing one, change both, or this check silently drifts from the rule
   // it's supposed to enforce.
   it('root CLAUDE.md stays within its size budget (soft 40k, hard 48k chars)', () => {
-    const claudeMd = readFileSync(join(REPO_ROOT, 'CLAUDE.md'), 'utf8');
+    const claudeMd = readIfExists(join(REPO_ROOT, 'CLAUDE.md'));
+    if (claudeMd === null) return; // absent in the public mirror
     assert.ok(
       claudeMd.length <= 48000,
       `CLAUDE.md is ${claudeMd.length} chars, over the 48,000-char hard budget -- run /shorten-brain`
