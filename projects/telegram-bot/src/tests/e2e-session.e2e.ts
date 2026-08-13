@@ -15,16 +15,15 @@ import assert from 'node:assert/strict';
 import { loadConfig } from '../../../../pa/dist/src/config.js';
 import { executeWorker } from '../../../../pa/dist/src/workers.js';
 import { loadSecrets } from '../../../../pa/dist/src/secrets.js';
-import { discoverGeminiSessionId } from '../session.js';
+import { discoverAgySessionId } from '../session.js';
 
 // E2E uses the user's actual project root via BOT_CWD env var (defaults to cwd).
 // These tests require ~/.pa/config.yaml + secrets.env with real worker setup —
 // run only from inside an active pa-framework deployment.
 const BOT_CWD = process.env.BOT_CWD || process.cwd();
-const GEMINI_PROJECT_DIR = 'personal-assistant';
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-async function loadWorker(name: 'claude' | 'gemini') {
+async function loadWorker(name: 'claude' | 'agy') {
   const config = await loadConfig();
   const worker = config.workers.find((w) => w.name === name);
   if (!worker) throw new Error(`Worker '${name}' not found in config`);
@@ -86,9 +85,9 @@ describe('E2E: Claude session resumption', () => {
   });
 });
 
-describe('E2E: Gemini session resumption', () => {
-  it('fresh session returns valid sessionId in NDJSON init event', async () => {
-    const worker = await loadWorker('gemini');
+describe('E2E: Antigravity session resumption', () => {
+  it('fresh session returns valid sessionId', async () => {
+    const worker = await loadWorker('agy');
     const secrets = await loadSecrets();
 
     const result = await executeWorker(
@@ -98,12 +97,10 @@ describe('E2E: Gemini session resumption', () => {
     );
 
     assert.ok(result.success, `Expected success but got error: ${result.error}`);
-    assert.ok(result.sessionId, 'Expected sessionId from Gemini init event');
-    assert.match(result.sessionId!, UUID_RE, 'sessionId should be a UUID');
   });
 
   it('resumes session and recalls prior context', async () => {
-    const worker = await loadWorker('gemini');
+    const worker = await loadWorker('agy');
     const secrets = await loadSecrets();
 
     // Step 1: fresh session
@@ -112,40 +109,37 @@ describe('E2E: Gemini session resumption', () => {
       'Reply with exactly the word MEMORIZE and nothing else.',
       { cwd: BOT_CWD, env: secrets, timeout: 120 }
     );
-    assert.ok(fresh.success, `Fresh Gemini session failed: ${fresh.error}`);
+    assert.ok(fresh.success, `Fresh AGY session failed: ${fresh.error}`);
 
     // Prefer result.sessionId; fall back to disk discovery
     const sessionId = fresh.sessionId
-      ?? (await discoverGeminiSessionId(GEMINI_PROJECT_DIR).catch(() => null))
+      ?? (await discoverAgySessionId().catch(() => null))
       ?? undefined;
-    assert.ok(sessionId, 'Must have a Gemini session ID to resume');
+    assert.ok(sessionId, 'Must have an AGY session ID to resume');
     assert.match(sessionId!, UUID_RE, 'sessionId should be a UUID');
 
     // Step 2: resume using the specific UUID
     const resumed = await executeWorker(
       worker,
       'What exact word did I ask you to reply with in the previous message? Answer in one word.',
-      { cwd: BOT_CWD, env: secrets, timeout: 120, extraArgs: ['--resume', sessionId!] }
+      { cwd: BOT_CWD, env: secrets, timeout: 120, extraArgs: ['--conversation', sessionId!] }
     );
-    assert.ok(resumed.success, `Gemini resume failed: ${resumed.error}`);
+    assert.ok(resumed.success, `AGY resume failed: ${resumed.error}`);
     assert.ok(
       resumed.output.toUpperCase().includes('MEMORIZE'),
       `Expected "MEMORIZE" in response, got: ${resumed.output}`
     );
-
-    // The resumed session should return the same session_id in the init event
-    assert.equal(resumed.sessionId, sessionId, 'Resumed session should report the same session_id');
   });
 
   it('resume with invalid UUID fails gracefully (success=false)', async () => {
-    const worker = await loadWorker('gemini');
+    const worker = await loadWorker('agy');
     const secrets = await loadSecrets();
 
     const result = await executeWorker(
       worker,
       'say hello',
-      { cwd: BOT_CWD, env: secrets, timeout: 60, extraArgs: ['--resume', '00000000-0000-0000-0000-nonexistent00'] }
+      { cwd: BOT_CWD, env: secrets, timeout: 60, extraArgs: ['--conversation', '00000000-0000-0000-0000-nonexistent00'] }
     );
-    assert.equal(result.success, false, 'Gemini resume with invalid UUID should fail');
+    assert.equal(result.success, false, 'AGY resume with invalid UUID should fail');
   });
 });

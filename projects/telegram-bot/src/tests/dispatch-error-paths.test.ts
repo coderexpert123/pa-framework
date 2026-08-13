@@ -14,7 +14,7 @@
  * Isolation strategy:
  * - The rate-limit module has an in-memory cache. To avoid cross-test pollution,
  *   the tryClassifyAndNotify rate-limit test uses a non-standard worker name
- *   ('test-worker-rl') so its cooldown doesn't affect gemini or zclaude checks.
+ *   ('test-worker-rl') so its cooldown doesn't affect agy or zclaude checks.
  * - The blackboard singleton uses the real ~/.pa/blackboard.json path regardless
  *   of PA_HOME. Tests use unique resource IDs to avoid lock contention.
  * - Config isolation: each dispatchMessage test writes its own config.yaml
@@ -105,7 +105,7 @@ describe('tryClassifyAndNotify outcomes', () => {
   it('returns rate-limit with nextWorker for an unknown worker (always classified)', async () => {
     // Unknown worker name → classifyRateLimit falls through to default:
     //   { minutes: 2, classification: 'unknown', source: 'default' }
-    // This exercises the rate-limit branch without polluting gemini/zclaude cooldowns.
+    // This exercises the rate-limit branch without polluting agy/zclaude cooldowns.
     const worker = { name: 'test-worker-rl', state_dir: '/nonexistent', state_pattern: '*.jsonl' };
     const backupWorker = { name: 'claude', state_dir: '/nonexistent', state_pattern: '*.jsonl' };
     const config = { workers: [backupWorker, worker] };
@@ -139,28 +139,28 @@ describe('dispatchMessage non-rate-limit failover cascade', () => {
     await rmRetry(testDir);
   });
 
-  it('default zclaude non-rate-limit failure falls over to gemini', async () => {
+  it('default zclaude non-rate-limit failure falls over to agy', async () => {
     await writeConfig(testDir, [
       { name: 'zclaude', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 1 },
-      { name: 'gemini', command: 'node', args: ['-e', "process.stdout.write('gemini took over'); process.exitCode=0"], priority: 2 },
+      { name: 'agy', command: 'node', args: ['-e', "process.stdout.write('agy took over'); process.exitCode=0"], priority: 2 },
     ]);
 
     const resource = `topic-999_${testRunId}-1`;
     const result = await dispatchMessage('hello', undefined, undefined, makeState(), {}, resource, 'zclaude');
 
-    assert.equal(result.dispatchedWorker, 'gemini');
-    assert.ok(result.response.includes('gemini took over'));
+    assert.equal(result.dispatchedWorker, 'agy');
+    assert.ok(result.response.includes('agy took over'));
     assert.equal(result.workerError, undefined);
   });
 
-  it('default gemini non-rate-limit (empty rate_limit_patterns) falls over to zclaude', async () => {
+  it('default agy non-rate-limit (empty rate_limit_patterns) falls over to zclaude', async () => {
     await writeConfig(testDir, [
       { name: 'zclaude', command: 'node', args: ['-e', "process.stdout.write('zclaude took over'); process.exitCode=0"], priority: 1 },
-      { name: 'gemini', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 2, rate_limit_patterns: [] },
+      { name: 'agy', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 2, rate_limit_patterns: [] },
     ]);
 
     const resource = `topic-999_${testRunId}-2`;
-    const result = await dispatchMessage('hello', undefined, undefined, makeState(), {}, resource, 'gemini');
+    const result = await dispatchMessage('hello', undefined, undefined, makeState(), {}, resource, 'agy');
 
     assert.equal(result.dispatchedWorker, 'zclaude');
     assert.ok(result.response.includes('zclaude took over'));
@@ -170,7 +170,7 @@ describe('dispatchMessage non-rate-limit failover cascade', () => {
   it('empty response (success=true, empty output) returns workerError:true with empty-response text', async () => {
     await writeConfig(testDir, [
       { name: 'zclaude', command: 'node', args: ['-e', 'process.exitCode=0'], priority: 1 },
-      { name: 'gemini', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 2 },
+      { name: 'agy', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 2 },
     ]);
 
     const resource = `topic-999_${testRunId}-3`;
@@ -209,22 +209,22 @@ describe('dispatchMessage non-rate-limit failover cascade', () => {
     assert.ok(result.response.length > 0, 'still returns a user-facing failure message, not a crash/blank');
   });
 
-  it('preferred zclaude non-rate-limit falls over to default gemini', async () => {
+  it('preferred zclaude non-rate-limit falls over to default agy', async () => {
     await writeConfig(testDir, [
       { name: 'zclaude', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 1 },
-      { name: 'gemini', command: 'node', args: ['-e', "process.stdout.write('gemini fallback'); process.exitCode=0"], priority: 2 },
+      { name: 'agy', command: 'node', args: ['-e', "process.stdout.write('agy fallback'); process.exitCode=0"], priority: 2 },
     ]);
 
     const resource = `topic-999_${testRunId}-5`;
-    const result = await dispatchMessage('hello', undefined, undefined, makeState({ preferred_worker: 'zclaude' }), {}, resource, 'gemini');
+    const result = await dispatchMessage('hello', undefined, undefined, makeState({ preferred_worker: 'zclaude' }), {}, resource, 'agy');
 
-    assert.equal(result.dispatchedWorker, 'gemini');
-    assert.ok(result.response.includes('gemini fallback'));
+    assert.equal(result.dispatchedWorker, 'agy');
+    assert.ok(result.response.includes('agy fallback'));
     assert.equal(result.workerError, undefined);
   });
 
   it('rate-limit path preserved: rateLimitedWorker set, workerError reflects overall failure', async () => {
-    // gemini with RESOURCE_EXHAUSTED in stderr → isRateLimited.hit=true → classifyRateLimit
+    // agy with RESOURCE_EXHAUSTED in stderr → isRateLimited.hit=true → classifyRateLimit
     // → { minutes: 2, ... } → rate-limit path → rateLimitedWorker set → falls to runWithFailover.
     // zclaude (the only fallback) fails too, non-rate-limit → cascade exhausted →
     // buildWorkerResponse returns a generic error string, and workerError is true
@@ -233,7 +233,7 @@ describe('dispatchMessage non-rate-limit failover cascade', () => {
     await writeConfig(testDir, [
       { name: 'zclaude', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 1 },
       {
-        name: 'gemini',
+        name: 'agy',
         command: 'node',
         // Embedded-double-quote form: the inner JS string uses double quotes
         // instead of single, so POSIX's quoteArg (which wraps this whole arg
@@ -248,11 +248,11 @@ describe('dispatchMessage non-rate-limit failover cascade', () => {
     ]);
 
     const resource = `topic-999_${testRunId}-6`;
-    const result = await dispatchMessage('hello', undefined, undefined, makeState(), {}, resource, 'gemini');
+    const result = await dispatchMessage('hello', undefined, undefined, makeState(), {}, resource, 'agy');
 
     assert.equal(result.workerError, true);
     assert.equal(result.dispatchedWorker, undefined);
-    assert.equal(result.rateLimitedWorker, 'gemini');
+    assert.equal(result.rateLimitedWorker, 'agy');
   });
 });
 
@@ -294,15 +294,15 @@ describe('dispatchMessage stop-marker guard', () => {
   it('does NOT abort a dispatch newer than the /stop (user\'s next message)', async () => {
     await writeConfig(testDir, [
       { name: 'zclaude', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 1 },
-      { name: 'gemini', command: 'node', args: ['-e', "process.stdout.write('gemini reply'); process.exitCode=0"], priority: 2 },
+      { name: 'agy', command: 'node', args: ['-e', "process.stdout.write('agy reply'); process.exitCode=0"], priority: 2 },
     ]);
     const resource = `topic-999_${testRunId}-stop2`;
     markTopicStopped(resource.replace(/^topic-/, ''), 'stop', 1000);
 
     const result = await dispatchMessage('hello', undefined, undefined, makeState(), {}, resource, 'zclaude', undefined, undefined, 1001 /* newer than /stop */);
 
-    assert.equal(result.dispatchedWorker, 'gemini', 'spawn actually happened, zclaude failed, cascaded to gemini instead of aborting');
-    assert.ok(result.response.includes('gemini reply'));
+    assert.equal(result.dispatchedWorker, 'agy', 'spawn actually happened, zclaude failed, cascaded to agy instead of aborting');
+    assert.ok(result.response.includes('agy reply'));
   });
 
   // The 2026-08-02 production failure: a /stop lands while a worker is mid-run,
@@ -315,7 +315,7 @@ describe('dispatchMessage stop-marker guard', () => {
   // they are guarded by different code: the default/preferred attempts are
   // guarded in dispatchMessage, everything after them inside pa's
   // runWithFailover. The second test is the one that reproduces production
-  // (agy failed first, gemini was killed inside the cascade).
+  // (agy failed first, agy was killed inside the cascade).
   it('aborts when the /stop lands while the default worker is running', async () => {
     const startedPath = join(testDir, 'worker1-started');
     const backupPath = join(testDir, 'worker2-ran');
@@ -327,9 +327,9 @@ describe('dispatchMessage stop-marker guard', () => {
         priority: 1,
       },
       {
-        name: 'gemini',
+        name: 'agy',
         command: 'node',
-        args: ['-e', `require('fs').writeFileSync(${JSON.stringify(backupPath)}, '1'); process.stdout.write('gemini answered a cancelled request'); process.exitCode = 0;`],
+        args: ['-e', `require('fs').writeFileSync(${JSON.stringify(backupPath)}, '1'); process.stdout.write('agy answered a cancelled request'); process.exitCode = 0;`],
         priority: 2,
       },
     ]);
@@ -357,9 +357,9 @@ describe('dispatchMessage stop-marker guard', () => {
     await writeConfig(testDir, [
       // Fails on its own, before any /stop — puts the dispatch into the cascade.
       { name: 'zclaude', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 1 },
-      // Killed mid-run by the /stop, exactly like gemini was in production.
+      // Killed mid-run by the /stop, exactly like agy was in production.
       {
-        name: 'gemini',
+        name: 'agy',
         command: 'node',
         args: ['-e', `require('fs').writeFileSync(${JSON.stringify(startedPath)}, '1'); setTimeout(() => process.exit(1), 4000);`],
         priority: 2,
@@ -398,16 +398,16 @@ describe('dispatchMessage stop-marker guard', () => {
   // worker actually finished before the kill landed, keep its real reply") and
   // would not be caught by either test above, since both exercise the
   // FAILURE-while-cancelled path only. Mirrors the cascade test's structure:
-  // zclaude fails on its own (forces runWithFailover), gemini is the one
-  // running when the marker is set, but this time gemini actually SUCCEEDS.
+  // zclaude fails on its own (forces runWithFailover), agy is the one
+  // running when the marker is set, but this time agy actually SUCCEEDS.
   it('keeps a successful reply when the /stop lands right as the cascade worker finishes', async () => {
     const startedPath = join(testDir, 'success-worker-started');
     await writeConfig(testDir, [
       { name: 'zclaude', command: 'node', args: ['-e', 'process.exitCode=1'], priority: 1 },
       {
-        name: 'gemini',
+        name: 'agy',
         command: 'node',
-        args: ['-e', `require('fs').writeFileSync(${JSON.stringify(startedPath)}, '1'); setTimeout(() => { process.stdout.write('gemini finished just before the stop'); process.exitCode = 0; }, 1000);`],
+        args: ['-e', `require('fs').writeFileSync(${JSON.stringify(startedPath)}, '1'); setTimeout(() => { process.stdout.write('agy finished just before the stop'); process.exitCode = 0; }, 1000);`],
         priority: 2,
       },
     ]);
@@ -424,7 +424,7 @@ describe('dispatchMessage stop-marker guard', () => {
 
     const result = await dispatch;
     assert.notEqual(result.workerError, true, 'a worker that succeeded must not be reported as a worker error (undefined on success, per main.ts:857)');
-    assert.equal(result.dispatchedWorker, 'gemini');
-    assert.ok(result.response.includes('gemini finished just before the stop'), 'the real successful reply must survive, not be discarded by the cancellation bail');
+    assert.equal(result.dispatchedWorker, 'agy');
+    assert.ok(result.response.includes('agy finished just before the stop'), 'the real successful reply must survive, not be discarded by the cancellation bail');
   });
 });

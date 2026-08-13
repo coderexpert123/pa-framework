@@ -10,7 +10,6 @@ import {
   isSessionExpired,
   sessionFileExists,
   isSessionValid,
-  discoverGeminiSessionId,
   discoverAgySessionId,
   buildResumeArgs,
   cleanupCodexSessions,
@@ -63,15 +62,15 @@ describe('isSessionExpired', () => {
 
 // ---------------------------------------------------------------------------
 // sessionFileExists — tested via a fake home dir using monkey-patching
-// We test the Gemini path via discoverGeminiSessionId (uses real filesystem).
+// We test the agy path via discoverAgySessionId (uses real filesystem).
 // For Claude, we test indirectly through isSessionValid with a temp dir.
 // ---------------------------------------------------------------------------
 
-// We can't easily monkey-patch homedir() in ESM, so we test the Gemini branch
-// through discoverGeminiSessionId and trust the Claude branch follows the same logic.
+// We can't easily monkey-patch homedir() in ESM, so we test the agy branch
+// through discoverAgySessionId and trust the Claude branch follows the same logic.
 
 // ---------------------------------------------------------------------------
-// discoverGeminiSessionId
+// discoverAgySessionId
 // ---------------------------------------------------------------------------
 
 let tempDir: string;
@@ -84,99 +83,6 @@ afterEach(async () => {
   await rm(tempDir, { recursive: true, force: true });
 });
 
-describe('discoverGeminiSessionId', () => {
-  it('returns null for an empty directory', async () => {
-    const chatsDir = join(tempDir, 'chats');
-    await mkdir(chatsDir, { recursive: true });
-
-    // Override the home lookup by using the parent of chatsDir as projectDir
-    // We can't easily override homedir(), so we test the function's directory logic
-    // by placing files at the expected relative path under a temp root.
-    // discoverGeminiSessionId uses: join(homedir(), '.gemini', 'tmp', projectDir, 'chats')
-    // We'll create a symlink-like structure using a custom projectDir path.
-
-    // Since we can't override homedir(), we test the "no matching files" branch
-    // by using a valid dir with no session-*.json files.
-    // The function returns null for empty chats dir.
-    const result = await discoverGeminiSessionId('__nonexistent_project_12345__');
-    assert.equal(result, null);
-  });
-
-  it('parses sessionId from the newest session file', async () => {
-    // Create the expected directory structure: ~/.gemini/tmp/<project>/chats/
-    const geminiDir = join(homedir(), '.gemini', 'tmp');
-    const projectDir = `tgbot-test-${Date.now()}`;
-    const chatsDir = join(geminiDir, projectDir, 'chats');
-    await mkdir(chatsDir, { recursive: true });
-
-    const sessionId1 = 'aaaaaaaa-0000-0000-0000-000000000001';
-    const sessionId2 = 'bbbbbbbb-0000-0000-0000-000000000002';
-
-    // Write an older file first
-    await writeFile(
-      join(chatsDir, 'session-2026-01-01T00-00-aaaaaaaa.json'),
-      JSON.stringify({ sessionId: sessionId1, messages: [] })
-    );
-
-    // Small delay to ensure distinct mtime
-    await new Promise((r) => setTimeout(r, 50));
-
-    // Write a newer file
-    await writeFile(
-      join(chatsDir, 'session-2026-01-02T00-00-bbbbbbbb.json'),
-      JSON.stringify({ sessionId: sessionId2, messages: [] })
-    );
-
-    try {
-      const result = await discoverGeminiSessionId(projectDir);
-      assert.equal(result, sessionId2, 'should return the most recent sessionId');
-    } finally {
-      await rm(join(geminiDir, projectDir), { recursive: true, force: true });
-    }
-  });
-
-  it('ignores non-session files', async () => {
-    const geminiDir = join(homedir(), '.gemini', 'tmp');
-    const projectDir = `tgbot-test-ignore-${Date.now()}`;
-    const chatsDir = join(geminiDir, projectDir, 'chats');
-    await mkdir(chatsDir, { recursive: true });
-
-    // Write files that don't match session-*.json pattern
-    await writeFile(join(chatsDir, 'config.json'), JSON.stringify({ sessionId: 'should-not-appear' }));
-    await writeFile(join(chatsDir, 'not-a-session.txt'), 'irrelevant');
-
-    try {
-      const result = await discoverGeminiSessionId(projectDir);
-      assert.equal(result, null);
-    } finally {
-      await rm(join(geminiDir, projectDir), { recursive: true, force: true });
-    }
-  });
-
-  it('returns null if session file has no sessionId field', async () => {
-    const geminiDir = join(homedir(), '.gemini', 'tmp');
-    const projectDir = `tgbot-test-noid-${Date.now()}`;
-    const chatsDir = join(geminiDir, projectDir, 'chats');
-    await mkdir(chatsDir, { recursive: true });
-
-    await writeFile(
-      join(chatsDir, 'session-2026-01-01T00-00-aabbccdd.json'),
-      JSON.stringify({ messages: [] }) // no sessionId
-    );
-
-    try {
-      const result = await discoverGeminiSessionId(projectDir);
-      assert.equal(result, null);
-    } finally {
-      await rm(join(geminiDir, projectDir), { recursive: true, force: true });
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// buildResumeArgs
-// ---------------------------------------------------------------------------
-
 describe('buildResumeArgs', () => {
   it('returns --resume <uuid> for claude', () => {
     const session: SessionInfo = {
@@ -186,16 +92,6 @@ describe('buildResumeArgs', () => {
     };
     const args = buildResumeArgs(session);
     assert.deepEqual(args, ['--resume', 'e0912e78-2c5b-4359-89a9-c0aa7915a346']);
-  });
-
-  it('returns --resume <uuid> for gemini (same as claude)', () => {
-    const session: SessionInfo = {
-      session_id: 'cc0c2c94-5c4e-4e6b-90f7-afe2a4cf6fca',
-      worker: 'gemini',
-      started_at: new Date().toISOString(),
-    };
-    const args = buildResumeArgs(session);
-    assert.deepEqual(args, ['--resume', 'cc0c2c94-5c4e-4e6b-90f7-afe2a4cf6fca']);
   });
 
   it('returns --resume <uuid> for zclaude (passthrough wrapper, same args as claude)', () => {
@@ -438,13 +334,6 @@ describe('getPriorSessionPath', () => {
     const claude = getPriorSessionPath('claude', 'abc-def-123', 'C:/test-project');
     const zclaude = getPriorSessionPath('zclaude', 'abc-def-123', 'C:/test-project');
     assert.equal(zclaude, claude);
-  });
-
-  it('returns glob pattern for gemini containing id prefix and a .json* suffix (matches .json and .jsonl)', () => {
-    const result = getPriorSessionPath('gemini', 'abc12345xxxx', undefined);
-    assert.ok(result !== null, 'should return a path');
-    assert.ok(result!.includes('abc12345'), `should contain first 8 chars of id, got: ${result}`);
-    assert.ok(/\.json\*?$/.test(result!), `should end in a .json/.json* glob suffix, got: ${result}`);
   });
 
   // Corrected 2026-07-22. This previously asserted a `<id>.pb` path and called it

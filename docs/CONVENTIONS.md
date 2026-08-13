@@ -13,7 +13,10 @@ These conventions prevent the working tree from accumulating loose junk. They ap
 ├── README.md              ← public docs
 ├── LICENSE                ← public
 ├── CLAUDE.md              ← private brain (gitignored from public framework)
+├── FILE_INVENTORY.md      ← private brain router (gitignored); real content in inventory/
+├── inventory/             ← private brain sub-files, split out of FILE_INVENTORY.md for size (2026-08-07)
 ├── BACKLOG.md             ← private (gitignored)
+├── backlog/               ← private brain sub-files, split out of BACKLOG.md for size (2026-08-07)
 ├── MEMORY.md              ← optional private memory index (gitignored, auto-managed when used)
 ├── DEBUGGING.md           ← private (gitignored)
 ├── AGENTS.md, GEMINI.md   ← private compatibility aliases; prefer filesystem links to CLAUDE.md
@@ -82,6 +85,102 @@ projects/<x>/
 
 Skills the framework ships as samples live under `examples/skills/<name>/skill.md` (public), NOT under `projects/`. User-installed skills live in `~/.pa/skills/<name>/` (outside the repo).
 
+## Brain-file organization
+
+This repo's brain files (`CLAUDE.md`, `FILE_INVENTORY.md`, `BACKLOG.md`, and their
+extracted sub-files) had no size or split convention until 2026-08-07, despite one
+already having been extracted once ("keep this file under its size budget," with no
+number ever attached). This section is that convention, defined once so it doesn't need
+rediscovering next time a brain file bloats.
+
+**(a) Size budgets — char-based, not line-based.** This repo's prose is dense
+single-paragraph-per-bullet, well past the ~80-100 chars/line the usual "~300-500 line
+CLAUDE.md" community guidance assumes — a line budget is the wrong unit here.
+
+| Class | Soft | Hard | Action at hard |
+|---|---|---|---|
+| Root `CLAUDE.md` (auto-loaded every session) | 40,000 chars | 48,000 chars | run `/shorten-brain`, extract a topic file |
+| Directory-scoped `CLAUDE.md` (auto-loads on demand, stacks on root) | 8,000 chars | 12,000 chars | extract to `docs/` or a subsystem file |
+| On-demand topic file (`docs/*.md`, `inventory/*.md`) — content a reader holds in mind while working | 12,000 chars | 16,000 chars | split along a natural fault line |
+| Auto-managed glob-derived inventory file (an `inventory/*.md` file the `update-brain` skill rewrites wholesale from one `glob()` pattern) | 12,000 chars | 18,000 chars | see note below before splitting |
+| Router/index file (a file that replaced a monolith with pointers) | — | 4,000 chars | it stopped being a router; re-split |
+| Evergreen audience-facing guide (the 9 evergreen `UPPERCASE.md` guides under `docs/`) | — | 24,000 chars | separate class from operational-detail docs |
+| Append-only archive file (`backlog/archive-*.md`, `backlog/not-valid.md`) — looked up by ID, never read front to back | — | no hard ceiling | see note below |
+
+**Note on the auto-managed inventory row**: this class exists because its size is bounded
+by *how many source files a glob pattern matches*, not by narrative verbosity — splitting
+one further means either minting another `glob()` pattern + marker pair (fragmenting
+`~/.pa/skills/update-brain/skill.md`'s otherwise-simple 1-glob-to-1-file mapping into
+content-based routing within a single directory) or shrinking per-entry descriptions
+below what a "do not regress" invariant needs. Prefer raising this specific row's ceiling
+again over either of those. `inventory/telegram-bot.md` (2026-08-07, 37 entries across
+`projects/telegram-bot/src/*.ts`) is the first file at this ceiling — if
+`projects/telegram-bot/src/` keeps growing, the next natural fault line is pulling its
+crash-recovery/delivery cluster (`orphan-reaper.ts`, `pending-dispatches.ts`,
+`recovery-gate.ts`, `delivered-store.ts`, `dlq.ts`, `watermark.ts`, `health.ts`) into its
+own `inventory/telegram-bot-reliability.md`, at the cost of the routing complexity above.
+
+**Note on the archive-file row**: `backlog/archive-*.md` holds completed `BACKLOG.md`
+items verbatim, by design (the 2026-08-07 dedupe pass exists specifically because a prior
+half-archived state had already lost the discipline of "one full body, one place" —
+shrinking these bodies to fit a budget would reintroduce that same failure mode). Their
+size tracks how much work shipped in that window, not anything a reader holds in mind —
+nobody reads an archive front to back, they jump to one `#### [AI-nnn]` id via
+`backlog/completed-index.md`. Splitting one further is fine when it falls on a natural
+date/cluster boundary (and the resulting file stays a coherent era, not an arbitrary char
+count), but never split PURELY to hit a number — that would separate cross-referenced
+items (e.g. the crash-survival cluster AI-095/096/097/099) that must stay findable
+together. `backlog/archive-2026-06-07.md` (31.7K, dominated by 4 large incident
+write-ups) is the first file to test this judgment and was deliberately left unsplit.
+
+Anthropic's own qualitative test (`code.claude.com/docs/en/best-practices`) is the
+underlying rule the numbers exist to approximate: *"For each line ask: would removing
+this cause Claude to make mistakes? If not, cut it. Bloated CLAUDE.md files cause Claude
+to ignore your actual instructions."* Include: bash commands Claude can't guess, code
+style differing from defaults, testing instructions, repo etiquette, project-specific
+architectural decisions, dev-environment quirks, non-obvious gotchas. Exclude: anything
+derivable from reading code, standard conventions, detailed API docs (link instead),
+information that changes frequently, long tutorials, file-by-file descriptions,
+self-evident practices.
+
+**(b) Three mechanisms, and when each applies:**
+1. **Directory-scoped `CLAUDE.md`** — native to Claude Code, automatic, no code needed:
+   a directory's own `CLAUDE.md` auto-loads whenever Claude reads a file in that
+   directory (root `CLAUDE.md` always loads; parent-directory `CLAUDE.md` files load with
+   it in a monorepo). Use for content genuinely scoped to one subsystem/directory that
+   should fire *proactively* whenever anyone works there. Precedents:
+   `projects/fitness-data-sync/CLAUDE.md`, `projects/travel-planner/CLAUDE.md`, and
+   `projects/telegram-bot/CLAUDE.md`.
+2. **A plain `docs/*.md` / `inventory/*.md` / `backlog/*.md` file plus a prose pointer**
+   ("Read X before touching Y") — on-demand, manual, read only when an agent follows the
+   pointer. Use for cross-cutting content, or content needed only for specific rare
+   operations.
+3. **`@path/to/import` syntax — almost never.** It *eagerly inlines* the target file's
+   full content into every session that loads the importing file, which is the opposite
+   of size reduction. Only legitimate for content that genuinely must load every session
+   but is factored out purely for maintainability. Do not "optimize" a prose pointer into
+   an `@import` — that silently re-bloats the auto-loaded budget the pointer exists to
+   avoid.
+
+**(c) Tree-depth rule.** Max depth 2 below repo root (`docs/<topic>.md`,
+`inventory/<area>.md`, `backlog/<area>.md`). Only go to `docs/<subsystem>/<topic>.md` when
+a single flat directory would exceed 8 *operational-detail* files — the 9 evergreen
+`UPPERCASE.md` guides are a permanent flat exception and don't count toward that trigger.
+Never create a directory solely to host a `CLAUDE.md` — only attach one to a directory
+that already exists for code reasons.
+
+**(d) Private/public constraint.** `.gitignore-public` is a whitelist (`/*` plus explicit
+re-includes) and `docs/` **is** re-included — anything under `docs/` publishes to
+`pa-framework`. Private-only extracted content (e.g. split out of `FILE_INVENTORY.md` or
+`BACKLOG.md`) goes in a new root directory that is *not* on that whitelist — private by
+omission, the same way `plans/` already is. This is why extracted private detail lives at
+repo root (`inventory/`, `backlog/`), never nested under `docs/`.
+
+**(e) Naming.** Root/auto-loaded brain files: `UPPERCASE.md`. Evergreen audience-facing
+`docs/` guides: `UPPERCASE.md`. Extracted operational-detail files: `lowercase-hyphen.md`
+with H1 `# <Title> — operational detail`. Split sub-files of a router: `<area>-<slug>.md`
+inside the router's own new directory.
+
 ## Naming conventions
 
 ### Patterns auto-gitignored at repo root
@@ -97,9 +196,9 @@ These never live at the root and are caught by `.gitignore`:
 | `/analyze_*.py`, `/check_*.py`, `/find_*.py` | ad-hoc scripts | `scratch/` or `<project>/scripts/` |
 | `/fetch_*.py`, `/search_*.py`, `/extract_*.py` | ad-hoc fetchers | `scratch/` or `<project>/scripts/` |
 | `/Action Items.md`, `/Preferences.md`, etc. | Ecosystem KB files | `<KB-root>/Ecosystem KB/` (outside the repo) |
-| `/message_to_user.md`, `/output.json`, `/output.md`, `/skill_proposals.json`, `/error_log.txt` | LLM worker "going agentic" — writes its response (or its error) to a file at cwd instead of returning text | delete; not a real output path for any script (confirmed via full-repo grep) |
+| `/message_to_user.md`, `/output.json`, `/output.md`, `/skill_proposals.json`, `/error_log.txt`, `/oracle_output.txt`, `**/glm-[0-9]*` | LLM worker "going agentic" — writes its response (or its error) to a file at cwd instead of returning text; `glm-*` is zclaude naming the file after its own model (glm-4.7, glm-5.2[1m]), in whatever subdir its cwd was | delete; not a real output path for any script (confirmed via full-repo grep) |
 
-The last row keeps growing because the failure mode keeps resurfacing under new filenames — `/output.md` and `/error_log.txt` were added on 2026-07-21. When you find a new one, add it to `.gitignore`, `.gitignore-public`, this table, and the private brain's hygiene section in the same edit. A partial update is how the pattern list falls behind reality.
+The last row keeps growing because the failure mode keeps resurfacing under new filenames — `/output.md` and `/error_log.txt` were added on 2026-07-21, `/oracle_output.txt` on 2026-08-08 (the `oracle` skill's step 1 script prints raw profile+briefing data to stdout by design for its worker to synthesize per step 6 — the worker dumped that raw stdout to a file instead of returning the synthesized text), and `**/glm-[0-9]*` on 2026-08-13 (zclaude's model-named dumps, root AND subdirs — the first instance of the class that is a glob, not a fixed filename, because the name tracks whatever model zclaude runs). When you find a new one, add it to `.gitignore`, `.gitignore-public`, this table, and the private brain's hygiene section in the same edit. A partial update is how the pattern list falls behind reality.
 
 ### Patterns auto-gitignored everywhere (any depth)
 
@@ -171,7 +270,7 @@ merge. This closes the gap where CI and the PII scan were only ever
 
 ## When to update these conventions
 
-Whenever a NEW class of file recurs (e.g., a new export format starts landing at root), add it to the appropriate `.gitignore` pattern + this doc + `CLAUDE.md`. Don't accept "we'll just remember to put it in the right place" — encode it.
+Whenever a NEW class of file recurs (e.g., a new export format starts landing at root), add it to the appropriate `.gitignore` pattern + this doc + `CLAUDE.md`. Don't accept "we'll just remember to put it in the right place" — encode it. The same applies to brain-file organization: if the § "Brain-file organization" size budgets or mechanism choices stop fitting reality, update that section rather than letting a new ad-hoc pattern grow unencoded next to it.
 
 ## See also
 
@@ -179,3 +278,5 @@ Whenever a NEW class of file recurs (e.g., a new export format starts landing at
 - `CLAUDE.md` § "Repository hygiene" — agent-facing rules (private brain)
 - `docs/ARCHITECTURE.md` — broader framework design
 - `.gitignore` and `.gitignore-public` — actual enforcement
+- § "Brain-file organization" above — size budgets and the directory-`CLAUDE.md` /
+  `docs/*.md` / `@import` mechanism choice

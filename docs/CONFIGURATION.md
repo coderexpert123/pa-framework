@@ -136,6 +136,17 @@ When set, the framework derives all paths from `${PA_HOME}/` instead of `~/.pa/`
 | `PA_MAX_CONCURRENT_WORKERS` | `3` | Machine-wide cap on concurrently running LLM CLI workers (bot dispatches + LLM skills share the pool via blackboard slot locks). Excess dispatches queue until a slot frees. Set `0` or negative to disable limiting. Evaluator calls are exempt (they run while a slot-holding worker awaits their verdict). Shell/`cmd:` skills are unaffected. |
 | `UV_THREADPOOL_SIZE` | Node default `4` | Recommended `16` for the bot and catchup processes: Node's fs and DNS lookups share this libuv pool, so heavy disk I/O can starve DNS and take all networking down with it. Set it in the process launcher (Task Scheduler wrapper, systemd unit, shell profile) — it must exist before Node starts. |
 
+## Blackboard lock env vars (AI-113)
+
+Only relevant if you're debugging a lock that's expiring too early/late, or writing a
+test that needs a short TTL instead of waiting out the real one:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PA_HEARTBEAT_STALE_MS` | `600000` (10 min) | How long a blackboard lock can go without a heartbeat before it's considered stale and purged. Read fresh per-call, not just at process start. |
+| `PA_LOCK_RENEW_INTERVAL_MS` | `60000` (1 min) | How often `startLockRenewal()` refreshes a held lock's heartbeat. |
+| `PA_LOCK_RENEW_MAX_MS` | `21600000` (6 h) | Absolute cap on how long `startLockRenewal()` will keep renewing — past this it stops and the lock is allowed to go stale via the normal TTL/purge mechanism, so a genuinely-hung dispatch (event loop healthy, an `await` never resolving) still eventually releases its lock rather than holding it forever. |
+
 ## Voice transcription env vars
 
 Cloud provider API keys (`~/.pa/secrets.env`) — set at least one to enable cloud transcription; unset entirely and `engine_preference: local` still works fully offline:

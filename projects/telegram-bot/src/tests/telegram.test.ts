@@ -1077,3 +1077,46 @@ describe('unpinChatMessage', () => {
     await assert.doesNotReject(() => unpinChatMessage('token', 123, 456));
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 3 sendMessage Hardening tests
+// ---------------------------------------------------------------------------
+
+describe('sendMessage Phase 3 hardening', () => {
+  it('prevents infinite loops in splitMessage when message starts with newlines at MAX boundary', () => {
+    const text = '\n\n' + 'a'.repeat(MAX + 500);
+    const chunks = splitMessage(text);
+    assert.ok(chunks.length >= 2);
+    assert.ok(chunks.every(c => c.length <= MAX));
+  });
+
+  it('retries up to 3 times on HTTP 429 (Too Many Requests) or 502 (Bad Gateway)', async () => {
+    const calls = setupFetchMock([
+      { ok: false, status: 429, bodyText: 'Too Many Requests' },
+      { ok: false, status: 502, bodyText: 'Bad Gateway' },
+      { ok: true, bodyJson: { ok: true } },
+    ]);
+    const result = await sendMessage('token', 123, 'hello');
+    assert.equal(result, true, 'should succeed after retrying transient 429 and 502 errors');
+    assert.equal(calls.length, 3);
+  });
+
+  it('handles response stream errors safely when reading error response text', async () => {
+    (globalThis as Record<string, unknown>).fetch = async () => {
+      return {
+        ok: false,
+        status: 500,
+        text: async () => { throw new Error('Stream read error'); },
+        json: async () => { throw new Error('Stream read error'); },
+      };
+    };
+    await assert.doesNotReject(
+      async () => {
+        const result = await sendMessage('token', 123, 'hello');
+        assert.equal(result, false);
+      },
+      'sendMessage must not throw or crash on response body stream error',
+    );
+  });
+});
+

@@ -108,9 +108,9 @@ async function statusSubcommand(): Promise<void> {
   const known = new Set(MAINTENANCE_JOBS.map((j) => j.name));
   const foreign = Object.keys(ledger.jobs).filter((n) => !known.has(n)).sort();
   if (foreign.length > 0) {
-    console.log("\n--- jobs declared outside this registry (host: 'bot'; see projects/telegram-bot/src/maintenance-jobs.ts) ---");
+    console.log("\n--- legacy / unlisted ledger entries ---");
     for (const name of foreign) {
-      printJobStatus(name, 'bot', ledger.jobs[name]);
+      printJobStatus(name, 'unknown', ledger.jobs[name]);
     }
   }
 
@@ -126,13 +126,8 @@ async function runSubcommand(args: string[]): Promise<void> {
     console.error(`Unknown maintenance job: '${jobName ?? ''}'`);
     console.error('Valid jobs:');
     for (const j of MAINTENANCE_JOBS) console.error(`  ${j.name}  [${j.host}]`);
-    console.error("  (host: 'bot' jobs are declared inside the Telegram bot process and run there; see `pa maintenance status` for their ledger rows.)");
     process.exitCode = 2;
     return;
-  }
-
-  if (job.host === 'bot') {
-    console.log(`Note: '${job.name}' is a host: 'bot' job — it normally runs inside the Telegram bot process, not via this CLI.`);
   }
 
   if (dryRun) {
@@ -151,6 +146,11 @@ async function runSubcommand(args: string[]): Promise<void> {
     }
     console.log('\nDry run complete. Re-run without --dry-run to actually run the job.');
     return;
+  }
+
+  if (job.host === 'bot') {
+    console.log(`Note: '${job.name}' is a host: 'bot' job — runtime execution requires the Telegram bot process (run ` +
+      `via live bot process). Statically previewing targets with --dry-run is fully supported.`);
   }
 
   let maintenanceOverrides: Record<string, { enabled?: boolean; everyMs?: number }> | undefined;

@@ -1,8 +1,20 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { access, readFile, mkdir, writeFile, unlink } from 'fs/promises';
+import { access, readFile, mkdir, writeFile, unlink, rm } from 'fs/promises';
 import { join } from 'path';
 import { createTempPaHome, cleanup } from './helpers.js';
+import { flushLog } from '../src/lib/log.js';
+
+async function readLogRows(dir: string): Promise<Array<{ module?: string; message?: string; level?: string; [k: string]: unknown }>> {
+  await flushLog();
+  let raw: string;
+  try {
+    raw = await readFile(join(dir, 'app.log.jsonl'), 'utf8');
+  } catch {
+    return [];
+  }
+  return raw.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+}
 
 describe('worker-pids', () => {
   let dir: string;
@@ -181,5 +193,169 @@ describe('worker-pids', () => {
 
     await removeWorkerPid(999995);
     await unlink(join(pidsDir, 'corrupt.json')).catch(() => {});
+  });
+
+  it('removeWorkerPid on an already-gone pid is silent (no log row)', async () => {
+    const { removeWorkerPid } = await import('../src/worker-pids.js');
+    const before = (await readLogRows(dir)).length;
+
+    await assert.doesNotReject(removeWorkerPid(424242)); // never registered — ENOENT
+
+    const after = await readLogRows(dir);
+    assert.equal(after.length, before, 'ENOENT must not produce a log row');
+  });
+
+  it('removeWorkerPid logs and does not reject on a real (non-ENOENT) failure', async () => {
+    const { removeWorkerPid } = await import('../src/worker-pids.js');
+    const pidsDir = join(dir, 'worker-pids');
+    await mkdir(pidsDir, { recursive: true });
+    // Directory-where-file-expected trick: unlink() on a directory fails with
+    // EISDIR/EPERM, not ENOENT — forces the "anything else" branch.
+    await mkdir(join(pidsDir, '999989.json'), { recursive: true });
+
+    await assert.doesNotReject(removeWorkerPid(999989), 'must never reject regardless of failure kind');
+
+    const rows = await readLogRows(dir);
+    const warnRow = rows.find((r) => r.module === 'worker-pids' && r.message === 'Failed to remove worker pid entry');
+    assert.ok(warnRow, `Expected a logged warn row, got: ${JSON.stringify(rows.map((r) => `${r.module}:${r.message}`))}`);
+
+    await rm(join(pidsDir, '999989.json'), { recursive: true, force: true }).catch(() => {});
+  });
+});
+
+describe('worker-pids: AI-114 harvest-window protection', () => {
+  let dir: string;
+
+  before(async () => {
+    dir = await createTempPaHome();
+  });
+
+  after(async () => {
+    await cleanup(dir);
+  });
+
+  it('cleanupOrphanedWorkers() with NO excludeSkills protects a real live descendant while harvestUntil is in the future, then reaps it past the deadline', async () => {
+    const { cleanupOrphanedWorkers, isProcessAlive } = await import('../src/worker-pids.js');
+    const { spawn } = await import('child_process');
+
+    // Real stand-in for the CLI child a crashed-instance dispatch is still
+    // waiting to harvest a reply from (AI-095's 45-minute window).
+    const orphan = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    try {
+      await new Promise((r) => setTimeout(r, 200));
+      assert.ok(orphan.pid && isProcessAlive(orphan.pid), 'stand-in must be running');
+
+      const pidsDir = join(dir, 'worker-pids');
+      await mkdir(pidsDir, { recursive: true });
+      const startedAt = new Date().toISOString();
+      const harvestUntil = new Date(Date.now() + 60_000).toISOString(); // 1 min in the future
+      await writeFile(
+        join(pidsDir, '999988.json'),
+        JSON.stringify({
+          pid: 999988, spawnedBy: 999999, worker: 'agy', skill: 'topic--999_1',
+          startedAt, descendants: [orphan.pid], harvestUntil,
+        }),
+        'utf8'
+      );
+
+      // Simulates the real unprotected `pa catchup` caller (orphan-worker-reap.ts).
+      const killedWhileProtected = await cleanupOrphanedWorkers();
+      assert.equal(killedWhileProtected, 0, 'must not kill while within the harvest window');
+      await assert.doesNotReject(access(join(pidsDir, '999988.json')), 'entry must survive');
+      assert.equal(isProcessAlive(orphan.pid!), true, 'stand-in must survive');
+
+      // Now simulate time passing the deadline via the `now` override.
+      const pastDeadline = Date.parse(harvestUntil) + 1000;
+      const killedPastDeadline = await cleanupOrphanedWorkers(undefined, { now: pastDeadline });
+      assert.equal(killedPastDeadline, 1, 'must reap once the harvest deadline has passed');
+
+      const deadline = Date.now() + 5000;
+      while (isProcessAlive(orphan.pid!) && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      assert.equal(isProcessAlive(orphan.pid!), false, 'stand-in must be killed after the deadline');
+      await assert.rejects(access(join(pidsDir, '999988.json')), 'entry must be removed after the deadline');
+    } finally {
+      try { orphan.kill('SIGKILL'); } catch { /* already dead — expected */ }
+    }
+  });
+
+  it('harvestUntil in the future but every known pid already dead → removed immediately (no accumulation)', async () => {
+    const { cleanupOrphanedWorkers } = await import('../src/worker-pids.js');
+    const pidsDir = join(dir, 'worker-pids');
+    await mkdir(pidsDir, { recursive: true });
+    const harvestUntil = new Date(Date.now() + 60_000).toISOString();
+    await writeFile(
+      join(pidsDir, '999987.json'),
+      JSON.stringify({
+        pid: 999987, spawnedBy: 999999, worker: 'agy', skill: 'topic--999_2',
+        startedAt: new Date().toISOString(), descendants: [999986], harvestUntil,
+      }),
+      'utf8'
+    );
+
+    const killed = await cleanupOrphanedWorkers();
+    assert.equal(killed, 0, 'no live survivor to kill');
+    await assert.rejects(access(join(pidsDir, '999987.json')), 'entry removed immediately despite a future harvestUntil — no live pid to protect');
+  });
+
+  it('no harvestUntil → killed exactly as today (regression guard for `pa run`)', async () => {
+    const { cleanupOrphanedWorkers, isProcessAlive } = await import('../src/worker-pids.js');
+    const { spawn } = await import('child_process');
+    const orphan = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    try {
+      await new Promise((r) => setTimeout(r, 200));
+      const pidsDir = join(dir, 'worker-pids');
+      await mkdir(pidsDir, { recursive: true });
+      await writeFile(
+        join(pidsDir, '999985.json'),
+        JSON.stringify({
+          pid: 999985, spawnedBy: 999999, worker: 'agy', skill: 'topic--999_3',
+          startedAt: new Date().toISOString(), descendants: [orphan.pid],
+        }),
+        'utf8'
+      );
+
+      const killed = await cleanupOrphanedWorkers();
+      assert.equal(killed, 1, 'no harvestUntil at all must kill exactly as before');
+
+      const deadline = Date.now() + 5000;
+      while (isProcessAlive(orphan.pid!) && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      assert.equal(isProcessAlive(orphan.pid!), false);
+    } finally {
+      try { orphan.kill('SIGKILL'); } catch { /* already dead — expected */ }
+    }
+  });
+
+  it('corrupt/unparseable harvestUntil fails closed (treated as no protection)', async () => {
+    const { cleanupOrphanedWorkers, isProcessAlive } = await import('../src/worker-pids.js');
+    const { spawn } = await import('child_process');
+    const orphan = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    try {
+      await new Promise((r) => setTimeout(r, 200));
+      const pidsDir = join(dir, 'worker-pids');
+      await mkdir(pidsDir, { recursive: true });
+      await writeFile(
+        join(pidsDir, '999984.json'),
+        JSON.stringify({
+          pid: 999984, spawnedBy: 999999, worker: 'agy', skill: 'topic--999_4',
+          startedAt: new Date().toISOString(), descendants: [orphan.pid], harvestUntil: 'not-a-valid-date',
+        }),
+        'utf8'
+      );
+
+      const killed = await cleanupOrphanedWorkers();
+      assert.equal(killed, 1, 'corrupt harvestUntil must fail closed to today\'s kill behavior');
+
+      const deadline = Date.now() + 5000;
+      while (isProcessAlive(orphan.pid!) && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      assert.equal(isProcessAlive(orphan.pid!), false);
+    } finally {
+      try { orphan.kill('SIGKILL'); } catch { /* already dead — expected */ }
+    }
   });
 });

@@ -168,18 +168,28 @@ async function checkWorkers(): Promise<CheckResult> {
 
   const unavailable = results.filter((r) => !r.ok).map((r) => r.name);
   const cooling = results.filter((r) => r.cooling).map((r) => r.name);
+  const activeCount = results.filter((r) => r.ok && !r.cooling).length;
 
   if (unavailable.length === results.length) {
     return {
       name: 'workers',
       status: 'FAIL',
-      detail: `all unavailable: ${unavailable.join(', ')}. Fix: install at least one of Claude Code, gemini-cli, or openai-codex and update ~/.pa/config.yaml's \`command\` paths. See docs/WORKERS_GUIDE.md.`,
+      detail: `all unavailable: ${unavailable.join(', ')}. Fix: install at least one of Claude Code or openai-codex and update ~/.pa/config.yaml's \`command\` paths. See docs/WORKERS_GUIDE.md.`,
+    };
+  }
+
+  if (activeCount === 0) {
+    return {
+      name: 'workers',
+      status: 'FAIL',
+      detail: `all available workers cooling / rate-limited (${cooling.join(', ')}). No active worker ready to take dispatches.`,
     };
   }
 
   const details: string[] = [];
   if (unavailable.length > 0) details.push(`unavailable: ${unavailable.join(', ')} (install/fix command path in config.yaml)`);
   if (cooling.length > 0) details.push(`cooling: ${cooling.join(', ')} (rate-limited; use \`--worker <other>\` or wait)`);
+  if (activeCount < 2 && results.length >= 2) details.push(`fleet capacity degraded (${activeCount}/${results.length} active non-cooling worker candidate ready)`);
 
   if (details.length > 0) return { name: 'workers', status: 'WARN', detail: details.join('; ') };
   return { name: 'workers', status: 'OK', detail: `all ${results.length} available` };

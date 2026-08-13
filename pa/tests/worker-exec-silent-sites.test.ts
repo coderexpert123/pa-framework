@@ -1,10 +1,11 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFile, mkdir } from 'fs/promises';
+import { writeFile, mkdir, readFile, readdir } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { createTempPaHome, createTempConfig, createTempSecrets, cleanup } from './helpers.js';
 import { executeWorker } from '../src/workers.js';
+import { flushLog } from '../src/lib/log.js';
 import type { WorkerConfig } from '../src/types.js';
 
 let tempDir: string;
@@ -119,5 +120,84 @@ describe('worker-exec silent-site alerts', () => {
 
     const result = await executeWorker(worker, 'test', { timeout: 5 });
     assert.equal(result.success, false);
+  });
+
+  it('a failed pid registration still lets the dispatch succeed, and logs a module:worker-pids warn row (AI-112)', async () => {
+    // Force addWorkerPid to fail: pre-create a FILE at the path where the
+    // worker-pids directory should be, so mkdir(dir, { recursive: true })
+    // rejects with ENOTDIR instead of creating it.
+    await writeFile(join(tempDir, 'worker-pids'), 'not-a-directory', 'utf8');
+
+    const script = await writeScript('ok-despite-pidfail.js', 'process.stdout.write("ok");');
+    const worker = makeWorker({ command: 'node', args: [script] });
+
+    const result = await executeWorker(worker, 'test', { timeout: 10, resource: 'skill-pidfail' });
+    assert.equal(result.success, true, 'dispatch must still succeed even though pid registration failed');
+
+    await flushLog();
+    const raw = await readFile(join(tempDir, 'app.log.jsonl'), 'utf8');
+    const rows = raw.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const warnRow = rows.find((r) => r.module === 'worker-pids' && r.message === 'Failed to register worker pid');
+    assert.ok(warnRow, `Expected a worker-pids warn row, got modules/messages: ${JSON.stringify(rows.map((r) => `${r.module}:${r.message}`))}`);
+  });
+
+  it('harvestWindowMs stamps a parseable, in-range harvestUntil onto the registry entry (AI-114)', async () => {
+    const script = await writeScript('slow-harvest.js', 'setTimeout(() => process.stdout.write("done"), 400);');
+    const worker = makeWorker({ command: 'node', args: [script] });
+    const harvestWindowMs = 5 * 60_000;
+    const before = Date.now();
+
+    const runPromise = executeWorker(worker, 'test', {
+      timeout: 10, resource: 'skill-harvest-set', harvestWindowMs,
+    });
+
+    let entry: { skill?: string; harvestUntil?: string } | undefined;
+    const pollDeadline = Date.now() + 2000;
+    while (!entry && Date.now() < pollDeadline) {
+      const files = await readdir(join(tempDir, 'worker-pids')).catch(() => [] as string[]);
+      for (const f of files) {
+        if (!f.endsWith('.json')) continue;
+        const raw = await readFile(join(tempDir, 'worker-pids', f), 'utf8').catch(() => null);
+        if (!raw) continue;
+        const parsed = JSON.parse(raw);
+        if (parsed.skill === 'skill-harvest-set') entry = parsed;
+      }
+      if (!entry) await new Promise((r) => setTimeout(r, 20));
+    }
+    await runPromise;
+
+    assert.ok(entry, 'expected to observe the registered pid entry mid-run');
+    assert.ok(entry!.harvestUntil, 'harvestUntil must be stamped when harvestWindowMs is set');
+    const parsedTime = Date.parse(entry!.harvestUntil!);
+    assert.ok(!Number.isNaN(parsedTime), 'harvestUntil must be a parseable date');
+    assert.ok(
+      parsedTime >= before + harvestWindowMs - 2000 && parsedTime <= before + harvestWindowMs + 5000,
+      `harvestUntil (${entry!.harvestUntil}) should be ~${harvestWindowMs}ms after dispatch start`
+    );
+  });
+
+  it('harvestWindowMs unset → no harvestUntil stamped (regression guard for `pa run`)', async () => {
+    const script = await writeScript('slow-no-harvest.js', 'setTimeout(() => process.stdout.write("done"), 400);');
+    const worker = makeWorker({ command: 'node', args: [script] });
+
+    const runPromise = executeWorker(worker, 'test', { timeout: 10, resource: 'skill-harvest-unset' });
+
+    let entry: { skill?: string; harvestUntil?: string } | undefined;
+    const pollDeadline = Date.now() + 2000;
+    while (!entry && Date.now() < pollDeadline) {
+      const files = await readdir(join(tempDir, 'worker-pids')).catch(() => [] as string[]);
+      for (const f of files) {
+        if (!f.endsWith('.json')) continue;
+        const raw = await readFile(join(tempDir, 'worker-pids', f), 'utf8').catch(() => null);
+        if (!raw) continue;
+        const parsed = JSON.parse(raw);
+        if (parsed.skill === 'skill-harvest-unset') entry = parsed;
+      }
+      if (!entry) await new Promise((r) => setTimeout(r, 20));
+    }
+    await runPromise;
+
+    assert.ok(entry, 'expected to observe the registered pid entry mid-run');
+    assert.equal(entry!.harvestUntil, undefined, 'harvestUntil must be absent when harvestWindowMs is not set');
   });
 });

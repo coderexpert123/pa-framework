@@ -63,10 +63,6 @@ export function getPriorSessionPath(worker: string, sessionId: string, cwd?: str
   if (worker === 'claude' || worker === 'zclaude') {
     return claudeSessionPath(sessionId, cwd);
   }
-  if (worker === 'gemini') {
-    // Exact filename requires async dir scan; return a glob pattern the LLM can resolve.
-    return `${homedir()}/.gemini/tmp/personal-assistant/chats/session-*-${sessionId.slice(0, 8)}*.json*`;
-  }
   // Agy + Codex: conversation state is a binary SQLite store, not a readable
   // transcript — no path to hand the model. Returning null makes context.ts
   // emit its "no transcript file available for this worker type" line instead.
@@ -101,22 +97,6 @@ async function codexSessionExists(sessionId: string): Promise<boolean> {
   }
 }
 
-async function geminiSessionPath(sessionId: string): Promise<string | null> {
-  // Gemini session files: ~/.gemini/tmp/personal-assistant/chats/session-*-<id-prefix>.json
-  // The first 8 chars of the sessionId appear in the filename.
-  const dir = join(homedir(), '.gemini', 'tmp', 'personal-assistant', 'chats');
-  const prefix = sessionId.slice(0, 8);
-  try {
-    const entries = await readdir(dir);
-    const match = entries.find(
-      (e) => e.startsWith('session-') && e.includes(prefix) && (e.endsWith('.json') || e.endsWith('.jsonl'))
-    );
-    return match ? join(dir, match) : null;
-  } catch {
-    return null;
-  }
-}
-
 export async function sessionFileExists(session: SessionInfo, cwd?: string): Promise<boolean> {
   try {
     if (session.worker === 'claude' || session.worker === 'zclaude') {
@@ -135,10 +115,7 @@ export async function sessionFileExists(session: SessionInfo, cwd?: string): Pro
         return true;
       }
     } else {
-      const path = await geminiSessionPath(session.session_id);
-      if (!path) return false;
-      await stat(path);
-      return true;
+      return false;
     }
   } catch {
     return false;
@@ -150,43 +127,6 @@ export async function sessionFileExists(session: SessionInfo, cwd?: string): Pro
 export async function isSessionValid(session: SessionInfo, cwd?: string): Promise<boolean> {
   if (isSessionExpired(session)) return false;
   return sessionFileExists(session, cwd);
-}
-
-// --- Gemini session discovery ---
-
-export async function discoverGeminiSessionId(projectDir: string): Promise<string | null> {
-  const dir = join(homedir(), '.gemini', 'tmp', projectDir, 'chats');
-  try {
-    const entries = await readdir(dir);
-    let latest: { path: string; mtime: Date } | null = null;
-
-    for (const name of entries) {
-      if (!name.startsWith('session-') || (!name.endsWith('.json') && !name.endsWith('.jsonl'))) continue;
-      const fp = join(dir, name);
-      try {
-        const s = await stat(fp);
-        if (!latest || s.mtime > latest.mtime) {
-          latest = { path: fp, mtime: s.mtime };
-        }
-      } catch {
-        // skip unreadable entries
-      }
-    }
-
-    if (!latest) return null;
-
-        const raw = await readFile(latest.path, 'utf8');
-    let data: { sessionId?: string };
-    if (latest.path.endsWith('.jsonl')) {
-      const firstLine = raw.split('\n')[0];
-      data = JSON.parse(firstLine);
-    } else {
-      data = JSON.parse(raw);
-    }
-    return data.sessionId ?? null;
-  } catch {
-    return null;
-  }
 }
 
 export async function discoverAgySessionId(): Promise<string | null> {

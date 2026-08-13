@@ -11,6 +11,7 @@ import { rmRetry } from './rm-retry.js';
 import { listPendingDispatches, pendingDispatchKey, _resetPendingDispatchesForTest } from '../pending-dispatches.js';
 import { markTopicRecovering, _resetRecoveryGateForTest } from '../recovery-gate.js';
 import { _clearQueueForTest } from '../topic-queue.js';
+import { blackboard } from '../../../../pa/dist/src/blackboard.js';
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -880,7 +881,7 @@ describe('runPollLoop: model expiry sweep', { concurrency: 1 }, () => {
       chat_id: 123,
       thread_id: 0,
       turns: [],
-      preferred_worker: 'gemini',
+      preferred_worker: 'agy',
       preferred_worker_set_at: yesterday,
       pinned_status_message_id: 42,
     };
@@ -941,11 +942,11 @@ describe('runPollLoop: model expiry sweep', { concurrency: 1 }, () => {
     const foreignFile = join(tempDir, 'telegram-bot-topic-999_5.json');
     const allowedState = {
       chat_id: 123, thread_id: 0, turns: [],
-      preferred_worker: 'gemini', preferred_worker_set_at: yesterday,
+      preferred_worker: 'agy', preferred_worker_set_at: yesterday,
     };
     const foreignState = {
       chat_id: 999, thread_id: 5, turns: [],
-      preferred_worker: 'gemini', preferred_worker_set_at: yesterday,
+      preferred_worker: 'agy', preferred_worker_set_at: yesterday,
     };
     await writeFile(allowedFile, JSON.stringify(allowedState), 'utf8');
     await writeFile(foreignFile, JSON.stringify(foreignState), 'utf8');
@@ -984,7 +985,7 @@ describe('runPollLoop: model expiry sweep', { concurrency: 1 }, () => {
     const savedAllowed = JSON.parse(await readFile(allowedFile, 'utf8')) as ConversationState;
     const savedForeign = JSON.parse(await readFile(foreignFile, 'utf8')) as ConversationState;
     assert.equal(savedAllowed.preferred_worker, undefined, 'allowed topic resets');
-    assert.equal(savedForeign.preferred_worker, 'gemini', 'foreign topic untouched');
+    assert.equal(savedForeign.preferred_worker, 'agy', 'foreign topic untouched');
     // No sendMessage should target chat 999
     assert.ok(!sendMessageBodies.some((b) => b.includes('"chat_id":999')), 'no sendMessage to foreign chat');
   });
@@ -995,7 +996,7 @@ describe('runPollLoop: model expiry sweep', { concurrency: 1 }, () => {
     const validFile = join(tempDir, 'telegram-bot-topic-123_2.json');
     const validState = {
       chat_id: 123, thread_id: 2, turns: [],
-      preferred_worker: 'gemini', preferred_worker_set_at: yesterday,
+      preferred_worker: 'agy', preferred_worker_set_at: yesterday,
     };
     await writeFile(corruptFile, '{ "chat_id": 123, "thread_id": 1, broken json', 'utf8');
     await writeFile(validFile, JSON.stringify(validState), 'utf8');
@@ -1039,7 +1040,7 @@ describe('runPollLoop: model expiry sweep', { concurrency: 1 }, () => {
     const staleFile = join(tempDir, 'telegram-bot-topic-123_2.json');
     const sharedState = {
       chat_id: 123, thread_id: 0, turns: [],
-      preferred_worker: 'gemini', preferred_worker_set_at: yesterday,
+      preferred_worker: 'agy', preferred_worker_set_at: yesterday,
     };
     await writeFile(freshFile, JSON.stringify({ ...sharedState, thread_id: 1 }), 'utf8');
     await writeFile(staleFile, JSON.stringify({ ...sharedState, thread_id: 2 }), 'utf8');
@@ -1083,7 +1084,7 @@ describe('runPollLoop: model expiry sweep', { concurrency: 1 }, () => {
     assert.equal(savedFresh.preferred_worker, undefined, 'fresh topic still gets its expired override cleared');
     assert.equal(savedFresh.model_status?.reason_code, 'midnight_reset');
 
-    assert.equal(savedStale.preferred_worker, 'gemini', 'stale topic is skipped — override left untouched by the sweep');
+    assert.equal(savedStale.preferred_worker, 'agy', 'stale topic is skipped — override left untouched by the sweep');
     assert.equal(savedStale.preferred_worker_set_at, yesterday, 'stale topic file is not rewritten at all');
     assert.equal(savedStale.model_status, undefined, 'sweep never even loaded/hydrated the stale topic');
   });
@@ -1109,7 +1110,7 @@ describe('runPollLoop: dynamic pin update on failover (AI-026)', { concurrency: 
   });
 
   it('posts and pins a fresh status card on failover even when no pin exists yet', async () => {
-    // Use gemini as the first worker because its rate-limit classifier uses text matching
+    // Use agy as the first worker because its rate-limit classifier uses text matching
     // (looks for "429" in stderr), so we can trigger it reliably without JSONL session files.
     const configPath = join(tempDir, 'config.yaml');
     // Write helper scripts to temp dir to avoid shell quoting complexity
@@ -1120,7 +1121,7 @@ describe('runPollLoop: dynamic pin update on failover (AI-026)', { concurrency: 
 
     await writeFile(configPath, `
 workers:
-  - name: gemini
+  - name: agy
     command: node
     args: ["${failScript.replace(/\\/g, '/')}"]
     check: node -e "process.exit(0)"
@@ -1130,7 +1131,7 @@ workers:
     args: ["${succeedScript.replace(/\\/g, '/')}"]
     check: node -e "process.exit(0)"
 topic_defaults:
-  "123_0": "gemini"
+  "123_0": "agy"
 `);
 
     const topicStateFile = join(tempDir, 'telegram-bot-topic-123_0.json');
@@ -1213,7 +1214,7 @@ workers:
     args: ["-e", "process.stdout.write('ok')"]
     check: node -e "process.exit(0)"
     rate_limit_patterns: []
-  - name: gemini
+  - name: agy
     command: node
     args: ["-e", "process.stdout.write('ok')"]
     check: node -e "process.exit(0)"
@@ -2135,6 +2136,134 @@ describe('runPollLoop: per-topic serialization', { concurrency: 1 }, () => {
     }
 
     assert.equal(sendMessageCallCount, 2, 'both sendMessages must fire after serialization completes');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AI-113: the per-topic blackboard lock acquired at the top of processUpdate
+// used to be heartbeated once and never again — any dispatch that outlived
+// PA_HEARTBEAT_STALE_MS (10 min default) had its lock purged out from under
+// it. startLockRenewal (pa/src/blackboard.ts) now keeps that specific
+// (resource, 'telegram-bot', contextId) row's heartbeat fresh for the
+// lifetime of the dispatch. This test shrinks the TTL and renewal cadence via
+// env so it doesn't need to wait out the real 10-minute default.
+//
+// harvestWindowMs (AI-114) is deliberately NOT asserted here: the real worker
+// dispatch path (dispatchMessage → executeWorker) spawns real pa worker
+// processes and isn't interceptable via the fetch mock this suite uses (see
+// the "restart_bot sentinel" block's note above) — the /default command used
+// below takes a skip-worker shortcut that never reaches executeWorker at all.
+// Not cheap to assert with this harness; the pa-side tests cover that
+// harvestWindowMs → harvestUntil stamping directly.
+// ---------------------------------------------------------------------------
+
+describe('runPollLoop: topic lock survives long dispatch (AI-113)', { concurrency: 1 }, () => {
+  let tempDir: string;
+  const savedFetch = globalThis.fetch;
+  const savedHeartbeatMs = process.env.PA_HEARTBEAT_STALE_MS;
+  const savedRenewIntervalMs = process.env.PA_LOCK_RENEW_INTERVAL_MS;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'tgbot-lock-renew-'));
+    process.env.PA_HOME = tempDir;
+    // Both startLockRenewal and blackboard.acquireLock read these envs fresh
+    // on every call, so shrinking them here (before the loop starts) is
+    // enough — no need to wait out the real 10-minute/60-second defaults.
+    process.env.PA_HEARTBEAT_STALE_MS = '300';
+    process.env.PA_LOCK_RENEW_INTERVAL_MS = '100';
+    await writeFile(join(tempDir, 'config.yaml'), JSON.stringify({ workers: [{ name: 'claude', command: 'node', args: ['-e', '0'], check: 'node -e 0' }] }), 'utf8');
+  });
+
+  afterEach(async () => {
+    delete process.env.PA_HOME;
+    if (savedHeartbeatMs === undefined) delete process.env.PA_HEARTBEAT_STALE_MS; else process.env.PA_HEARTBEAT_STALE_MS = savedHeartbeatMs;
+    if (savedRenewIntervalMs === undefined) delete process.env.PA_LOCK_RENEW_INTERVAL_MS; else process.env.PA_LOCK_RENEW_INTERVAL_MS = savedRenewIntervalMs;
+    await rmRetry(tempDir);
+    (globalThis as Record<string, unknown>).fetch = savedFetch;
+  });
+
+  it('a dispatch held in-flight past the (shrunk) heartbeat TTL keeps the topic lock row alive', async () => {
+    const controller = new AbortController();
+    const state = makeState(123, -1);
+    const resourceId = 'topic-123_0';
+
+    const update1 = {
+      update_id: 1,
+      message: { message_id: 1, chat: { id: 123, type: 'private' }, date: Math.floor(Date.now() / 1000), text: '/default' },
+    };
+
+    let sendMessageCallCount = 0;
+    let resolveGate!: () => void;
+    const gate = new Promise<void>(resolve => { resolveGate = resolve; });
+    let gateUsed = false;
+    let getUpdatesCallCount = 0;
+
+    (globalThis as Record<string, unknown>).fetch = async (url: string) => {
+      if ((url as string).includes('getUpdates')) {
+        getUpdatesCallCount++;
+        if (getUpdatesCallCount === 1) {
+          return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({ ok: true, result: [update1] }),
+            json: async () => ({ ok: true, result: [update1] }),
+          };
+        }
+        controller.abort();
+        return {
+          ok: true, status: 200,
+          text: async () => JSON.stringify({ ok: true, result: [] }),
+          json: async () => ({ ok: true, result: [] }),
+        };
+      }
+
+      if ((url as string).includes('sendMessage')) {
+        sendMessageCallCount++;
+        if (!gateUsed) {
+          gateUsed = true;
+          // Held open by the test until it has finished probing the lock.
+          await gate;
+        }
+      }
+
+      return {
+        ok: true, status: 200,
+        text: async () => JSON.stringify({ ok: true, result: { message_id: 999 } }),
+        json: async () => ({ ok: true, result: { message_id: 999 } }),
+      };
+    };
+
+    const loopDone = runPollLoop('token', [123], state, {}, controller.signal, fastSleep);
+
+    // Wait deterministically for the dispatch to reach the gate (lock now
+    // held, renewal started), up to 10s.
+    for (let i = 0; i < 500 && !gateUsed; i++) {
+      await new Promise(r => setTimeout(r, 20));
+    }
+    assert.ok(gateUsed, 'dispatch must have reached the gate (lock acquired) within the wait window');
+
+    try {
+      // Real wall-clock wait, well past 3x the shrunk TTL (300ms) — long
+      // enough for an un-renewed lock to have gone stale under the pre-fix
+      // code, and for the 100ms-cadence renewer to have ticked several times
+      // under the fix.
+      await new Promise(r => setTimeout(r, 1000));
+
+      // The actual regression check: a foreign acquirer on the same resource
+      // must still be blocked. acquireLock purges stale rows as part of this
+      // very call, so if the real lock's heartbeat had gone stale (no
+      // renewal), this would instead succeed.
+      const foreignAcquired = await blackboard.acquireLock(resourceId, 'foreign-agent', 999999, 100, 'foreign-context');
+      assert.equal(foreignAcquired, false, 'topic lock row must still be held (unpurged) after outlasting the shrunk heartbeat TTL — AI-113 regression');
+    } finally {
+      resolveGate();
+      await loopDone;
+    }
+
+    // After the loop drains and releases its own lock, a foreign acquirer
+    // succeeds — confirms the earlier block wasn't just a permanently-stuck lock.
+    const foreignAcquiredAfter = await blackboard.acquireLock(resourceId, 'foreign-agent', 999999, 2000, 'foreign-context-2');
+    assert.equal(foreignAcquiredAfter, true, 'lock must be released once the dispatch completes');
+    await blackboard.releaseLock(resourceId, 'foreign-agent', 'foreign-context-2');
   });
 });
 

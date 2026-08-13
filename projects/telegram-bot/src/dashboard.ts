@@ -135,7 +135,7 @@ function renderAtDetail(caps: DashboardWorkerCapability[], detail: 0 | 1 | 2 | 3
       return;
     }
     if (cap.settings.length === 0) {
-      // Not awkward, not blank: say so explicitly. gemini genuinely has no
+      // Not awkward, not blank: say so explicitly. zclaude genuinely has no
       // effort flag, and that absence is information the user needs.
       lines.push(`${head} — no settable options`);
       return;

@@ -75,7 +75,7 @@ async function runStream(
 ) {
   const script = await writeStreamScript(scriptName, events, opts);
   const worker = makeWorker({
-    name: 'gemini',
+    name: 'agy',
     command: 'node',
     args: [script],
     input_mode: 'arg',
@@ -166,8 +166,8 @@ describe('worker-exec gemini tool-boundary trim', () => {
       `agy output was emptied by the trim: ${JSON.stringify(guarded.output)}`);
   });
 
-  it('never trims a non-gemini worker', async () => {
-    // Boundary tracking is gemini/agy-only; a claude-named worker keeps everything.
+  it('never trims a non-agy worker', async () => {
+    // Boundary tracking is agy-only; a claude-named worker keeps everything.
     const result = await runStream('non-gemini.js', [
       assistant('SEGMENT_ONE '),
       toolResult,

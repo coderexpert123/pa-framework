@@ -80,7 +80,6 @@ import {
 } from '../../../pa/dist/src/workers.js';
 import {
   isSessionValid,
-  discoverGeminiSessionId,
   buildResumeArgs,
   getPriorSessionPath,
 } from './session.js';
@@ -121,7 +120,7 @@ import { resolveReplyContext } from './reply-context.js';
 import { loadSecrets } from '../../../pa/dist/src/secrets.js';
 import { startProxyAutoRefresh } from '../../../pa/dist/src/lib/telegram-proxy.js';
 import { cleanupOrphanedWorkers } from '../../../pa/dist/src/worker-pids.js';
-import { blackboard } from '../../../pa/dist/src/blackboard.js';
+import { blackboard, startLockRenewal } from '../../../pa/dist/src/blackboard.js';
 import { loadConfig, saveTopicDefault } from '../../../pa/dist/src/config.js';
 import type { CommandResult, FailoverNotifyPayload, WorkerConfig } from '../../../pa/dist/src/types.js';
 import { logger } from '../../../pa/dist/src/lib/log.js';
@@ -146,10 +145,6 @@ import {
 // Default bot working directory. Env-driven so the framework is portable.
 // Set BOT_CWD in secrets.env to the absolute path of your project root.
 const BOT_CWD = process.env.BOT_CWD || process.cwd();
-// GEMINI_PROJECT_DIR is derived by the Gemini CLI from cwd (lowercased,
-// spaces → hyphens). Must match the on-disk slug at ~/.gemini/tmp/<slug>/chats.
-// See docs/ARCHITECTURE.md ("Conventions") for the cwd ↔ slug relationship.
-const GEMINI_PROJECT_DIR = 'personal-assistant';
 
 // Workers that support --append-system-prompt-file (set globally in config.yaml).
 const CLAUDE_FAMILY_WORKERS = new Set(['claude', 'zclaude']);
@@ -763,7 +758,7 @@ export async function dispatchMessage(
       const worker = config.workers.find((w) => w.name === activeSession.worker);
       if (worker) {
         const prompt = await buildResumedPrompt(userText, replyContext, pendingDesc, topicNames, { omitStatic: workerSupportsSystemPrompt(activeSession.worker) });
-        const result = await executeWorker(worker, prompt, { cwd: effectiveCwd(state), env: secrets, extraArgs: buildDispatchExtraArgs(state, worker, buildResumeArgs(activeSession)), resource, agentName: activeSession.worker, contextId, isCancelled });
+        const result = await executeWorker(worker, prompt, { cwd: effectiveCwd(state), env: secrets, extraArgs: buildDispatchExtraArgs(state, worker, buildResumeArgs(activeSession)), resource, agentName: activeSession.worker, contextId, isCancelled, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS });
         if (result.success) {
           dispatchResult = { result, worker: activeSession.worker, session: activeSession };
         } else if (!isCancelled()) {
@@ -789,7 +784,7 @@ export async function dispatchMessage(
       if (preferredWorkerConfig) {
         const priorCtx = lastFailedSession ? { ...lastFailedSession, sessionPath: getPriorSessionPath(lastFailedSession.worker, lastFailedSession.sessionId, effectiveCwd(state)) } : undefined;
         const prompt = await buildPrompt(userText, state, topicNames, replyContext, pendingDesc, { omitStatic: workerSupportsSystemPrompt(preferredWorkerConfig.name), priorContext: priorCtx });
-        const prefResult = await executeWorker(preferredWorkerConfig, prompt, { cwd: effectiveCwd(state), env: secrets, extraArgs: buildDispatchExtraArgs(state, preferredWorkerConfig), resource, agentName: state.preferred_worker, contextId, isCancelled });
+        const prefResult = await executeWorker(preferredWorkerConfig, prompt, { cwd: effectiveCwd(state), env: secrets, extraArgs: buildDispatchExtraArgs(state, preferredWorkerConfig), resource, agentName: state.preferred_worker, contextId, isCancelled, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS });
         if (prefResult.success) freshResult = { result: prefResult, worker: preferredWorkerConfig.name };
         else if (!isCancelled()) {
           const co = await tryClassifyAndNotify(state.preferred_worker, prefResult, prefResult.sessionId, preferredWorkerConfig, config, state, defaultWorker, onNotify);
@@ -810,7 +805,7 @@ export async function dispatchMessage(
       if (defaultWorkerConfig) {
         const priorCtxDef = lastFailedSession ? { ...lastFailedSession, sessionPath: getPriorSessionPath(lastFailedSession.worker, lastFailedSession.sessionId, effectiveCwd(state)) } : undefined;
         const prompt = await buildPrompt(userText, state, topicNames, replyContext, pendingDesc, { omitStatic: workerSupportsSystemPrompt(defaultWorkerConfig.name), priorContext: priorCtxDef });
-        const defResult = await executeWorker(defaultWorkerConfig, prompt, { cwd: effectiveCwd(state), env: secrets, extraArgs: buildDispatchExtraArgs(state, defaultWorkerConfig), resource, agentName: defaultWorker, contextId, isCancelled });
+        const defResult = await executeWorker(defaultWorkerConfig, prompt, { cwd: effectiveCwd(state), env: secrets, extraArgs: buildDispatchExtraArgs(state, defaultWorkerConfig), resource, agentName: defaultWorker, contextId, isCancelled, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS });
         if (defResult.success) freshResult = { result: defResult, worker: defaultWorkerConfig.name };
         else if (!isCancelled()) {
           const co = await tryClassifyAndNotify(defaultWorker, defResult, defResult.sessionId, defaultWorkerConfig, config, state, defaultWorker, onNotify);
@@ -827,7 +822,7 @@ export async function dispatchMessage(
       }
       const priorCtxFo = lastFailedSession ? { ...lastFailedSession, sessionPath: getPriorSessionPath(lastFailedSession.worker, lastFailedSession.sessionId, effectiveCwd(state)) } : undefined;
       const failoverPrompt = await buildPrompt(userText, state, topicNames, replyContext, pendingDesc, { omitStatic: false, priorContext: priorCtxFo });
-      freshResult = await runWithFailover(failoverPrompt, { cwd: effectiveCwd(state), env: secrets, resource, updateId, excludeWorkers: failedWorkers, onWorkerSwitch: async (payload) => { if (onNotify) await onNotify(payload); }, checkAvailable: async (w) => !(await isWorkerCoolingDown(w.name)), preferredWorker: state.preferred_worker, contextId, isCancelled });
+      freshResult = await runWithFailover(failoverPrompt, { cwd: effectiveCwd(state), env: secrets, resource, updateId, excludeWorkers: failedWorkers, onWorkerSwitch: async (payload) => { if (onNotify) await onNotify(payload); }, checkAvailable: async (w) => !(await isWorkerCoolingDown(w.name)), preferredWorker: state.preferred_worker, contextId, isCancelled, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS });
       // The cascade stopped because the caller cancelled. Return the same shape
       // as the other three cancellation exits — crucially with the session
       // UNCHANGED: a killed run's session id must not become the topic's.
@@ -845,7 +840,6 @@ export async function dispatchMessage(
     let newSession: SessionInfo | undefined;
     let sessionId: string | undefined;
     if (freshResult.worker === 'claude' || freshResult.worker === 'zclaude' || freshResult.worker === 'codex') sessionId = freshResult.result.sessionId;
-    else if (freshResult.worker === 'gemini') sessionId = freshResult.result.sessionId ?? (await discoverGeminiSessionId(GEMINI_PROJECT_DIR).catch(() => null)) ?? undefined;
     // agy is deliberately SESSIONLESS — do not reinstate discovery here (2026-07-22).
     // agy emits plain text, so result.sessionId is never populated (worker-exec only
     // captures it from stream-json events), which meant this always fell through to
@@ -923,6 +917,11 @@ function dispatchGitWorkflowSkill(skillName: string): string {
   return `🚀 Kicked off \`${skillName}\` — it reports back in the main "My PA" topic when done, not necessarily here.`;
 }
 
+// AI-114: covers orphan-reaper.ts's 45-min REAP_MAX_WAIT_MS plus slack, so the
+// pa-host orphan-worker-reap maintenance job (runs every minute) doesn't kill
+// a worker the bot is still waiting to harvest a reply from.
+const ORPHAN_HARVEST_WINDOW_MS = 50 * 60 * 1000;
+
 async function processUpdate(
   update: any,
   token: string,
@@ -970,6 +969,9 @@ async function processUpdate(
     await sendMessage(token, chatId, appendRefIdAndLog('⚠️ Processing is delayed. Please try again in a moment.', { kind: 'lock_busy', chatId, threadId }), messageId, threadId);
     return;
   }
+  const lockRenewal = startLockRenewal(resourceId, 'telegram-bot', contextId, {
+    onLost: (reason) => logger.warn('lock', `topic lock renewal ${reason}`, { resource: resourceId, chatId, threadId, updateId: update.update_id }),
+  });
 
   try {
     const topicState = await loadTopicState(chatId, threadId);
@@ -1406,7 +1408,7 @@ async function processUpdate(
     if (pendingKey) await removePendingDispatch(pendingKey).catch(() => {});
     await saveTopicState(topicState);
     if (restartBot) writeFileSync(join(paHome(), 'telegram-bot.stop'), '');
-  } finally { await blackboard.releaseLock(resourceId, 'telegram-bot', contextId); }
+  } finally { lockRenewal.stop(); await blackboard.releaseLock(resourceId, 'telegram-bot', contextId); }
 }
 
 function getUpdateTopicKey(update: any): string {

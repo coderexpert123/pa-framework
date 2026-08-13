@@ -15,6 +15,12 @@ export interface WorkerPidEntry {
    * spawner while the real CLI child keeps running (observed 2026-07-04: cmd
    * wrapper 35304 dead, claude 27220 alive → reaper false-negatived liveness). */
   descendants?: number[];
+  /** AI-114: ISO deadline (set via RunOptions.harvestWindowMs at registration
+   * time) protecting this entry from cleanupOrphanedWorkers even when the
+   * spawner has died, as long as a tracked pid is still alive — lets a
+   * crashed-instance dispatch finish so its reply can be harvested instead of
+   * being killed by the next per-minute `pa catchup` sweep. */
+  harvestUntil?: string;
 }
 
 function pidsDir(): string {
@@ -45,16 +51,27 @@ export async function updateWorkerPidDescendants(pid: number, descendants: numbe
     const tmp = join(pidsDir(), `${pid}.json.tmp`);
     await writeFile(tmp, JSON.stringify(entry), 'utf8');
     await rename(tmp, target);
-  } catch {
-    // Entry already removed (worker finished) or unreadable — nothing to update.
+  } catch (err: unknown) {
+    // ENOENT (entry already removed — worker finished) is normal and silent.
+    // Anything else is the write that *creates* the data /stop depends on
+    // (AI-112) — a silent failure here reproduces the same bug by a different
+    // route, so it must be logged, not swallowed.
+    if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+      log('warn', 'worker-pids', 'Failed to update worker pid descendants', { pid, error: String(err) });
+    }
   }
 }
 
 export async function removeWorkerPid(pid: number): Promise<void> {
   try {
     await unlink(join(pidsDir(), `${pid}.json`));
-  } catch {
-    // Non-critical — ENOENT means already deleted; other errors handled by startup cleanup
+  } catch (err: unknown) {
+    // ENOENT means already deleted — normal and silent. Anything else is
+    // logged rather than swallowed (AI-112); other errors are still handled
+    // by startup cleanup as a backstop.
+    if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+      log('warn', 'worker-pids', 'Failed to remove worker pid entry', { pid, error: String(err) });
+    }
   }
 }
 
@@ -132,7 +149,10 @@ export async function reapStaleWorkerPidTmps(): Promise<number> {
  * the bot's orphan-dispatch reaper (AI-095), which wants crashed-instance
  * dispatch workers to finish so their reply can be harvested, not killed.
  */
-export async function cleanupOrphanedWorkers(excludeSkills?: Set<string>): Promise<number> {
+export async function cleanupOrphanedWorkers(
+  excludeSkills?: Set<string>,
+  opts?: { now?: number }
+): Promise<number> {
   const dir = pidsDir();
   let files: string[];
   try {
@@ -141,6 +161,7 @@ export async function cleanupOrphanedWorkers(excludeSkills?: Set<string>): Promi
     return 0; // No dir = no orphans
   }
 
+  const now = opts?.now ?? Date.now();
   let killed = 0;
   for (const file of files) {
     if (!file.endsWith('.json')) continue;  // skips .json.tmp crash artifacts
@@ -158,6 +179,23 @@ export async function cleanupOrphanedWorkers(excludeSkills?: Set<string>): Promi
         // even when the wrapper is alive, so kill each surviving pid's subtree
         // individually rather than relying on one walk from the wrapper.
         const survivors = [entry.pid, ...(entry.descendants ?? [])].filter(isProcessAlive);
+
+        // AI-114: a caller may have stamped a harvest deadline (RunOptions'
+        // harvestWindowMs) so a still-replying dispatch survives the periodic
+        // `pa catchup` sweep (which runs every 60s with no excludeSkills of
+        // its own). Corrupt/expired/no-survivors all fail closed to today's
+        // behavior — only a valid future deadline with a live survivor
+        // protects the entry, and only until the deadline or until every
+        // known pid is confirmed dead, whichever comes first.
+        const harvestDeadline = entry.harvestUntil ? Date.parse(entry.harvestUntil) : NaN;
+        if (!Number.isNaN(harvestDeadline) && harvestDeadline > now && survivors.length > 0) {
+          log('info', 'worker-pids', 'Skipping orphaned worker within harvest window', {
+            pid: entry.pid, worker: entry.worker, skill: entry.skill,
+            harvestUntil: entry.harvestUntil, survivors,
+          });
+          continue;
+        }
+
         if (survivors.length > 0) {
           log('warn', 'worker-pids', 'Killing orphaned worker', {
             pid: entry.pid, worker: entry.worker, skill: entry.skill,
@@ -165,6 +203,18 @@ export async function cleanupOrphanedWorkers(excludeSkills?: Set<string>): Promi
           });
           for (const pid of survivors) killProcessTree(pid);
           killed++;
+        } else if (entry.descendants === undefined) {
+          // Removing an entry that never recorded descendants, this soon
+          // after spawn, is the one residual/structurally-unfixable leak
+          // window (a grandchild forked and its wrapper died within the same
+          // couple seconds, before the first heartbeat could persist
+          // descendants). Not actionable here — just greppable.
+          const ageMs = now - Date.parse(entry.startedAt);
+          if (!Number.isNaN(ageMs) && ageMs >= 0 && ageMs < 30_000) {
+            log('warn', 'worker-pids', 'Removing worker-pid entry with no recorded descendants — possible leaked CLI child', {
+              pid: entry.pid, worker: entry.worker, skill: entry.skill, startedAt: entry.startedAt,
+            });
+          }
         }
         // Spawner is dead — remove the file whether or not the worker was alive
         await unlink(join(dir, file)).catch(() => {});

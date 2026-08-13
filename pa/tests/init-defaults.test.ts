@@ -29,22 +29,20 @@ describe('initCommand default config — worker rate_limit_patterns', () => {
     );
   });
 
-  it('gemini worker includes "RESOURCE_EXHAUSTED"', async () => {
+  it('agy worker includes "RESOURCE_EXHAUSTED"', async () => {
     await initCommand();
     const config = parseYaml(await readFile(configPath(), 'utf8'));
-    const gemini = config.workers.find((w: any) => w.name === 'gemini');
-    assert.ok(gemini, 'gemini worker should exist in default config');
+    const agy = config.workers.find((w: any) => w.name === 'agy');
+    assert.ok(agy, 'agy worker should exist in default config');
     assert.ok(
-      gemini.rate_limit_patterns.includes('RESOURCE_EXHAUSTED'),
-      `Expected gemini patterns to include 'RESOURCE_EXHAUSTED', got: ${JSON.stringify(gemini.rate_limit_patterns)}`
+      agy.rate_limit_patterns.includes('RESOURCE_EXHAUSTED'),
+      `Expected agy patterns to include 'RESOURCE_EXHAUSTED', got: ${JSON.stringify(agy.rate_limit_patterns)}`
     );
   });
 });
 
-// Compiled to pa/dist/tests/init-defaults.test.js — __dirname is that file's
-// dir; 3 levels up (dist/tests -> dist -> pa -> repo root) reaches examples/
-// (same convention as setup-topics.ts's __dirname resolution).
-const EXAMPLE_CONFIG_PATH = join(__dirname, '..', '..', '..', 'examples', 'config.yaml.example');
+// Resolves correctly whether running compiled in pa/dist/tests or source in pa/tests.
+const EXAMPLE_CONFIG_PATH = join(__dirname.includes('dist') ? join(__dirname, '..', '..', '..') : join(__dirname, '..', '..'), 'examples', 'config.yaml.example');
 
 /**
  * Structural invariants every scaffolded worker block must satisfy.
@@ -203,7 +201,7 @@ describe('initCommand default config — worker block self-consistency', () => {
   // -shm/-wal siblings) and ZERO *.pb; the gemini chats dir held 69 *.jsonl and
   // nothing else. Changing either value should be a deliberate act backed by a
   // fresh inspection, not a silent edit.
-  it('agy and gemini state patterns match the formats those CLIs actually write', async () => {
+  it('agy state pattern matches the format that CLI actually writes', async () => {
     await initCommand();
     const config = parseYaml(await readFile(configPath(), 'utf8'));
     const agy = config.workers.find((w: any) => w.name === 'agy');
@@ -211,10 +209,6 @@ describe('initCommand default config — worker block self-consistency', () => {
     assert.equal(agy.state_pattern, '*.db', 'agy writes SQLite conversation DBs, not protobuf (*.pb matches nothing)');
     assert.equal(agy.output_format, 'plain-text', 'agy has no --output-format flag');
     assert.equal(agy.input_mode, 'arg', 'agy takes its prompt via -p, not stdin');
-
-    const gemini = config.workers.find((w: any) => w.name === 'gemini');
-    assert.ok(gemini, 'gemini worker should exist in default config');
-    assert.equal(gemini.state_pattern, '*.jsonl', 'gemini-cli writes session-*.jsonl chat files');
   });
 });
 

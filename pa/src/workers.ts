@@ -8,7 +8,7 @@ import { logger } from './lib/log.js';
 import { isWorkerCoolingDown, recordRateLimit, parseRateLimitDuration, classifyRateLimit, getCooldownStatus, getWorkerCooldown, clearRateLimitCache } from './rate-limits.js';
 
 // Re-exports for backward compatibility — all existing imports from workers.js continue to work
-export { executeWorker, collectBgAlerts } from './worker-exec.js';
+export { executeWorker, collectBgAlerts, selectKillTargets } from './worker-exec.js';
 export type { BgEntry, BgAlertEntry } from './worker-exec.js';
 export { readStateTail } from './state-monitor.js';
 export { isWorkerCoolingDown, recordRateLimit, parseRateLimitDuration, classifyRateLimit, getCooldownStatus, getWorkerCooldown, clearRateLimitCache };
@@ -49,12 +49,11 @@ export interface RateLimitCheck {
 }
 
 export function isRateLimited(worker: WorkerConfig, result: CommandResult): RateLimitCheck {
-  // codex: errors come from the NDJSON stream, captured into result.error by worker-exec.
-  // gemini: API errors come from stderr (result.error). Both workers have a clean error channel
-  //         separate from agent text — never scan output for these.
+  // codex/agy: API errors come from stderr/NDJSON (result.error), a clean error channel
+  //            separate from agent text — never scan output for these.
   // claude/zclaude: rate-limit text can appear in the stream output, so scan both; but patterns
   //                 must be specific phrases seen in real errors, not broad heuristics.
-  const combined = (worker.name === 'codex' || worker.name === 'gemini' || worker.name === 'agy')
+  const combined = (worker.name === 'codex' || worker.name === 'agy')
     ? (result.error || '')
     : `${result.output}\n${result.error || ''}`;
   const lower = combined.toLowerCase();

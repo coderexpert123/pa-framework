@@ -23,7 +23,7 @@ export const orphanWorkerReapJob: MaintenanceJob = {
       note: 'The <pid>.json half is selected by SPAWNER LIVENESS, not by age — maxAgeMs above applies only to <pid>.json.tmp crash artifacts, so the dry-run preview under-reports .json candidates and never over-reports.',
     },
   ],
-  async run() {
-    return { touched: await cleanupOrphanedWorkers() };
+  async run(ctx) {
+    return { touched: await cleanupOrphanedWorkers(undefined, { now: ctx.now }) };
   },
 };

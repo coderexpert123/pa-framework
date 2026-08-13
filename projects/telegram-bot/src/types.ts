@@ -56,7 +56,7 @@ export interface ConversationTurn {
   timestamp: string;
   message_id?: number;
   thread_id?: number;   // set when archiving to identify which topic this turn came from
-  worker?: string;      // the specific model that generated this turn (e.g., 'claude', 'gemini')
+  worker?: string;      // the specific model that generated this turn (e.g., 'claude', 'agy')
   session_id?: string;  // the CLI session ID associated with this turn
   refId?: string;       // bot reply debug handle (e.g., 'c-a59a') — set on assistant turns; queryable via `pa ref`
 }
@@ -67,8 +67,8 @@ export interface PendingAction {
 }
 
 export interface SessionInfo {
-  session_id: string;  // UUID of the CLI session (Claude: JSONL filename; Gemini: UUID from session JSON)
-  worker: string;      // 'claude' or 'gemini'
+  session_id: string;  // UUID of the CLI session (Claude: JSONL filename)
+  worker: string;      // 'claude', 'zclaude', 'codex', or 'agy'
   started_at: string;  // ISO timestamp — session expires 24h after this
 }
 
@@ -97,7 +97,7 @@ export interface ConversationState {
   turns: ConversationTurn[];
   pending_action?: PendingAction;
   session?: SessionInfo;          // Active CLI session for resumption
-  preferred_worker?: string;      // 'claude' | 'gemini' | 'zclaude' — overrides config priority order
+  preferred_worker?: string;      // 'agy' | 'claude' | 'zclaude' | 'codex' — overrides config priority order
   preferred_worker_set_at?: string; // ISO timestamp when preferred_worker was set — cleared at IST midnight
   cwd_override?: string;          // absolute path — overrides BOT_CWD for all worker dispatches in this topic
   // --- Worker tunables (/llm, /effort) -------------------------------------

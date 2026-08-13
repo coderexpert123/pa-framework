@@ -117,11 +117,22 @@ pa/data/profile-history-archive.jsonl
 # /output.md added 2026-07-21: a full BRIEFING_START daily-mail-brief landed at
 # root under this new name. /error_log.txt is the same class from the error
 # side — a worker dumping a one-line provider error instead of returning it.
+# /oracle_output.txt added 2026-08-08: the oracle skill's worker dumped
+# oracle_agent.py's raw stdout (profile + newsletter briefings — real personal/
+# financial content) verbatim to a file at cwd instead of synthesizing it per
+# the skill's own step 6 ("Present the final briefing here").
+# **/glm-[0-9]* added 2026-08-13: zclaude (GLM-family models) writes its
+# response to a file NAMED AFTER THE MODEL at cwd — observed as glm-4.7,
+# glm-5.2[1m] at repo root AND in subdirs (pa/, projects/ekadashi-manager/),
+# i.e. wherever the worker's cwd happened to be. Digit-anchored so a
+# hypothetical docs/glm-guide.md stays trackable.
 /message_to_user.md
 /output.json
 /output.md
 /skill_proposals.json
 /error_log.txt
+/oracle_output.txt
+**/glm-[0-9]*
 
 # Scratch workspace — for ad-hoc / WIP / throwaway files (see scratch/README.md)
 /scratch/*

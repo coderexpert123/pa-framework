@@ -170,8 +170,8 @@ describe('evaluatePendingDispatch', () => {
     assert.equal(await wasDelivered(deliveredKey(rec.chatId, rec.threadId, rec.updateId)), true);
   });
 
-  it('sends a death notice for a gemini session (recovery is claude-family only)', async () => {
-    const rec = makeRecord({ session: { session_id: 'g-1', worker: 'gemini', started_at: T0 } });
+  it('sends a death notice for an agy session (recovery is claude-family only)', async () => {
+    const rec = makeRecord({ session: { session_id: 'g-1', worker: 'agy', started_at: T0 } });
     await addPendingDispatch(rec);
     const { deps, sent } = makeFakeDeps({});
     assert.equal(await evaluatePendingDispatch(rec, deps, FAR_DEADLINE), 'dead');
