@@ -215,7 +215,7 @@ describe('integration: at-least-once delivery', { concurrency: 1 }, () => {
     // Pre-populate topic state with a session from a previous successful message
     const existingSession: SessionInfo = {
       session_id: 'carry-off-session-xyz',
-      worker: 'gemini',
+      worker: 'agy',
       started_at: new Date().toISOString(),
     };
     const existing = await loadTopicState(chatId, threadId);

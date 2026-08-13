@@ -178,7 +178,7 @@ export interface RunOptions {
   idleTimeout?: number;
   extraArgs?: string[];
   resource?: string;   // unique identifier for the task (e.g. topicId, skillName)
-  agentName?: string;  // name of the agent (e.g. gemini, claude)
+  agentName?: string;  // name of the agent (e.g. agy, claude)
   isEvaluator?: boolean; // prevents recursive LLM evaluation of the evaluator itself
   onWorkerSwitch?: (payload: FailoverNotifyPayload) => Promise<void>;
   checkAvailable?: (worker: WorkerConfig) => Promise<boolean>;
@@ -195,6 +195,14 @@ export interface RunOptions {
   noFallback?: boolean; // when true, stop on first failure instead of continuing to next worker
   priorAttempts?: string[]; // workers that already failed before runWithFailover was invoked
   contextId?: string; // execution-context UUID; allows nested same-context blackboard lock re-entrancy
+  // AI-114: when set, stamps a harvestUntil deadline (now + this) onto the
+  // worker-pids registry entry, protecting it from cleanupOrphanedWorkers'
+  // periodic sweep (every 60s via `pa catchup`, no excludeSkills of its own)
+  // for as long as a tracked pid stays alive. Tie this to the caller's own
+  // harvest budget (e.g. the bot's orphan-dispatch reaper's REAP_MAX_WAIT_MS)
+  // plus slack — `pa run` skill dispatches leave it unset, keeping today's
+  // kill-within-60s hygiene.
+  harvestWindowMs?: number;
   bgTasksConfig?: BgTasksConfig; // BG-task alert thresholds; defaults to 300s/1800s if absent
   _bgTaskHooks?: { // injectable for tests
     getDescendantPids?: (pid: number) => Promise<Array<{ pid: number; parentPid: number }>>;
@@ -220,13 +228,13 @@ export interface SkillFrontmatter {
   idle_timeout?: number;  // max seconds of silence before kill (default DEFAULT_IDLE_TIMEOUT)
   trigger_description?: string;  // LLM-readable description of when to fire this skill from a brief
   inject_triggers?: boolean;     // if true, inject all other skills' trigger_descriptions into this skill's prompt
-  worker?: string;               // preferred worker for this skill (e.g. "claude", "gemini", "zclaude")
+  worker?: string;               // preferred worker for this skill (e.g. "claude", "agy", "zclaude")
   no_fallback?: boolean;         // when true, don't failover to other workers on failure
   cmd?: string;                  // direct shell command to execute (bypasses LLM if set)
   topic?: string;                // optional custom topic name for partitioning (replaces queue/priority)
   telegram_output?: TelegramOutput; // if set, pa run delivers LLM output to this Telegram chat/thread
   critical?: boolean;            // if true, self-improver never autonomously approves changes targeting this skill
-  worker_args?: string[];        // extra CLI args appended to the worker command for THIS skill only (e.g. gemini --include-directories to widen its file-tool workspace beyond the shim-forced repo cwd). Merged ahead of run-time extraArgs.
+  worker_args?: string[];        // extra CLI args appended to the worker command for THIS skill only (e.g. agy --include-directories to widen its file-tool workspace beyond the shim-forced repo cwd). Merged ahead of run-time extraArgs.
   exclusive_resource?: string;   // when set, pa run serializes this skill against every OTHER skill declaring the same resource name via a blackboard lock (e.g. "git-workflow" for commit/push/push-public/investigate-flagged, which all mutate the same working tree). Do NOT set this on a skill that itself invokes `pa run` on another skill declaring the same resource — the child would deadlock waiting for the parent's own lock.
 }
 

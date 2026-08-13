@@ -157,7 +157,6 @@ _PLACEHOLDER_SECRET_VALUES = re.compile(
 # a script, a test fixture, or a FILENAME" class that leaked in 2026-07.
 # Ambiguous English words (axis, chase, discover, ally, mint, wise, target)
 # are intentionally EXCLUDED — a false CI failure trains people to ignore it.
-# pii-scan:ignore-start
 _FINANCIAL_INSTITUTIONS = (
     "hdfc", "icici", "kotak", "indusind", "idfc", "yesbank", "canara",
     "andhra bank", "bank of baroda", "punjab national", "federal bank",
@@ -175,7 +174,6 @@ _FINANCIAL_INSTITUTIONS = (
     "razorpay", "payu", "billdesk", "phonepe", "paytm", "bharatpe",
     "policybazaar", "bajaj finserv", "bajaj finance", "cred\\.club",
 )
-# pii-scan:ignore-end
 
 _CLASS_DEFS: list[tuple[str, str, str, int]] = [
     # (class name, regex, scope: content|path|both, extra re flags)

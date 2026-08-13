@@ -1,10 +1,24 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { homedir, tmpdir } from 'os';
 import { join } from 'path';
-import { log, flushLog } from '../src/lib/log.js';
+import {
+  log,
+  flushLog,
+  getLogWriteFailureCount,
+  resetLogWriteFailureCountForTests,
+} from '../src/lib/log.js';
+// proper-lockfile is a CJS package: `import lockfile from 'proper-lockfile'`
+// resolves to the exact `module.exports` object (Node's CJS/ESM default-import
+// interop), which is a plain mutable JS object/function — the SAME singleton
+// instance log.ts imports (Node module cache, keyed by resolved path). That
+// lets these tests force the primary locked write to fail deterministically
+// by swapping out `.lock` for the duration of one test, instead of racing a
+// real lock (proper-lockfile's default retry backoff is exponential and would
+// make a real-contention test take 30+ seconds).
+import lockfileModule from 'proper-lockfile';
 
 const APP_LOG = 'app.log.jsonl';
 
@@ -211,5 +225,127 @@ describe('lib/log PA_TEST_LOG_HOME backstop', { concurrency: 1 }, () => {
     const written = await readFile(join(ownHome, APP_LOG), 'utf8');
     assert.match(written, /no signal, no redirect/);
     assert.equal(existsSync(join(redirectHome, APP_LOG)), false, 'nothing may be redirected without the signal');
+  });
+});
+
+// AI-111 regression suite: on 2026-08-08 two successful voice transcriptions
+// produced zero log trace in ~/.pa/app.log.jsonl — traced to appendLogInner's
+// lock acquisition failing (retry budget exhausted under contention) and the
+// entry being silently dropped by the outer .catch(() => {}). These tests
+// cover the fix: an unlocked fallback write, a last-resort console.error when
+// even that fails, and an observable failure counter.
+describe('lib/log AI-111 fallback on locked-write failure', { concurrency: 1 }, () => {
+  let tmp: string;
+  let originalHome: string | undefined;
+  let originalConsoleLog: typeof console.log;
+  let originalConsoleError: typeof console.error;
+  let originalLock: typeof lockfileModule.lock;
+  let consoleErrorCalls: unknown[][];
+
+  beforeEach(async () => {
+    originalHome = process.env.PA_HOME;
+    tmp = await mkdtemp(join(tmpdir(), 'pa-log-fallback-'));
+    process.env.PA_HOME = tmp;
+    await flushLog();
+    resetLogWriteFailureCountForTests();
+
+    originalLock = lockfileModule.lock;
+    originalConsoleLog = console.log;
+    originalConsoleError = console.error;
+    consoleErrorCalls = [];
+    console.log = () => {};
+    console.error = (...args: unknown[]) => {
+      consoleErrorCalls.push(args);
+    };
+  });
+
+  afterEach(async () => {
+    lockfileModule.lock = originalLock;
+    console.log = originalConsoleLog;
+    console.error = originalConsoleError;
+    await flushLog();
+    if (originalHome === undefined) delete process.env.PA_HOME;
+    else process.env.PA_HOME = originalHome;
+    await rm(tmp, { recursive: true, force: true });
+    resetLogWriteFailureCountForTests();
+  });
+
+  it('resetLogWriteFailureCountForTests / getLogWriteFailureCount start at 0', () => {
+    assert.equal(getLogWriteFailureCount(), 0);
+  });
+
+  it('regression: normal log() + flushLog() still writes a valid JSON line (unchanged happy path)', async () => {
+    log('info', 'log-test', 'happy path unaffected by AI-111 fix');
+    await flushLog();
+
+    const written = await readFile(join(tmp, APP_LOG), 'utf8');
+    const line = written.split('\n').filter(Boolean)[0];
+    const parsed = JSON.parse(line);
+    assert.equal(parsed.message, 'happy path unaffected by AI-111 fix');
+    assert.equal(getLogWriteFailureCount(), 0, 'the locked path succeeded — no fallback should have run');
+  });
+
+  it('falls back to an unlocked append when the locked write fails, and the entry still lands in the log', async () => {
+    lockfileModule.lock = async () => {
+      throw new Error('simulated lock contention (retry budget exhausted)');
+    };
+
+    log('info', 'log-test', 'rescued by the unlocked fallback');
+    await flushLog();
+
+    const written = await readFile(join(tmp, APP_LOG), 'utf8');
+    assert.match(written, /rescued by the unlocked fallback/);
+    assert.equal(getLogWriteFailureCount(), 1, 'the primary locked write failed exactly once');
+  });
+
+  it('caller never throws when the locked write fails — logger.info() still returns synchronously', async () => {
+    lockfileModule.lock = async () => {
+      throw new Error('simulated lock contention');
+    };
+
+    assert.doesNotThrow(() => {
+      log('info', 'log-test', 'must not throw even though the primary path will fail');
+    });
+    await flushLog();
+    assert.equal(getLogWriteFailureCount(), 1);
+  });
+
+  it('when BOTH the locked write and the unlocked fallback fail, nothing throws, the counter still increments, and the loss is surfaced via console.error', async () => {
+    // Make PA_HOME resolve to a path that cannot be used as a directory: a
+    // regular file sitting exactly where app.log.jsonl's parent directory
+    // needs to be. Both ensureLogFile's mkdir (in the locked path) AND the
+    // fallback's mkdir/appendFile fail identically (ENOTDIR/EEXIST), so this
+    // exercises "both paths fail" without mocking fs/promises directly.
+    const blockedHome = join(tmp, 'blocked-home');
+    await writeFile(blockedHome, 'i am a file, not a directory', 'utf8');
+    process.env.PA_HOME = blockedHome;
+
+    assert.doesNotThrow(() => {
+      log('error', 'log-test', 'this entry cannot be written anywhere');
+    });
+    await flushLog();
+
+    assert.equal(getLogWriteFailureCount(), 1, 'the primary write failed once (fallback attempted, also failed)');
+    assert.ok(
+      consoleErrorCalls.some((args) =>
+        String(args[0]).includes('DROPPED log entry') && String(args[0]).includes('this entry cannot be written anywhere')
+      ),
+      `expected a console.error call reporting the dropped entry, got: ${JSON.stringify(consoleErrorCalls)}`
+    );
+  });
+
+  it('flushLog() resolves only after the fallback attempt (and its failure logging) has settled', async () => {
+    lockfileModule.lock = async () => {
+      throw new Error('simulated lock contention');
+    };
+
+    log('info', 'log-test', 'flush must wait for the fallback');
+    await flushLog();
+
+    // If flushLog() had resolved before the fallback's async appendFile
+    // completed, this read could race it. Reading synchronously right after
+    // flushLog() and finding the line proves the fallback had already settled.
+    const written = await readFile(join(tmp, APP_LOG), 'utf8');
+    assert.match(written, /flush must wait for the fallback/);
   });
 });

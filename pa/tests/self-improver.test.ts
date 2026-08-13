@@ -39,6 +39,7 @@ function makeLockFake(opts: { acquire?: boolean } = {}): { bb: BlackboardLockCli
     },
     updateHeartbeat: async () => {
       state.heartbeatCalls++;
+      return true;
     },
     releaseLock: async () => {
       state.releaseCalls++;

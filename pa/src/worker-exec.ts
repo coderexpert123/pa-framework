@@ -9,7 +9,7 @@ import { blackboard } from './blackboard.js';
 import { resolveStateDir, getLatestStateMtime, analyzeAgentState } from './state-monitor.js';
 import { hasChildProcesses, killProcessTree, getDescendantPids, getCommandLines, areProcessesAlive } from './process-tree.js';
 import { evaluateWorkerState } from './worker-evaluator.js';
-import { addWorkerPid, removeWorkerPid, updateWorkerPidDescendants } from './worker-pids.js';
+import { addWorkerPid, removeWorkerPid, updateWorkerPidDescendants, isProcessAlive } from './worker-pids.js';
 import { logger } from './lib/log.js';
 import { notifyUser } from './lib/notify.js';
 import { getSkillTranslationPatterns } from './lib/skill-translations.js';
@@ -98,6 +98,29 @@ async function writeTempPrompt(prompt: string): Promise<string> {
   const tmpPath = join(tmpdir(), `pa-prompt-${id}.txt`);
   await writeFile(tmpPath, prompt, 'utf8');
   return tmpPath;
+}
+
+/**
+ * Which PIDs a kill should actually target: the wrapper (`rootPid`) plus every
+ * live tracked descendant, deduped, root-first. Deliberately does NOT bail out
+ * when the root is dead — a dead wrapper with a live descendant is exactly the
+ * AI-112 bug (shell:true wrapper dies/gets killed while the real CLI child it
+ * spawned keeps running), so a live descendant must still be returned.
+ */
+export function selectKillTargets(
+  rootPid: number | undefined,
+  descendants: number[],
+  alive: (pid: number) => boolean = isProcessAlive
+): number[] {
+  if (rootPid === undefined) return [];
+  const seen = new Set<number>();
+  const targets: number[] = [];
+  for (const pid of [rootPid, ...descendants]) {
+    if (seen.has(pid)) continue;
+    seen.add(pid);
+    if (alive(pid)) targets.push(pid);
+  }
+  return targets;
 }
 
 export async function executeWorker(
@@ -245,6 +268,10 @@ export async function executeWorker(
         windowsHide: true,
       });
 
+      // Hoisted above the kill helpers below (AI-112) — killWorkerTree reads
+      // bgTaskMap, so declaring it after them would be a TDZ error.
+      const bgTaskMap = new Map<number, BgEntry>();
+
       pidTracked = child.pid
         ? addWorkerPid({
             pid: child.pid,
@@ -252,7 +279,14 @@ export async function executeWorker(
             worker: worker.name,
             skill: options.resource || 'unknown',
             startedAt: new Date().toISOString(),
-          }).catch(() => {})
+            ...(options.harvestWindowMs
+              ? { harvestUntil: new Date(Date.now() + options.harvestWindowMs).toISOString() }
+              : {}),
+          }).catch((err) => {
+            logger.warn('worker-pids', 'Failed to register worker pid', {
+              pid: child.pid, worker: worker.name, error: String(err),
+            });
+          })
         : undefined;
 
       // Handle prompt injection via stdin
@@ -282,9 +316,28 @@ export async function executeWorker(
       const mergeKillError = (reason: string) =>
         codexStreamError ? `${reason}\n${codexStreamError}` : reason;
 
+      // Kills the wrapper PID (child.pid) AND every live tracked descendant
+      // (bgTaskMap — refreshed each heartbeat from the real OS process tree).
+      // AI-112: the wrapper can die/be killed while the real CLI child it
+      // spawned keeps running (shell:true always spawns a wrapper), so killing
+      // only child.pid left that child alive while done() still deregistered
+      // the worker-pids row unconditionally — /stop looked like it worked but
+      // did nothing to the actual process.
+      const killWorkerTree = (reason: string) => {
+        const targets = selectKillTargets(child.pid, [...bgTaskMap.keys()]);
+        const level = reason === 'evaluator-done' ? 'info' : 'warn';
+        logger[level]('worker-exec', 'Killing worker tree', {
+          worker: worker.name, resource, pid: child.pid, targets, tracked: bgTaskMap.size,
+        });
+        if (targets.length > 0) {
+          for (const pid of targets) killProcessTree(pid);
+        } else if (!child.pid) {
+          child.kill();
+        }
+      };
+
       const killWithMessage = (reason: string) => {
-        if (child.pid) killProcessTree(child.pid);
-        else child.kill();
+        killWorkerTree(reason);
         done({
           success: false,
           output: stdout,
@@ -295,8 +348,7 @@ export async function executeWorker(
       };
 
       const killWithSummary = (reason: string, summary: string) => {
-        if (child.pid) killProcessTree(child.pid);
-        else child.kill();
+        killWorkerTree(reason);
         done({
           success: false,
           output: stdout,
@@ -308,8 +360,7 @@ export async function executeWorker(
       };
 
       const killWithSuccess = (summary: string) => {
-        if (child.pid) killProcessTree(child.pid);
-        else child.kill();
+        killWorkerTree('evaluator-done');
         done({
           success: true,
           output: stdout || summary,
@@ -420,8 +471,6 @@ export async function executeWorker(
       const bgNotify = bgHooks.notifyUser ?? notifyUser;
       const heartbeatMs = bgHooks.heartbeatIntervalMs ?? 30_000;
       const startedAt = Date.now();
-
-      const bgTaskMap = new Map<number, BgEntry>();
 
       // Periodic heartbeat: checks process tree AND state file mtime
       const heartbeatInterval = setInterval(() => {
@@ -584,9 +633,9 @@ export async function executeWorker(
                 }
               }
 
-              // Tool boundary tracking (Gemini): record stdout position after each tool_result
+              // Tool boundary tracking (agy): record stdout position after each tool_result
               // so we can discard intermediate planning narration on exit.
-              if (event.type === 'tool_result' && (worker.name === 'gemini' || worker.name === 'agy')) {
+              if (event.type === 'tool_result' && worker.name === 'agy') {
                 lastToolBoundary = stdout.length;
               }
 
@@ -671,7 +720,7 @@ export async function executeWorker(
             }
             if (event.type === 'item.completed' && event.item?.type === 'agent_message' && event.item?.text) {
               stdout += event.item.text;
-            } else if (event.type === 'tool_result' && (worker.name === 'gemini' || worker.name === 'agy')) {
+            } else if (event.type === 'tool_result' && worker.name === 'agy') {
               lastToolBoundary = stdout.length;
             } else if (event.type === 'result' && event.result) {
               stdout = event.result;
@@ -692,7 +741,7 @@ export async function executeWorker(
           }
         }
 
-        // Gemini tool-boundary trim: discard all content accumulated before the last
+        // agy tool-boundary trim: discard all content accumulated before the last
         // tool_result. This strips intermediate planning narration from multi-step
         // tool-use conversations, keeping only the final response segment.
         //
@@ -703,7 +752,7 @@ export async function executeWorker(
         // deletes the model's entire output. That is the likeliest explanation for the
         // 0-byte ~/.pa/logs/oracle/20260717-081242-b56c4e.log after a 436s run recorded
         // as success. It became actively dangerous once run.ts started treating empty
-        // stdout from a telegram_output skill as a hard failure: a CORRECT gemini/agy
+        // stdout from a telegram_output skill as a hard failure: a CORRECT agy
         // run would be scored a failure, and three of those in a row park the skill via
         // the AI-098 backoff and page the user — a self-inflicted outage. A NO_OUTPUT
         // sentinel in the skill prompt cannot defend against this, because the trim
@@ -714,7 +763,7 @@ export async function executeWorker(
         // from '' — and whitespace is not a final response segment worth paying the
         // whole output for. Runs that DID emit text after the last tool call are
         // unaffected; they trim exactly as before.
-        if ((worker.name === 'gemini' || worker.name === 'agy') && lastToolBoundary > 0) {
+        if (worker.name === 'agy' && lastToolBoundary > 0) {
           const trimmed = stdout.slice(lastToolBoundary);
           if (trimmed.trim()) stdout = trimmed;
         }

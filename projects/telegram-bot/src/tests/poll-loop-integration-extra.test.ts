@@ -38,7 +38,7 @@ workers:
     command: node
     args: ["-e", "process.stdout.write('ok')"]
     check: node -e "process.exit(0)"
-  - name: gemini
+  - name: agy
     command: node
     args: ["-e", "process.stdout.write('ok')"]
     check: node -e "process.exit(0)"
@@ -73,7 +73,7 @@ topic_defaults:
                 message_id: 10,
                 chat: { id: 123, type: 'private' },
                 date: Math.floor(Date.now() / 1000),
-                text: '/default gemini',
+                text: '/default agy',
               },
             }] }),
             json: async () => ({ ok: true, result: [{
@@ -82,7 +82,7 @@ topic_defaults:
                 message_id: 10,
                 chat: { id: 123, type: 'private' },
                 date: Math.floor(Date.now() / 1000),
-                text: '/default gemini',
+                text: '/default agy',
               },
             }] }),
           };
@@ -111,7 +111,7 @@ topic_defaults:
     assert.ok(pinCalls.some(c => c.includes('200')), 'should pin new card');
 
     const saved = JSON.parse(await readFile(topicStateFile, 'utf8')) as ConversationState;
-    assert.equal(saved.model_status?.current_worker, 'gemini');
+    assert.equal(saved.model_status?.current_worker, 'agy');
     assert.equal(saved.model_status?.reason_code, 'default_changed');
     assert.equal(saved.pinned_status_message_id, 200);
   });
@@ -125,7 +125,7 @@ topic_defaults:
       chat_id: 123,
       thread_id: 0,
       turns: [{ role: 'user', text: 'hello' }],
-      preferred_worker: 'gemini',
+      preferred_worker: 'agy',
       pinned_status_message_id: 100
     };
     await writeFile(topicStateFile, JSON.stringify(topicState), 'utf8');
@@ -272,13 +272,13 @@ topic_defaults:
       thread_id: 0,
       turns: [],
       model_status: {
-        current_worker: 'gemini',
+        current_worker: 'agy',
         default_worker: 'claude',
         reason_code: 'failover',
         reason_text: 'Temporary failover',
         changed_at: new Date().toISOString()
       },
-      pinned_worker: 'gemini',
+      pinned_worker: 'agy',
       pinned_status_message_id: 100
     };
     await writeFile(topicStateFile, JSON.stringify(topicState), 'utf8');
@@ -404,7 +404,7 @@ topic_defaults:
   it('/effort on a worker that declares no effort is rejected with what it DOES support', async () => {
     await writeFile(join(tempDir, 'config.yaml'), `
 workers:
-  - name: gemini
+  - name: agy
     command: node
     args: ["-e", "process.exit(3)"]
     check: node -e "process.exit(0)"
@@ -412,7 +412,7 @@ workers:
       model:
         args: ["--model", "{value}"]
 topic_defaults:
-  "123_0": "gemini"
+  "123_0": "agy"
 `, 'utf8');
 
     const topicStateFile = join(tempDir, 'telegram-bot-topic-123_0.json');
@@ -422,7 +422,7 @@ topic_defaults:
     await runOneUpdate('/effort high', fetchLog);
 
     const sent = fetchLog.filter((u) => u.includes('sendMessage'));
-    assert.ok(sent.some((c) => c.includes('no setting called') && c.includes('model')), 'reply should name what gemini supports');
+    assert.ok(sent.some((c) => c.includes('no setting called') && c.includes('model')), 'reply should name what agy supports');
 
     const saved = JSON.parse(await readFile(topicStateFile, 'utf8')) as ConversationState;
     assert.equal(saved.tunable_overrides, undefined, 'a rejected knob stores nothing');

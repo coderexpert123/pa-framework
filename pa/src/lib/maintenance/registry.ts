@@ -9,19 +9,40 @@ import { weeklyLearnJob } from './jobs/weekly-learn.js';
 import { sessionGcJob } from './jobs/session-gc.js';
 import { voiceAttachmentGcJob } from './jobs/voice-attachment-gc.js';
 import { reservationGcJob } from './jobs/reservation-gc.js';
+import { botLogRotationCheckJob } from './jobs/bot-log-rotation-check.js';
+import { modelOverrideSweepJob } from './jobs/model-override-sweep.js';
+import { deliveredStoreCompactJob } from './jobs/delivered-store-compact.js';
+import { proxyPoolRefreshJob } from './jobs/proxy-pool-refresh.js';
+import { dlqFlushJob } from './jobs/dlq-flush.js';
+import { groundingCheckJob } from './jobs/grounding-check.js';
 
-/** THE single declared table. Every destructive path literal in this codebase
- *  lives under this directory — that is the point of the construct. */
+/** THE single declared table. Every declared maintenance job across pa and bot hosts
+ *  lives under this array — that is the point of the construct. */
 export const MAINTENANCE_JOBS: readonly MaintenanceJob[] = [
-  orphanWorkerReapJob, blackboardPurgeJob, stalenessCheckJob, skillLogRotateJob,
-  archivePruneJob, alertStateGcJob, weeklyLearnJob, sessionGcJob, voiceAttachmentGcJob,
+  // pa-host jobs
+  orphanWorkerReapJob,
+  blackboardPurgeJob,
+  stalenessCheckJob,
+  skillLogRotateJob,
+  archivePruneJob,
+  alertStateGcJob,
+  weeklyLearnJob,
+  sessionGcJob,
+  voiceAttachmentGcJob,
   reservationGcJob,
+  // bot-host jobs
+  botLogRotationCheckJob,
+  modelOverrideSweepJob,
+  deliveredStoreCompactJob,
+  proxyPoolRefreshJob,
+  groundingCheckJob,
+  dlqFlushJob,
 ];
 
 export function jobsForHost(host: MaintenanceHost): MaintenanceJob[] {
-  return MAINTENANCE_JOBS.filter(j => j.host === host);
+  return MAINTENANCE_JOBS.filter((j) => j.host === host);
 }
 
 export function findJob(name: string): MaintenanceJob | undefined {
-  return MAINTENANCE_JOBS.find(j => j.name === name);
+  return MAINTENANCE_JOBS.find((j) => j.name === name);
 }

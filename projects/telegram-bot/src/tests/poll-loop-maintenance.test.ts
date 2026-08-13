@@ -230,7 +230,7 @@ describe('runPollLoop: maintenance drain ordering (AI-100 Wave 2)', { concurrenc
       chat_id: 123,
       thread_id: 0,
       turns: [],
-      preferred_worker: 'gemini',
+      preferred_worker: 'agy',
       preferred_worker_set_at: yesterday,
       pinned_status_message_id: 42,
     };

@@ -21,7 +21,7 @@ describe('formatFailoverMessage — rate-limit variant', () => {
   it('includes classification, from, to, minutes, and IST reset time', () => {
     const msg = formatFailoverMessage({
       from: 'claude',
-      to: 'gemini',
+      to: 'agy',
       kind: 'rate-limit',
       reasonText: 'Usage limit reached for 5 hour',
       minutes: 47,
@@ -30,7 +30,7 @@ describe('formatFailoverMessage — rate-limit variant', () => {
       resetsAtIST: '2026-04-15 21:43 IST',
     });
     assert.ok(msg.includes('claude'), 'from worker');
-    assert.ok(msg.includes('gemini'), 'to worker');
+    assert.ok(msg.includes('agy'), 'to worker');
     assert.ok(msg.includes('usage-limit-session'), 'classification');
     assert.ok(msg.includes('47 min'), 'cooldown minutes');
     assert.ok(msg.includes('21:43 IST'), 'resume time');
@@ -40,7 +40,7 @@ describe('formatFailoverMessage — rate-limit variant', () => {
 
   it('unknown classification annotates duration as default/unparseable', () => {
     const msg = formatFailoverMessage({
-      from: 'gemini',
+      from: 'agy',
       to: 'codex',
       kind: 'rate-limit',
       reasonText: '429 RESOURCE_EXHAUSTED',
@@ -55,7 +55,7 @@ describe('formatFailoverMessage — rate-limit variant', () => {
 
   it('computes resumesAt from minutes when resetsAtIST is absent', () => {
     const msg = formatFailoverMessage({
-      from: 'gemini',
+      from: 'agy',
       to: 'codex',
       kind: 'rate-limit',
       reasonText: 'x',
@@ -84,13 +84,13 @@ describe('formatFailoverMessage — unavailable variant', () => {
   it('mentions unavailability and reason text', () => {
     const msg = formatFailoverMessage({
       from: 'zclaude',
-      to: 'gemini',
+      to: 'agy',
       kind: 'unavailable',
       reasonText: 'zclaude check failed or script missing',
     });
     assert.ok(msg.includes('zclaude'));
     assert.ok(msg.includes('unavailable'));
-    assert.ok(msg.includes('gemini'));
+    assert.ok(msg.includes('agy'));
     assert.ok(msg.includes('check failed'));
   });
 });
@@ -197,7 +197,7 @@ describe('formatFailoverMessage — raw code-fence fallback', () => {
   it('includes raw code-fence when classification is unknown', () => {
     const msg = formatFailoverMessage({
       from: 'zclaude',
-      to: 'gemini',
+      to: 'agy',
       kind: 'rate-limit',
       reasonText: 'some error',
       minutes: 2,
@@ -212,7 +212,7 @@ describe('formatFailoverMessage — raw code-fence fallback', () => {
   it('omits raw code-fence when minutes and resetsAtIST are both present', () => {
     const msg = formatFailoverMessage({
       from: 'zclaude',
-      to: 'gemini',
+      to: 'agy',
       kind: 'rate-limit',
       reasonText: 'usage-limit',
       minutes: 3000,

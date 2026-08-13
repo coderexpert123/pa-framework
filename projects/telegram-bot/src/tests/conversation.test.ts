@@ -251,7 +251,7 @@ describe('saveState round-trip', () => {
   it('persists session info through save/load', async () => {
     const state = makeState();
     const started_at = new Date().toISOString();
-    state.session = { session_id: 'aaaa-bbbb-cccc', worker: 'gemini', started_at };
+    state.session = { session_id: 'aaaa-bbbb-cccc', worker: 'agy', started_at };
     await saveState(state);
 
     const loaded = await loadState(123);
@@ -600,7 +600,7 @@ describe('preferred_worker persistence', () => {
 
   it('clears preferred_worker when saved as undefined', async () => {
     const state = makeState();
-    state.preferred_worker = 'gemini';
+    state.preferred_worker = 'agy';
     await saveState(state);
     state.preferred_worker = undefined;
     await saveState(state);
@@ -729,7 +729,7 @@ describe('saveTopicState', () => {
     // Verifies the crash carry-off building block: processUpdate calls saveTopicState
     // twice — once immediately after dispatch (session only), once at the end (turns +
     // pending_action). Both the session and the assistant turn must survive.
-    const session = { session_id: 'abc-123', worker: 'gemini', started_at: new Date().toISOString() };
+    const session = { session_id: 'abc-123', worker: 'agy', started_at: new Date().toISOString() };
     const state = await loadTopicState(123, 5);
     state.session = session;
 
@@ -743,7 +743,7 @@ describe('saveTopicState', () => {
     // Reload and verify both session AND turn survived the double-save
     const loaded = await loadTopicState(123, 5);
     assert.equal(loaded.session?.session_id, 'abc-123', 'session_id must survive double-save');
-    assert.equal(loaded.session?.worker, 'gemini', 'session worker must survive double-save');
+    assert.equal(loaded.session?.worker, 'agy', 'session worker must survive double-save');
     assert.equal(loaded.turns.length, 1, 'assistant turn must be present after final save');
     assert.equal(loaded.turns[0].text, 'response text', 'assistant turn text must match');
   });

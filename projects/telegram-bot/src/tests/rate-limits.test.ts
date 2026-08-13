@@ -81,9 +81,9 @@ describe('recordRateLimit + isWorkerCoolingDown', () => {
 
   it('defaults to 2-min cooldown when no duration specified', async () => {
     await resetState();
-    await recordRateLimit('gemini');
+    await recordRateLimit('agy');
     const status = await getCooldownStatus();
-    const entry = status['gemini'];
+    const entry = status['agy'];
     assert.ok(entry, 'entry should exist');
     const cooldownUntil = new Date(entry.cooldown_until);
     const expectedMin = new Date(Date.now() + 1 * 60 * 1000);
@@ -117,10 +117,10 @@ describe('rate-limit file persistence', () => {
   it('getCooldownStatus returns all active cooldowns', async () => {
     await resetState();
     await recordRateLimit('claude', 30, 'test1');
-    await recordRateLimit('gemini', 20, 'test2');
+    await recordRateLimit('agy', 20, 'test2');
     const status = await getCooldownStatus();
     assert.ok(status['claude'], 'claude should be in status');
-    assert.ok(status['gemini'], 'gemini should be in status');
+    assert.ok(status['agy'], 'agy should be in status');
   });
 });
 

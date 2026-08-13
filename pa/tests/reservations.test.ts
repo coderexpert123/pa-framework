@@ -252,12 +252,16 @@ describe('reservations', () => {
   });
 
   describe('reservationGcJob (maintenance job shape)', () => {
-    it('declares destructive:true, exactly one target, a fail-closed match, and a call-time resolve()', async () => {
+    it('declares destructive:true, its two targets (reservation rows + stale ~/.pa/*.tmp), fail-closed matches, and call-time resolve()', async () => {
       const { reservationGcJob } = await import('../src/lib/maintenance/jobs/reservation-gc.js');
       const { paHome } = await import('../src/paths.js');
 
       assert.equal(reservationGcJob.destructive, true);
-      assert.equal(reservationGcJob.targets.length, 1);
+      // Target 1: the reservation registry (row-level TTL expiry).
+      // Target 2: the stale atomic-write .tmp sweep in ~/.pa/ itself
+      // (added 2026-08-09 alongside cleanStaleTmpFiles — update this count
+      // if the job legitimately grows more targets).
+      assert.equal(reservationGcJob.targets.length, 2);
 
       const target = reservationGcJob.targets[0];
       assert.equal(target.match.test('reservations.json'), true);
@@ -278,6 +282,16 @@ describe('reservations', () => {
         await cleanup(otherHome);
         process.env.PA_HOME = dir;
       }
+
+      // Second target: the stale-tmp sweep declares the PA_HOME directory
+      // itself, matches ONLY *.tmp filenames, and ages out at 1h (well past
+      // any in-flight atomic write's lifetime, so a live write is never swept).
+      const tmpTarget = reservationGcJob.targets[1];
+      assert.equal(tmpTarget.resolve(), paHome());
+      assert.equal(tmpTarget.match.test('maintenance-state.json.abc-123.tmp'), true);
+      assert.equal(tmpTarget.match.test('maintenance-state.json'), false);
+      assert.equal(tmpTarget.match.test('config.yaml'), false);
+      assert.equal(tmpTarget.maxAgeMs, 3_600_000);
     });
   });
 });

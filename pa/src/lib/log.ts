@@ -62,6 +62,14 @@ function getLogFile(): string {
 
 let appendQueue: Promise<void> = Promise.resolve();
 
+// Count of primary (locked) write failures — incremented whenever
+// appendLogInner rejects (lock-retry exhaustion, ensureLogFile failure,
+// rotate failure, etc.), regardless of whether the unlocked fallback below
+// then succeeds. Exported so tests can assert the fallback path actually ran
+// without scraping stderr. See getLogWriteFailureCount/
+// resetLogWriteFailureCountForTests below.
+let logWriteFailureCount = 0;
+
 async function ensureLogFile(path: string): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, '', { flag: 'wx' }).catch((err: any) => {
@@ -77,6 +85,37 @@ async function appendLogInner(logFile: string, line: string): Promise<void> {
     await appendFile(logFile, line, 'utf8');
   } finally {
     await release();
+  }
+}
+
+/**
+ * Last-resort UNLOCKED write, used only when the locked path
+ * (appendLogInner) has already failed — e.g. lock-retry exhaustion under
+ * contention from the bot + per-minute scheduled-task children hammering the
+ * same app.log.jsonl (AI-111: two voice-transcription log lines vanished with
+ * zero trace in production on 2026-08-08, traced to exactly this swallowed
+ * failure). Accepts a small risk of interleaved writes under rare contention
+ * — strictly better than losing the line entirely, since this is a
+ * forensic/diagnostic log, not a source of truth requiring strict ordering.
+ *
+ * If even this fails, the entry is genuinely unrecoverable — surface it
+ * loudly via a direct console.error (NEVER logger/log() here: logging
+ * through this same module would recurse, exactly as safe-lock.ts's
+ * onCompromised handler already documents for the same reason). Only a
+ * bounded slice of the entry (timestamp/module/message) is printed, not
+ * arbitrary context, to keep stderr output bounded.
+ */
+async function appendLogFallback(logFile: string, line: string, entry: LogEntry): Promise<void> {
+  logWriteFailureCount++;
+  try {
+    await mkdir(dirname(logFile), { recursive: true });
+    await appendFile(logFile, line, 'utf8');
+  } catch (fallbackErr: any) {
+    const reason = fallbackErr?.message ?? String(fallbackErr);
+    console.error(
+      `[log] DROPPED log entry — locked write failed and unlocked fallback also failed (${reason}): ` +
+      `${entry.timestamp} [${entry.module}] ${entry.message}`
+    );
   }
 }
 
@@ -96,9 +135,10 @@ function appendLog(entry: LogEntry): void {
   appendQueue = appendQueue
     .catch(() => {})
     .then(() => appendLogInner(logFile, line))
-    .catch(() => {
-      // Swallow write errors — logging must never crash the caller
-    });
+    .catch(() => appendLogFallback(logFile, line, entry));
+  // appendLogFallback never rejects (it wraps its own try/catch), so this
+  // chain — and therefore flushLog() — still never rejects and never throws
+  // back to the caller, matching the pre-existing swallow contract.
 }
 
 /**
@@ -113,6 +153,22 @@ function appendLog(entry: LogEntry): void {
  */
 export function flushLog(): Promise<void> {
   return appendQueue.catch(() => {});
+}
+
+/**
+ * Number of times the primary locked write (appendLogInner) has failed since
+ * process start (or the last resetLogWriteFailureCountForTests() call),
+ * regardless of whether the unlocked fallback then recovered the entry.
+ * AI-111: makes the fallback path observable/testable without scraping
+ * stderr for the console.error diagnostic.
+ */
+export function getLogWriteFailureCount(): number {
+  return logWriteFailureCount;
+}
+
+/** Test-only reset for getLogWriteFailureCount(). */
+export function resetLogWriteFailureCountForTests(): void {
+  logWriteFailureCount = 0;
 }
 
 const LEVEL_PREFIX: Record<LogLevel, string> = {

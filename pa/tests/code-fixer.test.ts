@@ -256,6 +256,7 @@ function makeLockFake(
     updateHeartbeat: async (resource: string) => {
       state.heartbeatCalls++;
       calls.push({ command: `lock-heartbeat:${resource}` });
+      return true;
     },
     releaseLock: async (resource: string) => {
       state.releaseCalls++;

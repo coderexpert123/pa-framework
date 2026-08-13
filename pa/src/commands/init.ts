@@ -40,29 +40,6 @@ workers:
         values: [low, medium, high, xhigh, max]
         description: "Effort level for the session (Claude Code 2.x --effort)."
 
-  - name: gemini
-    command: gemini
-    args: ["--yolo", "--output-format", "stream-json"]
-    input_mode: stdin-text
-    output_format: stream-json
-    check: gemini --version
-    check_timeout: 10
-    rate_limit_patterns:
-      - "RESOURCE_EXHAUSTED"
-      - "quota"
-      - "rate limit"
-      - "429"
-      - "Resource exhausted"
-    priority: 3
-    state_dir: "~/.gemini/tmp/personal-assistant/chats"
-    state_pattern: "*.jsonl"   # gemini-cli writes session-<ts>-<id>.jsonl here (verified 2026-07-22)
-    # gemini-cli has -m/--model and NO reasoning-effort flag, so no effort knob
-    # here — the bot uses that absence to explain why /effort is unavailable.
-    tunables:
-      model:
-        args: ["--model", "{value}"]
-        description: "Model name (e.g. gemini-2.5-pro)."
-
   - name: codex
     command: codex
     args: ["exec", "--dangerously-bypass-approvals-and-sandbox", "--color", "never", "--json", "-"]

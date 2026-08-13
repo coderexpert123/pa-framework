@@ -13,7 +13,7 @@ let sharedTempDir: string;
 const BASE_CONFIG = {
   workers: [
     { name: 'claude', priority: 1, command: 'c', args: [], check: 'c', rate_limit_patterns: [] },
-    { name: 'gemini', priority: 2, command: 'g', args: [], check: 'c', rate_limit_patterns: [] }
+    { name: 'agy', priority: 2, command: 'g', args: [], check: 'c', rate_limit_patterns: [] }
   ]
 };
 
@@ -73,7 +73,7 @@ describe('Dashboard', () => {
     assert.ok(content.includes('Keep-awake**: on since 15:30 IST'));
     assert.ok(content.includes('Model Failover Order'));
     assert.ok(content.includes('1. claude (priority 1)'));
-    assert.ok(content.includes('2. gemini (priority 2)'));
+    assert.ok(content.includes('2. agy (priority 2)'));
     assert.ok(content.includes('Skill Schedule'));
     assert.ok(content.includes('daily-mail-brief**: `45 7 * * *`'));
   });
@@ -107,7 +107,7 @@ const CAP_CONFIG = {
     },
     {
       // No tunables at all — must render cleanly, not awkwardly.
-      name: 'gemini', priority: 2, command: 'g', args: [], check: 'c', rate_limit_patterns: []
+      name: 'agy', priority: 2, command: 'g', args: [], check: 'c', rate_limit_patterns: []
     },
     {
       name: 'codex', priority: 3, command: 'x', args: [], check: 'c', rate_limit_patterns: [],
@@ -198,9 +198,9 @@ describe('Dashboard capability matrix (pure renderer)', () => {
   });
 
   it('renders a worker with no tunables cleanly on one line', () => {
-    const lines = renderWorkerCapabilityMatrix([cap('gemini', 2)], 4000);
+    const lines = renderWorkerCapabilityMatrix([cap('agy', 2)], 4000);
     assert.equal(lines.length, 1);
-    assert.equal(lines[0], '1. gemini (priority 2) — no settable options');
+    assert.equal(lines[0], '1. agy (priority 2) — no settable options');
   });
 
   it('returns [] for an empty worker list', () => {
@@ -237,9 +237,8 @@ describe('Dashboard capability matrix (pure renderer)', () => {
     const caps = [
       cap('zclaude', 1, [{ setting: 'model', values: [], observed: ['a', 'b', 'c', 'd'] }, { setting: 'effort', values: ['low', 'medium', 'high', 'xhigh', 'max'] }]),
       cap('agy', 2, [{ setting: 'model', values: [], observed: ['gemini-3.6-flash-high'] }, { setting: 'effort', values: ['low', 'medium', 'high'] }]),
-      cap('gemini', 3),
-      cap('codex', 4, [{ setting: 'model', values: [] }, { setting: 'effort', values: ['minimal', 'low', 'medium', 'high'] }]),
-      cap('claude', 5, [{ setting: 'model', values: [] }, { setting: 'effort', values: ['low', 'medium', 'high', 'xhigh', 'max'] }])
+      cap('codex', 3, [{ setting: 'model', values: [] }, { setting: 'effort', values: ['minimal', 'low', 'medium', 'high'] }]),
+      cap('claude', 4, [{ setting: 'model', values: [] }, { setting: 'effort', values: ['low', 'medium', 'high', 'xhigh', 'max'] }])
     ];
     for (const budget of [4000, 800, 500, 300, 200, 120]) {
       const rendered = renderWorkerCapabilityMatrix(caps, budget).join('\n');
@@ -277,7 +276,7 @@ describe('Dashboard capability matrix (integration)', () => {
     assert.ok(content.includes('• model: any value (supersedes effort)'), content);
 
     // Worker WITHOUT tunables.
-    assert.ok(content.includes('2. gemini (priority 2) — no settable options'), content);
+    assert.ok(content.includes('2. agy (priority 2) — no settable options'), content);
 
     // Global-not-per-topic framing must be explicit.
     assert.ok(/capability only/i.test(content), content);
@@ -298,9 +297,8 @@ describe('Dashboard capability matrix (integration)', () => {
         workers: [
           { name: 'zclaude', priority: 1, command: 'z', args: [], check: 'c', rate_limit_patterns: [], tunables: { model: { args: ['--model', '{value}'] }, effort: effort5 } },
           { name: 'agy', priority: 2, command: 'a', args: [], check: 'c', rate_limit_patterns: [], tunables: { model: { args: ['--model', '{value}'] }, effort: { args: ['--effort', '{value}'], values: ['low', 'medium', 'high'] } } },
-          { name: 'gemini', priority: 3, command: 'g', args: [], check: 'c', rate_limit_patterns: [], tunables: { model: { args: ['--model', '{value}'] } } },
-          { name: 'codex', priority: 4, command: 'x', args: [], check: 'c', rate_limit_patterns: [], tunables: { model: { args: ['--model', '{value}'] }, effort: { args: ['-c', 'model_reasoning_effort={value}'], values: ['minimal', 'low', 'medium', 'high'] } } },
-          { name: 'claude', priority: 5, command: 'c', args: [], check: 'c', rate_limit_patterns: [], tunables: { model: { args: ['--model', '{value}'] }, effort: effort5 } }
+          { name: 'codex', priority: 3, command: 'x', args: [], check: 'c', rate_limit_patterns: [], tunables: { model: { args: ['--model', '{value}'] }, effort: { args: ['-c', 'model_reasoning_effort={value}'], values: ['minimal', 'low', 'medium', 'high'] } } },
+          { name: 'claude', priority: 4, command: 'c', args: [], check: 'c', rate_limit_patterns: [], tunables: { model: { args: ['--model', '{value}'] }, effort: effort5 } }
         ]
       });
 
@@ -356,7 +354,7 @@ describe('Dashboard capability matrix (integration)', () => {
     await writeConfig(sharedTempDir, BASE_CONFIG);
     const content = await getDashboardContent();
     assert.ok(content.includes('1. claude (priority 1)'), content);
-    assert.ok(content.includes('2. gemini (priority 2)'), content);
+    assert.ok(content.includes('2. agy (priority 2)'), content);
     assert.ok(!content.includes('•'), content);
   });
 });

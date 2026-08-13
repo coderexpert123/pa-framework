@@ -79,8 +79,13 @@ export async function readLedger(): Promise<MaintenanceLedger> {
 async function writeLedgerAtomic(path: string, ledger: MaintenanceLedger): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   const tmpPath = `${path}.${process.pid.toString(36)}-${randomBytes(3).toString('hex')}.tmp`;
-  await writeFile(tmpPath, JSON.stringify(ledger, null, 2), 'utf8');
-  await rename(tmpPath, path);
+  try {
+    await writeFile(tmpPath, JSON.stringify(ledger, null, 2), 'utf8');
+    await rename(tmpPath, path);
+  } catch (err) {
+    await unlink(tmpPath).catch(() => {});
+    throw err;
+  }
 }
 
 const stateMutexes: Map<string, Promise<void>> = new Map();

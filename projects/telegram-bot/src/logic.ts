@@ -23,8 +23,8 @@ export interface WorkerResult {
   evaluatorSummary?: string; // user-facing summary from LLM evaluator when worker is killed
 }
 
-export const MODEL_SWITCH_PATTERN = /^\/models?(?:@\w+)?\s+(claude|gemini|zclaude|codex|agy)\b/i;
-export const DEFAULT_SWITCH_PATTERN = /^\/default(?:@\w+)?(?:\s+(claude|gemini|zclaude|codex|agy))?$/i;
+export const MODEL_SWITCH_PATTERN = /^\/models?(?:@\w+)?\s+(claude|zclaude|codex|agy)\b/i;
+export const DEFAULT_SWITCH_PATTERN = /^\/default(?:@\w+)?(?:\s+(claude|zclaude|codex|agy))?$/i;
 export const CODE_PATTERN = /^\/code(?:@\w+)?(?:\s+(.+))?$/i;
 export const RESET_PATTERN = /^\/reset(?:@\w+)?$/i;
 export const NEW_PATTERN = /^\/new(?:@\w+)?(?:\s+(.+))?$/i;
@@ -705,7 +705,7 @@ export function parseTunableCommand(userText: string): TunableCommand | undefine
     // TunableCommand and gets handleTunableCommand's helpful "no setting
     // called '<x>'" rejection — that behavior is deliberate and tested
     // (e.g. "/default temperature 0.7") and must not be suppressed too.
-    if (/^(claude|gemini|zclaude|codex|agy)$/i.test(label)) return undefined;
+    if (/^(claude|zclaude|codex|agy)$/i.test(label)) return undefined;
     const setting = TUNABLE_COMMAND_SETTINGS[label] ?? normalizeTunableName(label);
     return build('topic', label, setting, def[2]);
   }
@@ -1189,7 +1189,7 @@ export function buildWorkerResponse(result: WorkerResult, worker: string): strin
   if (result.success && result.output.trim()) {
     let output = result.output.trim();
 
-    if (worker === 'gemini' || worker === 'agy') {
+    if (worker === 'agy') {
       const thoughtRegex = /\[Thought: true\]([\s\S]*?)\[Thought: false\]/g;
       const blocks: string[] = [];
       let match;

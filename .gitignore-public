@@ -83,11 +83,17 @@ projects/daily-mail-brief/scripts/draft_reply.py
 # LLM-agentic scratch writes at repo root (see private .gitignore for detail).
 # /output.md + /error_log.txt added 2026-07-21 after the same failure mode
 # recurred under new names (a full daily-brief body; a one-line provider error).
+# /oracle_output.txt added 2026-08-08 (same class — real personal/financial
+# content this time, see private .gitignore for the full incident note).
+# **/glm-[0-9]* added 2026-08-13: zclaude (GLM models) writes its response to
+# a model-named file at cwd (glm-4.7, glm-5.2[1m], root and subdirs).
 /message_to_user.md
 /output.json
 /output.md
 /skill_proposals.json
 /error_log.txt
+/oracle_output.txt
+**/glm-[0-9]*
 
 # Project data subdirectories (each project keeps its own data outside the repo)
 **/data/raw/

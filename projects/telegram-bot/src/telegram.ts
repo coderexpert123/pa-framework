@@ -16,8 +16,8 @@ export function splitMessage(text: string): string[] {
 
   while (remaining.length > MAX_MSG_LEN) {
     let cut = remaining.lastIndexOf('\n\n', MAX_MSG_LEN);
-    if (cut === -1) cut = remaining.lastIndexOf('\n', MAX_MSG_LEN);
-    if (cut === -1) cut = MAX_MSG_LEN;
+    if (cut <= 0) cut = remaining.lastIndexOf('\n', MAX_MSG_LEN);
+    if (cut <= 0) cut = MAX_MSG_LEN;
 
     chunks.push(remaining.slice(0, cut).trim());
     remaining = remaining.slice(cut).trim();
@@ -27,10 +27,18 @@ export function splitMessage(text: string): string[] {
   return chunks;
 }
 
+export async function safeResponseText(res: Response): Promise<string> {
+  try {
+    return await res.text();
+  } catch {
+    return '<unable to read response text>';
+  }
+}
+
 export async function getUpdates(token: string, offset: number, timeout: number = 0, signal?: AbortSignal): Promise<TelegramUpdate[]> {
   const url = `${BASE}/bot${token}/getUpdates?offset=${offset}&timeout=${timeout}`;
   const res = await telegramFetch(url, signal ? { signal } : undefined);
-  if (!res.ok) throw new Error(`getUpdates failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) throw new Error(`getUpdates failed: ${res.status} ${await safeResponseText(res)}`);
   const data = await res.json() as { ok: boolean; result: TelegramUpdate[] };
   if (!data.ok) throw new Error(`getUpdates not ok`);
   return data.result;
@@ -174,7 +182,10 @@ export async function sendMessage(
   replyToMessageId?: number,
   threadId?: number
 ): Promise<boolean> {
-  const chunks = splitMessage(text.trim());
+  const trimmed = text.trim();
+  if (!trimmed) return true;
+
+  const chunks = splitMessage(trimmed);
   let allDelivered = true;
 
   for (const chunk of chunks) {
@@ -184,18 +195,15 @@ export async function sendMessage(
       parse_mode: 'MarkdownV2',
     };
     if (threadId !== undefined && threadId !== null && threadId !== 0) body.message_thread_id = threadId;
-  // all chunks need it for forum topics
     if (replyToMessageId) {
       body.reply_to_message_id = replyToMessageId;
       replyToMessageId = undefined; // Only reply on the first chunk
     }
 
-    // Retry up to 3 times on transient connection errors (e.g. ECONNRESET).
-    // On timeout (AbortError/TimeoutError) we break immediately without retrying:
-    // after 30s Telegram has almost certainly processed the request, so retrying
-    // would produce a duplicate message. Treat as optimistically delivered.
     let res: Response | undefined;
     let timedOut = false;
+    let parseErrorHappened = false;
+
     for (let attempt = 0; attempt < 3; attempt++) {
       if (attempt > 0) await new Promise<void>((r) => setTimeout(r, 1000 * attempt));
       try {
@@ -205,6 +213,28 @@ export async function sendMessage(
           body: JSON.stringify(body),
           signal: AbortSignal.timeout(30_000),
         });
+
+        if (res.ok) {
+          break;
+        }
+
+        const errorText = await safeResponseText(res);
+        if (res.status === 429 || res.status >= 500) {
+          if (attempt < 2) {
+            logger.warn('telegram', `[sendMessage] HTTP ${res.status}, retrying (${attempt + 1}/3)`, { error: errorText });
+            continue;
+          } else {
+            console.error(`[sendMessage] HTTP ${res.status} error after 3 attempts: ${errorText}`);
+            break;
+          }
+        }
+
+        if (res.status === 400 && errorText.includes('parse')) {
+          parseErrorHappened = true;
+          break;
+        }
+
+        console.error(`sendMessage failed: ${res.status} ${errorText}`);
         break;
       } catch (err) {
         const name = (err as any)?.name;
@@ -220,47 +250,68 @@ export async function sendMessage(
         }
       }
     }
+
     if (!res) {
       if (!timedOut) allDelivered = false;
       continue;
     }
 
     // Fallback: if Markdown parse fails, retry as plain text
-    if (!res.ok) {
-      const errorText = await res.text();
-      if (errorText.includes('parse')) {
+    if (!res.ok || parseErrorHappened) {
+      const errorText = await safeResponseText(res);
+      if (parseErrorHappened || errorText.includes('parse')) {
         logger.warn('telegram', 'MarkdownV2 parse failed — falling back to plain text', {
           error: errorText,
           chunkPreview: chunk.slice(0, 200),
         });
         delete body.parse_mode;
-        // Strip italic markers from ref ID so it shows as "Ref: xxx" not "_Ref: xxx_" in plain text.
-        // The optional (\n\n)? handles the edge case where splitMessage puts the ref into its own
-        // chunk, trimming the leading newlines.
         body.text = chunk.replace(/((?:\n\n)?)_Ref: ([a-z]+-[0-9a-f]{4,})_$/, '$1Ref: $2');
-        try {
-          res = await telegramFetch(`${BASE}/bot${token}/sendMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-            signal: AbortSignal.timeout(30_000),
-          });
-          if (!res.ok) {
-            allDelivered = false;
-            console.error(`sendMessage failed: ${res.status} ${await res.text()}`);
-          }
-        } catch (err) {
-          const name = (err as any)?.name;
-          if (name === 'TimeoutError' || name === 'AbortError') {
-            logger.warn('telegram', 'sendMessage plain-text fallback timeout — not retrying to avoid duplicate delivery', {});
-          } else {
-            allDelivered = false;
-            console.error('[sendMessage] plain-text fallback network error:', err);
+
+        let fallbackRes: Response | undefined;
+        let fallbackTimedOut = false;
+
+        for (let attempt = 0; attempt < 3; attempt++) {
+          if (attempt > 0) await new Promise<void>((r) => setTimeout(r, 1000 * attempt));
+          try {
+            fallbackRes = await telegramFetch(`${BASE}/bot${token}/sendMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(body),
+              signal: AbortSignal.timeout(30_000),
+            });
+            if (fallbackRes.ok) {
+              res = fallbackRes;
+              break;
+            }
+
+            const fbErrText = await safeResponseText(fallbackRes);
+            if ((fallbackRes.status === 429 || fallbackRes.status >= 500) && attempt < 2) {
+              logger.warn('telegram', `[sendMessage fallback] HTTP ${fallbackRes.status}, retrying (${attempt + 1}/3)`, { error: fbErrText });
+              continue;
+            }
+            console.error(`sendMessage failed: ${fallbackRes.status} ${fbErrText}`);
+            res = fallbackRes;
+            break;
+          } catch (err) {
+            const name = (err as any)?.name;
+            if (name === 'TimeoutError' || name === 'AbortError') {
+              logger.warn('telegram', 'sendMessage plain-text fallback timeout — not retrying to avoid duplicate delivery', {});
+              fallbackTimedOut = true;
+              break;
+            }
+            if (attempt < 2) {
+              console.warn(`[sendMessage fallback] network error, retrying (${attempt + 1}/3): ${(err as Error).message}`);
+            } else {
+              console.error('[sendMessage] plain-text fallback network error after 3 attempts:', err);
+            }
           }
         }
+
+        if ((!fallbackRes || !fallbackRes.ok) && !fallbackTimedOut) {
+          allDelivered = false;
+        }
       } else {
-        allDelivered = false;
-        console.error(`sendMessage failed: ${res.status} ${errorText}`);
+        if (!timedOut) allDelivered = false;
       }
     }
   }
@@ -293,11 +344,11 @@ export async function sendMessageWithId(
       signal: AbortSignal.timeout(30_000),
     });
     if (!res.ok) {
-      console.error(`sendMessageWithId failed: ${res.status} ${await res.text()}`);
+      console.error(`sendMessageWithId failed: ${res.status} ${await safeResponseText(res)}`);
       return null;
     }
-    const data = await res.json() as { ok: boolean; result: { message_id: number } };
-    return data.ok ? data.result.message_id : null;
+    const data = await res.json().catch(() => null) as { ok?: boolean; result?: { message_id: number } } | null;
+    return data?.ok ? (data.result?.message_id ?? null) : null;
   } catch (err) {
     console.error('sendMessageWithId network error:', err);
     return null;
@@ -325,7 +376,10 @@ export async function editMessageText(
       signal: AbortSignal.timeout(30_000),
     });
     if (!res.ok) {
-      const errorText = await res.text();
+      const errorText = await safeResponseText(res);
+      if (errorText.includes('message is not modified')) {
+        return true;
+      }
       // If Markdown fails, retry as plain text (same as sendMessage)
       if (errorText.includes('parse')) {
         delete (body as any).parse_mode;
@@ -361,7 +415,7 @@ export async function pinChatMessage(
     try {
       const res = await telegramFetch(`${BASE}/bot${token}/pinChatMessage`, opts);
       if (res.ok) return true;
-      console.error(`pinChatMessage failed (attempt ${attempt + 1}): ${res.status} ${await res.text()}`);
+      console.error(`pinChatMessage failed (attempt ${attempt + 1}): ${res.status} ${await safeResponseText(res)}`);
     } catch (err) {
       console.error(`pinChatMessage network error (attempt ${attempt + 1}):`, err);
     }
@@ -380,7 +434,7 @@ export async function unpinChatMessage(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: chatId, message_id: messageId }),
     });
-    if (!res.ok) console.error(`unpinChatMessage failed: ${res.status} ${await res.text()}`);
+    if (!res.ok) console.error(`unpinChatMessage failed: ${res.status} ${await safeResponseText(res)}`);
   } catch (err) {
     console.error('unpinChatMessage network error:', err);
   }

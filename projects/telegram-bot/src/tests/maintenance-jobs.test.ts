@@ -7,6 +7,7 @@ import { join } from 'path';
 import { createBotMaintenanceJobs, type BotMaintenanceDeps } from '../maintenance-jobs.js';
 import { validateRegistry } from '../../../../pa/dist/src/lib/maintenance/policy.js';
 import { RUNTIME_ARCHIVE_MAX_BYTES } from '../../../../pa/dist/src/lib/archive-files.js';
+import { flushLog } from '../../../../pa/dist/src/lib/log.js';
 import type { TopicNameMap } from '../topic-names.js';
 
 let tempDir: string;
@@ -30,6 +31,13 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  // Drain the pa logger's fire-and-forget append queue BEFORE removing the
+  // temp PA_HOME — the jobs under test call logger.info/warn, whose queued
+  // appends target ${PA_HOME}/app.log.jsonl and would otherwise race this
+  // rm (late ensureLogFile mkdir / append recreating entries mid-delete →
+  // ENOTEMPTY, observed deterministically 2026-08-13). Same contract as
+  // pa/tests/helpers.ts's cleanup().
+  await flushLog();
   await rm(tempDir, { recursive: true, force: true });
   if (originalPaHome === undefined) delete process.env.PA_HOME;
   else process.env.PA_HOME = originalPaHome;

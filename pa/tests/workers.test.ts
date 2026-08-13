@@ -143,7 +143,7 @@ describe('executeWorker', () => {
     await writeFile(stateFile, JSON.stringify({
       messages: [
         { type: 'user', content: 'hello' },
-        { type: 'gemini', content: 'How can I help you?' } 
+        { type: 'agy', content: 'How can I help you?' } 
       ]
     }), 'utf8');
 
@@ -395,7 +395,7 @@ describe('executeWorker', () => {
       lines.forEach(l => process.stdout.write(l + '\\n'));
     `);
     const worker = makeWorker({
-      name: 'gemini',
+      name: 'agy',
       command: 'node',
       args: [script],
       input_mode: 'stdin-text',
@@ -438,7 +438,7 @@ describe('executeWorker', () => {
       lines.forEach(l => process.stdout.write(l + '\\n'));
     `);
     const worker = makeWorker({
-      name: 'gemini',
+      name: 'agy',
       command: 'node',
       args: [script],
       input_mode: 'stdin-text',
@@ -544,13 +544,13 @@ describe('isRateLimited', () => {
     assert.equal(rl.pattern, 'hit your usage limit');
   });
 
-  it('for gemini: only scans error field, NOT output (same as codex)', () => {
-    // gemini errors come from stderr (Google API errors), not agent output
-    const worker = makeWorker({ name: 'gemini', rate_limit_patterns: ['RESOURCE_EXHAUSTED'] });
+  it('for agy: only scans error field, NOT output (same as codex)', () => {
+    // agy errors come from stderr (Google API errors), not agent output
+    const worker = makeWorker({ name: 'agy', rate_limit_patterns: ['RESOURCE_EXHAUSTED'] });
     // pattern in output only → must NOT match
     const inOutput = { success: false, output: 'RESOURCE_EXHAUSTED in agent text', error: '', exitCode: 1 };
     assert.equal(isRateLimited(worker, inOutput).hit, false,
-      'gemini rate-limit check must not scan agent output');
+      'agy rate-limit check must not scan agent output');
     // pattern in error → must match
     const inError = { success: false, output: '', error: 'RESOURCE_EXHAUSTED', exitCode: 1 };
     assert.equal(isRateLimited(worker, inError).hit, true);

@@ -77,7 +77,7 @@ async function loadTurnsByIds(ids: string[]): Promise<ConversationTurn[]> {
 
 /**
  * Dry-run validation for a brand-new skill proposal: replay it against the original
- * conversation it was proposed from, then have the `gemini` worker judge whether the
+ * conversation it was proposed from, then have the `agy` worker judge whether the
  * output would have been a good, safe replacement.
  *
  * `onDetail`, if given, receives the intermediate validation detail (candidate-run success,

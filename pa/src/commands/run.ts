@@ -520,7 +520,7 @@ export async function runCommand(
   }
 
   // 2. LLM worker execution
-  // Skill-declared worker_args (e.g. gemini --include-directories to widen its
+  // Skill-declared worker_args (e.g. agy --include-directories to widen its
   // file-tool workspace past the shim-forced repo cwd) prepend the run-time
   // extraArgs. cmd-based skills above don't use these — they're worker CLI flags.
   const workerExtraArgs = [...(skill.frontmatter.worker_args ?? []), ...extraArgs];

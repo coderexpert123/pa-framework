@@ -10,14 +10,20 @@ describe('MAINTENANCE_JOBS registry', () => {
     assert.doesNotThrow(() => validateRegistry([...MAINTENANCE_JOBS]));
   });
 
-  it('declares exactly 10 jobs with the expected names', () => {
-    assert.equal(MAINTENANCE_JOBS.length, 10);
+  it('declares exactly 16 jobs (10 pa + 6 bot) with the expected names', () => {
+    assert.equal(MAINTENANCE_JOBS.length, 16);
     const names = MAINTENANCE_JOBS.map((j) => j.name).sort();
     assert.deepEqual(names, [
       'alert-state-gc',
       'archive-prune',
       'blackboard-purge',
+      'bot-log-rotation-check',
+      'delivered-store-compact',
+      'dlq-flush',
+      'grounding-check',
+      'model-override-sweep',
       'orphan-worker-reap',
+      'proxy-pool-refresh',
       'reservation-gc',
       'session-gc',
       'skill-log-rotate',
@@ -27,33 +33,33 @@ describe('MAINTENANCE_JOBS registry', () => {
     ]);
   });
 
-  // jobsForHost('bot') is 0 BY DESIGN, not because Wave 2 is pending. Bot jobs
-  // close over a runtime token/chatIds/sentinelPath that only exist after the
-  // bot's main() loads secrets, and pa cannot import bot source — so they are
-  // built by createBotMaintenanceJobs() in
-  // projects/telegram-bot/src/maintenance-jobs.ts and handed straight to
-  // runDueJobs('bot', …). See AI-100 Wave 2.
-  it('every registry job is host: "pa" — bot jobs are constructed in-process, not registered here', () => {
-    for (const job of MAINTENANCE_JOBS) {
-      assert.equal(job.host, 'pa', `${job.name} should be host: 'pa'`);
-    }
-    assert.equal(jobsForHost('bot').length, 0);
+  it('splits jobs correctly by host (10 pa, 6 bot)', () => {
     assert.equal(jobsForHost('pa').length, 10);
+    assert.equal(jobsForHost('bot').length, 6);
+    const botNames = jobsForHost('bot').map((j) => j.name).sort();
+    assert.deepEqual(botNames, [
+      'bot-log-rotation-check',
+      'delivered-store-compact',
+      'dlq-flush',
+      'grounding-check',
+      'model-override-sweep',
+      'proxy-pool-refresh',
+    ]);
   });
 
   function resolveEvery(job: (typeof MAINTENANCE_JOBS)[number]): number {
     return typeof job.everyMs === 'function' ? job.everyMs() : job.everyMs;
   }
 
-  it('locks the declared cadence for the three 1-minute jobs', () => {
-    for (const name of ['orphan-worker-reap', 'blackboard-purge', 'staleness-check']) {
+  it('locks the declared cadence for the 1-minute jobs', () => {
+    for (const name of ['orphan-worker-reap', 'blackboard-purge', 'staleness-check', 'model-override-sweep']) {
       const job = findJob(name);
       assert.ok(job, `${name} should exist`);
       assert.equal(resolveEvery(job!), 60_000, `${name} cadence`);
     }
   });
 
-  it('locks the declared cadence for the three 1-hour jobs', () => {
+  it('locks the declared cadence for the 1-hour jobs', () => {
     for (const name of ['skill-log-rotate', 'archive-prune', 'alert-state-gc']) {
       const job = findJob(name);
       assert.ok(job, `${name} should exist`);
@@ -61,16 +67,19 @@ describe('MAINTENANCE_JOBS registry', () => {
     }
   });
 
-  it('locks session-gc at 6h and weekly-learn at 7d', () => {
+  it('locks session-gc at 6h, grounding-check at 6h, and weekly-learn at 7d', () => {
     assert.equal(resolveEvery(findJob('session-gc')!), 21_600_000);
+    assert.equal(resolveEvery(findJob('grounding-check')!), 21_600_000);
     assert.equal(resolveEvery(findJob('weekly-learn')!), 604_800_000);
   });
 
-  it('locks the declared destructive set', () => {
+  it('locks the declared destructive set across both hosts', () => {
     const destructive = MAINTENANCE_JOBS.filter((j) => j.destructive).map((j) => j.name).sort();
     assert.deepEqual(destructive, [
       'alert-state-gc',
       'archive-prune',
+      'delivered-store-compact',
+      'dlq-flush',
       'orphan-worker-reap',
       'reservation-gc',
       'session-gc',
@@ -97,8 +106,9 @@ describe('MAINTENANCE_JOBS registry', () => {
     assert.equal(agyTarget.match.test('index.pb'), false);
   });
 
-  it('findJob resolves known names and returns undefined for unknown ones', () => {
+  it('findJob resolves known names across both hosts and returns undefined for unknown ones', () => {
     assert.equal(findJob('session-gc')?.name, 'session-gc');
+    assert.equal(findJob('dlq-flush')?.name, 'dlq-flush');
     assert.equal(findJob('nope'), undefined);
   });
 });

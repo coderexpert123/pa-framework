@@ -45,6 +45,8 @@ export const TIMER_ALLOWLIST: TimerAllowlistEntry[] = [
     reason: 'In-flight only: heartbeats the git-workflow blackboard lock (see run.ts entry above) for the duration of ONE attemptCodeFix run and is cleared in the same finally that releases the lock. Mirrors run.ts\'s own lock heartbeat. No durable side effect of its own.' },
   { file: 'pa/src/worker-exec.ts', pattern: 'setInterval', count: 1,
     reason: 'In-flight only: 30s heartbeat for ONE worker process; cleared when the child exits.' },
+  { file: 'pa/src/blackboard.ts', pattern: 'setInterval', count: 1,
+    reason: 'AI-113: startLockRenewal() heartbeats ONE (resource, agent, contextId) lock row for the lifetime of a single long-running holder (e.g. one Telegram dispatch), stopped via its own stop() or the maxMs cap (default 6h). Generalizes the same in-flight-only heartbeat pattern already allowlisted above for catchup.ts/run.ts/code-fixer.ts. No durable side effect beyond refreshing an existing lock\'s heartbeat field.' },
   { file: 'pa/src/lib/telegram-proxy.ts', pattern: 'due-check', count: 1,
     reason: 'In-memory circuit-breaker re-probe gate for the direct/proxy failover decision — no ledger, no disk writes, resets on every call. Not a durable schedule.' },
   { file: 'projects/telegram-bot/src/health.ts', pattern: 'setInterval', count: 1,

@@ -16,7 +16,28 @@ export interface BlackboardData {
   active_locks: LockEntry[];
 }
 
-const HEARTBEAT_STALE_MS = 10 * 60 * 1000; // 10 minutes
+const HEARTBEAT_STALE_MS = 10 * 60 * 1000; // 10 minutes (default)
+
+/**
+ * Reads the stale-lock TTL fresh on every call from PA_HEARTBEAT_STALE_MS
+ * (falls back to the 10-minute default) — so tests can shrink it instead of
+ * waiting 10 real minutes, and an operator can tune it without a rebuild.
+ */
+function heartbeatStaleMs(): number {
+  const raw = process.env.PA_HEARTBEAT_STALE_MS;
+  if (raw) {
+    const n = parseInt(raw, 10);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return HEARTBEAT_STALE_MS;
+}
+
+function envMs(varName: string): number | undefined {
+  const raw = process.env[varName];
+  if (!raw) return undefined;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
 
 function getBlackboardPath(): string {
   return join(paHome(), 'blackboard.json');
@@ -36,10 +57,12 @@ function isPidAlive(pid: number): boolean {
 }
 
 export class Blackboard {
-  private path: string;
-
-  constructor() {
-    this.path = getBlackboardPath();
+  // Resolved fresh on every access rather than cached at construction: PA_HOME
+  // can change within a single process (test suites with multiple temp-home
+  // cycles; PA_HOME env overrides), and a cached path would silently keep
+  // operating against a stale, possibly-deleted directory.
+  private get path(): string {
+    return getBlackboardPath();
   }
 
   private async ensureFile(): Promise<void> {
@@ -105,7 +128,7 @@ export class Blackboard {
         const activeLocks = data.active_locks.filter((lock) => {
           const isAlive = isPidAlive(lock.pid);
           const heartbeatAge = now.getTime() - new Date(lock.heartbeat).getTime();
-          const isStale = heartbeatAge > HEARTBEAT_STALE_MS;
+          const isStale = heartbeatAge > heartbeatStaleMs();
 
           if (!isAlive) {
             console.log(`[blackboard] Purging dead PID lock: ${lock.resource} (pid:${lock.pid})`);
@@ -198,7 +221,7 @@ export class Blackboard {
    * entry. When omitted, updates the first matching resource+agent entry
    * (legacy behaviour — safe once the concurrent-hold bug is fixed).
    */
-  async updateHeartbeat(resource: string, agent: string, contextId?: string): Promise<void> {
+  async updateHeartbeat(resource: string, agent: string, contextId?: string): Promise<boolean> {
     await this.ensureFile();
     let release: (() => Promise<void>) | undefined;
     try {
@@ -210,9 +233,12 @@ export class Blackboard {
       if (entry) {
         entry.heartbeat = new Date().toISOString();
         await fs.writeJson(this.path, data, { spaces: 2 });
+        return true;
       }
+      return false;
     } catch {
       // Non-fatal
+      return false;
     } finally {
       if (release) await release();
     }
@@ -226,7 +252,7 @@ export class Blackboard {
     const data = await this.readData();
     const now = new Date();
     return data.active_locks.filter((lock) => {
-      return isPidAlive(lock.pid) && (now.getTime() - new Date(lock.heartbeat).getTime() < HEARTBEAT_STALE_MS);
+      return isPidAlive(lock.pid) && (now.getTime() - new Date(lock.heartbeat).getTime() < heartbeatStaleMs());
     });
   }
 
@@ -242,7 +268,7 @@ export class Blackboard {
       const before = data.active_locks.length;
       const now = new Date();
       const activeLocks = data.active_locks.filter((lock) => {
-        return isPidAlive(lock.pid) && (now.getTime() - new Date(lock.heartbeat).getTime() < HEARTBEAT_STALE_MS);
+        return isPidAlive(lock.pid) && (now.getTime() - new Date(lock.heartbeat).getTime() < heartbeatStaleMs());
       });
       await fs.writeJson(this.path, { active_locks: activeLocks }, { spaces: 2 });
       return before - activeLocks.length;
@@ -256,3 +282,83 @@ export class Blackboard {
 }
 
 export const blackboard = new Blackboard();
+
+export interface LockRenewalOptions {
+  /** Renewal tick cadence. Default 60s, or PA_LOCK_RENEW_INTERVAL_MS. */
+  intervalMs?: number;
+  /** Cap on total renewal lifetime — after this, stop renewing and fire
+   * onLost('expired') once. Default 6h, or PA_LOCK_RENEW_MAX_MS. This is what
+   * keeps a truly-hung dispatch from holding the lock forever: an async hang
+   * with a healthy event loop would otherwise renew indefinitely (a
+   * wedged/dead event loop already stops renewing on its own, since
+   * setInterval can't fire). */
+  maxMs?: number;
+  onLost?: (reason: 'expired' | 'purged') => void;
+}
+
+/**
+ * Keeps a single (resource, agent, contextId) lock row's heartbeat fresh for
+ * the lifetime of a long-running holder, via setInterval → updateHeartbeat —
+ * the same hand-rolled pattern already used twice in this codebase
+ * (pa/src/commands/catchup.ts, pa/src/code-fixer.ts), generalized into a
+ * reusable helper. AI-113: without this, any single dispatch running past
+ * HEARTBEAT_STALE_MS (10 min default) has its lock purged out from under it by
+ * the next acquireLock call, even though the holder is alive and working.
+ */
+export function startLockRenewal(
+  resource: string,
+  agent: string,
+  contextId: string | undefined,
+  opts?: LockRenewalOptions
+): { stop: () => void } {
+  const intervalMs = opts?.intervalMs ?? envMs('PA_LOCK_RENEW_INTERVAL_MS') ?? 60_000;
+  const maxMs = opts?.maxMs ?? envMs('PA_LOCK_RENEW_MAX_MS') ?? 6 * 60 * 60 * 1000;
+  const onLost = opts?.onLost;
+  const start = Date.now();
+  let stopped = false;
+  let inFlight = false;
+  let lostFired = false;
+
+  const fireLostOnce = (reason: 'expired' | 'purged') => {
+    if (lostFired) return;
+    lostFired = true;
+    onLost?.(reason);
+  };
+
+  const tick = () => {
+    if (stopped) return;
+    // The maxMs cap must be checked on EVERY tick, unconditionally — never
+    // gated behind the overlap guard below. A slow updateHeartbeat (real fs
+    // lock contention) could otherwise leave inFlight true across several
+    // tick callbacks, silently delaying the cap past its deadline and
+    // defeating the one thing it exists for: freeing a truly-hung holder.
+    if (Date.now() - start >= maxMs) {
+      stopped = true;
+      clearInterval(timer);
+      fireLostOnce('expired');
+      return;
+    }
+    if (inFlight) return; // overlap guard: skip the UPDATE if the previous hasn't settled
+    inFlight = true;
+    blackboard.updateHeartbeat(resource, agent, contextId)
+      .then((refreshed) => {
+        // Row already purged (e.g. a competing holder acquired it, or it went
+        // stale before this renewer's first tick) — latched, never re-acquire,
+        // a legitimate new holder may already exist. Keep ticking harmlessly.
+        if (!refreshed && !stopped) fireLostOnce('purged');
+      })
+      .catch(() => {})
+      .finally(() => { inFlight = false; });
+  };
+
+  const timer = setInterval(tick, intervalMs);
+  timer.unref?.();
+
+  return {
+    stop: () => {
+      if (stopped) return;
+      stopped = true;
+      clearInterval(timer);
+    },
+  };
+}

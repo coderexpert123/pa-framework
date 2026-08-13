@@ -185,7 +185,7 @@ describe('parseTunableCommand', () => {
   });
 
   it('never hijacks /default <worker> — order-independent, not just by call site', () => {
-    for (const worker of ['claude', 'gemini', 'zclaude', 'codex', 'agy', 'AGY']) {
+    for (const worker of ['claude', 'zclaude', 'codex', 'agy', 'AGY']) {
       assert.equal(parseTunableCommand(`/default ${worker}`), undefined, worker);
     }
   });

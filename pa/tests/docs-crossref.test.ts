@@ -207,4 +207,102 @@ describe('docs cross-reference checker', () => {
     );
     assert.equal(numbers.length, 11);
   });
+
+  // Brain-file size budget (docs/CONVENTIONS.md § "Brain-file organization",
+  // added 2026-08-07). Numbers here MUST match that section — if you're
+  // changing one, change both, or this check silently drifts from the rule
+  // it's supposed to enforce.
+  it('root CLAUDE.md stays within its size budget (soft 40k, hard 48k chars)', () => {
+    const claudeMd = readIfExists(join(REPO_ROOT, 'CLAUDE.md'));
+    if (claudeMd === null) return; // absent in the public mirror
+    assert.ok(
+      claudeMd.length <= 48000,
+      `CLAUDE.md is ${claudeMd.length} chars, over the 48,000-char hard budget -- run /shorten-brain`
+    );
+  });
+
+  it('every directory-scoped projects/*/CLAUDE.md stays within its size budget (12k chars)', () => {
+    const PROJECTS_DIR = join(REPO_ROOT, 'projects');
+    if (!existsSync(PROJECTS_DIR)) return;
+
+    const failures: string[] = [];
+    for (const entry of readdirSync(PROJECTS_DIR, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const claudeMdPath = join(PROJECTS_DIR, entry.name, 'CLAUDE.md');
+      const content = readIfExists(claudeMdPath);
+      if (content === null) continue;
+      if (content.length > 12000) {
+        failures.push(`${claudeMdPath} is ${content.length} chars, over the 12,000-char budget`);
+      }
+    }
+    assert.deepEqual(failures, [], failures.join('\n'));
+  });
+
+  it('docs/*.md operational-detail files stay within budget (16k); evergreen UPPERCASE guides get 24k', (t) => {
+    if (!existsSync(DOCS_DIR)) return t.skip(DOCS_MISSING_REASON);
+    const failures: string[] = [];
+    for (const f of readdirSync(DOCS_DIR).filter((f) => f.endsWith('.md'))) {
+      const content = readFileSync(join(DOCS_DIR, f), 'utf8');
+      // Evergreen guides are ALL-CAPS-before-the-dot (BOT_GUIDE.md, CONFIGURATION.md);
+      // extracted operational-detail files are lowercase-hyphen (repo-topology.md).
+      const isEvergreenGuide = /^[A-Z][A-Z0-9_]*\.md$/.test(f);
+      const budget = isEvergreenGuide ? 24000 : 16000;
+      if (content.length > budget) {
+        failures.push(`docs/${f} is ${content.length} chars, over its ${budget.toLocaleString()}-char budget`);
+      }
+    }
+    assert.deepEqual(failures, [], failures.join('\n'));
+  });
+
+  it('the FILE_INVENTORY.md router stays within its 4k budget', () => {
+    const content = readIfExists(join(REPO_ROOT, 'FILE_INVENTORY.md'));
+    if (content === null) return; // absent in the public mirror
+    assert.ok(
+      content.length <= 4000,
+      `FILE_INVENTORY.md is ${content.length} chars, over the 4,000-char router budget -- it has stopped being a router, re-split`
+    );
+  });
+
+  it('inventory/*.md files stay within budget (16k manual, 18k for auto-managed glob-derived files)', () => {
+    const INVENTORY_DIR = join(REPO_ROOT, 'inventory');
+    if (!existsSync(INVENTORY_DIR)) return; // absent in the public mirror and pre-Phase-3 checkouts
+
+    const failures: string[] = [];
+    for (const f of readdirSync(INVENTORY_DIR).filter((f) => f.endsWith('.md'))) {
+      const content = readFileSync(join(INVENTORY_DIR, f), 'utf8');
+      // docs/CONVENTIONS.md § "Brain-file organization": a file the update-brain
+      // skill rewrites wholesale from one glob() pattern gets the higher ceiling
+      // -- its AUTO:FILE-INVENTORY-* marker pair is what makes it that class.
+      const isAutoManaged = content.includes('<!-- AUTO:FILE-INVENTORY-');
+      const budget = isAutoManaged ? 18000 : 16000;
+      if (content.length > budget) {
+        failures.push(`inventory/${f} is ${content.length} chars, over its ${budget.toLocaleString()}-char budget`);
+      }
+    }
+    assert.deepEqual(failures, [], failures.join('\n'));
+  });
+
+  it('backlog/completed-index.md (the lookup table, not the archives) stays within its 16k budget', () => {
+    // docs/CONVENTIONS.md § "Brain-file organization": archive-*.md/not-valid.md
+    // are the "append-only archive" class with NO hard ceiling -- their size
+    // tracks how much work shipped in a window, not anything a reader holds in
+    // mind, and splitting one purely to hit a number would separate
+    // cross-referenced items that must stay findable together. Only the
+    // lookup-table file gets budget-checked here.
+    const content = readIfExists(join(REPO_ROOT, 'backlog', 'completed-index.md'));
+    if (content === null) return; // absent in the public mirror and pre-Phase-4 checkouts
+    assert.ok(
+      content.length <= 16000,
+      `backlog/completed-index.md is ${content.length} chars, over the 16,000-char budget -- it's a lookup table, not an archive, and should stay scannable`
+    );
+  });
+
+  it('root BACKLOG.md stays within its size budget (12k chars)', () => {
+    const content = readIfExists(join(REPO_ROOT, 'BACKLOG.md'));
+    if (content === null) return; // absent in the public mirror
+    assert.ok(
+      content.length <= 12000,
+      `BACKLOG.md is ${content.length} chars, over its 12,000-char budget -- move more DONE items to backlog/`
+    );
+  });
 });

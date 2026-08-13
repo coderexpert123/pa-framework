@@ -193,4 +193,22 @@ Use `pa logs <skill>` to read recent runs.
 - **Marker-based content insertion**: Skills like `update-brain` use `<!-- AUTO:* -->` markers to identify auto-managed sections within manually-edited files. The skill validates markers exist post-update and refuses to write if any disappeared.
 - **Line-count floor**: Stateful skills that rewrite files should refuse to write the new content if it's < 80% of the old size — a guard against accidental wipes.
 
-See also: `docs/SKILLS_GUIDE.md`, `docs/WORKERS_GUIDE.md`, `docs/BOT_GUIDE.md`, `docs/CONFIGURATION.md`, `docs/TROUBLESHOOTING.md`.
+See also — the full `docs/` index (rebuilt 2026-08-07, see `docs/CONVENTIONS.md` § "Brain-file organization" for the naming/size rules behind this split):
+
+Evergreen guides (audience-facing, read when learning or setting up a subsystem):
+- `docs/QUICKSTART.md` — first-run setup, numbered walkthrough
+- `docs/DEPLOYMENT.md` — deploying your own pa-framework fork
+- `docs/CONFIGURATION.md` — every config file/env var reference
+- `docs/CONVENTIONS.md` — repo hygiene, naming, brain-file organization
+- `docs/SKILLS_GUIDE.md` — authoring skills
+- `docs/WORKERS_GUIDE.md` — the worker contract, adding a worker
+- `docs/BOT_GUIDE.md` — the Telegram bot end to end
+- `docs/TROUBLESHOOTING.md` — `pa health` diagnosis, common failure modes
+
+Operational-detail files (read on demand, only when touching that specific area):
+- `docs/repo-topology.md` — git-workflow skill locking, the public/private mirror split, PII-guard internals
+- `docs/maintenance-jobs.md` — the full declared-maintenance-job catalog (pa-host + bot-host)
+- `docs/bot-reliability-internals.md` — DLQ, delivery-dedup guarantees, `/stop` cancellation, AI-096 deviations
+
+Auto-loading (native Claude Code directory-scoped `CLAUDE.md`, not manually read):
+- `projects/telegram-bot/CLAUDE.md` — loads automatically whenever a session touches that directory

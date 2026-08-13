@@ -606,14 +606,14 @@ describe('buildWorkerResponse', () => {
 
   it('returns full output including internal newlines', () => {
     const output = 'line1\nline2\nline3';
-    const r = buildWorkerResponse({ success: true, output }, 'gemini');
+    const r = buildWorkerResponse({ success: true, output }, 'agy');
     assert.equal(r, output);
   });
 
   it('suppresses a collapsed one-line NO_OUTPUT sentinel leak', () => {
     const output =
       'Checking the specified `rate-limit-unparseable.jsonl` file and filtering to entries from the last 65 minutes.NO_OUTPUT';
-    const r = buildWorkerResponse({ success: true, output }, 'gemini');
+    const r = buildWorkerResponse({ success: true, output }, 'agy');
     assert.equal(r, '');
   });
 
@@ -662,7 +662,7 @@ describe('buildWorkerResponse', () => {
   });
 
   it('failure output is non-empty (message is always sent)', () => {
-    const r = buildWorkerResponse({ success: false, output: '', error: 'oops' }, 'gemini');
+    const r = buildWorkerResponse({ success: false, output: '', error: 'oops' }, 'agy');
     assert.ok(r.trim().length > 0, 'failure response must be non-empty so a message is sent');
   });
 
@@ -673,19 +673,19 @@ describe('buildWorkerResponse', () => {
 
   it('returns evaluator summary when killed with evaluatorSummary set', () => {
     const summary = 'The agent searched for weather data but entered a completion loop without producing a final answer.';
-    const r = buildWorkerResponse({ success: false, output: '', evaluatorSummary: summary, error: 'Killed: LLM evaluator decided to stop (semantic loop detected)' }, 'gemini');
+    const r = buildWorkerResponse({ success: false, output: '', evaluatorSummary: summary, error: 'Killed: LLM evaluator decided to stop (semantic loop detected)' }, 'agy');
     assert.equal(r, summary, 'should return evaluator summary instead of generic apology');
     assert.ok(!r.includes("couldn't process"), 'should not include generic apology');
   });
 
   it('still returns generic apology when killed without evaluatorSummary', () => {
-    const r = buildWorkerResponse({ success: false, output: '', error: 'Killed: no activity for 300s (idle timeout)' }, 'gemini');
+    const r = buildWorkerResponse({ success: false, output: '', error: 'Killed: no activity for 300s (idle timeout)' }, 'agy');
     assert.ok(r.includes("couldn't process"), 'should still return generic apology when no summary');
   });
 
   it('does not show partial stdout as user-facing response on kill', () => {
     // Accumulated stdout from a killed worker might be non-empty but incomplete
-    const r = buildWorkerResponse({ success: false, output: 'partial incomplete response...', error: 'Killed: no activity for 300s (idle timeout)' }, 'gemini');
+    const r = buildWorkerResponse({ success: false, output: 'partial incomplete response...', error: 'Killed: no activity for 300s (idle timeout)' }, 'agy');
     // Without evaluatorSummary, should show apology not the partial output
     assert.ok(r.includes("couldn't process"), 'should not show partial stdout to user');
     assert.ok(!r.includes('partial incomplete'), 'should not leak partial stdout to user');
@@ -693,73 +693,73 @@ describe('buildWorkerResponse', () => {
 
   // --- cleaning logic ---
 
-  // --- Gemini thought block extraction ---
+  // --- agy thought block extraction ---
 
-  it('gemini: returns last thought block content, discarding outer planning text', () => {
+  it('agy: returns last thought block content, discarding outer planning text', () => {
     const output = '**Planning** I will now summarize.\n[Thought: true]\nHere is the answer.\n[Thought: false]';
-    const r = buildWorkerResponse({ success: true, output }, 'gemini');
+    const r = buildWorkerResponse({ success: true, output }, 'agy');
     assert.equal(r, 'Here is the answer.');
   });
 
-  it('gemini: returns the LAST thought block when multiple exist', () => {
+  it('agy: returns the LAST thought block when multiple exist', () => {
     const output = '[Thought: true] thinking 1 [Thought: false]\nMid text\n[Thought: true] final answer [Thought: false]\nEnd text';
-    const r = buildWorkerResponse({ success: true, output }, 'gemini');
+    const r = buildWorkerResponse({ success: true, output }, 'agy');
     assert.equal(r, 'final answer');
   });
 
-  it('gemini: falls back to full output (tags stripped) when no thought blocks present', () => {
+  it('agy: falls back to full output (tags stripped) when no thought blocks present', () => {
     const output = 'The planning phase is complete.';
-    const r = buildWorkerResponse({ success: true, output }, 'gemini');
+    const r = buildWorkerResponse({ success: true, output }, 'agy');
     assert.equal(r, 'The planning phase is complete.');
   });
 
-  it('gemini: strips orphaned tags when no complete thought block exists', () => {
+  it('agy: strips orphaned tags when no complete thought block exists', () => {
     const output = '[Thought: true]\nHello world';
-    const r = buildWorkerResponse({ success: true, output }, 'gemini');
+    const r = buildWorkerResponse({ success: true, output }, 'agy');
     assert.equal(r, 'Hello world');
   });
 
-  it('gemini: ignores empty thought blocks, returns last non-empty one', () => {
+  it('agy: ignores empty thought blocks, returns last non-empty one', () => {
     const output = '[Thought: true][Thought: false]\n[Thought: true]\nReal answer\n[Thought: false]';
-    const r = buildWorkerResponse({ success: true, output }, 'gemini');
+    const r = buildWorkerResponse({ success: true, output }, 'agy');
     assert.equal(r, 'Real answer');
   });
 
-  // --- Gemini bold planning header stripping ---
+  // --- agy bold planning header stripping ---
 
-  it('gemini: strips bold planning header + narration from start of output', () => {
+  it('agy: strips bold planning header + narration from start of output', () => {
     const output = "**Delivering the Comprehensive Strategy** I've completed the report.\nI have created the document.";
-    const r = buildWorkerResponse({ success: true, output }, 'gemini');
+    const r = buildWorkerResponse({ success: true, output }, 'agy');
     assert.equal(r, 'I have created the document.');
   });
 
-  it('gemini: strips multiple consecutive bold planning headers', () => {
+  it('agy: strips multiple consecutive bold planning headers', () => {
     const output = "**Refining** I'm zeroing in...\n**Creating** I'm drafting the content...\nActual answer here.";
-    const r = buildWorkerResponse({ success: true, output }, 'gemini');
+    const r = buildWorkerResponse({ success: true, output }, 'agy');
     assert.equal(r, 'Actual answer here.');
   });
 
-  it('gemini: normalizes **bold** to *bold* in non-narration output', () => {
+  it('agy: normalizes **bold** to *bold* in non-narration output', () => {
     const output = '**The Verdict:** UTIs are linked to the same imbalance.';
-    const r = buildWorkerResponse({ success: true, output }, 'gemini');
+    const r = buildWorkerResponse({ success: true, output }, 'agy');
     assert.equal(r, '*The Verdict:* UTIs are linked to the same imbalance.');
   });
 
-  it('gemini: normalizes ### **bold header** to *bold*', () => {
+  it('agy: normalizes ### **bold header** to *bold*', () => {
     const output = '### **1. The Leaky Gut Pipeline**\nExplanation here.';
-    const r = buildWorkerResponse({ success: true, output }, 'gemini');
+    const r = buildWorkerResponse({ success: true, output }, 'agy');
     assert.equal(r, '*1. The Leaky Gut Pipeline*\nExplanation here.');
   });
 
-  it('gemini: noise prefix stripping also applies to gemini worker', () => {
+  it('agy: noise prefix stripping also applies to agy worker', () => {
     const output = 'Planning...\nHello world';
-    const r = buildWorkerResponse({ success: true, output }, 'gemini');
+    const r = buildWorkerResponse({ success: true, output }, 'agy');
     assert.equal(r, 'Hello world');
   });
 
-  it('gemini: clean direct answer passes through unchanged', () => {
+  it('agy: clean direct answer passes through unchanged', () => {
     const output = 'Yes, the timing of her UTIs starting only after the IUI is medically logical.';
-    const r = buildWorkerResponse({ success: true, output }, 'gemini');
+    const r = buildWorkerResponse({ success: true, output }, 'agy');
     assert.equal(r, 'Yes, the timing of her UTIs starting only after the IUI is medically logical.');
   });
 
@@ -822,18 +822,15 @@ describe('AUTH_PATTERN', () => {
 
 describe('MODEL_SWITCH_PATTERN', () => {
   it('matches /model claude', () => assert.ok(MODEL_SWITCH_PATTERN.test('/model claude')));
-  it('matches /model gemini', () => assert.ok(MODEL_SWITCH_PATTERN.test('/model gemini')));
   it('matches /model zclaude', () => assert.ok(MODEL_SWITCH_PATTERN.test('/model zclaude')));
   it('matches /model codex', () => assert.ok(MODEL_SWITCH_PATTERN.test('/model codex')));
   it('matches /model agy', () => assert.ok(MODEL_SWITCH_PATTERN.test('/model agy')));
   it('matches /models claude (plural)', () => assert.ok(MODEL_SWITCH_PATTERN.test('/models claude')));
-  it('matches /models gemini (plural)', () => assert.ok(MODEL_SWITCH_PATTERN.test('/models gemini')));
   it('matches /models zclaude (plural)', () => assert.ok(MODEL_SWITCH_PATTERN.test('/models zclaude')));
   it('matches /models codex (plural)', () => assert.ok(MODEL_SWITCH_PATTERN.test('/models codex')));
   it('matches /models agy (plural)', () => assert.ok(MODEL_SWITCH_PATTERN.test('/models agy')));
   it('matches case-insensitively', () => {
     assert.ok(MODEL_SWITCH_PATTERN.test('/model Claude'));
-    assert.ok(MODEL_SWITCH_PATTERN.test('/MODEL GEMINI'));
     assert.ok(MODEL_SWITCH_PATTERN.test('/model ZCLAUDE'));
     assert.ok(MODEL_SWITCH_PATTERN.test('/model CODEX'));
     assert.ok(MODEL_SWITCH_PATTERN.test('/model AGY'));
@@ -870,11 +867,11 @@ describe('handleModelSwitch', () => {
     assert.equal(state.preferred_worker, undefined);
   });
 
-  it('sets preferred_worker to gemini on /model gemini', () => {
+  it('sets preferred_worker to agy on /model agy', () => {
     const state = makeState();
-    const result = handleModelSwitch(state, '/model gemini');
+    const result = handleModelSwitch(state, '/model agy');
     assert.equal(result.switched, true);
-    assert.equal(state.preferred_worker, 'gemini');
+    assert.equal(state.preferred_worker, 'agy');
     assert.ok(state.preferred_worker_set_at, 'preferred_worker_set_at should be set');
     assert.ok(result.response.includes('until midnight IST'), 'response should mention expiry');
   });
@@ -902,7 +899,7 @@ describe('handleModelSwitch', () => {
   it('clears active session on switch', () => {
     const state = makeState();
     state.session = { session_id: 'abc', worker: 'claude', started_at: new Date().toISOString() };
-    handleModelSwitch(state, '/model gemini');
+    handleModelSwitch(state, '/model agy');
     assert.equal(state.session, undefined);
   });
 
@@ -915,16 +912,16 @@ describe('handleModelSwitch', () => {
 
   it('returns a non-empty confirmation response on switch', () => {
     const state = makeState();
-    const result = handleModelSwitch(state, '/model gemini');
+    const result = handleModelSwitch(state, '/model agy');
     assert.ok(result.response.length > 0);
-    assert.ok(result.response.toLowerCase().includes('gemini'));
+    assert.ok(result.response.toLowerCase().includes('agy'));
   });
 
   it('overwrites an existing preferred_worker', () => {
     const state = makeState();
     state.preferred_worker = 'claude';
-    handleModelSwitch(state, '/model gemini');
-    assert.equal(state.preferred_worker, 'gemini');
+    handleModelSwitch(state, '/model agy');
+    assert.equal(state.preferred_worker, 'agy');
   });
 });
 
@@ -935,14 +932,14 @@ describe('handleModelSwitch', () => {
 describe('resolveEffectiveDefaultWorker', () => {
   it('prefers a configured topic default when that worker exists', () => {
     assert.equal(
-      resolveEffectiveDefaultWorker('gemini', [{ name: 'claude' }, { name: 'gemini' }]),
-      'gemini',
+      resolveEffectiveDefaultWorker('agy', [{ name: 'claude' }, { name: 'agy' }]),
+      'agy',
     );
   });
 
   it('falls back to priority order when the configured default is absent', () => {
     assert.equal(
-      resolveEffectiveDefaultWorker('missing-worker', [{ name: 'zclaude' }, { name: 'gemini' }]),
+      resolveEffectiveDefaultWorker('missing-worker', [{ name: 'zclaude' }, { name: 'agy' }]),
       'zclaude',
     );
   });
@@ -955,11 +952,11 @@ describe('resolveEffectiveDefaultWorker', () => {
 describe('hydrateModelStatus', () => {
   it('hydrates legacy preferred_worker state into a user_override snapshot', () => {
     const state = makeState();
-    state.preferred_worker = 'gemini';
+    state.preferred_worker = 'agy';
     state.preferred_worker_set_at = '2026-04-28T10:00:00.000Z';
 
     const snapshot = hydrateModelStatus(state, 'claude');
-    assert.equal(snapshot.current_worker, 'gemini');
+    assert.equal(snapshot.current_worker, 'agy');
     assert.equal(snapshot.default_worker, 'claude');
     assert.equal(snapshot.reason_code, 'user_override');
     assert.equal(snapshot.changed_at, '2026-04-28T10:00:00.000Z');
@@ -975,9 +972,9 @@ describe('hydrateModelStatus', () => {
       reasonText: 'Temporary failover from claude to codex.',
     });
 
-    const snapshot = hydrateModelStatus(state, 'gemini');
+    const snapshot = hydrateModelStatus(state, 'agy');
     assert.equal(snapshot.current_worker, 'codex');
-    assert.equal(snapshot.default_worker, 'gemini');
+    assert.equal(snapshot.default_worker, 'agy');
     assert.equal(snapshot.reason_code, 'failover');
     assert.equal(snapshot.reason_text, 'Temporary failover from claude to codex.');
   });
@@ -992,7 +989,7 @@ describe('modelStatusNeedsRefresh', () => {
       changedAt: '2026-04-28T11:00:00.000Z',
     });
     const next = buildModelStatusSnapshot({
-      currentWorker: 'gemini',
+      currentWorker: 'agy',
       defaultWorker: 'claude',
       reasonCode: 'failover',
       changedAt: '2026-04-28T11:05:00.000Z',
@@ -1016,25 +1013,25 @@ describe('expirePreferredWorker', () => {
 
   it('no-op when preferred_worker set but no set_at timestamp', () => {
     const state = makeState();
-    state.preferred_worker = 'gemini';
+    state.preferred_worker = 'agy';
     const expired = expirePreferredWorker(state);
     assert.equal(expired, false);
-    assert.equal(state.preferred_worker, 'gemini');
+    assert.equal(state.preferred_worker, 'agy');
   });
 
   it('no-op when preferred_worker was set today (IST)', () => {
     const state = makeState();
-    state.preferred_worker = 'gemini';
+    state.preferred_worker = 'agy';
     state.preferred_worker_set_at = new Date().toISOString();
     const expired = expirePreferredWorker(state);
     assert.equal(expired, false);
-    assert.equal(state.preferred_worker, 'gemini');
+    assert.equal(state.preferred_worker, 'agy');
   });
 
   it('clears preferred_worker when set on a previous IST day', () => {
     const state = makeState();
-    state.preferred_worker = 'gemini';
-    state.session = { session_id: 'abc', worker: 'gemini', started_at: new Date().toISOString() };
+    state.preferred_worker = 'agy';
+    state.session = { session_id: 'abc', worker: 'agy', started_at: new Date().toISOString() };
     // Simulate set yesterday in IST
     const yesterday = new Date(Date.now() - 25 * 60 * 60 * 1000);
     state.preferred_worker_set_at = yesterday.toISOString();
@@ -1073,10 +1070,10 @@ describe('handleDefaultQuery', () => {
     assert.equal(result.worker, 'claude');
   });
 
-  it('matches /default gemini (case insensitive)', () => {
-    const result = handleDefaultQuery('/default GEMINI');
+  it('matches /default agy (case insensitive)', () => {
+    const result = handleDefaultQuery('/default AGY');
     assert.equal(result.matched, true);
-    assert.equal(result.worker, 'gemini');
+    assert.equal(result.worker, 'agy');
   });
 
   it('matches /default zclaude', () => {
@@ -1949,18 +1946,18 @@ describe('normalizeMarkdown: table → code block (edge cases)', () => {
   });
 });
 
-describe('buildWorkerResponse: Gemini thought blocks', () => {
+describe('buildWorkerResponse: agy thought blocks', () => {
   it('calls normalizeMarkdown on extracted thought block content', () => {
     const output = '[Thought: true]\n**Bold result** with _italic_\n[Thought: false]';
-    const result = buildWorkerResponse({ success: true, output }, 'gemini');
+    const result = buildWorkerResponse({ success: true, output }, 'agy');
     assert.ok(result.includes('*Bold result*'), '**bold** converted to *bold*');
     assert.ok(!result.includes('**'), 'no double asterisks remain');
   });
 
-  it('normalizes a table inside a Gemini thought block', () => {
+  it('normalizes a table inside an agy thought block', () => {
     const table = '| A | B |\n|---|---|\n| 1 | 2 |';
     const output = `[Thought: true]\nHere:\n\n${table}\n[Thought: false]`;
-    const result = buildWorkerResponse({ success: true, output }, 'gemini');
+    const result = buildWorkerResponse({ success: true, output }, 'agy');
     assert.ok(result.includes('```'), 'table wrapped in code block');
     assert.ok(result.includes('| A | B |'), 'table content preserved');
   });
@@ -2052,11 +2049,11 @@ describe('clearTopicContext', () => {
   it('preserves cwd_override and preferred_worker', () => {
     const state = makeState();
     state.cwd_override = 'C:/test-repos/foo';
-    state.preferred_worker = 'gemini';
+    state.preferred_worker = 'agy';
     state.preferred_worker_set_at = '2026-01-01T00:00:00Z';
     clearTopicContext(state);
     assert.equal(state.cwd_override, 'C:/test-repos/foo');
-    assert.equal(state.preferred_worker, 'gemini');
+    assert.equal(state.preferred_worker, 'agy');
   });
 });
 
@@ -2098,9 +2095,9 @@ describe('handleNewCommand', () => {
 
   it('preserves preferred_worker after /new', () => {
     const state = makeState();
-    state.preferred_worker = 'gemini';
+    state.preferred_worker = 'agy';
     handleNewCommand(state, '/new');
-    assert.equal(state.preferred_worker, 'gemini');
+    assert.equal(state.preferred_worker, 'agy');
   });
 });
 
@@ -2114,7 +2111,7 @@ describe('handleResetCommand (regression after clearTopicContext refactor)', () 
     state.turns.push({ role: 'user', text: 'hi', timestamp: '2026-01-01T00:00:00Z' });
     state.session = { session_id: 'x', worker: 'claude', started_at: '2026-01-01T00:00:00Z' };
     state.pending_action = { description: 'do thing', proposed_at: '2026-01-01T00:00:00Z' };
-    state.preferred_worker = 'gemini';
+    state.preferred_worker = 'agy';
     state.cwd_override = 'C:/foo';
     const result = handleResetCommand(state);
     assert.ok(result.matched);
@@ -2284,14 +2281,14 @@ describe('renderStatusCard', () => {
   it('formats card with default, current, reason, and keep-awake lines', () => {
     const card = renderStatusCard({
       snapshot: buildModelStatusSnapshot({
-        currentWorker: 'gemini',
+        currentWorker: 'agy',
         defaultWorker: 'zclaude',
         reasonCode: 'user_override',
       }),
       keepAwake: { active: true, since: '2026-04-21T07:26:00.000Z' }
     });
     assert.ok(card.includes('Default: zclaude'));
-    assert.ok(card.includes('Current: gemini'));
+    assert.ok(card.includes('Current: agy'));
     assert.ok(card.includes('Reason: Temporary user override until IST midnight.'));
     assert.ok(card.includes('Keep-awake: on since 2026-04-21T07:26:00.000Z'));
   });
