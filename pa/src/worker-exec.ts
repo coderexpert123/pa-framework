@@ -1,6 +1,7 @@
 import { spawn } from 'child_process';
-import { writeFile, unlink } from 'fs/promises';
+import { writeFile, unlink, mkdir } from 'fs/promises';
 import { join } from 'path';
+import { paHome } from './paths.js';
 import { tmpdir } from 'os';
 import { randomBytes, randomUUID } from 'crypto';
 import { DEFAULT_TIMEOUT, DEFAULT_IDLE_TIMEOUT } from './types.js';
@@ -226,6 +227,18 @@ export async function executeWorker(
 
     const mergedEnv = { ...process.env, ...(options.env || {}), PA_BOT_PID: String(process.pid) } as NodeJS.ProcessEnv;
 
+    // Tee stdout for agy: the shim wraps agy with the tee helper when
+    // AGY_TEE_OUT is set, capturing output to disk so the orphan reaper can
+    // recover sessionless workers' replies after a bot crash.
+    let teePath: string | undefined;
+    if (worker.name === 'agy' && !mergedEnv.AGY_TEE_OUT) {
+      const teeDir = join(paHome(), 'logs', 'worker-tee');
+      await mkdir(teeDir, { recursive: true });
+      const safeName = options.contextId || `${Date.now()}-${randomBytes(4).toString('hex')}`;
+      teePath = join(teeDir, `${safeName}.out`);
+      mergedEnv.AGY_TEE_OUT = teePath;
+    }
+
     // Snapshot state dir mtime before spawning so we can detect new activity
     const stateDir = worker.state_dir ? resolveStateDir(worker.state_dir) : null;
     const statePattern = worker.state_pattern || '*.jsonl';
@@ -251,6 +264,8 @@ export async function executeWorker(
       let capturedSessionId: string | undefined;
       let lastCodexTelemetry: { usedPercent: number; windowMinutes: number; resetsAt: number } | undefined;
       let codexStreamError = ''; // captures {"type":"error",...} events from codex NDJSON stream
+      let agyStreamError = ''; // captures error text from agy result events with status !== SUCCESS
+      let agyResultSeen = false; // tracks whether an agy result event was parsed (for fallback logic)
       const isStreamJson = worker.output_format === 'stream-json';
 
       const child = spawn(worker.command, args, {
@@ -282,6 +297,7 @@ export async function executeWorker(
             ...(options.harvestWindowMs
               ? { harvestUntil: new Date(Date.now() + options.harvestWindowMs).toISOString() }
               : {}),
+            ...(teePath ? { teePath } : {}),
           }).catch((err) => {
             logger.warn('worker-pids', 'Failed to register worker pid', {
               pid: child.pid, worker: worker.name, error: String(err),
@@ -314,7 +330,7 @@ export async function executeWorker(
       }
 
       const mergeKillError = (reason: string) =>
-        codexStreamError ? `${reason}\n${codexStreamError}` : reason;
+        [codexStreamError, agyStreamError].filter(Boolean).join('\n') ? `${reason}\n${[codexStreamError, agyStreamError].filter(Boolean).join('\n')}` : reason;
 
       // Kills the wrapper PID (child.pid) AND every live tracked descendant
       // (bgTaskMap — refreshed each heartbeat from the real OS process tree).
@@ -662,6 +678,33 @@ export async function executeWorker(
                   }
                 }
               }
+
+              // agy stream-json: uses event.event (not event.type) as discriminator.
+              // Gated on worker name to prevent codex/claude/gemini events from matching.
+              if (worker.name === 'agy' && event.event) {
+                // Session ID from init event (belt) and result event (suspenders)
+                if ((event.event === 'init' || event.event === 'result') && typeof event.conversation_id === 'string') {
+                  capturedSessionId = event.conversation_id;
+                }
+                // Also capture from event.result.conversation_id for result events (belt-and-suspenders)
+                if (event.event === 'result' && event.result && typeof event.result === 'object' && typeof event.result.conversation_id === 'string') {
+                  capturedSessionId = event.result.conversation_id;
+                }
+                // Result event: extract final response
+                if (event.event === 'result' && event.result && typeof event.result === 'object') {
+                  agyResultSeen = true;
+                  if (typeof event.result.response === 'string') {
+                    stdout = event.result.response;
+                  }
+                  if (event.result.status && event.result.status !== 'SUCCESS' && typeof event.result.response === 'string') {
+                    agyStreamError += (agyStreamError ? '\n' : '') + event.result.response;
+                  }
+                }
+                // step_update: accumulate text_delta as fallback (used if no result event)
+                if (event.event === 'step_update' && event.step_update?.text_delta && !agyResultSeen) {
+                  stdout += event.step_update.text_delta;
+                }
+              }
             } catch {
               // Malformed JSON line — skip
             }
@@ -736,6 +779,28 @@ export async function executeWorker(
                 }
               }
             }
+
+            // agy stream-json: trailing buffer flush (same logic as stdout handler)
+            if (worker.name === 'agy' && event.event) {
+              if ((event.event === 'init' || event.event === 'result') && typeof event.conversation_id === 'string') {
+                capturedSessionId = event.conversation_id;
+              }
+              if (event.event === 'result' && event.result && typeof event.result === 'object' && typeof event.result.conversation_id === 'string') {
+                capturedSessionId = event.result.conversation_id;
+              }
+              if (event.event === 'result' && event.result && typeof event.result === 'object') {
+                agyResultSeen = true;
+                if (typeof event.result.response === 'string') {
+                  stdout = event.result.response;
+                }
+                if (event.result.status && event.result.status !== 'SUCCESS' && typeof event.result.response === 'string') {
+                  agyStreamError += (agyStreamError ? '\n' : '') + event.result.response;
+                }
+              }
+              if (event.event === 'step_update' && event.step_update?.text_delta && !agyResultSeen) {
+                stdout += event.step_update.text_delta;
+              }
+            }
           } catch {
             // Final buffer wasn't valid JSON — ignore
           }
@@ -770,8 +835,8 @@ export async function executeWorker(
 
         // Clear the heartbeat line
         if (stateDir) process.stdout.write('\r' + ' '.repeat(60) + '\r');
-        // Merge codex stream errors into the error field so rate-limit detection can see them
-        const combinedError = [codexStreamError, stderr, code !== 0 && !codexStreamError && !stderr ? `Exited with code ${code}` : '']
+        // Merge codex and agy stream errors into the error field so rate-limit detection can see them
+        const combinedError = [codexStreamError, agyStreamError, stderr, code !== 0 && !codexStreamError && !agyStreamError && !stderr ? `Exited with code ${code}` : '']
           .filter(Boolean).join('\n') || undefined;
         if (code !== 0) {
           logger.warn('worker-exec', 'spawn-failed', { worker: worker.name, exitCode: code, stderr_excerpt: (combinedError ?? '').slice(0, 1000) });

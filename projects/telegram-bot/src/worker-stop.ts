@@ -31,7 +31,9 @@ import { logger } from '../../../pa/dist/src/lib/log.js';
 
 export type StopKind = 'stop' | 'steer';
 
-export const STOP_MARKER_TTL_MS = 5 * 60 * 1000;
+// 15 min: covers PA_VOICE_TRANSCRIBE_TIMEOUT_MS (10 min default) plus slack
+// so a late-completing flush-check still sees a valid marker (E11).
+export const STOP_MARKER_TTL_MS = 15 * 60 * 1000;
 
 // Marker per topic. `sinceUpdateId` scopes it to dispatches OLDER than the
 // /stop//steer message itself: without that gate a lingering marker (e.g. the
@@ -137,12 +139,20 @@ export async function stopTopicWorkers(
 export const STOP_PATTERN = /^\/stop(?:@\w+)?\s*$/i;
 export const STEER_PATTERN = /^\/steer(?:@\w+)?(?:\s+([\s\S]+))?$/i;
 
-export function parseStopSteer(text: string): { kind: StopKind; prompt?: string } | null {
+export function parseStopSteer(
+  text: string,
+  hasAttachment?: boolean
+): { kind: StopKind; prompt?: string } | null {
   if (STOP_PATTERN.test(text)) return { kind: 'stop' };
   const m = STEER_PATTERN.exec(text);
   if (m) {
     const prompt = m[1]?.trim();
-    // /steer with no prompt degrades to /stop (documented in BOT_COMMANDS).
+    // /steer with no prompt degrades to /stop (documented in BOT_COMMANDS),
+    // EXCEPT when hasAttachment is true — return steer with undefined prompt
+    // so the caller can treat the attachment itself as the prompt (E7, A3).
+    if (hasAttachment && !prompt) {
+      return { kind: 'steer', prompt: undefined };
+    }
     return prompt ? { kind: 'steer', prompt } : { kind: 'stop' };
   }
   return null;

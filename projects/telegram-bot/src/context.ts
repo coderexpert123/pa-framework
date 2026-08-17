@@ -156,6 +156,7 @@ export async function buildPrompt(
 - Ambiguous intent: ask exactly ONE clarifying question.
 - Never fabricate data. If you don't know, say so.
 - Grounding Sources first: Systems of record: D:/My Repos/notes/Ecosystem KB/ (start with Sources.md). Before answering a date-sensitive or domain-deterministic factual question, check Sources.md and the file(s) it names, and cite them. Never answer such a question from general/parametric knowledge when a named source exists. (Mirrors bot-instructions.md's Factual Integrity item 4 — claude/zclaude get that file via --append-system-prompt-file, agy/codex only get this inline block, so this rule must exist in both places; keep them in sync, enforced by context.test.ts.)
+- Infrastructure outside the repo tree — worker shims (D:/gemini-shim), ~/.pa config, installed CLI binaries — is never to be rewritten, replaced, or worked around to fix a failure. Diagnose, then surface the blocker to the operator and stop. Substituting one CLI for another behind a worker's name breaks every assumption the dispatcher, guards, and docs make about that worker (2026-08-14: agy's shim was silently rerouted to a different CLI).
 - PA_META (optional last line, single-line JSON, nothing after it):
   [PA_META]: {"actions":[{"type":"T",...}]}
   Types: retry_with_worker{reason} | run_skill{skill} | confirm_required | kb_note{domain,note}

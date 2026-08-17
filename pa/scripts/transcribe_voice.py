@@ -79,10 +79,11 @@ _EXT_MIME = {
     ".amr": "audio/amr",
 }
 
-# OpenAI's documented accepted-extension list does not include .oga/.opus --
-# this only ever changes the TRANSMITTED filename, never touches the file on
-# disk. Groq accepts .oga fine and keeps the real basename.
-_OPENAI_EXT_ALIAS = {".oga": ".ogg", ".opus": ".ogg"}
+# OpenAI's and Groq's documented accepted-extension lists do not include
+# .oga/.opus -- this only ever changes the TRANSMITTED filename, never touches
+# the file on disk. Both providers reject .oga but accept .ogg (Groq: 400
+# "file must be one of the following types"; OpenAI: undocumented but similar).
+_CLOUD_EXT_ALIAS = {".oga": ".ogg", ".opus": ".ogg"}
 
 NO_ENGINE_HELP = """No transcription engine is available yet.
 
@@ -284,15 +285,15 @@ def _format_size(num_bytes):
 
 
 def _upload_part(provider, audio_path):
-    """Return (filename, mime) to transmit for `provider`. Groq keeps the real
-    basename; OpenAI gets its extension normalized via _OPENAI_EXT_ALIAS
-    (transmitted filename only -- never touches the file on disk)."""
+    """Return (filename, mime) to transmit for `provider`. Groq and OpenAI both
+    get their extension normalized via _CLOUD_EXT_ALIAS (transmitted filename
+    only -- never touches the file on disk)."""
     basename = os.path.basename(audio_path)
     stem, ext = os.path.splitext(basename)
     ext = ext.lower()
 
-    if provider == "openai":
-        alias_ext = _OPENAI_EXT_ALIAS.get(ext)
+    if provider in ("groq", "openai"):
+        alias_ext = _CLOUD_EXT_ALIAS.get(ext)
         if alias_ext:
             return f"{stem}{alias_ext}", _EXT_MIME.get(alias_ext, "application/octet-stream")
 

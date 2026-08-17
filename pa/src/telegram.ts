@@ -27,6 +27,31 @@ export function splitMessage(text: string): string[] {
 }
 
 /**
+ * Parse Telegram 429 retry_after from response body.
+ * Returns the seconds to wait (capped at 60), or null if unparseable.
+ * AI-149: honors Telegram's rate-limit signal instead of blind retries.
+ */
+function parseRetryAfter(body: string): number | null {
+  try {
+    const parsed = JSON.parse(body);
+    const raw = parsed?.parameters?.retry_after;
+    if (typeof raw === 'number') {
+      return Math.min(raw, 60); // cap at 60s
+    }
+  } catch {
+    // JSON parse fails → treat as unparseable
+  }
+  return null;
+}
+
+/**
+ * Sleep for N milliseconds. Mirrors the pattern in lib/notify.ts.
+ */
+async function sleep(ms: number): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+/**
  * Outcome of a send. Returned (never thrown) so callers — notably
  * `lib/notify.ts` — can tell a delivered message from a rejected one.
  *
@@ -125,93 +150,160 @@ export async function sendToTelegram(
       body.message_thread_id = config.thread_id;
     }
 
-    try {
-      const res = await telegramFetch(`${BASE}/bot${token}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
+    let attempt = 0;
+    const maxAttempts = 3; // AI-149: up to 3 total attempts for 429 retries
+    let chunkFailure: SendResult | null = null;
 
-      if (!res.ok) {
-        const errorText = await res.text();
-        // Fallback: retry as plain text if Markdown parse fails
-        if (errorText.includes('parse')) {
-          delete body.parse_mode;
-          // Strip italic markers from ref ID so it shows as "Ref: xxx" not "_Ref: xxx_" in plain text.
-          // The optional (\n\n)? handles the edge case where splitMessage puts the ref into its own chunk.
-          // The optional `\\` matches the dash escape for MdV2 (`s\-9b43`) — capture id as
-          // prefix + hex separately so output is always clean `Ref: s-9b43` regardless of input form.
-          body.text = (body.text as string).replace(/((?:\n\n)?)_Ref: ([a-z]+)\\?-([0-9a-f]{4,})_$/, '$1Ref: $2-$3');
-          try {
-            const res2 = await telegramFetch(`${BASE}/bot${token}/sendMessage`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(body),
-            });
-            if (!res2.ok) {
-              const errorText2 = await res2.text();
-              console.error(`[pa/telegram] sendToTelegram failed (plain-text fallback): ${res2.status} ${errorText2}`);
-              log('error', 'telegram', 'send failed (plain-text fallback)', {
+    while (attempt < maxAttempts && !chunkFailure) {
+      attempt++;
+      try {
+        const res = await telegramFetch(`${BASE}/bot${token}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+
+        if (!res.ok) {
+          const errorText = await res.text();
+
+          // AI-149: 429 rate limit — honor retry_after, do NOT fall back to plain text
+          if (res.status === 429) {
+            const retryAfter = parseRetryAfter(errorText);
+            if (retryAfter !== null && attempt < maxAttempts) {
+              const waitMs = (retryAfter + 1) * 1000; // +1s margin, convert to ms
+              console.error(`[pa/telegram] 429 rate limit, waiting ${retryAfter + 1}s before retry ${attempt + 1}/${maxAttempts}`);
+              log('warn', 'telegram', '429 rate limit, retrying', {
                 refId,
                 chatId: config.chat_id,
                 threadId: config.thread_id,
                 chunkIndex,
-                status: res2.status,
-                detail: errorText2.slice(0, DETAIL_MAX_LEN),
+                attempt,
+                retryAfter,
+                waitMs,
               });
-              failure ??= httpFailure(res2.status, errorText2);
-            } else {
-              log('info', 'telegram', 'skill message sent (plain-text fallback)', {
-                refId,
-                chatId: config.chat_id,
-                threadId: config.thread_id,
-                chunkIndex,
-                textPreview: (body.text as string).slice(0, 500),
-              });
+              await sleep(waitMs);
+              continue; // retry SAME payload (no parse-mode fallback)
             }
-          } catch (err) {
-            console.error('[pa/telegram] sendToTelegram plain-text fallback error:', err);
-            log('error', 'telegram', 'send error (plain-text fallback)', {
+            // Unparseable retry_after or final attempt — treat as normal http failure
+            console.error(`[pa/telegram] 429 rate limit, cannot retry (unparseable or final attempt)`);
+            chunkFailure = httpFailure(res.status, errorText);
+            break;
+          }
+
+          // Fallback: retry as plain text if Markdown parse fails (NOT for 429)
+          if (errorText.includes('parse')) {
+            delete body.parse_mode;
+            // Strip italic markers from ref ID so it shows as "Ref: xxx" not "_Ref: xxx_" in plain text.
+            // The optional (\n\n)? handles the edge case where splitMessage puts the ref into its own chunk.
+            // The optional `\\` matches the dash escape for MdV2 (`s\-9b43`) — capture id as
+            // prefix + hex separately so output is always clean `Ref: s-9b43` regardless of input form.
+            body.text = (body.text as string).replace(/((?:\n\n)?)_Ref: ([a-z]+)\\?-([0-9a-f]{4,})_$/, '$1Ref: $2-$3');
+
+            // AI-149: plain-text fallback also needs 429 retry handling
+            let fallbackAttempt = 0;
+            const maxFallbackAttempts = 3;
+            let fallbackSucceeded = false;
+
+            while (fallbackAttempt < maxFallbackAttempts && !fallbackSucceeded && !chunkFailure) {
+              fallbackAttempt++;
+              try {
+                const res2 = await telegramFetch(`${BASE}/bot${token}/sendMessage`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(body),
+                });
+                if (!res2.ok) {
+                  const errorText2 = await res2.text();
+                  // AI-149: 429 on fallback — retry with same plain-text payload
+                  if (res2.status === 429) {
+                    const retryAfter = parseRetryAfter(errorText2);
+                    if (retryAfter !== null && fallbackAttempt < maxFallbackAttempts) {
+                      const waitMs = (retryAfter + 1) * 1000;
+                      console.error(`[pa/telegram] 429 rate limit on plain-text fallback, waiting ${retryAfter + 1}s`);
+                      await sleep(waitMs);
+                      continue; // retry same plain-text payload
+                    }
+                    // Unparseable or final attempt — fail
+                    console.error(`[pa/telegram] 429 rate limit on plain-text fallback, cannot retry`);
+                    chunkFailure = httpFailure(res2.status, errorText2);
+                    break;
+                  }
+                  // Other non-429 error on fallback — fail immediately
+                  console.error(`[pa/telegram] sendToTelegram failed (plain-text fallback): ${res2.status} ${errorText2}`);
+                  log('error', 'telegram', 'send failed (plain-text fallback)', {
+                    refId,
+                    chatId: config.chat_id,
+                    threadId: config.thread_id,
+                    chunkIndex,
+                    status: res2.status,
+                    detail: errorText2.slice(0, DETAIL_MAX_LEN),
+                  });
+                  chunkFailure = httpFailure(res2.status, errorText2);
+                } else {
+                  log('info', 'telegram', 'skill message sent (plain-text fallback)', {
+                    refId,
+                    chatId: config.chat_id,
+                    threadId: config.thread_id,
+                    chunkIndex,
+                    textPreview: (body.text as string).slice(0, 500),
+                  });
+                  fallbackSucceeded = true;
+                  break; // AI-149: exit retry loop on success
+                }
+              } catch (err) {
+                console.error('[pa/telegram] sendToTelegram plain-text fallback error:', err);
+                log('error', 'telegram', 'send error (plain-text fallback)', {
+                  refId,
+                  chatId: config.chat_id,
+                  threadId: config.thread_id,
+                  chunkIndex,
+                  detail: detailOf(err),
+                });
+                chunkFailure = networkFailure(err);
+              }
+            }
+            // AI-149: if fallback succeeded, exit main retry loop
+            if (fallbackSucceeded) {
+              break;
+            }
+          } else {
+            console.error(`[pa/telegram] sendToTelegram failed: ${res.status} ${errorText}`);
+            log('error', 'telegram', 'send failed', {
               refId,
               chatId: config.chat_id,
               threadId: config.thread_id,
               chunkIndex,
-              detail: detailOf(err),
+              status: res.status,
+              detail: errorText.slice(0, DETAIL_MAX_LEN),
             });
-            failure ??= networkFailure(err);
+            chunkFailure = httpFailure(res.status, errorText);
           }
         } else {
-          console.error(`[pa/telegram] sendToTelegram failed: ${res.status} ${errorText}`);
-          log('error', 'telegram', 'send failed', {
+          // Success — log and exit retry loop
+          log('info', 'telegram', 'skill message sent', {
             refId,
             chatId: config.chat_id,
             threadId: config.thread_id,
             chunkIndex,
-            status: res.status,
-            detail: errorText.slice(0, DETAIL_MAX_LEN),
+            textPreview: chunk.slice(0, 500),
           });
-          failure ??= httpFailure(res.status, errorText);
+          break; // AI-149: exit retry loop on success
         }
-      } else {
-        log('info', 'telegram', 'skill message sent', {
+      } catch (err) {
+        console.error('[pa/telegram] sendToTelegram network error:', err);
+        log('error', 'telegram', 'send network error', {
           refId,
           chatId: config.chat_id,
           threadId: config.thread_id,
           chunkIndex,
-          textPreview: chunk.slice(0, 500),
+          detail: detailOf(err),
         });
+        // AI-149: network errors keep current no-retry semantics — record and break
+        chunkFailure = networkFailure(err);
       }
-    } catch (err) {
-      console.error('[pa/telegram] sendToTelegram network error:', err);
-      log('error', 'telegram', 'send network error', {
-        refId,
-        chatId: config.chat_id,
-        threadId: config.thread_id,
-        chunkIndex,
-        detail: detailOf(err),
-      });
-      failure ??= networkFailure(err);
     }
+
+    failure ??= chunkFailure;
   }
 
   return failure ?? { ok: true, chunks: chunks.length };

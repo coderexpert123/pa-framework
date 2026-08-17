@@ -35,8 +35,15 @@ guard.
 Crash-in-flight dispatches are covered too (AI-095): `pending-dispatches.ts` records
 every dispatch before the worker spawns; on startup `orphan-reaper.ts` recovers the lost
 reply from claude-family session transcripts (waiting for the orphan to finish —
-main.ts excludes those topics from the AI-039 orphan-kill pass) or sends a death notice;
-recovered replies are dedup-guarded via the same delivered-store. The poll loop's
+main.ts excludes those topics from the AI-039 orphan-kill pass), or — for transcript-less
+workers, i.e. agy — from the **stdout tee** (`worker-exec.ts` sets `AGY_TEE_OUT` on agy
+dispatches; the shim's `worker_stdout_tee.js` mirrors stdout to
+`~/.pa/logs/worker-tee/<contextId>.out`, which survives a bot-only kill because the shim
+chain outlives the bot; the reaper's tee-fallback branch waits for the orphan then
+harvests the file — `extractTeeResult` handles NDJSON `type:'result'` events AND
+plain-text) — or sends a death notice;
+recovered replies are dedup-guarded via the same delivered-store. Tee files are GC'd
+after 24h by the declared `worker-tee-gc` job (AI-100). The poll loop's
 stop-sentinel watcher (main.ts) aborts a slow proxied `getUpdates` so graceful shutdown
 stays prompt.
 
@@ -63,7 +70,7 @@ stays prompt.
    `/model`, etc.) to a recovering topic must still execute, not get swallowed by the
    deferral notice.
 
-## /stop -> executor cancellation (AI-092)
+## /stop -> executor cancellation (AI-092; voice-prefetch + flush semantics 2026-08-15)
 
 `/stop`/`/steer` cancel a REQUEST, not just the worker holding it right now.
 `worker-stop.ts` sets the topic marker; `dispatchMessage` hands `isTopicStopped` to pa as
@@ -77,6 +84,29 @@ the cancelled request got answered by the next worker instead (live incident 202
 thread 29, plus a false pa-alerts page). The bot's post-cascade bail is deliberately
 gated on `!result.success`, preserving the invariant that a worker which finished just
 before the kill keeps its real reply. `plans/2026-08-02-autonomous-stop-cancellation-cascade.md`.
+
+**2026-08-15 wave (voice prefetch + flush; plans/2026-08-15-voice-prefetch-stop-steer-flush*.md)**:
+
+- Voice/audio/video notes transcribe AT ARRIVAL (`voice-prefetch.ts`, started in the
+  poll loop's enqueue block, AFTER the AI-095 placeholder write). The transcript becomes
+  the queued entry's text — from then on a voice note is exactly a text message. Never
+  cancelled by stop/steer.
+- `/stop` and `/steer` flush the topic's turn boundary: everything not-yet-dispatched
+  and non-command becomes HELD context (`topic-queue.ts` held entries) carried by the
+  next dispatch (`absorbHeldEntries`, arrival-ordered, promise-aware). An in-flight
+  dispatch cancelled by the marker contributes its text via the reply-path A6 flush.
+  The marker is ALWAYS set (no unmark-on-killed-0) and TTL is 15 min (covers the
+  10-min transcription cap); it is updateId-gated so it can never touch newer messages.
+- Caption parsing: `/stop`/`/steer` are detected from `msg.text ?? msg.caption`;
+  bare `/steer` as a caption on a voice note = the transcript is the steer prompt.
+  A caption that is any slash-command skips transcription entirely (`__skipVoice`).
+- Do-not-regress: the stop/steer kill IIFE must NOT drain the queue for `/steer` (it
+  resumes at the loop's next await — after the steer's own entry registered — and
+  would cancel it); held absorption for a steer happens in ITS normalizer, never at
+  interception time; prefetch deps need the secrets-bearing env + hoisted
+  `transcription:` config (process.env alone silently strands prefetch on local
+  whisper); placeholder-before-prefetch ordering is load-bearing (AI-095 tests gate
+  on the first /getFile).
 
 ## Worker-pid registry & topic-lock invariants (AI-112/113/114, 2026-08-08)
 

@@ -152,7 +152,11 @@ instead. Full record: `plans/2026-07-21-performance-audit-remediation.md`.
     Headline facts worth knowing unprompted: DO NOT TRUST THE GUARD ALONE (it's a local
     hook — uninstalled, stale, or bypassed leaves zero coverage, which is why the CI
     backstop exists independently); a layer-3 (agy) infra failure now blocks the push by
-    design, not waves it through; the sanctioned bypass is
+    design, not waves it through — UNLESS a fresh hash-pinned review record covers the
+    exact added lines (2026-08-13, AI-117 consolidation: `--record-review` after
+    push-public's Step 3 review, 10-minute TTL, `~/.pa/pii-guard-reviews.jsonl`; layers
+    0-2 and `--full` never consult records, and the record waives nothing regex-shaped);
+    the sanctioned bypass is
     `PA_SKIP_PII_GUARD=1 git-public push origin main`, logged to
     `~/.pa/pii-guard-bypass.jsonl`, never silent.
 -   **OAuth boundary**: generic bridge-page assets, `/auth` handling, auth-session

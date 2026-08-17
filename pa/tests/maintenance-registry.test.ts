@@ -10,8 +10,8 @@ describe('MAINTENANCE_JOBS registry', () => {
     assert.doesNotThrow(() => validateRegistry([...MAINTENANCE_JOBS]));
   });
 
-  it('declares exactly 16 jobs (10 pa + 6 bot) with the expected names', () => {
-    assert.equal(MAINTENANCE_JOBS.length, 16);
+  it('declares exactly 17 jobs (11 pa + 6 bot) with the expected names', () => {
+    assert.equal(MAINTENANCE_JOBS.length, 17);
     const names = MAINTENANCE_JOBS.map((j) => j.name).sort();
     assert.deepEqual(names, [
       'alert-state-gc',
@@ -30,11 +30,12 @@ describe('MAINTENANCE_JOBS registry', () => {
       'staleness-check',
       'voice-attachment-gc',
       'weekly-learn',
+      'worker-tee-gc',
     ]);
   });
 
-  it('splits jobs correctly by host (10 pa, 6 bot)', () => {
-    assert.equal(jobsForHost('pa').length, 10);
+  it('splits jobs correctly by host (11 pa, 6 bot)', () => {
+    assert.equal(jobsForHost('pa').length, 11);
     assert.equal(jobsForHost('bot').length, 6);
     const botNames = jobsForHost('bot').map((j) => j.name).sort();
     assert.deepEqual(botNames, [
@@ -85,6 +86,7 @@ describe('MAINTENANCE_JOBS registry', () => {
       'session-gc',
       'skill-log-rotate',
       'voice-attachment-gc',
+      'worker-tee-gc',
     ]);
   });
 

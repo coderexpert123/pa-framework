@@ -2452,7 +2452,7 @@ describe('runPollLoop: /steer folds queued messages into context', { concurrency
     (globalThis as Record<string, unknown>).fetch = savedFetch;
   });
 
-  it('msg1 in-flight + msg2/msg3 queued + queued /reset + /steer: msg2/msg3 fold into one combined dispatch, /reset still runs on its own', async () => {
+  it('msg1 in-flight + msg2/msg3 queued + queued /reset + /steer: msg2/msg3 fold into one combined dispatch, /reset still runs on its own', async function() {
     // The "worker" reads the full prompt off stdin and echoes it back wrapped
     // in GOTPROMPTSTART/GOTPROMPTEND markers — lets the test read back
     // exactly what dispatchMessage sent as `## Current Message`, in order,
@@ -2490,9 +2490,6 @@ topic_defaults:
     const queuedReset = { update_id: 4, message: { message_id: 4, chat: { id: 123, type: 'private' }, date: Math.floor(Date.now() / 1000), text: '/reset' } };
     const steerMsg = { update_id: 5, message: { message_id: 5, chat: { id: 123, type: 'private' }, date: Math.floor(Date.now() / 1000), text: '/steer STEERPROMPT' } };
 
-    let resolveGate!: () => void;
-    const gate = new Promise<void>(resolve => { resolveGate = resolve; });
-    let gateUsed = false;
     let getUpdatesCallCount = 0;
     const sentTexts: string[] = [];
 
@@ -2509,56 +2506,51 @@ topic_defaults:
       if ((url as string).includes('sendMessage')) {
         const body = opts?.body ? JSON.parse(opts.body) : {};
         const text: string = body.text ?? '';
-        // Only the FIRST worker-dispatch reply (msg1's own) is gated. Nothing
-        // else — the steer kill's own system notice, /reset's local reply,
-        // and the eventual combined-dispatch reply — is ever blocked, so
-        // there is no ordering race to manage beyond "msg1 must still be
-        // in-flight when /steer's kill+drain runs", which the topicPending
-        // chain already guarantees deterministically (msg2/msg3/queuedReset/
-        // steer's own registration all happen synchronously earlier in the
-        // SAME poll-loop iteration, well before msg1's real reply attempt).
-        if (text.includes('GOTPROMPTSTART') && !gateUsed) {
-          gateUsed = true;
-          await gate;
-        }
         sentTexts.push(text);
         return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: { message_id: 900 + sentTexts.length } }), json: async () => ({ ok: true, result: { message_id: 900 + sentTexts.length } }) };
       }
       return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: true }), json: async () => ({ ok: true, result: true }) };
     };
 
-    const loopDone = runPollLoop('token', [123], state, {}, controller.signal, fastSleep);
+    await runPollLoop('token', [123], state, {}, controller.signal, fastSleep);
 
-    // Wait deterministically for msg1's dispatch to reach the gate.
-    for (let i = 0; i < 500 && !gateUsed; i++) {
-      await new Promise(r => setTimeout(r, 20));
-    }
+    // The echoed prompt overflows Telegram's 4096-char send limit, so the
+    // reply arrives as sequential CHUNKS — only the first carries the
+    // GOTPROMPTSTART marker. Reassemble the FULL reply by joining every
+    // sent text from the marker chunk onward (the chunks of one reply are
+    // consecutive; no other message can interleave inside one send call).
+    const firstChunkIdx = sentTexts.findIndex(t => t.includes('GOTPROMPTSTART'));
+    const gotPromptReplies = firstChunkIdx === -1 ? [] : [sentTexts.slice(firstChunkIdx).join('')];
+    // A11: Re-baselined — exactly ONE worker dispatch (the steer's combined turn).
+    // msg1's in-flight turn is cancelled at flush-check (killed=0), its text
+    // folds into held via A6, and the steer absorbs it at normalizer time via A7.
+    // Note: msg1 never reaches dispatchMessage because the flush-check (A8) returns
+    // early when the topic is stopped, so there's no gate mechanism needed.
+    assert.equal(gotPromptReplies.length, 1, `expected exactly 1 worker dispatch (the steer's combined turn) — msg1 cancelled at flush-check, msg2/msg3 folded. Got: ${JSON.stringify(sentTexts)}`);
 
-    let gotPromptCountAtGate = -1;
-    try {
-      assert.ok(gateUsed, 'msg1 must have reached its worker-dispatch reply (gate) within the wait window');
-      gotPromptCountAtGate = sentTexts.filter(t => t.includes('GOTPROMPTSTART')).length;
-      assert.equal(
-        gotPromptCountAtGate, 0,
-        'while msg1 is gated, its own reply has not been pushed yet — msg2/msg3 must not have produced any independent worker dispatch either',
-      );
-    } finally {
-      resolveGate();
-      await loopDone;
-    }
-
-    const gotPromptReplies = sentTexts.filter(t => t.includes('GOTPROMPTSTART'));
-    assert.equal(gotPromptReplies.length, 2, `expected exactly 2 worker dispatches total (msg1, then the combined steer dispatch) — msg2/msg3 must never dispatch on their own. Got: ${JSON.stringify(sentTexts)}`);
-
-    const combined = gotPromptReplies[1];
-    const idxTwo = combined.indexOf('QUEUEDTWO');
-    const idxThree = combined.indexOf('QUEUEDTHREE');
-    const idxSteer = combined.indexOf('STEERPROMPT');
+    const combined = gotPromptReplies[0];
+    // The echoed prompt includes the topic's conversation HISTORY plus the
+    // "*Current Message*" section (rendered header — italics marker, not ##).
+    // msg1's text legitimately appears in BOTH (archived at receipt per
+    // AI-095, then folded into the current message via A6+A7) — so slice the
+    // current-message section for the fold assertions, and leave the history
+    // copy out of the duplication guard.
+    const currentSection = combined.slice(combined.indexOf('*Current Message*'));
+    const idxOne = currentSection.indexOf('SEEDMESSAGEONE');
+    const idxTwo = currentSection.indexOf('QUEUEDTWO');
+    const idxThree = currentSection.indexOf('QUEUEDTHREE');
+    const idxSteer = currentSection.indexOf('STEERPROMPT');
+    assert.ok(idxOne !== -1, 'combined dispatch must contain msg1 text (via held from A6)');
     assert.ok(idxTwo !== -1, 'combined dispatch must contain msg2 text');
     assert.ok(idxThree !== -1, 'combined dispatch must contain msg3 text');
     assert.ok(idxSteer !== -1, 'combined dispatch must contain the steer prompt');
-    assert.ok(idxTwo < idxThree && idxThree < idxSteer, `combined text must be msg2, then msg3, then the steer prompt, in that order — got indices ${idxTwo}, ${idxThree}, ${idxSteer}`);
-    assert.ok(!combined.includes('SEEDMESSAGEONE'), 'the combined dispatch must not carry msg1\'s own text — msg1 already dispatched on its own');
+    assert.ok(idxOne < idxTwo && idxTwo < idxThree && idxThree < idxSteer, `combined text must be msg1, then msg2, then msg3, then the steer prompt, in that order — got indices ${idxOne}, ${idxTwo}, ${idxThree}, ${idxSteer}`);
+    // A9 regression guard: no duplicate SEEDMESSAGEONE in the CURRENT MESSAGE
+    // (a real double-fold — e.g. flush-check AND A6 both adding, or the
+    // steer drain cancelling + folding itself — would show 2+ here). Exactly
+    // one occurrence in history is expected and fine.
+    const occurrences = (currentSection.match(/SEEDMESSAGEONE/g) || []).length;
+    assert.equal(occurrences, 1, `SEEDMESSAGEONE must appear exactly once in the current message (A9 double-fold guard). Got ${occurrences} occurrences.`);
 
     // The queued /reset must NOT have been folded — it still runs in its own
     // turn, producing its usual local reply.

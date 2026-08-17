@@ -185,31 +185,28 @@ workers:
     # SQLite — it reports "unknown" instead of guessing, so agy stuck-detection
     # relies on the process-tree heartbeat rather than transcript inspection.
     state_pattern: "*.db"
-    # THE `supersedes:` CASE. On agy (v1.1.5, every line below is a real
-    # invocation from 2026-07-22) model and effort are NOT independent knobs:
+    # THE `supersedes:` CASE, AND ITS RETIREMENT. On agy v1.1.5 (every line
+    # below is a real invocation from 2026-07-22) model and effort were NOT
+    # independent knobs, so the model tunable declared `supersedes: [effort]`:
     #   --model gemini-3.6-flash                  -> ERROR: invalid model selection ... --effort ""
     #   --model gemini-3.6-flash --effort high    -> OK
     #   --model gemini-3.6-flash-high             -> OK   (the suffix IS the effort)
     #   --model claude-sonnet-4-6 --effort high   -> ERROR: --effort is not supported
     #   --effort high  (no model)                 -> OK
-    # `agy models` lists no bare gemini names — every gemini entry carries an
-    # effort suffix, and the Claude/GPT entries reject --effort. So the model
-    # alone is correct for every name agy offers, and "both" is wrong for half
-    # of them. Without the rule below, a user who set both would break EVERY
-    # dispatch in their topic and see it as a worker outage.
+    # agy v1.1.13 (live-verified 2026-08-15, AI-155) changed the last row: a
+    # bare --effort with no model is now ALSO rejected instantly, so the effort
+    # knob is gone entirely and `supersedes:` has nothing to suppress here.
+    # The mechanism itself is unchanged and still the right tool whenever two
+    # of a worker's knobs are mutually exclusive — see the general note on
+    # `supersedes:` near the top of this file.
     tunables:
       model:
         args: ["--model", "{value}"]
-        supersedes: [effort]
         # Declared here (unusually for a model knob) precisely because the
         # effort suffix makes the vocabulary worth showing. Still a hint: an
         # unlisted id passes through, so a model that ships tomorrow works.
-        values: ["gemini-3.6-flash-high", "gemini-3.6-flash-medium", "gemini-3.6-flash-low", "gemini-3.5-flash-high", "gemini-3.5-flash-medium", "gemini-3.5-flash-low", "gemini-3.1-pro-high", "gemini-3.1-pro-low", "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium"]
-        description: "Model for this CLI session (run `agy models` for the current list — from PowerShell/cmd, not Git Bash, where it hangs). Effort is embedded in the gemini names; a base name with no -high/-medium/-low suffix is rejected."
-      effort:
-        args: ["--effort", "{value}"]
-        values: [low, medium, high]
-        description: "Reasoning effort when no model is set (agy's own default is low). Superseded once a model is set."
+        values: ["gemini-3.7-flash-high", "gemini-3.7-flash-medium", "gemini-3.7-flash-low", "gemini-3.6-flash-high", "gemini-3.6-flash-medium", "gemini-3.6-flash-low", "gemini-3.5-flash-high", "gemini-3.5-flash-medium", "gemini-3.5-flash-low", "gemini-3.1-pro-high", "gemini-3.1-pro-low", "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium"]
+        description: "Model for this CLI session (run `agy models` for the current list — from PowerShell/cmd, not Git Bash, where it hangs). Effort is embedded in the gemini names; a base name with no -high/-medium/-low suffix is rejected. There is deliberately NO effort knob on v1.1.13+ (a bare --effort is rejected — AI-155)."
 
 # ---- evaluator (optional) ----
 # When a worker appears stuck (no output for idle_timeout seconds), the

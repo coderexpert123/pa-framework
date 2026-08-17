@@ -82,6 +82,45 @@ export function extractFinalAssistantText(jsonl: string, afterIso: string): { te
   return found;
 }
 
+/**
+ * Extract the final output from an agy stream-json tee file.
+ * Finds the last `type:'result'` event whose `result` field is a non-empty
+ * string — this matches worker-exec's `stdout = event.result` assignment.
+ * Returns null when no result event is found (incomplete/corrupt/empty file).
+ * Handles both NDJSON (stream-json) and plain-text fallback per §0.
+ */
+export function extractTeeResult(raw: string): string | null {
+  // First pass: check if this looks like NDJSON (at least one line parses as JSON)
+  let hasJsonLine = false;
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    try { JSON.parse(line); hasJsonLine = true; break; } catch { continue; }
+  }
+
+  // NDJSON path: extract last result event
+  if (hasJsonLine) {
+    let result: string | null = null;
+    for (const line of raw.split('\n')) {
+      if (!line.trim()) continue;
+      let event: any;
+      try { event = JSON.parse(line); } catch { continue; }
+      if (event?.type === 'result' && typeof event.result === 'string' && event.result.trim()) {
+        result = event.result.trim();
+      }
+      // agy stream-json: uses event.event (not event.type), result is an object with .response
+      if (event?.event === 'result' && typeof event.result === 'object' && event.result !== null
+          && typeof (event.result as any).response === 'string' && (event.result as any).response.trim()) {
+        result = ((event.result as any).response as string).trim();
+      }
+    }
+    return result;
+  }
+
+  // Plain-text fallback: return entire non-empty trimmed content
+  const trimmed = raw.trim();
+  return trimmed || null;
+}
+
 // ---------------------------------------------------------------------------
 // Injectable dependencies (defaults hit the real fs / process table / Telegram)
 // ---------------------------------------------------------------------------
@@ -95,6 +134,13 @@ export interface ReaperDeps {
    * pending — the process that owned the original typing loop is dead, so
    * without this the topic looks silent while the orphan finishes. */
   sendTyping?: (record: PendingDispatch) => Promise<void>;
+  /** Optional: read the tee-captured stdout path for a non-transcript worker
+   * (agy). Returns null when no tee file is associated with this dispatch.
+   * If omitted, tee recovery is skipped entirely (falls to death notice). */
+  readTeePath?: (record: PendingDispatch) => Promise<string | null>;
+  /** Optional: read file contents for tee recovery (mocked in tests). If omitted,
+   * uses the real fs.readFile. */
+  readFile?: (path: string, encoding: 'utf8') => Promise<string>;
 }
 
 function defaultReadTranscript(record: PendingDispatch): Promise<{ content: string; mtimeMs: number } | null> {
@@ -132,6 +178,29 @@ export async function isTopicWorkerAliveByRegistry(record: PendingDispatch): Pro
   }
 }
 
+/**
+ * Look up the tee-captured stdout path from the worker-pids registry for a
+ * given pending dispatch. Returns the teePath from the first matching entry,
+ * or null if no entry has one. Exported for tests.
+ */
+export async function findTeePathByRegistry(record: PendingDispatch): Promise<string | null> {
+  const resource = `topic-${record.chatId}_${record.threadId}`;
+  try {
+    const entries = await listWorkerPids();
+    for (const entry of entries) {
+      if (entry.skill === resource) {
+        // teePath is added by WP1's worker-pids.ts change; access via type
+        // assertion to avoid compile-time dependency on WP1's unmerged type.
+        const teePath = (entry as { teePath?: string }).teePath;
+        if (teePath) return teePath;
+      }
+    }
+  } catch {
+    // registry unreadable — no recovery possible
+  }
+  return null;
+}
+
 export function makeDefaultDeps(token: string): ReaperDeps {
   return {
     send: async (record, text) => {
@@ -163,6 +232,8 @@ export function makeDefaultDeps(token: string): ReaperDeps {
     },
     readTranscript: defaultReadTranscript,
     isTopicWorkerAlive: isTopicWorkerAliveByRegistry,
+    readTeePath: findTeePathByRegistry,
+    readFile: readFile,
     now: () => Date.now(),
     sendTyping: (record) => sendTyping(token, record.chatId, record.threadId),
   };
@@ -224,6 +295,42 @@ export async function evaluatePendingDispatch(
     }
     if (!expired && (workerAlive || !quiescent || !final)) return 'waiting';
     // Deadline passed with nothing recoverable → fall through to the death notice.
+  }
+
+  // Tee-path recovery for sessionless workers (agy). The transcript harvest
+  // above only covers claude-family; agy is sessionless so there is no on-disk
+  // transcript to read. The tee file (written by the shim-chain tee helper)
+  // captures the raw stdout. extractTeeResult pulls the final result event
+  // from the stream-json output, matching what worker-exec would have captured.
+  const teePath = await deps.readTeePath?.(record) ?? null;
+  if (teePath) {
+    const workerAlive = await deps.isTopicWorkerAlive(record);
+    if (workerAlive && !expired) {
+      return 'waiting'; // orphan still running — let it finish
+    }
+    if (!workerAlive || expired) {
+      let teeRaw: string;
+      try {
+        teeRaw = await (deps.readFile ?? readFile)(teePath, 'utf8');
+      } catch {
+        teeRaw = '';
+      }
+      const extracted = extractTeeResult(teeRaw);
+      if (extracted) {
+        const { cleaned } = parseMetadata(extracted);
+        const body = cleaned.trim() || extracted.trim();
+        const sent = await deps.send(
+          record,
+          `♻️ *Recovered reply* (the bot restarted mid-request; the worker finished on its own):\n\n${body}`,
+        );
+        if (sent) {
+          await finish(record, 'recovered');
+          return 'recovered';
+        }
+        return 'waiting'; // send failed — retry next poll
+      }
+      // tee file empty or no result event — fall through to death notice
+    }
   }
 
   if (!recoverable || expired) {

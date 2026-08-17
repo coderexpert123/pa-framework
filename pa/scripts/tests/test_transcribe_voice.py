@@ -722,9 +722,14 @@ class TestUploadPart(unittest.TestCase):
         self.assertEqual(filename, "bar.ogg")
         self.assertEqual(mime, "audio/ogg")
 
-    def test_groq_keeps_real_basename_and_extension(self):
+    def test_groq_oga_normalized_to_ogg(self):
         filename, mime = tv._upload_part("groq", "/tmp/foo.oga")
-        self.assertEqual(filename, "foo.oga")
+        self.assertEqual(filename, "foo.ogg")
+        self.assertEqual(mime, "audio/ogg")
+
+    def test_groq_opus_normalized_to_ogg(self):
+        filename, mime = tv._upload_part("groq", "/tmp/bar.opus")
+        self.assertEqual(filename, "bar.ogg")
         self.assertEqual(mime, "audio/ogg")
 
     def test_mp4_mime_recognized(self):

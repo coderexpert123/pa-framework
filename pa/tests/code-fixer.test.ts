@@ -17,6 +17,7 @@ import {
 } from '../src/code-fixer.js';
 import type { ExecFn, ExecResult, BlackboardLockClient } from '../src/code-fixer.js';
 import { exclusiveLockKey } from '../src/commands/run.js';
+import type { Reservation } from '../src/lib/reservations.js';
 import { resolvePythonCommand } from '../src/lib/python.js';
 import type { DraftProposal } from '../src/types.js';
 import type { FailureRecord } from '../src/failure-analyzer.js';
@@ -288,29 +289,7 @@ const healthyBot = async (): Promise<CheckResult> => ({ name: 'bot-process', sta
 const noopSleep = async () => {};
 
 describe('attemptCodeFix', () => {
-  it('skips (dirty-worktree) and never spawns a worker when git status --porcelain is non-empty', async () => {
-    await createTempSkill(dir, 'daily-mail-brief', '---\ncwd: "D:/fake-repo/projects/daily-mail-brief"\ncmd: "python scripts/run_brief.py"\n---\n\nBody.');
-    const calls: ExecCall[] = [];
-    let workerCalled = false;
-    const exec = makeExec([
-      ...baseHandlers(),
-      { match: 'git status --porcelain', stdout: ' M projects/other-thing/scratch.py\n' },
-    ], calls);
-    const runner = async (...args: any[]) => { workerCalled = true; return okRunner(); };
-    const { bb } = makeLockFake(calls);
-
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner, blackboardFn: bb });
-
-    assert.equal(result.outcome, 'code-fix-skipped-dirty-worktree');
-    assert.equal(workerCalled, false);
-    assert.equal(calls.some((c) => c.command.startsWith('git push')), false);
-
-    const raw = await readFile(join(dir, 'self-improver-audit.jsonl'), 'utf8');
-    const record = JSON.parse(raw.trim());
-    assert.equal(record.action, 'code-fix-skipped-dirty-worktree');
-  });
-
-  it('ignores pa/data/profile* runtime drift when checking dirty-worktree', async () => {
+  it('ignores pa/data/profile* runtime drift when checking the tree (churn is filtered from recent-activity check)', async () => {
     await createTempSkill(dir, 'daily-mail-brief', '---\ncwd: "D:/fake-repo/projects/daily-mail-brief"\ncmd: "python scripts/run_brief.py"\n---\n\nBody.');
     const calls: ExecCall[] = [];
     const exec = makeExec([
@@ -324,7 +303,9 @@ describe('attemptCodeFix', () => {
     ], calls);
     const { bb } = makeLockFake(calls);
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb });
+    const recentActivityFn = async () => [];
+
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn });
 
     // Worker ran but made no changes (status --porcelain is called a 2nd time post-worker; our
     // handler returns the same drift-only output both times) — proves the drift didn't count as
@@ -342,7 +323,9 @@ describe('attemptCodeFix', () => {
     ], calls);
     const { bb } = makeLockFake(calls);
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: failRunner, blackboardFn: bb });
+    const recentActivityFn = async () => [];
+
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: failRunner, blackboardFn: bb, recentActivityFn });
 
     assert.equal(result.outcome, 'code-fix-skipped-worker-failed');
     assert.equal(calls.some((c) => c.command.startsWith('git reset --hard')), false);
@@ -361,10 +344,12 @@ describe('attemptCodeFix', () => {
     ]);
     const { bb } = makeLockFake();
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb });
+    const recentActivityFn = async () => [];
+
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn });
 
     assert.equal(result.outcome, 'code-fix-skipped-no-changes');
-    assert.equal(statusCalls, 2); // once for F4 (dirty check), once after the worker ran
+    assert.equal(statusCalls, 2); // once for quiet-tree gate, once after the worker ran
   });
 
   it('reverts (F1) when the diff touches a protected path — no commit, no push', async () => {
@@ -380,17 +365,24 @@ describe('attemptCodeFix', () => {
         },
       },
       { match: 'git rev-parse HEAD', stdout: 'abc1111\n' },
-      { match: 'git reset --hard', stdout: '' },
-      { match: 'git clean -fd', stdout: '' },
+      { match: 'git ls-files', stdout: 'pa/src/validator.ts\nprojects/daily-mail-brief/scripts/run_brief.py\n' },
+      { match: 'git ls-tree', stdout: 'pa/src/validator.ts\nprojects/daily-mail-brief/scripts/run_brief.py\n' },
+      { match: 'git checkout', stdout: '' },
+      { match: 'git clean', stdout: '' },
     ], calls);
     const { bb } = makeLockFake(calls);
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb });
+    const recentActivityFn = async () => [];
+
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn });
 
     assert.equal(result.outcome, 'code-fix-reverted');
     assert.match(result.reason, /protected/i);
-    assert.ok(calls.some((c) => c.command.startsWith('git reset --hard') && c.command.includes('abc1111')));
-    assert.ok(calls.some((c) => c.command.startsWith('git clean -fd')));
+    // After 2026-08-15: scoped revert uses `git checkout <sha> -- <path>`
+    assert.ok(calls.some((c) => c.command.startsWith('git checkout') && c.command.includes('abc1111')));
+    // NO tree-wide reset --hard or bare clean -fd
+    assert.equal(calls.some((c) => c.command === 'git reset --hard abc1111' || c.command.match(/^git reset --hard /)), false);
+    assert.equal(calls.some((c) => c.command === 'git clean -fd'), false);
     assert.equal(calls.some((c) => c.command.startsWith('git commit')), false);
     assert.equal(calls.some((c) => c.command.startsWith('git push')), false);
 
@@ -413,16 +405,23 @@ describe('attemptCodeFix', () => {
       },
       { match: 'git rev-parse HEAD', stdout: 'abc1111\n' },
       { match: 'git diff --numstat', stdout: '5\t1\tprojects/daily-mail-brief/scripts/run_brief.py\n0\t8\tprojects/daily-mail-brief/tests/test_run_brief.py\n' },
-      { match: 'git reset --hard', stdout: '' },
-      { match: 'git clean -fd', stdout: '' },
+      { match: 'git ls-files', stdout: 'projects/daily-mail-brief/scripts/run_brief.py\nprojects/daily-mail-brief/tests/test_run_brief.py\n' },
+      { match: 'git ls-tree', stdout: 'projects/daily-mail-brief/scripts/run_brief.py\nprojects/daily-mail-brief/tests/test_run_brief.py\n' },
+      { match: 'git checkout', stdout: '' },
+      { match: 'git clean', stdout: '' },
     ], calls);
     const { bb } = makeLockFake(calls);
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb });
+    const recentActivityFn = async () => [];
+
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn });
 
     assert.equal(result.outcome, 'code-fix-reverted');
     assert.match(result.reason, /test/i);
-    assert.ok(calls.some((c) => c.command.startsWith('git reset --hard')));
+    // After 2026-08-15: scoped revert uses `git checkout <sha> -- <path>`
+    assert.ok(calls.some((c) => c.command.startsWith('git checkout') && c.command.includes('abc1111')));
+    // NO bare `git reset --hard`
+    assert.equal(calls.some((c) => c.command.match(/^git reset --hard\b/)), false);
 
     const raw = await readFile(join(dir, 'self-improver-audit.jsonl'), 'utf8');
     const record = JSON.parse(raw.trim());
@@ -446,18 +445,22 @@ describe('attemptCodeFix', () => {
       { match: 'npm test', stdout: '# tests 1\n# pass 1\n# fail 0\n# skipped 0\n' },
       { match: 'git ls-files', stdout: 'projects/daily-mail-brief/tests/test_run_brief.py\n' },
       { match: `${resolvePythonForTest()} -m pytest`, stdout: '3 passed in 0.4s\n' },
+      { match: 'git diff --cached --name-only', stdout: 'projects/daily-mail-brief/scripts/run_brief.py\nprojects/daily-mail-brief/tests/test_run_brief.py\n' },
       { match: 'git add -A', stdout: '' },
       { match: 'git commit -F', stdout: '[master abc9999] autonomous-code-fix: daily-mail-brief-fix\n' },
       { match: 'git push origin', stdout: '' },
     ]);
     const { bb } = makeLockFake();
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb });
+    const recentActivityFn = async () => [];
+    const readActiveFn = async () => [];
+
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn });
 
     assert.equal(result.outcome, 'applied-code-fix');
   });
 
-  it('reverts (F3) when the pa test suite fails after the fix — full revert, no push', async () => {
+  it('reverts (F3) when the pa test suite fails after the fix — scoped revert, no push', async () => {
     await createTempSkill(dir, 'daily-mail-brief', '---\ncwd: "D:/fake-repo/projects/daily-mail-brief"\ncmd: "python scripts/run_brief.py"\n---\n\nBody.');
     let postWorkerStatus = false;
     const calls: ExecCall[] = [];
@@ -473,15 +476,24 @@ describe('attemptCodeFix', () => {
       { match: 'git diff --numstat', stdout: '5\t1\tprojects/daily-mail-brief/scripts/run_brief.py\n' },
       { match: 'npm run build', stdout: '' },
       { match: 'npm test', reject: 'Command failed: npm test\n# fail 3\nassertion error in daily-mail-brief.test.js' },
-      { match: 'git reset --hard', stdout: '' },
-      { match: 'git clean -fd', stdout: '' },
+      { match: 'git ls-files', stdout: 'projects/daily-mail-brief/scripts/run_brief.py\n' },
+      { match: 'git ls-tree', stdout: 'projects/daily-mail-brief/scripts/run_brief.py\n' },
+      { match: 'git checkout', stdout: '' },
+      { match: 'git clean', stdout: '' },
     ], calls);
     const { bb } = makeLockFake(calls);
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb });
+    const recentActivityFn = async () => [];
+    const readActiveFn = async () => [];
+
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn });
 
     assert.equal(result.outcome, 'code-fix-reverted');
-    assert.ok(calls.some((c) => c.command.startsWith('git reset --hard')));
+    // After 2026-08-15: scoped revert uses `git checkout <sha> -- <path>`
+    assert.ok(calls.some((c) => c.command.startsWith('git checkout') && c.command.includes('abc1111')));
+    // NO tree-wide reset --hard or bare clean -fd
+    assert.equal(calls.some((c) => c.command.match(/^git reset --hard\b/)), false);
+    assert.equal(calls.some((c) => c.command === 'git clean -fd'), false);
     assert.equal(calls.some((c) => c.command.startsWith('git push')), false);
 
     const raw = await readFile(join(dir, 'self-improver-audit.jsonl'), 'utf8');
@@ -512,13 +524,17 @@ describe('attemptCodeFix', () => {
       { match: 'git diff --numstat', stdout: '5\t1\tprojects/daily-mail-brief/scripts/run_brief.py\n' },
       { match: 'npm run build', stdout: '' },
       { match: 'npm test', stdout: '# tests 1\n# pass 1\n# fail 0\n# skipped 0\n' },
+      { match: 'git diff --cached --name-only', stdout: 'projects/daily-mail-brief/scripts/run_brief.py\n' },
       { match: 'git add -A', stdout: '' },
       { match: 'git commit -F', stdout: '[master abc9999] fix\n' },
       { match: 'git push origin', stdout: '' },
     ]);
     const { bb } = makeLockFake();
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb });
+    const recentActivityFn = async () => [];
+    const readActiveFn = async () => [];
+
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn });
     assert.equal(result.outcome, 'applied-code-fix');
   });
 
@@ -549,14 +565,23 @@ describe('attemptCodeFix', () => {
       { match: 'git diff --numstat', stdout: '5\t1\tprojects/daily-mail-brief/scripts/run_brief.py\n' },
       { match: 'npm run build', stdout: '' },
       { match: 'npm test', stdout: '# tests 1\n# pass 1\n# fail 0\n# skipped 0\n' },
-      { match: 'git reset --hard', stdout: '' },
-      { match: 'git clean -fd', stdout: '' },
+      { match: 'git ls-files', stdout: 'projects/daily-mail-brief/scripts/run_brief.py\n' },
+      { match: 'git ls-tree', stdout: 'projects/daily-mail-brief/scripts/run_brief.py\n' },
+      { match: 'git checkout', stdout: '' },
+      { match: 'git clean', stdout: '' },
     ], calls);
     const { bb } = makeLockFake(calls);
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb });
+    const recentActivityFn = async () => [];
+    const readActiveFn = async () => [];
+
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn });
     assert.equal(result.outcome, 'code-fix-reverted');
-    assert.ok(calls.some((c) => c.command.startsWith('git reset --hard')));
+    // After 2026-08-15: scoped revert uses `git checkout <sha> -- <path>`
+    assert.ok(calls.some((c) => c.command.startsWith('git checkout') && c.command.includes('abc1111')));
+    // NO tree-wide reset --hard or bare clean -fd
+    assert.equal(calls.some((c) => c.command.match(/^git reset --hard\b/)), false);
+    assert.equal(calls.some((c) => c.command === 'git clean -fd'), false);
     assert.equal(calls.some((c) => c.command.startsWith('git push')), false);
 
     const raw = await readFile(join(dir, 'self-improver-audit.jsonl'), 'utf8');
@@ -583,13 +608,17 @@ describe('attemptCodeFix', () => {
       { match: 'npm run build', stdout: '' },
       { match: 'npm test', stdout: '# tests 620\n# pass 620\n# fail 0\n# skipped 0\n' },
       { match: 'git ls-files', stdout: '' }, // no tests/ dir for this project in this fixture
+      { match: 'git diff --cached --name-only', stdout: 'projects/daily-mail-brief/scripts/run_brief.py\n' },
       { match: 'git add -A', stdout: '' },
       { match: 'git commit -F', stdout: '[master abc9999] autonomous-code-fix: daily-mail-brief-fix\n' },
       { match: 'git push origin master', stdout: '' },
     ], calls);
     const { bb } = makeLockFake(calls);
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb });
+    const recentActivityFn = async () => [];
+    const readActiveFn = async () => [];
+
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn });
 
     assert.equal(result.outcome, 'applied-code-fix');
     assert.equal(result.commitHash, 'abc9999');
@@ -628,13 +657,17 @@ describe('attemptCodeFix', () => {
       { match: 'npm run build', stdout: '' },
       { match: 'npm test', stdout: '# tests 1\n# pass 1\n# fail 0\n# skipped 0\n' },
       { match: 'git ls-files', stdout: '' },
+      { match: 'git diff --cached --name-only', stdout: 'projects/daily-mail-brief/scripts/run_brief.py\n' },
       { match: 'git add -A', stdout: '' },
       { match: 'git commit -F', stdout: '[master abc9999] autonomous-code-fix: daily-mail-brief-fix\n' },
       { match: 'git push origin master', stdout: '' },
     ], calls);
     const { bb } = makeLockFake(calls);
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb });
+    const recentActivityFn = async () => [];
+    const readActiveFn = async () => [];
+
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn });
 
     assert.equal(result.outcome, 'applied-code-fix');
     assert.deepEqual(result.filesChanged, ['projects/daily-mail-brief/scripts/run_brief.py']);
@@ -658,7 +691,7 @@ describe('attemptCodeFix', () => {
     assert.doesNotMatch(commit!, /pa\/data\/profile/);
   });
 
-  it('preserves pa/data/profile* churn across a hard revert: stash → reset → pop, never checkout/clean on it', async () => {
+  it('preserves pa/data/profile* churn across a hard revert: stash → checkout/clean (scoped) → pop, never checkout/clean on it', async () => {
     await createTempSkill(dir, 'daily-mail-brief', '---\ncwd: "D:/fake-repo/projects/daily-mail-brief"\ncmd: "python scripts/run_brief.py"\n---\n\nBody.');
     let postWorkerStatus = false;
     const calls: ExecCall[] = [];
@@ -671,23 +704,31 @@ describe('attemptCodeFix', () => {
         },
       },
       { match: 'git rev-parse HEAD', stdout: 'abc1111\n' },
-      { match: 'git reset --hard', stdout: '' },
-      { match: 'git clean -fd', stdout: '' },
+      { match: 'git ls-files', stdout: 'pa/src/validator.ts\n' },
+      { match: 'git ls-tree', stdout: 'pa/src/validator.ts\n' },
+      { match: 'git checkout', stdout: '' },
+      { match: 'git clean', stdout: '' },
     ], calls);
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner });
+    const recentActivityFn = async () => [];
+    const readActiveFn = async () => [];
+
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, recentActivityFn, readActiveFn });
 
     assert.equal(result.outcome, 'code-fix-reverted');
     const cmds = calls.map((c) => c.command);
     const pushIdx = cmds.findIndex((c) => c.startsWith('git stash push'));
-    const resetIdx = cmds.findIndex((c) => c.startsWith('git reset --hard'));
+    const checkoutIdx = cmds.findIndex((c) => c.startsWith('git checkout') && c.includes('abc1111'));
     const popIdx = cmds.findIndex((c) => c.startsWith('git stash pop'));
     assert.ok(pushIdx >= 0, `expected a churn stash push, got: ${cmds.join(' | ')}`);
-    assert.ok(resetIdx > pushIdx, 'the churn must be stashed BEFORE the destructive reset');
-    assert.ok(popIdx > resetIdx, 'the churn must be restored AFTER the reset/clean');
+    assert.ok(checkoutIdx > pushIdx, 'the churn must be stashed BEFORE the destructive checkout');
+    assert.ok(popIdx > checkoutIdx, 'the churn must be restored AFTER the checkout/clean');
     // The profile data is never restored-from-HEAD or deleted outright.
-    assert.equal(cmds.some((c) => c.startsWith('git checkout')), false);
+    assert.equal(cmds.some((c) => c.includes('checkout') && c.includes('profile')), false);
     assert.equal(cmds.some((c) => c.startsWith('git clean') && c.includes('profile')), false);
+    // NO tree-wide reset --hard or bare clean -fd
+    assert.equal(cmds.some((c) => c === 'git reset --hard abc1111' || c.match(/^git reset --hard /)), false);
+    assert.equal(cmds.some((c) => c === 'git clean -fd'), false);
   });
 
   it('builds+tests+restarts+polls the bot when projects/telegram-bot is touched', async () => {
@@ -707,6 +748,8 @@ describe('attemptCodeFix', () => {
       { match: 'git diff --numstat', stdout: '5\t1\tprojects/telegram-bot/src/logic.ts\n' },
       { match: 'npm run build', stdout: '' },
       { match: 'npm test', stdout: '# tests 5\n# pass 5\n# fail 0\n# skipped 0\n' },
+      { match: 'git ls-files', stdout: '' },
+      { match: 'git diff --cached --name-only', stdout: 'projects/telegram-bot/src/logic.ts\n' },
       { match: 'git add -A', stdout: '' },
       { match: 'git commit -F', stdout: '[master abc9999] autonomous-code-fix: daily-mail-brief-fix\n' },
       { match: 'git push origin master', stdout: '' },
@@ -718,9 +761,11 @@ describe('attemptCodeFix', () => {
     };
 
     const { bb } = makeLockFake();
+    const recentActivityFn = async () => [];
+    const readActiveFn = async () => [];
     const result = await attemptCodeFix(
       makeProposal({ target_skill: 'daily-mail-brief' }), evidence,
-      { execFn: exec, runner: okRunner, botRestartFn, checkBotProcessFn, sleepFn: noopSleep, blackboardFn: bb },
+      { execFn: exec, runner: okRunner, botRestartFn, checkBotProcessFn, sleepFn: noopSleep, blackboardFn: bb, recentActivityFn, readActiveFn },
     );
 
     assert.equal(result.outcome, 'applied-code-fix');
@@ -744,18 +789,28 @@ describe('attemptCodeFix', () => {
       { match: 'git diff --numstat', stdout: '5\t1\tprojects/telegram-bot/src/logic.ts\n' },
       { match: 'npm run build', stdout: '' },
       { match: 'npm test', stdout: '# tests 5\n# pass 5\n# fail 0\n# skipped 0\n' },
-      { match: 'git reset --hard', stdout: '' },
-      { match: 'git clean -fd', stdout: '' },
+      { match: 'git ls-files', stdout: 'projects/telegram-bot/src/logic.ts\n' },
+      { match: 'git ls-tree', stdout: 'projects/telegram-bot/src/logic.ts\n' },
+      { match: 'git checkout', stdout: '' },
+      { match: 'git clean', stdout: '' },
     ], calls);
     const unhealthyBot = async (): Promise<CheckResult> => ({ name: 'bot-process', status: 'FAIL', detail: 'no lock file' });
     const { bb } = makeLockFake(calls);
 
+    const recentActivityFn = async () => [];
+    const readActiveFn = async () => [];
+
     const result = await attemptCodeFix(
       makeProposal(), evidence,
-      { execFn: exec, runner: okRunner, botRestartFn: noopBotRestart, checkBotProcessFn: unhealthyBot, sleepFn: noopSleep, blackboardFn: bb },
+      { execFn: exec, runner: okRunner, botRestartFn: noopBotRestart, checkBotProcessFn: unhealthyBot, sleepFn: noopSleep, blackboardFn: bb, recentActivityFn, readActiveFn },
     );
 
     assert.equal(result.outcome, 'code-fix-reverted');
+    // After 2026-08-15: scoped revert uses `git checkout <sha> -- <path>`
+    assert.ok(calls.some((c) => c.command.startsWith('git checkout') && c.command.includes('abc1111')));
+    // NO tree-wide reset --hard or bare clean -fd
+    assert.equal(calls.some((c) => c.command.match(/^git reset --hard\b/)), false);
+    assert.equal(calls.some((c) => c.command === 'git clean -fd'), false);
     assert.equal(calls.some((c) => c.command.startsWith('git push')), false);
   });
 });
@@ -769,7 +824,7 @@ describe('attemptCodeFix', () => {
 // ---------------------------------------------------------------------------
 
 describe('attemptCodeFix — git-workflow lock', () => {
-  it('acquires the exact skill-exclusive:git-workflow resource after repoRoot/branch resolve, before F4\'s dirty-worktree check', async () => {
+  it('acquires the exact skill-exclusive:git-workflow resource after repoRoot/branch resolve, before the quiet-tree gate', async () => {
     await createTempSkill(dir, 'daily-mail-brief', '---\ncwd: "D:/fake-repo/projects/daily-mail-brief"\ncmd: "python scripts/run_brief.py"\n---\n\nBody.');
     const calls: ExecCall[] = [];
     const { bb, state } = makeLockFake(calls);
@@ -778,7 +833,10 @@ describe('attemptCodeFix — git-workflow lock', () => {
       { match: 'git status --porcelain', stdout: ' M projects/other-thing/scratch.py\n' },
     ], calls);
 
-    await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb });
+    const recentActivityFn = async () => [];
+    const readActiveFn = async () => [];
+
+    await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn });
 
     assert.equal(state.acquireCalls.length, 1);
     assert.equal(state.acquireCalls[0].resource, exclusiveLockKey(GIT_WORKFLOW_RESOURCE));
@@ -788,7 +846,7 @@ describe('attemptCodeFix — git-workflow lock', () => {
     const acquireIdx = cmds.findIndex((c) => c.startsWith('lock-acquire:'));
     const statusIdx = cmds.findIndex((c) => c === 'git status --porcelain');
     assert.ok(acquireIdx >= 0, `expected a lock-acquire call, got: ${cmds.join(' | ')}`);
-    assert.ok(statusIdx > acquireIdx, `expected the F4 dirty-worktree check after lock-acquire, got: ${cmds.join(' | ')}`);
+    assert.ok(statusIdx > acquireIdx, `expected the quiet-tree gate after lock-acquire, got: ${cmds.join(' | ')}`);
   });
 
   it('returns code-fix-skipped-git-lock-busy, audits it, and never runs the F4 dirty check or any mutating git command when the lock is busy', async () => {
@@ -813,10 +871,10 @@ describe('attemptCodeFix — git-workflow lock', () => {
     assert.equal(record.action, 'code-fix-skipped-git-lock-busy');
   });
 
-  type Branch = 'dirty-worktree' | 'worker-failed' | 'no-changes' | 'reverted-protected-path' | 'reverted-verification-failed' | 'applied-happy-path';
+  type Branch = 'concurrent-activity' | 'worker-failed' | 'no-changes' | 'reverted-protected-path' | 'reverted-verification-failed' | 'applied-happy-path';
 
   const EXPECTED_OUTCOMES: Record<Branch, string> = {
-    'dirty-worktree': 'code-fix-skipped-dirty-worktree',
+    'concurrent-activity': 'code-fix-skipped-concurrent-activity',
     'worker-failed': 'code-fix-skipped-worker-failed',
     'no-changes': 'code-fix-skipped-no-changes',
     'reverted-protected-path': 'code-fix-reverted',
@@ -824,17 +882,19 @@ describe('attemptCodeFix — git-workflow lock', () => {
     'applied-happy-path': 'applied-code-fix',
   };
 
-  function buildBranchFixture(branch: Branch): { exec: ExecFn; runner: typeof okRunner; calls: ExecCall[] } {
+  function buildBranchFixture(branch: Branch): { exec: ExecFn; runner: typeof okRunner; calls: ExecCall[]; recentActivityFn?: () => Promise<string[]>; readActiveFn?: () => Promise<Reservation[]> } {
     const calls: ExecCall[] = [];
     let postWorkerStatus = false;
     switch (branch) {
-      case 'dirty-worktree':
+      case 'concurrent-activity':
         return {
           calls, runner: okRunner,
           exec: makeExec([
             ...baseHandlers(),
             { match: 'git status --porcelain', stdout: ' M projects/other-thing/scratch.py\n' },
           ], calls),
+          recentActivityFn: async () => ['projects/other-thing/scratch.py'],
+          readActiveFn: async () => [],
         };
       case 'worker-failed':
         return {
@@ -844,6 +904,8 @@ describe('attemptCodeFix — git-workflow lock', () => {
             { match: 'git status --porcelain', stdout: '' },
             { match: 'git rev-parse HEAD', stdout: 'abc1111\n' },
           ], calls),
+          recentActivityFn: async () => [],
+          readActiveFn: async () => [],
         };
       case 'no-changes':
         return {
@@ -853,6 +915,8 @@ describe('attemptCodeFix — git-workflow lock', () => {
             { match: 'git status --porcelain', stdout: '' },
             { match: 'git rev-parse HEAD', stdout: 'abc1111\n' },
           ], calls),
+          recentActivityFn: async () => [],
+          readActiveFn: async () => [],
         };
       case 'reverted-protected-path':
         return {
@@ -869,6 +933,8 @@ describe('attemptCodeFix — git-workflow lock', () => {
             { match: 'git reset --hard', stdout: '' },
             { match: 'git clean -fd', stdout: '' },
           ], calls),
+          recentActivityFn: async () => [],
+          readActiveFn: async () => [],
         };
       case 'reverted-verification-failed':
         return {
@@ -888,6 +954,8 @@ describe('attemptCodeFix — git-workflow lock', () => {
             { match: 'git reset --hard', stdout: '' },
             { match: 'git clean -fd', stdout: '' },
           ], calls),
+          recentActivityFn: async () => [],
+          readActiveFn: async () => [],
         };
       case 'applied-happy-path':
         return {
@@ -905,10 +973,13 @@ describe('attemptCodeFix — git-workflow lock', () => {
             { match: 'npm run build', stdout: '' },
             { match: 'npm test', stdout: '# tests 620\n# pass 620\n# fail 0\n# skipped 0\n' },
             { match: 'git ls-files', stdout: '' },
+            { match: 'git diff --cached --name-only', stdout: 'projects/daily-mail-brief/scripts/run_brief.py\n' },
             { match: 'git add -A', stdout: '' },
             { match: 'git commit -F', stdout: '[master abc9999] autonomous-code-fix: daily-mail-brief-fix\n' },
             { match: 'git push origin master', stdout: '' },
           ], calls),
+          recentActivityFn: async () => [],
+          readActiveFn: async () => [],
         };
     }
   }
@@ -916,10 +987,10 @@ describe('attemptCodeFix — git-workflow lock', () => {
   for (const branch of Object.keys(EXPECTED_OUTCOMES) as Branch[]) {
     it(`releases the lock exactly once after outcome '${EXPECTED_OUTCOMES[branch]}' (${branch})`, async () => {
       await createTempSkill(dir, 'daily-mail-brief', '---\ncwd: "D:/fake-repo/projects/daily-mail-brief"\ncmd: "python scripts/run_brief.py"\n---\n\nBody.');
-      const { exec, runner, calls } = buildBranchFixture(branch);
+      const { exec, runner, calls, recentActivityFn, readActiveFn } = buildBranchFixture(branch);
       const { bb, state } = makeLockFake(calls);
 
-      const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner, blackboardFn: bb });
+      const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner, blackboardFn: bb, recentActivityFn, readActiveFn });
 
       assert.equal(result.outcome, EXPECTED_OUTCOMES[branch]);
       assert.equal(state.acquireCalls.length, 1);
@@ -942,8 +1013,11 @@ describe('attemptCodeFix — git-workflow lock', () => {
       { match: 'git status --porcelain', reject: 'unexpected git failure' },
     ], calls);
 
+    const recentActivityFn = async () => [];
+    const readActiveFn = async () => [];
+
     await assert.rejects(
-      () => attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb }),
+      () => attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn }),
       /unexpected git failure/
     );
 
@@ -965,9 +1039,12 @@ describe('attemptCodeFix — git-workflow lock', () => {
       return okRunner();
     };
 
+    const recentActivityFn = async () => [];
+    const readActiveFn = async () => [];
+
     const result = await attemptCodeFix(
       makeProposal(), evidence,
-      { execFn: exec, runner: slowRunner, blackboardFn: bb, lockHeartbeatMs: 20 },
+      { execFn: exec, runner: slowRunner, blackboardFn: bb, lockHeartbeatMs: 20, recentActivityFn, readActiveFn },
     );
 
     assert.equal(result.outcome, 'code-fix-skipped-no-changes');
@@ -978,16 +1055,18 @@ describe('attemptCodeFix — git-workflow lock', () => {
     assert.equal(state.heartbeatCalls, heartbeatsAtReturn, 'heartbeat must stop once attemptCodeFix has returned');
   });
 
-  it('with no blackboardFn injected, the real singleton default wiring still produces the expected fast non-git outcome on a dirty-worktree fixture', async () => {
+  it('with no blackboardFn injected, the real singleton default wiring still produces the expected fast non-git outcome on a concurrent-activity fixture', async () => {
     await createTempSkill(dir, 'daily-mail-brief', '---\ncwd: "D:/fake-repo/projects/daily-mail-brief"\ncmd: "python scripts/run_brief.py"\n---\n\nBody.');
     const exec = makeExec([
       ...baseHandlers(),
       { match: 'git status --porcelain', stdout: ' M projects/other-thing/scratch.py\n' },
     ]);
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner });
+    const recentActivityFn = async () => ['projects/other-thing/scratch.py'];
+    const readActiveFn = async () => [];
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, recentActivityFn, readActiveFn });
 
-    assert.equal(result.outcome, 'code-fix-skipped-dirty-worktree');
+    assert.equal(result.outcome, 'code-fix-skipped-concurrent-activity');
   });
 });
 
