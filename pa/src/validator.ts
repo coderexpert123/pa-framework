@@ -15,7 +15,9 @@ import type { AuditValidation } from './lib/improvement-audit.js';
 // self-improver.ts's generateProposals(). This is the ONLY unconditional block remaining in
 // the fully autonomous regime (2026-07-11): isCriticalChange and hasRealSideEffects below are
 // now risk *flags* recorded alongside an applied change, not gates that prevent it.
-const PROTECTED_SKILLS = new Set(['self-improver']);
+// Includes the git-workflow family (commit/push/push-public/commit-and-push/investigate-flagged/update-brain)
+// because the loop must not rewrite the skills that gate its own commits (2026-08-17 audit P1-1).
+const PROTECTED_SKILLS = new Set(['self-improver', 'commit', 'push', 'push-public', 'commit-and-push', 'investigate-flagged', 'update-brain']);
 
 /**
  * Hard block — the self-improvement loop must never modify or roll back this skill, no

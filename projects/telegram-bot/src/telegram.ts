@@ -35,6 +35,25 @@ export async function safeResponseText(res: Response): Promise<string> {
   }
 }
 
+/**
+ * Extract retry_after from a 429 response, defensively.
+ * Returns undefined if parsing fails, otherwise returns the retry_after value.
+ */
+async function parseRetryAfter(res: Response, errorText: string): Promise<number | undefined> {
+  if (res.status !== 429) return undefined;
+  try {
+    const data = JSON.parse(errorText);
+    const retryAfter = data?.parameters?.retry_after;
+    if (typeof retryAfter === 'number' && retryAfter > 0) {
+      return retryAfter;
+    }
+  } catch {
+    // JSON parse failed or structure not as expected
+  }
+  return undefined;
+}
+
+
 export async function getUpdates(token: string, offset: number, timeout: number = 0, signal?: AbortSignal): Promise<TelegramUpdate[]> {
   const url = `${BASE}/bot${token}/getUpdates?offset=${offset}&timeout=${timeout}`;
   const res = await telegramFetch(url, signal ? { signal } : undefined);
@@ -222,6 +241,17 @@ export async function sendMessage(
         if (res.status === 429 || res.status >= 500) {
           if (attempt < 2) {
             logger.warn('telegram', `[sendMessage] HTTP ${res.status}, retrying (${attempt + 1}/3)`, { error: errorText });
+            // AI-149: honor retry_after on 429, with cap at 60s + 1s margin
+            if (res.status === 429) {
+              const retryAfter = await parseRetryAfter(res, errorText);
+              if (retryAfter !== undefined) {
+                const delayMs = Math.min(retryAfter + 1, 61) * 1000; // cap at 60s + 1s margin
+                logger.warn('telegram', `[sendMessage] 429 rate limit, waiting ${retryAfter}s (capped at 60s) before retry`, { retryAfter });
+                await new Promise<void>((r) => setTimeout(r, delayMs));
+                continue;
+              }
+            }
+            // For 5xx or unparsable 429, use immediate retry (existing behavior)
             continue;
           } else {
             console.error(`[sendMessage] HTTP ${res.status} error after 3 attempts: ${errorText}`);
@@ -287,6 +317,17 @@ export async function sendMessage(
             const fbErrText = await safeResponseText(fallbackRes);
             if ((fallbackRes.status === 429 || fallbackRes.status >= 500) && attempt < 2) {
               logger.warn('telegram', `[sendMessage fallback] HTTP ${fallbackRes.status}, retrying (${attempt + 1}/3)`, { error: fbErrText });
+              // AI-149: honor retry_after on 429, with cap at 60s + 1s margin
+              if (fallbackRes.status === 429) {
+                const retryAfter = await parseRetryAfter(fallbackRes, fbErrText);
+                if (retryAfter !== undefined) {
+                  const delayMs = Math.min(retryAfter + 1, 61) * 1000; // cap at 60s + 1s margin
+                  logger.warn('telegram', `[sendMessage fallback] 429 rate limit, waiting ${retryAfter}s (capped at 60s) before retry`, { retryAfter });
+                  await new Promise<void>((r) => setTimeout(r, delayMs));
+                  continue;
+                }
+              }
+              // For 5xx or unparsable 429, use immediate retry (existing behavior)
               continue;
             }
             console.error(`sendMessage failed: ${fallbackRes.status} ${fbErrText}`);

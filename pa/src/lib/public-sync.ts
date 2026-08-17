@@ -18,6 +18,7 @@
 import { spawn } from 'child_process';
 import { access, rm } from 'fs/promises';
 import { join } from 'path';
+import { notifyUser } from './notify.js';
 
 // Windows: PATH often puts git-bash's bundled GNU tar (MSYS) ahead of the
 // native bsdtar at System32\tar.exe (Windows 10 1803+). MSYS tar cannot
@@ -142,6 +143,12 @@ export async function syncPublicMirror(opts: SyncOptions): Promise<SyncResult> {
     return { ok: false, code: ERR_DIRTY_PRIVATE, ...empty, error: `git status failed in private repo: ${privateStatus.stderr.trim()}` };
   }
   if (privateStatus.stdout.trim() !== '') {
+    // RA-1: send a deduped pa-alerts page (once per day)
+    await notifyUser(
+      'pa public-sync blocked: private tree has uncommitted changes',
+      'The private working tree has uncommitted changes. Syncing now would publish a version that does not match what is actually committed.\n\nFix: Commit your pending work first (`/commit` or `pa claim`), then retry `pa public-sync`.',
+      { dedupKey: 'public-sync-dirty-tree', dedupWindowMs: 86400000, severity: 'warn' }
+    );
     return { ok: false, code: ERR_DIRTY_PRIVATE, ...empty, error: `private repo is dirty:\n${privateStatus.stdout}` };
   }
 

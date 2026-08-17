@@ -614,7 +614,7 @@ export async function transcribeVoiceMessage(
           // The transcribe leg itself timed out — this already cost the full
           // timeout budget; falling through to a spawned re-attempt would
           // double the wait for a note that's already unlikely to succeed.
-          logger.warn('voice', 'persistent worker transcribe request timed out', { chatId, message: outcome.message });
+          logger.warn('voice', 'persistent worker transcription timed out', { chatId, audioPath: dest, message: outcome.message, layer: 'persistent-transcribe' });
           return fail('timeout', outcome.message, dest);
         } else {
           // D4's one permitted, one-directional error fallback: the worker
@@ -643,6 +643,8 @@ export async function transcribeVoiceMessage(
         const execResult = await execFn(resolvePythonCommand(deps.env), args, { env: deps.env, timeoutMs });
 
         if (execResult.timedOut) {
+          const stderrTail = execResult.stderr.slice(-500);
+          logger.warn('voice', 'spawn transcription timed out', { chatId, audioPath: dest, stderrTail, layer: 'spawn' });
           return fail('timeout', 'transcription child process timed out', dest);
         }
 

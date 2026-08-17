@@ -8,6 +8,7 @@ import { alertStateGcJob } from './jobs/alert-state-gc.js';
 import { weeklyLearnJob } from './jobs/weekly-learn.js';
 import { sessionGcJob } from './jobs/session-gc.js';
 import { voiceAttachmentGcJob } from './jobs/voice-attachment-gc.js';
+import { workerTeeGcJob } from './jobs/worker-tee-gc.js';
 import { reservationGcJob } from './jobs/reservation-gc.js';
 import { botLogRotationCheckJob } from './jobs/bot-log-rotation-check.js';
 import { modelOverrideSweepJob } from './jobs/model-override-sweep.js';
@@ -29,6 +30,7 @@ export const MAINTENANCE_JOBS: readonly MaintenanceJob[] = [
   weeklyLearnJob,
   sessionGcJob,
   voiceAttachmentGcJob,
+  workerTeeGcJob,
   reservationGcJob,
   // bot-host jobs
   botLogRotationCheckJob,

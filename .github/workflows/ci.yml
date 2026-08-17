@@ -87,12 +87,24 @@ jobs:
           npm run build
           npm test
 
+      # Non-blocking npm audit for pa (informational until baseline is clean)
+      - name: npm audit (pa)
+        continue-on-error: true
+        working-directory: pa
+        run: npm audit --audit-level=high
+
       - name: Build and test Telegram bot
         working-directory: projects/telegram-bot
         run: |
           npm ci
           npm run build
           npm test
+
+      # Non-blocking npm audit for bot (informational until baseline is clean)
+      - name: npm audit (bot)
+        continue-on-error: true
+        working-directory: projects/telegram-bot
+        run: npm audit --audit-level=high
 
   # Split out of the `test` job on 2026-08-04. Unlike the Node steps above,
   # this suite has NO dependency on pa or the bot being installed/built
@@ -130,13 +142,13 @@ jobs:
         with:
           python-version: '3.11'
 
-      # No pa/requirements.txt exists -- these two are the only non-stdlib
-      # imports across all 5 test_*.py files (test_backup_secrets.py needs
-      # cryptography; test_finish_google_telegram_reauth.py needs
-      # google-auth-oauthlib), installed explicitly rather than narrowing
-      # which tests run.
+      # Python test dependencies are declared in pa/scripts/requirements.txt
+      # (pinned to currently-installed versions; use pip show to query).
+      # These are the only non-stdlib imports across all test_*.py files:
+      # - test_backup_secrets.py needs cryptography
+      # - test_finish_google_telegram_reauth.py needs google-auth-oauthlib
       - name: Install Python test dependencies
-        run: pip install cryptography google-auth-oauthlib
+        run: pip install -r pa/scripts/requirements.txt
 
       - name: Run Python test suite (PII guard + related tooling)
         run: python -m unittest discover -s pa/scripts/tests -p "test_*.py"

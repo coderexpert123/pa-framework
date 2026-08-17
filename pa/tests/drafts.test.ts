@@ -332,6 +332,45 @@ describe('drafts', () => {
       const proposal = makeProposal({ name: 'brand-new-xyz', prompt: 'Never seen before prompt xyzabc.' });
       assert.equal(await isDuplicate(proposal), false);
     });
+
+    it('blocks by fingerprint when rejected draft exists, then unblocks after cleanRejected()', async () => {
+      const prompt = 'Thrash-control test prompt.';
+      const fingerprint = computeFingerprint('thrash-test', prompt);
+      await createTempDraft(dir, 'thrash-test', prompt, makeMeta({ fingerprint, status: 'rejected' }));
+
+      // Should block because rejected draft's fingerprint matches
+      const proposal1 = makeProposal({ name: 'thrash-test-2', prompt });
+      assert.ok(await isDuplicate(proposal1));
+
+      // Clean the rejected draft
+      await cleanRejected();
+
+      // Now should NOT block — the purge unblocks re-proposal
+      const proposal2 = makeProposal({ name: 'thrash-test-2', prompt });
+      assert.equal(await isDuplicate(proposal2), false);
+    });
+
+    it('still blocks by name (skill or draft dir) even after cleanRejected()', async () => {
+      // Create a deployed skill
+      await createTempSkill(dir, 'name-block-test', 'Deployed skill prompt.');
+
+      // Create and clean a rejected draft with a different name
+      await createTempDraft(dir, 'other-draft', 'Other.', makeMeta({ status: 'rejected' }));
+      await cleanRejected();
+
+      // Should still block by skill name
+      const proposal1 = makeProposal({ name: 'name-block-test', prompt: 'Different prompt.' });
+      assert.ok(await isDuplicate(proposal1));
+
+      // Create a draft directory and clean rejected drafts
+      await createTempDraft(dir, 'draft-block-test', 'Draft prompt.', makeMeta({ status: 'pending' }));
+      await createTempDraft(dir, 'rejected-again', 'R.', makeMeta({ status: 'rejected' }));
+      await cleanRejected();
+
+      // Should still block by draft name (even with different prompt)
+      const proposal2 = makeProposal({ name: 'draft-block-test', prompt: 'Completely different prompt.' });
+      assert.ok(await isDuplicate(proposal2));
+    });
   });
 
   describe('cleanRejected', () => {
@@ -349,23 +388,26 @@ describe('drafts', () => {
       await assert.doesNotReject(() => loadDraft('clean-pending'));
     });
 
-    it('also purges rejected_stale, rejected_auto, and rejected_post_rollback (2026-07-29) — not just literal "rejected"', async () => {
-      await createTempDraft(dir, 'clean-stale', 'S.', makeMeta({ status: 'rejected_stale' }));
-      await createTempDraft(dir, 'clean-auto', 'A.', makeMeta({ status: 'rejected_auto' }));
-      await createTempDraft(dir, 'clean-post-rollback', 'PR.', makeMeta({ status: 'rejected_post_rollback' }));
-      await createTempDraft(dir, 'clean-pending', 'P.', makeMeta({ status: 'pending' }));
-      await createTempDraft(dir, 'clean-approved', 'AP.', makeMeta({ status: 'approved' }));
+    it('removes drafts in each of the four terminal rejected statuses (rejected, rejected_stale, rejected_auto, rejected_post_rollback)', async () => {
+      await createTempDraft(dir, 'term-rejected', 'R.', makeMeta({ status: 'rejected' }));
+      await createTempDraft(dir, 'term-stale', 'S.', makeMeta({ status: 'rejected_stale' }));
+      await createTempDraft(dir, 'term-auto', 'A.', makeMeta({ status: 'rejected_auto' }));
+      await createTempDraft(dir, 'term-post-rollback', 'PR.', makeMeta({ status: 'rejected_post_rollback' }));
+      await createTempDraft(dir, 'term-pending', 'P.', makeMeta({ status: 'pending' }));
+      await createTempDraft(dir, 'term-approved', 'AP.', makeMeta({ status: 'approved' }));
 
       const count = await cleanRejected();
-      assert.equal(count, 3);
+      assert.equal(count, 4);
 
-      await assert.rejects(() => loadDraft('clean-stale'));
-      await assert.rejects(() => loadDraft('clean-auto'));
-      await assert.rejects(() => loadDraft('clean-post-rollback'));
+      // All four terminal rejected statuses should be purged
+      await assert.rejects(() => loadDraft('term-rejected'));
+      await assert.rejects(() => loadDraft('term-stale'));
+      await assert.rejects(() => loadDraft('term-auto'));
+      await assert.rejects(() => loadDraft('term-post-rollback'));
 
-      // Never touch pending or approved — approved backs rollback's target-backup.skill.md
-      await assert.doesNotReject(() => loadDraft('clean-pending'));
-      await assert.doesNotReject(() => loadDraft('clean-approved'));
+      // Pending and approved should survive
+      await assert.doesNotReject(() => loadDraft('term-pending'));
+      await assert.doesNotReject(() => loadDraft('term-approved'));
     });
   });
 

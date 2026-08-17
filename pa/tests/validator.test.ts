@@ -74,6 +74,14 @@ describe('isProtected (hard block — self-guard, 2026-07-11 full-autonomy regim
     );
   });
 
+  it('is protected for all git-workflow skills (2026-08-17 audit P1-1)', () => {
+    const gitWorkflowSkills = ['commit', 'push', 'push-public', 'commit-and-push', 'investigate-flagged', 'update-brain'];
+    for (const skill of gitWorkflowSkills) {
+      assert.equal(isProtected(makeProposal({ name: skill })), true, `${skill} should be protected`);
+      assert.equal(isProtected(makeProposal({ name: `${skill}-fix`, target_skill: skill })), true, `${skill} target should be protected`);
+    }
+  });
+
   it('is NOT protected for an ordinary skill name or target', () => {
     assert.equal(isProtected(makeProposal({ name: 'weather-report' })), false);
     assert.equal(

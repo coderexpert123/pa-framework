@@ -88,6 +88,11 @@ action envelope for cross-skill triggering.
   config.yaml is deployment policy, `PA_VOICE_*` is env-var operational tuning.
   Maintenance job `voice-attachment-gc` (30d retention on `~/.pa/attachments/*.oga`).
   Full design + error-code vocabulary in the plan file.
+  **2026-08-15: transcription moved to ARRIVAL** (`voice-prefetch.ts` + the poll-loop
+  enqueue block) — the transcript becomes the topic-queue entry's text, so voice
+  participates in /stop//steer flush semantics exactly like text; see
+  `docs/bot-reliability-internals.md`'s AI-092 section for the flush model and the
+  do-not-regress list (steer-drain, held ordering, prefetch env).
 
 ## Reliability internals
 

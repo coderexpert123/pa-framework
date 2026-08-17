@@ -51,6 +51,15 @@ export interface AuditRecord {
     // The git-workflow blackboard lock (see pa/src/commands/run.ts's exclusive_resource
     // mechanism) was busy for the whole wait window — nothing was attempted.
     | 'code-fix-skipped-git-lock-busy'
+    // F4 v2 (2026-08-15): the coding worker edited a file that already carried someone
+    // else's uncommitted changes — that diff mixes both and is never committed or reverted.
+    | 'code-fix-skipped-stranger-overlap'
+    // Index hygiene (2026-08-15): the staged set after `git reset -q HEAD` + pathspec
+    // re-add did not equal the worker's paths exactly — something else was staged, so no commit.
+    | 'code-fix-skipped-staged-mismatch'
+    // Quiet-tree gate (2026-08-15): active reservations or recent non-churn path modifications
+    // indicate concurrent work — defer to next nightly run.
+    | 'code-fix-skipped-concurrent-activity'
     | 'reverted-protected-path'
     | 'reverted-test-weakening'
     | 'reverted-verification-failed'

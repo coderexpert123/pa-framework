@@ -57,6 +57,15 @@ projects/daily-mail-brief/*
 # Exclude personal one-off email helpers (hardcoded recipient/subject/body)
 projects/daily-mail-brief/scripts/draft_reply.py
 
+# Inside projects/whatsapp-drafts/: track only code + docs; the contact
+# directory is a personal-data cache that NEVER ships (regenerable via
+# import_google.py; see private .gitignore rationale).
+projects/whatsapp-drafts/*
+!projects/whatsapp-drafts/README.md
+!projects/whatsapp-drafts/INSTRUCTIONS.md
+!projects/whatsapp-drafts/scripts/
+!projects/whatsapp-drafts/tests/
+
 # Universal noise excludes
 **/__pycache__/
 **/*.pyc
@@ -99,3 +108,8 @@ projects/daily-mail-brief/scripts/draft_reply.py
 **/data/raw/
 **/data/processed/
 **/data/exports/
+
+# Claude Code session config — deployment-specific. The thin delegation skills
+# under .claude/skills/ (added 2026-08-15) invoke THIS deployment's `pa run`
+# git-workflow family; public-mirror users get examples/skills/ instead.
+.claude/

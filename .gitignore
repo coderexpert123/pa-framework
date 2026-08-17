@@ -185,6 +185,14 @@ projects/daily-mail-brief/emails.json
 projects/daily-mail-brief/analysis_input.md
 projects/daily-mail-brief/briefing_output.md
 
+# whatsapp-drafts contact directory — a REGENERABLE CACHE (re-run
+# import_google.py; the source of truth is Google Contacts), kept in-tree
+# ONLY because sandboxed workers cannot read ~/.pa. Never version it: it is
+# 1200+ personal phone numbers, and the private repo's no-history-rewrite
+# policy would make one accidental commit permanent. (2026-08-15: one such
+# commit was rebased out pre-push for exactly this reason.)
+projects/whatsapp-drafts/data/contacts.json
+
 # === Public-repo coexistence ===
 # TRACKED PRIVATELY since 2026-08-06 (was ignored here before): .gitignore-public,
 # git-public.ps1/.cmd, README.md, LICENSE, docs/, examples/. They had NO recovery

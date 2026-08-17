@@ -1,8 +1,9 @@
 import { exec as execCb } from 'child_process';
 import { promisify } from 'util';
-import { writeFile, mkdtemp, rm } from 'fs/promises';
+import { writeFile, mkdtemp, rm, readFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join, relative } from 'path';
+import { createHash } from 'crypto';
 import { loadSkill } from './skills.js';
 import { runWithFailover } from './workers.js';
 import { botRestartCommand } from './commands/bot.js';
@@ -11,6 +12,8 @@ import { exclusiveLockKey } from './commands/run.js';
 import { blackboard } from './blackboard.js';
 import { appendAuditRecord, skillRunStats, toAuditBaseline } from './lib/improvement-audit.js';
 import { resolvePythonCommand } from './lib/python.js';
+import { recentActivity } from './commands/claim.js';
+import { readActive } from './lib/reservations.js';
 import type { DraftProposal, Skill } from './types.js';
 import type { FailureRecord } from './failure-analyzer.js';
 import type { AuditTestRunCounts } from './lib/improvement-audit.js';
@@ -81,7 +84,10 @@ export type CodeFixOutcome =
   | 'code-fix-skipped-dirty-worktree'
   | 'code-fix-skipped-worker-failed'
   | 'code-fix-skipped-no-changes'
-  | 'code-fix-skipped-git-lock-busy';
+  | 'code-fix-skipped-git-lock-busy'
+  | 'code-fix-skipped-stranger-overlap'
+  | 'code-fix-skipped-staged-mismatch'
+  | 'code-fix-skipped-concurrent-activity';
 
 export interface CodeFixResult {
   outcome: CodeFixOutcome;
@@ -100,6 +106,10 @@ export interface CodeFixOptions {
   blackboardFn?: BlackboardLockClient;
   /** Test-only: overrides LOCK_HEARTBEAT_MS so heartbeat tests don't need to wait 60s. */
   lockHeartbeatMs?: number;
+  /** Test-only: overrides recentActivity probe. */
+  recentActivityFn?: () => Promise<string[]>;
+  /** Test-only: overrides readActive probe. */
+  readActiveFn?: () => Promise<import('./lib/reservations.js').Reservation[]>;
 }
 
 // --- F1: protected framework paths — the loop's own execution/audit/rollback chain and the
@@ -257,18 +267,50 @@ async function getNumstat(exec: ExecFn, repoRoot: string, preFixHead: string): P
   return entries;
 }
 
-async function hardRevert(exec: ExecFn, repoRoot: string, preFixHead: string): Promise<void> {
+async function hardRevert(exec: ExecFn, repoRoot: string, preFixHead: string, paths: string[]): Promise<void> {
   const opts = { cwd: repoRoot };
-  // `git reset --hard` would roll the nightly-churning pa/data/profile* files back to the
-  // pre-fix commit and silently destroy a day of learn_agent-written profile data — the F4
-  // carve-out let that drift through the gate, so it is still present here. Stash just those
-  // paths across the reset/clean and put them back (2026-07-21). Do not regress.
+  // Scoped revert (2026-08-15): only the worker's own touched paths are reverted, not the
+  // entire tree. This allows out-of-scope WIP to coexist with autonomous fixes. Churn is still
+  // stashed/pop'd across the operation — pa/data/profile* files are never reverted or cleaned.
+  // Before 2026-08-15, this used tree-wide `git reset --hard` + bare `git clean -fd`, which
+  // forced F4 to refuse on ANY dirty path. The new scoped revert enables F4 v2's scoped gate.
+  //
+  // Split into three buckets to avoid throwing on worker-created staged files (which don't
+  // exist at preFixHead and would cause `git checkout` to error):
+  //   1. existsAtPreFixHead: restore via `git checkout ${preFixHead} -- <path>`
+  //   2. stagedNew: remove via `git rm -q -f -- <path>` (drops from index AND disk)
+  //   3. untracked: remove via `git clean -fd -- <path>`
   const stashed = await stashChurn(exec, `pa-code-fix-revert-${preFixHead}`, opts);
   try {
-    await exec(`git reset --hard ${preFixHead}`, opts);
-    // reset --hard doesn't remove new untracked files the worker created — F4 already confirmed
-    // the tree was clean before the worker ran, so anything untracked now is the worker's.
-    await exec('git clean -fd', opts);
+    const pathspec = paths.map((p) => `"${p}"`).join(' ');
+
+    // Bucket 1: files that exist at preFixHead (in the tree at that commit)
+    const { stdout: lsTreeOut } = await exec(`git ls-tree --name-only ${preFixHead} -- ${pathspec}`, opts);
+    const existsAtPreFixHead = lsTreeOut.trim().split('\n').filter((p) => p.length > 0).map((p) => normalizePath(p));
+
+    // Bucket 2: files in the index but NOT at preFixHead (worker-created, staged new files)
+    const { stdout: lsFilesOut } = await exec(`git ls-files -- ${pathspec}`, opts);
+    const staged = lsFilesOut.trim().split('\n').filter((p) => p.length > 0).map((p) => normalizePath(p));
+    const stagedSet = new Set(staged);
+    const existsAtPreFixHeadSet = new Set(existsAtPreFixHead);
+    const stagedNew = staged.filter((p) => !existsAtPreFixHeadSet.has(p));
+
+    // Bucket 3: untracked files (not in the index)
+    const untracked = paths.filter((p) => !stagedSet.has(p));
+
+    // Apply each bucket's cleanup only when non-empty — each command must succeed without throwing
+    if (existsAtPreFixHead.length > 0) {
+      const existsPathspec = existsAtPreFixHead.map((p) => `"${p}"`).join(' ');
+      await exec(`git checkout ${preFixHead} -- ${existsPathspec}`, opts);
+    }
+    if (stagedNew.length > 0) {
+      const stagedNewPathspec = stagedNew.map((p) => `"${p}"`).join(' ');
+      await exec(`git rm -q -f -- ${stagedNewPathspec}`, opts);
+    }
+    if (untracked.length > 0) {
+      const untrackedPathspec = untracked.map((p) => `"${p}"`).join(' ');
+      await exec(`git clean -fd -- ${untrackedPathspec}`, opts);
+    }
   } finally {
     if (stashed) {
       const restoreError = await popChurn(exec, opts);
@@ -580,14 +622,14 @@ export async function attemptCodeFix(
   const { stdout: branchRaw } = await exec('git rev-parse --abbrev-ref HEAD', { cwd: repoRoot });
   const branch = branchRaw.trim();
 
-  // git-workflow lock: acquired here — right after repoRoot/branch resolve, before F4 —
-  // not just around the final commit/push. F4's clean-tree guarantee means nothing if
-  // another process can dirty the tree right after the check; the coding worker writes
-  // into the shared tree for up to 30 minutes, entirely before any commit happens; and
-  // hardRevert()'s `git reset --hard` + `git clean -fd` (the most destructive operation
-  // in this file) runs on every F1/F2/F3 failure path, not just F6. See buildCodeFixBrief's
-  // requirement 5 (above), which the coding worker's brief cross-references: it must not
-  // invoke a git-workflow skill of its own while this lock is held.
+  // git-workflow lock: acquired here — right after repoRoot/branch resolve, before the
+  // quiet-tree gate — not just around the final commit/push. The quiet-tree gate means
+  // nothing if another process can dirty the tree right after the check; the coding worker
+  // writes into the shared tree for up to 30 minutes, entirely before any commit happens;
+  // and hardRevert()'s scoped revert (the most destructive operation in this file) runs
+  // on every F1/F2/F3 failure path, not just F6. See buildCodeFixBrief's requirement 5
+  // (above), which the coding worker's brief cross-references: it must not invoke a
+  // git-workflow skill of its own while this lock is held.
   const bb = opts.blackboardFn ?? blackboard;
   const lockKey = exclusiveLockKey(GIT_WORKFLOW_RESOURCE);
   const lockAcquired = await bb.acquireLock(lockKey, CODE_FIX_LOCK_AGENT, process.pid, GIT_LOCK_WAIT_MS);
@@ -609,18 +651,41 @@ export async function attemptCodeFix(
   }
 
   async function runBody(): Promise<CodeFixResult> {
-  // F4: working-tree-clean precondition — never mix an autonomous diff with human WIP.
-  const preExisting = await getWorkingTreePaths(exec, repoRoot);
-  if (preExisting.length > 0) {
-    const reason = `Working tree has ${preExisting.length} uncommitted change(s) — refusing to run: ${preExisting.slice(0, 5).join(', ')}`;
-    await appendAuditRecord({ ...baseAudit, action: 'code-fix-skipped-dirty-worktree', reason });
-    return { outcome: 'code-fix-skipped-dirty-worktree', reason };
-  }
-
   const { stdout: preFixHeadRaw } = await exec('git rev-parse HEAD', { cwd: repoRoot });
   const preFixHead = preFixHeadRaw.trim();
 
   const projectRelDir = normalizePath(relative(repoRoot, targetCwd));
+
+  // Quiet-tree gate (2026-08-15): proceed only when no concurrent activity is detected.
+  // This replaces F4 v2's scoped dirty-path refusal — instead of refusing on dirty paths,
+  // we now allow a heavily dirty tree as long as it's stale (finished agent work awaiting
+  // commit, not live work). The gate checks two things:
+  //   1. No active reservations (readActive) — the self-improver loop itself holds none,
+  //      so ANY active reservation means another session declared work.
+  //   2. No recent non-churn path modifications (recentActivity filtered by isChurnPath) —
+  //      the 15-minute mtime window distinguishes finished work (stale dirt) from live work.
+  // Either trips ⇒ skip with outcome code-fix-skipped-concurrent-activity, retry next night.
+  // The safety net built earlier (scoped hardRevert, stranger-overlap guard, staged-set
+  // verification, narrowed rollback refusal) covers races that slip through.
+  //
+  // We still compute preExisting (non-churn dirty paths) because the stranger-overlap
+  // snapshot and workerPaths isolation need it.
+  const recentActivityFn = opts.recentActivityFn ?? recentActivity;
+  const readActiveFn = opts.readActiveFn ?? readActive;
+  const preExisting = await getWorkingTreePaths(exec, repoRoot);
+  const activeReservations = await readActiveFn();
+  if (activeReservations.length > 0) {
+    const reason = `Active reservations: ${activeReservations.map((r) => `${r.id} (${r.session})`).join(', ')} — deferring to avoid concurrent work.`;
+    await appendAuditRecord({ ...baseAudit, action: 'code-fix-skipped-concurrent-activity', reason });
+    return { outcome: 'code-fix-skipped-concurrent-activity', reason };
+  }
+  const recent = await recentActivityFn();
+  const recentNonChurn = recent.filter((p) => !isChurnPath(p));
+  if (recentNonChurn.length > 0) {
+    const reason = `Recent non-churn modifications: ${recentNonChurn.slice(0, 5).join(', ')} — deferring to avoid concurrent work.`;
+    await appendAuditRecord({ ...baseAudit, action: 'code-fix-skipped-concurrent-activity', reason });
+    return { outcome: 'code-fix-skipped-concurrent-activity', reason };
+  }
 
   // F3 baseline: capture the target project's PRE-FIX failing tests, on a clean
   // tree, before the worker touches anything — so the post-fix gate can tell a
@@ -630,6 +695,21 @@ export async function attemptCodeFix(
     ? null
     : await collectProjectTests(projectRelDir, repoRoot, exec).catch(() => null);
   const projectBaselineFailures = preFixProject?.failedIds ?? new Set<string>();
+
+  // Pre-flight snapshot for stranger-overlap detection (2026-08-15): hash every preExisting
+  // file NOW, before the worker runs, so we can detect if the worker modified a file that was
+  // already dirty. If we snapshot post-flight, both reads see the same content and modifications
+  // are undetected. Conservative fallback: '<unreadable>' means "assume it changed."
+  const preExistingHashes = new Map<string, string>();
+  for (const p of preExisting) {
+    try {
+      const content = await readFile(join(repoRoot, p), 'utf8');
+      preExistingHashes.set(p, createHash('sha256').update(content).digest('hex'));
+    } catch {
+      // If we can't read the file, conservatively assume it might have changed.
+      preExistingHashes.set(p, '<unreadable>');
+    }
+  }
 
   const brief = buildCodeFixBrief(proposal, evidence, projectRelDir);
 
@@ -646,28 +726,60 @@ export async function attemptCodeFix(
     return { outcome: 'code-fix-skipped-worker-failed', reason };
   }
 
-  const touchedPaths = await getWorkingTreePaths(exec, repoRoot);
-  if (touchedPaths.length === 0) {
+  // Post-flight worker-diff isolation (2026-08-15): compute what the worker actually touched
+  // by comparing pre-flight and post-flight dirty sets. This isolates the worker's changes from
+  // pre-existing out-of-scope WIP that F4 v2 now allows to remain.
+  const currentDirty = await getWorkingTreePaths(exec, repoRoot);
+  const preExistingSet = new Set(preExisting);
+  const workerPaths = currentDirty.filter((p) => !preExistingSet.has(p));
+
+  if (workerPaths.length === 0) {
     const reason = 'Coding worker completed but made no file changes.';
     await appendAuditRecord({ ...baseAudit, action: 'code-fix-skipped-no-changes', reason });
     return { outcome: 'code-fix-skipped-no-changes', reason };
   }
 
+  // Stranger-overlap guard (2026-08-15): if any preExisting file's content CHANGED post-flight,
+  // the worker edited a file that already carried someone else's uncommitted work. That file's
+  // diff now mixes both changes and must never be committed or reverted. Before 2026-08-15,
+  // F4's whole-tree clean check prevented this scenario; with F4 v2's scoped gate, it can
+  // happen, so we detect it explicitly. The snapshot was taken pre-flight (above), so this
+  // comparison detects actual worker modifications to pre-existing dirty files.
+  const overlapped: string[] = [];
+  for (const p of preExisting) {
+    try {
+      const content = await readFile(join(repoRoot, p), 'utf8');
+      const currentHash = createHash('sha256').update(content).digest('hex');
+      if (currentHash !== preExistingHashes.get(p)) {
+        overlapped.push(p);
+      }
+    } catch {
+      // If we can't read the file now, conservatively assume it changed.
+      overlapped.push(p);
+    }
+  }
+  if (overlapped.length > 0) {
+    await hardRevert(exec, repoRoot, preFixHead, workerPaths);
+    const reason = `Stranger overlap: worker edited file(s) with pre-existing uncommitted work: ${overlapped.join(', ')} — reverted worker paths only.`;
+    await appendAuditRecord({ ...baseAudit, action: 'code-fix-skipped-stranger-overlap', reason, files_changed: workerPaths });
+    return { outcome: 'code-fix-skipped-stranger-overlap', reason };
+  }
+
   // F1: protected-path diff inspection.
-  const protectedTouched = touchedPaths.filter(isProtectedPath);
+  const protectedTouched = workerPaths.filter(isProtectedPath);
   if (protectedTouched.length > 0) {
-    await hardRevert(exec, repoRoot, preFixHead);
+    await hardRevert(exec, repoRoot, preFixHead, workerPaths);
     const reason = `Coding worker touched protected path(s): ${protectedTouched.join(', ')} — reverted.`;
-    await appendAuditRecord({ ...baseAudit, action: 'reverted-protected-path', reason, files_changed: touchedPaths });
+    await appendAuditRecord({ ...baseAudit, action: 'reverted-protected-path', reason, files_changed: workerPaths });
     return { outcome: 'code-fix-reverted', reason };
   }
 
   // F5 (diff-inspection half): data-destruction guard.
-  const guardedTouched = touchedPaths.filter(touchesGuardedDataPath);
+  const guardedTouched = workerPaths.filter(touchesGuardedDataPath);
   if (guardedTouched.length > 0) {
-    await hardRevert(exec, repoRoot, preFixHead);
+    await hardRevert(exec, repoRoot, preFixHead, workerPaths);
     const reason = `Coding worker touched a guarded data/secrets path: ${guardedTouched.join(', ')} — reverted.`;
-    await appendAuditRecord({ ...baseAudit, action: 'reverted-protected-path', reason, files_changed: touchedPaths });
+    await appendAuditRecord({ ...baseAudit, action: 'reverted-protected-path', reason, files_changed: workerPaths });
     return { outcome: 'code-fix-reverted', reason };
   }
 
@@ -675,19 +787,19 @@ export async function attemptCodeFix(
   const numstat = await getNumstat(exec, repoRoot, preFixHead);
   const weakened = numstat.filter((n) => isExistingTestFile(n.path) && n.deleted > n.added);
   if (weakened.length > 0) {
-    await hardRevert(exec, repoRoot, preFixHead);
+    await hardRevert(exec, repoRoot, preFixHead, workerPaths);
     const reason = `Net test deletions in existing test file(s): ${weakened.map((w) => w.path).join(', ')} — reverted.`;
-    await appendAuditRecord({ ...baseAudit, action: 'reverted-test-weakening', reason, files_changed: touchedPaths });
+    await appendAuditRecord({ ...baseAudit, action: 'reverted-test-weakening', reason, files_changed: workerPaths });
     return { outcome: 'code-fix-reverted', reason };
   }
 
   // F3: post-apply verification gate — build + full relevant suites (+ bot restart/health).
-  const verification = await runVerificationGate(touchedPaths, repoRoot, exec, botRestartFn, checkBotProcessFn, sleep, projectRelDir, projectBaselineFailures);
+  const verification = await runVerificationGate(workerPaths, repoRoot, exec, botRestartFn, checkBotProcessFn, sleep, projectRelDir, projectBaselineFailures);
   if (!verification.ok) {
-    await hardRevert(exec, repoRoot, preFixHead);
+    await hardRevert(exec, repoRoot, preFixHead, workerPaths);
     const reason = `Verification failed: ${verification.excerpt ?? 'unknown failure'} — reverted.`;
     await appendAuditRecord({
-      ...baseAudit, action: 'reverted-verification-failed', reason, files_changed: touchedPaths,
+      ...baseAudit, action: 'reverted-verification-failed', reason, files_changed: workerPaths,
       test_run_counts: verification.testRunCounts,
     });
     return { outcome: 'code-fix-reverted', reason };
@@ -696,17 +808,36 @@ export async function attemptCodeFix(
   // F6: commit + push PRIVATE origin only (plain `git` always resolves to .git, never
   // .git-public — this module never invokes git-public.ps1/.cmd or passes --git-dir).
   //
+  // Index hygiene (2026-08-15): full unstage first (`git reset -q HEAD`), then stage ONLY the
+  // worker's paths, then verify that the staged set matches exactly. This prevents a stranger's
+  // staged index from riding along in the fix commit. Before 2026-08-15, we unstaged only the
+  // churn pathspecs and assumed the rest was clean; with F4 v2 allowing out-of-scope WIP, a
+  // stranger's staged entries would otherwise slip into the commit.
+  //
   // Pathspec-limited staging (2026-07-21, do NOT regress to a bare `git add -A`): the bare
   // form swept the nightly pa/data/profile* churn into the fix commit itself, which made every
   // autonomous fix commit UN-REVERTABLE by construction — `git revert` aborts on "local changes
   // to pa/data/profile.json would be overwritten by merge" as soon as learn_agent has rewritten
-  // it again (see DIRTY_IGNORE_PREFIXES for the 7b82c88 incident). `touchedPaths` already
-  // excludes the churn, so it is exactly the set the coding worker changed. The pathspec-limited
-  // `git reset` first is belt-and-suspenders against churn that was somehow already staged: it
-  // only rewrites the INDEX entry, never the working tree, so no profile data is touched.
-  const commitPathspec = touchedPaths.map((p) => `"${p}"`).join(' ');
-  await exec(`git reset -q HEAD -- ${CHURN_PATHSPEC_ARGS}`, { cwd: repoRoot }).catch(() => {});
+  // it again (see DIRTY_IGNORE_PREFIXES for the 7b82c88 incident). `workerPaths` already
+  // excludes the churn, so it is exactly the set the coding worker changed. The new mechanism
+  // adds a staged-set equality check on top of the 2026-07-21 pathspec-limited staging.
+  await exec(`git reset -q HEAD`, { cwd: repoRoot }).catch(() => {});
+  const commitPathspec = workerPaths.map((p) => `"${p}"`).join(' ');
   await exec(`git add -A -- ${commitPathspec}`, { cwd: repoRoot });
+
+  // Verify staged-set matches exactly — any mismatch means something unexpected slipped in.
+  const { stdout: stagedNames } = await exec(`git diff --cached --name-only`, { cwd: repoRoot });
+  const stagedSet = new Set(stagedNames.trim().split('\n').filter((p) => p.length > 0).map((p) => normalizePath(p)));
+  const workerSet = new Set(workerPaths);
+  if (stagedSet.size !== workerSet.size || ![...stagedSet].every((p) => workerSet.has(p))) {
+    await hardRevert(exec, repoRoot, preFixHead, workerPaths);
+    const unexpected = [...stagedSet].filter((p) => !workerSet.has(p));
+    const missing = [...workerSet].filter((p) => !stagedSet.has(p));
+    const reason = `Staged set mismatch: staged [${[...stagedSet].join(', ')}] vs worker [${workerPaths.join(', ')}] — unexpected: [${unexpected.join(', ')}], missing: [${missing.join(', ')}]. Reverted worker paths only.`;
+    await appendAuditRecord({ ...baseAudit, action: 'code-fix-skipped-staged-mismatch', reason, files_changed: workerPaths });
+    return { outcome: 'code-fix-skipped-staged-mismatch', reason };
+  }
+
   const commitMessage = buildCommitMessage(proposal, evidence);
   const tmpDir = await mkdtemp(join(tmpdir(), 'pa-code-fix-'));
   const msgPath = join(tmpDir, 'commit-message.txt');
@@ -727,11 +858,11 @@ export async function attemptCodeFix(
     action: 'applied-code-fix',
     reason,
     commit_hash: commitHash,
-    files_changed: touchedPaths,
+    files_changed: workerPaths,
     test_run_counts: verification.testRunCounts,
     baseline: toAuditBaseline(await skillRunStats(targetSkillName, 14)),
   });
 
-  return { outcome: 'applied-code-fix', reason, commitHash, filesChanged: touchedPaths, testRunCounts: verification.testRunCounts };
+  return { outcome: 'applied-code-fix', reason, commitHash, filesChanged: workerPaths, testRunCounts: verification.testRunCounts };
   }
 }

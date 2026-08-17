@@ -22,6 +22,10 @@ export interface MaintenanceJobState {
   /** Consecutive SUPPRESSING skips (disabled/degraded/in-flight). 'not-due'
    *  skips do NOT increment it — a job that isn't due isn't being suppressed. */
   consecutiveSkips: number;
+  /** Watchdog state: true if a worker is currently executing this job. */
+  inFlight?: boolean;
+  /** ISO timestamp when the job entered in-flight state. */
+  inFlightSince?: string | null;
 }
 
 export interface MaintenanceLedger {
@@ -81,10 +85,52 @@ async function writeLedgerAtomic(path: string, ledger: MaintenanceLedger): Promi
   const tmpPath = `${path}.${process.pid.toString(36)}-${randomBytes(3).toString('hex')}.tmp`;
   try {
     await writeFile(tmpPath, JSON.stringify(ledger, null, 2), 'utf8');
-    await rename(tmpPath, path);
+    // AI-150: Windows EPERM retry — pa catchup (1-min cadence) and bot both write
+    // this ledger concurrently; rename fails when the target is open elsewhere.
+    await renameWithRetry(tmpPath, path);
   } catch (err) {
     await unlink(tmpPath).catch(() => {});
     throw err;
+  }
+}
+
+/**
+ * Retry a rename operation ONLY on Windows EPERM/EACCES (file open elsewhere).
+ * AI-150: pa catchup and bot both write maintenance-state.json concurrently;
+ * Windows refuses to rename over a concurrently-open file.
+ *
+ * @param tmpPath Source file path (temp file to rename)
+ * @param path Target path
+ * @param opts.attempts Number of retry attempts (default 5)
+ * @param opts.baseDelayMs Base backoff delay (default 50ms)
+ * @param opts.jitterMs Jitter range override (tests inject 0 for deterministic timing)
+ * @param renameFn Rename implementation (overridable for tests)
+ * @throws Final error after all retries exhausted, or immediately for non-EPERM/EACCES
+ */
+export async function renameWithRetry(
+  tmpPath: string,
+  path: string,
+  opts: { attempts?: number; baseDelayMs?: number; jitterMs?: number } = {},
+  renameFn: (a: string, b: string) => Promise<void> = rename,
+): Promise<void> {
+  const maxAttempts = opts.attempts ?? 5;
+  const baseDelay = opts.baseDelayMs ?? 50;
+  const jitterMs = opts.jitterMs ?? 50; // default jitter range 0-50ms
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await renameFn(tmpPath, path);
+      return; // success
+    } catch (err: any) {
+      // EPERM/EACCES on Windows → target likely open elsewhere, retry with backoff
+      if (attempt < maxAttempts && (err?.code === 'EPERM' || err?.code === 'EACCES')) {
+        const delay = baseDelay * Math.pow(2, attempt - 1) + Math.floor(Math.random() * jitterMs);
+        await new Promise<void>((resolve) => setTimeout(resolve, delay));
+        continue;
+      }
+      // Non-retryable error or final attempt → rethrow
+      throw err;
+    }
   }
 }
 
@@ -120,6 +166,15 @@ function defaultJobState(nowMs: number): MaintenanceJobState {
     consecutiveFailures: 0,
     consecutiveSkips: 0,
   };
+}
+
+/**
+ * Load a single job's state from the ledger.
+ * Returns the job's state, or a default empty state if the job has never been recorded.
+ */
+export async function loadJobState(name: string): Promise<MaintenanceJobState> {
+  const ledger = await readLedger();
+  return ledger.jobs[name] ?? defaultJobState(Date.now());
 }
 
 /**

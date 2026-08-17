@@ -654,6 +654,38 @@ describe('transcribeVoiceMessage', () => {
     assert.equal((result as any).reason, 'timeout');
   });
 
+  it('spawn timeout logs enhanced diagnostics with layer and stderrTail (WPB5)', async () => {
+    let warnLogged = false;
+    let warnArgs: any;
+
+    // Mock logger directly (same pattern as other tests in this file)
+    const { logger } = await import('../../../../pa/dist/src/lib/log.js');
+    const originalWarn = logger.warn;
+    (logger as any).warn = (event: string, msg: string, args: any) => {
+      if (event === 'voice' && msg === 'spawn transcription timed out') {
+        warnLogged = true;
+        warnArgs = args;
+      }
+      originalWarn(event, msg, args);
+    };
+
+    try {
+      const deps = makeDeps({
+        execFn: async () => ({ stdout: '', stderr: 'Long stderr with details at the end about the timeout', code: null, timedOut: true }),
+      });
+      const result = await transcribeVoiceMessage(TOKEN, CHAT_ID, makeVoice(), deps);
+      assert.equal(result.ok, false);
+      assert.equal((result as any).reason, 'timeout');
+      assert.equal(warnLogged, true);
+      assert.equal(warnArgs?.layer, 'spawn');
+      assert.ok(typeof warnArgs?.audioPath === 'string');
+      assert.ok(typeof warnArgs?.stderrTail === 'string');
+      assert.ok(warnArgs.stderrTail.length > 0);
+    } finally {
+      (logger as any).warn = originalWarn;
+    }
+  });
+
   it('ok:true with blank text maps to empty-transcript', async () => {
     const deps = makeDeps({ execFn: async () => okExec({ text: '   ' }) });
     const result = await transcribeVoiceMessage(TOKEN, CHAT_ID, makeVoice(), deps);
@@ -807,6 +839,38 @@ describe('transcribeVoiceMessage', () => {
     assert.equal(result.ok, false);
     assert.equal((result as any).reason, 'timeout');
     assert.equal(execCalls, 0);
+  });
+
+  it('persistent worker timeout logs enhanced diagnostics with layer (WPB5)', async () => {
+    let warnLogged = false;
+    let warnArgs: any;
+
+    // Mock logger directly (same pattern as other tests in this file)
+    const { logger } = await import('../../../../pa/dist/src/lib/log.js');
+    const originalWarn = logger.warn;
+    (logger as any).warn = (event: string, msg: string, args: any) => {
+      if (event === 'voice' && msg === 'persistent worker transcription timed out') {
+        warnLogged = true;
+        warnArgs = args;
+      }
+      originalWarn(event, msg, args);
+    };
+
+    try {
+      const deps = makeDeps({
+        transcription: { worker_mode: 'persistent', engine_preference: 'local' },
+        persistentFn: async (): Promise<VoiceWorkerOutcome> => ({ kind: 'timeout', message: 'persistent worker timed out' }),
+        execFn: async () => okExec(),
+      });
+      const result = await transcribeVoiceMessage(TOKEN, CHAT_ID, makeVoice(), deps);
+      assert.equal(result.ok, false);
+      assert.equal((result as any).reason, 'timeout');
+      assert.equal(warnLogged, true);
+      assert.equal(warnArgs?.layer, 'persistent-transcribe');
+      assert.ok(typeof warnArgs?.audioPath === 'string');
+    } finally {
+      (logger as any).warn = originalWarn;
+    }
   });
 
   it('a throw from persistentFn itself still falls through to the spawn fallback', async () => {

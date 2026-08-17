@@ -310,3 +310,127 @@ describe('sendToTelegram — app.log textPreview', () => {
     assert.equal(entry.textPreview.length, 500);
   });
 });
+
+// ---------------------------------------------------------------------------
+// sendToTelegram — 429 rate-limit handling (AI-149)
+// ---------------------------------------------------------------------------
+
+describe('sendToTelegram — 429 rate-limit handling', () => {
+  const cfg: TelegramOutput = { chat_id: '-1001234567', token_secret: 'T' };
+
+  it('retries once on 429 with retry_after, then succeeds', async () => {
+    const calls = setupFetchMock([
+      { ok: false, status: 429, bodyText: '{"parameters":{"retry_after":2}}' },
+      { ok: true },
+    ]);
+
+    // Mock sleep to be instant
+    const originalSetTimeout = globalThis.setTimeout;
+    (globalThis as any).setTimeout = (cb: () => void) => {
+      setImmediate(cb);
+      return {} as any;
+    };
+
+    const result = await sendToTelegram('hello', cfg, 'tok');
+
+    (globalThis as any).setTimeout = originalSetTimeout;
+
+    assert.equal(result.ok, true, 'should succeed after retry');
+    assert.equal(calls.length, 2, 'should make 2 attempts');
+  });
+
+  it('gives up after 3 total 429s', async () => {
+    const calls = setupFetchMock([
+      { ok: false, status: 429, bodyText: '{"parameters":{"retry_after":1}}' },
+      { ok: false, status: 429, bodyText: '{"parameters":{"retry_after":1}}' },
+      { ok: false, status: 429, bodyText: '{"parameters":{"retry_after":1}}' },
+    ]);
+
+    // Fast-forward sleep calls
+    const originalSetTimeout = globalThis.setTimeout;
+    (globalThis as any).setTimeout = (cb: () => void) => setImmediate(cb);
+
+    const result = await sendToTelegram('hello', cfg, 'tok');
+
+    (globalThis as any).setTimeout = originalSetTimeout;
+
+    assert.equal(result.ok, false, 'should fail after 3 attempts');
+    assert.equal(result.reason, 'http');
+    assert.equal(calls.length, 3, 'should make exactly 3 attempts');
+  });
+
+  it('treats unparseable 429 as immediate failure', async () => {
+    const calls = setupFetchMock([
+      { ok: false, status: 429, bodyText: 'invalid json' },
+    ]);
+
+    const result = await sendToTelegram('hello', cfg, 'tok');
+
+    assert.equal(result.ok, false, 'should fail immediately');
+    assert.equal(result.reason, 'http');
+    assert.equal(calls.length, 1, 'should make only 1 attempt');
+  });
+
+  it('caps retry_after at 60 seconds', async () => {
+    const calls = setupFetchMock([
+      { ok: false, status: 429, bodyText: '{"parameters":{"retry_after":120}}' },
+      { ok: true },
+    ]);
+
+    // Fast-forward sleep
+    const originalSetTimeout = globalThis.setTimeout;
+    (globalThis as any).setTimeout = (cb: () => void) => setImmediate(cb);
+
+    const result = await sendToTelegram('hello', cfg, 'tok');
+
+    (globalThis as any).setTimeout = originalSetTimeout;
+
+    assert.equal(result.ok, true, 'should succeed after retry');
+  });
+
+  it('does NOT fall back to plain text on 429', async () => {
+    const calls = setupFetchMock([
+      { ok: false, status: 429, bodyText: '{"parameters":{"retry_after":1}}' },
+      { ok: true },
+    ]);
+
+    // Fast-forward sleep
+    const originalSetTimeout = globalThis.setTimeout;
+    (globalThis as any).setTimeout = (cb: () => void) => setImmediate(cb);
+
+    const result = await sendToTelegram('hello', cfg, 'tok', 'Markdown');
+
+    (globalThis as any).setTimeout = originalSetTimeout;
+
+    assert.equal(result.ok, true);
+    assert.equal(calls.length, 2, 'should retry with original Markdown form');
+    // Both calls should have parse_mode='Markdown' (no fallback to plain text)
+    const body1 = JSON.parse(calls[0].init!.body as string);
+    const body2 = JSON.parse(calls[1].init!.body as string);
+    assert.equal(body1.parse_mode, 'Markdown');
+    assert.equal(body2.parse_mode, 'Markdown', 'should preserve parse_mode on 429 retry');
+  });
+
+  it('handles 429 in plain-text fallback mode too', async () => {
+    const calls = setupFetchMock([
+      { ok: false, status: 400, bodyText: 'parse error' },
+      { ok: false, status: 429, bodyText: '{"parameters":{"retry_after":1}}' },
+      { ok: true },
+      { ok: true }, // Extra success in case mock cycles
+    ]);
+
+    // Fast-forward sleep
+    const originalSetTimeout = globalThis.setTimeout;
+    (globalThis as any).setTimeout = (cb: () => void) => setImmediate(cb);
+
+    const result = await sendToTelegram('hello', cfg, 'tok', 'Markdown');
+
+    (globalThis as any).setTimeout = originalSetTimeout;
+
+    assert.equal(result.ok, true);
+    assert.equal(calls.length, 3, 'parse fallback then 429 retry then success');
+    // Third call (after 429) should still have parse_mode undefined (plain text)
+    const body3 = JSON.parse(calls[2].init!.body as string);
+    assert.equal(body3.parse_mode, undefined, 'should retry plain-text form on 429');
+  });
+});

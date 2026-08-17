@@ -21,6 +21,11 @@ export interface WorkerPidEntry {
    * crashed-instance dispatch finish so its reply can be harvested instead of
    * being killed by the next per-minute `pa catchup` sweep. */
   harvestUntil?: string;
+  /** Path to the tee-captured stdout file for this dispatch (set by
+   * worker-exec for agy only; undefined for all other workers and when
+   * AGY_TEE_OUT was externally set). Read by the orphan reaper to recover
+   * sessionless workers' replies. */
+  teePath?: string;
 }
 
 function pidsDir(): string {

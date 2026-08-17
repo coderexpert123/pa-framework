@@ -21,24 +21,14 @@ workers:
     priority: 1
     state_dir: "~/.claude/projects"
     state_pattern: "*.jsonl"
-    # tunables: user-settable knobs (the bot's /llm and /effort commands).
-    # "args" is an ARG TEMPLATE — "{value}" is substituted and the whole
-    # template is appended, but ONLY when the setting is actually set.
-    # Only declare flags the CLI actually has — a bogus flag fails EVERY
-    # dispatch to this worker and looks like an outage, not a settings error.
-    # Omit "default:" to leave the CLI's own default in charge (nothing passed).
-    # "values" is a display hint (or a canonical->native map), never an
-    # allowlist: any value the user types is passed through.
-    # "supersedes: [other]" declares that setting THIS knob must suppress
-    # another one's args, for a CLI that rejects the two together (see agy).
-    tunables:
-      model:
-        args: ["--model", "{value}"]
-        description: "Model name passed to the CLI (e.g. opusplan, opus, sonnet)."
-      effort:
-        args: ["--effort", "{value}"]
-        values: [low, medium, high, xhigh, max]
-        description: "Effort level for the session (Claude Code 2.x --effort)."
+    # Optional defense-in-depth: limit which secrets this worker receives.
+    # If absent, the worker gets ALL secrets from secrets.env (current behavior).
+    # If present, ONLY the named secrets are injected into the worker's environment.
+    # Secret names must match pattern [A-Z0-9_]+ (uppercase alphanumeric + underscore).
+    # LLM workers (agy, claude, codex, zclaude): this field controls which secrets
+    #   from secrets.env are injected. Shell skills (cmd:) are unaffected.
+    # Example: secret_allowlist: [TELEGRAM_BOT_TOKEN, OPENAI_API_KEY]
+    # secret_allowlist:
 
   - name: codex
     command: codex
@@ -57,6 +47,7 @@ workers:
     state_pattern: "state_5.sqlite"
     # codex has no --effort flag; reasoning effort is a -c config override —
     # which is exactly why "args" is a template array and not flag+value.
+    # secret_allowlist: []  # Uncomment and list secrets this worker may access
     tunables:
       model:
         args: ["--model", "{value}"]
@@ -82,6 +73,7 @@ workers:
     priority: 5
     state_dir: "~/.claude/projects"
     state_pattern: "*.jsonl"
+    # secret_allowlist: []  # Uncomment and list secrets this worker may access
     tunables:
       model:
         args: ["--model", "{value}"]
@@ -115,19 +107,23 @@ workers:
     # rather than guessing; agy stuck-detection therefore relies on the
     # process-tree heartbeat, not transcript inspection.
     state_pattern: "*.db"
-    # MODEL AND EFFORT ARE NOT INDEPENDENT ON agy (v1.1.5, verified live
-    # 2026-07-22): '--model gemini-3.6-flash' alone is REJECTED (the CLI demands
-    # an effort), '--model gemini-3.6-flash-high' is fine because the suffix IS
-    # the effort, and '--model claude-sonnet-4-6 --effort high' is rejected with
-    # "--effort is not supported". Every name 'agy models' prints is either
-    # effort-suffixed or an effort-rejecting Claude/GPT model, so sending the
-    # model ALONE is right for all of them - hence "supersedes: [effort]".
-    # Effort on its own is still valid and is still passed.
+    # agy v1.1.13 (live-verified 2026-08-15, AI-155): a bare '--effort high'
+    # with no model is REJECTED instantly ("invalid model selection --
+    # --effort is not supported for the current model"), which killed every
+    # effort-bearing dispatch until 1.1.13 was probed. The effort tunable is
+    # therefore deliberately ABSENT for agy: the model name's -high/-medium/-low
+    # suffix IS the effort and is the only valid surface. claude-*/gpt-* names
+    # reject --effort outright, so "model alone" is correct for every entry
+    # 'agy models' prints. (On v1.1.5, 2026-07-22, effort-alone was still
+    # accepted — the removal is a 1.1.13 behavior change, not a cleanup.)
+    # secret_allowlist: []  # Uncomment and list secrets this worker may access
     tunables:
       model:
         args: ["--model", "{value}"]
-        supersedes: [effort]
         values:
+          - gemini-3.7-flash-high
+          - gemini-3.7-flash-medium
+          - gemini-3.7-flash-low
           - gemini-3.6-flash-high
           - gemini-3.6-flash-medium
           - gemini-3.6-flash-low
@@ -139,11 +135,7 @@ workers:
           - claude-sonnet-4-6
           - claude-opus-4-6-thinking
           - gpt-oss-120b-medium
-        description: "Model for this CLI session; agy's reasoning effort is EMBEDDED in its gemini model names (-high/-medium/-low), and a base name with no suffix is rejected. Setting a model supersedes the effort knob. Run 'agy models' for the current list - from PowerShell/cmd, not Git Bash, where it hangs (verified 2026-07-22: 242s, rc=124, 0 bytes; NOT a TTY gate - it works with stdout redirected)."
-      effort:
-        args: ["--effort", "{value}"]
-        values: [low, medium, high]
-        description: "Reasoning effort when no model is set (agy's own default is low). Superseded once a model is set, because agy's model names carry the effort."
+        description: "Model for this CLI session; agy's reasoning effort is EMBEDDED in its gemini model names (-high/-medium/-low), and a base name with no suffix is rejected. There is deliberately NO effort knob (v1.1.13 rejects a bare --effort, AI-155). Run 'agy models' for the current list - from PowerShell/cmd, not Git Bash, where it hangs (verified 2026-07-22: 242s, rc=124, 0 bytes; NOT a TTY gate - it works with stdout redirected)."
 
 bg_tasks:
   alert_seconds: 300

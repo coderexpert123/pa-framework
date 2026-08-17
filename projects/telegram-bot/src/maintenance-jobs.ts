@@ -24,6 +24,7 @@ import {
   dlqFlushJob,
   groundingCheckJob,
 } from '../../../pa/dist/src/lib/maintenance/jobs/index.js';
+import { loadJobState, updateJobState } from '../../../pa/dist/src/lib/maintenance/state.js';
 
 export interface BotMaintenanceDeps {
   /** Telegram bot token — needed by dlq-flush and proxy-pool-refresh. */
@@ -53,6 +54,42 @@ export interface BotMaintenanceDeps {
  * timeout). It runs LAST so a stalled flush never delays the cheap jobs that
  * share the pass.
  */
+/**
+ * Watchdog for stuck maintenance jobs (P2-3 fix). Detects and clears in-flight markers
+ * that are older than 10x the job's everyMs interval, which indicates the job's
+ * runner process died or the promise never settled.
+ */
+export async function watchdogStaleJobs(jobs: MaintenanceJob[]): Promise<void> {
+  const MINUTES = 60 * 1000;
+  for (const job of jobs) {
+    try {
+      // Resolve everyMs (can be number or function)
+      const resolvedEveryMs = typeof job.everyMs === 'function' ? job.everyMs() : job.everyMs;
+      // Skip jobs without a defined cadence or those not eligible for watchdog
+      if (!resolvedEveryMs || resolvedEveryMs <= 0) continue;
+
+      const state = await loadJobState(job.name);
+      if (!state.inFlight) continue;
+
+      const elapsed = Date.now() - new Date(state.inFlightSince || '').getTime();
+      const maxAge = 10 * resolvedEveryMs;
+
+      if (elapsed > maxAge) {
+        logger.warn('maintenance-watchdog', `clearing stale in-flight marker for job ${job.name}`, {
+          jobName: job.name,
+          inFlightSince: state.inFlightSince,
+          elapsed,
+          maxAge,
+        });
+        await updateJobState(job.name, (prev) => ({ ...prev, inFlight: false, inFlightSince: null }));
+      }
+    } catch (err) {
+      // Watchdog failures must not crash the bot; log and continue
+      logger.warn('maintenance-watchdog', `watchdog check failed for job ${job.name}`, { error: String(err) });
+    }
+  }
+}
+
 export function createBotMaintenanceJobs(deps: BotMaintenanceDeps): MaintenanceJob[] {
   const boundBotLogRotationCheck: MaintenanceJob = {
     ...botLogRotationCheckJob,

@@ -3,6 +3,7 @@ import { randomBytes, randomUUID } from 'crypto';
 import { existsSync, unlinkSync, writeFileSync, mkdirSync } from 'fs';
 import { readdir, unlink, rename, writeFile, readFile, stat } from 'fs/promises';
 import { join } from 'path';
+import { homedir } from 'os';
 import { acquireLock, releaseLock } from './lock.js';
 import { getUpdates, sendMessage, sendMessageWithId, pinChatMessage, unpinChatMessage, sendTyping, setMessageReaction, downloadFile, editMessageText, createForumTopic, deleteMessage } from './telegram.js';
 import { loadState, saveState, loadTopicState, saveTopicState, addTurn, findHistoricalSessionTurns, findRecentTurnsByTopic, listTopicStateRefs } from './conversation.js';
@@ -91,8 +92,8 @@ import { addPendingDispatch, removePendingDispatch, pendingDispatchKey, listPend
 import { reapOrphanedDispatches } from './orphan-reaper.js';
 import { isTopicRecovering } from './recovery-gate.js';
 import { isDegraded, startHealthProbe } from './health.js';
-import { parseStopSteer, stopTopicWorkers, markTopicStopped, unmarkTopicStopped, isTopicStopped, consumeTopicStopped } from './worker-stop.js';
-import { registerQueuedUpdate, dequeueUpdate, drainQueuedText, type QueueEntry } from './topic-queue.js';
+import { parseStopSteer, stopTopicWorkers, markTopicStopped, isTopicStopped, consumeTopicStopped } from './worker-stop.js';
+import { registerQueuedUpdate, dequeueUpdate, drainQueuedEntries, addHeldEntry, absorbHeldEntries, type QueueEntry, type HeldItem } from './topic-queue.js';
 import { updateDashboard } from './dashboard.js';
 import type { ConversationState, SessionInfo, PAMeta, ModelStatusSnapshot, ModelStatusReasonCode } from './types.js';
 import { loadTopicNames, updateTopicName, setTopicDescription, extractTopicEvent, loadBranches, addBranch, removeBranch, findBranchParent, getTopicName, type TopicNameMap, type BranchIndex } from './topic-names.js';
@@ -113,7 +114,15 @@ import {
   extractAudioAttachment,
   findCachedAudio,
   type AudioAttachmentKind,
+  type VoiceResult,
 } from './voice.js';
+import {
+  startPrefetch,
+  lookupPrefetch,
+  userTextFromVoiceResult,
+  clearPrefetch,
+  type VoicePrefetchDescriptor,
+} from './voice-prefetch.js';
 import { resolveReplyContext } from './reply-context.js';
 
 // Import pa modules
@@ -130,7 +139,7 @@ import { resolvePythonCommand } from '../../../pa/dist/src/lib/python.js';
 import { paHome } from '../../../pa/dist/src/paths.js';
 import { runDueJobs } from '../../../pa/dist/src/lib/maintenance/runner.js';
 import { updateJobState } from '../../../pa/dist/src/lib/maintenance/state.js';
-import { createBotMaintenanceJobs } from './maintenance-jobs.js';
+import { createBotMaintenanceJobs, watchdogStaleJobs } from './maintenance-jobs.js';
 
 /** Topic keys created by /branch — signals forum_topic_created to skip description */
 const branchCreatedTopicKeys = new Set<string>();
@@ -150,6 +159,22 @@ const BOT_CWD = process.env.BOT_CWD || process.cwd();
 const CLAUDE_FAMILY_WORKERS = new Set(['claude', 'zclaude']);
 function workerSupportsSystemPrompt(workerName: string): boolean {
   return CLAUDE_FAMILY_WORKERS.has(workerName);
+}
+
+// agy native-resume trial (2026-08-16). Single-topic allowlist.
+// Topics here get native conversation resume instead of sessionless dispatch.
+// Promote to config file or fleet-wide after trial review.
+export const AGY_NATIVE_RESUME_TOPICS = new Set(['310']);
+
+// threadId from a `topic-<chatId>_<threadId>` blackboard resource. chatId may be
+// NEGATIVE (supergroups: -100...), so never parse it with \d+ — the obvious
+// /^topic-\d+_/ regex silently fails on this deployment's own supergroup
+// (orchestrator correction 2026-08-17, caught in spec review).
+export function threadIdFromResource(resource: string): string {
+  if (!resource.startsWith('topic-')) return '';
+  const parts = resource.replace(/^topic-/, '').split('_');
+  if (parts.length < 2) return ''; // malformed: no underscore, no threadId
+  return parts.pop() ?? '';
 }
 
 function effectiveCwd(state: ConversationState): string {
@@ -408,6 +433,10 @@ export { extractReplyContext } from './reply-context.js';
 
 const NOTIFY_DEBOUNCE_MS = 10_000;
 const notifyDebounce = new Map<string, number>();
+
+// Track consecutive spawn-failed failures per topic for pinned-worker hints.
+// Key: `${chatId}_${threadId}`, value: consecutive failure count.
+const topicSpawnFailureCount = new Map<string, number>();
 
 // ---------------------------------------------------------------------------
 // AI-029: Topic description suggestion helpers
@@ -686,6 +715,18 @@ export async function tryClassifyAndNotify(
   return { outcome: 'rate-limit', nextWorker };
 }
 
+/**
+ * Kill-drop rule for agy native-resume trial topics.
+ * Returns undefined (drop the session) if the session belongs to an agy
+ * worker on a trial topic and shouldDrop is true; otherwise returns the
+ * session unchanged.
+ */
+function maybeDropAgySession(session: SessionInfo | undefined, resource: string, shouldDrop: boolean): SessionInfo | undefined {
+  if (!shouldDrop || !session || session.worker !== 'agy') return session;
+  if (!AGY_NATIVE_RESUME_TOPICS.has(threadIdFromResource(resource))) return session;
+  return undefined;
+}
+
 export async function dispatchMessage(
   userText: string,
   replyContext: string | undefined,
@@ -776,7 +817,7 @@ export async function dispatchMessage(
     // AI-092: if the user /stop'd this topic while the (session) attempt above
     // was being killed, do NOT fail over to a fresh worker for a cancelled request.
     if (isCancelled()) {
-      return { response: '', session: state.session, meta: null, workerError: true };
+      return { response: '', session: maybeDropAgySession(state.session, resource, true), meta: null, workerError: true };
     }
     let freshResult: { result: CommandResult; worker: string } | undefined;
     if (state.preferred_worker && !failedWorkers.has(state.preferred_worker) && !(await isWorkerCoolingDown(state.preferred_worker))) {
@@ -797,7 +838,7 @@ export async function dispatchMessage(
 
     // The preferred attempt above may have been the one that got killed.
     if (!freshResult && isCancelled()) {
-      return { response: '', session: state.session, meta: null, workerError: true };
+      return { response: '', session: maybeDropAgySession(state.session, resource, true), meta: null, workerError: true };
     }
 
     if (!freshResult && defaultWorker && !failedWorkers.has(defaultWorker) && !(await isWorkerCoolingDown(defaultWorker))) {
@@ -818,7 +859,7 @@ export async function dispatchMessage(
 
     if (!freshResult) {
       if (isCancelled()) {
-        return { response: '', session: state.session, meta: null, workerError: true };
+        return { response: '', session: maybeDropAgySession(state.session, resource, true), meta: null, workerError: true };
       }
       const priorCtxFo = lastFailedSession ? { ...lastFailedSession, sessionPath: getPriorSessionPath(lastFailedSession.worker, lastFailedSession.sessionId, effectiveCwd(state)) } : undefined;
       const failoverPrompt = await buildPrompt(userText, state, topicNames, replyContext, pendingDesc, { omitStatic: false, priorContext: priorCtxFo });
@@ -833,26 +874,59 @@ export async function dispatchMessage(
       // finished before the kill landed, keep its real reply"). Bailing on a
       // successful result here would throw that answer away.
       if (!freshResult.result.success && isCancelled()) {
-        return { response: '', session: state.session, meta: null, workerError: true };
+        return { response: '', session: maybeDropAgySession(state.session, resource, true), meta: null, workerError: true };
       }
     }
 
     let newSession: SessionInfo | undefined;
     let sessionId: string | undefined;
-    if (freshResult.worker === 'claude' || freshResult.worker === 'zclaude' || freshResult.worker === 'codex') sessionId = freshResult.result.sessionId;
-    // agy is deliberately SESSIONLESS — do not reinstate discovery here (2026-07-22).
-    // agy emits plain text, so result.sessionId is never populated (worker-exec only
-    // captures it from stream-json events), which meant this always fell through to
-    // discoverAgySessionId(): "newest .db by mtime". But agy creates its .db at run
-    // START, so under the default concurrency cap of 3 — with agy now the default for
-    // 16 topics plus 5 scheduled skills — any agy run starting mid-dispatch wins the
-    // scan. The topic would then store a FOREIGN conversation id and the next message
-    // would run `agy --conversation <another topic's or a skill's>`, bleeding unrelated
-    // history into the reply. Continuity does not depend on this: context.ts injects
-    // the last 10 turns into every prompt, and topic stickiness lives in
-    // preferred_worker/topic_defaults, not in sessions. Cost of sessionless: the turns
-    // are re-sent as text instead of reusing agy's native context. That is cheap and
-    // correct; cross-topic contamination is neither.
+    if (freshResult.worker === 'claude' || freshResult.worker === 'zclaude' || freshResult.worker === 'codex') {
+      sessionId = freshResult.result.sessionId;
+    } else if (freshResult.worker === 'agy' && freshResult.result.success && freshResult.result.sessionId) {
+      // agy native-resume trial (2026-08-16): capture conversation_id for
+      // allowlisted topics only. worker-exec.ts extracts conversation_id from
+      // agy's stream-json init/result events when output_format=stream-json.
+      // Discovery-by-.db-mtime (discoverAgySessionId) stays DEAD — concurrent
+      // contamination risk is unchanged.
+      //
+      // Kill-drop rule: cancelled dispatches return early (the four
+      // maybeDropAgySession exits above), and the success gate here rejects
+      // non-zero exits — a failed agy run may still carry a conversation_id
+      // captured mid-stream, and resuming a conversation that died mid-run
+      // risks corrupt state. So a sessionId arriving here means the dispatch
+      // completed successfully. (Integrator fix 2026-08-17: the success gate
+      // is load-bearing; claude/zclaude/codex keep their pre-existing
+      // capture-without-success-gate behavior, unchanged on purpose.)
+      if (AGY_NATIVE_RESUME_TOPICS.has(threadIdFromResource(resource))) {
+        // Session-validity check (2026-08-17): verify the session file exists
+        // before capturing agy native-resume sessionId. If the .pb/.db file is
+        // missing (e.g. external deletion or agy's own GC), skip capture and fall
+        // through to sessionless. This prevents resuming a non-existent conversation
+        // which would fail on the next dispatch with "conversation not found" errors.
+        const agySessionId = freshResult.result.sessionId;
+        const agyDir = join(homedir(), '.gemini', 'antigravity-cli', 'conversations');
+        let sessionFileExists = false;
+        try {
+          await stat(join(agyDir, `${agySessionId}.pb`));
+          sessionFileExists = true;
+        } catch {
+          try {
+            await stat(join(agyDir, `${agySessionId}.db`));
+            sessionFileExists = true;
+          } catch {
+            // Neither file exists
+          }
+        }
+        if (sessionFileExists) {
+          sessionId = agySessionId;
+        } else {
+          logger.warn('dispatch', 'agy native-resume: session file missing, dropping session', {
+            sessionId: agySessionId,
+            threadId: threadIdFromResource(resource),
+          });
+        }
+      }
+    }
     if (sessionId) newSession = { session_id: sessionId, worker: freshResult.worker, started_at: new Date().toISOString() };
     dispatchResult = { ...freshResult, session: newSession };
   }
@@ -995,32 +1069,48 @@ async function processUpdate(
     let voiceTranscribed = false;
 
     const audioAttachment = extractAudioAttachment(msg);
-    if (audioAttachment) {
-      const vr = await transcribeVoiceMessage(token, chatId, audioAttachment.media, {
-        repoRoot: BOT_CWD,
-        env: runtimeEnv,
-        transcription: config.transcription,
-        threadId,
-      }, audioAttachment.kind);
+    // A5: __skipVoice for command-captioned media — skip transcription entirely.
+    // The normalizer set this when enqueue saw a caption starting with '/'.
+    if ((update as any).__skipVoice) {
+      // Leave userText as-is (caption or text). No transcription.
+      // Fall through to command parsing with the original caption.
+    } else if (audioAttachment) {
+      // A5/D2: Consume prefetched result if present; otherwise transcribe inline.
+      let vr: VoiceResult;
+      const prefetched = (update as any).__voiceResult as VoiceResult | undefined;
+      if (prefetched) {
+        vr = prefetched;
+      } else {
+        vr = await transcribeVoiceMessage(token, chatId, audioAttachment.media, {
+          repoRoot: BOT_CWD,
+          env: runtimeEnv,
+          transcription: config.transcription,
+          threadId,
+        }, audioAttachment.kind);
+      }
       const forwardedFrom = describeForwardOrigin(msg);
       if (!vr.ok) {
-        // Archived (not discarded) — hardened plan WP6 item 4: falls through
-        // the SAME addTurn/saveTopicState/delivered-store/DLQ chain as any
-        // other skip-worker command below, instead of the old ad-hoc
-        // sendMessage+return that left zero trace beyond an orphaned .oga.
-        userText = formatFailedTranscriptUserText(audioAttachment.kind, vr.reason, { caption: msg.caption });
+        // D2: If normalizer already combined held entries + transcript, don't overwrite.
+        if (!(update as any).__heldAbsorbed) {
+          userText = formatFailedTranscriptUserText(audioAttachment.kind, vr.reason, { caption: msg.caption });
+        }
         response = voiceErrorMessage(vr);
         skipWorker = true;
       } else {
-        userText = formatTranscriptUserText(vr.text, {
-          truncated: vr.truncated,
-          caption: msg.caption,
-          kind: audioAttachment.kind,
-          fileName: audioAttachment.media.file_name,
-          speakers: vr.speakers,
-          forwardedFrom,
-        });
-        voiceTranscribed = true;
+        // D2: If normalizer already set userText (held + transcript), don't overwrite.
+        if ((update as any).__heldAbsorbed) {
+          voiceTranscribed = true;
+        } else {
+          userText = formatTranscriptUserText(vr.text, {
+            truncated: vr.truncated,
+            caption: msg.caption,
+            kind: audioAttachment.kind,
+            fileName: audioAttachment.media.file_name,
+            speakers: vr.speakers,
+            forwardedFrom,
+          });
+          voiceTranscribed = true;
+        }
       }
     } else if (msg.document?.mime_type && /^(audio|video)\//.test(msg.document.mime_type)) {
       // Audio/video uploaded as a generic document — deliberately not routed
@@ -1322,6 +1412,8 @@ async function processUpdate(
     }
 
     let pendingKey: string | undefined;
+    // AI-151: track the actual worker that handled this dispatch for accurate archival
+    let assistantWorker: string = 'local';
     if (!skipWorker) {
       // AI-095: persist the in-flight dispatch so a crash mid-dispatch leaves a
       // recoverable record for the startup orphan reaper instead of a silent void.
@@ -1352,6 +1444,8 @@ async function processUpdate(
         const dr = await dispatchMessage(userText, replyContext, topicState.pending_action?.description, topicState, secrets, resourceId, effectiveDefault, topicNames, onNotify, update.update_id, contextId);
         response = dr.response; topicState.session = dr.session;
         workerErrored = !!dr.workerError;
+        // AI-151: capture the actual worker that handled this dispatch
+        assistantWorker = dr.dispatchedWorker || topicState.session?.worker || topicState.preferred_worker || effectiveDefault;
         const { response: processedResponse, skillToRun, restartBot: metaRestartBot, kbNote } = applyMetaActions(response, dr.meta, topicState);
         response = processedResponse; restartBot = metaRestartBot;
         if (skillToRun) {
@@ -1367,15 +1461,39 @@ async function processUpdate(
         logger.warn('dispatch', `dispatchMessage error: ${(dispatchErr as Error).message}`);
         response = '⚠️ Service temporarily unavailable.';
         workerErrored = true;
+
+        // Pinned-worker failure hint (2026-08-17 zclaude incident): when the
+        // effective worker is a pinned/explicit choice (preferred_worker or
+        // topic_default) and this is a consecutive spawn-failed class error,
+        // append a hint about switching workers. Rate-limited to after 2+
+        // consecutive spawn failures for the same topic.
+        const topicKey = `${chatId}_${threadId}`;
+        const isPinnedWorker = !!topicState.preferred_worker || (!!effectiveDefault && effectiveDefault !== getEffectiveDefaultWorker(config, topicKey));
+        // Detect spawn-failed class: timeout, ENOENT, or "not found" in error
+        const errMsg = String((dispatchErr as Error).message).toLowerCase();
+        const isSpawnFailed = errMsg.includes('timeout') || errMsg.includes('enoent') || errMsg.includes('not found') || errMsg.includes('spawn') || errMsg.includes('timed out');
+        if (isPinnedWorker && isSpawnFailed) {
+          const count = (topicSpawnFailureCount.get(topicKey) ?? 0) + 1;
+          topicSpawnFailureCount.set(topicKey, count);
+          if (count >= 2) {
+            const pinnedName = topicState.preferred_worker || effectiveDefault;
+            response += `\n\n💡 Pinned worker ${pinnedName} is failing — /model <alt> to switch or /default to reset.`;
+            topicSpawnFailureCount.set(topicKey, 0); // reset after showing hint
+          }
+        }
       } finally { clearInterval(typingInterval); }
 
       // AI-092: a /stop or /steer killed this dispatch's worker. Swap the
-      // resulting error for a clean confirmation (stop) or silence (steer —
+      // the resulting error for a clean confirmation (stop) or silence (steer —
       // the steer prompt's own dispatch is queued right behind this one). If
       // the worker actually finished before the kill landed, keep its real
       // reply — the marker is consumed either way so it can't leak forward.
       const stoppedKind = consumeTopicStopped(topicKey, update.update_id);
       if (stoppedKind && workerErrored) {
+        // A6: in-flight flush — when a stop/steer cancels a dispatch that
+        // already started (locked topic, but never reached dispatchMessage),
+        // the message's text becomes held context for the next dispatch.
+        addHeldEntry(topicKey, userText);
         response = stoppedKind === 'stop' ? '⏹ Stopped.' : '';
       }
     }
@@ -1397,7 +1515,8 @@ async function processUpdate(
         const delivered = await sendMessage(token, chatId, textToSend, messageId, threadId);
         if (delivered) {
           if (dedupOn) await markDelivered(idemKey);
-          addTurn(topicState, { role: 'assistant', text: response.trim(), timestamp: new Date().toISOString(), worker: 'worker', refId });
+          // AI-151: use the actual worker name, not hardcoded 'worker'
+          addTurn(topicState, { role: 'assistant', text: response.trim(), timestamp: new Date().toISOString(), worker: assistantWorker, refId });
         } else {
           await appendDlq({ chatId, threadId, replyToMessageId: messageId, text: textToSend, timestamp: new Date().toISOString(), updateId: update.update_id, refId });
         }
@@ -1450,6 +1569,15 @@ export async function runPollLoop(
   // disk. Changing config.maintenance for a bot job needs a bot restart.
   let maintenanceOverrides: Record<string, { enabled?: boolean; everyMs?: number }> | undefined;
   try { maintenanceOverrides = (await loadConfig()).maintenance; } catch {}
+  // A4: Hoist transcription config for prefetch use in /stop, /steer, and enqueue.
+  // Stale until bot restart is acceptable (same as maintenance overrides).
+  let loopTranscriptionCfg: any = undefined;
+  try { loopTranscriptionCfg = (await loadConfig()).transcription; } catch {}
+  // Prefetch deps env: process.env PLUS secrets — the cloud transcription
+  // API keys (GROQ_API_KEY etc.) live in secrets, and process.env alone
+  // would silently strand prefetch on the local engine. Mirrors
+  // processUpdate's runtimeEnv construction.
+  const loopRuntimeEnv: NodeJS.ProcessEnv = { ...process.env, ...secrets };
   // Cold-start seeding (AI-100 Wave 2): dlq-flush, delivered-store-compact and
   // proxy-pool-refresh mirror the OLD setInterval-based timers, none of which
   // fired on their very first tick (setInterval always waits one full interval
@@ -1490,6 +1618,9 @@ export async function runPollLoop(
   const MAINTENANCE_KICK_INTERVAL_MS = 20_000;
   let maintenanceKickDueAt = 0; // due on the very first iteration
   const activeMaintenancePasses = new Set<Promise<unknown>>();
+  // Watchdog runs less frequently (every 5 minutes) to clear stale in-flight markers.
+  const WATCHDOG_INTERVAL_MS = 5 * 60 * 1000;
+  let watchdogDueAt = Date.now() + WATCHDOG_INTERVAL_MS;
 
   while (!signal.aborted) {
     if (sentinelPath && existsSync(sentinelPath)) break;
@@ -1508,6 +1639,13 @@ export async function runPollLoop(
       activeMaintenancePasses.add(pass);
     }
 
+    // Watchdog for stuck maintenance jobs (P2-3 fix). Runs independently to
+    // clear stale in-flight markers that would otherwise block jobs forever.
+    if (Date.now() >= watchdogDueAt) {
+      watchdogDueAt = Date.now() + WATCHDOG_INTERVAL_MS;
+      watchdogStaleJobs(botJobs).catch((err) => logger.warn('maintenance', `watchdog failed: ${(err as Error).message}`));
+    }
+
     try {
       const timeout = inFlight.size > 0 ? 0 : LONG_POLL_TIMEOUT;
       const updates = await getUpdates(token, computePollOffset(pollOffset), timeout, signal);
@@ -1515,6 +1653,9 @@ export async function runPollLoop(
       if (updates.length > 0) {
         pollOffset = updates[updates.length - 1].update_id;
         state.last_update_id = pollOffset;
+        // Side-map for steer context attachment in the enqueue block. Cleared each
+        // batch to avoid cross-batch contamination.
+        const steerContextsByUpdateId = new Map<number, { drainedEntries: QueueEntry[]; steerPrompt: string; steerVoice?: { promise: Promise<VoiceResult>; descriptor: VoicePrefetchDescriptor } }>();
         for (const update of updates) {
           // AI-092: /stop and /steer act on the topic's RUNNING worker, so they
           // must bypass per-topic serialization (queuing behind the in-flight
@@ -1522,7 +1663,7 @@ export async function runPollLoop(
           // the normal chain as a plain message carrying the steer prompt.
           const stopMsg = update.message;
           const stopReq = stopMsg && allowedChatIds.has(stopMsg.chat?.id)
-            ? parseStopSteer((stopMsg.text ?? '').trim())
+            ? parseStopSteer((stopMsg.text ?? stopMsg.caption ?? '').trim(), !!extractAudioAttachment(stopMsg))
             : null;
           // Computed once, up front, and reused for the stop/steer marker key,
           // the topic-queue key, and the topicPending key below — all three
@@ -1539,34 +1680,132 @@ export async function runPollLoop(
             void (async () => {
               // Mark BEFORE killing: a fast-dying worker's error path could
               // otherwise race past the consume check before the marker exists.
-              markTopicStopped(`${sChatId}_${sThreadId}`, stopReq.kind, sUpdateId);
+              const sTopicKey = `${sChatId}_${sThreadId}`;
+              markTopicStopped(sTopicKey, stopReq.kind, sUpdateId);
               const killed = await stopTopicWorkers(sChatId, sThreadId);
-              if (killed === 0) unmarkTopicStopped(`${sChatId}_${sThreadId}`);
+              // A9: the IIFE resumes at the loop's next await (addPendingDispatch),
+              // which is AFTER the steer's own entry has been registered — a drain
+              // here would cancel the steer's own entry (observed: 0 dispatches).
+              // /steer drains synchronously in its own handler below; only /stop
+              // drains here, inside the stop-only block.
+              let heldCount = 0;
+              let drained: QueueEntry[] = [];
+              // A10: /stop reply's held count includes the stop message's own audio (+1 when present).
+              const stopAudio = extractAudioAttachment(stopMsg);
+              if (stopAudio) {
+                heldCount += 1;
+              }
               if (stopReq.kind === 'stop') {
-                const text = killed > 0
-                  ? '⏹ Stopping the running worker…'
-                  : 'Nothing is running in this topic.';
-                await sendMessage(token, sChatId, appendRefIdAndLog(text, { kind: 'system', chatId: sChatId, threadId: sThreadId }), sMessageId, sThreadId);
+                // A1: Drain ONCE — reuse the result for both counting and held-entry processing.
+                drained = drainQueuedEntries(sTopicKey);
+                heldCount += drained.filter(e => !e.isCommand).length;
+              }
+              // A2: Reply IMMEDIATELY with truthful counts (heldCount is synchronous).
+              if (stopReq.kind === 'stop') {
+                let reply: string;
+                if (killed > 0 && heldCount > 0) {
+                  reply = `⏹ Stopped the running worker and held ${heldCount} queued message(s).`;
+                } else if (killed > 0) {
+                  reply = '⏹ Stopping…';
+                } else if (heldCount > 0) {
+                  reply = `⏹ Held ${heldCount} queued message(s).`;
+                } else {
+                  reply = 'Nothing is running in this topic.';
+                }
+                await sendMessage(token, sChatId, appendRefIdAndLog(reply, { kind: 'system', chatId: sChatId, threadId: sThreadId }), sMessageId, sThreadId);
               } else if (killed === 0) {
                 // Steer with nothing running: the prompt below dispatches normally.
                 await sendMessage(token, sChatId, appendRefIdAndLog('Nothing was running — dispatching your prompt as a new message.', { kind: 'system', chatId: sChatId, threadId: sThreadId }), sMessageId, sThreadId);
               }
+              // A9: drain-to-held and E5 own-audio blocks run ONLY for /stop, not /steer.
+              // For /steer, these cause double-prefetch and race with the sync drain.
+              if (stopReq.kind === 'stop') {
+                // A2: Move drained non-command entries to held. Voice entries: await their
+                // already-started prefetch promises and add formatted transcripts to held.
+                // Text entries: add directly as strings. This runs in the background after
+                // the reply, so slow transcriptions don't block the acknowledgment.
+                for (const entry of drained) {
+                  if (entry.isCommand) continue;
+                  if (entry.voice) {
+                    // Prefetch already started at enqueue time. Await it here and add to held.
+                    try {
+                      const vr = await entry.voice.promise;
+                      const formatted = userTextFromVoiceResult(vr, entry.voice.descriptor);
+                      addHeldEntry(sTopicKey, formatted);
+                    } catch {
+                      // If promise rejects (shouldn't happen per WP1 contract), add placeholder.
+                      addHeldEntry(sTopicKey, entry.text);
+                    }
+                  } else {
+                    addHeldEntry(sTopicKey, entry.text);
+                  }
+                }
+                // E5: /stop message itself is a voice note — start prefetch and add to held.
+                if (stopAudio) {
+                  const stopDescriptor: VoicePrefetchDescriptor = {
+                    kind: stopAudio.kind,
+                    caption: stopMsg.caption,
+                    forwardedFrom: describeForwardOrigin(stopMsg),
+                    messageDate: new Date(stopMsg.date * 1000).toISOString(),
+                  };
+                  // A4: Use hoisted transcription config from poll loop.
+                  const deps = { repoRoot: BOT_CWD, env: loopRuntimeEnv, transcription: loopTranscriptionCfg, threadId: sThreadId };
+                  startPrefetch(sTopicKey, sUpdateId, token, sChatId, stopAudio.media, deps, stopAudio.kind, stopDescriptor);
+                  const stopPrefetch = lookupPrefetch(sTopicKey, sUpdateId);
+                  if (stopPrefetch) {
+                    stopPrefetch.then((vr) => {
+                      const formatted = userTextFromVoiceResult(vr, stopDescriptor);
+                      addHeldEntry(sTopicKey, formatted);
+                    }).catch(() => {
+                      // Add failure placeholder on reject.
+                      addHeldEntry(sTopicKey, userTextFromVoiceResult({ ok: false, reason: 'transcribe-failed', message: 'Promise rejected' }, stopDescriptor));
+                    });
+                  }
+                }
+              }
             })().catch((err) => logger.warn('worker-stop', `stop/steer failed: ${(err as Error).message}`));
             if (stopReq.kind === 'stop') continue; // fully handled out-of-band
-            // Fold every not-yet-started update still queued behind the one
-            // just killed into the steer prompt (shell-flush-on-Ctrl+C
-            // semantics), in arrival order, steer prompt last — instead of
-            // letting them run independently once the kill settles, or
-            // dispatching the steer prompt only after they've all finished.
-            // Deliberately synchronous (does NOT await the kill IIFE above):
-            // drainQueuedText acts on the in-memory topic-queue, not the
-            // OS-process/PID registry the kill touches, so there's nothing to
-            // race — and awaiting it here would serialize this whole batch's
-            // remaining updates behind the kill's PID-list read.
-            const queuedTexts = drainQueuedText(topicKey);
-            stopMsg.text = queuedTexts.length > 0
-              ? [...queuedTexts, stopReq.prompt!].join('\n\n')
-              : stopReq.prompt!;                 // steer → normal chain with the prompt
+            // /steer handler: drain queued entries and store steerContext for
+            // materialization in the normalizer. Held entries are absorbed at
+            // normalizer time (A7), not iteration time.
+            const drainedEntries = drainQueuedEntries(topicKey);
+            // E6/E7: /steer message itself has audio — start prefetch.
+            const steerAudio = extractAudioAttachment(stopMsg);
+            let steerVoice: { promise: Promise<VoiceResult>; descriptor: VoicePrefetchDescriptor } | undefined = undefined;
+            if (steerAudio) {
+              const steerDescriptor: VoicePrefetchDescriptor = {
+                kind: steerAudio.kind,
+                caption: stopMsg.caption,
+                forwardedFrom: describeForwardOrigin(stopMsg),
+                messageDate: new Date(stopMsg.date * 1000).toISOString(),
+              };
+              // A4: Use hoisted transcription config from poll loop.
+              const deps = { repoRoot: BOT_CWD, env: loopRuntimeEnv, transcription: loopTranscriptionCfg, threadId: sThreadId };
+              startPrefetch(topicKey, sUpdateId, token, sChatId, steerAudio.media, deps, steerAudio.kind, steerDescriptor);
+              const prefetch = lookupPrefetch(topicKey, sUpdateId);
+              if (prefetch) {
+                steerVoice = { promise: prefetch, descriptor: steerDescriptor };
+              }
+            }
+            // Store steerContext on the queue entry. The enqueue block below will
+            // attach it after registerQueuedUpdate returns.
+            const steerContext = { drainedEntries, steerPrompt: stopReq.prompt! };
+            // For text-only steer (no audio anywhere), use the old combined-text path.
+            // For voice steer (drainedEntries has voice OR steerVoice is set), store
+            // steerContext and set just the prompt.
+            const hasVoiceInDrain = drainedEntries.some(e => e.voice !== undefined);
+            const hasVoice = hasVoiceInDrain || steerVoice !== undefined;
+            if (!hasVoice) {
+              // Text-only steer: combine drained texts + prompt immediately.
+              const drainedTexts = drainedEntries.map(e => e.text).filter(t => t !== '');
+              stopMsg.text = [...drainedTexts, stopReq.prompt!].join('\n\n');
+            } else {
+              // Voice steer: store steerContext and set just the prompt. The normalizer
+              // will materialize the full prompt with transcripts (including held entries).
+              stopMsg.text = stopReq.prompt!;
+            }
+            // Store in the side map for the enqueue block to attach.
+            steerContextsByUpdateId.set(update.update_id, { ...steerContext, steerVoice });
           }
           // AI-095 follow-up (deep-recheck 2026-07-08, Phase 1A): persist a
           // minimal placeholder record for this update BEFORE it's chained
@@ -1586,11 +1825,39 @@ export async function runPollLoop(
             const eThreadId = m.message_thread_id ?? 0;
             const userText = placeholderDispatchText(m);
             enqKey = pendingDispatchKey(eChatId, eThreadId, update.update_id);
+            // E8/A5: Compute isCommandOverride from caption for voice/audio/video notes.
+            // Command-captioned media skips transcription entirely.
+            const hasAudio = !!(m.voice || m.audio || m.video_note);
+            let isCommandOverride: boolean | undefined = undefined;
+            let skipVoice = false;
+            if (hasAudio && m.caption) {
+              const captionTrimmed = (m.caption ?? '').trim();
+              if (/^\//.test(captionTrimmed)) {
+                isCommandOverride = true;
+                skipVoice = true; // A5: __skipVoice for command-captioned media
+              }
+            }
+            // A4: Start prefetch for non-command audio-bearing messages.
+            // transcription config is hoisted at poll loop level. DEFERRED to
+            // after the enqueue-time placeholder write below: the AI-095
+            // invariant tests gate on the first /getFile (the prefetch's
+            // download) and must observe the placeholder already persisted —
+            // trace-before-spawned-work is also the crash-window-safe order.
+            let voiceField: { promise: Promise<VoiceResult>; descriptor: VoicePrefetchDescriptor } | undefined = undefined;
+            // A5: Store __skipVoice on update for processUpdate to check.
+            if (skipVoice) {
+              (update as any).__skipVoice = true;
+            }
             // Registered BEFORE addPendingDispatch/chaining so a /steer arriving
             // later in this same batch (processed further down this same loop)
             // can already see this update as "queued" and fold it in — see
             // topic-queue.ts.
-            queueEntry = registerQueuedUpdate(topicKey, update.update_id, userText);
+            queueEntry = registerQueuedUpdate(topicKey, update.update_id, userText, isCommandOverride);
+            // Attach steerContext from the side map if present.
+            const steerCtx = steerContextsByUpdateId.get(update.update_id);
+            if (steerCtx) {
+              queueEntry.steerContext = steerCtx;
+            }
             await addPendingDispatch({
               updateId: update.update_id,
               chatId: eChatId,
@@ -1605,16 +1872,128 @@ export async function runPollLoop(
               // only record, the reaper sends a death notice quoting the
               // user's own raw text back to them.
             }).catch((err) => logger.warn('dispatch', 'failed to persist enqueue-time placeholder', { error: String(err) }));
+            // A4 (post-placeholder): start the prefetch and attach the voice
+            // field. env must include SECRETS (cloud API keys live there) —
+            // process.env alone would silently strand prefetch on the local
+            // engine (loopRuntimeEnv is built once at poll-loop start).
+            if (hasAudio && !skipVoice) {
+              const media = extractAudioAttachment(m);
+              if (media) {
+                const descriptor: VoicePrefetchDescriptor = {
+                  kind: media.kind,
+                  caption: m.caption,
+                  forwardedFrom: describeForwardOrigin(m),
+                  messageDate: new Date(m.date * 1000).toISOString(),
+                };
+                const deps = { repoRoot: BOT_CWD, env: loopRuntimeEnv, transcription: loopTranscriptionCfg, threadId: eThreadId };
+                startPrefetch(topicKey, update.update_id, token, eChatId, media.media, deps, media.kind, descriptor);
+                const prefetch = lookupPrefetch(topicKey, update.update_id);
+                if (prefetch) {
+                  voiceField = { promise: prefetch, descriptor };
+                }
+                if (voiceField) {
+                  queueEntry.voice = voiceField;
+                }
+              }
+            }
           }
           const prev = topicPending.get(topicKey) ?? Promise.resolve();
           const p: Promise<void> = prev
-            .then(() => {
-              // "No longer just queued, now starting" — must run BEFORE the
-              // cancelled check so a stale entry never lingers in the topic
-              // queue past this update's own dispatch turn.
+            .then(async () => {
+              // Cancelled-entry cleanup.
               if (queueEntry) {
                 dequeueUpdate(topicKey, queueEntry);
-                if (queueEntry.cancelled) return; // folded into an earlier /steer — do not dispatch on its own
+                if (queueEntry.cancelled) {
+                  if (queueEntry.voice) clearPrefetch(topicKey, queueEntry.updateId);
+                  return;
+                }
+              }
+              // --- Voice prefetch await (step C.1) ---
+              if (queueEntry?.voice) {
+                try {
+                  const vr = await queueEntry.voice.promise;
+                  (update as any).__voiceResult = vr;
+                } catch {
+                  // Should never happen (startPrefetch catches), but defensive.
+                }
+              }
+              // --- Steer fold materialization (D1, A2, A3, A7) ---
+              if (queueEntry?.steerContext) {
+                const ctx = queueEntry.steerContext;
+                const texts: string[] = [];
+                // A7: Absorb held entries at normalizer time (not iteration time).
+                // These are the OLDEST context — prepend first.
+                const heldTexts = await absorbHeldEntries(topicKey);
+                texts.push(...heldTexts);
+                // Drained entries in arrival order.
+                for (const entry of ctx.drainedEntries) {
+                  if (entry.voice) {
+                    try {
+                      const vr = await entry.voice.promise;
+                      texts.push(userTextFromVoiceResult(vr, entry.voice.descriptor));
+                    } catch {
+                      texts.push(entry.text); // fallback to placeholder
+                    }
+                  } else {
+                    texts.push(entry.text);
+                  }
+                }
+                // Own transcript (steer message itself was media — E6/E7).
+                let ownTranscript: string | undefined = undefined;
+                if (queueEntry.voice) {
+                  const vr = (update as any).__voiceResult as VoiceResult | undefined;
+                  if (vr) ownTranscript = userTextFromVoiceResult(vr, queueEntry.voice.descriptor);
+                }
+                // A3: E7 — when steerPrompt is undefined (bare /steer on voice),
+                // the own transcript IS the prompt. Push last without duplication.
+                if (ctx.steerPrompt !== undefined) {
+                  texts.push(ctx.steerPrompt);
+                } else if (ownTranscript !== undefined) {
+                  texts.push(ownTranscript);
+                } else {
+                  // Degraded case: no prompt and no own transcript. Push empty last.
+                  texts.push('');
+                }
+                // If ownTranscript exists and steerPrompt is defined, push it before the prompt.
+                if (ownTranscript !== undefined && ctx.steerPrompt !== undefined) {
+                  texts.splice(-1, 0, ownTranscript);
+                }
+                (update as any).message = { ...update.message, text: texts.join('\n\n') };
+              }
+              // --- Flush-check (step C.2, A8) ---
+              if (isTopicStopped(topicKey, update.update_id)) {
+                const vr = (update as any).__voiceResult as VoiceResult | undefined;
+                const desc = queueEntry?.voice?.descriptor;
+                if (!queueEntry?.isCommand) {
+                  const text = vr && desc
+                    ? userTextFromVoiceResult(vr, desc)
+                    : queueEntry?.text ?? placeholderDispatchText(update.message);
+                  addHeldEntry(topicKey, text);
+                  if (queueEntry?.voice) clearPrefetch(topicKey, queueEntry.updateId);
+                  return; // Do NOT run processUpdate
+                }
+                // A8: Commands never hold and always proceed to processUpdate.
+                // Still clean up prefetch if any.
+                if (queueEntry?.voice) clearPrefetch(topicKey, queueEntry.updateId);
+              }
+              // --- Held absorb (step C.3, A2) ---
+              if (!queueEntry?.isCommand) {
+                const held = await absorbHeldEntries(topicKey);
+                if (held.length > 0) {
+                  let ownText: string;
+                  const vr = (update as any).__voiceResult as VoiceResult | undefined;
+                  if (vr && queueEntry?.voice?.descriptor) {
+                    ownText = userTextFromVoiceResult(vr, queueEntry.voice.descriptor);
+                    (update as any).__heldAbsorbed = true; // D2
+                  } else if (update.message) {
+                    ownText = (update.message.text || update.message.caption || '').trim();
+                  } else {
+                    ownText = '';
+                  }
+                  if (update.message) {
+                    update.message = { ...update.message, text: [...held, ownText].join('\n\n') };
+                  }
+                }
               }
               return processUpdate(update, token, allowedChatIds, secrets, topicNames, branchIndex);
             })

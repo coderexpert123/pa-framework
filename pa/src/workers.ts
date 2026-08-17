@@ -82,13 +82,53 @@ export async function getAvailableWorkers(): Promise<Array<WorkerConfig & { avai
   return results;
 }
 
+/**
+ * Filter secrets for a worker based on its secret_allowlist.
+ *
+ * If the worker has no secret_allowlist, return all secrets unchanged (backward compatible).
+ * If the worker has a secret_allowlist, return only the named secrets that exist.
+ * Warn about any names in the allowlist that don't exist in secrets.env.
+ */
+export function filterSecretsForWorker(
+  allSecrets: Record<string, string>,
+  worker: WorkerConfig
+): Record<string, string> {
+  // No allowlist = receive all secrets (current behavior, backward compatible)
+  if (!worker.secret_allowlist || worker.secret_allowlist.length === 0) {
+    return allSecrets;
+  }
+
+  const filtered: Record<string, string> = {};
+  const missing: string[] = [];
+
+  for (const name of worker.secret_allowlist) {
+    if (allSecrets[name] !== undefined) {
+      filtered[name] = allSecrets[name];
+    } else {
+      missing.push(name);
+    }
+  }
+
+  // Fail-soft on unknown names: warn but continue with the subset that exists
+  if (missing.length > 0) {
+    const missingStr = missing.join(', ');
+    console.warn(`[workers] Worker '${worker.name}' secret_allowlist references missing secrets: ${missingStr}. These will be omitted.`);
+    logger.warn('workers', 'secret_allowlist missing secrets', { worker: worker.name, missing });
+  }
+
+  return filtered;
+}
+
 export async function runWithFailover(
   prompt: string,
   options: RunOptions
 ): Promise<{ result: CommandResult; worker: string }> {
   const { executeWorker } = await import('./worker-exec.js');
   const config = await loadConfig();
-  const secrets = options.env || await loadSecrets();
+  const allSecrets = options.env || await loadSecrets();
+
+  // Use injected notifyUser if available (for testing), otherwise use default
+  const notify = options._bgTaskHooks?.notifyUser || notifyUser;
 
   // Reorder workers: preferred first, then rest in priority order
   const workers = options.preferredWorker
@@ -175,14 +215,14 @@ export async function runWithFailover(
     }
 
     // 2. Check script availability
-    const available = (await checkWorker(worker, secrets)) && (options.checkAvailable ? await options.checkAvailable(worker) : true);
+    const available = (await checkWorker(worker, allSecrets)) && (options.checkAvailable ? await options.checkAvailable(worker) : true);
     if (!available) {
       logger.info('workers', `skip: ${worker.name} — not available`, ctx);
       if (options.onWorkerSwitch) {
         let nextWorker: WorkerConfig | undefined;
         for (let j = i + 1; j < workers.length; j++) {
           const w = workers[j];
-          if (!(await isWorkerCoolingDown(w.name)) && (await checkWorker(w, secrets)) && (options.checkAvailable ? await options.checkAvailable(w) : true)) {
+          if (!(await isWorkerCoolingDown(w.name)) && (await checkWorker(w, allSecrets)) && (options.checkAvailable ? await options.checkAvailable(w) : true)) {
             nextWorker = w;
             break;
           }
@@ -203,8 +243,12 @@ export async function runWithFailover(
     attemptedWorkers.push(worker.name);
     anyAttempted = true;
 
+    // Filter secrets for this worker based on its secret_allowlist (defense-in-depth)
+    const workerSecrets = filterSecretsForWorker(allSecrets, worker);
+
     const result = await executeWorker(worker, prompt, {
       ...options,
+      env: workerSecrets,
       agentName: worker.name,
       bgTasksConfig: options.bgTasksConfig ?? config.bg_tasks,
     });
@@ -243,7 +287,7 @@ export async function runWithFailover(
           let nextWorker: WorkerConfig | undefined;
           for (let j = i + 1; j < workers.length; j++) {
             const w = workers[j];
-            if (!(await isWorkerCoolingDown(w.name)) && (await checkWorker(w, secrets)) && (options.checkAvailable ? await options.checkAvailable(w) : true)) {
+            if (!(await isWorkerCoolingDown(w.name)) && (await checkWorker(w, allSecrets)) && (options.checkAvailable ? await options.checkAvailable(w) : true)) {
               nextWorker = w;
               break;
             }
@@ -278,7 +322,7 @@ export async function runWithFailover(
         let nextWorker: WorkerConfig | undefined;
         for (let j = i + 1; j < workers.length; j++) {
           const w = workers[j];
-          if (!(await isWorkerCoolingDown(w.name)) && (await checkWorker(w, secrets)) && (options.checkAvailable ? await options.checkAvailable(w) : true)) {
+          if (!(await isWorkerCoolingDown(w.name)) && (await checkWorker(w, allSecrets)) && (options.checkAvailable ? await options.checkAvailable(w) : true)) {
             nextWorker = w;
             break;
           }
@@ -320,7 +364,7 @@ export async function runWithFailover(
           let nextWorker: WorkerConfig | undefined;
           for (let j = i + 1; j < workers.length; j++) {
             const w = workers[j];
-            if (!(await isWorkerCoolingDown(w.name)) && (await checkWorker(w, secrets)) && (options.checkAvailable ? await options.checkAvailable(w) : true)) {
+            if (!(await isWorkerCoolingDown(w.name)) && (await checkWorker(w, allSecrets)) && (options.checkAvailable ? await options.checkAvailable(w) : true)) {
               nextWorker = w;
               break;
             }
@@ -354,7 +398,7 @@ export async function runWithFailover(
         let nextWorker: WorkerConfig | undefined;
         for (let j = i + 1; j < workers.length; j++) {
           const w = workers[j];
-          if (!(await isWorkerCoolingDown(w.name)) && (await checkWorker(w, secrets)) && (options.checkAvailable ? await options.checkAvailable(w) : true)) {
+          if (!(await isWorkerCoolingDown(w.name)) && (await checkWorker(w, allSecrets)) && (options.checkAvailable ? await options.checkAvailable(w) : true)) {
             nextWorker = w;
             break;
           }
@@ -382,7 +426,7 @@ export async function runWithFailover(
       let nextWorker: WorkerConfig | undefined;
       for (let j = i + 1; j < workers.length; j++) {
         const w = workers[j];
-        if (!(await isWorkerCoolingDown(w.name)) && (await checkWorker(w, secrets)) && (options.checkAvailable ? await options.checkAvailable(w) : true)) {
+        if (!(await isWorkerCoolingDown(w.name)) && (await checkWorker(w, allSecrets)) && (options.checkAvailable ? await options.checkAvailable(w) : true)) {
           nextWorker = w;
           break;
         }
@@ -399,12 +443,39 @@ export async function runWithFailover(
     if (options.noFallback) {
       return { result, worker: worker.name };
     }
+    // P2-1: Backoff before next attempt to avoid rapid-fire failures across workers
+    // Skip if this is the last worker (no next attempt) to avoid pointless delay
+    if (i < workers.length - 1) {
+      await new Promise(r => setTimeout(r, 2000));
+    }
     continue;
   }
 
   // Loop exhausted — all workers tried or skipped.
   // Branch on exhaustion vs rate-limit-wall vs empty-pool.
   const resourceKey = options.resource ?? 'unknown';
+
+  // P2-2: All-cooling wall alert — send notification when every worker is cooling,
+  // even when noFallback is set (user should see why no workers are available)
+  const coolingState = await getCooldownStatus();
+  const coolingEntries = Object.entries(coolingState)
+    .filter(([name]) => !options.excludeWorkers?.has(name))
+    .map(([name, entry]) => `${name} (until ${entry.cooldown_until})`);
+  const allCooling = coolingEntries.length > 0 && workers.every(w =>
+    options.excludeWorkers?.has(w.name) || coolingState[w.name] !== undefined
+  );
+
+  if (allCooling) {
+    const body =
+      `All candidate workers for ${resourceKey} are currently rate-limited.\n` +
+      `Cooling: ${coolingEntries.join(', ')}`;
+    notify(
+      `All workers rate-limited: ${resourceKey}`,
+      body.slice(0, 3500),
+      { dedupKey: `all-workers-rate-limited-${resourceKey}`, severity: 'warn' },
+    ).catch(() => {});
+    finalResult.alreadyAlertedPaSupport = true;
+  }
 
   if (!options.noFallback) {
     if (anyAttempted) {
@@ -416,32 +487,15 @@ export async function runWithFailover(
         `Last worker: ${finalWorkerName}\n` +
         `Failover log:\n` +
         switchEvents.map(e => `  ${e.from} → ${e.to}: ${e.reason}`).join('\n');
-      notifyUser(
+      notify(
         `Skill exhausted: ${resourceKey}`,
         body.slice(0, 3500),
         { dedupKey: `skill-exhausted-${resourceKey}`, severity: 'error' },
       ).catch(() => {});
       finalResult.alreadyAlertedPaSupport = true;
-    } else {
-      // Zero attempts — check if all candidates were cooling (rate-limit wall) or excluded
-      const coolingState = await getCooldownStatus();
-      const coolingEntries = Object.entries(coolingState)
-        .filter(([name]) => !options.excludeWorkers?.has(name))
-        .map(([name, entry]) => `${name} (until ${entry.cooldown_until})`);
-      if (coolingEntries.length > 0) {
-        const coolingNames = coolingEntries;
-        const body =
-          `All candidate workers for ${resourceKey} are currently rate-limited.\n` +
-          `Cooling: ${coolingNames.join(', ')}`;
-        notifyUser(
-          `All workers rate-limited: ${resourceKey}`,
-          body.slice(0, 3500),
-          { dedupKey: `all-workers-rate-limited-${resourceKey}`, severity: 'warn' },
-        ).catch(() => {});
-        finalResult.alreadyAlertedPaSupport = true;
-      } else {
-        logger.warn('workers', `no candidates for ${resourceKey} — pool fully excluded or empty`, ctx);
-      }
+    } else if (!allCooling) {
+      // Zero attempts, not all cooling — pool fully excluded or empty
+      logger.warn('workers', `no candidates for ${resourceKey} — pool fully excluded or empty`, ctx);
     }
   }
 

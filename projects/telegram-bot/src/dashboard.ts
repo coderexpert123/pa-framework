@@ -14,7 +14,7 @@ import type { WorkerConfig } from '../../../pa/dist/src/types.js';
 import { loadTopicNames, setTopicDescription } from './topic-names.js';
 import { appendRefIdAndLog } from './ref-id.js';
 
-const DASHBOARD_TOPIC_NAME = 'System Dashboard';
+const DASHBOARD_TOPIC_NAME = 'system-dashboard';
 const DASHBOARD_DESCRIPTION = 'Live system status — keep-awake state, model failover order, per-CLI settings, and scheduled skill crons. Auto-updated by the bot.';
 
 /**
@@ -348,7 +348,7 @@ export async function updateDashboard(token: string, fallbackChatId: number): Pr
 
   // 1. Ensure topic exists
   if (!state.thread_id) {
-    // Check for an existing System Dashboard topic before creating a new one
+    // Check for an existing dashboard topic before creating a new one
     const existingThread = await findExistingDashboardTopic(chatId);
     if (existingThread) {
       logger.info('dashboard', `Reusing existing dashboard topic: ${existingThread}`);

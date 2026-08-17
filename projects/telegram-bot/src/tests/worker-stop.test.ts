@@ -31,6 +31,11 @@ describe('parseStopSteer', () => {
     assert.deepEqual(parseStopSteer('/steer   '), { kind: 'stop' });
   });
 
+  it('/steer without a prompt but with attachment returns steer with undefined prompt (E7, A3)', () => {
+    assert.deepEqual(parseStopSteer('/steer', true), { kind: 'steer', prompt: undefined });
+    assert.deepEqual(parseStopSteer('/steer   ', true), { kind: 'steer', prompt: undefined });
+  });
+
   it('ignores everything else, including prefixed text', () => {
     assert.equal(parseStopSteer('please /stop it'), null);
     assert.equal(parseStopSteer('/stopwatch'), null);

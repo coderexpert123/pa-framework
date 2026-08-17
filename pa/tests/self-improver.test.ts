@@ -132,6 +132,17 @@ describe('buildReport', () => {
     assert.doesNotMatch(defaultedNoStale, /Stale drafts reaped/);
   });
 
+  it('includes a purged-drafts line when purgedCount > 0, omits it otherwise (2026-08-15)', () => {
+    const withPurged = buildReport([], [], 0, 2);
+    assert.match(withPurged, /Rejected drafts purged \(2\)/);
+
+    const withoutPurged = buildReport([], [], 0, 0);
+    assert.doesNotMatch(withoutPurged, /Rejected drafts purged/);
+
+    const defaultedNoPurged = buildReport([], []);
+    assert.doesNotMatch(defaultedNoPurged, /Rejected drafts purged/);
+  });
+
   it('applied entries with no risk flags show no [risk: ...] suffix', () => {
     const entries: ReportEntry[] = [
       makeEntry({ name: 'clean-fix', outcome: 'applied-fix', targetSkill: 'clean-skill', detail: 'overwrote `clean-skill`', riskFlags: [] }),
@@ -468,6 +479,146 @@ describe('gateAndApprove', () => {
       const records = await readAuditRecords(dir);
       assert.deepEqual(records[0].risk_flags, ['critical-skill']);
     });
+
+    describe('validation retry (2026-08-15)', () => {
+      it('new-skill: first validation fails, regenerateProposalFn returns revised proposal, second validates → approved; updateDraftPromptFn called; entry detail "validated on retry 2"', async () => {
+        let regenerateCalls = 0;
+        let updateDraftCalls = 0;
+        let receivedJudgeExcerpt: string | undefined;
+        const revisedProposal = makeProposal({
+          name: 'brand-new-skill-v2',
+          prompt: 'Revised prompt that passes validation.',
+          frontmatter: { cron: '*/5 * * * *' },
+        });
+
+        const entries = await gateAndApprove(
+          [{ proposal: makeProposal({ name: 'brand-new-skill', target_skill: undefined }), sourceType: 'conversation' }],
+          {
+            validateNewSkillFn: async (p) => {
+              // First call fails, second call (with revised proposal) passes.
+              return p.name === 'brand-new-skill-v2';
+            },
+            regenerateProposalFn: async (proposal, judgeExcerpt) => {
+              regenerateCalls++;
+              receivedJudgeExcerpt = judgeExcerpt;
+              return revisedProposal;
+            },
+            updateDraftPromptFn: async (name, fm, prompt) => {
+              updateDraftCalls++;
+              assert.equal(name, 'brand-new-skill-v2');
+              assert.equal(fm.cron, '*/5 * * * *');
+              assert.equal(prompt, 'Revised prompt that passes validation.');
+            },
+            approveDraftFn: async () => {},
+          }
+        );
+
+        assert.equal(regenerateCalls, 1, 'regenerateProposalFn should be called exactly once');
+        assert.equal(updateDraftCalls, 1, 'updateDraftPromptFn should be called exactly once');
+        assert.ok(receivedJudgeExcerpt, 'judge_excerpt should be passed to regenerateProposalFn');
+        assert.equal(entries.length, 1);
+        assert.equal(entries[0].outcome, 'approved-new-skill');
+        assert.equal(entries[0].detail, 'validated on retry 2');
+      });
+
+      it('new-skill: regenerateProposalFn returns null → parks validation-failed-pending after exactly 1 attempt', async () => {
+        let regenerateCalls = 0;
+
+        const entries = await gateAndApprove(
+          [{ proposal: makeProposal({ name: 'fails-validation', target_skill: undefined }), sourceType: 'conversation' }],
+          {
+            validateNewSkillFn: async () => false,
+            regenerateProposalFn: async () => {
+              regenerateCalls++;
+              return null;
+            },
+          }
+        );
+
+        assert.equal(regenerateCalls, 1, 'regenerateProposalFn should be called exactly once');
+        assert.equal(entries.length, 1);
+        assert.equal(entries[0].outcome, 'validation-failed-pending');
+      });
+
+      it('new-skill: both attempts fail → validation-failed-pending; regenerate called exactly once', async () => {
+        let regenerateCalls = 0;
+        let validateCalls = 0;
+
+        const entries = await gateAndApprove(
+          [{ proposal: makeProposal({ name: 'never-passes', target_skill: undefined }), sourceType: 'conversation' }],
+          {
+            validateNewSkillFn: async () => {
+              validateCalls++;
+              return false;
+            },
+            regenerateProposalFn: async (original, judgeExcerpt) => {
+              regenerateCalls++;
+              assert.ok(judgeExcerpt, 'judge_excerpt should be provided');
+              // Return a revised proposal that also fails validation
+              return makeProposal({ name: 'never-passes-v2', prompt: 'Still fails.' });
+            },
+          }
+        );
+
+        assert.equal(validateCalls, 2, 'validateNewSkillFn should be called twice (initial + 1 retry)');
+        assert.equal(regenerateCalls, 1, 'regenerateProposalFn should be called exactly once');
+        assert.equal(entries.length, 1);
+        assert.equal(entries[0].outcome, 'validation-failed-pending');
+      });
+
+      it('new-skill: no regenerateProposalFn passed → single attempt, parks (today\'s behavior unchanged)', async () => {
+        let validateCalls = 0;
+
+        const entries = await gateAndApprove(
+          [{ proposal: makeProposal({ name: 'no-retry-fn', target_skill: undefined }), sourceType: 'conversation' }],
+          {
+            validateNewSkillFn: async () => {
+              validateCalls++;
+              return false;
+            },
+          }
+        );
+
+        assert.equal(validateCalls, 1, 'validateNewSkillFn should be called exactly once (no retry without fn)');
+        assert.equal(entries.length, 1);
+        assert.equal(entries[0].outcome, 'validation-failed-pending');
+      });
+
+      it('skill-fix (non-cmd target): retry-then-pass with validateSkillFixFn', async () => {
+        await createTempSkill(dir, 'needs-fix', 'Original prompt.');
+        let regenerateCalls = 0;
+        let validateCalls = 0;
+        const revisedProposal = makeProposal({
+          name: 'needs-fix-v2',
+          target_skill: 'needs-fix',
+          prompt: 'Fixed prompt that passes.',
+        });
+
+        const entries = await gateAndApprove(
+          [{ proposal: makeProposal({ name: 'needs-fix-fix', target_skill: 'needs-fix' }), sourceType: 'failure' }],
+          {
+            validateSkillFixFn: async (p) => {
+              validateCalls++;
+              // First call fails, second passes
+              return p.name === 'needs-fix-v2';
+            },
+            regenerateProposalFn: async () => {
+              regenerateCalls++;
+              return revisedProposal;
+            },
+            applyFixFn: async (p) => {
+              assert.equal(p.name, 'needs-fix-v2', 'applyFixFn should receive the revised proposal');
+            },
+          }
+        );
+
+        assert.equal(validateCalls, 2, 'validateSkillFixFn should be called twice');
+        assert.equal(regenerateCalls, 1, 'regenerateProposalFn should be called once');
+        assert.equal(entries.length, 1);
+        assert.equal(entries[0].outcome, 'applied-fix');
+        assert.ok(entries[0].detail?.includes('validated on retry 2'));
+      });
+    });
   });
 });
 
@@ -798,9 +949,9 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
   });
 
   it('refuses to revert (and audits rollback-failed) when the tree carries human WIP', async () => {
-    // Precondition mirroring code-fixer's F4 — an autonomous `git revert` must never be
-    // mixed with, or run destructive cleanup over, a human's uncommitted work. Churn in
-    // pa/data/profile* alone does NOT count as WIP (that's the whole point of the carve-out).
+    // Updated behavior (2026-08-15): refusal is scoped to the condemned commit's files.
+    // When diff-tree fails (simulated here by empty output), it falls back to the old
+    // "refuse on any WIP" behavior.
     await seedDraft();
     const cmds: string[] = [];
     const { bb } = makeLockFake();
@@ -808,6 +959,10 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
       checkForRollbacksFn: async () => [gitRevertFlag()],
       execFn: async (cmd: string) => {
         cmds.push(cmd);
+        if (cmd.includes('diff-tree')) {
+          // Simulate diff-tree failure (empty output)
+          return { stdout: '', stderr: '' };
+        }
         if (cmd === 'git status --porcelain') {
           return { stdout: ' M pa/src/workers.ts\n M pa/data/profile.json\n', stderr: '' };
         }
@@ -824,6 +979,86 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
     const rec = (await readAuditRecords(dir)).find((r) => r.action === 'rollback-failed');
     assert.ok(rec, 'expected a rollback-failed audit record');
     assert.equal(rec.commit_hash, 'abc1234');
+  });
+
+  it('proceeds with revert when WIP file is NOT in the condemned set (2026-08-15)', async () => {
+    await seedDraft();
+    const cmds: string[] = [];
+    const { bb } = makeLockFake();
+    const lines = await rollback({
+      checkForRollbacksFn: async () => [gitRevertFlag()],
+      execFn: async (cmd: string) => {
+        cmds.push(cmd);
+        if (cmd.includes('diff-tree')) {
+          // Condemned commit touched projects/coding-dirs-updater/script.py only
+          return { stdout: 'projects/coding-dirs-updater/script.py\n', stderr: '' };
+        }
+        if (cmd === 'git status --porcelain') {
+          // WIP is in pa/src/workers.ts (NOT in condemned set)
+          return { stdout: ' M pa/src/workers.ts\n', stderr: '' };
+        }
+        if (cmd === 'git rev-parse HEAD') return { stdout: 'def5678\n', stderr: '' };
+        if (cmd === 'git rev-parse --abbrev-ref HEAD') return { stdout: 'main\n', stderr: '' };
+        return { stdout: '', stderr: '' };
+      },
+      blackboardFn: bb,
+    });
+
+    // Should proceed with the revert
+    assert.ok(cmds.some((c) => c.includes('git revert -n abc1234')));
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /Reverted/);
+  });
+
+  it('refuses when WIP file IS in the condemned set (2026-08-15)', async () => {
+    await seedDraft();
+    const cmds: string[] = [];
+    const { bb } = makeLockFake();
+    const lines = await rollback({
+      checkForRollbacksFn: async () => [gitRevertFlag()],
+      execFn: async (cmd: string) => {
+        cmds.push(cmd);
+        if (cmd.includes('diff-tree')) {
+          // Condemned commit touched projects/coding-dirs-updater/script.py
+          return { stdout: 'projects/coding-dirs-updater/script.py\n', stderr: '' };
+        }
+        if (cmd === 'git status --porcelain') {
+          // WIP overlaps condemned path
+          return { stdout: ' M projects/coding-dirs-updater/script.py\n', stderr: '' };
+        }
+        return { stdout: '', stderr: '' };
+      },
+      blackboardFn: bb,
+    });
+
+    assert.match(lines[0], /Rollback FAILED/);
+    assert.match(lines[0], /projects\/coding-dirs-updater\/script\.py/);
+    assert.equal(cmds.some((c) => c.startsWith('git revert')), false);
+  });
+
+  it('on revert failure, runs scoped cleanup (revert --quit + checkout HEAD -- <condemned>) instead of tree-wide reset (2026-08-15)', async () => {
+    await seedDraft();
+    const cmds: string[] = [];
+    const { bb } = makeLockFake();
+    const lines = await rollback({
+      checkForRollbacksFn: async () => [gitRevertFlag()],
+      execFn: async (cmd: string) => {
+        cmds.push(cmd);
+        if (cmd.includes('diff-tree')) {
+          return { stdout: 'projects/coding-dirs-updater/script.py\n', stderr: '' };
+        }
+        if (cmd.includes('revert -n')) {
+          throw new Error('conflict');
+        }
+        return { stdout: '', stderr: '' };
+      },
+      blackboardFn: bb,
+    });
+
+    assert.match(lines[0], /Rollback FAILED/);
+    assert.ok(cmds.some((c) => c.includes('git revert --quit')));
+    assert.ok(cmds.some((c) => c.includes('git checkout HEAD -- projects/coding-dirs-updater/script.py')));
+    assert.equal(cmds.some((c) => c.includes('git reset --hard HEAD')), false, 'should NOT run tree-wide reset');
   });
 
   it('acquires the git-workflow lock (correct resource/agent/pid/timeout) before any git command, and releases it after the last one', async () => {
@@ -1063,5 +1298,100 @@ describe('getReportTopic (report routing)', () => {
     await createTempSecrets(dir, 'PA_ALERTS_CHAT_ID=-100777\nPA_SELF_IMPROVER_CHAT_ID=-100222\nPA_SELF_IMPROVER_THREAD_ID=1234\n');
 
     assert.deepEqual(await getReportTopic(), { chat_id: '-100222', thread_id: 1234 });
+  });
+});
+
+describe('P2-19: rollback-failed notification (self-improver rollback path)', () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await createTempPaHome();
+  });
+
+  afterEach(async () => {
+    await cleanup(dir);
+  });
+
+  function gitRevertFlag() {
+    return {
+      kind: 'git-revert' as const,
+      skillName: 'coding-dirs-update',
+      draftName: 'coding-dirs-update-fix',
+      commitHash: 'abc1234',
+    };
+  }
+
+  async function seedDraft(): Promise<void> {
+    await createTempDraft(dir, 'coding-dirs-update-fix', 'Trigger record.', {
+      proposed_at: new Date().toISOString(),
+      reason: 'coding-dirs-update failing.',
+      source_turns: [],
+      status: 'rejected_auto',
+      fingerprint: computeFingerprint('coding-dirs-update-fix', 'x'),
+      source_type: 'failure',
+      target_skill: 'coding-dirs-update',
+    });
+  }
+
+  it('sends pa-alerts notification after rollback-failed audit record (P2-19)', async () => {
+    await seedDraft();
+
+    let notifyCalls: any[] = [];
+    const mockNotify = async (subject: string, message: string, opts: any) => {
+      notifyCalls.push({ subject, message, opts });
+      return { sent: true, suppressed: false };
+    };
+
+    const { bb } = makeLockFake();
+    const lines = await rollback({
+      checkForRollbacksFn: async () => [gitRevertFlag()],
+      execFn: async (cmd: string) => {
+        if (cmd.includes('git revert')) throw new Error('conflict');
+        return { stdout: '', stderr: '' };
+      },
+      blackboardFn: bb,
+      notifyUserFn: mockNotify,
+    });
+
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /Rollback FAILED/);
+
+    // Should have sent a notification
+    assert.equal(notifyCalls.length, 1);
+    const call = notifyCalls[0];
+    assert.equal(call.subject, 'Rollback Failed — Bad Fix Live');
+    assert.ok(call.message.includes('coding-dirs-update'));
+    assert.ok(call.message.includes('abc1234'));
+    assert.ok(call.opts.dedupKey === 'rollback-failed');
+    assert.ok(call.opts.severity === 'error');
+    assert.match(call.message, /_Ref: [0-9a-f]+_/, 'Should include ref-ID');
+  });
+
+  it('notification is best-effort — audit record succeeds even if notify fails', async () => {
+    await seedDraft();
+
+    let notifyThrew = false;
+    const mockNotify = async () => {
+      notifyThrew = true;
+      throw new Error('Notification failed');
+    };
+
+    const { bb } = makeLockFake();
+    const lines = await rollback({
+      checkForRollbacksFn: async () => [gitRevertFlag()],
+      execFn: async (cmd: string) => {
+        if (cmd.includes('git revert')) throw new Error('conflict');
+        return { stdout: '', stderr: '' };
+      },
+      blackboardFn: bb,
+      notifyUserFn: mockNotify,
+    });
+
+    // Audit record should still be written
+    const records = await readAuditRecords(dir);
+    const rec = records.find((r) => r.action === 'rollback-failed');
+    assert.ok(rec, 'Audit record should exist despite notification failure');
+    assert.equal(rec.commit_hash, 'abc1234');
+    assert.equal(notifyThrew, true, 'Notification should have been attempted');
   });
 });
