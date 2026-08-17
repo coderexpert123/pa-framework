@@ -1261,11 +1261,19 @@ describe('parseMetadata', () => {
 
   // --- malformed JSON ---
 
-  it('returns meta=null for malformed JSON, cleaned has body without [PA_META] line', () => {
+  it('returns meta=null for malformed JSON, cleaned preserves envelope with warning (2026-08-17 WP3)', () => {
     const output = 'Text.\n[PA_META]: {not valid json}';
-    const { cleaned, meta } = parseMetadata(output);
-    assert.equal(meta, null);
-    assert.equal(cleaned, 'Text.');
+    const consoleWarnSpy = console.warn;
+    let warnArgs: any[] | undefined;
+    console.warn = (...args: any[]) => { warnArgs = args; };
+    try {
+      const { cleaned, meta } = parseMetadata(output);
+      assert.equal(meta, null);
+      assert.equal(cleaned, output, 'envelope must be preserved when parsing fails');
+      assert.ok(warnArgs, 'console.warn must be called');
+    } finally {
+      console.warn = consoleWarnSpy;
+    }
   });
 
   it('returns meta=null when actions is not an array', () => {
@@ -1331,6 +1339,25 @@ describe('parseMetadata', () => {
     // Second call: no metadata line left, passthrough
     assert.equal(second.cleaned, 'Text.');
     assert.equal(second.meta, null);
+  });
+
+  // --- parse failure logging (2026-08-17 audit P2 bot-core addendum) ---
+
+  it('logs a warning when envelope is detected but JSON parsing fails', () => {
+    const output = 'Response text.\n[PA_META]: {"actions":[{"type":"run_skill","skill":"test"}'; // malformed: missing closing }
+    const consoleWarnSpy = console.warn;
+    let warnArgs: any[] | undefined;
+    console.warn = (...args: any[]) => { warnArgs = args; };
+    try {
+      const { cleaned, meta } = parseMetadata(output);
+      assert.equal(meta, null, 'malformed JSON must return null meta');
+      assert.equal(cleaned, output, 'original output must be returned on parse failure');
+      assert.ok(warnArgs, 'console.warn must be called');
+      assert.ok(warnArgs![0].includes('[pa-meta] failed to parse envelope'), 'warn message must indicate parse failure');
+      assert.ok(warnArgs![1]?.tail, 'warn must include tail context');
+    } finally {
+      console.warn = consoleWarnSpy;
+    }
   });
 });
 
@@ -1627,6 +1654,33 @@ describe('applyMetaActions', () => {
     );
     assert.deepEqual(kbNote, { domain: 'D', note: 'N' });
     assert.equal(restartBot, true);
+  });
+
+  // --- git-workflow skills authorization (2026-08-17 audit P1-2) ---
+
+  it('rejects PA_META run_skill for protected git-workflow skills', () => {
+    const state = makeState();
+    const protectedSkills = ['commit', 'push', 'push-public', 'commit-and-push', 'investigate-flagged', 'update-brain', 'self-improver'];
+    for (const skill of protectedSkills) {
+      const { skillToRun, response } = applyMetaActions(
+        'Done.',
+        meta([{ type: 'run_skill', skill }]),
+        state
+      );
+      assert.equal(skillToRun, null, `${skill} should be rejected`);
+      assert.ok(response.includes(`_(Skill trigger blocked: ${skill} requires an explicit command.)_`), `should show block message for ${skill}`);
+    }
+  });
+
+  it('accepts PA_META run_skill for ordinary non-protected skills', () => {
+    const state = makeState();
+    const { skillToRun, response } = applyMetaActions(
+      'Done.',
+      meta([{ type: 'run_skill', skill: 'fitness-sync' }]),
+      state
+    );
+    assert.equal(skillToRun, 'fitness-sync');
+    assert.ok(response.includes('_(Triggering skill: fitness-sync)_'));
   });
 
   // --- state isolation ---

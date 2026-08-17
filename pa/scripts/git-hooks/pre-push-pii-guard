@@ -66,7 +66,14 @@ Modes:
                  a real hook, so plain ".git" is correct there; pass GIT_DIR
                  explicitly for a manual sweep from elsewhere). Reports all
                  violations. Use for the scheduled pii-audit skill / manual
-                 full-tree sweeps.
+                 full-tree sweeps. NEVER consults review records.
+  --record-review --reviewer <who>
+                 AFTER a real semantic review of the diff about to be pushed
+                 (push-public Step 3): append a hash-pinned review record to
+                 ~/.pa/pii-guard-reviews.jsonl so the hook's layer 3 accepts
+                 this exact content without re-invoking agy (10-minute TTL).
+                 One semantic pass per push instead of two; an agy outage no
+                 longer blocks a reviewed manual sync. Layers 0-2 unaffected.
   --no-llm       with --full: skip the agy layer (regex + tripwires only).
 
 Install (or just run `python pa/scripts/install_git_hooks.py`, which does
@@ -74,6 +81,7 @@ this idempotently and verifies the drift):
   cp pa/scripts/git-hooks/pre-push-pii-guard <public mirror>/.git/hooks/pre-push
   chmod +x <public mirror>/.git/hooks/pre-push
 """
+import hashlib
 import json
 import os
 import re
@@ -612,30 +620,12 @@ def _run_agy(argv: list[str], timeout: float) -> subprocess.CompletedProcess:
 LLM_SKIP_REASON = ""
 
 
-def agy_check(content: str, tripwires: list[str]) -> tuple[bool, str, bool]:
-    """
-    Ask agy to scan content for PII. Returns (is_clean, reason, ok) where
-    ok=False means the layer itself failed (timeout/unparseable/missing
-    binary) and is_clean is a placeholder default, NOT a real CLEAN verdict —
-    callers decide what ok=False means for them: full_audit() fails open (a
-    scheduled report must always complete — see module docstring), the
-    pre-push hook fails CLOSED (a push is not a report, it is a gate). On
-    ok=False the module global LLM_SKIP_REASON holds the human-readable cause.
-    """
-    global LLM_SKIP_REASON
-    LLM_SKIP_REASON = ""
-    argv = resolve_agy_argv()
-    if argv is None:
-        LLM_SKIP_REASON = ("no agy binary resolvable — AGY_CMD unset in env "
-                           "and in ~/.pa/secrets.env, and 'agy' is not on PATH "
-                           "(git hooks inherit a minimal environment)")
-        print("⚠  PII guard: no agy binary (set AGY_CMD) — semantic layer OFF", file=sys.stderr)
-        return True, "", False
+def _build_pii_prompt(content: str, tripwires: list[str]) -> str:
+    """Shared prompt for the LLM semantic scan (agy + zclaude fallback)."""
     tripwire_ctx = ""
     if tripwires:
         tripwire_ctx = "\nAlso specifically flag:\n" + "\n".join(f"- {t}" for t in tripwires)
-
-    prompt = f"""You are a security guard for a public open-source git repository.
+    return f"""You are a security guard for a public open-source git repository.
 Analyze the following added lines (git diff) for personal or private information that must NOT appear in a public repository.
 
 Block (respond VIOLATION) if you find:
@@ -658,6 +648,92 @@ VIOLATION: <short description>
 Added lines to analyze (capped at 400 lines):
 {chr(10).join(content.splitlines()[:400])}
 """
+
+
+def resolve_zclaude_argv() -> list[str] | None:
+    """Resolve zclaude the same way resolve_agy_argv resolves agy — env, PATH,
+    secrets.env fallback. zclaude is a Zhipu GLM wrapper (api.z.ai via claude
+    binary); used as the LLM fallback when agy is quota-dead."""
+    candidate = (
+        os.environ.get("ZCLAUDE_CMD")
+        or shutil.which("zclaude")
+        or _load_secrets().get("ZCLAUDE_CMD")
+    )
+    if not candidate:
+        return None
+    if candidate.lower().endswith((".cmd", ".bat")):
+        return ["cmd", "/c", candidate]
+    return [candidate]
+
+
+def _parse_llm_verdict(response: str) -> tuple[bool, str, bool]:
+    """Parse a CLEAN/VIOLATION response. Returns (is_clean, reason, ok).
+    Shared by agy_check and zclaude_check — the verdict format is identical."""
+    for resp_line in response.strip().splitlines():
+        resp_line = resp_line.strip()
+        if resp_line.startswith("VIOLATION"):
+            reason = resp_line[len("VIOLATION"):].lstrip(": ").strip()
+            return False, reason, True
+        if resp_line == "CLEAN":
+            return True, "", True
+    return True, "", False  # unparseable
+
+
+def zclaude_check(content: str, tripwires: list[str]) -> tuple[bool, str, bool]:
+    """Fallback semantic scan via zclaude when agy is unavailable (2026-08-14).
+
+    Same prompt, same CLEAN/VIOLATION format. zclaude (a Zhipu GLM wrapper via
+    api.z.ai, recharged 2026-08-14) doesn't support the @<file> prompt-file
+    syntax agy uses, so the full prompt is written to a temp file and the CLI
+    is given a short instruction to read it — claude's print mode uses tools
+    (Read) under --dangerously-skip-permissions. This avoids the Windows 32KB
+    argv ceiling that a direct -p pass of the full prompt would hit."""
+    argv = resolve_zclaude_argv()
+    if argv is None:
+        return True, "", False
+
+    prompt = _build_pii_prompt(content, tripwires)
+    prompt_file = _write_agy_prompt(prompt)
+    try:
+        short_instruction = (
+            f"Read the file at {prompt_file} and follow the instructions in it "
+            f"exactly. Respond with CLEAN or VIOLATION."
+        )
+        full_argv = argv + ["--dangerously-skip-permissions", "-p", short_instruction]
+        result = _run_agy(full_argv, AGY_TIMEOUT)  # reuse the tree-kill wrapper
+        return _parse_llm_verdict(result.stdout)
+    except Exception as exc:
+        print(f"⚠  PII guard: zclaude fallback failed ({exc})", file=sys.stderr)
+        return True, "", False
+    finally:
+        if prompt_file:
+            try:
+                os.unlink(prompt_file)
+            except OSError:
+                pass
+
+
+def agy_check(content: str, tripwires: list[str]) -> tuple[bool, str, bool]:
+    """
+    Ask agy to scan content for PII. Returns (is_clean, reason, ok) where
+    ok=False means the layer itself failed (timeout/unparseable/missing
+    binary) and is_clean is a placeholder default, NOT a real CLEAN verdict —
+    callers decide what ok=False means for them: full_audit() fails open (a
+    scheduled report must always complete — see module docstring), the
+    pre-push hook fails CLOSED (a push is not a report, it is a gate). On
+    ok=False the module global LLM_SKIP_REASON holds the human-readable cause.
+    """
+    global LLM_SKIP_REASON
+    LLM_SKIP_REASON = ""
+    argv = resolve_agy_argv()
+    if argv is None:
+        LLM_SKIP_REASON = ("no agy binary resolvable — AGY_CMD unset in env "
+                           "and in ~/.pa/secrets.env, and 'agy' is not on PATH "
+                           "(git hooks inherit a minimal environment)")
+        print("⚠  PII guard: no agy binary (set AGY_CMD) — semantic layer OFF", file=sys.stderr)
+        return True, "", False
+
+    prompt = _build_pii_prompt(content, tripwires)
     # "Sturdy, relied-on" means transient failures (timeout, a network blip
     # surfacing as a generic subprocess error) get ONE retry before this
     # layer gives up — a single hiccup silently disabling the semantic scan
@@ -940,6 +1016,11 @@ def full_audit(use_llm: bool) -> int:
                 break
             is_clean, reason, ok = agy_check("\n".join(chunk), tripwires)
             if not ok:
+                # Fallback: try zclaude when agy is unavailable (2026-08-14).
+                z_clean, z_reason, z_ok = zclaude_check("\n".join(chunk), tripwires)
+                if z_ok:
+                    is_clean, reason, ok = z_clean, z_reason, True
+            if not ok:
                 consecutive_failures += 1
                 if consecutive_failures >= LLM_FAILURE_BREAKER:
                     warn_layer_skipped(
@@ -970,9 +1051,197 @@ def full_audit(use_llm: bool) -> int:
     return 0
 
 
+# --- Review-record handoff (2026-08-13, AI-117 consolidation) -----------------
+#
+# Layer 3 used to be the ONLY semantic review and re-reviewed content that the
+# push-public skill's Step 3 had just reviewed in the same run — two agy passes
+# over identical lines, and a single agy quota outage blocked every public
+# push (observed 2026-08-13: 46h Google quota exhaustion with the sync commit
+# stranded). The handoff: whoever completes a real semantic review of a push's
+# added lines records a sha256 of EXACTLY the text layer 3 scans; the hook
+# accepts a fresh matching record as the layer-3 verdict and skips agy.
+#
+# Scope rules (deliberate):
+#   * Pre-push mode ONLY. `--full` audits never consult records — the weekly
+#     audit stays an independent check.
+#   * Layers 0-2 are unconditional: a record waives nothing regex-shaped.
+#   * TTL 10 minutes: a record is for THIS push, now. Stale/mismatched hash
+#     falls through to the ordinary agy path (fail-closed as before).
+#   * PA_SKIP_PII_GUARD remains the only full bypass, human-set, logged.
+
+REVIEW_RECORD_TTL_S = 600
+
+
+def reviews_path() -> str:
+    return os.path.join(PA_HOME, "pii-guard-reviews.jsonl")
+
+
+def added_content_hash(added_content: str) -> str:
+    return hashlib.sha256(added_content.encode("utf-8")).hexdigest()
+
+
+def find_fresh_review(content_hash: str) -> dict | None:
+    """Newest record matching content_hash and inside the TTL, or None.
+    Never raises — an unreadable/corrupt reviews file degrades to 'no
+    record', i.e. the ordinary agy path, which is the fail-safe direction."""
+    try:
+        with open(reviews_path(), encoding="utf-8") as f:
+            records = []
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get("content_sha256") != content_hash:
+                    continue
+                reviewed_at = rec.get("reviewed_at", "")
+                try:
+                    age = time.time() - datetime.fromisoformat(reviewed_at).timestamp()
+                except ValueError:
+                    continue
+                if 0 <= age <= REVIEW_RECORD_TTL_S:
+                    records.append((reviewed_at, rec))
+    except OSError:
+        return None
+    if not records:
+        return None
+    return max(records, key=lambda pair: pair[0])[1]
+
+
+def _head_sha() -> str | None:
+    try:
+        r = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", timeout=10)
+        return r.stdout.strip() if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def _current_branch() -> str | None:
+    try:
+        r = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=10)
+        name = r.stdout.strip() if r.returncode == 0 else None
+        if not name or name == "HEAD":
+            return None  # detached — cannot predict the push ref
+        return name
+    except Exception:
+        return None
+
+
+def _remote_branch_sha(branch: str) -> str | None:
+    try:
+        r = subprocess.run(["git", "rev-parse", "--verify", f"origin/{branch}"],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=10)
+        return r.stdout.strip() if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def record_review_mode(argv: list[str]) -> int:
+    """`--record-review --reviewer <who>`: append a review record for the
+    added lines HEAD is about to push. Run AFTER completing a real semantic
+    review of that diff, immediately BEFORE the push, from the repo root
+    (the public mirror) on the branch that will be pushed. The base for the
+    diff is resolved exactly as the hook will resolve it at push time: the
+    remote-tracking ref for the current branch if one exists, else the
+    merge-base fallback for a brand-new ref (so first pushes and updates
+    both hash identically to what the hook later collects from stdin)."""
+    reviewer = None
+    if "--reviewer" in argv:
+        i = argv.index("--reviewer")
+        if i + 1 < len(argv):
+            reviewer = argv[i + 1]
+    if not reviewer:
+        print("usage: pre-push-pii-guard --record-review --reviewer <who> "
+              "(run after reviewing the diff, from the branch to be pushed)",
+              file=sys.stderr)
+        return 2
+
+    local_sha = _head_sha()
+    branch = _current_branch()
+    if not local_sha or not branch:
+        print("pii-guard: --record-review needs a normal branch checkout "
+              "(got detached/no HEAD) in the repo that will be pushed",
+              file=sys.stderr)
+        return 2
+
+    remote_sha = _remote_branch_sha(branch)
+    base = remote_sha or _resolve_new_ref_base(local_sha) or EMPTY_TREE
+    _collect_added(base, local_sha)
+    if not ADDED:
+        print("pii-guard: nothing added on this branch vs its base — no "
+              "record needed (layer 3 has no content to scan)", file=sys.stderr)
+        return 0
+
+    content_hash = added_content_hash("\n".join(ADDED))
+    record = {
+        "content_sha256": content_hash,
+        "reviewed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "reviewer": reviewer,
+        "source": "push-public",
+        "base": base[:12],
+        "head": local_sha[:12],
+        "added_lines": len(ADDED),
+    }
+    try:
+        os.makedirs(PA_HOME, exist_ok=True)
+        with open(reviews_path(), "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except OSError as exc:
+        print(f"pii-guard: could not write review record to {reviews_path()} "
+              f"({exc}) — layer 3 will need agy at push time", file=sys.stderr)
+        return 1
+    print(f"review recorded: {len(ADDED)} added line(s), sha256 {content_hash[:12]}… "
+          f"(reviewer: {reviewer}; valid {REVIEW_RECORD_TTL_S // 60} min)")
+    return 0
+
+
+def _print_usage_and_exit() -> None:
+    """Print usage and exit 0 WITHOUT reading stdin."""
+    print("pre-push-pii-guard — PII scanner for pa-framework public mirror", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Modes:", file=sys.stderr)
+    print("  (default)      pre-push hook — scans the outgoing push", file=sys.stderr)
+    print("  --full         audit mode — scans entire repo (scheduled pii-audit skill)", file=sys.stderr)
+    print("  --no-llm       with --full: skip the agy layer (regex + tripwires only)", file=sys.stderr)
+    print("  --record-review --reviewer <who>", file=sys.stderr)
+    print("                 record a completed semantic review (push-public Step 3)", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Bypass (recorded):", file=sys.stderr)
+    print("  PA_SKIP_PII_GUARD=1 git-public push origin main", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("Full audit (manual):", file=sys.stderr)
+    print("  python pa/scripts/git-hooks/pre-push-pii-guard --full", file=sys.stderr)
+    sys.exit(0)
+
+
 def main() -> int:
+    # Handle --help and bare invocation WITHOUT reading stdin.
+    # Live incident 2026-08-17: push-public ran 'pre-push-pii-guard --help',
+    # which fell into the stdin protocol and blocked forever on a pipe.
+    if "--help" in sys.argv or "-h" in sys.argv:
+        _print_usage_and_exit()
+
+    # Bare invocation (no git args): git ALWAYS passes the remote name + URL as
+    # argv[1..2] to a pre-push hook, so zero args is almost certainly a mistaken
+    # bare call from code or a human. Exit gracefully with usage rather than
+    # blocking on stdin forever. (No isatty() check: Windows reports the NUL
+    # device as a TTY, which silently defeated the tty-guarded variant —
+    # live-test finding 2026-08-17.)
+    if len(sys.argv) <= 1:
+        _print_usage_and_exit()
+
     if "--full" in sys.argv:
         return full_audit(use_llm="--no-llm" not in sys.argv)
+
+    if "--record-review" in sys.argv:
+        return record_review_mode(sys.argv)
 
     if os.environ.get("PA_SKIP_PII_GUARD"):
         # Deliberate escape hatch (documented for verified-clean force-rewrites)
@@ -1045,7 +1314,10 @@ def main() -> int:
             print(f"   {v}", file=sys.stderr)
         return 1
 
-    # Layer 3: agy semantic scan of the ADDED LINES.
+    # Layer 3: semantic scan of the ADDED LINES — agy, OR a fresh
+    # review-record handoff (2026-08-13) when the identical content was
+    # already semantically reviewed moments ago by the push-public flow's
+    # reviewer (see the review-record section above for the scope rules).
     #
     # FAIL-CLOSED, changed 2026-07-22 (was fail-open — see module docstring
     # for the full reasoning and why --full below keeps the OLD behavior).
@@ -1053,12 +1325,39 @@ def main() -> int:
     # said clean," but "nobody knows what agy would have said." Waving a push
     # through on that basis is exactly the silent gap this whole file exists
     # to close, and it is now a HARD BLOCK: a human must either get agy
-    # working again, or explicitly set PA_SKIP_PII_GUARD=1 (recorded to
+    # working again, record a completed review of this exact content
+    # (--record-review), or explicitly set PA_SKIP_PII_GUARD=1 (recorded to
     # ~/.pa/pii-guard-bypass.jsonl — never a silent pass). Layers 0-2 already
     # ran and already blocked independently above; this only changes what
     # happens when layer 3 itself cannot render a verdict.
     if added_content:
+        record = find_fresh_review(added_content_hash(added_content))
+        if record:
+            print(f"✓  PII guard layer 3: satisfied by review record "
+                  f"(reviewer: {record.get('reviewer', 'unknown')}, "
+                  f"{record.get('reviewed_at', '?')}, "
+                  f"{record.get('added_lines', '?')} added line(s)) — agy not invoked",
+                  file=sys.stderr)
+            print("✓  PII guard: clean", file=sys.stderr)
+            return 0
         is_clean, reason, ok = agy_check(added_content, tripwires)
+        if not ok:
+            # Fallback: try zclaude when agy is unavailable (2026-08-14).
+            # zclaude is a GLM wrapper (api.z.ai) that was recharged after the
+            # 46h Google quota outage stranded a public sync. One attempt,
+            # same prompt, same verdict format — if zclaude produces a real
+            # verdict, use it; if zclaude also fails, the fail-closed path
+            # below runs unchanged.
+            print("ℹ  PII guard: agy unavailable — trying zclaude fallback…",
+                  file=sys.stderr)
+            z_clean, z_reason, z_ok = zclaude_check(added_content, tripwires)
+            if z_ok:
+                is_clean, reason, ok = z_clean, z_reason, True
+                if not is_clean:
+                    print("🚫 PII guard (zclaude fallback): personal data detected "
+                          "— push aborted", file=sys.stderr)
+                    print(f"   Reason: {z_reason}", file=sys.stderr)
+                    return 1
         if not ok:
             warn_layer_skipped(
                 "agy semantic scan (layer 3)",

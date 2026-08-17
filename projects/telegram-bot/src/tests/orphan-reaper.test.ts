@@ -6,9 +6,11 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import {
   extractFinalAssistantText,
+  extractTeeResult,
   evaluatePendingDispatch,
   reapOrphanedDispatches,
   isTopicWorkerAliveByRegistry,
+  findTeePathByRegistry,
   TRANSCRIPT_QUIESCENT_MS,
   type ReaperDeps,
 } from '../orphan-reaper.js';
@@ -75,6 +77,53 @@ describe('extractFinalAssistantText', () => {
   });
 
   it('skips a mid-turn narration entry that ALSO contains a tool_use block (2026-07-27 incident)', () => {
+    // The crash happened right after the model wrote narration + queued a
+    // tool call, before any tool_result or further assistant text landed.
+    // That narration must not be harvested as a "final reply".
+    const jsonl =
+      assistantLine('real text', '2026-07-03T15:01:00Z') +
+      line({
+        type: 'assistant',
+        timestamp: '2026-07-03T15:02:00Z',
+        message: { content: [{ type: 'text', text: 'Now let me look at the actual ref command implementation to find the hang.' }, { type: 'tool_use', name: 'Read' }] },
+      });
+    assert.equal(extractFinalAssistantText(jsonl, T0)?.text, 'real text');
+  });
+
+  it('skips [text, tool_use] — tool_use after last text means mid-turn (WPB5 position-aware fix)', () => {
+    // A tool_use appearing AFTER the last text block indicates the turn
+    // wasn't finished — the model intended to call a tool and continue.
+    const jsonl = line({
+      type: 'assistant',
+      timestamp: '2026-08-17T12:00:00Z',
+      message: { content: [{ type: 'text', text: 'Let me check the file.' }, { type: 'tool_use', name: 'Read' }] },
+    });
+    assert.equal(extractFinalAssistantText(jsonl, T0), null);
+  });
+
+  it('delivers text for [tool_use, text] — tool_use before text means completed turn (WPB5 position-aware fix)', () => {
+    // A tool_use appearing BEFORE a final text block means the tool call
+    // finished and the model then wrote the actual answer.
+    const jsonl = line({
+      type: 'assistant',
+      timestamp: '2026-08-17T12:00:00Z',
+      message: { content: [{ type: 'tool_use', name: 'Bash' }, { type: 'text', text: 'The file contains 42 lines.' }] },
+    });
+    assert.equal(extractFinalAssistantText(jsonl, T0)?.text, 'The file contains 42 lines.');
+  });
+
+  it('delivers last text for [text, tool_use, text] — tool_use between texts, final text wins (WPB5 position-aware fix)', () => {
+    // A tool_use between text blocks with a final text block means the
+    // turn completed after the tool call — harvest the final answer.
+    const jsonl = line({
+      type: 'assistant',
+      timestamp: '2026-08-17T12:00:00Z',
+      message: { content: [{ type: 'text', text: 'First thought.' }, { type: 'tool_use', name: 'Read' }, { type: 'text', text: 'Final answer after tool use.' }] },
+    });
+    assert.equal(extractFinalAssistantText(jsonl, T0)?.text, 'Final answer after tool use.');
+  });
+
+  it('skips [text, tool_use] — tool_use after last text means mid-turn', () => {
     // The crash happened right after the model wrote narration + queued a
     // tool call, before any tool_result or further assistant text landed.
     // That narration must not be harvested as a "final reply".
@@ -523,5 +572,235 @@ describe('reapOrphanedDispatches — recovery gate lifecycle', () => {
     });
     assert.ok(sawStillMarkedAfterRound1, 'the topic must stay marked after round 1 — rec1 settled but rec2 (same topic) is still pending. A naive per-individual-record-mid-loop implementation would have cleared it prematurely here.');
     assert.equal(isTopicRecovering('-100555_9'), false, 'cleared once BOTH records for the topic have settled');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// extractTeeResult (WP2: NDJSON + plain-text fallback per §0)
+// ---------------------------------------------------------------------------
+
+describe('extractTeeResult', () => {
+  it('returns the last result event text from NDJSON', () => {
+    const ndjson = [
+      '{"type":"assistant","content":"first"}',
+      '{"type":"result","result":"answer one"}',
+      '{"type":"assistant","content":"middle"}',
+      '{"type":"result","result":"final answer"}',
+    ].join('\n');
+    assert.equal(extractTeeResult(ndjson), 'final answer');
+  });
+
+  it('returns null on empty input', () => {
+    assert.equal(extractTeeResult(''), null);
+  });
+
+  it('returns null when no result event exists', () => {
+    const ndjson = [
+      '{"type":"assistant","content":"text"}',
+      '{"type":"tool_result","content":"tool output"}',
+    ].join('\n');
+    assert.equal(extractTeeResult(ndjson), null);
+  });
+
+  it('handles malformed JSON lines gracefully (skips them)', () => {
+    const ndjson = [
+      'garbage{{{',
+      '{"type":"result","result":"valid"}',
+      'more garbage',
+    ].join('\n');
+    assert.equal(extractTeeResult(ndjson), 'valid');
+  });
+
+  it('handles mixed events (tool_result, assistant, result) — extracts only result', () => {
+    const ndjson = [
+      '{"type":"tool_result","content":"tool output"}',
+      '{"type":"assistant","content":"assistant spoke"}',
+      '{"type":"result","result":"the answer"}',
+    ].join('\n');
+    assert.equal(extractTeeResult(ndjson), 'the answer');
+  });
+
+  it('falls back to plain text when NO line parses as JSON', () => {
+    const plainText = 'plain old stdout\nno json here';
+    assert.equal(extractTeeResult(plainText), 'plain old stdout\nno json here');
+  });
+
+  it('returns null for whitespace-only plain text', () => {
+    assert.equal(extractTeeResult('   \n  \n  '), null);
+  });
+
+  it('handles NDJSON-without-result → null (falls through to death notice)', () => {
+    const ndjson = [
+      '{"type":"assistant","content":"something"}',
+      '{"type":"tool_result","content":"tool"}',
+    ].join('\n');
+    assert.equal(extractTeeResult(ndjson), null);
+  });
+
+  it('extractTeeResult: agy stream-json event.event shape', () => {
+    const ndjson = [
+      '{"event":"init","conversation_id":"abc"}',
+      '{"event":"result","result":{"status":"SUCCESS","response":"hello"}}',
+    ].join('\n');
+    assert.equal(extractTeeResult(ndjson), 'hello');
+  });
+
+  it('extractTeeResult: agy stream-json with non-SUCCESS status', () => {
+    const ndjson = [
+      '{"event":"init","conversation_id":"abc"}',
+      '{"event":"result","result":{"status":"ERROR","response":"hello"}}',
+    ].join('\n');
+    assert.equal(extractTeeResult(ndjson), 'hello', 'extracts response regardless of status');
+  });
+
+  it('extractTeeResult: agy stream-json with empty response falls through', () => {
+    const ndjson = [
+      '{"event":"init","conversation_id":"abc"}',
+      '{"event":"result","result":{"status":"SUCCESS","response":""}}',
+    ].join('\n');
+    assert.equal(extractTeeResult(ndjson), null, 'empty response treated as no-result');
+  });
+
+  it('extractTeeResult: agy stream-json mixed with event.type lines', () => {
+    const ndjson = [
+      '{"type":"result","result":"codex reply"}',
+      '{"event":"result","result":{"status":"SUCCESS","response":"agy reply"}}',
+    ].join('\n');
+    assert.equal(extractTeeResult(ndjson), 'agy reply', 'last-writer wins when both shapes match');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// evaluatePendingDispatch — tee-fallback branch (WP2)
+// ---------------------------------------------------------------------------
+
+describe('evaluatePendingDispatch — tee-fallback (agy)', () => {
+  function makeFakeDepsWithTee(cfg: FakeDepsConfig & { teePath?: string | null; teeContent?: string }): { deps: ReaperDeps; sent: Array<{ record: PendingDispatch; text: string }> } {
+    const base = makeFakeDeps(cfg);
+    const teeFile = cfg.teePath && cfg.teeContent !== undefined ? cfg.teePath : null;
+    const teeContent = cfg.teeContent ?? '';
+    return {
+      sent: base.sent,
+      deps: {
+        ...base.deps,
+        readTeePath: async () => teeFile,
+        readFile: async (path: string) => {
+          if (path === teeFile) return teeContent;
+          throw new Error('Unexpected readFile path');
+        },
+      },
+    };
+  }
+
+  it('agy dispatch + teePath + worker dead + non-empty tee → recovered reply delivered once', async () => {
+    const rec = makeRecord({ session: { session_id: 'g-1', worker: 'agy', started_at: T0 } });
+    await addPendingDispatch(rec);
+    const { deps, sent } = makeFakeDepsWithTee({
+      workerAlive: false,
+      teePath: 'D:/pa/logs/worker-tee/test.out',
+      teeContent: '{"type":"result","result":"agy reply here"}',
+    });
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(outcome, 'recovered');
+    assert.equal(sent.length, 1);
+    assert.ok(sent[0].text.includes('Recovered reply'));
+    assert.ok(sent[0].text.includes('agy reply here'));
+    assert.deepEqual(await listPendingDispatches(), []);
+    assert.equal(await wasDelivered(deliveredKey(rec.chatId, rec.threadId, rec.updateId)), true);
+  });
+
+  it('agy dispatch + teePath + worker dead + empty tee → death notice', async () => {
+    const rec = makeRecord({ session: { session_id: 'g-1', worker: 'agy', started_at: T0 } });
+    await addPendingDispatch(rec);
+    const { deps, sent } = makeFakeDepsWithTee({
+      workerAlive: false,
+      teePath: 'D:/pa/logs/worker-tee/empty.out',
+      teeContent: '',
+    });
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(outcome, 'dead');
+    assert.equal(sent.length, 1);
+    assert.ok(sent[0].text.includes('could not be recovered'));
+  });
+
+  it('agy dispatch + teePath + worker still alive → waiting', async () => {
+    const rec = makeRecord({ session: { session_id: 'g-1', worker: 'agy', started_at: T0 } });
+    await addPendingDispatch(rec);
+    const { deps, sent } = makeFakeDepsWithTee({
+      workerAlive: true,
+      teePath: 'D:/pa/logs/worker-tee/test.out',
+      teeContent: 'partial',
+    });
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(outcome, 'waiting');
+    assert.equal(sent.length, 0);
+    assert.equal((await listPendingDispatches()).length, 1);
+  });
+
+  it('claude dispatch + no teePath → existing transcript path unchanged', async () => {
+    const rec = makeRecord(); // claude session
+    await addPendingDispatch(rec);
+    const now = Date.now();
+    const { deps, sent } = makeFakeDeps({
+      workerAlive: false,
+      transcript: { content: assistantLine('claude reply', '2026-07-03T15:10:00Z'), mtimeMs: now - TRANSCRIPT_QUIESCENT_MS - 1000 },
+      nowMs: now,
+    });
+    // No readTeePath provided → should skip tee branch and use transcript
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(outcome, 'recovered');
+    assert.ok(sent[0].text.includes('claude reply'));
+  });
+
+  it('dedup: recovered tee reply is not double-delivered on re-run', async () => {
+    const rec = makeRecord({ session: { session_id: 'g-1', worker: 'agy', started_at: T0 } });
+    await addPendingDispatch(rec);
+    const { deps, sent } = makeFakeDepsWithTee({
+      workerAlive: false,
+      teePath: 'D:/pa/logs/worker-tee/test.out',
+      teeContent: '{"type":"result","result":"agy reply"}',
+    });
+
+    // First run → recovered
+    const outcome1 = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(outcome1, 'recovered');
+    assert.equal(sent.length, 1);
+
+    // Second run → already-delivered (record cleared by first run)
+    const outcome2 = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(outcome2, 'already-delivered');
+    assert.equal(sent.length, 1, 'no additional send attempted');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// findTeePathByRegistry (WP2)
+// ---------------------------------------------------------------------------
+
+describe('findTeePathByRegistry', () => {
+  const { mkdirSync, writeFileSync: wf } = fsSync;
+
+  function writeEntry(entry: Record<string, unknown>): void {
+    const dir = join(home, 'worker-pids');
+    mkdirSync(dir, { recursive: true });
+    wf(join(dir, `${entry.pid}.json`), JSON.stringify(entry), 'utf8');
+  }
+
+  it('returns teePath when a matching registry entry has one', async () => {
+    writeEntry({ pid: 12345, spawnedBy: 1, worker: 'agy', skill: 'topic--100555_9', startedAt: T0, teePath: 'D:/pa/logs/worker-tee/test.out' });
+    const rec = makeRecord({ chatId: -100555, threadId: 9 });
+    assert.equal(await findTeePathByRegistry(rec), 'D:/pa/logs/worker-tee/test.out');
+  });
+
+  it('returns null when no matching entry exists', async () => {
+    writeEntry({ pid: 12345, spawnedBy: 1, worker: 'agy', skill: 'topic--999999_9', startedAt: T0, teePath: 'D:/pa/logs/worker-tee/other.out' });
+    const rec = makeRecord({ chatId: -100555, threadId: 9 });
+    assert.equal(await findTeePathByRegistry(rec), null);
+  });
+
+  it('returns null when the matching entry has no teePath', async () => {
+    writeEntry({ pid: 12345, spawnedBy: 1, worker: 'claude', skill: 'topic--100555_9', startedAt: T0 });
+    const rec = makeRecord({ chatId: -100555, threadId: 9 });
+    assert.equal(await findTeePathByRegistry(rec), null);
   });
 });

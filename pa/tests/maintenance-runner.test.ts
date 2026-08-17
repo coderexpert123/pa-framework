@@ -254,6 +254,64 @@ describe('runDueJobs', () => {
   });
 });
 
+describe('P2-16: staleness sub-hourly blind spot fix', () => {
+  it('sub-hourly skill (e.g., 5-min interval) fires staleness alert after 30 min + 2*interval', async () => {
+    const { stalenessCheckJob } = await import('../src/lib/maintenance/jobs/staleness-check.js');
+    const everyMs = 5 * 60 * 1000; // 5-minute cron
+    const now = Date.now();
+    const lastSuccess = new Date(now - 35 * 60 * 1000).toISOString(); // 35 minutes ago (>30 min and >2*5min)
+
+    const mockCtx = {
+      now,
+      everyMs,
+      async listSkills() {
+        return [{
+          name: 'test-skill',
+          frontmatter: { cron: '*/5 * * * *' }, // 5-minute interval
+        } as any];
+      },
+      async getLastSuccessfulRun(skillName: string) {
+        if (skillName === 'test-skill') {
+          return { timestamp: lastSuccess };
+        }
+        return null;
+      },
+    };
+
+    const result = await stalenessCheckJob.run(mockCtx);
+    assert.equal(result.touched, 1, 'Should detect stale sub-hourly skill');
+    const detail = result.detail as { skills?: string[] } | undefined;
+    assert.ok((detail?.skills?.length ?? 0) > 0, 'Should report the stale skill');
+  });
+
+  it('sub-hourly skill NOT stale when only 20 min + 2*interval (P2-16 fix: requires >30 min minimum)', async () => {
+    const { stalenessCheckJob } = await import('../src/lib/maintenance/jobs/staleness-check.js');
+    const everyMs = 5 * 60 * 1000;
+    const now = Date.now();
+    const lastSuccess = new Date(now - 22 * 60 * 1000).toISOString(); // 22 min ago (<30 min floor)
+
+    const mockCtx = {
+      now,
+      everyMs,
+      async listSkills() {
+        return [{
+          name: 'test-skill',
+          frontmatter: { cron: '*/5 * * * *' },
+        } as any];
+      },
+      async getLastSuccessfulRun(skillName: string) {
+        if (skillName === 'test-skill') {
+          return { timestamp: lastSuccess };
+        }
+        return null;
+      },
+    };
+
+    const result = await stalenessCheckJob.run(mockCtx);
+    assert.equal(result.touched, 0, 'Should NOT fire - below 30-minute minimum threshold');
+  });
+});
+
 describe('resolveEveryMs', () => {
   it('applies a valid override', () => {
     const job = makeJob({ name: 'x', everyMs: 1000 });

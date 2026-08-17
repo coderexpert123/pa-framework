@@ -1118,5 +1118,110 @@ describe('sendMessage Phase 3 hardening', () => {
       'sendMessage must not throw or crash on response body stream error',
     );
   });
+
+  // AI-149: honor retry_after on 429 responses (real behavioral coverage —
+  // fetch mocked, setTimeout stubbed so the rate-limit wait is captured, not slept)
+  it('honors retry_after on 429 response before retrying', async () => {
+    const delays: number[] = [];
+    const origSetTimeout = globalThis.setTimeout;
+    (globalThis as Record<string, unknown>).setTimeout = ((fn: () => void, ms?: number) => {
+      delays.push(ms ?? 0);
+      fn();
+      return 0 as never;
+    }) as unknown as typeof setTimeout;
+
+    let attempt = 0;
+    const originalFetch = globalThis.fetch;
+    (globalThis as Record<string, unknown>).fetch = (async () => {
+      attempt++;
+      if (attempt === 1) {
+        return {
+          ok: false, status: 429,
+          text: async () => JSON.stringify({ ok: false, parameters: { retry_after: 2 } }),
+          json: async () => ({ ok: false }),
+        } as unknown as Response;
+      }
+      return { ok: true, status: 200, text: async () => '', json: async () => ({ ok: true }) } as unknown as Response;
+    }) as typeof fetch;
+
+    try {
+      const delivered = await sendMessage('t', -100, 'hello');
+      assert.strictEqual(delivered, true, 'second attempt should deliver');
+      assert.strictEqual(attempt, 2, 'exactly one retry');
+      // delays[0] = the 429 rate-limit wait; delays[1] = attempt-2 pre-backoff
+      // (telegram.ts:227, 1000 * attempt) — both expected, in this order.
+      assert.deepStrictEqual(delays, [3000, 1000], 'rate-limit wait first, then the attempt backoff');
+    } finally {
+      (globalThis as Record<string, unknown>).fetch = originalFetch;
+      (globalThis as Record<string, unknown>).setTimeout = origSetTimeout;
+    }
+  });
+
+  it('caps retry_after wait at 61 seconds', async () => {
+    const delays: number[] = [];
+    const origSetTimeout = globalThis.setTimeout;
+    (globalThis as Record<string, unknown>).setTimeout = ((fn: () => void, ms?: number) => {
+      delays.push(ms ?? 0);
+      fn();
+      return 0 as never;
+    }) as unknown as typeof setTimeout;
+
+    let attempt = 0;
+    const originalFetch = globalThis.fetch;
+    (globalThis as Record<string, unknown>).fetch = (async () => {
+      attempt++;
+      if (attempt === 1) {
+        return {
+          ok: false, status: 429,
+          text: async () => JSON.stringify({ ok: false, parameters: { retry_after: 120 } }),
+          json: async () => ({ ok: false }),
+        } as unknown as Response;
+      }
+      return { ok: true, status: 200, text: async () => '', json: async () => ({ ok: true }) } as unknown as Response;
+    }) as typeof fetch;
+
+    try {
+      const delivered = await sendMessage('t', -100, 'hello');
+      assert.strictEqual(delivered, true);
+      assert.deepStrictEqual(delays, [61000, 1000], 'capped rate-limit wait first, then the attempt backoff');
+    } finally {
+      (globalThis as Record<string, unknown>).fetch = originalFetch;
+      (globalThis as Record<string, unknown>).setTimeout = origSetTimeout;
+    }
+  });
+
+  it('retries a 429 with unparsable body immediately (no rate-limit wait)', async () => {
+    const delays: number[] = [];
+    const origSetTimeout = globalThis.setTimeout;
+    (globalThis as Record<string, unknown>).setTimeout = ((fn: () => void, ms?: number) => {
+      delays.push(ms ?? 0);
+      fn();
+      return 0 as never;
+    }) as unknown as typeof setTimeout;
+
+    let attempt = 0;
+    const originalFetch = globalThis.fetch;
+    (globalThis as Record<string, unknown>).fetch = (async () => {
+      attempt++;
+      if (attempt === 1) {
+        return {
+          ok: false, status: 429,
+          text: async () => '<html>gateway noise</html>',
+          json: async () => { throw new Error('not json'); },
+        } as unknown as Response;
+      }
+      return { ok: true, status: 200, text: async () => '', json: async () => ({ ok: true }) } as unknown as Response;
+    }) as typeof fetch;
+
+    try {
+      const delivered = await sendMessage('t', -100, 'hello');
+      assert.strictEqual(delivered, true);
+      assert.strictEqual(attempt, 2);
+      assert.deepStrictEqual(delays, [1000], 'only the attempt-2 pre-backoff — no rate-limit wait for an unparsable 429');
+    } finally {
+      (globalThis as Record<string, unknown>).fetch = originalFetch;
+      (globalThis as Record<string, unknown>).setTimeout = origSetTimeout;
+    }
+  });
 });
 

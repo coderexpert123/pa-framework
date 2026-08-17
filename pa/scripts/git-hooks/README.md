@@ -16,7 +16,7 @@ survived every push for months.
 | 0. Commit-message tripwires + credentials | every commit message the push publishes | yes |
 | 1. Structural credential regex | full content of every touched file, + added lines, + commit messages | yes |
 | 2. Personal tripwire regex | full content of every touched file, + touched paths, + added lines, + commit messages | yes |
-| 3. agy semantic scan | **added lines only** | yes on VIOLATION; on infra failure, **blocks on push (fail-closed), lets through on `--full` (fail-open)** — see below |
+| 3. agy semantic scan | **added lines only** | yes on VIOLATION; on infra failure, **blocks on push (fail-closed), lets through on `--full` (fail-open)** — see below. Since 2026-08-13 a fresh hash-pinned **review record** (below) satisfies this layer without invoking agy |
 
 **Migrated from Gemini to agy (2026-07-22).** agy (Antigravity CLI) is the
 framework's own default worker (see `~/.pa/config.yaml`) — faster and a
@@ -125,6 +125,37 @@ Either way, every infra failure prints a `!!!!` banner naming **which** layer
 did not run and **why** — silence used to be indistinguishable from "ran and
 found nothing"; it isn't any more. The human-readable cause is in
 `LLM_SKIP_REASON`.
+
+**Review-record handoff (2026-08-13, AI-117 consolidation).** The push-public
+skill's Step 3 and this hook's layer 3 used to be two separate semantic passes
+over identical added lines — and, because layer 3 needs agy, a single agy quota
+outage stranded every reviewed sync (observed live: 46h Google quota
+exhaustion with the sync commit sitting on a local branch). Now the reviewer
+records a completed review:
+```sh
+python pa/scripts/git-hooks/pre-push-pii-guard --record-review --reviewer push-public
+```
+(run from **the repo being pushed** — `pa-public/` in this deployment — on the
+branch about to be pushed, right after the review, right before the push; the
+script's git calls resolve against cwd, exactly like the hook's own). It hashes
+the added lines exactly as layer 3
+sees them — resolving the diff base the same way the hook will (remote-tracking
+ref for the branch if it exists, else the new-ref merge-base fallback) — and
+appends one JSON line to `~/.pa/pii-guard-reviews.jsonl`. At push time, a
+record whose `content_sha256` matches and whose `reviewed_at` is within the
+10-minute TTL satisfies layer 3 **without calling agy**; the guard prints the
+reviewer and timestamp it acted on. Scope rules, deliberately narrow:
+- **Layers 0-2 are unconditional** — a record waives nothing regex-shaped.
+- **`--full` never consults records** — the weekly audit stays independent.
+- **Stale or mismatched hash falls through** to the ordinary fail-closed agy
+  path: a record covers THIS content, THIS push, NOW. Amend/rebase after
+  recording and the record no longer matches.
+- **`PA_SKIP_PII_GUARD` is unchanged** — the only full bypass, human-set,
+  logged. A record is a review that happened; a bypass is a scan that didn't.
+
+The record file is outside the repo (same reasoning as the bypass log) and
+append-only by lines-per-day volume; treat it as audit trail, read it with
+`cat ~/.pa/pii-guard-reviews.jsonl`.
 
 **Override for deliberate pushes (recorded):**
 ```sh

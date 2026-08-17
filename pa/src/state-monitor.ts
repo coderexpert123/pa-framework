@@ -2,6 +2,7 @@ import { readFile, readdir, stat, open } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
 import { log } from './lib/log.js';
+import { listWorkerPids, isProcessAlive } from './worker-pids.js';
 
 export function resolveStateDir(stateDir: string): string {
   return stateDir.replace(/^~/, homedir());
@@ -267,7 +268,15 @@ export async function readUsableStateTail(
  * workerName is used only for the degraded-state log line; pass it whenever the
  * caller knows which worker the state dir belongs to.
  */
-export async function analyzeAgentState(dir: string, pattern: string, workerName = 'unknown'): Promise<AgentState> {
+export async function analyzeAgentState(
+  dir: string,
+  pattern: string,
+  workerName = 'unknown',
+  opts: { isAliveFn?: (pid: number) => boolean } = {},
+): Promise<AgentState> {
+  // isAliveFn is a test seam for the binary-state liveness fallback — production
+  // callers leave it unset and the real isProcessAlive runs.
+  const isAlive = opts.isAliveFn ?? isProcessAlive;
   try {
     const tail = await readUsableStateTail(dir, pattern, workerName);
 
@@ -275,10 +284,50 @@ export async function analyzeAgentState(dir: string, pattern: string, workerName
     // error. Say so out loud rather than reporting a generic 'unknown' that a
     // human would read as "the heuristics ran and were inconclusive".
     if (tail.problem === 'binary') {
+      // RA-2/P2-11: agy liveness fallback via worker-pids heartbeat age / tee mtime.
+      // Registry entries do not record their worker's state_dir, so match by
+      // worker name: if any registry entry for THIS worker has a live PID, the
+      // worker process is running and the dispatch is not silently dead.
+      const workerPids = await listWorkerPids();
+      const matchingEntry = workerPids.find((entry) => entry.worker === workerName);
+
+      let fallbackStatus: string | null = null;
+      let fallbackVerdict: 'alive' | 'unknown' = 'unknown';
+
+      if (matchingEntry) {
+        const pids = [matchingEntry.pid, ...(matchingEntry.descendants ?? [])];
+        const alivePids = pids.filter(isAlive);
+
+        if (alivePids.length > 0) {
+          fallbackVerdict = 'alive';
+          fallbackStatus = `worker-pids registry shows PID ${alivePids[0]} alive (binary state unreadable)`;
+        } else {
+          // All PIDs are dead - check tee file for warning
+          if (matchingEntry.teePath) {
+            try {
+              const teeStat = await stat(matchingEntry.teePath);
+              const teeAge = Date.now() - teeStat.mtimeMs;
+              // Default idle_timeout of 15 minutes (900s) if not specified
+              const idleTimeoutMs = 15 * 60 * 1000;
+              if (teeAge > idleTimeoutMs) {
+                log('warn', 'state-monitor', 'Binary state worker silent with stale tee file', {
+                  worker: workerName,
+                  pid: matchingEntry.pid,
+                  teePath: matchingEntry.teePath,
+                  teeAgeMs: teeAge,
+                });
+              }
+            } catch {
+              // Tee file missing or unreadable - silent
+            }
+          }
+        }
+      }
+
       const who = workerName === 'unknown' ? 'this worker' : workerName;
       return {
-        status: `state file is not readable text (binary conversation store) — idle/stuck heuristics unavailable for ${who}`,
-        verdict: 'unknown',
+        status: fallbackStatus || `state file is not readable text (binary conversation store) — idle/stuck heuristics unavailable for ${who}`,
+        verdict: fallbackVerdict,
         degraded: 'binary',
       };
     }
@@ -351,18 +400,28 @@ export async function analyzeAgentState(dir: string, pattern: string, workerName
     }
 
     // --- Rule 2: Assistant asking a question (ends with ?) ---
+    // Narrowed to avoid false positives on legitimate clarifying questions.
+    // Fire only when the trailing question also matches a self-referential/help-seeking stem,
+    // or the message is very short and ends with ?.
     if (last.type === 'assistant' || last.role === 'assistant' || last.role === 'model') {
       const text = typeof last.content === 'string'
         ? last.content
         : Array.isArray(last.content)
           ? last.content.map((c: any) => c.text || c.message || '').join('')
           : '';
-      if (text.trim().endsWith('?')) {
-        return {
-          status: 'asking a question (no one will answer)',
-          verdict: 'stuck',
-          lastEntry: last,
-        };
+      const trimmed = text.trim();
+      if (trimmed.endsWith('?')) {
+        const stems = ['what should', 'how should', 'should i', 'do you want', 'which option', 'how do i', 'next', 'proceed', 'clarif'];
+        const lower = trimmed.toLowerCase();
+        const hasStem = stems.some((stem) => lower.includes(stem));
+        const veryShort = trimmed.length <= 12;
+        if (hasStem || veryShort) {
+          return {
+            status: 'asking a question (no one will answer)',
+            verdict: 'stuck',
+            lastEntry: last,
+          };
+        }
       }
     }
 

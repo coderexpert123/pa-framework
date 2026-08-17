@@ -1,6 +1,6 @@
 import { parseExpression } from 'cron-parser';
-import { listSkills } from '../../../skills.js';
-import { getLastSuccessfulRun } from '../../../logger.js';
+import { listSkills as defaultListSkills } from '../../../skills.js';
+import { getLastSuccessfulRun as defaultGetLastSuccessfulRun } from '../../../logger.js';
 import { notifyUser } from '../../notify.js';
 import { log } from '../../log.js';
 import type { MaintenanceJob } from '../types.js';
@@ -18,6 +18,10 @@ export const stalenessCheckJob: MaintenanceJob = {
   async run(ctx) {
     // Dedup handled by notifyUser via dedup key 'staleness'
 
+    // Use injected functions from context if available (for testing), otherwise use defaults
+    const listSkills = (ctx as any).listSkills || defaultListSkills;
+    const getLastSuccessfulRun = (ctx as any).getLastSuccessfulRun || defaultGetLastSuccessfulRun;
+
     const skills = await listSkills();
     const now = ctx.now;
     const alerts: string[] = [];
@@ -32,11 +36,9 @@ export const stalenessCheckJob: MaintenanceJob = {
         const next1 = interval.next().toDate();
         const next2 = interval.next().toDate();
         const intervalMs = next2.getTime() - next1.getTime();
-        // Skip sub-hourly skills (e.g. reminders at * * * * *) — their 2x threshold
-        // would be only 2 minutes, firing on every maintenance pass.
-        if (intervalMs < 60 * 60 * 1000) continue;
         const timeSinceSuccess = now - new Date(lastSuccess.timestamp).getTime();
-        if (timeSinceSuccess > 2 * intervalMs) {
+        // Applied uniformly: stale when >2x interval AND at least 30 minutes (P2-16)
+        if (timeSinceSuccess > 2 * intervalMs && timeSinceSuccess > 30 * 60 * 1000) {
           const hoursAgo = Math.round(timeSinceSuccess / 3600000);
           alerts.push(`${skill.name}: last success ${hoursAgo}h ago (interval: ${Math.round(intervalMs / 3600000)}h)`);
         }

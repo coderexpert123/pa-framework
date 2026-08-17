@@ -4,10 +4,11 @@ import { mkdtemp, rm, mkdir, writeFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { createBotMaintenanceJobs, type BotMaintenanceDeps } from '../maintenance-jobs.js';
+import { createBotMaintenanceJobs, watchdogStaleJobs, type BotMaintenanceDeps } from '../maintenance-jobs.js';
 import { validateRegistry } from '../../../../pa/dist/src/lib/maintenance/policy.js';
 import { RUNTIME_ARCHIVE_MAX_BYTES } from '../../../../pa/dist/src/lib/archive-files.js';
 import { flushLog } from '../../../../pa/dist/src/lib/log.js';
+import { loadJobState, updateJobState } from '../../../../pa/dist/src/lib/maintenance/state.js';
 import type { TopicNameMap } from '../topic-names.js';
 
 let tempDir: string;
@@ -230,6 +231,66 @@ describe('createBotMaintenanceJobs', () => {
       const jobs = createBotMaintenanceJobs(stubDeps({ topicNames }));
       const job = jobs.find((j) => j.name === 'grounding-check')!;
       await assert.doesNotReject(() => job.run({ now: Date.now(), everyMs: 21_600_000 }));
+    });
+  });
+
+  describe('watchdogStaleJobs (P2-3)', () => {
+    it('does nothing when no jobs have in-flight markers', async () => {
+      const jobs = createBotMaintenanceJobs(stubDeps());
+      await assert.doesNotReject(() => watchdogStaleJobs(jobs));
+    });
+
+    it('clears an in-flight marker older than 10x everyMs', async () => {
+      const jobs = createBotMaintenanceJobs(stubDeps());
+      const job = jobs.find((j) => j.name === 'model-override-sweep')!;
+      // Set in-flight marker 15 minutes ago (10x 60s everyMs = 10min)
+      const oldTime = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+      await updateJobState(job.name, (prev) => ({ ...prev, inFlight: true, inFlightSince: oldTime, lastRunAt: oldTime, lastSkipReason: undefined }));
+      const beforeState = await loadJobState(job.name);
+      assert.equal(beforeState.inFlight, true);
+
+      await watchdogStaleJobs(jobs);
+
+      const afterState = await loadJobState(job.name);
+      assert.equal(afterState.inFlight, false);
+      assert.equal(afterState.inFlightSince, null);
+    });
+
+    it('does not clear an in-flight marker younger than 10x everyMs', async () => {
+      const jobs = createBotMaintenanceJobs(stubDeps());
+      const job = jobs.find((j) => j.name === 'model-override-sweep')!;
+      // Set in-flight marker 2 minutes ago (well under 10x 60s everyMs = 10min)
+      const recentTime = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+      await updateJobState(job.name, (prev) => ({ ...prev, inFlight: true, inFlightSince: recentTime, lastRunAt: recentTime, lastSkipReason: undefined }));
+      const beforeState = await loadJobState(job.name);
+      assert.equal(beforeState.inFlight, true);
+
+      await watchdogStaleJobs(jobs);
+
+      const afterState = await loadJobState(job.name);
+      assert.equal(afterState.inFlight, true);
+      assert.equal(afterState.inFlightSince, recentTime);
+    });
+
+    it('skips jobs without everyMs defined', async () => {
+      const jobs = createBotMaintenanceJobs(stubDeps());
+      const jobWithNoEveryMs = { ...jobs[0], everyMs: 0 };
+      await assert.doesNotReject(() => watchdogStaleJobs([jobWithNoEveryMs]));
+    });
+
+    it('continues after one job fails to load state', async () => {
+      const jobs = createBotMaintenanceJobs(stubDeps());
+      // Manually corrupt one job's state file
+      const job = jobs[0];
+      await updateJobState(job.name, (prev) => ({ ...prev, inFlight: true, inFlightSince: new Date().toISOString(), lastRunAt: new Date().toISOString(), lastSkipReason: undefined }));
+      // Then delete the PA_HOME to make loadJobState fail for subsequent jobs
+      const originalPaHome = process.env.PA_HOME;
+      process.env.PA_HOME = '/nonexistent/path';
+      try {
+        await assert.doesNotReject(() => watchdogStaleJobs(jobs));
+      } finally {
+        process.env.PA_HOME = originalPaHome;
+      }
     });
   });
 

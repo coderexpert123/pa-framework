@@ -95,6 +95,27 @@ export interface WorkerConfig {
   output_format?: string;  // e.g. "stream-json" for NDJSON output
   check_timeout?: number;  // seconds to wait for version check (default 30)
   tunables?: Record<string, TunableSpec>;  // per-worker settable knobs (see TunableSpec); absent = worker has none, behaves exactly as before
+  /**
+   * Optional allowlist of secret names this LLM worker receives.
+   *
+   * SEMANTICS (backward compatible):
+   * - Field ABSENT: worker receives ALL secrets (current behavior).
+   * - Field PRESENT: worker receives ONLY the named secrets.
+   *
+   * LLM workers (agy, claude, codex, zclaude): this field controls which secrets
+   * from secrets.env are injected into the worker's environment.
+   *
+   * Shell skills (cmd: skills): these keep their existing frontmatter `secrets:`
+   * filtering, which already default-denies — this field does not affect them.
+   *
+   * Secret names must match the pattern [A-Z0-9_]+ (uppercase alphanumeric + underscore).
+   * Unknown names (not present in secrets.env) warn but don't block dispatch —
+   * the worker receives the subset that exists.
+   *
+   * MOTIVATION: Defense-in-depth. A worker compromised (exploit, leaked token in logs,
+   * or supply-chain backdoor) can only access secrets it was explicitly granted.
+   */
+  secret_allowlist?: string[];
 }
 
 export interface EvaluatorConfig {

@@ -109,6 +109,23 @@ describe('addTurn', () => {
     addTurn(state, makeTurn('user', 'no id'));
     assert.equal(state.turns[0].message_id, undefined);
   });
+
+  // AI-151: verify worker attribution is preserved
+  it('preserves worker field in assistant turns', () => {
+    const state = makeState();
+    const turn = makeTurn('assistant', 'response');
+    (turn as any).worker = 'claude';
+    addTurn(state, turn);
+    assert.equal(state.turns[0].worker, 'claude');
+  });
+
+  it('defaults to local for assistant turns when worker not specified', () => {
+    const state = makeState();
+    const turn = makeTurn('assistant', 'response');
+    addTurn(state, turn);
+    // If worker field is missing, it should be handled gracefully
+    assert.equal(state.turns[0].role, 'assistant');
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -36,7 +36,7 @@ export async function catchupCommand(opts: CatchupOptions = {}): Promise<void> {
   // into ~93 relaunches. Anything reasoning about catchup's blast radius (lock
   // hold time, worker admission slots, retry pacing) must budget for 1 minute.
   const heartbeat = setInterval(() => {
-    void blackboard.updateHeartbeat(lockKey, 'catchup-command').catch(() => {});
+    void blackboard.updateHeartbeat(lockKey, 'catchup-command').catch(err => log('warn', 'catchup', 'heartbeat update failed', { error: err?.message ?? String(err) }));
   }, 60_000);
   heartbeat.unref?.();
 

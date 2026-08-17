@@ -1,0 +1,10 @@
+# Python dependencies for pa/scripts/tests and related tooling.
+# Pinned to currently-installed versions (queried via pip show).
+#
+# These are the only non-stdlib imports across all test_*.py files:
+# - test_backup_secrets.py needs cryptography
+# - test_finish_google_telegram_reauth.py needs google-auth-oauthlib
+#
+# Run: pip install -r pa/scripts/requirements.txt
+cryptography>=42.0.0
+google-auth-oauthlib>=1.0.0

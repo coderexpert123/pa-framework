@@ -1,6 +1,6 @@
-import { describe, it, before, after, beforeEach } from 'node:test';
+import { describe, it, before, after, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, writeFile, readFile } from 'fs/promises';
+import { mkdir, writeFile, readFile, rm } from 'fs/promises';
 import { join } from 'path';
 import { createTempPaHome, createTempConfig, cleanup } from './helpers.js';
 import { flushLog } from '../src/lib/log.js';
@@ -89,6 +89,19 @@ const PENDING_TOOL_JSONL =
 const QUESTION_JSONL =
   '{"type":"user","content":"deploy it"}\n' +
   '{"type":"assistant","content":"Which environment should I deploy to?"}\n';
+
+// P2-9 test fixtures: questions WITH stems (stuck) vs WITHOUT (alive)
+const QUESTION_WITH_STEM_JSONL =
+  '{"type":"user","content":"continue"}\n' +
+  '{"type":"assistant","content":"What should I do next?"}\n';
+
+const QUESTION_NO_STEM_LONG_JSONL =
+  '{"type":"user","content":"explain this"}\n' +
+  '{"type":"assistant","content":"How would you implement a feature that handles user authentication with JWT tokens and includes refresh token rotation?"}\n';
+
+const QUESTION_VERY_SHORT_JSONL =
+  '{"type":"user","content":"start"}\n' +
+  '{"type":"assistant","content":"Ok?"}\n';
 
 const GEMINI_SESSION_JSON = JSON.stringify({
   sessionId: 'abc',
@@ -299,6 +312,91 @@ describe('state-monitor binary state files', () => {
   });
 });
 
+describe('RA-2/P2-11: agy liveness fallback via worker-pids heartbeat age / tee mtime', () => {
+  let dir: string;
+  let n = 0;
+
+  before(async () => {
+    dir = await createTempPaHome();
+  });
+
+  after(async () => {
+    await cleanup(dir);
+  });
+
+  async function stateDirWith(name: string, contents: Buffer | string): Promise<string> {
+    const stateDir = join(dir, `state-${name}-${n++}`);
+    await mkdir(stateDir, { recursive: true });
+    await writeFile(join(stateDir, `${name}.db`), contents);
+    return stateDir;
+  }
+
+  async function mockWorkerPids(pids: any[]): Promise<void> {
+    const { addWorkerPid } = await import('../src/worker-pids.js');
+    for (const pid of pids) {
+      await addWorkerPid(pid);
+    }
+  }
+
+  async function clearWorkerPids(): Promise<void> {
+    const workerPidsDir = join(dir, 'worker-pids');
+    await rm(workerPidsDir, { recursive: true, force: true }).catch(() => {});
+  }
+
+  afterEach(async () => {
+    await clearWorkerPids();
+  });
+
+  it('when worker-pids shows alive PID, binary state returns verdict alive', async () => {
+    // Mock a live worker-pids entry
+    await mockWorkerPids([{
+      pid: 12345,
+      spawnedBy: 1,
+      worker: 'agy',
+      skill: 'test-skill',
+      startedAt: new Date().toISOString(),
+      descendants: [],
+    }]);
+
+    const stateDir = await stateDirWith('agy-fallback', sqliteHeaderFile());
+
+    // Liveness injected via the isAliveFn seam (ESM exports are read-only)
+    const state = await analyzeAgentState(stateDir, '*.db', 'agy', { isAliveFn: (pid) => pid === 12345 });
+
+    assert.equal(state.verdict, 'alive', 'should treat as alive when worker-pids shows live PID');
+    assert.equal(state.degraded, 'binary', 'should still mark as degraded');
+    assert.ok(state.status.includes('PID 12345 alive'), 'status should mention the live PID');
+  });
+
+  it('when worker-pids shows all dead PIDs, binary state returns verdict unknown', async () => {
+    await mockWorkerPids([{
+      pid: 12345,
+      spawnedBy: 1,
+      worker: 'agy',
+      skill: 'test-skill',
+      startedAt: new Date().toISOString(),
+      descendants: [],
+    }]);
+
+    const stateDir = await stateDirWith('agy-dead', sqliteHeaderFile());
+
+    // Liveness injected via the isAliveFn seam: every PID reports dead
+    const state = await analyzeAgentState(stateDir, '*.db', 'agy', { isAliveFn: () => false });
+
+    assert.equal(state.verdict, 'unknown', 'should return unknown when all PIDs are dead');
+    assert.equal(state.degraded, 'binary', 'should still mark as degraded');
+  });
+
+  it('when no worker-pids entry exists, binary state returns verdict unknown', async () => {
+    const stateDir = await stateDirWith('agy-no-entry', sqliteHeaderFile());
+
+    const state = await analyzeAgentState(stateDir, '*.db', 'agy');
+
+    assert.equal(state.verdict, 'unknown', 'should return unknown when no worker-pids entry exists');
+    assert.equal(state.degraded, 'binary', 'should still mark as degraded');
+  });
+});
+
 describe('analyzeAgentState regression on text state files', () => {
   let dir: string;
 
@@ -315,6 +413,18 @@ describe('analyzeAgentState regression on text state files', () => {
     await mkdir(stateDir, { recursive: true });
     await writeFile(join(stateDir, `session.${ext}`), contents, 'utf8');
     return stateDir;
+  }
+
+  async function mockWorkerPids(pids: any[]): Promise<void> {
+    const { addWorkerPid } = await import('../src/worker-pids.js');
+    for (const pid of pids) {
+      await addWorkerPid(pid);
+    }
+  }
+
+  async function clearWorkerPids(): Promise<void> {
+    const workerPidsDir = join(dir, 'worker-pids');
+    await rm(workerPidsDir, { recursive: true, force: true }).catch(() => {});
   }
 
   it('still detects a pending tool call as alive', async () => {
@@ -360,6 +470,29 @@ describe('analyzeAgentState regression on text state files', () => {
     const stateDir = await jsonlDir('twoarg', PENDING_TOOL_JSONL);
     const state = await analyzeAgentState(stateDir, '*.jsonl');
     assert.equal(state.verdict, 'alive');
+  });
+
+  describe('P2-9: narrow the ? heuristic (stuck detection)', () => {
+    it('stuck: question WITH self-referential stem ("what should") fires stuck verdict', async () => {
+      const stateDir = await jsonlDir('question-with-stem', QUESTION_WITH_STEM_JSONL);
+      const state = await analyzeAgentState(stateDir, '*.jsonl', 'claude');
+      assert.equal(state.verdict, 'stuck');
+      assert.ok(state.status.includes('asking a question'));
+    });
+
+    it('stuck: very short question (≤12 chars) ending with ? fires stuck verdict', async () => {
+      const stateDir = await jsonlDir('question-very-short', QUESTION_VERY_SHORT_JSONL);
+      const state = await analyzeAgentState(stateDir, '*.jsonl', 'claude');
+      assert.equal(state.verdict, 'stuck');
+      assert.ok(state.status.includes('asking a question'));
+    });
+
+    it('NOT stuck: legitimate question without stem AND >12 chars returns alive (P2-9 fix)', async () => {
+      const stateDir = await jsonlDir('question-no-stem-long', QUESTION_NO_STEM_LONG_JSONL);
+      const state = await analyzeAgentState(stateDir, '*.jsonl', 'claude');
+      assert.equal(state.verdict, 'alive', 'long question without help-seeking stem is not stuck');
+      assert.ok(state.status.includes('thinking') || state.status.includes('responding'));
+    });
   });
 });
 

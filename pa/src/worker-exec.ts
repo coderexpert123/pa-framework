@@ -1,6 +1,7 @@
 import { spawn } from 'child_process';
-import { writeFile, unlink } from 'fs/promises';
+import { writeFile, unlink, mkdir } from 'fs/promises';
 import { join } from 'path';
+import { paHome } from './paths.js';
 import { tmpdir } from 'os';
 import { randomBytes, randomUUID } from 'crypto';
 import { DEFAULT_TIMEOUT, DEFAULT_IDLE_TIMEOUT } from './types.js';
@@ -167,7 +168,7 @@ export async function executeWorker(
         // Keep the already-held resource lock fresh while queued — a slot wait
         // can exceed HEARTBEAT_STALE_MS, and a purged topic lock would let a
         // concurrent same-topic dispatch through.
-        await blackboard.updateHeartbeat(resource, agentName, contextId).catch(() => {});
+        await blackboard.updateHeartbeat(resource, agentName, contextId).catch(err => logger.warn('worker-exec', 'heartbeat update failed during slot queue', { error: err?.message ?? String(err) }));
       });
   if (slotHandle === null) {
     await blackboard.releaseLock(resource, agentName, contextId);
@@ -226,6 +227,18 @@ export async function executeWorker(
 
     const mergedEnv = { ...process.env, ...(options.env || {}), PA_BOT_PID: String(process.pid) } as NodeJS.ProcessEnv;
 
+    // Tee stdout for agy: the shim wraps agy with the tee helper when
+    // AGY_TEE_OUT is set, capturing output to disk so the orphan reaper can
+    // recover sessionless workers' replies after a bot crash.
+    let teePath: string | undefined;
+    if (worker.name === 'agy' && !mergedEnv.AGY_TEE_OUT) {
+      const teeDir = join(paHome(), 'logs', 'worker-tee');
+      await mkdir(teeDir, { recursive: true });
+      const safeName = options.contextId || `${Date.now()}-${randomBytes(4).toString('hex')}`;
+      teePath = join(teeDir, `${safeName}.out`);
+      mergedEnv.AGY_TEE_OUT = teePath;
+    }
+
     // Snapshot state dir mtime before spawning so we can detect new activity
     const stateDir = worker.state_dir ? resolveStateDir(worker.state_dir) : null;
     const statePattern = worker.state_pattern || '*.jsonl';
@@ -241,7 +254,7 @@ export async function executeWorker(
         clearTimeout(maxTimer);
         clearInterval(heartbeatInterval);
         if (child.pid) {
-          (pidTracked || Promise.resolve()).then(() => removeWorkerPid(child.pid!)).catch(() => {});
+          (pidTracked || Promise.resolve()).then(() => removeWorkerPid(child.pid!)).catch(err => logger.warn('worker-exec', 'removeWorkerPid failed on done', { error: err?.message ?? String(err) }));
         }
         resolve(r);
       };
@@ -251,6 +264,8 @@ export async function executeWorker(
       let capturedSessionId: string | undefined;
       let lastCodexTelemetry: { usedPercent: number; windowMinutes: number; resetsAt: number } | undefined;
       let codexStreamError = ''; // captures {"type":"error",...} events from codex NDJSON stream
+      let agyStreamError = ''; // captures error text from agy result events with status !== SUCCESS
+      let agyResultSeen = false; // tracks whether an agy result event was parsed (for fallback logic)
       const isStreamJson = worker.output_format === 'stream-json';
 
       const child = spawn(worker.command, args, {
@@ -282,6 +297,7 @@ export async function executeWorker(
             ...(options.harvestWindowMs
               ? { harvestUntil: new Date(Date.now() + options.harvestWindowMs).toISOString() }
               : {}),
+            ...(teePath ? { teePath } : {}),
           }).catch((err) => {
             logger.warn('worker-pids', 'Failed to register worker pid', {
               pid: child.pid, worker: worker.name, error: String(err),
@@ -314,7 +330,7 @@ export async function executeWorker(
       }
 
       const mergeKillError = (reason: string) =>
-        codexStreamError ? `${reason}\n${codexStreamError}` : reason;
+        [codexStreamError, agyStreamError].filter(Boolean).join('\n') ? `${reason}\n${[codexStreamError, agyStreamError].filter(Boolean).join('\n')}` : reason;
 
       // Kills the wrapper PID (child.pid) AND every live tracked descendant
       // (bgTaskMap — refreshed each heartbeat from the real OS process tree).
@@ -380,6 +396,8 @@ export async function executeWorker(
       // idle timer while an evaluator call is already in flight).
       let evaluating = false;
       let maxExtensions = 0;
+      // Track consecutive extend verdicts for the same stuck evaluation (P2-17)
+      let consecutiveExtends = 0;
 
       const checkAndMaybeKill = async () => {
         if (resolved || evaluating) return;
@@ -391,7 +409,8 @@ export async function executeWorker(
             const state = await analyzeAgentState(stateDir, statePattern, worker.name);
 
             if (state.verdict === 'stuck') {
-              // Obvious stuck case — no need to call the LLM evaluator
+              // Stuck verdict resets the consecutive-extend counter
+              consecutiveExtends = 0;
               killWithMessage(`Killed: ${state.status}`);
               return;
             }
@@ -403,10 +422,12 @@ export async function executeWorker(
               const verdict = await evaluateWorkerState(stateDir, statePattern, worker.name, options.env, executeWorker);
               if (verdict) {
                 if (verdict.verdict === 'done') {
+                  consecutiveExtends = 0;
                   killWithSuccess(verdict.summary);
                   return;
                 }
                 if (verdict.verdict === 'kill') {
+                  consecutiveExtends = 0;
                   killWithSummary(
                     `Killed: LLM evaluator decided to stop (${verdict.reason})`,
                     verdict.summary,
@@ -414,11 +435,17 @@ export async function executeWorker(
                   return;
                 }
                 // verdict === 'extend'
-                process.stdout.write(`\r  [check] ${worker.name}: evaluator extending — ${verdict.summary}    `);
+                consecutiveExtends++;
+                if (consecutiveExtends >= 3) {
+                  killWithMessage(`Killed: ${consecutiveExtends} consecutive extend verdicts — forcing termination`);
+                  return;
+                }
+                process.stdout.write(`\r  [check] ${worker.name}: evaluator extending (${consecutiveExtends}/3) — ${verdict.summary}    `);
                 resetIdleTimer();
                 return;
               }
               // Evaluator unavailable/failed — fall through to heuristic result
+              consecutiveExtends = 0;
               if (state.verdict === 'alive') {
                 process.stdout.write(`\r  [check] ${worker.name}: ${state.status} — extending (no evaluator)...    `);
                 resetIdleTimer();
@@ -426,6 +453,7 @@ export async function executeWorker(
               }
             } else if (state.verdict === 'alive') {
               // This IS the evaluator — use heuristic only, no recursion
+              consecutiveExtends = 0;
               process.stdout.write(`\r  [check] ${worker.name}: ${state.status} — extending...    `);
               resetIdleTimer();
               return;
@@ -483,7 +511,7 @@ export async function executeWorker(
             if (resolved) return;
             await blackboard.updateHeartbeat(resource, agentName, contextId);
             if (slotHandle !== 'disabled') {
-              await blackboard.updateHeartbeat(slotHandle.slot, agentName, slotHandle.ctx).catch(() => {});
+              await blackboard.updateHeartbeat(slotHandle.slot, agentName, slotHandle.ctx).catch(err => logger.warn('worker-exec', 'heartbeat update failed during periodic heartbeat', { error: err?.message ?? String(err) }));
             }
 
             // BG-task tracking: one OS query → BFS in memory
@@ -491,7 +519,7 @@ export async function executeWorker(
             if (resolved) return; // guard: worker may have exited while querying OS
             // Persist the live worker tree so the orphan reaper can check liveness
             // even after the shell wrapper (child.pid) dies with a crashed spawner.
-            updateWorkerPidDescendants(child.pid!, descendants.map(d => d.pid)).catch(() => {});
+            updateWorkerPidDescendants(child.pid!, descendants.map(d => d.pid)).catch(err => logger.warn('worker-exec', 'updateWorkerPidDescendants failed', { error: err?.message ?? String(err) }));
             const now = Date.now();
             const currentPids = new Set(descendants.map(d => d.pid));
 
@@ -521,7 +549,7 @@ export async function executeWorker(
               bgNotify(
                 `bg-leak: ${alerting.length} long-running descendant(s) of ${worker.name} (pid ${child.pid})`,
                 body.slice(0, 3500),
-              ).catch(() => {});
+              ).catch(err => logger.warn('worker-exec', 'bgNotify failed for bg-leak alert', { error: err?.message ?? String(err) }));
             }
 
             // Check 1: process tree (idle-timer reset)
@@ -662,6 +690,33 @@ export async function executeWorker(
                   }
                 }
               }
+
+              // agy stream-json: uses event.event (not event.type) as discriminator.
+              // Gated on worker name to prevent codex/claude/gemini events from matching.
+              if (worker.name === 'agy' && event.event) {
+                // Session ID from init event (belt) and result event (suspenders)
+                if ((event.event === 'init' || event.event === 'result') && typeof event.conversation_id === 'string') {
+                  capturedSessionId = event.conversation_id;
+                }
+                // Also capture from event.result.conversation_id for result events (belt-and-suspenders)
+                if (event.event === 'result' && event.result && typeof event.result === 'object' && typeof event.result.conversation_id === 'string') {
+                  capturedSessionId = event.result.conversation_id;
+                }
+                // Result event: extract final response
+                if (event.event === 'result' && event.result && typeof event.result === 'object') {
+                  agyResultSeen = true;
+                  if (typeof event.result.response === 'string') {
+                    stdout = event.result.response;
+                  }
+                  if (event.result.status && event.result.status !== 'SUCCESS' && typeof event.result.response === 'string') {
+                    agyStreamError += (agyStreamError ? '\n' : '') + event.result.response;
+                  }
+                }
+                // step_update: accumulate text_delta as fallback (used if no result event)
+                if (event.event === 'step_update' && event.step_update?.text_delta && !agyResultSeen) {
+                  stdout += event.step_update.text_delta;
+                }
+              }
             } catch {
               // Malformed JSON line — skip
             }
@@ -683,7 +738,7 @@ export async function executeWorker(
           `Worker spawn failed: ${worker.name}`,
           `Failed to start ${worker.name}: ${err.message}\nResource: ${resource}`,
           { dedupKey: `worker-spawn-${worker.name}`, severity: 'error' },
-        ).catch(() => {});
+        ).catch(err => logger.warn('worker-exec', 'notifyUser failed for spawn error', { error: err?.message ?? String(err) }));
         done({
           success: false,
           output: stdout,
@@ -736,6 +791,28 @@ export async function executeWorker(
                 }
               }
             }
+
+            // agy stream-json: trailing buffer flush (same logic as stdout handler)
+            if (worker.name === 'agy' && event.event) {
+              if ((event.event === 'init' || event.event === 'result') && typeof event.conversation_id === 'string') {
+                capturedSessionId = event.conversation_id;
+              }
+              if (event.event === 'result' && event.result && typeof event.result === 'object' && typeof event.result.conversation_id === 'string') {
+                capturedSessionId = event.result.conversation_id;
+              }
+              if (event.event === 'result' && event.result && typeof event.result === 'object') {
+                agyResultSeen = true;
+                if (typeof event.result.response === 'string') {
+                  stdout = event.result.response;
+                }
+                if (event.result.status && event.result.status !== 'SUCCESS' && typeof event.result.response === 'string') {
+                  agyStreamError += (agyStreamError ? '\n' : '') + event.result.response;
+                }
+              }
+              if (event.event === 'step_update' && event.step_update?.text_delta && !agyResultSeen) {
+                stdout += event.step_update.text_delta;
+              }
+            }
           } catch {
             // Final buffer wasn't valid JSON — ignore
           }
@@ -770,8 +847,8 @@ export async function executeWorker(
 
         // Clear the heartbeat line
         if (stateDir) process.stdout.write('\r' + ' '.repeat(60) + '\r');
-        // Merge codex stream errors into the error field so rate-limit detection can see them
-        const combinedError = [codexStreamError, stderr, code !== 0 && !codexStreamError && !stderr ? `Exited with code ${code}` : '']
+        // Merge codex and agy stream errors into the error field so rate-limit detection can see them
+        const combinedError = [codexStreamError, agyStreamError, stderr, code !== 0 && !codexStreamError && !agyStreamError && !stderr ? `Exited with code ${code}` : '']
           .filter(Boolean).join('\n') || undefined;
         if (code !== 0) {
           logger.warn('worker-exec', 'spawn-failed', { worker: worker.name, exitCode: code, stderr_excerpt: (combinedError ?? '').slice(0, 1000) });
@@ -787,7 +864,7 @@ export async function executeWorker(
               `Worker exited with code ${code}: ${worker.name}`,
               `Worker: ${worker.name}\nResource: ${resourceKey}\nExit code: ${code}\nError: ${(combinedError ?? '').slice(0, 500)}`,
               { dedupKey: `worker-exit-${worker.name}-${resourceKey}`, severity: 'error' },
-            ).catch(() => {});
+            ).catch(err => logger.warn('worker-exec', 'notifyUser failed for exit alert', { error: err?.message ?? String(err) }));
           }
         }
         done({
@@ -815,9 +892,9 @@ export async function executeWorker(
                 `bg-orphan: ${orphans.length} orphaned descendant(s) of ${worker.name}`,
                 body.slice(0, 3500),
                 { dedupKey: `bg-orphan-${startedAt}-${workerPid}` },
-              ).catch(() => {});
+              ).catch(err => logger.warn('worker-exec', 'bgNotify failed for bg-orphan alert', { error: err?.message ?? String(err) }));
             }
-          }).catch(() => {});
+          }).catch(err => logger.warn('worker-exec', 'orphan sweep failed', { error: err?.message ?? String(err) }));
         }
       });
     });
@@ -830,7 +907,7 @@ export async function executeWorker(
   } finally {
     await blackboard.releaseLock(resource, agentName, contextId);
     if (slotHandle !== 'disabled') {
-      await blackboard.releaseLock(slotHandle.slot, agentName, slotHandle.ctx).catch(() => {});
+      await blackboard.releaseLock(slotHandle.slot, agentName, slotHandle.ctx).catch(err => logger.warn('worker-exec', 'releaseLock failed for slot', { error: err?.message ?? String(err) }));
     }
   }
 }

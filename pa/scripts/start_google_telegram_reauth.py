@@ -15,6 +15,7 @@ DEFAULT_SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.compose",
     "https://www.googleapis.com/auth/documents",
+    "https://www.googleapis.com/auth/contacts.readonly",
 ]
 
 def main():

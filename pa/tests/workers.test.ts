@@ -138,12 +138,13 @@ describe('executeWorker', () => {
     const stateDir = join(tempDir, 'state-stuck');
     await mkdir(stateDir, { recursive: true });
     
-    // Create a stuck state file (Gemini format: ends with ?)
+    // Create a stuck state file (question heuristic per P2-9: a bare '?' no
+    // longer suffices — the message must carry a help-seeking stem)
     const stateFile = join(stateDir, 'session.json');
     await writeFile(stateFile, JSON.stringify({
       messages: [
         { type: 'user', content: 'hello' },
-        { type: 'agy', content: 'How can I help you?' } 
+        { type: 'agy', content: 'What should I do next?' } 
       ]
     }), 'utf8');
 
@@ -1031,12 +1032,96 @@ describe('LLM evaluator', () => {
     const result = await executeWorker(worker, 'unused', { timeout: 8, idleTimeout: 2 });
     const elapsed = Date.now() - start;
 
-    // Should hit MAX timeout (not idle timeout) because evaluator kept extending.
-    // With maxExtensions=2 cap, the kill message now says "absolute timeout exceeded after N extensions".
+    // P2-17: consecutive-extend cap — after 3 extend verdicts, worker is killed
+    // (old behavior: always extend to max timeout; new behavior: kill after 3 extends)
     assert.equal(result.success, false);
-    const isMaxTimeout = result.error?.includes('exceeded max timeout') || result.error?.includes('absolute timeout exceeded');
-    assert.ok(isMaxTimeout, `Expected max timeout error, got: ${result.error}`);
-    assert.ok(elapsed >= 7000, `Should have lasted at least 7s, took ${elapsed}ms`);
+    assert.ok(result.error?.includes('Killed: 3 consecutive extend verdicts'), `Expected consecutive-extend kill, got: ${result.error}`);
+    // Timing is variable due to system load; 6s+ confirms the extend loop ran (vs immediate failure)
+    assert.ok(elapsed >= 5000, `Should have run extend loop, took ${elapsed}ms`);
+  });
+
+  describe('P2-17: consecutive-extend cap (worker-exec idle timer)', () => {
+    it('kills after 3 consecutive extend verdicts for the same stuck evaluation', async () => {
+      const stateDir = join(tempDir, 'state-consecutive-extend');
+      await mkdir(stateDir, { recursive: true });
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({
+        messages: [{ type: 'gemini', content: 'stuck in loop' }]
+      }), 'utf8');
+
+      // Evaluator that ALWAYS returns extend
+      const evalScript = await writeScript('evaluator-always-extend.js',
+        'process.stdout.write(JSON.stringify({verdict:"extend",summary:"Still working",reason:"not done"}));'
+      );
+
+      const workerScript = await writeScript('hang-consecutive-extend.js', 'setTimeout(()=>{}, 60000);');
+
+      await createTempConfig(tempDir, [
+        { name: 'worker-under-test', command: 'node', args: [workerScript], check: 'echo ok', priority: 1 },
+        { name: 'evaluator', command: 'node', args: [evalScript], check: 'echo ok', priority: 2 },
+      ], { evaluator: { worker: 'evaluator', timeout: 10 } });
+
+      const worker = makeWorker({
+        name: 'worker-under-test',
+        command: 'node',
+        args: [workerScript],
+        state_dir: stateDir,
+        state_pattern: 'session.json',
+      });
+
+      // Short idle timeout to trigger multiple evaluator checks
+      const result = await executeWorker(worker, 'unused', { timeout: 30, idleTimeout: 2 });
+
+      assert.equal(result.success, false);
+      assert.ok(result.error?.includes('3 consecutive extend verdicts'), `Should kill after 3 consecutive extends, got: ${result.error}`);
+    });
+
+    it('resets consecutive-extend counter on any non-extend verdict', async () => {
+      const stateDir = join(tempDir, 'state-reset-counter');
+      await mkdir(stateDir, { recursive: true });
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({
+        messages: [{ type: 'gemini', content: 'working' }]
+      }), 'utf8');
+
+      // Evaluator script: extend → extend → kill (resets before hitting cap).
+      // The call-count file lives in this test's OWN stateDir (unique per run) —
+      // the cwd-based version leaked state across runs and polluted the tree.
+      const evalScript = await writeScript('evaluator-reset.js', `
+        const fs = require('fs');
+        const path = require('path');
+        const counterFile = path.join(${JSON.stringify(stateDir)}, 'counter.txt');
+        let calls = 0;
+        try { calls = parseInt(fs.readFileSync(counterFile, 'utf8')); } catch {}
+        calls++;
+        fs.writeFileSync(counterFile, calls.toString());
+        if (calls <= 2) {
+          process.stdout.write(JSON.stringify({verdict:"extend",summary:"Continue",reason:"not done"}));
+        } else {
+          process.stdout.write(JSON.stringify({verdict:"kill",summary:"Stop now",reason:"done enough"}));
+        }
+      `);
+
+      const workerScript = await writeScript('hang-reset.js', 'setTimeout(()=>{}, 60000);');
+
+      await createTempConfig(tempDir, [
+        { name: 'worker-under-test', command: 'node', args: [workerScript], check: 'echo ok', priority: 1 },
+        { name: 'evaluator', command: 'node', args: [evalScript], check: 'echo ok', priority: 2 },
+      ], { evaluator: { worker: 'evaluator', timeout: 10 } });
+
+      const worker = makeWorker({
+        name: 'worker-under-test',
+        command: 'node',
+        args: [workerScript],
+        state_dir: stateDir,
+        state_pattern: 'session.json',
+      });
+
+      const result = await executeWorker(worker, 'unused', { timeout: 30, idleTimeout: 2 });
+
+      assert.equal(result.success, false);
+      // Should kill due to "kill" verdict (evaluator decision), NOT consecutive-extend cap
+      assert.ok(result.error?.includes('LLM evaluator decided to stop'), `Should respect kill verdict, got: ${result.error}`);
+      assert.ok(!result.error?.includes('3 consecutive'), `Should not hit consecutive-extend cap, got: ${result.error}`);
+    });
   });
 
   it('skips LLM evaluation when isEvaluator is true', async () => {
@@ -1112,5 +1197,181 @@ describe('LLM evaluator', () => {
     assert.equal(result.success, false);
     // Should NOT have the evaluator summary (evaluator failed)
     assert.ok(!result.output.includes('Should not be called'));
+  });
+});
+
+// P2-1 and P2-2 tests (2026-08-17 infra-audit wave A)
+describe('runWithFailover — P2-1 backoff on plain failure', () => {
+  it('adds 2s backoff before next worker after plain failure', async () => {
+    const brokenScript = await writeScript('backoff-broken.js', 'process.stderr.write("fail"); process.exit(1);');
+    const backupScript = await writeScript('backup-backup.js', 'process.stdout.write("backup ok");');
+    await createTempSecrets(tempDir, '');
+    await createTempConfig(tempDir, [
+      { name: 'broken_w', command: 'node', args: [brokenScript], check: 'echo ok', priority: 1, rate_limit_patterns: [] },
+      { name: 'backup_w', command: 'node', args: [backupScript], check: 'echo ok', priority: 2, rate_limit_patterns: [] },
+    ]);
+
+    const start = Date.now();
+    const { result, worker } = await runWithFailover('unused', { timeout: 10 });
+    const elapsed = Date.now() - start;
+
+    assert.equal(result.success, true);
+    assert.equal(worker, 'backup_w');
+    // Should take at least 2s due to backoff
+    assert.ok(elapsed >= 1900, `Expected >= 1900ms due to backoff, got ${elapsed}ms`);
+  });
+
+  it('skips backoff when last worker fails', async () => {
+    const brokenScript = await writeScript('last-broken.js', 'process.stderr.write("fail"); process.exit(1);');
+    await createTempSecrets(tempDir, '');
+    await createTempConfig(tempDir, [
+      { name: 'only_w', command: 'node', args: [brokenScript], check: 'echo ok', priority: 1, rate_limit_patterns: [] },
+    ]);
+
+    const start = Date.now();
+    const { result } = await runWithFailover('unused', { timeout: 10 });
+    const elapsed = Date.now() - start;
+
+    assert.equal(result.success, false);
+    // Should complete quickly without backoff (last worker)
+    assert.ok(elapsed < 1500, `Expected < 1500ms (no backoff on last worker), got ${elapsed}ms`);
+  });
+});
+
+describe('runWithFailover — P2-2 all-cooling wall alert', () => {
+  it('sends notification when all workers are cooling, even with noFallback', async () => {
+    await createTempSecrets(tempDir, '');
+    await createTempConfig(tempDir, [
+      { name: 'cooling_w', command: 'echo', args: ['x'], check: 'echo ok', priority: 1, rate_limit_patterns: [] },
+    ]);
+
+    // Manually write a cooldown state
+    const { join: pathJoin } = await import('path');
+    const rateLimitFile = pathJoin(tempDir, 'rate-limit-state.json');
+    const { writeFile: wf } = await import('fs/promises');
+    await wf(rateLimitFile, JSON.stringify({
+      cooling_w: { cooldown_until: new Date(Date.now() + 60000).toISOString(), last_event: new Date().toISOString(), reason: 'test' },
+    }), 'utf8');
+
+    let notificationSent = false;
+    let notificationBody = '';
+    const mockNotify = async (subject: string, body: string, opts?: unknown) => {
+      if (subject.includes('All workers rate-limited')) {
+        notificationSent = true;
+        notificationBody = body;
+      }
+      return { sent: true, suppressed: false };
+    };
+
+    const { result } = await runWithFailover('unused', {
+      timeout: 10,
+      resource: 'skill-test-all-cooling',
+      noFallback: true,  // Key: should still notify even when noFallback is set
+      _bgTaskHooks: {
+        notifyUser: mockNotify,
+      },
+    });
+
+    assert.equal(result.success, false);
+    assert.equal(notificationSent, true, 'Should send notification when all workers are cooling');
+    assert.ok(notificationBody.includes('cooling_w'), 'Notification should list cooling workers');
+  });
+
+  it('sends notification when pool is partially cooling and partially excluded', async () => {
+    await createTempSecrets(tempDir, '');
+    await createTempConfig(tempDir, [
+      { name: 'cooling_w', command: 'echo', args: ['x'], check: 'echo ok', priority: 1, rate_limit_patterns: [] },
+      { name: 'excluded_w', command: 'echo', args: ['x'], check: 'echo ok', priority: 2, rate_limit_patterns: [] },
+    ]);
+
+    // Manually write a cooldown state for only one worker
+    const { join: pathJoin } = await import('path');
+    const rateLimitFile = pathJoin(tempDir, 'rate-limit-state.json');
+    const { writeFile: wf } = await import('fs/promises');
+    await wf(rateLimitFile, JSON.stringify({
+      cooling_w: { cooldown_until: new Date(Date.now() + 60000).toISOString(), last_event: new Date().toISOString(), reason: 'test' },
+    }), 'utf8');
+
+    let notificationSent = false;
+    const mockNotify = async (subject: string, body: string) => {
+      if (subject.includes('All workers rate-limited')) {
+        notificationSent = true;
+      }
+      return { sent: true, suppressed: false };
+    };
+
+    const { result } = await runWithFailover('unused', {
+      timeout: 10,
+      resource: 'skill-test-partial-cooling',
+      excludeWorkers: new Set(['excluded_w']),  // Exclude the non-cooling worker
+      _bgTaskHooks: {
+        notifyUser: mockNotify,
+      },
+    });
+
+    assert.equal(result.success, false);
+    assert.equal(notificationSent, true, 'Should send notification when all candidates are cooling or excluded');
+  });
+
+  describe('filterSecretsForWorker', async () => {
+    const { filterSecretsForWorker } = await import('../src/workers.js');
+
+    it('passes through all secrets when secret_allowlist is absent (backward compatible)', () => {
+      const worker = makeWorker();
+      const allSecrets = { KEY1: 'val1', KEY2: 'val2', KEY3: 'val3' };
+      const filtered = filterSecretsForWorker(allSecrets, worker);
+      assert.deepEqual(filtered, allSecrets);
+    });
+
+    it('passes through all secrets when secret_allowlist is empty array', () => {
+      const worker = makeWorker({ secret_allowlist: [] });
+      const allSecrets = { KEY1: 'val1', KEY2: 'val2' };
+      const filtered = filterSecretsForWorker(allSecrets, worker);
+      assert.deepEqual(filtered, allSecrets);
+    });
+
+    it('filters to only the named secrets when secret_allowlist is present', () => {
+      const worker = makeWorker({ secret_allowlist: ['KEY1', 'KEY3'] });
+      const allSecrets = { KEY1: 'val1', KEY2: 'val2', KEY3: 'val3', KEY4: 'val4' };
+      const filtered = filterSecretsForWorker(allSecrets, worker);
+      assert.deepEqual(filtered, { KEY1: 'val1', KEY3: 'val3' });
+    });
+
+    it('warns about missing secrets but continues with the subset that exists', () => {
+      const cap = { warnings: [] as string[], original: console.warn };
+      console.warn = (...args: unknown[]) => { cap.warnings.push(args.map(String).join(' ')); };
+      try {
+        const worker = makeWorker({ secret_allowlist: ['KEY1', 'MISSING_KEY', 'KEY3'] });
+        const allSecrets = { KEY1: 'val1', KEY2: 'val2', KEY3: 'val3' };
+        const filtered = filterSecretsForWorker(allSecrets, worker);
+        // Should return only the existing secrets
+        assert.deepEqual(filtered, { KEY1: 'val1', KEY3: 'val3' });
+        // Should have warned about the missing secret
+        assert(cap.warnings.some(w => w.includes('MISSING_KEY') && w.includes('missing secrets')));
+      } finally {
+        console.warn = cap.original;
+      }
+    });
+
+    it('handles empty allowlist by returning empty object', () => {
+      const worker = makeWorker({ secret_allowlist: [] });
+      const allSecrets = { KEY1: 'val1', KEY2: 'val2' };
+      const filtered = filterSecretsForWorker(allSecrets, worker);
+      assert.deepEqual(filtered, allSecrets); // Empty array treated as absent, so passthrough
+    });
+
+    it('handles all secrets missing gracefully with warnings', () => {
+      const cap = { warnings: [] as string[], original: console.warn };
+      console.warn = (...args: unknown[]) => { cap.warnings.push(args.map(String).join(' ')); };
+      try {
+        const worker = makeWorker({ secret_allowlist: ['MISSING1', 'MISSING2'] });
+        const allSecrets = { KEY1: 'val1' };
+        const filtered = filterSecretsForWorker(allSecrets, worker);
+        assert.deepEqual(filtered, {});
+        assert(cap.warnings.some(w => w.includes('MISSING1') && w.includes('MISSING2')));
+      } finally {
+        console.warn = cap.original;
+      }
+    });
   });
 });

@@ -187,4 +187,112 @@ describe('loadConfig', () => {
       console.warn = cap.original;
     }
   });
+
+  describe('secret_allowlist', () => {
+    it('passes through when secret_allowlist is absent (backward compatible)', async () => {
+      await createTempConfig(tempDir, [
+        { name: 'w1', command: 'echo', args: ['x'], check: 'echo ok' },
+      ]);
+      const config = await loadConfig();
+      assert.equal(config.workers[0].secret_allowlist, undefined);
+    });
+
+    it('accepts a valid secret_allowlist with uppercase names', async () => {
+      await createTempConfig(tempDir, [
+        {
+          name: 'w1',
+          command: 'echo',
+          args: ['x'],
+          check: 'echo ok',
+          secret_allowlist: ['TELEGRAM_BOT_TOKEN', 'OPENAI_API_KEY', 'AWS_SECRET_KEY'],
+        },
+      ]);
+      const config = await loadConfig();
+      assert.deepEqual(config.workers[0].secret_allowlist, [
+        'TELEGRAM_BOT_TOKEN',
+        'OPENAI_API_KEY',
+        'AWS_SECRET_KEY',
+      ]);
+    });
+
+    it('rejects secret names that do not match [A-Z0-9_]+ pattern', async () => {
+      const cap = { warnings: [] as string[], original: console.warn };
+      console.warn = (...args: unknown[]) => { cap.warnings.push(args.map(String).join(' ')); };
+      try {
+        await createTempConfig(tempDir, [
+          {
+            name: 'w1',
+            command: 'echo',
+            args: ['x'],
+            check: 'echo ok',
+            secret_allowlist: ['VALID_NAME', 'invalid-name', 'ANOTHER_VALID', 'lowercase'],
+          },
+        ]);
+        const config = await loadConfig();
+        // Should keep only the valid names
+        assert.deepEqual(config.workers[0].secret_allowlist, ['VALID_NAME', 'ANOTHER_VALID']);
+        // Should have warned about the invalid entries
+        assert(cap.warnings.some(w => w.includes('invalid-name') && w.includes('does not match pattern')));
+        assert(cap.warnings.some(w => w.includes('lowercase') && w.includes('does not match pattern')));
+      } finally {
+        console.warn = cap.original;
+      }
+    });
+
+    it('treats empty secret_allowlist as absent', async () => {
+      const cap = { warnings: [] as string[], original: console.warn };
+      console.warn = (...args: unknown[]) => { cap.warnings.push(args.map(String).join(' ')); };
+      try {
+        await createTempConfig(tempDir, [
+          {
+            name: 'w1',
+            command: 'echo',
+            args: ['x'],
+            check: 'echo ok',
+            secret_allowlist: [],
+          },
+        ]);
+        const config = await loadConfig();
+        assert.equal(config.workers[0].secret_allowlist, undefined);
+        assert(cap.warnings.some(w => w.includes('has no valid entries') && w.includes('treating as absent')));
+      } finally {
+        console.warn = cap.original;
+      }
+    });
+
+    it('rejects non-array secret_allowlist', async () => {
+      const cap = { warnings: [] as string[], original: console.warn };
+      console.warn = (...args: unknown[]) => { cap.warnings.push(args.map(String).join(' ')); };
+      try {
+        await createTempConfig(tempDir, [
+          {
+            name: 'w1',
+            command: 'echo',
+            args: ['x'],
+            check: 'echo ok',
+            secret_allowlist: 'NOT_AN_ARRAY' as any,
+          },
+        ]);
+        const config = await loadConfig();
+        assert.equal(config.workers[0].secret_allowlist, undefined);
+        assert(cap.warnings.some(w => w.includes('must be an array')));
+      } finally {
+        console.warn = cap.original;
+      }
+    });
+
+    it('filters out null/undefined/empty entries from secret_allowlist', async () => {
+      await createTempConfig(tempDir, [
+        {
+          name: 'w1',
+          command: 'echo',
+          args: ['x'],
+          check: 'echo ok',
+          secret_allowlist: ['VALID', null, undefined, '', '  ', 'ANOTHER'] as any,
+        },
+      ]);
+      const config = await loadConfig();
+      assert.deepEqual(config.workers[0].secret_allowlist, ['VALID', 'ANOTHER']);
+    });
+  });
 });

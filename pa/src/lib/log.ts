@@ -14,6 +14,7 @@ import lockfile from 'proper-lockfile';
 import { safeLockOptions } from './safe-lock.js';
 import { paHome } from '../paths.js';
 import { rotateFileIfNeeded } from './archive-files.js';
+import { redactSecrets } from './redact.js';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
@@ -184,12 +185,14 @@ export function log(
   message: string,
   context?: Record<string, unknown>
 ): void {
+  // Redact secrets from context values before logging
+  const redactedContext = context ? redactSecrets(context) as Record<string, unknown> : context;
   const entry: LogEntry = {
     timestamp: new Date().toISOString(),
     level,
     module,
     message,
-    ...context,
+    ...redactedContext,
   };
 
   appendLog(entry);

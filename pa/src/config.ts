@@ -369,10 +369,40 @@ export async function loadConfig(): Promise<PaConfig> {
     throw new Error(`Invalid config: 'workers' must be an array in ${path}`);
   }
 
+  // Validation regex for secret names: uppercase alphanumeric + underscore only
+  const SECRET_NAME_PATTERN = /^[A-Z0-9_]+$/;
+
   const workers: WorkerConfig[] = parsed.workers.map((w: any, i: number) => {
     if (!w.name || !w.command || !w.args || !w.check) {
       throw new Error(`Worker #${i + 1} missing required fields (name, command, args, check)`);
     }
+
+    // Validate secret_allowlist if present
+    if (w.secret_allowlist !== undefined && w.secret_allowlist !== null) {
+      if (!Array.isArray(w.secret_allowlist)) {
+        console.warn(`[config] worker '${w.name}': 'secret_allowlist' must be an array of secret name strings; ignoring`);
+        w.secret_allowlist = undefined;
+      } else {
+        const validNames: string[] = [];
+        for (const entry of w.secret_allowlist) {
+          if (entry === undefined || entry === null) continue;
+          const name = String(entry).trim();
+          if (!name) continue;
+          if (!SECRET_NAME_PATTERN.test(name)) {
+            console.warn(`[config] worker '${w.name}': secret_allowlist entry '${name}' does not match pattern [A-Z0-9_]+; ignoring`);
+            continue;
+          }
+          if (!validNames.includes(name)) validNames.push(name);
+        }
+        if (validNames.length === 0) {
+          console.warn(`[config] worker '${w.name}': 'secret_allowlist' has no valid entries; treating as absent`);
+          w.secret_allowlist = undefined;
+        } else {
+          w.secret_allowlist = validNames;
+        }
+      }
+    }
+
     return {
       name: w.name,
       command: w.command,
@@ -386,6 +416,7 @@ export async function loadConfig(): Promise<PaConfig> {
       output_format: w.output_format,
       check_timeout: w.check_timeout || 30,
       tunables: parseTunables(w.tunables, w.name),
+      secret_allowlist: w.secret_allowlist,
     };
   });
 

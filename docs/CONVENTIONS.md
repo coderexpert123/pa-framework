@@ -209,8 +209,49 @@ The last row keeps growing because the failure mode keeps resurfacing under new 
 | `**/debug_*.{py,log}`, `**/*-debug.log` | debug outputs | transient |
 | `**/test_repro.*` | repro scripts | session-local |
 | `**/data/{raw,processed,exports}/` | project data dirs | per-project external data |
+| `projects/whatsapp-drafts/data/contacts.json` | contact directory cache | personal data (1200+ phone numbers), regenerable via `import_google.py`; never versioned — the private repo's no-history-rewrite policy would make one accidental commit permanent |
 | `**/__pycache__/`, `**/venv/`, `**/.venv/` | Python build/env | universal |
 | `**/node_modules/`, `**/dist/`, `**/*.tsbuildinfo` | Node build/env | universal |
+
+## Generated / runtime files — decision tree
+
+For any file the system *generates* during daily working (as opposed to files
+a human or agent authors as work product), ask three questions — they fully
+determine its handling:
+
+1. **Is it regenerable?** (external source of truth exists — an API, an
+   import, a re-runnable computation)
+2. **Who must read it?** (only pa/Python/Bot code — which can read any path —
+   vs. sandboxed worker CLIs, which effectively read only the repo tree)
+3. **Is it state or cache?** (appended-to/mutated as living state, vs a
+   rebuildable snapshot)
+
+| Answers | Handling | Examples |
+|---|---|---|
+| regenerable + pa-only readers | `~/.pa/` (runtime home) | `worker-capabilities.json`, profile.json |
+| regenerable + **worker CLI readers** | in-tree `data/` + **explicit-file** ignore in ALL FOUR ignore homes (`.gitignore`, `.gitignore-public`, this file's table, root CLAUDE.md) — same change that introduces the writer | `whatsapp-drafts/data/contacts.json` |
+| living state, cross-process readers | `~/.pa/` ALWAYS — never the tree (a mutating tracked file dirties the tree on every write and trips clean-worktree floors like the code-fixer's) | `pending-dispatches.json`, `worker-pids/`, topic states, DLQ |
+| per-run personal artifacts | in-repo path + explicit ignore (delivery convenience beats relocation) | `daily-mail-brief/emails.json`, `data/alerts_sent.jsonl` |
+| NOT regenerable + personal (primary data) | outside the repo (`~/Documents/personal-imports/`, or `~/.pa/` + secrets-backup coverage) — the private repo MAY hold personal data, but only as a deliberate hand-made commit, never via an auto-commit sweep | contact exports, statements, ID scans |
+| agent-authored judgment/work product | tracked normally (private repo; personal data acceptable) | `master-sheet.md`, plan files |
+
+Two hard rules that close the incident class (derived 2026-08-15, the
+contacts.json sweep):
+
+- **The ignore entry ships with the writer.** Any change that introduces a
+  generated file's write path adds its ignore entry in the same change — the
+  `commit` skill's survey and the nightly `update-brain` sweep treat
+  untracked-but-unignored files as pending work, which is exactly how an
+  accidental personal-data commit happens.
+- **Prefer explicit file paths over broad directory globs in ignore
+  patterns.** The `**/data/{raw,processed,exports}/` convention did not cover
+  files directly in `data/` — broad globs create false confidence; an exact
+  path cannot drift.
+- If a sweep already captured personal data and the commit is **local-only**,
+  the sanctioned remedy is a surgical pre-push rebase (the repo's no-rewrite
+  policy's one exception — see memory `project_session_2026_08_15_lessons`);
+  after push, it is permanent by policy, so the two rules above are the real
+  defense.
 
 ## The `scratch/` directory
 

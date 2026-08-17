@@ -31,9 +31,9 @@ import type { BlackboardLockClient } from './code-fixer.js';
 import { analyzeFeedbackPatterns } from './feedback-analyzer.js';
 import { exec as execCb } from 'child_process';
 import { promisify } from 'util';
-import { saveDraft, markDraftMeta, approveDraft, loadDraft, listDrafts } from './drafts.js';
+import { saveDraft, markDraftMeta, approveDraft, loadDraft, listDrafts, cleanRejected, updateDraftPrompt } from './drafts.js';
 import { skillsDir, draftsDir } from './paths.js';
-import { isProtected, isCriticalChange, hasRealSideEffects, isCmdBasedTarget, validateNewSkill, validateSkillFix, applyFix } from './validator.js';
+import { isProtected, isCriticalChange, hasRealSideEffects, isCmdBasedTarget, validateNewSkill, validateSkillFix, applyFix, regenerateProposal } from './validator.js';
 import { loadSkill } from './skills.js';
 import { blackboard } from './blackboard.js';
 import { exclusiveLockKey } from './commands/run.js';
@@ -155,6 +155,7 @@ export interface RollbackDeps {
   checkForRollbacksFn?: typeof checkForRollbacks;
   execFn?: (command: string, options?: { cwd?: string }) => Promise<{ stdout: string; stderr: string }>;
   blackboardFn?: BlackboardLockClient;
+  notifyUserFn?: typeof notifyUser;
 }
 
 type RollbackExec = NonNullable<RollbackDeps['execFn']>;
@@ -172,7 +173,7 @@ export interface GitRevertResult {
  * `git revert`s a prior applied-code-fix commit without tripping over — or destroying — the
  * nightly pa/data/profile* churn that learn_agent/oracle writes.
  *
- * The bare `git revert --no-edit HASH` this replaces aborted every time that churn was
+ * The bare `git revert --no-edit HASH` this replaced aborted every time that churn was
  * present ("Your local changes to the following files would be overwritten by merge:
  * pa/data/profile-history-archive.jsonl, pa/data/profile.json"), leaving the CONDEMNED fix
  * live: ~/.pa/self-improver-audit.jsonl records action 'rollback-failed' for commit 7b82c88
@@ -181,8 +182,9 @@ export interface GitRevertResult {
  *
  * Shape of the safe sequence — never `git checkout`/`git clean` the profile files, never
  * discard them:
- *   1. refuse outright if there is human WIP in the tree (mirrors code-fixer's F4, and is
- *      what makes the failure-path `git reset --hard HEAD` below safe);
+ *   1. compute the condemned commit's touched files; refuse only if non-churn WIP overlaps
+ *      those files (fallback to refusing on ANY non-churn WIP if diff-tree fails — fail
+ *      closed);
  *   2. stash ONLY the churn paths;
  *   3. `git revert -n` (staged, uncommitted) so the churn paths can be dropped from the
  *      revert before it becomes a commit — a revert commit carrying pa/data/profile* would
@@ -190,17 +192,48 @@ export interface GitRevertResult {
  *   4. commit, then pop the churn stash back on top.
  * A crash anywhere between 2 and 4 leaves profile.json at its last COMMITTED content — valid
  * JSON, never truncated — with the newer content recoverable from `git stash list`.
+ *
+ * On failure (e.g. merge conflict), cleanup runs `git revert --quit` + targeted
+ * `git checkout HEAD -- <condemned paths>` only — NOT a tree-wide `git reset --hard HEAD`,
+ * since the tree may legitimately carry unrelated WIP now that refusal is scoped.
  */
 export async function gitRevertPreservingChurn(
   commitHash: string,
   execFn: RollbackExec
 ): Promise<GitRevertResult> {
-  const { stdout: statusOut } = await execFn('git status --porcelain');
-  const humanWip = parsePorcelainPaths(statusOut).filter((p) => !isChurnPath(p));
-  if (humanWip.length > 0) {
-    throw new Error(
-      `working tree has ${humanWip.length} uncommitted change(s) (${humanWip.slice(0, 5).join(', ')}) — refusing to revert ${commitHash}; the condemned fix is still live.`
-    );
+  // Step 1: compute condemned commit's files to scope the refusal check.
+  let condemnedPaths: string[] = [];
+  let diffTreeFailed = false;
+  try {
+    const { stdout: diffTreeOut } = await execFn(`git diff-tree --no-commit-id --name-only -r ${commitHash}`);
+    condemnedPaths = diffTreeOut.trim().split('\n')
+      .filter(Boolean)
+      .map((p) => p.replace(/^"|"$/g, '')) // Strip surrounding quotes if present.
+      .map((p) => p.replace(/\\/g, '/')); // Normalize Windows backslashes.
+  } catch {
+    diffTreeFailed = true;
+  }
+
+  // Conservative fallback: if diff-tree failed or returned nothing, refuse on ANY non-churn WIP.
+  // This is fail-closed — the gate only gets narrower when we actually know the condemned set.
+  if (condemnedPaths.length === 0) {
+    const { stdout: statusOut } = await execFn('git status --porcelain');
+    const humanWip = parsePorcelainPaths(statusOut).filter((p) => !isChurnPath(p));
+    if (humanWip.length > 0) {
+      throw new Error(
+        `working tree has ${humanWip.length} uncommitted change(s) (${humanWip.slice(0, 5).join(', ')}) — refusing to revert ${commitHash}; the condemned fix is still live.`
+      );
+    }
+  } else {
+    // Narrow refusal: only refuse if non-churn WIP overlaps the condemned commit's files.
+    const { stdout: statusOut } = await execFn('git status --porcelain');
+    const humanWip = parsePorcelainPaths(statusOut).filter((p) => !isChurnPath(p));
+    const overlapping = humanWip.filter((p) => condemnedPaths.includes(p));
+    if (overlapping.length > 0) {
+      throw new Error(
+        `working tree has uncommitted change(s) overlapping the condemned commit (${overlapping.slice(0, 5).join(', ')}) — refusing to revert ${commitHash}; the condemned fix is still live.`
+      );
+    }
   }
 
   const stashed = await stashChurn(execFn, `pa-self-improver-revert-${commitHash}`);
@@ -220,10 +253,12 @@ export async function gitRevertPreservingChurn(
     await execFn('git revert --quit').catch(() => {});
   } catch (err) {
     revertErr = err;
-    // Leave nothing half-applied. Safe for the churn files: they are in the stash and get
-    // restored immediately below, and step 1 proved there is no human WIP to destroy.
+    // Scoped failure cleanup: only revert the condemned paths we know we touched, not the
+    // whole tree. Safe for the churn files: they are in the stash and get restored below.
     await execFn('git revert --quit').catch(() => {});
-    await execFn('git reset --hard HEAD').catch(() => {});
+    if (condemnedPaths.length > 0 && !diffTreeFailed) {
+      await execFn(`git checkout HEAD -- ${condemnedPaths.join(' ')}`).catch(() => {});
+    }
   }
 
   const churnRestoreError = stashed ? await popChurn(execFn) : undefined;
@@ -239,7 +274,7 @@ export async function gitRevertPreservingChurn(
 }
 
 export async function rollback(deps: RollbackDeps = {}): Promise<string[]> {
-  const { checkForRollbacksFn = checkForRollbacks, execFn = defaultRollbackExec, blackboardFn } = deps;
+  const { checkForRollbacksFn = checkForRollbacks, execFn = defaultRollbackExec, blackboardFn, notifyUserFn = notifyUser } = deps;
   const flags = await checkForRollbacksFn();
   // The overwhelming common case — checkForRollbacksFn() reads run metadata only, no git —
   // so this must never pay for or contend on a lock it doesn't need.
@@ -351,6 +386,16 @@ export async function rollback(deps: RollbackDeps = {}): Promise<string[]> {
           reason: `git revert ${flag.commitHash} failed: ${err.message}`.slice(0, 500),
           commit_hash: flag.commitHash,
         }).catch(() => {});
+
+        // Send pa-alerts notification (P2-19) — a bad fix is live pending manual revert
+        const refId = Math.random().toString(16).slice(2, 14);
+        await notifyUserFn(
+          `Rollback Failed — Bad Fix Live`,
+          `Skill: ${flag.skillName}\nCommit: ${flag.commitHash}\nDraft: ${flag.draftName}\n\nA failed rollback leaves the bad fix LIVE. Manual revert required.\n\n_Ref: ${refId}_`,
+          { dedupKey: 'rollback-failed', severity: 'error' },
+        ).catch((e) => {
+          console.error(`[self-improver] Failed to send rollback-failed notification: ${e?.message}`);
+        });
       }
     }
   }
@@ -419,7 +464,20 @@ export interface GateDeps {
   approveDraftFn?: typeof approveDraft;
   attemptCodeFixFn?: typeof attemptCodeFix;
   readRecentFailuresFn?: typeof readRecentFailures;
+  // Deliberately NO default here (unlike every Fn above) — the bounded validation retry below
+  // only runs when a caller opts in by passing this. main() wires the real regenerateProposal;
+  // every existing test that exercises "validation fails -> validation-failed-pending" without
+  // passing this keeps behaving exactly as it did before retry existed, since the retry loop's
+  // `regenerateProposalFn &&` check short-circuits on undefined.
+  regenerateProposalFn?: typeof regenerateProposal;
+  updateDraftPromptFn?: typeof updateDraftPrompt;
 }
+
+// 1 initial validation attempt + 1 retry-with-judge-feedback before parking as
+// validation-failed-pending (2026-07-29 autonomy pass). Bounded deliberately: each retry is
+// still the same fails-closed LLM-judged check, so this doesn't change the trust model, only
+// gives a plausibly-close proposal one more autonomous shot instead of dead-ending immediately.
+const MAX_VALIDATION_ATTEMPTS = 2;
 
 export async function gateAndApprove(
   tagged: Array<{ proposal: DraftProposal; sourceType: 'conversation' | 'failure' | 'feedback' }>,
@@ -432,6 +490,8 @@ export async function gateAndApprove(
     approveDraftFn = approveDraft,
     attemptCodeFixFn = attemptCodeFix,
     readRecentFailuresFn = readRecentFailures,
+    regenerateProposalFn,
+    updateDraftPromptFn = updateDraftPrompt,
   } = deps;
 
   const entries: ReportEntry[] = [];
@@ -455,22 +515,33 @@ export async function gateAndApprove(
     if (await hasRealSideEffects(proposal)) riskFlags.push('declares-secrets');
 
     if (!proposal.target_skill) {
+      let current = proposal;
       let detail: AuditValidation = {};
-      const valid = await validateNewSkillFn(proposal, undefined, (d) => { detail = d; });
+      let valid = await validateNewSkillFn(current, undefined, (d) => { detail = d; });
+      let attempts = 1;
+      while (!valid && regenerateProposalFn && attempts < MAX_VALIDATION_ATTEMPTS) {
+        const revised = await regenerateProposalFn(current, detail.judge_excerpt ?? 'Validation failed (dry run did not succeed).');
+        if (!revised) break;
+        current = revised;
+        valid = await validateNewSkillFn(current, undefined, (d) => { detail = d; });
+        attempts++;
+      }
+
       if (valid) {
-        await approveDraftFn(proposal.name, { approved_autonomously: true, risk_flags: riskFlags });
-        entries.push({ ...base, outcome: 'approved-new-skill', riskFlags });
+        if (attempts > 1) await updateDraftPromptFn(current.name, current.frontmatter, current.prompt);
+        await approveDraftFn(current.name, { approved_autonomously: true, risk_flags: riskFlags });
+        entries.push({ ...base, outcome: 'approved-new-skill', riskFlags, ...(attempts > 1 ? { detail: `validated on retry ${attempts}` } : {}) });
         await appendAuditRecord({
           ts: new Date().toISOString(), draft: proposal.name, source_type: sourceType,
           action: 'approved-new-skill', risk_flags: riskFlags, reason: proposal.reason,
-          validation: detail, diff: proposal.prompt.slice(0, 4000),
+          validation: detail, diff: current.prompt.slice(0, 4000),
         });
       } else {
         entries.push({ ...base, outcome: 'validation-failed-pending', riskFlags });
         await appendAuditRecord({
           ts: new Date().toISOString(), draft: proposal.name, source_type: sourceType,
           action: 'validation-failed', risk_flags: riskFlags, reason: proposal.reason,
-          validation: detail, diff: proposal.prompt.slice(0, 4000),
+          validation: detail, diff: current.prompt.slice(0, 4000),
         });
       }
     } else if (await isCmdBasedTarget(proposal.target_skill)) {
@@ -505,20 +576,30 @@ export async function gateAndApprove(
       let oldPrompt = '';
       try { oldPrompt = (await loadSkill(proposal.target_skill)).prompt; } catch { /* best-effort */ }
 
+      let current = proposal;
       let detail: AuditValidation = {};
-      const valid = await validateSkillFixFn(proposal, undefined, undefined, (d) => { detail = d; });
+      let valid = await validateSkillFixFn(current, undefined, undefined, (d) => { detail = d; });
+      let attempts = 1;
+      while (!valid && regenerateProposalFn && attempts < MAX_VALIDATION_ATTEMPTS) {
+        const revised = await regenerateProposalFn(current, detail.judge_excerpt ?? 'Validation failed (dry run did not succeed or judge rejected it).');
+        if (!revised) break;
+        current = revised;
+        valid = await validateSkillFixFn(current, undefined, undefined, (d) => { detail = d; });
+        attempts++;
+      }
+
       if (valid) {
-        await applyFixFn(proposal, riskFlags);
+        await applyFixFn(current, riskFlags);
         entries.push({
           ...base,
           outcome: 'applied-fix',
           riskFlags,
-          detail: `overwrote \`${proposal.target_skill}\` (backup: \`${proposal.name}/target-backup.skill.md\`)`,
+          detail: `overwrote \`${proposal.target_skill}\` (backup: \`${proposal.name}/target-backup.skill.md\`)${attempts > 1 ? ` — validated on retry ${attempts}` : ''}`,
         });
         await appendAuditRecord({
           ts: new Date().toISOString(), draft: proposal.name, source_type: sourceType,
           target_skill: proposal.target_skill, action: 'applied-fix', risk_flags: riskFlags,
-          reason: proposal.reason, validation: detail, diff: unifiedDiff(oldPrompt, proposal.prompt),
+          reason: proposal.reason, validation: detail, diff: unifiedDiff(oldPrompt, current.prompt),
           backup_path: join(draftsDir(), proposal.name, 'target-backup.skill.md'),
           baseline: toAuditBaseline(await skillRunStats(proposal.target_skill, ANALYSIS_DAYS)),
         });
@@ -527,7 +608,7 @@ export async function gateAndApprove(
         await appendAuditRecord({
           ts: new Date().toISOString(), draft: proposal.name, source_type: sourceType,
           target_skill: proposal.target_skill, action: 'validation-failed', risk_flags: riskFlags,
-          reason: proposal.reason, validation: detail, diff: unifiedDiff(oldPrompt, proposal.prompt),
+          reason: proposal.reason, validation: detail, diff: unifiedDiff(oldPrompt, current.prompt),
         });
       }
     }
@@ -540,7 +621,7 @@ function riskFlagSuffix(e: ReportEntry): string {
   return e.riskFlags && e.riskFlags.length > 0 ? ` [risk: ${e.riskFlags.join(', ')}]` : '';
 }
 
-export function buildReport(rollbackLines: string[], entries: ReportEntry[], staleCount: number = 0): string {
+export function buildReport(rollbackLines: string[], entries: ReportEntry[], staleCount: number = 0, purgedCount: number = 0): string {
   const applied = entries.filter((e) => e.outcome === 'approved-new-skill' || e.outcome === 'applied-fix' || e.outcome === 'applied-code-fix');
   const pending = entries.filter((e) => e.outcome === 'validation-failed-pending');
   const autoRejected = entries.filter((e) => e.outcome === 'auto-rejected-cmd-target');
@@ -561,6 +642,11 @@ export function buildReport(rollbackLines: string[], entries: ReportEntry[], sta
 
   if (staleCount > 0) {
     lines.push(`*Stale drafts reaped (${staleCount})* — pending >${STALE_DRAFT_DAYS} days; re-propose if still real.`);
+    lines.push('');
+  }
+
+  if (purgedCount > 0) {
+    lines.push(`*Rejected drafts purged (${purgedCount})* — terminal rejections removed from disk; fingerprints no longer block re-proposals.`);
     lines.push('');
   }
 
@@ -646,10 +732,11 @@ export function buildReport(rollbackLines: string[], entries: ReportEntry[], sta
 async function main() {
   const rollbackLines = await rollback();
   const staleCount = await sweepStaleDrafts();
+  const purgedCount = await cleanRejected();
   const { toGate, skipped } = await generateProposals();
-  const gateEntries = await gateAndApprove(toGate);
+  const gateEntries = await gateAndApprove(toGate, { regenerateProposalFn: regenerateProposal });
   const entries = [...skipped, ...gateEntries];
-  const report = buildReport(rollbackLines, entries, staleCount);
+  const report = buildReport(rollbackLines, entries, staleCount, purgedCount);
 
   // Local visibility only (captured in this run's own .log file) — NOT what gets delivered
   // to Telegram. See the file header for why: the skill has no telegram_output, precisely so

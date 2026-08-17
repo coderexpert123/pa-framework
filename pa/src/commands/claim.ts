@@ -164,7 +164,7 @@ export async function claimsCommand(): Promise<number> {
   return 0;
 }
 
-async function recentActivity(): Promise<string[]> {
+export async function recentActivity(): Promise<string[]> {
   // Must be the true repo root, not process.cwd() — git status --porcelain
   // returns root-relative paths regardless of invoking cwd, so joining them
   // onto anything else produces a non-existent path (see lib/git-root.ts).

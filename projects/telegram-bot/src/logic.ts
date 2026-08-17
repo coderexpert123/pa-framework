@@ -15,6 +15,7 @@ import {
   type TunableValidation,
 } from '../../../pa/dist/src/lib/tunables.js';
 import { BOT_COMMANDS } from './commands.js';
+import { redactSecrets } from '../../../pa/dist/src/lib/redact.js';
 
 export interface WorkerResult {
   success: boolean;
@@ -59,6 +60,20 @@ export const COMMIT_PATTERN = /^\/commit(?:@\w+)?\s*$/i;
 export const PUSH_PATTERN = /^\/push(?:@\w+)?\s*$/i;
 export const PUSH_PUBLIC_PATTERN = /^\/push_public(?:@\w+)?\s*$/i;
 export const INVESTIGATE_FLAGGED_PATTERN = /^\/investigate_flagged(?:@\w+)?\s*$/i;
+
+// PA_META run_skill authorization (2026-08-17 audit P1-2). These skills may only be
+// invoked by explicit human commands (/commit, /push, etc.) — never via PA_META
+// run_skill, because LLM inference about when to git-commit/push is too unreliable for
+// an operation that mutates the live tree.
+const PA_META_PROTECTED_SKILLS = new Set([
+  'self-improver',
+  'commit',
+  'push',
+  'push-public',
+  'commit-and-push',
+  'investigate-flagged',
+  'update-brain',
+]);
 
 // --- Worker tunables: /llm, /effort, /default <setting> [value] -------------
 // `/model` deliberately stays what it has always been (pick the CLI). These are
@@ -1015,11 +1030,22 @@ export function parseMetadata(output: string, executionMode = false): { cleaned:
       const candidate = jsonStr.slice(0, lastBrace + 1);
       const secondAttempt = tryParseMeta(candidate);
       if (secondAttempt !== undefined) return withMeta(cleaned, secondAttempt);
+      // Distinguish empty artifact (preserves envelope) from real artifact (strips marker)
+      if (trailing === '') {
+        // Empty trailing artifact: malformed JSON only, preserve envelope with warning
+        console.warn('[pa-meta] failed to parse envelope, actions dropped', { tail: output.slice(-80) });
+        return withMeta(output, null);
+      }
+      // Real trailing artifact (e.g. </invoke>): strip marker silently
       return withMeta(cleaned, null);
     }
   }
 
-  if (jsonStr.endsWith('}')) return withMeta(cleaned, null);
+  // Without trailing artifact: full envelope + warn
+  console.warn('[pa-meta] failed to parse envelope, actions dropped', { tail: output.slice(-80) });
+  if (jsonStr.endsWith('}')) {
+    return withMeta(output, null);
+  }
   return withMeta(output, null);
 }
 
@@ -1076,6 +1102,11 @@ export function applyMetaActions(
       const skillName = runSkillAction.skill;
       if (!/^[a-zA-Z0-9_-]+$/.test(skillName)) {
         console.warn(`[pa-meta] run_skill rejected — invalid skill name: ${skillName}`);
+        return { response: out, skillToRun: null, restartBot, kbNote };
+      }
+      if (PA_META_PROTECTED_SKILLS.has(skillName)) {
+        console.warn(`[pa-meta] run_skill rejected — protected skill: ${skillName}`);
+        out += `\n\n_(Skill trigger blocked: ${skillName} requires an explicit command.)_`;
         return { response: out, skillToRun: null, restartBot, kbNote };
       }
       out += `\n\n_(Triggering skill: ${skillName})_`;
@@ -1197,8 +1228,28 @@ export function buildWorkerResponse(result: WorkerResult, worker: string): strin
         const content = match[1].trim();
         if (content) blocks.push(content);
       }
-      if (blocks.length > 0) return normalizeMarkdown(blocks[blocks.length - 1]);
-      output = output.replace(/\[Thought: (true|false)\]/g, '').trim();
+      // If there are multiple thought blocks, use the last one (captures multi-step reasoning)
+      // If there's one thought block, prefer content after it (the actual response),
+      //   but fall back to thought block content if nothing substantive after
+      // Otherwise, strip orphaned tags and use remaining content
+      if (blocks.length > 1) {
+        output = blocks[blocks.length - 1];
+      } else if (blocks.length === 1) {
+        // Single thought block: check if there's non-whitespace content after it
+        const afterLastBlock = output.replace(/\[Thought: true\][\s\S]*?\[Thought: false\]/, '').trim();
+        // Check if afterLastBlock is substantive (not just planning headers, noise, or leftover tags)
+        const isSubstantiveAfter = afterLastBlock &&
+          !/^(\*\*[^*]+\*\*|Planning:|Strategy:|\[Thought)/.test(afterLastBlock) &&
+          afterLastBlock.length > 10; // Substantive responses are longer than headers/tags
+        if (isSubstantiveAfter) {
+          output = afterLastBlock;
+        } else {
+          output = blocks[0];
+        }
+      } else {
+        // No complete thought blocks: strip orphaned tags and use remaining content
+        output = output.replace(/\[Thought: (true|false)\]/g, '').trim();
+      }
     } else {
       output = output.replace(/<thought>[\s\S]*?<\/thought>\s*/gi, '');
       output = output.replace(/<\/?thought>/gi, '').trim();
@@ -1220,11 +1271,17 @@ export function buildWorkerResponse(result: WorkerResult, worker: string): strin
 
     if (isNoOutputSentinel(output)) return '';
 
-    return normalizeMarkdown(output);
+    // Apply redaction as the last line of defense before returning
+    const cleaned = normalizeMarkdown(output);
+    return redactSecrets(cleaned) as string;
   }
 
   if (!result.success) {
-    if (result.evaluatorSummary?.trim()) return result.evaluatorSummary.trim();
+    if (result.evaluatorSummary?.trim()) {
+      // Apply redaction to evaluatorSummary as well (WPB2: redaction layers)
+      const cleaned = normalizeMarkdown(result.evaluatorSummary.trim());
+      return redactSecrets(cleaned) as string;
+    }
     const snippet = result.error ? ` (${result.error})` : '';
     return `Sorry, I couldn't process that.${snippet}`;
   }

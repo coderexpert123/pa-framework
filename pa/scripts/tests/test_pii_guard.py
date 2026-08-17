@@ -20,6 +20,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch, MagicMock
 
 GUARD_PATH = os.path.join(
@@ -31,6 +32,14 @@ guard = importlib.util.module_from_spec(spec)
 with open(GUARD_PATH, encoding="utf-8") as f:
     code = f.read()
 exec(compile(code.replace('if __name__ == "__main__":', 'if False:'), GUARD_PATH, "exec"), guard.__dict__)
+
+# Module-level safety net (2026-08-14): prevent ANY real zclaude API call
+# during tests. Tests that exercise zclaude_check directly mock _run_agy or
+# resolve_zclaude_argv themselves; this default ensures tests that reach
+# main()/full_audit() via the agy-failure fallback path never invoke the
+# real zclaude binary (which would hang on a 150s timeout against api.z.ai).
+_original_resolve_zclaude = guard.resolve_zclaude_argv
+guard.resolve_zclaude_argv = lambda *a, **kw: None
 
 
 class TestResolveAgyArgv(unittest.TestCase):
@@ -691,6 +700,7 @@ class TestPushScanCoverage(unittest.TestCase):
              patch.object(guard, "collect_diff", side_effect=fake_collect), \
              patch.object(guard, "load_tripwires", return_value=list(tripwires)), \
              patch.object(guard, "agy_check", return_value=agy) as gc, \
+             patch.object(guard, "zclaude_check", return_value=(True, "", False)), \
              contextlib.redirect_stderr(buf):
             rc = guard.main()
         return rc, buf.getvalue(), gc
@@ -817,6 +827,7 @@ class TestPushModeFailClosed(unittest.TestCase):
              patch.object(guard, "collect_diff", side_effect=fake_collect), \
              patch.object(guard, "load_tripwires", return_value=["Secretname"]), \
              patch.object(guard, "agy_check", return_value=agy), \
+             patch.object(guard, "zclaude_check", return_value=(True, "", False)), \
              contextlib.redirect_stderr(buf):
             rc = guard.main()
         return rc, buf.getvalue()
@@ -888,6 +899,255 @@ class TestBypassRecord(unittest.TestCase):
             with patch.object(guard.os, "makedirs", side_effect=OSError("read-only")):
                 rc, err = self._bypass(tmp, [])
         self.assertEqual(rc, 0, "bookkeeping failure must never wedge the push")
+
+
+class TestReviewRecordHandoff(unittest.TestCase):
+    """AI-117 consolidation (2026-08-13): a completed semantic review of the
+    exact added-lines content can satisfy layer 3 via a hash-pinned record,
+    so the same diff is LLM-reviewed once instead of twice and an agy outage
+    no longer blocks a reviewed manual sync. Scope rules under test: TTL,
+    hash-pinning, layers 0-2 unconditional, --full never consults records."""
+
+    def setUp(self):
+        for lst in (guard.ADDED, guard.TOUCHED_PATHS, guard.TOUCHED_FILES,
+                    guard.UNREADABLE_PATHS, guard.MESSAGES):
+            lst.clear()
+
+    def _write_record(self, pa_home, content, age_s=0, reviewer="tester"):
+        os.makedirs(pa_home, exist_ok=True)
+        ts = (datetime.now(timezone.utc)
+              - timedelta(seconds=age_s)).isoformat(timespec="seconds")
+        rec = {"content_sha256": guard.added_content_hash(content),
+               "reviewed_at": ts, "reviewer": reviewer, "source": "push-public"}
+        with open(os.path.join(pa_home, "pii-guard-reviews.jsonl"), "a",
+                  encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+
+    def _main(self, pa_home, added=(), tripwires=(), agy=(True, "", True)):
+        def fake_collect():
+            guard.ADDED.extend(added)
+        env = {k: v for k, v in os.environ.items() if k != "PA_SKIP_PII_GUARD"}
+        buf = io.StringIO()
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(guard, "PA_HOME", pa_home), \
+             patch.object(guard.sys, "argv", ["pre-push-pii-guard", "origin", "git@x:y.git"]), \
+             patch.object(guard, "collect_diff", side_effect=fake_collect), \
+             patch.object(guard, "load_tripwires", return_value=list(tripwires)), \
+             patch.object(guard, "agy_check", return_value=agy) as gc, \
+             patch.object(guard, "zclaude_check", return_value=(True, "", False)), \
+             contextlib.redirect_stderr(buf):
+            rc = guard.main()
+        return rc, buf.getvalue(), gc
+
+    def test_fresh_matching_record_satisfies_layer3_without_invoking_agy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_record(tmp, "some added line\nother line")
+            rc, err, gc = self._main(tmp, added=["some added line", "other line"],
+                                     agy=(True, "", False))  # agy BROKEN
+            self.assertEqual(rc, 0, "a fresh matching record must satisfy layer 3")
+            self.assertEqual(gc.call_count, 0, "agy must not be invoked at all")
+            self.assertIn("review record", err)
+            self.assertIn("tester", err)
+
+    def test_stale_record_falls_through_to_agy_and_blocks_when_agy_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_record(tmp, "some added line", age_s=3600)  # 1h old
+            rc, err, gc = self._main(tmp, added=["some added line"],
+                                     agy=(True, "", False))
+            self.assertEqual(rc, 1, "TTL expired: ordinary fail-closed path")
+            self.assertEqual(gc.call_count, 1)
+
+    def test_mismatched_hash_falls_through_to_agy_and_blocks_when_agy_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_record(tmp, "DIFFERENT content entirely")
+            rc, err, gc = self._main(tmp, added=["some added line"],
+                                     agy=(True, "", False))
+            self.assertEqual(rc, 1, "hash mismatch: record covers other content")
+
+    def test_regex_layers_still_block_despite_a_valid_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            content = "leaky AcmeBank line"
+            self._write_record(tmp, content)
+            rc, err, gc = self._main(tmp, added=[content],
+                                     tripwires=[r"\bAcmeBank\b"],
+                                     agy=(True, "", False))
+            self.assertEqual(rc, 1, "a record waives NOTHING that layers 0-2 catch")
+            self.assertIn("(added lines)", err)
+
+    def test_corrupt_reviews_file_degrades_to_no_record_not_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "pii-guard-reviews.jsonl"), "w",
+                      encoding="utf-8") as f:
+                f.write("not json at all\n")
+            rc, err, gc = self._main(tmp, added=["x"], agy=(True, "", True))
+            self.assertEqual(rc, 0)
+            self.assertEqual(gc.call_count, 1, "clean agy verdict still the path")
+
+    def test_record_review_mode_round_trip_with_push_path(self):
+        """The golden property: a record emitted by --record-review for the
+        diff HEAD will push is accepted by main() for that same diff."""
+        added_lines = ["alpha line", "beta line"]
+
+        def fake_collect_added(base, local_sha):
+            guard.ADDED.extend(added_lines)
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             tempfile.TemporaryDirectory() as tmp2:
+            argv = ["pre-push-pii-guard", "--record-review",
+                    "--reviewer", "round-trip-test"]
+            with patch.object(guard, "PA_HOME", tmp), \
+                 patch.object(guard.sys, "argv", argv), \
+                 patch.object(guard, "_head_sha", return_value="b" * 40), \
+                 patch.object(guard, "_current_branch", return_value="sync/x"), \
+                 patch.object(guard, "_remote_branch_sha", return_value=None), \
+                 patch.object(guard, "_resolve_new_ref_base", return_value="a" * 40), \
+                 patch.object(guard, "_collect_added",
+                              side_effect=fake_collect_added):
+                rc = guard.record_review_mode(argv)
+            self.assertEqual(rc, 0)
+            record_file = os.path.join(tmp, "pii-guard-reviews.jsonl")
+            self.assertTrue(os.path.exists(record_file))
+
+            # Now the push: same content, agy hard-down — must pass on the
+            # record. Copy it into this run's PA_HOME (records are
+            # PA_HOME-scoped).
+            shutil.copyfile(record_file, os.path.join(tmp2, "pii-guard-reviews.jsonl"))
+            guard.ADDED.clear()
+            rc, err, gc = self._main(tmp2, added=added_lines, agy=(True, "", False))
+            self.assertEqual(rc, 0, "round trip: emitted record must satisfy the hook")
+            self.assertEqual(gc.call_count, 0)
+
+    def test_record_review_mode_requires_a_reviewer(self):
+        buf = io.StringIO()
+        with patch.object(guard, "PA_HOME", "/nonexistent"), \
+             patch.object(guard.sys, "argv", ["pre-push-pii-guard", "--record-review"]), \
+             contextlib.redirect_stderr(buf):
+            rc = guard.record_review_mode(["pre-push-pii-guard", "--record-review"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--reviewer", buf.getvalue())
+
+    def test_record_review_mode_with_no_added_lines_is_a_clean_noop(self):
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(guard, "PA_HOME", tmp), \
+                 patch.object(guard.sys, "argv", ["x", "--record-review", "--reviewer", "t"]), \
+                 patch.object(guard, "_head_sha", return_value="b" * 40), \
+                 patch.object(guard, "_current_branch", return_value="sync/x"), \
+                 patch.object(guard, "_remote_branch_sha", return_value="a" * 40), \
+                 patch.object(guard, "_collect_added", lambda base, sha: None), \
+                 contextlib.redirect_stderr(buf):
+                rc = guard.record_review_mode(
+                    ["x", "--record-review", "--reviewer", "t"])
+            self.assertEqual(rc, 0)
+            self.assertFalse(os.path.exists(os.path.join(tmp, "pii-guard-reviews.jsonl")))
+
+    def test_record_review_write_failure_fails_loud(self):
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            def fill(base, sha):
+                guard.ADDED.extend(["line"])
+            with patch.object(guard, "PA_HOME", tmp), \
+                 patch.object(guard.sys, "argv", ["x", "--record-review", "--reviewer", "t"]), \
+                 patch.object(guard, "_head_sha", return_value="b" * 40), \
+                 patch.object(guard, "_current_branch", return_value="sync/x"), \
+                 patch.object(guard, "_remote_branch_sha", return_value=None), \
+                 patch.object(guard, "_resolve_new_ref_base", return_value="a" * 40), \
+                 patch.object(guard, "_collect_added", side_effect=fill), \
+                 patch.object(guard.os, "makedirs", side_effect=OSError("read-only")), \
+                 contextlib.redirect_stderr(buf):
+                rc = guard.record_review_mode(
+                    ["x", "--record-review", "--reviewer", "t"])
+            self.assertEqual(rc, 1, "an unrecordable review must not silently pass")
+            self.assertIn("agy", buf.getvalue())
+
+
+class TestZclaudeFallback(unittest.TestCase):
+    """2026-08-14: when agy is unavailable (quota outage, missing binary,
+    timeout), the guard falls back to zclaude (Zhipu GLM via api.z.ai) before
+    hitting the fail-closed block — same prompt, same CLEAN/VIOLATION verdict."""
+
+    def setUp(self):
+        for lst in (guard.ADDED, guard.TOUCHED_PATHS, guard.TOUCHED_FILES,
+                    guard.UNREADABLE_PATHS, guard.MESSAGES):
+            lst.clear()
+
+    def _main(self, pa_home, added=(), tripwires=(),
+              agy=(True, "", False), zclaude=None):
+        """Pre-push main() with agy failing and optional zclaude fallback.
+        agy defaults to failing (the scenario the fallback exists for)."""
+        def fake_collect():
+            guard.ADDED.extend(added)
+        env = {k: v for k, v in os.environ.items() if k != "PA_SKIP_PII_GUARD"}
+        buf = io.StringIO()
+        mocks = [
+            patch.dict(os.environ, env, clear=True),
+            patch.object(guard, "PA_HOME", pa_home),
+            patch.object(guard.sys, "argv", ["pre-push-pii-guard", "origin", "git@x:y.git"]),
+            patch.object(guard, "collect_diff", side_effect=fake_collect),
+            patch.object(guard, "load_tripwires", return_value=list(tripwires)),
+            patch.object(guard, "agy_check", return_value=agy),
+        ]
+        if zclaude is not None:
+            mocks.append(patch.object(guard, "zclaude_check", return_value=zclaude))
+        with contextlib.ExitStack() as stack:
+            for m in mocks:
+                stack.enter_context(m)
+            with contextlib.redirect_stderr(buf):
+                rc = guard.main()
+        return rc, buf.getvalue()
+
+    def test_agy_down_zclaude_clean_pushes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, err = self._main(tmp, added=["some code line"],
+                                 agy=(True, "", False),
+                                 zclaude=(True, "", True))
+            self.assertEqual(rc, 0, "zclaude CLEAN verdict must let the push through")
+            self.assertIn("zclaude", err.lower())
+
+    def test_agy_down_zclaude_violation_blocks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, err = self._main(tmp, added=["leaky content"],
+                                 agy=(True, "", False),
+                                 zclaude=(False, "real name found", True))
+            self.assertEqual(rc, 1, "zclaude VIOLATION must block the push")
+            self.assertIn("zclaude", err.lower())
+
+    def test_agy_down_zclaude_also_down_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, err = self._main(tmp, added=["some code line"],
+                                 agy=(True, "", False),
+                                 zclaude=(True, "", False))
+            self.assertEqual(rc, 1, "both agy and zclaude down: fail-closed")
+
+    def test_zclaude_check_parses_clean_response(self):
+        mock_result = MagicMock(stdout="CLEAN", returncode=0)
+        with patch.object(guard, "resolve_zclaude_argv",
+                          return_value=["cmd", "/c", "zclaude.bat"]), \
+             patch.object(guard, "_run_agy", return_value=mock_result):
+            is_clean, reason, ok = guard.zclaude_check("content", [])
+        self.assertTrue(ok)
+        self.assertTrue(is_clean)
+
+    def test_zclaude_check_parses_violation_response(self):
+        mock_result = MagicMock(stdout="VIOLATION: phone number", returncode=0)
+        with patch.object(guard, "resolve_zclaude_argv",
+                          return_value=["cmd", "/c", "zclaude.bat"]), \
+             patch.object(guard, "_run_agy", return_value=mock_result):
+            is_clean, reason, ok = guard.zclaude_check("content", [])
+        self.assertTrue(ok)
+        self.assertFalse(is_clean)
+        self.assertIn("phone", reason)
+
+    def test_zclaude_check_returns_not_ok_when_binary_missing(self):
+        with patch.object(guard, "resolve_zclaude_argv", return_value=None):
+            is_clean, reason, ok = guard.zclaude_check("content", [])
+        self.assertFalse(ok)
+
+    def test_parse_llm_verdict_shared_helper(self):
+        self.assertEqual(guard._parse_llm_verdict("CLEAN"), (True, "", True))
+        self.assertEqual(guard._parse_llm_verdict("VIOLATION: test"), (False, "test", True))
+        self.assertEqual(guard._parse_llm_verdict("garbage"), (True, "", False))
+        self.assertEqual(guard._parse_llm_verdict("preamble\nCLEAN\ntail"), (True, "", True))
 
 
 class TestFullAuditPathScan(unittest.TestCase):
@@ -1048,6 +1308,67 @@ class TestSubprocessEncodingInvariant(unittest.TestCase):
         with open(GUARD_PATH, encoding="utf-8") as f:
             src = f.read()
         self.assertIn('encoding="utf-8", errors="replace"', src)
+
+
+class TestHelpAndBareInvocation(unittest.TestCase):
+    """Live incident 2026-08-17: push-public ran 'pre-push-pii-guard --help',
+    which had no --help path and fell into the stdin protocol, blocking forever.
+    Fixed: --help/-h print usage and exit 0 WITHOUT reading stdin."""
+
+    def test_help_flag_exits_zero_with_usage(self):
+        """Invoking with --help should print usage and exit 0, not hang on stdin."""
+        with tempfile.TemporaryDirectory() as tmp:
+            guard_path = os.path.join(tmp, "guard")
+            shutil.copy(GUARD_PATH, guard_path)
+            # Run with --help, with stdin explicitly closed to prove we don't read it.
+            result = subprocess.run(
+                ["python", guard_path, "--help"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=5,  # Should exit instantly; timeout = test failure.
+                encoding="utf-8",
+                errors="replace",
+            )
+        self.assertEqual(result.returncode, 0, f"exit 0, got {result.returncode}")
+        self.assertIn("PII scanner", result.stderr)
+        self.assertIn("--full", result.stderr)
+        self.assertIn("--record-review", result.stderr)
+
+    def test_short_help_flag_also_works(self):
+        """-h should behave the same as --help."""
+        with tempfile.TemporaryDirectory() as tmp:
+            guard_path = os.path.join(tmp, "guard")
+            shutil.copy(GUARD_PATH, guard_path)
+            result = subprocess.run(
+                ["python", guard_path, "-h"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                encoding="utf-8",
+                errors="replace",
+            )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("PII scanner", result.stderr)
+
+    def test_bare_invocation_with_closed_stdin_exits_zero(self):
+        """Bare invocation (no args) with closed stdin should print usage and exit,
+        not block forever reading from a pipe that will never close."""
+        with tempfile.TemporaryDirectory() as tmp:
+            guard_path = os.path.join(tmp, "guard")
+            shutil.copy(GUARD_PATH, guard_path)
+            result = subprocess.run(
+                [sys.executable, guard_path],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=5,  # The bug: this would hang forever.
+                encoding="utf-8",
+                errors="replace",
+            )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("PII scanner", result.stderr)
 
 
 if __name__ == "__main__":
