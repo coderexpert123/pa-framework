@@ -4,7 +4,7 @@
 # `pa init` scaffolds a minimal default; this template shows ALL fields.
 
 workers:
-  # ---- zclaude (priority 1 — your highest-preferred worker) ----
+  # === zclaude (priority 1 — your highest-preferred worker) ===
   - name: zclaude
     command: zclaude          # PATH-resolved binary, or absolute path
     # Windows: command: C:/Users/you/.local/bin/zclaude.bat
@@ -32,7 +32,7 @@ workers:
     priority: 1
     state_dir: "~/.claude/projects"   # for session-mode rate-limit detection
     state_pattern: "*.jsonl"
-    # ---- secret_allowlist (optional, defense-in-depth) ----
+    # === secret_allowlist (optional, defense-in-depth) ===
     # If absent, this worker receives ALL secrets from secrets.env.
     # If present, ONLY the named secrets are injected into the worker's environment.
     # Secret names must match pattern [A-Z0-9_]+ (uppercase alphanumeric + underscore).
@@ -44,7 +44,7 @@ workers:
     #   - TELEGRAM_BOT_TOKEN
     #   - OPENAI_API_KEY
     # secret_allowlist:
-    # ---- tunables (optional) ----
+    # === tunables (optional) ===
     # User-settable knobs this worker's CLI exposes. The bot surfaces them as
     # ONE uniform command per knob (/llm <name>, /effort <value>) regardless of
     # which CLI is active; everything CLI-specific lives here.
@@ -84,7 +84,7 @@ workers:
         values: [low, medium, high, xhigh, max]
         description: "Effort level for the session (Claude Code 2.x --effort)."
 
-  # ---- codex (priority 4) ----
+  # === codex (priority 4) ===
   - name: codex
     command: codex
     # Windows (Node-based, path varies by npm setup):
@@ -121,7 +121,7 @@ workers:
         values: [minimal, low, medium, high]
         description: "Reasoning effort, via codex's -c config override."
 
-  # ---- claude (priority 5 — last resort) ----
+  # === claude (priority 5 — last resort) ===
   - name: claude
     command: claude
     # Windows: command: C:/Users/<you>/AppData/Roaming/npm/claude.cmd
@@ -157,7 +157,7 @@ workers:
         values: [low, medium, high, xhigh, max]
         description: "Effort level for the session (Claude Code 2.x --effort)."
 
-  # ---- agy (priority 2 — Antigravity CLI) ----
+  # === agy (priority 2 — Antigravity CLI) ===
   # Plain-text worker: it has no --output-format flag, so pa never sees
   # stream-json events from it. Consequence: pa cannot capture a native session
   # id for agy (worker-exec only reads session ids off stream-json events), so
@@ -223,7 +223,7 @@ workers:
         values: ["gemini-3.7-flash-high", "gemini-3.7-flash-medium", "gemini-3.7-flash-low", "gemini-3.6-flash-high", "gemini-3.6-flash-medium", "gemini-3.6-flash-low", "gemini-3.5-flash-high", "gemini-3.5-flash-medium", "gemini-3.5-flash-low", "gemini-3.1-pro-high", "gemini-3.1-pro-low", "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium"]
         description: "Model for this CLI session (run `agy models` for the current list — from PowerShell/cmd, not Git Bash, where it hangs). Effort is embedded in the gemini names; a base name with no -high/-medium/-low suffix is rejected. There is deliberately NO effort knob on v1.1.13+ (a bare --effort is rejected — AI-155)."
 
-# ---- evaluator (optional) ----
+# === evaluator (optional) ===
 # When a worker appears stuck (no output for idle_timeout seconds), the
 # orchestrator consults this LLM to decide: extend timeout, kill, or
 # fail-over to next worker.
@@ -231,7 +231,7 @@ evaluator:
   worker: claude            # name must match one of the workers above
   timeout: 60               # seconds; default 60
 
-# ---- topic_defaults (optional) ----
+# === topic_defaults (optional) ===
 # Maps Telegram (chat_id, thread_id) pairs to a preferred worker.
 # Useful when you want different topics to default to different LLMs
 # (e.g., a "coding" topic always uses claude, a "research" topic always
@@ -242,12 +242,12 @@ topic_defaults:
   # "-1001234567890_310": claude       # supergroup thread 310 → claude
   # "-1001234567890_29": gemini
 
-# ---- bg_tasks (background-leak detection) ----
+# === bg_tasks (background-leak detection) ===
 bg_tasks:
   alert_seconds: 300          # alert if a worker's descendant outlives parent by N seconds; min 60
   alert_repeat_seconds: 1800  # repeat alerts every N seconds (must be >= alert_seconds); default 1800
 
-# ---- maintenance (optional) ----
+# === maintenance (optional) ===
 # Overrides for declared maintenance jobs. Run `pa maintenance list` for the
 # full table with resolved target paths. A knob may only DISABLE a job or
 # CHANGE its cadence — it can never add or widen a target.
@@ -255,7 +255,29 @@ bg_tasks:
 #   session-gc:    { enabled: true, every: 6h }
 #   archive-prune: { every: 1h }
 
-# ---- transcription (optional) ----
+# === usage (optional) ===
+# Track token usage and set budget alerts. The `pa costs` command reports
+# usage rollups by worker, model, and skill. When budget_monthly_usd is set,
+# alerts fire at 50/80/100% of the monthly budget (once per threshold per month).
+# Cost estimation requires a price table to be configured — without prices,
+# tokens are tracked but costs remain null, and budget alerts are inert.
+# usage:
+#   budget_monthly_usd: 100   # optional monthly USD budget; alerts fire at 50/80/100%
+
+# === quota-aware failover (optional) ===
+# Opt-in flag to enable health-score-based worker ordering. When ON:
+# - workers in cooldown are demoted to the tail of the failover chain
+# - workers with 3+ consecutive recent failures are demoted to the tail
+# - stable priority order is preserved among healthy workers
+# When OFF (default): workers are tried in fixed priority order.
+# quota_aware_failover: false
+
+# === worker pin (optional) ===
+# Persisted override for 'pa worker pin <name>' — the named worker is tried
+# first in all dispatches regardless of health. Set via CLI, edit manually to clear.
+# worker_pin: "claude"
+
+# === transcription (optional) ===
 # Controls how Telegram VOICE NOTES become text. If you never send voice notes,
 # ignore this whole block — everything else works exactly as before.
 #
@@ -300,3 +322,4 @@ bg_tasks:
 #   # is accepted but logs a config-load warning, since it will likely mistranscribe
 #   # or transliterate rather than fail outright. Leave unset (null) to auto-detect.
 #   language: null
+

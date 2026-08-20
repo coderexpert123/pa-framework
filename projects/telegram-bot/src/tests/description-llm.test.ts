@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   generateDescriptionWithLLM,
   DESCRIPTION_SYSTEM_PROMPT,
+  BRANCH_DESCRIPTION_SYSTEM_PROMPT,
 } from '../main.js';
 
 const ORIGINAL_PLATFORM = process.platform;
@@ -85,6 +86,30 @@ describe('generateDescriptionWithLLM — argument handling', { concurrency: 1 },
     await generateDescriptionWithLLM('hyper-local', undefined, makeRunner(captured, 'success'));
     assert.equal(captured.opts.shell, true);
   });
+
+  it('supports branch description context with parent name, description, and user prompt', async () => {
+    setPlatform('linux');
+    await generateDescriptionWithLLM(
+      {
+        name: 'auth-jwt',
+        isBranch: true,
+        parentName: 'web-backend',
+        parentDescription: 'Backend API service',
+        userPrompt: 'refactor auth to use jwt tokens',
+        sampleTurns: 'fix auth bug',
+      },
+      undefined,
+      makeRunner(captured, 'success'),
+    );
+
+    assert.equal(captured.args[0], '--system-prompt');
+    assert.equal(captured.args[1], BRANCH_DESCRIPTION_SYSTEM_PROMPT);
+    assert.ok(captured.args[3].includes('Branch topic name: auth-jwt'));
+    assert.ok(captured.args[3].includes('Parent topic: web-backend'));
+    assert.ok(captured.args[3].includes('Parent topic description: Backend API service'));
+    assert.ok(captured.args[3].includes('Branch creation prompt: refactor auth to use jwt tokens'));
+    assert.ok(captured.args[3].includes('Context: fix auth bug'));
+  });
 });
 
 describe('generateDescriptionWithLLM — runner output handling', { concurrency: 1 }, () => {
@@ -101,12 +126,17 @@ describe('generateDescriptionWithLLM — runner output handling', { concurrency:
   });
 });
 
-describe('DESCRIPTION_SYSTEM_PROMPT — quote-regression guard', () => {
+describe('DESCRIPTION_SYSTEM_PROMPT & BRANCH_DESCRIPTION_SYSTEM_PROMPT — quote-regression guard', () => {
   it('contains no double-quote characters (otherwise Windows arg quoting breaks)', () => {
     assert.equal(
       DESCRIPTION_SYSTEM_PROMPT.includes('"'),
       false,
       'DESCRIPTION_SYSTEM_PROMPT must not contain " characters — they break the Windows shell arg-quoting fix in generateDescriptionWithLLM',
+    );
+    assert.equal(
+      BRANCH_DESCRIPTION_SYSTEM_PROMPT.includes('"'),
+      false,
+      'BRANCH_DESCRIPTION_SYSTEM_PROMPT must not contain " characters — they break the Windows shell arg-quoting fix in generateDescriptionWithLLM',
     );
   });
 });

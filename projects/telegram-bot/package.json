@@ -10,7 +10,8 @@
     "build": "tsc",
     "start": "node dist/main.js",
     "dev": "tsc --watch",
-    "test": "node --import ./dist/tests/test-env-setup.js --test dist/tests/*.test.js"
+    "test": "node scripts/run-tests.mjs",
+    "test:quarantined": "node scripts/run-tests.mjs --quarantined"
   },
   "dependencies": {
     "fs-extra": "^11.3.4",

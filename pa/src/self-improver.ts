@@ -39,7 +39,10 @@ import { blackboard } from './blackboard.js';
 import { exclusiveLockKey } from './commands/run.js';
 import { appendAuditRecord, readAuditRecords, skillRunStats, toAuditBaseline, unifiedDiff } from './lib/improvement-audit.js';
 import type { AuditValidation } from './lib/improvement-audit.js';
+import { runEvalGate, formatEvalDetail } from './lib/eval-gate.js';
 import { notifyUser, resolveNotifyTopic } from './lib/notify.js';
+import { createPostmortemStub } from './lib/postmortem.js';
+import type { PostmortemInput, PostmortemMetadata } from './lib/postmortem.js';
 import { rm, copyFile } from 'fs/promises';
 import { join } from 'path';
 import type { DraftProposal, DraftMeta } from './types.js';
@@ -70,6 +73,92 @@ export async function getReportTopic(): Promise<{ chat_id: string; thread_id: nu
     chatKey: 'PA_SELF_IMPROVER_CHAT_ID',
     threadKey: 'PA_SELF_IMPROVER_THREAD_ID',
   });
+}
+
+/**
+ * Generates a URL-safe slug from a rollback/rollback-failed event.
+ * Converts to kebab-case and limits length to avoid filesystem issues.
+ */
+function generatePostmortemSlug(action: string, skillName: string, commitHash?: string): string {
+  const base = `${action}-${skillName}`;
+  const suffix = commitHash ? `-${commitHash.slice(0, 8)}` : '';
+  // Limit to reasonable length and ensure filesystem-safe
+  return `${base}${suffix}`.toLowerCase().replace(/[^a-z0-9-]+/g, '-').slice(0, 60);
+}
+
+/**
+ * Creates action items from the audit record's skill+reason.
+ * Each action item is a concise checklist item for follow-up.
+ */
+function generateActionItems(skillName: string, reason: string, commitHash?: string): string[] {
+  const items: string[] = [
+    `Investigate root cause of ${skillName} rollback`,
+  ];
+  if (commitHash) {
+    items.push(`Review code changes in commit ${commitHash}`);
+  }
+  items.push(`Update this postmortem with root cause analysis`);
+  items.push(`Close resolved action items (uncheck when complete)`);
+  return items;
+}
+
+/**
+ * Extracts timeline refs from the audit record and context.
+ * For rollbacks, includes the original fix commit and the revert commit.
+ */
+function extractTimelineRefs(commitHash?: string, revertCommitHash?: string): string[] {
+  const refs: string[] = [];
+  // Future: could look up ref-IDs from the audit trail or recent logs
+  if (revertCommitHash) {
+    refs.push(`Revert commit: ${revertCommitHash}`);
+  }
+  return refs;
+}
+
+/**
+ * Creates a postmortem stub and updates INDEX.md after a rollback or rollback-failed.
+ * Called immediately after appendAuditRecord in the rollback path.
+ *
+ * This is deterministic and does not use an LLM — it's pure string templating.
+ */
+async function maybeCreatePostmortem(
+  action: 'rolled-back' | 'rollback-failed',
+  skillName: string,
+  reason: string,
+  commitHash?: string,
+  revertCommitHash?: string
+): Promise<void> {
+  try {
+    const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+    const slug = generatePostmortemSlug(action, skillName, commitHash);
+    const title = `${action === 'rolled-back' ? 'Rollback' : 'Failed Rollback'}: ${skillName}`;
+
+    const timelineRefs = extractTimelineRefs(commitHash, revertCommitHash);
+    const actionItems = generateActionItems(skillName, reason, commitHash);
+
+    const input: PostmortemInput = {
+      date: today,
+      slug,
+      title,
+      timelineRefs,
+      actionItems,
+    };
+
+    const meta: PostmortemMetadata = {
+      created: new Date().toISOString(),
+      sourceAction: action,
+      sourceSkill: skillName,
+      sourceCommit: commitHash,
+    };
+
+    const filepath = await createPostmortemStub(input, meta);
+
+    // Log to console so it appears in the self-improver run log
+    console.log(`[self-improver] Postmortem stub created: ${filepath}`);
+  } catch (err) {
+    // Postmortem creation failure must not break the rollback flow
+    console.error(`[self-improver] Failed to create postmortem stub: ${err}`);
+  }
 }
 // Not 1 day: analyzeConversationPatterns/analyzeFailurePatterns require a pattern to repeat
 // across *different* days (2-3+ occurrences) to qualify — a 1-day window would make that
@@ -354,6 +443,8 @@ export async function rollback(deps: RollbackDeps = {}): Promise<string[]> {
           revert_commit_hash: revertCommitHash,
           baseline: toAuditBaseline(await skillRunStats(flag.skillName, ANALYSIS_DAYS)),
         });
+        // WPD6: Create postmortem stub after rollback
+        await maybeCreatePostmortem('rolled-back', flag.skillName, 'Elevated failure rate since the code fix was applied — git-reverted.', flag.commitHash, revertCommitHash);
         continue; // audit written above with the revert-specific fields — skip the shared one
       } else {
         await rm(join(skillsDir(), flag.skillName), { recursive: true, force: true });
@@ -371,6 +462,8 @@ export async function rollback(deps: RollbackDeps = {}): Promise<string[]> {
         reason: `Elevated failure rate since ${flag.kind === 'restore' ? 'the fix was applied' : 'it was approved'} — auto-rolled-back.`,
         baseline: toAuditBaseline(await skillRunStats(flag.skillName, ANALYSIS_DAYS)),
       });
+      // WPD6: Create postmortem stub after rollback
+      await maybeCreatePostmortem('rolled-back', flag.skillName, `Elevated failure rate since ${flag.kind === 'restore' ? 'the fix was applied' : 'it was approved'} — auto-rolled-back.`);
     } catch (err: any) {
       lines.push(`- Rollback FAILED for \`${flag.skillName}\` (${flag.kind}): ${err.message}`);
       if (flag.kind === 'git-revert') {
@@ -386,6 +479,9 @@ export async function rollback(deps: RollbackDeps = {}): Promise<string[]> {
           reason: `git revert ${flag.commitHash} failed: ${err.message}`.slice(0, 500),
           commit_hash: flag.commitHash,
         }).catch(() => {});
+
+        // WPD6: Create postmortem stub after rollback-failed
+        await maybeCreatePostmortem('rollback-failed', flag.skillName, `git revert ${flag.commitHash} failed: ${err.message}`.slice(0, 500), flag.commitHash).catch(() => {});
 
         // Send pa-alerts notification (P2-19) — a bad fix is live pending manual revert
         const refId = Math.random().toString(16).slice(2, 14);
@@ -589,6 +685,35 @@ export async function gateAndApprove(
       }
 
       if (valid) {
+        // Wave H WPH1: Run the golden-task eval gate (SOFT in v1 — informs, doesn't gate)
+        const evalResult = await runEvalGate({
+          skillName: proposal.target_skill!,
+          changedPrompt: current.prompt,
+          fullEval: false // v1: deterministic-only subset
+        });
+
+        // If eval fails, park as validation-failed-pending with eval detail (NOT auto-reject)
+        if (evalResult.fail > 0) {
+          entries.push({
+            ...base,
+            outcome: 'validation-failed-pending',
+            riskFlags,
+            detail: `Eval gate failed (${formatEvalDetail(evalResult)}) — parked for human review via \`pa improvements\``
+          });
+          await appendAuditRecord({
+            ts: new Date().toISOString(), draft: proposal.name, source_type: sourceType,
+            target_skill: proposal.target_skill, action: 'validation-failed', risk_flags: riskFlags,
+            reason: proposal.reason, validation: detail, diff: unifiedDiff(oldPrompt, current.prompt),
+            eval: {
+              pass: evalResult.pass,
+              fail: evalResult.fail,
+              skipped: evalResult.skipped,
+              detail: formatEvalDetail(evalResult)
+            }
+          });
+          continue; // Skip the apply path
+        }
+
         await applyFixFn(current, riskFlags);
         entries.push({
           ...base,
@@ -602,6 +727,12 @@ export async function gateAndApprove(
           reason: proposal.reason, validation: detail, diff: unifiedDiff(oldPrompt, current.prompt),
           backup_path: join(draftsDir(), proposal.name, 'target-backup.skill.md'),
           baseline: toAuditBaseline(await skillRunStats(proposal.target_skill, ANALYSIS_DAYS)),
+          eval: {
+            pass: evalResult.pass,
+            fail: evalResult.fail,
+            skipped: evalResult.skipped,
+            detail: formatEvalDetail(evalResult)
+          }
         });
       } else {
         entries.push({ ...base, outcome: 'validation-failed-pending', riskFlags });

@@ -237,6 +237,93 @@ The list of recognized skill names lives in `~/.pa/codex-skill-translations.json
 
 The same list is also used by the bot's `PASS_THROUGH_PATTERN` in `projects/telegram-bot/src/logic.ts` to recognize commands that should not be routed to LLMs (e.g., `/deep-plan` should reach the deep-plan skill, not be interpreted as bot conversation).
 
+## MCP integration
+
+The pa CLI can run as a local MCP server, exposing read-only tools to LLM clients (Claude Code, Codex, agy). This enables agents to query pa state without spawning subprocesses.
+
+### Available tools
+
+| Tool | Purpose |
+|---|---|
+| `pa_ref_lookup` | Look up a ref-ID (e.g. "c-a59a") to find what message produced it |
+| `pa_claims` | List active path reservations + recently modified files (multi-session coordination) |
+| `pa_maintenance_status` | Show maintenance ledger (last run, outcome, consecutive failures/skips) |
+| `pa_costs` | Usage/cost rollup by worker, model, and skill |
+| `pa_slo_report` | SLO error budget report for bot-reply-delivery, daily-mail-brief, catchup-heartbeat, ekadashi-alerts |
+
+### Starting the server
+
+```bash
+pa mcp serve
+```
+
+The server uses stdio transport — it reads JSON-RPC from stdin and writes responses to stdout.
+
+### Registration
+
+Run `pa mcp manifest` to print the manifest and registration instructions for your CLI:
+
+```bash
+pa mcp manifest
+```
+
+**Claude (claude mcp add):**
+```bash
+claude mcp add pa-mcp --stdio pa mcp serve
+```
+
+**Codex (~/.codex/config.json):**
+```json
+{
+  "mcpServers": {
+    "pa-mcp": {
+      "command": "node",
+      "args": ["D:/Personal Assistant/pa/mcp/server.mjs"]
+    }
+  }
+}
+```
+
+**agy (~/.agy/config.yaml):**
+```yaml
+mcp:
+  servers:
+    pa-mcp:
+      command: node
+      args:
+        - D:/Personal Assistant/pa/mcp/server.mjs
+```
+
+The manifest file at `~/.pa/mcp.json` contains the full tool definitions for reference.
+
+### Tool schema
+
+All tools return structured text responses. Example:
+
+```json
+{
+  "name": "pa_ref_lookup",
+  "arguments": {
+    "id": "c-a59a"
+  }
+}
+```
+
+Returns:
+```text
+{
+  "refId": "c-a59a",
+  "kind": "turn",
+  "timestamp": "2026-08-17T12:34:56.789Z",
+  "worker": "agy",
+  "chatId": 123456789,
+  "threadId": 9855,
+  "messageId": 12345,
+  "text": "The assistant's reply...",
+  "source": "conversation-history"
+}
+```
+
 ## Related docs
 
 - [`CONFIGURATION.md`](CONFIGURATION.md) — `config.yaml` schema reference

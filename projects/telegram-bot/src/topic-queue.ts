@@ -36,8 +36,8 @@ export type HeldItem = string | { promise: Promise<VoiceResult>; descriptor: Voi
 export interface SteerFoldContext {
   /** Drained entries carrying voice promises. The normalizer awaits them. */
   drainedEntries: QueueEntry[];
-  /** The steer instruction (from /steer prompt arg or caption). */
-  steerPrompt: string;
+  /** The steer instruction (from /steer prompt arg or caption), if any. */
+  steerPrompt?: string;
 }
 
 export interface QueueEntry {

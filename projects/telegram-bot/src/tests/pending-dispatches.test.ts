@@ -6,6 +6,7 @@ import { join } from 'path';
 import {
   addPendingDispatch,
   removePendingDispatch,
+  updatePendingDispatch,
   listPendingDispatches,
   pendingDispatchKey,
   PENDING_DISPATCH_MAX_AGE_MS,
@@ -126,5 +127,63 @@ describe('pending-dispatches store', () => {
     const listed = await listPendingDispatches();
     assert.equal(listed.length, 1);
     assert.equal(listed[0].cwd, 'D:/Personal Assistant');
+  });
+
+  // WP1: updatePendingDispatch tests
+  it('updatePendingDispatch merges fields into an existing record', async () => {
+    const rec = makeRecord();
+    const key = pendingDispatchKey(rec.chatId, rec.threadId, rec.updateId);
+    await addPendingDispatch(rec);
+    await updatePendingDispatch(key, { teePath: '/tee/test.out', workerName: 'agy' });
+    _resetPendingDispatchesForTest();
+    const listed = await listPendingDispatches();
+    assert.equal(listed.length, 1);
+    assert.equal(listed[0].teePath, '/tee/test.out');
+    assert.equal(listed[0].workerName, 'agy');
+    // Original fields preserved
+    assert.equal(listed[0].userText, 'go yes on that plan');
+    assert.equal(listed[0].session?.session_id, 'abc-123');
+  });
+
+  it('updatePendingDispatch is a no-op for a removed record', async () => {
+    const rec = makeRecord();
+    const key = pendingDispatchKey(rec.chatId, rec.threadId, rec.updateId);
+    await addPendingDispatch(rec);
+    await removePendingDispatch(key);
+    // Should not throw even though record is gone
+    await assert.doesNotReject(updatePendingDispatch(key, { teePath: '/tee/test.out', workerName: 'agy' }));
+    // Store stays empty
+    assert.deepEqual(await listPendingDispatches(), []);
+  });
+
+  it('updatePendingDispatch survives cache reset (disk roundtrip)', async () => {
+    const rec = makeRecord();
+    const key = pendingDispatchKey(rec.chatId, rec.threadId, rec.updateId);
+    await addPendingDispatch(rec);
+    await updatePendingDispatch(key, { teePath: '/tee/test.out', workerName: 'claude' });
+    // Cache reset forces disk reload
+    _resetPendingDispatchesForTest();
+    const listed = await listPendingDispatches();
+    assert.equal(listed.length, 1);
+    assert.equal(listed[0].teePath, '/tee/test.out');
+    assert.equal(listed[0].workerName, 'claude');
+  });
+
+  it('backward compat: loading an old on-disk record without new fields still works', async () => {
+    // Write a JSON file directly with a record that has no teePath/workerName
+    const legacy = makeRecord();
+    delete (legacy as any).teePath;
+    delete (legacy as any).workerName;
+    const key = pendingDispatchKey(legacy.chatId, legacy.threadId, legacy.updateId);
+    writeFileSync(join(home, 'telegram-pending-dispatches.json'), JSON.stringify({ [key]: legacy }), 'utf8');
+    _resetPendingDispatchesForTest();
+    const listed = await listPendingDispatches();
+    assert.equal(listed.length, 1);
+    // New fields should be undefined, not throw
+    assert.equal(listed[0].teePath, undefined);
+    assert.equal(listed[0].workerName, undefined);
+    // Original fields intact
+    assert.equal(listed[0].userText, 'go yes on that plan');
+    assert.equal(listed[0].session?.session_id, 'abc-123');
   });
 });

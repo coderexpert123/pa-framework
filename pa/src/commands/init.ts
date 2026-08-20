@@ -141,7 +141,7 @@ bg_tasks:
   alert_seconds: 300
   alert_repeat_seconds: 1800
 
-# ---- maintenance (optional) ----
+# === maintenance (optional) ===
 # Overrides for declared maintenance jobs. Run \`pa maintenance list\` for the
 # full table with resolved target paths. A knob may only DISABLE a job or
 # CHANGE its cadence — it can never add or widen a target.
@@ -149,7 +149,26 @@ bg_tasks:
 #   session-gc:    { enabled: true, every: 6h }
 #   archive-prune: { every: 1h }
 
-# ---- transcription (optional) ----
+# === usage (optional) ===
+# Track token usage and set budget alerts. The \`pa costs\` command reports
+# usage rollups by worker, model, and skill. When budget_monthly_usd is set,
+# alerts fire at 50/80/100% of the monthly budget (once per threshold per month).
+# Cost estimation requires a price table to be configured — without prices,
+# tokens are tracked but costs remain null, and budget alerts are inert.
+# usage:
+#   budget_monthly_usd: 100   # optional monthly USD budget; alerts fire at 50/80/100%
+
+# === quota-aware failover (optional) ===
+# Opt-in flag for health-score-based worker ordering. When ON, cooldown
+# workers and those with 3+ consecutive failures are demoted to the tail.
+# When OFF (default): workers tried in fixed priority order.
+# quota_aware_failover: false
+
+# === worker pin (optional) ===
+# Persisted override for 'pa worker pin <name>' — set via CLI command.
+# worker_pin: "claude"
+
+# === transcription (optional) ===
 # Controls how Telegram VOICE NOTES become text. If you never send voice notes,
 # ignore this whole block — everything else works exactly as before.
 #

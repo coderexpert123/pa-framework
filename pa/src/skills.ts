@@ -112,6 +112,7 @@ export async function loadSkill(name: string): Promise<Skill> {
       ? meta.worker_args.map((a: unknown) => String(a))
       : undefined,
     exclusive_resource: meta.exclusive_resource,
+    cost_tier: meta.cost_tier || 'anytime',
   };
 
   return { name, path: skillPath, frontmatter, prompt: body };

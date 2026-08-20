@@ -15,7 +15,7 @@ import { loadTopicNames, setTopicDescription } from './topic-names.js';
 import { appendRefIdAndLog } from './ref-id.js';
 
 const DASHBOARD_TOPIC_NAME = 'system-dashboard';
-const DASHBOARD_DESCRIPTION = 'Live system status — keep-awake state, model failover order, per-CLI settings, and scheduled skill crons. Auto-updated by the bot.';
+const DASHBOARD_DESCRIPTION = 'Live system status — keep-awake state, agent failover order, per-CLI settings, and scheduled skill crons. Auto-updated by the bot.';
 
 /**
  * THE CAPABILITY MATRIX IS GLOBAL, NOT PER-TOPIC.
@@ -23,13 +23,13 @@ const DASHBOARD_DESCRIPTION = 'Live system status — keep-awake state, model fa
  * This is a single pinned message for the whole chat, so it can only ever
  * document what is POSSIBLE. A topic's ACTIVE value comes from the 4-tier
  * cascade (session / topic / worker default / CLI default) and is answered by a
- * bare `/llm` or `/effort` in that topic. Keep this distinction spelled out in
+ * bare `/model` or `/effort` in that topic. Keep this distinction spelled out in
  * the rendered text — a matrix that reads like current state is worse than no
  * matrix at all.
  */
 const CAPABILITY_NOTE =
   'What each CLI ACCEPTS — capability only, never any topic’s active setting. '
-  + 'Set with /llm or /effort inside a topic; send either one bare to see that topic’s current value.';
+  + 'Set with /model or /effort inside a topic; send either one bare to see that topic’s current value.';
 
 /**
  * Telegram hard-caps a message at 4096 characters, and `editMessageText` (this
@@ -265,8 +265,8 @@ export async function getDashboardContent(): Promise<string> {
   head.push(`⏰ **Keep-awake**: ${kaStatus}`);
   head.push('');
 
-  // 2. Model priorities + per-worker capability matrix
-  head.push('⚙️ **Model Failover Order & Settings**');
+  // 2. Agent priorities + per-worker capability matrix
+  head.push('⚙️ **Agent Failover Order & Settings**');
   head.push(`_${CAPABILITY_NOTE}_`);
 
   // 3. Scheduled Skills

@@ -673,6 +673,35 @@ describe('runWithFailover', () => {
     assert.equal(worker, 'backup');
   });
 
+  it('evaluates getExtraArgs dynamically for each candidate worker during failover', async () => {
+    const brokenScript = await writeScript('failover-w1.js', 'process.stderr.write("error"); process.exit(1);');
+    const backupScript = await writeScript('failover-w2.js', 'process.stdout.write(JSON.stringify(process.argv.slice(2)));');
+    await createTempConfig(tempDir, [
+      {
+        name: 'w1',
+        command: 'node',
+        args: [brokenScript],
+        check: 'echo ok',
+        priority: 1,
+      },
+      {
+        name: 'w2',
+        command: 'node',
+        args: [backupScript],
+        check: 'echo ok',
+        priority: 2,
+      },
+    ]);
+    const { result, worker } = await runWithFailover('unused', {
+      timeout: 10,
+      getExtraArgs: (w) => w.name === 'w2' ? ['--model', 'gemini-3.7-flash-high'] : ['--model', 'opusplan'],
+    });
+    assert.equal(result.success, true);
+    assert.equal(worker, 'w2');
+    assert.ok(result.output.includes('gemini-3.7-flash-high'), 'w2 must receive extraArgs resolved for w2');
+    assert.ok(!result.output.includes('opusplan'), 'w2 must not receive w1 extraArgs');
+  });
+
   it('returns failure when all workers exhausted', async () => {
     await createTempConfig(tempDir, [
       { name: 'w1', command: 'echo', args: ['x'], check: 'nonexistent_cmd_xyz', priority: 1 },
@@ -1373,5 +1402,83 @@ describe('runWithFailover — P2-2 all-cooling wall alert', () => {
         console.warn = cap.original;
       }
     });
+  });
+});
+
+// WPE4 tests — quota-aware failover ordering (proposal #17)
+describe('runWithFailover — WPE4 quota-aware failover ordering', () => {
+  it('opt-in flag off → byte-identical legacy order (no reordering)', async () => {
+    const script1 = await writeScript('order-w1.js', 'process.stdout.write("w1");');
+    const script2 = await writeScript('order-w2.js', 'process.stdout.write("w2");');
+    await createTempConfig(tempDir, [
+      { name: 'w1', command: 'node', args: [script1], check: 'echo ok', priority: 1, rate_limit_patterns: [] },
+      { name: 'w2', command: 'node', args: [script2], check: 'echo ok', priority: 2, rate_limit_patterns: [] },
+    ], { quota_aware_failover: false });
+
+    const { result, worker } = await runWithFailover('unused', { timeout: 10 });
+    assert.equal(result.success, true);
+    assert.equal(worker, 'w1', 'Should try w1 first when flag is off (legacy order)');
+  });
+
+  it('cooling worker demoted to tail when flag is ON', async () => {
+    const script1 = await writeScript('cool-w1.js', 'process.stdout.write("w1");');
+    const script2 = await writeScript('cool-w2.js', 'process.stdout.write("w2");');
+    await createTempConfig(tempDir, [
+      { name: 'w1', command: 'node', args: [script1], check: 'echo ok', priority: 1, rate_limit_patterns: [] },
+      { name: 'w2', command: 'node', args: [script2], check: 'echo ok', priority: 2, rate_limit_patterns: [] },
+    ], { quota_aware_failover: true });
+
+    // Manually write a cooldown state for w1 (priority 1, should be demoted)
+    const { join: pathJoin } = await import('path');
+    const rateLimitFile = pathJoin(tempDir, 'rate-limit-state.json');
+    const { writeFile: wf } = await import('fs/promises');
+    await wf(rateLimitFile, JSON.stringify({
+      w1: { cooldown_until: new Date(Date.now() + 60000).toISOString(), last_event: new Date().toISOString(), reason: 'test' },
+    }), 'utf8');
+
+    const { result, worker } = await runWithFailover('unused', { timeout: 10 });
+    assert.equal(result.success, true);
+    assert.equal(worker, 'w2', 'Should skip cooling w1 and try w2 first');
+  });
+
+  it('pinned worker always first regardless of health or flag', async () => {
+    const script1 = await writeScript('pin-w1.js', 'process.stdout.write("w1");');
+    const script2 = await writeScript('pin-w2.js', 'process.stdout.write("w2");');
+    await createTempConfig(tempDir, [
+      { name: 'w1', command: 'node', args: [script1], check: 'echo ok', priority: 2, rate_limit_patterns: [] },
+      { name: 'w2', command: 'node', args: [script2], check: 'echo ok', priority: 1, rate_limit_patterns: [] },
+    ], { quota_aware_failover: true, worker_pin: 'w1' });
+
+    const { result, worker } = await runWithFailover('unused', { timeout: 10 });
+    assert.equal(result.success, true);
+    assert.equal(worker, 'w1', 'Pinned worker w1 should be tried first despite lower priority');
+  });
+
+  it('stable priority order preserved among healthy workers', async () => {
+    const script1 = await writeScript('stable-w1.js', 'process.stdout.write("w1");');
+    const script2 = await writeScript('stable-w2.js', 'process.stdout.write("w2");');
+    const script3 = await writeScript('stable-w3.js', 'process.stdout.write("w3");');
+    await createTempConfig(tempDir, [
+      { name: 'w1', command: 'node', args: [script1], check: 'echo ok', priority: 1, rate_limit_patterns: [] },
+      { name: 'w2', command: 'node', args: [script2], check: 'echo ok', priority: 3, rate_limit_patterns: [] },
+      { name: 'w3', command: 'node', args: [script3], check: 'echo ok', priority: 2, rate_limit_patterns: [] },
+    ], { quota_aware_failover: true });
+
+    const { result, worker } = await runWithFailover('unused', { timeout: 10 });
+    assert.equal(result.success, true);
+    assert.equal(worker, 'w1', 'Healthy workers should maintain priority order (w1 priority 1 first)');
+  });
+
+  it('preferredWorker option overrides config worker_pin for single dispatch', async () => {
+    const script1 = await writeScript('pref-w1.js', 'process.stdout.write("w1");');
+    const script2 = await writeScript('pref-w2.js', 'process.stdout.write("w2");');
+    await createTempConfig(tempDir, [
+      { name: 'w1', command: 'node', args: [script1], check: 'echo ok', priority: 1, rate_limit_patterns: [] },
+      { name: 'w2', command: 'node', args: [script2], check: 'echo ok', priority: 2, rate_limit_patterns: [] },
+    ], { worker_pin: 'w1' });
+
+    const { result, worker } = await runWithFailover('unused', { timeout: 10, preferredWorker: 'w2' });
+    assert.equal(result.success, true);
+    assert.equal(worker, 'w2', 'preferredWorker option should override pinned worker');
   });
 });

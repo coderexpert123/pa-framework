@@ -71,7 +71,7 @@ describe('Dashboard', () => {
     
     assert.ok(content.includes('SYSTEM DASHBOARD'));
     assert.ok(content.includes('Keep-awake**: on since 15:30 IST'));
-    assert.ok(content.includes('Model Failover Order'));
+    assert.ok(content.includes('Agent Failover Order'));
     assert.ok(content.includes('1. claude (priority 1)'));
     assert.ok(content.includes('2. agy (priority 2)'));
     assert.ok(content.includes('Skill Schedule'));
@@ -261,7 +261,7 @@ describe('Dashboard capability matrix (integration)', () => {
     const content = await getDashboardContent();
 
     // The pre-existing section is still discoverable by its original name.
-    assert.ok(content.includes('Model Failover Order'), content);
+    assert.ok(content.includes('Agent Failover Order'), content);
     assert.ok(content.includes('1. zclaude (priority 1)'), content);
 
     // Worker WITH tunables.
@@ -280,7 +280,7 @@ describe('Dashboard capability matrix (integration)', () => {
 
     // Global-not-per-topic framing must be explicit.
     assert.ok(/capability only/i.test(content), content);
-    assert.ok(content.includes('/llm'), content);
+    assert.ok(content.includes('/model'), content);
     assert.ok(content.includes('/effort'), content);
   });
 

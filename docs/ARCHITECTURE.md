@@ -50,6 +50,9 @@ workers:
     check_timeout: 30         # seconds; default 30
     input_mode: stdin-json    # 'arg' | 'stdin-text' | 'stdin-json'
     output_format: stream-json # informational; "stream-json" = NDJSON
+    secret_allowlist: [ZHIPU_API_KEY]  # OPTIONAL: LLM workers receive ONLY these
+                                        # secrets (absent = all, for backward compat —
+                                        # default-deny per worker when present)
     rate_limit_patterns:       # substrings searched in stdout+stderr
       - "rate limit"
       - "429"
@@ -122,6 +125,7 @@ Skills live at `~/.pa/skills/<name>/skill.md`. The YAML frontmatter (between `--
 | `no_fallback` | boolean | false | When true with `worker:`, don't failover on failure. |
 | `cmd` | string | — | Direct shell command (bypasses LLM). `${VAR}` env-interpolated. |
 | `telegram_output` | object | — | Deliver LLM output to Telegram. See below. |
+| `cost_tier` | `'off_peak' \| 'anytime'` | `'anytime'` | Cost tier for scheduled skills. `off_peak` skills run only during z.ai off-peak window (19:30-11:30 IST); periodic off_peak skills are deferred during peak hours (11:30-19:30 IST) with once-daily logging. Time-pinned crons with `cost_tier` are ignored with a config warning. |
 
 ### `telegram_output`
 
@@ -149,6 +153,123 @@ Action types:
 - **`confirm_required`** — used by the bot in place of "Reply *yes* to confirm" text; the bot tracks pending confirmations per-topic.
 
 The bot strips the envelope before delivering text to the user. In execution mode (`Pending Confirmation` set), the bot suppresses any `[PA_META]` the model emits.
+
+## Sequential workflow chains
+
+Chains are defined as YAML files in `~/.pa/chains/` and execute a series of skills sequentially, with retry logic and failure handling.
+
+### Chain schema
+
+```yaml
+steps:
+  - skill: <name>               # required: skill name
+    args?: <string array>       # optional: args to pass to `pa run <skill>`
+    retry?:                      # optional: retry configuration
+      max: <number>             # default: 1
+      backoff_s: <number>       # default: 0
+    on_failure: stop|notify|continue  # default: stop
+report: telegram|stdout         # default: stdout
+```
+
+### Execution model
+
+- **Sequential only**: No parallel execution. Steps run in order.
+- **Subprocess spawning**: Each step spawns `pa run <skill>` as a subprocess, inheriting git-workflow lock discipline automatically (children take their own locks).
+- **Failure propagation**:
+  - `on_failure: stop` (default): Chain stops immediately on step failure.
+  - `on_failure: notify`: Sends a Telegram notification but continues to next step.
+  - `on_failure: continue`: Continues silently to next step.
+- **Retry logic**: If a step fails, it retries up to `max` attempts with `backoff_s` seconds between attempts.
+- **End-of-chain report**:
+  - `report: telegram`: Sends a summary to pa-alerts (deduped by chain-name+date).
+  - `report: stdout`: Prints the summary to console.
+
+### Example
+
+The `commit-ship.yaml` chain (included as `~/.pa/chains/commit-ship.yaml`):
+
+```yaml
+steps:
+  - skill: update-brain
+    on_failure: notify
+
+  - skill: commit
+    on_failure: stop
+
+  - skill: push
+    retry:
+      max: 3
+      backoff_s: 5
+    on_failure: stop
+
+  - skill: push-public
+    on_failure: notify
+
+report: telegram
+```
+
+This chain stages and ships all pending work: update brain → commit → push → sync to public mirror.
+
+### CLI
+
+```bash
+pa chain run <name>    # Execute a chain
+pa chain list          # List available chains
+```
+
+### Validation
+
+The chain schema is strict and validated on load:
+
+- Unknown fields are rejected (at top level, step level, and retry level).
+- Invalid values are rejected (e.g., negative `max`, unknown `on_failure` values).
+- Missing required fields are rejected (`skill` is required).
+- Defaults are applied automatically (`retry.max: 1`, `retry.backoff_s: 0`, `on_failure: stop`, `report: stdout`).
+
+## Golden-task eval gate (self-improver)
+
+The autonomous self-improvement loop (`pa/src/self-improver.ts`) includes a golden-task eval gate (Wave H WPH1) that validates skill prompt changes against a suite of deterministic quality checks.
+
+### Gate operation
+
+When a skill prompt fix passes validation, the eval gate runs a subset of golden tasks against the change:
+
+- **Deterministic-only (v1)**: Tasks 4-6 run against static fixture inputs (no worker dispatch):
+  - `markdown_shape`: Output parses as valid Markdown
+  - `pa_meta_wellformedness`: PA_META envelope parses correctly, protected-skill forgery rejected
+  - `injection_resistance`: Output refuses prompt injection attempts
+- **LLM-dependent (deferred to v2)**: Tasks 1-3 require worker dispatch and are skipped unless `PA_EVAL_FULL=1`:
+  - `ref_id_format`: Output includes properly formatted ref-ID (`_Ref: s-[0-9a-f]{12}_`)
+  - `date_arithmetic`: Correct date arithmetic for calendar events
+  - `grounding_citation`: Output cites source documents correctly
+
+### Gate behavior (SOFT in v1)
+
+The gate is deliberately non-blocking in v1:
+
+- **Pass**: Change is applied, eval outcome recorded in audit trail
+- **Fail**: Change is parked as `validation-failed-pending` with eval detail, human reviews via `pa improvements`
+
+The validation floor still governs — a change that fails validation stays pending regardless of eval results.
+
+### Scoring
+
+Each task has a `scorer.py` that outputs JSON `{pass: bool, detail: string}` and exits 0 (pass) or 1 (fail). Results are aggregated and appended to `~/.pa/eval-results.jsonl` for audit trail inspection.
+
+### Audit trail
+
+Applied changes gain an `eval` field in their audit record:
+
+```json
+"eval": {
+  "pass": 2,
+  "fail": 1,
+  "skipped": 3,
+  "detail": "Eval gate: 2 passed, 1 failed, 3 skipped. Failures: ..."
+}
+```
+
+This enables post-factum review via `pa improvements --show <draft>`.
 
 ## Blackboard & locking
 

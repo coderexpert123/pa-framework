@@ -35,6 +35,8 @@ pa/src/telegram_notify.py
 # telegram_notify, which don't exist in the public mirror (permanently-broken
 # tests there), and their fixtures/docstrings reference personal context.
 pa/src/tests/
+# Private test for telegram_notify module (excluded module above)
+pa/scripts/tests/test_telegram_notify_429.py
 pa/scripts/upload_apk.py
 # pa/scripts/upload_plan.py — INCLUDED (refactored to env-driven via PA_PLANS_DRIVE_FOLDER_ID; see Cat E3)
 

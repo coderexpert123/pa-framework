@@ -185,6 +185,7 @@ interface NotifyOpts {
   dedupWindowMs?: number;
   topic?: { chat_id: string; thread_id?: number };
   severity?: 'info' | 'warn' | 'error';
+  runbook?: string; // Optional runbook slug to append as "Runbook: <slug>"
 }
 
 interface NotifyResult {
@@ -360,9 +361,14 @@ export async function notifyUser(
 
   const fullText = body ? `${subject}\n\n${body}` : subject;
 
+  // Append runbook link if provided
+  const textWithRunbook = opts?.runbook
+    ? `${fullText}\n\nRunbook: ${opts.runbook}`
+    : fullText;
+
   try {
     const sendPromise = sendToTelegram(
-      fullText,
+      textWithRunbook,
       { chat_id: topic.chat_id, thread_id: topic.thread_id, token_secret: 'TELEGRAM_BOT_TOKEN' },
       token,
       'MarkdownV2', // sendToTelegram routes the body through sanitizeMdV2 — alert bodies (paths, snake_case identifiers, parens) are escaped, italic `_Ref: <id>_` trailer renders as italic.

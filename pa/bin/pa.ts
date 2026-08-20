@@ -19,10 +19,84 @@ import { notifyCommand } from '../src/commands/notify-cmd.js';
 import { bgtasksCommand } from '../src/commands/bgtasks.js';
 import { refCommand } from '../src/commands/ref.js';
 import { improvementsCommand, acceptRollbackCommand } from '../src/commands/improvements.js';
+import { costsCommand } from '../src/commands/costs.js';
 import { maintenanceCommand } from '../src/commands/maintenance.js';
 import { publicSyncCommand } from '../src/commands/public-sync.js';
 import { claimCommand, releaseCommand, claimsCommand } from '../src/commands/claim.js';
 import { reconcileCommand } from '../src/commands/reconcile.js';
+import { dlqCommand } from '../src/commands/dlq.js';
+import { chainRunCommand, chainListCommand } from '../src/commands/chain.js';
+import { sloReportCommand } from '../src/commands/slo.js';
+
+async function mcpServeCommand(): Promise<void> {
+  // @ts-ignore - .mjs module without declaration file
+  await import('../mcp/server.mjs');
+  // Server is now running on stdio
+}
+
+async function mcpManifestCommand(): Promise<void> {
+  const manifest = {
+    name: 'pa-cli-mcp-server',
+    version: '1.0.0',
+    description: 'Personal Assistant CLI MCP server — read-only tools for pa lookup and coordination',
+    tools: [
+      {
+        name: 'pa_ref_lookup',
+        description: 'Look up a pa ref-ID (e.g. "c-a59a") to find what message produced it. Returns the full record with timestamp, worker, chat context, and text preview.',
+      },
+      {
+        name: 'pa_claims',
+        description: 'List active path reservations and recently modified files (last 15 minutes). Used for multi-session coordination.',
+      },
+      {
+        name: 'pa_maintenance_status',
+        description: 'Show the maintenance ledger — last run time, outcome, consecutive failures/skips for each declared maintenance job.',
+      },
+      {
+        name: 'pa_costs',
+        description: 'Show usage/cost rollup by worker, model, and skill. Supports time periods (week/month) and optional skill filtering.',
+      },
+      {
+        name: 'pa_slo_report',
+        description: 'Generate SLO error budget report. Shows service-level objectives, error budget consumed/remaining, and event breakdowns.',
+      },
+    ],
+    transport: 'stdio',
+    command: 'pa mcp serve',
+  };
+
+  console.log('# pa MCP Server Manifest\n');
+  console.log('Save this manifest to ~/.pa/mcp.json for manual registration:\n');
+  console.log('```json');
+  console.log(JSON.stringify(manifest, null, 2));
+  console.log('```\n');
+  console.log('## Registration Instructions\n');
+  console.log('### Claude (claude mcp add)\n');
+  console.log('```bash');
+  console.log('claude mcp add pa-mcp --stdio pa mcp serve');
+  console.log('```\n');
+  console.log('### Codex (~/.codex/config.json)\n');
+  console.log('Add to mcpServers:\n');
+  console.log('```json');
+  console.log('{');
+  console.log('  "mcpServers": {');
+  console.log('    "pa-mcp": {');
+  console.log('      "command": "node",');
+  console.log('      "args": ["D:/Personal Assistant/pa/mcp/server.mjs"]');
+  console.log('    }');
+  console.log('  }');
+  console.log('}');
+  console.log('```\n');
+  console.log('### agy (~/.agy/config.yaml)\n');
+  console.log('```yaml');
+  console.log('mcp:');
+  console.log('  servers:');
+  console.log('    pa-mcp:');
+  console.log('      command: node');
+  console.log('      args:');
+  console.log('        - D:/Personal Assistant/pa/mcp/server.mjs');
+  console.log('```\n');
+}
 
 const USAGE = `
 pa — Personal Assistant CLI Dispatcher
@@ -61,6 +135,15 @@ Usage:
   pa release <id>             Release a reservation by id
   pa claims                   Show active reservations + recently modified paths (mtime layer)
   pa reconcile [--check] [--restore <path>] [--merge <path>]  Detect/restore/diagnose files reverted to an ancestor of HEAD
+  pa dlq list                 List Dead Letter Queue entries (age, attempts, quarantined, preview)
+  pa dlq replay <index|all>   Clear quarantined flag and reset attempts (retry on next flush)
+  pa dlq discard <index|all>  Remove entries from DLQ
+  pa costs [--week|--month] [--skill <name>]  Show usage/cost rollup by worker, model, and skill
+  pa slo report [--month <YYYY-MM>]  Generate SLO error budget report
+  pa mcp serve                Start the MCP stdio server (for Claude/Codex/agy integration)
+  pa mcp manifest             Print MCP manifest + registration instructions
+  pa chain run <name>         Execute a sequential workflow chain
+  pa chain list               List available chains
   pa help                     Show this help message
 `.trim();
 
@@ -91,9 +174,12 @@ async function main(): Promise<void> {
         await listCommand();
         break;
 
-      case 'workers':
-        await workersCommand();
+      case 'workers': {
+        // Extract subcommand args (e.g., 'pin <name>')
+        const subArgs = args.slice(1);
+        await workersCommand(subArgs);
         break;
+      }
 
       case 'logs': {
         const skillName = args[1];
@@ -221,6 +307,48 @@ async function main(): Promise<void> {
       case 'reconcile':
         await reconcileCommand(args.slice(1));
         break;
+
+      case 'costs':
+        await costsCommand(args.slice(1));
+        break;
+
+      case 'dlq':
+        await dlqCommand(args.slice(1));
+        break;
+
+      case 'chain': {
+        const sub = args[1];
+        if (sub === 'run') {
+          process.exitCode = await chainRunCommand(args.slice(2));
+        } else if (sub === 'list') {
+          process.exitCode = await chainListCommand();
+        } else {
+          console.log('Usage: pa chain <run|list>');
+        }
+        break;
+      }
+
+      case 'slo': {
+        const sub = args[1];
+        if (sub === 'report') {
+          await sloReportCommand(args.slice(2));
+        } else {
+          console.log('Usage: pa slo report [--month <YYYY-MM>]');
+        }
+        break;
+      }
+
+      case 'mcp': {
+        const sub = args[1];
+        if (sub === 'serve') {
+          await mcpServeCommand();
+        } else if (sub === 'manifest') {
+          await mcpManifestCommand();
+        } else {
+          console.log('Usage: pa mcp <serve|manifest>');
+        }
+        break;
+      }
 
       case 'help':
       case '--help':

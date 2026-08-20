@@ -51,7 +51,7 @@ export const stalenessCheckJob: MaintenanceJob = {
       await notifyUser(
         'Stale Skills Detected',
         msg,
-        { dedupKey: 'staleness', severity: 'warn' },
+        { dedupKey: 'staleness', severity: 'warn', runbook: 'runbooks/missed-alert-class.md' },
       ).catch(() => {});
     }
 

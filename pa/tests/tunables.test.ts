@@ -21,6 +21,7 @@ import {
   resolveTunable,
   resolveTunableArgs,
   resolveTunables,
+  resolveWorkerLlm,
   selectWorkerTunables,
   setWorkerTunable,
   supportsTunable,
@@ -764,5 +765,51 @@ describe('observed tunable values', () => {
   it('returns an empty map for a worker with no tunables', async () => {
     assert.deepEqual(await readObservedTunableValuesForWorker(plain, { dir: logs, now: NOW }), {});
     assert.deepEqual(await readObservedTunableValuesForWorker(undefined, { dir: logs, now: NOW }), {});
+  });
+});
+
+describe('resolveWorkerLlm', () => {
+  it('returns undefined for undefined worker or worker with no model tunable', () => {
+    assert.equal(resolveWorkerLlm(undefined), undefined);
+    assert.equal(resolveWorkerLlm(plain), undefined);
+  });
+
+  it('resolves session override before topic default or worker default', () => {
+    const w = worker('test', { model: { args: ['--model', '{value}'], default: 'w-def' } });
+    assert.equal(resolveWorkerLlm(w, { model: 'sess-model' }, { model: 'topic-model' }), 'sess-model');
+  });
+
+  it('resolves topic default when session override is absent', () => {
+    const w = worker('test', { model: { args: ['--model', '{value}'], default: 'w-def' } });
+    assert.equal(resolveWorkerLlm(w, undefined, { model: 'topic-model' }), 'topic-model');
+  });
+
+  it('resolves worker tunable default when session and topic tiers are absent', () => {
+    const w = worker('test', { model: { args: ['--model', '{value}'], default: 'w-def' } });
+    assert.equal(resolveWorkerLlm(w), 'w-def');
+  });
+
+  it('resolves pinned static args when no cascade tiers have values', () => {
+    const w: WorkerConfig = {
+      name: 'claude',
+      command: 'claude',
+      args: ['-p', '--model', 'opusplan'],
+      check: 'echo ok',
+      rate_limit_patterns: [],
+      priority: 1,
+      tunables: { model: { args: ['--model', '{value}'] } },
+    };
+    assert.equal(resolveWorkerLlm(w), 'opusplan');
+  });
+
+  it('returns known CLI default model when worker declares model tunable but has no overrides or defaults', () => {
+    const w = worker('codex', { model: { args: ['--model', '{value}'] } });
+    assert.equal(resolveWorkerLlm(w), 'gpt-5.4');
+
+    const z = worker('zclaude', { model: { args: ['--model', '{value}'] } });
+    assert.equal(resolveWorkerLlm(z), 'glm-5.3');
+
+    const unknown = worker('custom-cli', { model: { args: ['--model', '{value}'] } });
+    assert.equal(resolveWorkerLlm(unknown), 'cli default');
   });
 });

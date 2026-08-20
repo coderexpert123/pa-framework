@@ -130,14 +130,45 @@ export async function runWithFailover(
   // Use injected notifyUser if available (for testing), otherwise use default
   const notify = options._bgTaskHooks?.notifyUser || notifyUser;
 
-  // Reorder workers: preferred first, then rest in priority order
-  const workers = options.preferredWorker
-    ? (() => {
-        const preferred = config.workers.find((w) => w.name === options.preferredWorker);
-        const others = config.workers.filter((w) => w.name !== options.preferredWorker);
-        return preferred ? [preferred, ...others] : config.workers;
-      })()
-    : config.workers;
+  // Reorder workers based on config and health state
+  let workers = config.workers;
+
+  // Apply worker_pin override if set (always first regardless of health)
+  if (config.worker_pin) {
+    const pinned = config.workers.find((w) => w.name === config.worker_pin);
+    const others = config.workers.filter((w) => w.name !== config.worker_pin);
+    workers = pinned ? [pinned, ...others] : config.workers;
+  }
+
+  // Apply preferredWorker if set (higher priority than pin for this dispatch only)
+  if (options.preferredWorker) {
+    const preferred = workers.find((w) => w.name === options.preferredWorker);
+    const others = workers.filter((w) => w.name !== options.preferredWorker);
+    workers = preferred ? [preferred, ...others] : workers;
+  }
+
+  // Apply quota-aware failover ordering if enabled (opt-in, default OFF)
+  if (config.quota_aware_failover) {
+    const { getWorkerHealthSnapshot } = await import('./rate-limits.js');
+    const healthMap = await getWorkerHealthSnapshot(workers.map((w) => w.name));
+
+    // Split into healthy and demoted workers
+    const healthy: typeof workers = [];
+    const demoted: typeof workers = [];
+
+    for (const w of workers) {
+      const health = healthMap.get(w.name) || { isCoolingDown: false, consecutiveFailures: 0 };
+      // Demote if cooling down OR 3+ consecutive failures
+      if (health.isCoolingDown || health.consecutiveFailures >= 3) {
+        demoted.push(w);
+      } else {
+        healthy.push(w);
+      }
+    }
+
+    // Preserve priority order within each group, demoted workers go to tail
+    workers = [...healthy, ...demoted];
+  }
 
   const ctx: Record<string, unknown> = {};
   if (options.resource) ctx['topic'] = options.resource;
@@ -246,8 +277,10 @@ export async function runWithFailover(
     // Filter secrets for this worker based on its secret_allowlist (defense-in-depth)
     const workerSecrets = filterSecretsForWorker(allSecrets, worker);
 
+    const workerExtraArgs = options.getExtraArgs ? options.getExtraArgs(worker) : options.extraArgs;
     const result = await executeWorker(worker, prompt, {
       ...options,
+      extraArgs: workerExtraArgs,
       env: workerSecrets,
       agentName: worker.name,
       bgTasksConfig: options.bgTasksConfig ?? config.bg_tasks,

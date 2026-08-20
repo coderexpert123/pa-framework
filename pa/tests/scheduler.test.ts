@@ -2,7 +2,7 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createTempPaHome, createTempSkill, cleanup } from './helpers.js';
 import { writeLog } from '../src/logger.js';
-import { getOverdueSkills } from '../src/scheduler.js';
+import { getOverdueSkills, partitionOverdueByCostTier } from '../src/scheduler.js';
 import type { RunMeta } from '../src/types.js';
 
 let tempDir: string;
@@ -148,5 +148,189 @@ describe('getOverdueSkills', () => {
     const overdue = await getOverdueSkills();
     assert.equal(overdue.length, 1);
     assert.equal(overdue[0].skill.name, 'good-cron');
+  });
+});
+
+describe('partitionOverdueByCostTier', () => {
+  let tempDir2: string;
+
+  beforeEach(async () => {
+    tempDir2 = await createTempPaHome();
+  });
+
+  afterEach(async () => {
+    await cleanup(tempDir2);
+  });
+
+  async function setupSkillWithCostTier(
+    name: string,
+    cron: string,
+    costTier: string = 'anytime',
+    lastRunISO?: string
+  ): Promise<void> {
+    const frontmatter = [
+      '---',
+      `cron: "${cron}"`,
+      `cost_tier: ${costTier}`,
+      'on_missed: latest',
+      '---',
+      'Test prompt.',
+    ].join('\n');
+
+    await createTempSkill(tempDir2, name, frontmatter);
+
+    if (lastRunISO) {
+      await writeLog(name, 'output', makeMeta(lastRunISO));
+    }
+  }
+
+  it('anytime skills always run regardless of time window', async () => {
+    const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+    await setupSkillWithCostTier('anytime-skill', '0 * * * *', 'anytime', threeHoursAgo);
+    const overdue = await getOverdueSkills();
+
+    // Test during peak hours (11:30-19:30 IST = 06:00-14:00 UTC)
+    const peakHour = new Date();
+    peakHour.setUTCHours(10, 0, 0, 0); // 10:00 UTC = 15:30 IST (peak)
+
+    const partition = await partitionOverdueByCostTier(overdue, peakHour);
+    assert.equal(partition.runnable.length, 1, 'anytime skill should run during peak hours');
+    assert.equal(partition.deferred.length, 0, 'anytime skill should not be deferred');
+  });
+
+  it('off_peak skills run during off-peak window', async () => {
+    const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+    await setupSkillWithCostTier('offpeak-skill', '0 * * * *', 'off_peak', threeHoursAgo);
+    const overdue = await getOverdueSkills();
+
+    // Test during off-peak hours (19:30-11:30 IST = 14:00-06:00 UTC)
+    const offPeakHour = new Date();
+    offPeakHour.setUTCHours(15, 0, 0, 0); // 15:00 UTC = 20:30 IST (off-peak)
+
+    const partition = await partitionOverdueByCostTier(overdue, offPeakHour);
+    assert.equal(partition.runnable.length, 1, 'off_peak skill should run during off-peak hours');
+    assert.equal(partition.deferred.length, 0, 'off_peak skill should not be deferred during off-peak');
+  });
+
+  it('off_peak skills are deferred during peak hours', async () => {
+    const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+    await setupSkillWithCostTier('offpeak-skill', '0 * * * *', 'off_peak', threeHoursAgo);
+    const overdue = await getOverdueSkills();
+
+    // Wednesday 08:00 UTC = 13:30 IST — inside z.ai peak (Mon-Fri 11:30-15:30 IST)
+    const peakHour = new Date('2026-08-19T08:00:00Z');
+
+    const partition = await partitionOverdueByCostTier(overdue, peakHour);
+    assert.equal(partition.runnable.length, 0, 'off_peak skill should not run during peak hours');
+    assert.equal(partition.deferred.length, 1, 'off_peak skill should be deferred during peak');
+    assert.ok(
+      partition.deferred[0].reason.includes('off_peak skill deferred during peak hours'),
+      'deferred reason should mention peak hours'
+    );
+  });
+
+  it('off_peak skills run at boundary times (peak end)', async () => {
+    const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+    await setupSkillWithCostTier('offpeak-skill', '0 * * * *', 'off_peak', threeHoursAgo);
+    const overdue = await getOverdueSkills();
+
+    // Wednesday 10:00 UTC = 15:30 IST — peak ends (half-open interval)
+    const boundaryTime = new Date('2026-08-19T10:00:00Z');
+
+    const partition = await partitionOverdueByCostTier(overdue, boundaryTime);
+    assert.equal(partition.runnable.length, 1, 'off_peak skill should run at 15:30 IST (peak end)');
+    assert.equal(partition.deferred.length, 0, 'should not be deferred at boundary');
+  });
+
+  it('off_peak skills deferred at peak start boundary', async () => {
+    const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+    await setupSkillWithCostTier('offpeak-skill', '0 * * * *', 'off_peak', threeHoursAgo);
+    const overdue = await getOverdueSkills();
+
+    // Wednesday 06:00 UTC = 11:30 IST — peak STARTS (deferral begins here)
+    const boundaryTime = new Date('2026-08-19T06:00:00Z');
+
+    const partition = await partitionOverdueByCostTier(overdue, boundaryTime);
+    assert.equal(partition.runnable.length, 0, 'off_peak skill should be deferred at 11:30 IST (peak start)');
+    assert.equal(partition.deferred.length, 1, 'should be deferred at peak start boundary');
+  });
+
+  it('off_peak skills are deferred just before off-peak starts', async () => {
+    const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+    await setupSkillWithCostTier('offpeak-skill', '0 * * * *', 'off_peak', threeHoursAgo);
+    const overdue = await getOverdueSkills();
+
+    // Test at 11:29 IST = 05:59 UTC (just before off-peak ends)
+    const justBefore = new Date();
+    justBefore.setUTCHours(5, 59, 0, 0);
+
+    const partition = await partitionOverdueByCostTier(overdue, justBefore);
+    assert.equal(partition.runnable.length, 1, 'off_peak skill should run at 11:29 IST (still off-peak)');
+    assert.equal(partition.deferred.length, 0, 'should not be deferred just before boundary');
+  });
+
+  it('off_peak skills are deferred just after peak starts', async () => {
+    const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+    await setupSkillWithCostTier('offpeak-skill', '0 * * * *', 'off_peak', threeHoursAgo);
+    const overdue = await getOverdueSkills();
+
+    // Test at 11:31 IST = 06:01 UTC (just after peak starts)
+    const justAfter = new Date();
+    justAfter.setUTCHours(6, 1, 0, 0);
+
+    const partition = await partitionOverdueByCostTier(overdue, justAfter);
+    assert.equal(partition.runnable.length, 0, 'off_peak skill should not run at 11:31 IST (peak started)');
+    assert.equal(partition.deferred.length, 1, 'off_peak skill should be deferred just after peak starts');
+  });
+
+  it('mixed skills: anytime runs, off_peak deferred during peak', async () => {
+    const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+    await setupSkillWithCostTier('anytime-skill', '0 * * * *', 'anytime', threeHoursAgo);
+    await setupSkillWithCostTier('offpeak-skill', '0 * * * *', 'off_peak', threeHoursAgo);
+    const overdue = await getOverdueSkills();
+
+    // Wednesday 08:00 UTC = 13:30 IST - inside z.ai peak
+    const peakHour = new Date('2026-08-19T08:00:00Z');
+
+    const partition = await partitionOverdueByCostTier(overdue, peakHour);
+    assert.equal(partition.runnable.length, 1, 'only anytime skill should run during peak');
+    assert.equal(partition.deferred.length, 1, 'off_peak skill should be deferred during peak');
+  });
+
+  it('mixed skills: both run during off-peak', async () => {
+    const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+    await setupSkillWithCostTier('anytime-skill', '0 * * * *', 'anytime', threeHoursAgo);
+    await setupSkillWithCostTier('offpeak-skill', '0 * * * *', 'off_peak', threeHoursAgo);
+    const overdue = await getOverdueSkills();
+
+    // Test during off-peak hours
+    const offPeakHour = new Date();
+    offPeakHour.setUTCHours(15, 0, 0, 0); // 20:30 IST
+
+    const partition = await partitionOverdueByCostTier(overdue, offPeakHour);
+    assert.equal(partition.runnable.length, 2, 'both skills should run during off-peak');
+    assert.equal(partition.deferred.length, 0, 'no skills should be deferred during off-peak');
+  });
+
+  it('skills without cost_tier default to anytime', async () => {
+    // Create skill without cost_tier field
+    const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+    await createTempSkill(tempDir2, 'default-skill', [
+      '---',
+      'cron: "0 * * * *"',
+      'on_missed: latest',
+      '---',
+      'Test prompt.',
+    ].join('\n'));
+    await writeLog('default-skill', 'output', makeMeta(threeHoursAgo));
+
+    const overdue = await getOverdueSkills();
+
+    // Wednesday 08:00 UTC = 13:30 IST - inside z.ai peak
+    const peakHour = new Date('2026-08-19T08:00:00Z');
+
+    const partition = await partitionOverdueByCostTier(overdue, peakHour);
+    assert.equal(partition.runnable.length, 1, 'skill without cost_tier should default to anytime');
+    assert.equal(partition.deferred.length, 0, 'should not be deferred');
   });
 });

@@ -7,7 +7,7 @@ describe('buildWorkerErrorResponse', () => {
     const out = buildWorkerErrorResponse({ worker: 'claude', exitCode: 1, stderr: 'API error', suggestedWorker: 'agy' });
     assert.ok(out.startsWith('⚠️ claude failed (exit 1).'));
     assert.ok(out.includes('```\nAPI error\n```'));
-    assert.ok(out.includes('Try again, or switch with /model agy.'));
+    assert.ok(out.includes('Try again, or switch with /agent agy.'));
   });
 
   it('exitCode -1 omits the exit suffix', () => {
@@ -25,7 +25,7 @@ describe('buildWorkerErrorResponse', () => {
   it('empty stderr omits the code-fence block', () => {
     const out = buildWorkerErrorResponse({ worker: 'claude', exitCode: 1, stderr: '', suggestedWorker: 'agy' });
     assert.ok(!out.includes('```'));
-    assert.ok(out.includes('Try again, or switch with /model agy.'));
+    assert.ok(out.includes('Try again, or switch with /agent agy.'));
   });
 
   it('stderr over 500 chars is truncated to 500', () => {
@@ -45,12 +45,13 @@ describe('buildWorkerErrorResponse', () => {
     const out = buildWorkerErrorResponse({ worker: 'agy', emptyResponse: true, suggestedWorker: 'zclaude' });
     assert.ok(out.startsWith('⚠️ agy returned an empty response.'));
     assert.ok(!out.includes('```'));
-    assert.ok(out.includes('Try again, or switch with /model zclaude.'));
+    assert.ok(out.includes('Try again, or switch with /agent zclaude.'));
   });
 
   it('suggestedWorker null renders the cooling-down fallback line', () => {
     const out = buildWorkerErrorResponse({ worker: 'claude', exitCode: 1, stderr: 'err', suggestedWorker: null });
     assert.ok(out.includes('Try again (all other workers cooling down or unavailable).'));
+    assert.ok(!out.includes('/agent'));
     assert.ok(!out.includes('/model'));
   });
 });

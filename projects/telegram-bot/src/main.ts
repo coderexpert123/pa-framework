@@ -5,7 +5,7 @@ import { readdir, unlink, rename, writeFile, readFile, stat } from 'fs/promises'
 import { join } from 'path';
 import { homedir } from 'os';
 import { acquireLock, releaseLock } from './lock.js';
-import { getUpdates, sendMessage, sendMessageWithId, pinChatMessage, unpinChatMessage, sendTyping, setMessageReaction, downloadFile, editMessageText, createForumTopic, deleteMessage } from './telegram.js';
+import { getUpdates, sendMessage, sendMessageWithId, pinChatMessage, unpinChatMessage, sendTyping, setMessageReaction, downloadFile, editMessageText, createForumTopic, deleteMessage, sendMessageWithKeyboard, answerCallbackQuery } from './telegram.js';
 import { loadState, saveState, loadTopicState, saveTopicState, addTurn, findHistoricalSessionTurns, findRecentTurnsByTopic, listTopicStateRefs } from './conversation.js';
 import { buildPrompt, buildResumedPrompt, buildSkillStatus } from './context.js';
 import {
@@ -14,7 +14,9 @@ import {
   resolvePendingDescription,
   buildWorkerResponse,
   buildWorkerErrorResponse,
+  getAgentSwitchTarget,
   getModelSwitchTarget,
+  AGENT_BARE_PATTERN,
   expirePreferredWorker,
   handleDefaultQuery,
   handleCodeCommand,
@@ -27,6 +29,7 @@ import {
   handleMergeCommand,
   RESET_PATTERN,
   NEW_PATTERN,
+  CODE_PATTERN,
   STATUS_PATTERN,
   KEEP_AWAKE_PATTERN,
   SKILLS_PATTERN,
@@ -42,6 +45,7 @@ import {
   buildModelStatusSnapshot,
   hydrateModelStatus,
   modelStatusNeedsRefresh,
+  handleSunsetLlmCommand,
   parseTunableCommand,
   setSessionTunable,
   setTopicTunable,
@@ -51,16 +55,23 @@ import {
   renderTunableClearResult,
   handleRetranscribeCommand,
   describeForwardOrigin,
+  handleHealthCommand,
+  handleRefCommand,
+  handleClaimsCommand,
   COMMIT_PATTERN,
   COMMIT_AND_PUSH_PATTERN,
   PUSH_PATTERN,
   PUSH_PUBLIC_PATTERN,
   INVESTIGATE_FLAGGED_PATTERN,
+  HEALTH_PATTERN,
+  REF_PATTERN,
+  CLAIMS_PATTERN,
   type TunableCommand,
 } from './logic.js';
 import {
   resolveTunable,
   resolveTunableArgs,
+  resolveWorkerLlm,
   selectWorkerTunables,
   mergeTunableArgs,
   validateTunable,
@@ -88,7 +99,7 @@ import { computeBackoff, computePollOffset, LONG_POLL_TIMEOUT } from './poll.js'
 import { WatermarkTracker } from './watermark.js';
 import { appendDlq, flushDlq } from './dlq.js';
 import { deliveredKey, wasDelivered, markDelivered } from './delivered-store.js';
-import { addPendingDispatch, removePendingDispatch, pendingDispatchKey, listPendingDispatches } from './pending-dispatches.js';
+import { addPendingDispatch, removePendingDispatch, updatePendingDispatch, pendingDispatchKey, listPendingDispatches } from './pending-dispatches.js';
 import { reapOrphanedDispatches } from './orphan-reaper.js';
 import { isTopicRecovering } from './recovery-gate.js';
 import { isDegraded, startHealthProbe } from './health.js';
@@ -113,6 +124,7 @@ import {
   voiceErrorMessage,
   extractAudioAttachment,
   findCachedAudio,
+  voiceAttachmentPath,
   type AudioAttachmentKind,
   type VoiceResult,
 } from './voice.js';
@@ -124,6 +136,7 @@ import {
   type VoicePrefetchDescriptor,
 } from './voice-prefetch.js';
 import { resolveReplyContext } from './reply-context.js';
+import { findSessionForRefId } from './ref-lookup.js';
 
 // Import pa modules
 import { loadSecrets } from '../../../pa/dist/src/secrets.js';
@@ -161,10 +174,12 @@ function workerSupportsSystemPrompt(workerName: string): boolean {
   return CLAUDE_FAMILY_WORKERS.has(workerName);
 }
 
-// agy native-resume trial (2026-08-16). Single-topic allowlist.
-// Topics here get native conversation resume instead of sessionless dispatch.
-// Promote to config file or fleet-wide after trial review.
-export const AGY_NATIVE_RESUME_TOPICS = new Set(['310']);
+// agy native resume: trialed 2026-08-16 on topic 310, FLEET-WIDE since
+// 2026-08-17 (operator directive: feature gates don't outlive their trial —
+// roll out and learn fast). EVERY agy topic resumes its native conversation.
+// This set is now an emergency EXCLUSION list (empty = all topics resume);
+// add a threadId here only if a resume pathology ever shows up on it.
+export const AGY_NATIVE_RESUME_EXCLUDED_TOPICS = new Set<string>([]);
 
 // threadId from a `topic-<chatId>_<threadId>` blackboard resource. chatId may be
 // NEGATIVE (supergroups: -100...), so never parse it with \d+ — the obvious
@@ -279,9 +294,10 @@ async function refreshPinnedStatusCardInPlace(
   threadId: number,
   state: ConversationState,
   effectiveDefault: string,
-  keepAwake = getKeepAwakeStatus()
+  keepAwake = getKeepAwakeStatus(),
+  config?: { workers?: WorkerConfig[] }
 ): Promise<void> {
-  const snapshot = hydrateModelStatus(state, effectiveDefault);
+  const snapshot = hydrateModelStatus(state, effectiveDefault, config);
   syncModelStatusState(state, snapshot);
 
   const pinText = renderStatusCard({ snapshot, keepAwake });
@@ -320,10 +336,15 @@ async function maybeUpdatePinnedStatusAfterDispatch(
   state: ConversationState,
   effectiveDefault: string,
   dispatchedWorker: string,
-  failoverPayload?: FailoverNotifyPayload
+  failoverPayload?: FailoverNotifyPayload,
+  config?: { workers?: WorkerConfig[] }
 ): Promise<void> {
   const expectedWorker = state.preferred_worker || effectiveDefault;
-  const currentSnapshot = hydrateModelStatus(state, effectiveDefault);
+  const currentSnapshot = hydrateModelStatus(state, effectiveDefault, config);
+  const dispatchedWorkerConfig = config?.workers?.find((w: WorkerConfig) => w.name === dispatchedWorker);
+  const dispatchedLlm = dispatchedWorkerConfig
+    ? resolveWorkerLlm(dispatchedWorkerConfig, selectWorkerTunables(state.tunable_overrides, dispatchedWorker), selectWorkerTunables(state.tunable_defaults, dispatchedWorker))
+    : undefined;
 
   if (dispatchedWorker !== expectedWorker) {
     const nextSnapshot = buildModelStatusSnapshot({
@@ -331,6 +352,7 @@ async function maybeUpdatePinnedStatusAfterDispatch(
       defaultWorker: effectiveDefault,
       reasonCode: 'failover',
       reasonText: buildFailoverReasonText(failoverPayload, expectedWorker, dispatchedWorker),
+      currentLlm: dispatchedLlm,
     });
     if (modelStatusNeedsRefresh(currentSnapshot, nextSnapshot) || !state.pinned_status_message_id) {
       await replacePinnedStatusCard(token, chatId, threadId, state, nextSnapshot);
@@ -346,12 +368,18 @@ async function maybeUpdatePinnedStatusAfterDispatch(
       currentWorker: expectedWorker,
       defaultWorker: effectiveDefault,
       reasonCode,
+      currentLlm: dispatchedLlm,
     });
     if (modelStatusNeedsRefresh(currentSnapshot, nextSnapshot) || !state.pinned_status_message_id) {
       await replacePinnedStatusCard(token, chatId, threadId, state, nextSnapshot);
     } else {
       syncModelStatusState(state, nextSnapshot);
     }
+    return;
+  }
+
+  if (!state.pinned_status_message_id) {
+    await replacePinnedStatusCard(token, chatId, threadId, state, currentSnapshot);
     return;
   }
 
@@ -397,9 +425,14 @@ export async function runExpiredModelOverrideSweep(
       const expiredTunables = expireTunableOverrides(topicState);
 
       if (expired) {
+        const defaultWorkerConfig = config?.workers?.find((w: WorkerConfig) => w.name === effectiveDefault);
+        const currentLlm = defaultWorkerConfig
+          ? resolveWorkerLlm(defaultWorkerConfig, selectWorkerTunables(topicState.tunable_overrides, effectiveDefault), selectWorkerTunables(topicState.tunable_defaults, effectiveDefault))
+          : undefined;
         const snapshot = buildModelStatusSnapshot({
           defaultWorker: effectiveDefault,
           reasonCode: 'midnight_reset',
+          currentLlm,
         });
         await replacePinnedStatusCard(token, ref.chatId, ref.threadId, topicState, snapshot);
         await saveTopicState(topicState);
@@ -407,9 +440,9 @@ export async function runExpiredModelOverrideSweep(
         continue;
       }
 
-      const hydrated = hydrateModelStatus(topicState, effectiveDefault);
+      const hydrated = hydrateModelStatus(topicState, effectiveDefault, config);
       if (expiredTunables.length > 0 || modelStatusNeedsRefresh(topicState.model_status, hydrated) || topicState.pinned_worker !== hydrated.current_worker) {
-        syncModelStatusState(topicState, hydrated);
+        await refreshPinnedStatusCardInPlace(token, ref.chatId, ref.threadId, topicState, effectiveDefault, getKeepAwakeStatus(), config);
         await saveTopicState(topicState);
         touched++;
       }
@@ -484,6 +517,18 @@ export function parseDescriptionLLMOutput(
 export const DESCRIPTION_SYSTEM_PROMPT =
   'Generate a concise Telegram forum topic description. Output exactly 1 sentence (60-150 chars), plain text only, no quotes. Describe what conversations belong here, not what the topic is about. Exception: if the topic name is too vague or ambiguous to infer a meaningful description (e.g. a single letter, a number, a person\'s name alone, or a generic word like \'misc\'), output exactly the single word UNKNOWN and nothing else. Otherwise output only the description text.';
 
+export const BRANCH_DESCRIPTION_SYSTEM_PROMPT =
+  'Generate a concise Telegram forum topic description for a branch topic. Output exactly 1 sentence (60-150 chars), plain text only, no quotes. Describe what conversations belong in this branch. Exception: if the context is too vague or ambiguous to infer a meaningful description, output exactly the single word UNKNOWN and nothing else. Otherwise output only the description text.';
+
+export interface DescriptionOptions {
+  name: string;
+  sampleTurns?: string;
+  isBranch?: boolean;
+  parentName?: string;
+  parentDescription?: string;
+  userPrompt?: string;
+}
+
 export type DescriptionRunner = (
   cmd: string,
   args: string[],
@@ -492,17 +537,50 @@ export type DescriptionRunner = (
 ) => void;
 
 export async function generateDescriptionWithLLM(
-  name: string,
+  nameOrOptions: string | DescriptionOptions,
   sampleTurns?: string,
   runner: DescriptionRunner = execFile as unknown as DescriptionRunner,
 ): Promise<{ description: string; confident: boolean }> {
-  const safeName = name.replace(/[&|<>"^`$\\%]/g, ' ').replace(/\s+/g, ' ').trim();
-  const contextPart = sampleTurns
-    ? ` Context: ${sampleTurns.replace(/[&|<>"^`$\\%]/g, ' ').slice(0, 200)}`
-    : '';
-  const userPrompt = `Topic name: ${safeName}.${contextPart}`;
+  let name: string;
+  let sample: string | undefined;
+  let isBranch = false;
+  let parentName: string | undefined;
+  let parentDescription: string | undefined;
+  let userPrompt: string | undefined;
 
-  let args = ['--system-prompt', DESCRIPTION_SYSTEM_PROMPT, '-p', userPrompt, '--output-format', 'text'];
+  if (typeof nameOrOptions === 'string') {
+    name = nameOrOptions;
+    sample = sampleTurns;
+  } else {
+    name = nameOrOptions.name;
+    sample = nameOrOptions.sampleTurns;
+    isBranch = !!nameOrOptions.isBranch;
+    parentName = nameOrOptions.parentName;
+    parentDescription = nameOrOptions.parentDescription;
+    userPrompt = nameOrOptions.userPrompt;
+  }
+
+  const safeName = name.replace(/[&|<>"^`$\\%]/g, ' ').replace(/\s+/g, ' ').trim();
+  const contextPart = sample
+    ? ` Context: ${sample.replace(/[&|<>"^`$\\%]/g, ' ').slice(0, 200)}`
+    : '';
+
+  let systemPrompt = DESCRIPTION_SYSTEM_PROMPT;
+  let promptText = `Topic name: ${safeName}.${contextPart}`;
+
+  if (isBranch) {
+    systemPrompt = BRANCH_DESCRIPTION_SYSTEM_PROMPT;
+    const safeParent = (parentName || 'parent').replace(/[&|<>"^`$\\%]/g, ' ').trim();
+    const parentDescPart = parentDescription
+      ? ` Parent topic description: ${parentDescription.replace(/[&|<>"^`$\\%]/g, ' ').slice(0, 200)}.`
+      : '';
+    const branchPromptPart = userPrompt
+      ? ` Branch creation prompt: ${userPrompt.replace(/[&|<>"^`$\\%]/g, ' ').slice(0, 200)}.`
+      : '';
+    promptText = `Branch topic name: ${safeName}. Parent topic: ${safeParent}.${parentDescPart}${branchPromptPart}${contextPart}`;
+  }
+
+  let args = ['--system-prompt', systemPrompt, '-p', promptText, '--output-format', 'text'];
   if (process.platform === 'win32') {
     args = args.map(a => /\s/.test(a) ? `"${a}"` : a);
   }
@@ -536,6 +614,20 @@ async function generateDescriptionSuggestionWithHistory(
     .join(' | ');
 
   return generateDescriptionWithLLM(name, sample || undefined);
+}
+
+export async function autoSetTopicDescription(
+  token: string,
+  topicNames: TopicNameMap,
+  chatId: number,
+  threadId: number,
+  description: string,
+  topicName?: string
+): Promise<void> {
+  await setTopicDescription(topicNames, chatId, threadId, description);
+  const nameHint = topicName ? ` _${topicName}_` : '';
+  const msg = `🌿 Topic${nameHint} created. Description set: _${description}_`;
+  await sendMessage(token, chatId, appendRefIdAndLog(msg, { kind: 'help', chatId, threadId }), undefined, threadId || undefined);
 }
 
 export async function postDescriptionSuggestion(
@@ -578,11 +670,9 @@ async function backfillTopicDescriptions(
       if (threadId === 0) continue;
       if (entry.description) continue;
 
-      const topicState = await loadTopicState(chatId, threadId);
-      if (topicState.pendingDescription) continue;
-
-      const { description } = await generateDescriptionSuggestionWithHistory(entry.name, threadId);
-      await postDescriptionSuggestion(token, chatId, threadId, description, entry.name);
+      const { description, confident } = await generateDescriptionSuggestionWithHistory(entry.name, threadId);
+      const finalDesc = (confident && description) ? description : `Discussions and tasks relating to ${entry.name}.`;
+      await setTopicDescription(topicNames, chatId, threadId, finalDesc);
       count++;
     }
   }
@@ -723,7 +813,7 @@ export async function tryClassifyAndNotify(
  */
 function maybeDropAgySession(session: SessionInfo | undefined, resource: string, shouldDrop: boolean): SessionInfo | undefined {
   if (!shouldDrop || !session || session.worker !== 'agy') return session;
-  if (!AGY_NATIVE_RESUME_TOPICS.has(threadIdFromResource(resource))) return session;
+  if (AGY_NATIVE_RESUME_EXCLUDED_TOPICS.has(threadIdFromResource(resource))) return session;
   return undefined;
 }
 
@@ -863,7 +953,20 @@ export async function dispatchMessage(
       }
       const priorCtxFo = lastFailedSession ? { ...lastFailedSession, sessionPath: getPriorSessionPath(lastFailedSession.worker, lastFailedSession.sessionId, effectiveCwd(state)) } : undefined;
       const failoverPrompt = await buildPrompt(userText, state, topicNames, replyContext, pendingDesc, { omitStatic: false, priorContext: priorCtxFo });
-      freshResult = await runWithFailover(failoverPrompt, { cwd: effectiveCwd(state), env: secrets, resource, updateId, excludeWorkers: failedWorkers, onWorkerSwitch: async (payload) => { if (onNotify) await onNotify(payload); }, checkAvailable: async (w) => !(await isWorkerCoolingDown(w.name)), preferredWorker: state.preferred_worker, contextId, isCancelled, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS });
+      freshResult = await runWithFailover(failoverPrompt, {
+        cwd: effectiveCwd(state),
+        env: secrets,
+        resource,
+        updateId,
+        excludeWorkers: failedWorkers,
+        onWorkerSwitch: async (payload) => { if (onNotify) await onNotify(payload); },
+        checkAvailable: async (w) => !(await isWorkerCoolingDown(w.name)),
+        preferredWorker: state.preferred_worker,
+        contextId,
+        isCancelled,
+        harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS,
+        getExtraArgs: (w) => buildDispatchExtraArgs(state, w),
+      });
       // The cascade stopped because the caller cancelled. Return the same shape
       // as the other three cancellation exits — crucially with the session
       // UNCHANGED: a killed run's session id must not become the topic's.
@@ -897,7 +1000,7 @@ export async function dispatchMessage(
       // completed successfully. (Integrator fix 2026-08-17: the success gate
       // is load-bearing; claude/zclaude/codex keep their pre-existing
       // capture-without-success-gate behavior, unchanged on purpose.)
-      if (AGY_NATIVE_RESUME_TOPICS.has(threadIdFromResource(resource))) {
+      if (!AGY_NATIVE_RESUME_EXCLUDED_TOPICS.has(threadIdFromResource(resource))) {
         // Session-validity check (2026-08-17): verify the session file exists
         // before capturing agy native-resume sessionId. If the .pb/.db file is
         // missing (e.g. external deletion or agy's own GC), skip capture and fall
@@ -954,7 +1057,13 @@ export async function dispatchMessage(
 function isAcceptableUpdate(update: any, allowedChatIds: Set<number>): boolean {
   const msg = update?.message;
   if (!msg) return false;
-  if (!msg.text && !msg.caption && !msg.voice && !msg.audio && !msg.video_note) return false;
+  // WPE3 (2026-08-18): documents and photos join the accepted set — they route
+  // through the same dated-attachment substrate as voice. Disallowed TYPES are
+  // accepted here then rejected with a polite local reply in the handler (the
+  // placeholder/pending-dispatch record must be written at receipt for crash
+  // recovery regardless of whether the type is processable).
+  if (!msg.text && !msg.caption && !msg.voice && !msg.audio && !msg.video_note
+      && !msg.document && !msg.photo) return false;
   if (!allowedChatIds.has(msg.chat?.id)) return false;
   return true;
 }
@@ -991,6 +1100,58 @@ function dispatchGitWorkflowSkill(skillName: string): string {
   return `🚀 Kicked off \`${skillName}\` — it reports back in the main "My PA" topic when done, not necessarily here.`;
 }
 
+/**
+ * Execute a pa CLI command synchronously and return trimmed stdout.
+ * Used for read-only commands like /health, /ref, and /claims.
+ */
+function execPaCommand(args: string[], maxChars: number = 1200): string {
+  try {
+    const { execFileSync } = require('node:child_process') as typeof import('node:child_process');
+    const stdout = execFileSync(
+      'node',
+      ['pa/dist/bin/pa.js', ...args],
+      { cwd: BOT_CWD, windowsHide: true, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024, timeout: 30000 }
+    ) as string;
+    const output = stdout.trim();
+    if (output.length <= maxChars) return output;
+    return output.slice(0, maxChars) + '…';
+  } catch (err: any) {
+    const stderr = typeof err?.stderr === 'string' ? err.stderr.trim() : '';
+    const errorMsg = stderr || err?.message || String(err);
+    return `Error: ${errorMsg.slice(0, 200)}`;
+  }
+}
+
+/**
+ * Execute pa ref <id> and return the lookup result, chunked if needed.
+ */
+function execPaRef(refId: string): string {
+  try {
+    const { execFileSync } = require('node:child_process') as typeof import('node:child_process');
+    const stdout = execFileSync(
+      'node',
+      ['pa/dist/bin/pa.js', 'ref', refId],
+      { cwd: BOT_CWD, windowsHide: true, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024, timeout: 30000 }
+    ) as string;
+    const output = stdout.trim();
+    const chunks: string[] = [];
+    const remaining = output;
+    const MAX_CHUNK = 4000;
+    if (output.length <= MAX_CHUNK) return output;
+
+    let idx = 0;
+    while (idx < output.length) {
+      chunks.push(output.slice(idx, idx + MAX_CHUNK));
+      idx += MAX_CHUNK;
+    }
+    return chunks[0] + '\n\n_(`' + refId + '` output truncated — full result at terminal)_';
+  } catch (err: any) {
+    const stderr = typeof err?.stderr === 'string' ? err.stderr.trim() : '';
+    const errorMsg = stderr || err?.message || String(err);
+    return `Error: ${errorMsg.slice(0, 200)}`;
+  }
+}
+
 // AI-114: covers orphan-reaper.ts's 45-min REAP_MAX_WAIT_MS plus slack, so the
 // pa-host orphan-worker-reap maintenance job (runs every minute) doesn't kill
 // a worker the bot is still waiting to harvest a reply from.
@@ -1013,10 +1174,21 @@ async function processUpdate(
     if (msg.forum_topic_created) {
       const topicKey = `${topicEvent.chatId}_${topicEvent.threadId}`;
       if (!branchCreatedTopicKeys.delete(topicKey)) {
-        const newTopicState = await loadTopicState(topicEvent.chatId, topicEvent.threadId);
-        if (!newTopicState.pendingDescription) {
-          const { description, confident } = await generateDescriptionWithLLM(topicEvent.name);
-          await postDescriptionSuggestion(token, topicEvent.chatId, topicEvent.threadId, confident ? description : '', topicEvent.name);
+        const { description, confident } = await generateDescriptionWithLLM(topicEvent.name);
+        const finalDesc = (confident && description) ? description : `Discussions and tasks relating to ${topicEvent.name}.`;
+        await autoSetTopicDescription(token, topicNames, topicEvent.chatId, topicEvent.threadId, finalDesc, topicEvent.name);
+
+        // Generate and pin topic status card by default for this new topic
+        try {
+          let config: any = { workers: [] };
+          try { config = await loadConfig(); } catch {}
+          const effectiveDefault = getEffectiveDefaultWorker(config, topicKey);
+          const topicState = await loadTopicState(topicEvent.chatId, topicEvent.threadId);
+          const snapshot = hydrateModelStatus(topicState, effectiveDefault, config);
+          await replacePinnedStatusCard(token, topicEvent.chatId, topicEvent.threadId, topicState, snapshot);
+          await saveTopicState(topicState);
+        } catch (pinErr) {
+          logger.warn('topic', `failed to generate pinned status card for new topic ${topicKey}: ${(pinErr as Error).message}`);
         }
       }
     }
@@ -1120,6 +1292,34 @@ async function processUpdate(
       // dispatched with no indication the attachment was ignored.
       const hint = '[An audio file was attached as a document and was not transcribed. Re-send it as a voice note or audio message to have it transcribed.]';
       userText = userText ? `${userText}\n\n${hint}` : hint;
+    } else if (msg.document || msg.photo) {
+      // WPE3 (2026-08-18): document/photo attachments — download to the same
+      // dated substrate as voice, allowlist the type, and inject the path into
+      // userText (the format context.ts's Attachments section also uses).
+      const ALLOWED_DOC_EXT = /\.(pdf|jpe?g|png|webp|txt|md|csv|xlsx|zip)$/i;
+      const docName = msg.document?.file_name;
+      const photo = Array.isArray(msg.photo) ? msg.photo[msg.photo.length - 1] : undefined; // largest size
+      const fileName = docName ?? (photo ? `photo_${photo.file_unique_id}.jpg` : undefined);
+      if (!fileName || !ALLOWED_DOC_EXT.test(fileName)) {
+        userText = userText ? `${userText}\n\n[Attachment ${fileName ?? '(unnamed)'} rejected: allowed types are pdf, jpg, png, webp, txt, md, csv, xlsx, zip.]` : `[Attachment ${fileName ?? '(unnamed)'} rejected: allowed types are pdf, jpg, png, webp, txt, md, csv, xlsx, zip.]`;
+      } else {
+        const media = (msg.document ?? photo) as { file_id: string; file_unique_id: string };
+        const ext = fileName.includes('.') ? fileName.slice(fileName.lastIndexOf('.') + 1).toLowerCase() : 'bin';
+        try {
+          const destPath = voiceAttachmentPath(chatId, media.file_unique_id, new Date(), ext);
+          // Create parent directory before download (downloadFile does not do this itself)
+          const { dirname } = require('node:path');
+          mkdirSync(dirname(destPath), { recursive: true });
+          const ok = await downloadFile(token, media.file_id, destPath);
+          if (!ok) throw new Error('downloadFile returned false');
+          logger.info('attachments', 'downloaded attachment', { chatId, threadId, fileName, destPath });
+          const line = `[Attachment: ${fileName} at ${destPath}]`;
+          userText = userText ? `${userText}\n\n${line}` : line;
+        } catch (err: any) {
+          logger.warn('attachments', 'attachment download failed', { error: err?.message ?? String(err), fileName });
+          userText = userText ? `${userText}\n\n[Attachment ${fileName} failed to download — see pa-alerts log.]` : `[Attachment ${fileName} failed to download — see pa-alerts log.]`;
+        }
+      }
     }
 
     let archivedUserText = userText;
@@ -1172,44 +1372,147 @@ async function processUpdate(
       await replacePinnedStatusCard(token, chatId, threadId, topicState, expirySnapshot);
     }
 
-    addTurn(topicState, { role: 'user', text: archivedUserText, timestamp, message_id: messageId, worker: topicState.preferred_worker || effectiveDefault, session_id: topicState.session?.session_id });
-    // AI-095 item 2: persist + archive the user turn AT RECEIPT. A crash during
-    // the (possibly minutes-long) dispatch must not erase the user's message from
-    // topic state / conversation-history.jsonl — 2026-07-03 lost two user turns
-    // this way. Watermark dedup makes the second save at the end idempotent.
-    await saveTopicState(topicState).catch((err) => logger.warn('conversation', 'early user-turn save failed', { error: String(err) }));
+    if (!userText && !audioAttachment && !msg.document && !msg.photo) {
+      skipWorker = true;
+    }
+
+    if (userText) {
+      addTurn(topicState, { role: 'user', text: archivedUserText, timestamp, message_id: messageId, worker: topicState.preferred_worker || effectiveDefault, session_id: topicState.session?.session_id });
+      // AI-095 item 2: persist + archive the user turn AT RECEIPT. A crash during
+      // the (possibly minutes-long) dispatch must not erase the user's message from
+      // topic state / conversation-history.jsonl — 2026-07-03 lost two user turns
+      // this way. Watermark dedup makes the second save at the end idempotent.
+      await saveTopicState(topicState).catch((err) => logger.warn('conversation', 'early user-turn save failed', { error: String(err) }));
+    }
 
     
     
 
-    const modelTarget = getModelSwitchTarget(userText);
-    if (modelTarget) {
+    if (!skipWorker && userText && AGENT_BARE_PATTERN.test(userText.trim())) {
+      const activeWorker = topicState.preferred_worker || effectiveDefault;
+      const workerList = (config?.workers ?? []).map((w: WorkerConfig) => w.name).join(', ') || 'agy, claude, codex, zclaude';
+      response = `*Agent Status*\n` +
+        `Current: *${activeWorker}* (${topicState.preferred_worker ? 'session override' : 'topic default'})\n` +
+        `Default: *${effectiveDefault}*\n` +
+        `Available: ${workerList}\n\n` +
+        `Use \`/agent <name>\` to switch agent, and \`/model <name>\` to set its model.`;
+      skipWorker = true;
+    }
+
+    const agentSwitch = (!skipWorker && userText) ? getAgentSwitchTarget(userText) : undefined;
+    if (agentSwitch) {
+      const modelTarget = agentSwitch.target;
       let nextSnapshot: ModelStatusSnapshot;
+      const targetWorkerConfig = config?.workers?.find((w: WorkerConfig) => w.name === modelTarget);
+      const currentLlm = targetWorkerConfig
+        ? resolveWorkerLlm(targetWorkerConfig, selectWorkerTunables(topicState.tunable_overrides, modelTarget), selectWorkerTunables(topicState.tunable_defaults, modelTarget))
+        : undefined;
       if (modelTarget === effectiveDefault) {
         topicState.preferred_worker = undefined;
         topicState.preferred_worker_set_at = undefined;
-        nextSnapshot = buildModelStatusSnapshot({ defaultWorker: effectiveDefault, reasonCode: 'user_selected_default' });
+        nextSnapshot = buildModelStatusSnapshot({ defaultWorker: effectiveDefault, reasonCode: 'user_selected_default', currentLlm });
       } else {
         topicState.preferred_worker = modelTarget;
         topicState.preferred_worker_set_at = new Date().toISOString();
-        nextSnapshot = buildModelStatusSnapshot({ currentWorker: modelTarget, defaultWorker: effectiveDefault, reasonCode: 'user_override', changedAt: topicState.preferred_worker_set_at });
+        nextSnapshot = buildModelStatusSnapshot({ currentWorker: modelTarget, defaultWorker: effectiveDefault, reasonCode: 'user_override', changedAt: topicState.preferred_worker_set_at, currentLlm });
       }
       topicState.session = undefined;
       await replacePinnedStatusCard(token, chatId, threadId, topicState, nextSnapshot);
+      if (agentSwitch.isLegacy) {
+        response = `Switched agent to *${modelTarget}* (until midnight IST).\n💡 _Tip: use \`/agent <name>\` to pick the agent and \`/model <name>\` to set its model._`;
+      } else {
+        response = `Switched agent to *${modelTarget}* (until midnight IST).`;
+      }
       skipWorker = true;
     }
 
     if (!skipWorker && KEEP_AWAKE_PATTERN.test(userText)) {
       const ka = await toggleKeepAwake();
-      await refreshPinnedStatusCardInPlace(token, chatId, threadId, topicState, effectiveDefault, ka);
+      await refreshPinnedStatusCardInPlace(token, chatId, threadId, topicState, effectiveDefault, ka, config);
       updateDashboard(token, chatId).catch(() => {});
       skipWorker = true;
     }
 
     if (!skipWorker && RESET_PATTERN.test(userText)) {
       response = handleResetCommand(topicState).response;
-      await replacePinnedStatusCard(token, chatId, threadId, topicState, buildModelStatusSnapshot({ defaultWorker: effectiveDefault, reasonCode: 'reset' }));
+      const defaultWorkerConfig = config?.workers?.find((w: WorkerConfig) => w.name === effectiveDefault);
+      const currentLlm = defaultWorkerConfig
+        ? resolveWorkerLlm(defaultWorkerConfig, selectWorkerTunables(topicState.tunable_overrides, effectiveDefault), selectWorkerTunables(topicState.tunable_defaults, effectiveDefault))
+        : undefined;
+      await replacePinnedStatusCard(token, chatId, threadId, topicState, buildModelStatusSnapshot({ defaultWorker: effectiveDefault, reasonCode: 'reset', currentLlm }));
       skipWorker = true;
+    }
+
+    if (!skipWorker && NEW_PATTERN.test(userText)) {
+      const oldSessionId = topicState.session?.session_id;
+      const newCmd = handleNewCommand(topicState, userText);
+      const replyText = msg.reply_to_message?.text || msg.reply_to_message?.caption;
+      let seededTurnsCount = 0;
+      if (replyText) {
+        const refMatch = /(?:_Ref:\s*|\bRef:\s*)([a-z0-9-]+)(?:_|\b)/i.exec(replyText);
+        if (refMatch) {
+          const refId = refMatch[1];
+          const repliedSessionId = await findSessionForRefId(refId);
+          if (repliedSessionId && repliedSessionId !== oldSessionId) {
+            const historicalTurns = await findHistoricalSessionTurns(repliedSessionId, threadId, 20);
+            if (historicalTurns.length > 0) {
+              topicState.turns = historicalTurns;
+              seededTurnsCount = historicalTurns.length;
+            }
+          }
+        }
+      }
+      if (newCmd.instruction) {
+        userText = newCmd.instruction;
+        archivedUserText = newCmd.instruction;
+        addTurn(topicState, {
+          role: 'user',
+          text: newCmd.instruction,
+          timestamp,
+          message_id: messageId,
+          worker: topicState.preferred_worker || effectiveDefault,
+        });
+        skipWorker = false;
+      } else {
+        response = seededTurnsCount > 0
+          ? `🔄 Context reset and seeded with ${seededTurnsCount} turn(s) from previous session.`
+          : '🔄 Context cleared and ready for a fresh session.';
+        skipWorker = true;
+      }
+    }
+
+    if (!skipWorker && CODE_PATTERN.test(userText)) {
+      const codeCmd = handleCodeCommand(topicState, userText);
+      if (codeCmd.action === 'show' || codeCmd.action === 'reset') {
+        response = codeCmd.response;
+        skipWorker = true;
+      } else if (codeCmd.action === 'set' && codeCmd.path) {
+        let dirExists = false;
+        try {
+          const st = await stat(codeCmd.path);
+          dirExists = st.isDirectory();
+        } catch {
+          dirExists = false;
+        }
+        if (!dirExists) {
+          response = `⚠️ Directory not found: \`${codeCmd.path}\``;
+          skipWorker = true;
+        } else {
+          topicState.cwd_override = codeCmd.path;
+          topicState.session = undefined;
+          if (codeCmd.instruction) {
+            userText = codeCmd.instruction;
+            archivedUserText = codeCmd.instruction;
+            if (topicState.turns.length > 0 && topicState.turns[topicState.turns.length - 1].role === 'user') {
+              topicState.turns[topicState.turns.length - 1].text = codeCmd.instruction;
+            }
+            skipWorker = false;
+          } else {
+            response = `📁 Working directory set to: \`${codeCmd.path}\``;
+            skipWorker = true;
+          }
+        }
+      }
     }
 
     if (!skipWorker) {
@@ -1225,13 +1528,26 @@ async function processUpdate(
         topicState.preferred_worker = undefined;
         topicState.preferred_worker_set_at = undefined;
         topicState.session = undefined;
-        const nextSnapshot = buildModelStatusSnapshot({ currentWorker: effectiveDefault, defaultWorker: effectiveDefault, reasonCode: 'default_changed' });
+        const defaultWorkerConfig = config?.workers?.find((w: WorkerConfig) => w.name === effectiveDefault);
+        const currentLlm = defaultWorkerConfig
+          ? resolveWorkerLlm(defaultWorkerConfig, selectWorkerTunables(topicState.tunable_overrides, effectiveDefault), selectWorkerTunables(topicState.tunable_defaults, effectiveDefault))
+          : undefined;
+        const nextSnapshot = buildModelStatusSnapshot({ currentWorker: effectiveDefault, defaultWorker: effectiveDefault, reasonCode: 'default_changed', currentLlm });
         await replacePinnedStatusCard(token, chatId, threadId, topicState, nextSnapshot);
         skipWorker = true;
       }
     }
 
-    // Uniform LLM knobs: /llm and /effort (session tier), plus the /default
+    // Sunsetted commands: /llm and /default llm
+    if (!skipWorker) {
+      const sunset = handleSunsetLlmCommand(userText);
+      if (sunset.matched) {
+        response = sunset.response;
+        skipWorker = true;
+      }
+    }
+
+    // Model and effort knobs: /model and /effort (session tier), plus the /default
     // <setting> <value> extension (topic tier). Checked AFTER handleDefaultQuery
     // so `/default <worker>` keeps its existing meaning — parseTunableCommand
     // also refuses the worker form itself, so the two can never both fire.
@@ -1239,6 +1555,9 @@ async function processUpdate(
       const tunableCmd = parseTunableCommand(userText);
       if (tunableCmd) {
         response = await handleTunableCommand(tunableCmd, topicState, config, effectiveDefault);
+        if (tunableCmd.action === 'set' || tunableCmd.action === 'clear') {
+          await refreshPinnedStatusCardInPlace(token, chatId, threadId, topicState, effectiveDefault, getKeepAwakeStatus(), config);
+        }
         skipWorker = true;
       }
     }
@@ -1283,6 +1602,47 @@ async function processUpdate(
       }
     }
 
+    // Deterministic read-only commands: /status, /skills, /help, /health, /ref <id>, /claims
+    if (!skipWorker && STATUS_PATTERN.test(userText)) {
+      const ka = await getKeepAwakeStatus();
+      const snapshot = hydrateModelStatus(topicState, effectiveDefault, config);
+      response = appendRefIdAndLog(renderStatusCard({ snapshot, keepAwake: ka }), { kind: 'pin', chatId, threadId });
+      skipWorker = true;
+    }
+
+    if (!skipWorker && SKILLS_PATTERN.test(userText)) {
+      const skillStatus = await buildSkillStatus();
+      response = appendRefIdAndLog(`*Scheduled Skills*\n\n${skillStatus}`, { kind: 'system', chatId, threadId });
+      skipWorker = true;
+    }
+
+    if (!skipWorker && HELP_PATTERN.test(userText)) {
+      response = appendRefIdAndLog(handleHelpCommand().response, { kind: 'help', chatId, threadId });
+      skipWorker = true;
+    }
+
+    // These spawn pa CLI commands synchronously and return trimmed output.
+    if (!skipWorker && HEALTH_PATTERN.test(userText)) {
+      const healthResult = execPaCommand(['health'], 1200);
+      response = appendRefIdAndLog(healthResult, { kind: 'system', chatId, threadId });
+      skipWorker = true;
+    }
+
+    if (!skipWorker && REF_PATTERN.test(userText)) {
+      const refCmd = handleRefCommand(userText);
+      if (refCmd.matched && refCmd.refId) {
+        const refResult = execPaRef(refCmd.refId);
+        response = appendRefIdAndLog(refResult, { kind: 'system', chatId, threadId });
+        skipWorker = true;
+      }
+    }
+
+    if (!skipWorker && CLAIMS_PATTERN.test(userText)) {
+      const claimsResult = execPaCommand(['claims'], 1200);
+      response = appendRefIdAndLog(claimsResult, { kind: 'system', chatId, threadId });
+      skipWorker = true;
+    }
+
     // The git-workflow skill family: one deterministic Telegram trigger per
     // phase (see dispatchGitWorkflowSkill's own comment for why these bypass
     // LLM inference). Order doesn't matter — the patterns are mutually
@@ -1309,21 +1669,65 @@ async function processUpdate(
       skipWorker = true;
     }
 
-    // AI-028: /branch <name> — create a child topic linked to this one.
+    // AI-028: /branch <name> [prompt] — create a child topic linked to this one.
     if (!skipWorker) {
       const br = handleBranchCommand(topicState, userText);
       if (br.matched) {
         if (br.branchName) {
           const parentName = getTopicName(topicNames, chatId, threadId) ?? 'parent';
+          const parentEntry = topicNames.get(String(chatId))?.get(threadId);
+          const parentDesc = parentEntry?.description;
+          const sampleTurns = topicState.turns
+            .filter((t) => t.role === 'user')
+            .slice(-5)
+            .map((t) => t.text.slice(0, 80))
+            .join(' | ');
+
           const newThreadId = await createForumTopic(token, chatId, br.branchName);
           await updateTopicName(topicNames, chatId, newThreadId, br.branchName);
+
+          const { description, confident } = await generateDescriptionWithLLM({
+            name: br.branchName,
+            isBranch: true,
+            parentName,
+            parentDescription: parentDesc,
+            userPrompt: br.prompt,
+            sampleTurns: sampleTurns || undefined,
+          });
+
+          let branchDesc = (confident && description) ? description : '';
+          if (!branchDesc) {
+            branchDesc = br.prompt
+              ? `Branch of ${parentName} for ${br.branchName}: ${br.prompt}`
+              : `Branch of ${parentName} focused on ${br.branchName}.`;
+          }
+          if (branchDesc.length > MAX_DESCRIPTION_LEN) {
+            branchDesc = branchDesc.slice(0, MAX_DESCRIPTION_LEN);
+          }
+
+          await setTopicDescription(topicNames, chatId, newThreadId, branchDesc);
+
           const branchState = await loadTopicState(chatId, newThreadId);
           branchState.ancestry = { parentChatId: chatId, parentThreadId: threadId, branchName: br.branchName };
           addTurn(branchState, { role: 'assistant', text: `[Branch of: ${parentName}]`, timestamp: new Date().toISOString(), worker: 'local' });
+          if (br.prompt) {
+            addTurn(branchState, { role: 'user', text: br.prompt, timestamp: new Date().toISOString() });
+          }
+
+          // Generate and pin status card by default for the new branch topic
+          try {
+            const branchTopicKey = topicKeyFor(chatId, newThreadId);
+            const branchEffectiveDefault = getEffectiveDefaultWorker(config, branchTopicKey);
+            const branchSnapshot = hydrateModelStatus(branchState, branchEffectiveDefault, config);
+            await replacePinnedStatusCard(token, chatId, newThreadId, branchState, branchSnapshot);
+          } catch (pinErr) {
+            logger.warn('branch', `failed to generate pinned status card for branch ${br.branchName}: ${(pinErr as Error).message}`);
+          }
+
           await saveTopicState(branchState);
           await addBranch(branchIndex, chatId, newThreadId, { parentThreadId: threadId, branchName: br.branchName, createdAt: new Date().toISOString() });
           branchCreatedTopicKeys.add(`${chatId}_${newThreadId}`);
-          await sendMessage(token, chatId, appendRefIdAndLog(`🌿 Branch *${br.branchName}* created — continue in the new topic.`, { kind: 'branch', chatId, threadId: newThreadId }), undefined, newThreadId);
+          await sendMessage(token, chatId, appendRefIdAndLog(`🌿 Branch *${br.branchName}* created — continue in the new topic.\nDescription: _${branchDesc}_`, { kind: 'branch', chatId, threadId: newThreadId }), undefined, newThreadId);
           await sendMessage(token, chatId, appendRefIdAndLog(`🌿 Created branch *${br.branchName}* as a new topic.`, { kind: 'branch', chatId, threadId }), messageId, threadId);
         } else {
           response = br.response;
@@ -1456,7 +1860,18 @@ async function processUpdate(
           // or fail the reply that carried the note.
           appendKbNote(kbNote.domain, kbNote.note).catch(() => {});
         }
-        if (dr.dispatchedWorker) await maybeUpdatePinnedStatusAfterDispatch(token, chatId, threadId, topicState, effectiveDefault, dr.dispatchedWorker, latestFailoverPayload);
+        if (dr.dispatchedWorker) await maybeUpdatePinnedStatusAfterDispatch(token, chatId, threadId, topicState, effectiveDefault, dr.dispatchedWorker, latestFailoverPayload, config);
+
+        // Enrich pending dispatch with teePath for crash recovery.
+        // The teePath is deterministic from contextId (same formula
+        // used by worker-exec.ts). This is a best-effort enrichment:
+        // the worker-pids entry also carries it, but the entry may be
+        // cleaned up by the worker's own done() callback before
+        // the reaper reads it.
+        if (pendingKey && contextId) {
+          const inferredTeePath = join(paHome(), 'logs', 'worker-tee', `${contextId}.out`);
+          await updatePendingDispatch(pendingKey, { teePath: inferredTeePath, workerName: dr.dispatchedWorker }).catch(() => {});
+        }
       } catch (dispatchErr) {
         logger.warn('dispatch', `dispatchMessage error: ${(dispatchErr as Error).message}`);
         response = '⚠️ Service temporarily unavailable.';
@@ -1655,7 +2070,7 @@ export async function runPollLoop(
         state.last_update_id = pollOffset;
         // Side-map for steer context attachment in the enqueue block. Cleared each
         // batch to avoid cross-batch contamination.
-        const steerContextsByUpdateId = new Map<number, { drainedEntries: QueueEntry[]; steerPrompt: string; steerVoice?: { promise: Promise<VoiceResult>; descriptor: VoicePrefetchDescriptor } }>();
+        const steerContextsByUpdateId = new Map<number, { drainedEntries: QueueEntry[]; steerPrompt?: string; steerVoice?: { promise: Promise<VoiceResult>; descriptor: VoicePrefetchDescriptor } }>();
         for (const update of updates) {
           // AI-092: /stop and /steer act on the topic's RUNNING worker, so they
           // must bypass per-topic serialization (queuing behind the in-flight
@@ -1789,7 +2204,7 @@ export async function runPollLoop(
             }
             // Store steerContext on the queue entry. The enqueue block below will
             // attach it after registerQueuedUpdate returns.
-            const steerContext = { drainedEntries, steerPrompt: stopReq.prompt! };
+            const steerContext = { drainedEntries, steerPrompt: stopReq.prompt };
             // For text-only steer (no audio anywhere), use the old combined-text path.
             // For voice steer (drainedEntries has voice OR steerVoice is set), store
             // steerContext and set just the prompt.
@@ -1798,15 +2213,130 @@ export async function runPollLoop(
             if (!hasVoice) {
               // Text-only steer: combine drained texts + prompt immediately.
               const drainedTexts = drainedEntries.map(e => e.text).filter(t => t !== '');
-              stopMsg.text = [...drainedTexts, stopReq.prompt!].join('\n\n');
+              const parts = stopReq.prompt ? [...drainedTexts, stopReq.prompt] : drainedTexts;
+              stopMsg.text = parts.join('\n\n');
             } else {
               // Voice steer: store steerContext and set just the prompt. The normalizer
               // will materialize the full prompt with transcripts (including held entries).
-              stopMsg.text = stopReq.prompt!;
+              stopMsg.text = stopReq.prompt ?? '';
             }
             // Store in the side map for the enqueue block to attach.
             steerContextsByUpdateId.set(update.update_id, { ...steerContext, steerVoice });
           }
+
+          // WPE2: HITL callback_query handling for self-improver risk-flagged alerts
+          if (update.callback_query && allowedChatIds.has(update.callback_query.message?.chat?.id ?? 0)) {
+            const cb = update.callback_query;
+            const cbChatId = cb.message?.chat.id ?? 0;
+            const cbThreadId = cb.message?.message_thread_id ?? 0;
+            const cbMessageId = cb.message?.message_id;
+            const cbUserId = cb.from?.id?.toString();
+
+            void (async () => {
+              try {
+                const operatorId = secrets['PA_OPERATOR_USER_ID'];
+                if (!operatorId) {
+                  await answerCallbackQuery(token, cb.id, 'Set PA_OPERATOR_USER_ID to enable HITL buttons', true);
+                  await sendMessage(token, cbChatId, appendRefIdAndLog('⚠️ Operator user ID not configured. Set PA_OPERATOR_USER_ID in secrets.env to enable HITL approval buttons.', { kind: 'callback', chatId: cbChatId, threadId: cbThreadId }), cbMessageId, cbThreadId);
+                  logger.info('callback', 'rejected - no operator ID', { refId: 'none', chatId: cbChatId, threadId: cbThreadId });
+                  return;
+                }
+
+                if (cbUserId !== operatorId) {
+                  await answerCallbackQuery(token, cb.id, 'Only the configured operator can approve changes', true);
+                  logger.info('callback', 'rejected - unauthorized user', { refId: 'none', chatId: cbChatId, threadId: cbThreadId, userId: cbUserId });
+                  return;
+                }
+
+                const callbackData = cb.data;
+                if (!callbackData) {
+                  await answerCallbackQuery(token, cb.id, 'Invalid callback data');
+                  return;
+                }
+
+                const match = callbackData.match(/^pm:([^:]+):(approve|reject|diff)$/);
+                if (!match) {
+                  await answerCallbackQuery(token, cb.id, 'Invalid callback format');
+                  return;
+                }
+
+                const auditId = match[1];
+                const action = match[2];
+
+                // Read audit records to find the target record
+                const { readAuditRecords, appendAuditRecord } = await import('../../../pa/dist/src/lib/improvement-audit.js');
+                const records = await readAuditRecords();
+                const targetRecord = records.find(r => r.ts === auditId || r.commit_hash === auditId);
+
+                if (!targetRecord) {
+                  await answerCallbackQuery(token, cb.id, 'Audit record not found', true);
+                  logger.info('callback', 'rejected - record not found', { refId: 'none', auditId, action, chatId: cbChatId, threadId: cbThreadId });
+                  return;
+                }
+
+                // Check 24h expiry
+                const recordAge = Date.now() - new Date(targetRecord.ts).getTime();
+                const EXPIRY_MS = 24 * 60 * 60 * 1000;
+                if (recordAge > EXPIRY_MS) {
+                  await answerCallbackQuery(token, cb.id, 'This approval button has expired (24h limit)', true);
+                  logger.info('callback', 'rejected - expired', { refId: 'none', auditId, action, chatId: cbChatId, threadId: cbThreadId, recordAge });
+                  return;
+                }
+
+                // Handle actions
+                const refId = makeRefId('cb');
+                logger.info('callback', 'received', { refId, auditId, action, chatId: cbChatId, threadId: cbThreadId });
+
+                if (action === 'approve') {
+                  const reviewRecord = {
+                    ts: new Date().toISOString(),
+                    draft: targetRecord.draft,
+                    source_type: 'conversation' as const,
+                    action: 'rollback-accepted' as const,
+                    risk_flags: targetRecord.risk_flags,
+                    reason: 'Approved via HITL button by operator',
+                    accepted_at: new Date().toISOString(),
+                    accepted_by: 'operator',
+                    commit_hash: targetRecord.commit_hash,
+                  };
+                  await appendAuditRecord(reviewRecord);
+                  await answerCallbackQuery(token, cb.id, '✅ Change approved');
+                  await sendMessage(token, cbChatId, appendRefIdAndLog(`✅ Approved change ${auditId} _Ref: ${refId}_`, { kind: 'callback', chatId: cbChatId, threadId: cbThreadId }), cbMessageId, cbThreadId);
+                } else if (action === 'reject') {
+                  const reviewRecord = {
+                    ts: new Date().toISOString(),
+                    draft: targetRecord.draft,
+                    source_type: 'conversation' as const,
+                    action: 'rollback-accepted' as const,
+                    risk_flags: targetRecord.risk_flags,
+                    reason: 'Rejected via HITL button by operator',
+                    accepted_at: new Date().toISOString(),
+                    accepted_by: 'operator',
+                    commit_hash: targetRecord.commit_hash,
+                  };
+                  await appendAuditRecord(reviewRecord);
+                  await answerCallbackQuery(token, cb.id, '❌ Change rejected');
+                  await sendMessage(token, cbChatId, appendRefIdAndLog(`❌ Rejected change ${auditId} _Ref: ${refId}_`, { kind: 'callback', chatId: cbChatId, threadId: cbThreadId }), cbMessageId, cbThreadId);
+                  // Notify pa-alerts about rejection
+                  const paAlertsChatId = secrets['PA_ALERTS_CHAT_ID'] ? parseInt(secrets['PA_ALERTS_CHAT_ID']) : null;
+                  if (paAlertsChatId && !isNaN(paAlertsChatId)) {
+                    await sendMessage(token, paAlertsChatId, `⚠️ Change ${auditId} was rejected by operator via HITL button.`);
+                  }
+                } else if (action === 'diff') {
+                  const diff = targetRecord.diff || 'No diff available';
+                  const chunks = diff.match(/[\s\S]{1,3000}/g) || ['No diff available'];
+                  const firstChunk = chunks[0];
+                  await answerCallbackQuery(token, cb.id, '📄 Showing diff');
+                  await sendMessage(token, cbChatId, appendRefIdAndLog(`📄 Diff for ${auditId}:\n\n${firstChunk}${chunks.length > 1 ? '\n\n...(truncated)' : ''} _Ref: ${refId}_`, { kind: 'callback', chatId: cbChatId, threadId: cbThreadId }), cbMessageId, cbThreadId);
+                }
+              } catch (err) {
+                logger.warn('callback', `error processing callback: ${(err as Error).message}`, { chatId: cbChatId, threadId: cbThreadId });
+                await answerCallbackQuery(token, cb.id, 'Error processing callback').catch(() => {});
+              }
+            })();
+            continue; // Don't process callback queries as messages
+          }
+
           // AI-095 follow-up (deep-recheck 2026-07-08, Phase 1A): persist a
           // minimal placeholder record for this update BEFORE it's chained
           // into topicPending — a same-topic update queued behind a
@@ -1944,21 +2474,18 @@ export async function runPollLoop(
                   const vr = (update as any).__voiceResult as VoiceResult | undefined;
                   if (vr) ownTranscript = userTextFromVoiceResult(vr, queueEntry.voice.descriptor);
                 }
-                // A3: E7 — when steerPrompt is undefined (bare /steer on voice),
-                // the own transcript IS the prompt. Push last without duplication.
-                if (ctx.steerPrompt !== undefined) {
+                // When steerPrompt is provided, push it. If steer message was voice/audio, ownTranscript is pushed.
+                if (ctx.steerPrompt !== undefined && ctx.steerPrompt.trim().length > 0) {
                   texts.push(ctx.steerPrompt);
                 } else if (ownTranscript !== undefined) {
                   texts.push(ownTranscript);
-                } else {
-                  // Degraded case: no prompt and no own transcript. Push empty last.
-                  texts.push('');
                 }
-                // If ownTranscript exists and steerPrompt is defined, push it before the prompt.
-                if (ownTranscript !== undefined && ctx.steerPrompt !== undefined) {
+                // If ownTranscript exists and steerPrompt is defined, push ownTranscript before the prompt.
+                if (ownTranscript !== undefined && ctx.steerPrompt !== undefined && ctx.steerPrompt.trim().length > 0) {
                   texts.splice(-1, 0, ownTranscript);
                 }
-                (update as any).message = { ...update.message, text: texts.join('\n\n') };
+                const combinedText = texts.filter(t => t.trim().length > 0).join('\n\n');
+                (update as any).message = { ...update.message, text: combinedText };
               }
               // --- Flush-check (step C.2, A8) ---
               if (isTopicStopped(topicKey, update.update_id)) {
@@ -2020,7 +2547,16 @@ export async function runPollLoop(
       await sleepFn(computeBackoff(consecutiveErrors));
     }
   }
-  if (inFlight.size > 0) await Promise.allSettled(inFlight);
+  // Non-blocking shutdown: workers are independent processes that
+  // keep running after the bot exits. Pending-dispatch records
+  // persist to disk; the orphan reaper recovers their replies on the
+  // next startup. process.exit() skips pending promise callbacks
+  // (the .finally() chains on detached processUpdate promises
+  // won't fire), which is intentional — markDelivered and
+  // removePendingDispatch stay on disk for recovery.
+  if (inFlight.size > 0) {
+    logger.info('shutdown', `detaching ${inFlight.size} in-flight dispatch(es) — workers continue independently`);
+  }
   // Bounded drain: waits for every currently in-flight maintenance pass (there
   // can be more than one — kicks are throttled by time, not by whether a prior
   // pass has settled, see above), not just the most recently kicked one.
@@ -2035,6 +2571,7 @@ export async function runPollLoop(
     ]);
     if (drainTimer) clearTimeout(drainTimer);
   }
+  process.exit(0);
 }
 
 async function main(): Promise<void> {
@@ -2069,7 +2606,7 @@ async function main(): Promise<void> {
       await flushDlq(token).catch(() => {});
       // AI-095: recover replies from dispatches orphaned by a crashed prior instance.
       // May wait many minutes for an orphan to finish.
-      void reapOrphanedDispatches(token).catch((err) => logger.warn('reaper', 'reap failed', { error: String(err) }));
+      void reapOrphanedDispatches(token, { secrets }).catch((err) => logger.warn('reaper', 'reap failed', { error: String(err) }));
       await backfillTopicDescriptions(token, chatIds, topicNames).catch(() => {});
       await registerBotCommands(token).catch(() => {});
       await updateDashboard(token, chatIds[0]).catch(() => {});

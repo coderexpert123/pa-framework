@@ -1,4 +1,4 @@
-import { getOverdueSkills, partitionOverdueByFailureBackoff } from '../scheduler.js';
+import { getOverdueSkills, partitionOverdueByFailureBackoff, partitionOverdueByCostTier } from '../scheduler.js';
 import { runCommand } from './run.js';
 import { blackboard } from '../blackboard.js';
 import { log } from '../lib/log.js';
@@ -74,6 +74,15 @@ async function runCatchup(opts: CatchupOptions): Promise<void> {
   if (opts.topic) {
     overdue = overdue.filter(o => (o.skill.frontmatter.topic || 'default') === opts.topic);
   }
+
+  // cost_tier (2026-08-17): partition out off_peak periodic skills during the
+  // z.ai peak billing window (Mon-Fri 11:30-15:30 IST) FIRST — the failure
+  // backoff below then operates only on what is actually allowed to run.
+  const costPartition = await partitionOverdueByCostTier(overdue);
+  for (const { entry, reason } of costPartition.deferred) {
+    log('info', 'catchup', `${entry.skill.name}: deferred by cost_tier`, { reason });
+  }
+  overdue = costPartition.runnable;
 
   // AI-098: partition out skills mid-backoff or parked after repeated
   // failures, BEFORE the "no overdue skills" check so an all-deferred/parked

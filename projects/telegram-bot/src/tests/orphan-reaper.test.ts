@@ -337,6 +337,123 @@ describe('evaluatePendingDispatch', () => {
     assert.equal(await wasDelivered(deliveredKey(rec.chatId, rec.threadId, rec.updateId)), false,
       'must not be marked delivered — that would foreclose recovery forever');
   });
+
+  // --------------------------------------------------------------------
+  // WP3: worker alive FIRST check (decision tree rewrite)
+  // --------------------------------------------------------------------
+
+  it('worker alive + no result yet → waiting (non-recoverable record, no session)', async () => {
+    // A codex dispatch (not in CLAUDE_FAMILY) with no tee — the OLD
+    // code would have sent a death notice immediately. The new code checks
+    // worker alive first and waits.
+    const rec = makeRecord({ session: { session_id: 'c-1', worker: 'codex', started_at: T0 } });
+    await addPendingDispatch(rec);
+    const { deps, sent } = makeFakeDeps({
+      workerAlive: true,
+      // No transcript (codex has no readable transcript path)
+      // No tee
+    });
+    assert.equal(await evaluatePendingDispatch(rec, deps, FAR_DEADLINE), 'waiting');
+    assert.equal(sent.length, 0);
+  });
+
+  it('fresh dispatch placeholder (no session, no tee) + worker alive → waiting', async () => {
+    const rec = makeRecord({ session: undefined });
+    await addPendingDispatch(rec);
+    const { deps, sent } = makeFakeDeps({
+      workerAlive: true,
+    });
+    assert.equal(await evaluatePendingDispatch(rec, deps, FAR_DEADLINE), 'waiting');
+    assert.equal(sent.length, 0);
+  });
+
+  it('codex dispatch + worker dead + no tee → death notice (no recovery source)', async () => {
+    const rec = makeRecord({ session: { session_id: 'c-1', worker: 'codex', started_at: T0 } });
+    await addPendingDispatch(rec);
+    const { deps, sent } = makeFakeDeps({ workerAlive: false });
+    assert.equal(await evaluatePendingDispatch(rec, deps, FAR_DEADLINE), 'dead');
+    assert.equal(sent.length, 1);
+    assert.ok(sent[0].text.includes('could not be recovered'));
+  });
+
+  // --------------------------------------------------------------------
+  // WP3: tee file from pending dispatch (not registry)
+  // --------------------------------------------------------------------
+
+  it('reads tee from pending dispatch when worker-pids entry is gone', async () => {
+    const rec = makeRecord({ session: { session_id: 'g-1', worker: 'agy', started_at: T0 }, teePath: '/logs/test.out' });
+    await addPendingDispatch(rec);
+    const { deps, sent } = makeFakeDeps({
+      workerAlive: false,
+      sendResult: true,
+    });
+    // Add readFile dep to return tee content
+    (deps as any).readFile = async () => '{"event":"result","result":{"status":"SUCCESS","response":"tee reply"}}';
+    assert.equal(await evaluatePendingDispatch(rec, deps, FAR_DEADLINE), 'recovered');
+    assert.equal(sent.length, 1);
+    assert.ok(sent[0].text.includes('tee reply'));
+  });
+
+  // --------------------------------------------------------------------
+  // WP3: native resume re-dispatch
+  // --------------------------------------------------------------------
+
+  it('native resume fires when worker dead + no result + session exists', async () => {
+    const rec = makeRecord({ session: { session_id: 's-1', worker: 'agy', started_at: T0 } });
+    await addPendingDispatch(rec);
+    let redispatched = false;
+    const { deps, sent } = makeFakeDeps({
+      workerAlive: false,
+      sendResult: true,
+    });
+    (deps as any).redispatchWithResume = async () => { redispatched = true; return 're-dispatched output'; };
+    assert.equal(await evaluatePendingDispatch(rec, deps, FAR_DEADLINE), 'recovered');
+    assert.equal(sent.length, 1);
+    assert.ok(sent[0].text.includes('re-dispatched'));
+    assert.ok(redispatched);
+  });
+
+  it('native resume skipped when session has no session_id', async () => {
+    const rec = makeRecord({ session: { session_id: '', worker: 'agy', started_at: T0 } });
+    await addPendingDispatch(rec);
+    let redispatched = false;
+    const { deps, sent } = makeFakeDeps({
+      workerAlive: false,
+      sendResult: true,
+    });
+    (deps as any).redispatchWithResume = async () => { redispatched = true; return 'output'; };
+    // No session_id → skip native resume → death notice
+    assert.equal(await evaluatePendingDispatch(rec, deps, FAR_DEADLINE), 'dead');
+    assert.ok(!redispatched, 'empty session_id must skip re-dispatch');
+  });
+
+  it('re-dispatch attempted, returns null → death notice (not waiting loop)', async () => {
+    const rec = makeRecord({ session: { session_id: 's-1', worker: 'claude', started_at: T0 } });
+    await addPendingDispatch(rec);
+    let redispatched = false;
+    const { deps, sent } = makeFakeDeps({
+      workerAlive: false,
+      sendResult: true,
+    });
+    (deps as any).redispatchWithResume = async () => { redispatched = true; return null; };
+    // Re-dispatch IS attempted (returns null) → falls through to death notice
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(outcome, 'dead');
+    assert.ok(redispatched, 'resume was attempted before falling through to death notice');
+  });
+
+  it('native resume skipped when no session at all', async () => {
+    const rec = makeRecord({ session: undefined });
+    await addPendingDispatch(rec);
+    let redispatched = false;
+    const { deps, sent } = makeFakeDeps({
+      workerAlive: false,
+      sendResult: true,
+    });
+    (deps as any).redispatchWithResume = async () => { redispatched = true; return 'output'; };
+    assert.equal(await evaluatePendingDispatch(rec, deps, FAR_DEADLINE), 'dead');
+    assert.ok(!redispatched);
+  });
 });
 
 // ---------------------------------------------------------------------------

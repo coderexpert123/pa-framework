@@ -103,7 +103,11 @@ export async function buildPrompt(
   topicNames?: TopicNameMap,
   replyContext?: string,
   pendingAction?: string,
-  options?: { omitStatic?: boolean; priorContext?: { worker: string; sessionId: string; sessionPath: string | null } }
+  options?: {
+    omitStatic?: boolean;
+    priorContext?: { worker: string; sessionId: string; sessionPath: string | null };
+    attachments?: Array<{ filename: string; path: string }>;
+  }
 ): Promise<string> {
   const today = todayIST();
   const now = nowIST();
@@ -126,6 +130,14 @@ export async function buildPrompt(
 
   const replySection = replyContext
     ? `## Replying To\n${replyContext}\n\n`
+    : '';
+
+  // WPE3 (2026-08-18): document/photo attachments ride the same dated-dir
+  // substrate as voice notes; the worker gets absolute paths to act on.
+  const attachmentsSection = options?.attachments?.length
+    ? `## Attachments\nThe user attached file(s), downloaded to disk:\n${options.attachments
+        .map((a) => `- [Attachment: ${a.filename} at ${a.path}]`)
+        .join('\n')}\n\n`
     : '';
 
   const pendingSection = pendingAction
@@ -186,7 +198,7 @@ ${cwdSection}${skillStatusSection}${topicDescSection}${telegramMeta}
 ## Conversation History
 ${historySection}
 ${priorContextSection}
-${replySection}${pendingSection}## Current Message
+${replySection}${attachmentsSection}${pendingSection}## Current Message
 ${userMessage}
 ${capabilitiesSection}`;
 }

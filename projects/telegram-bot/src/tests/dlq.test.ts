@@ -1,9 +1,9 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, readFile } from 'fs/promises';
+import { mkdtemp, rm, readFile, mkdir, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { appendDlq, loadDlq, clearDlq, writeDlq, flushDlq, DLQ_MAX_AGE_MS, type DlqEntry } from '../dlq.js';
+import { appendDlq, loadDlq, clearDlq, writeDlq, flushDlq, DLQ_MAX_AGE_MS, QUARANTINE_THRESHOLD, type DlqEntry } from '../dlq.js';
 import { markDelivered, deliveredKey, _resetDeliveredCacheForTest } from '../delivered-store.js';
 
 function makeEntry(overrides: Partial<DlqEntry> = {}): DlqEntry {
@@ -264,5 +264,119 @@ describe('flushDlq', () => {
     const result = await flushDlq('token');
     assert.equal(sendCount, 1, 're-flush must not resend an already-delivered entry');
     assert.equal(result.deduped, 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Quarantine behavior
+// ---------------------------------------------------------------------------
+
+describe('quarantine', () => {
+  it('increments attempts on each failed flush', async () => {
+    (globalThis as Record<string, unknown>).fetch = async () => ({ ok: false, status: 400, text: async () => 'Bad Request', json: async () => ({ ok: false }) });
+    const entry = makeEntry({ text: 'failing message', updateId: 1 });
+    await appendDlq(entry);
+
+    await flushDlq('token'); // attempts becomes 1
+    let loaded = await loadDlq();
+    assert.equal(loaded.length, 1);
+    assert.equal(loaded[0].attempts, 1);
+
+    await flushDlq('token'); // attempts becomes 2
+    loaded = await loadDlq();
+    assert.equal(loaded.length, 1);
+    assert.equal(loaded[0].attempts, 2);
+  });
+
+  it('quarantines entry after QUARANTINE_THRESHOLD failed attempts', async () => {
+    (globalThis as Record<string, unknown>).fetch = async () => ({ ok: false, status: 400, text: async () => 'Bad Request', json: async () => ({ ok: false }) });
+    const entry = makeEntry({ text: 'chronically failing', updateId: 2, refId: 's-abc123' });
+    await appendDlq(entry);
+
+    // Fail QUARANTINE_THRESHOLD times
+    for (let i = 0; i < QUARANTINE_THRESHOLD; i++) {
+      await flushDlq('token');
+    }
+
+    const loaded = await loadDlq();
+    assert.equal(loaded.length, 1);
+    assert.equal(loaded[0].quarantined, true);
+    assert.equal(loaded[0].attempts, QUARANTINE_THRESHOLD);
+  });
+
+  it('stops retrying quarantined entries', async () => {
+    let sendCount = 0;
+    (globalThis as Record<string, unknown>).fetch = async () => { sendCount++; return { ok: false, status: 400, text: async () => 'Bad Request', json: async () => ({ ok: false }) }; };
+    const entry = makeEntry({ text: 'quarantined entry', updateId: 3 });
+    await appendDlq(entry);
+
+    // Quarantine the entry
+    for (let i = 0; i < QUARANTINE_THRESHOLD; i++) {
+      await flushDlq('token');
+    }
+    const sendCountAtQuarantine = sendCount;
+
+    // Try flushing again - should NOT attempt send
+    await flushDlq('token');
+    assert.equal(sendCount, sendCountAtQuarantine, 'quarantined entry must not be retried');
+  });
+
+  it('sends quarantine alert once when entry is quarantined', async () => {
+    // Routing mock: DELIVERY sends keep failing (drives attempts up to the
+    // quarantine threshold) but the ALERT send to the pa-alerts chat succeeds —
+    // the dedup file is only written after a SUCCESSFUL alert, by design.
+    (globalThis as Record<string, unknown>).fetch = async (_url: unknown, init: { body?: string } | undefined) => {
+      const body = init?.body ?? '';
+      const isAlert = typeof body === 'string' && (body.includes('"chat_id":123') || body.includes('"chat_id":"123"'));
+      return isAlert
+        ? { ok: true, status: 200, text: async () => '{"ok":true}', json: async () => ({ ok: true }) }
+        : { ok: false, status: 400, text: async () => 'Bad Request', json: async () => ({ ok: false }) };
+    };
+    const entry = makeEntry({ chatId: -100999, text: 'alert test message', updateId: 4, refId: 's-alert123' });
+    await appendDlq(entry);
+
+    // Set required env vars for alert to run
+    process.env.PA_ALERTS_CHAT_ID = '123';
+    process.env.TELEGRAM_BOT_TOKEN = 'test-token';
+
+    // Create quarantine-alerts directory
+    const alertDir = join(tempDir, 'quarantine-alerts');
+    await mkdir(alertDir, { recursive: true });
+
+    // Quarantine the entry (will attempt to send alert)
+    for (let i = 0; i < QUARANTINE_THRESHOLD; i++) {
+      await flushDlq('token');
+    }
+
+    // Verify the alert dedup file was created (prevents duplicate alerts)
+    const alertFiles = await readFile(join(alertDir, 's-alert123.json'), 'utf8').catch(() => null);
+    assert.ok(alertFiles, 'quarantine alert dedup file should be created');
+  });
+
+  it('quarantined entries persist beyond TTL for operator action', async () => {
+    const veryOldTimestamp = new Date(Date.now() - DLQ_MAX_AGE_MS - 100000).toISOString();
+    const oldQuarantinedEntry = makeEntry({ text: 'old quarantined', timestamp: veryOldTimestamp, updateId: 5, attempts: 5, quarantined: true });
+    const oldNormalEntry = makeEntry({ text: 'old normal', timestamp: veryOldTimestamp, updateId: 6 });
+
+    await appendDlq(oldQuarantinedEntry);
+    await appendDlq(oldNormalEntry);
+
+    const loaded = await loadDlq();
+    assert.equal(loaded.length, 1, 'only quarantined entry should remain (normal entry expired)');
+    assert.equal(loaded[0].text, 'old quarantined');
+    assert.equal(loaded[0].quarantined, true);
+  });
+
+  it('non-quarantined entries are still filtered by TTL', async () => {
+    const veryOldTimestamp = new Date(Date.now() - DLQ_MAX_AGE_MS - 100000).toISOString();
+    const oldEntry = makeEntry({ text: 'old entry', timestamp: veryOldTimestamp, updateId: 7 });
+    const freshEntry = makeEntry({ text: 'fresh entry', updateId: 8 });
+
+    await appendDlq(oldEntry);
+    await appendDlq(freshEntry);
+
+    const loaded = await loadDlq();
+    assert.equal(loaded.length, 1);
+    assert.equal(loaded[0].text, 'fresh entry');
   });
 });

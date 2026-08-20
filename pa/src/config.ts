@@ -1,7 +1,7 @@
 import { readFile, writeFile } from 'fs/promises';
 import { parse as parseYaml } from 'yaml';
 import { configPath } from './paths.js';
-import type { PaConfig, WorkerConfig, EvaluatorConfig, BgTasksConfig, TunableSpec, TunableValues, MaintenanceConfig, TranscriptionConfig, TranscriptionEnginePreference, TranscriptionWorkerMode } from './types.js';
+import type { PaConfig, WorkerConfig, EvaluatorConfig, BgTasksConfig, TunableSpec, TunableValues, MaintenanceConfig, TranscriptionConfig, TranscriptionEnginePreference, TranscriptionWorkerMode, UsageConfig } from './types.js';
 
 /**
  * Parse a tunable's optional `values:` — a DISPLAY HINT, never a gate.
@@ -355,6 +355,31 @@ export function parseTranscription(raw: any): TranscriptionConfig | undefined {
   return resolveTranscriptionConfig(partial);
 }
 
+/** Parse the optional top-level `usage:` block. WARN-AND-SKIP, same
+ *  house style as parseTunables/parseMaintenance/parseTranscription. */
+export function parseUsage(raw: any): UsageConfig | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    console.warn("[config] ~/.pa/config.yaml: 'usage' must be a mapping with 'budget_monthly_usd'; ignoring");
+    return undefined;
+  }
+
+  const out: UsageConfig = {};
+
+  if (raw.budget_monthly_usd !== undefined && raw.budget_monthly_usd !== null) {
+    const v = Number(raw.budget_monthly_usd);
+    if (Number.isFinite(v) && v > 0) {
+      out.budget_monthly_usd = v;
+    } else {
+      console.warn(
+        `[config] ~/.pa/config.yaml: usage.budget_monthly_usd must be a positive number (got ${JSON.stringify(raw.budget_monthly_usd)}); ignoring`,
+      );
+    }
+  }
+
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 export async function loadConfig(): Promise<PaConfig> {
   const path = configPath();
   let raw: string;
@@ -452,6 +477,9 @@ export async function loadConfig(): Promise<PaConfig> {
       concurrency_limit: Number.isInteger(parsed.concurrency_limit) ? parsed.concurrency_limit : 2,
       maintenance: parseMaintenance(parsed.maintenance),
       transcription: parseTranscription(parsed.transcription),
+      usage: parseUsage(parsed.usage),
+      quota_aware_failover: typeof parsed.quota_aware_failover === 'boolean' ? parsed.quota_aware_failover : false,
+      worker_pin: typeof parsed.worker_pin === 'string' ? parsed.worker_pin.trim() : undefined,
     };
 }
 

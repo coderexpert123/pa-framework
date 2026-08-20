@@ -1,5 +1,6 @@
 import { spawn } from 'child_process';
 import { writeFile, unlink, mkdir } from 'fs/promises';
+import { createWriteStream } from 'fs';
 import { join } from 'path';
 import { paHome } from './paths.js';
 import { tmpdir } from 'os';
@@ -14,6 +15,7 @@ import { addWorkerPid, removeWorkerPid, updateWorkerPidDescendants, isProcessAli
 import { logger } from './lib/log.js';
 import { notifyUser } from './lib/notify.js';
 import { getSkillTranslationPatterns } from './lib/skill-translations.js';
+import { appendUsage, extractUsageFromEvent, type UsageRecord } from './lib/usage-ledger.js';
 
 function sanitizeCmdline(cmdline: string): string {
   return cmdline.replace(/([?&](api_key|token|password|secret)=)[^\s&]*/gi, '$1<redacted>').slice(0, 200);
@@ -227,16 +229,21 @@ export async function executeWorker(
 
     const mergedEnv = { ...process.env, ...(options.env || {}), PA_BOT_PID: String(process.pid) } as NodeJS.ProcessEnv;
 
-    // Tee stdout for agy: the shim wraps agy with the tee helper when
-    // AGY_TEE_OUT is set, capturing output to disk so the orphan reaper can
-    // recover sessionless workers' replies after a bot crash.
+    // Tee stdout for all workers: for agy, the shim wraps agy with the tee
+    // helper when AGY_TEE_OUT is set, capturing output to disk so the orphan
+    // reaper can recover sessionless workers' replies after a bot crash.
+    // For non-agy workers, we tee stdout here in Node.js so the tee file is
+    // universally available for recovery.
     let teePath: string | undefined;
-    if (worker.name === 'agy' && !mergedEnv.AGY_TEE_OUT) {
-      const teeDir = join(paHome(), 'logs', 'worker-tee');
-      await mkdir(teeDir, { recursive: true });
-      const safeName = options.contextId || `${Date.now()}-${randomBytes(4).toString('hex')}`;
-      teePath = join(teeDir, `${safeName}.out`);
+    const teeDir = join(paHome(), 'logs', 'worker-tee');
+    await mkdir(teeDir, { recursive: true });
+    const safeName = options.contextId || `${Date.now()}-${randomBytes(4).toString('hex')}`;
+    const teeFilePath = join(teeDir, `${safeName}.out`);
+    if (worker.name === 'agy') {
+      teePath = mergedEnv.AGY_TEE_OUT || teeFilePath;
       mergedEnv.AGY_TEE_OUT = teePath;
+    } else {
+      teePath = teeFilePath;
     }
 
     // Snapshot state dir mtime before spawning so we can detect new activity
@@ -256,7 +263,8 @@ export async function executeWorker(
         if (child.pid) {
           (pidTracked || Promise.resolve()).then(() => removeWorkerPid(child.pid!)).catch(err => logger.warn('worker-exec', 'removeWorkerPid failed on done', { error: err?.message ?? String(err) }));
         }
-        resolve(r);
+        if (teeWriteStream) { teeWriteStream.end(); }
+        resolve({ teePath: r.teePath ?? teePath, ...r });
       };
 
       let stdout = '';
@@ -266,6 +274,7 @@ export async function executeWorker(
       let codexStreamError = ''; // captures {"type":"error",...} events from codex NDJSON stream
       let agyStreamError = ''; // captures error text from agy result events with status !== SUCCESS
       let agyResultSeen = false; // tracks whether an agy result event was parsed (for fallback logic)
+      let capturedUsage: { tokensIn: number; tokensOut: number; tokensThinking?: number; tokensCacheRead?: number } | undefined; // tracks usage from stream events
       const isStreamJson = worker.output_format === 'stream-json';
 
       const child = spawn(worker.command, args, {
@@ -286,6 +295,16 @@ export async function executeWorker(
       // Hoisted above the kill helpers below (AI-112) — killWorkerTree reads
       // bgTaskMap, so declaring it after them would be a TDZ error.
       const bgTaskMap = new Map<number, BgEntry>();
+
+      // Node.js stdout tee for non-agy workers. Agy uses the shim-based
+      // AGY_TEE_OUT tee which writes from the shim process; duplicating
+      // that here would be wasteful. For other workers, we tee stdout
+      // here so the orphan reaper can recover the reply even when the
+      // worker-pids registry entry is cleaned up by the worker's own
+      // done() callback.
+      const teeWriteStream = (teePath && worker.name !== 'agy')
+        ? createWriteStream(teePath, { flags: 'a' })
+        : null;
 
       pidTracked = child.pid
         ? addWorkerPid({
@@ -620,6 +639,7 @@ export async function executeWorker(
       let lastToolBoundary = 0;
 
       child.stdout?.on('data', (data: Buffer) => {
+        if (teeWriteStream) teeWriteStream.write(data);
         const chunk = data.toString();
         if (isStreamJson) {
           // Buffer chunks and process complete lines only
@@ -716,6 +736,10 @@ export async function executeWorker(
                 if (event.event === 'step_update' && event.step_update?.text_delta && !agyResultSeen) {
                   stdout += event.step_update.text_delta;
                 }
+
+                // Extract usage from agy events
+                const usage = extractUsageFromEvent(event, worker.name);
+                if (usage) capturedUsage = usage;
               }
             } catch {
               // Malformed JSON line — skip
@@ -812,6 +836,10 @@ export async function executeWorker(
               if (event.event === 'step_update' && event.step_update?.text_delta && !agyResultSeen) {
                 stdout += event.step_update.text_delta;
               }
+
+              // Extract usage from agy events in trailing buffer
+              const usage = extractUsageFromEvent(event, worker.name);
+              if (usage) capturedUsage = usage;
             }
           } catch {
             // Final buffer wasn't valid JSON — ignore
@@ -873,8 +901,24 @@ export async function executeWorker(
           error: combinedError,
           exitCode: code,
           sessionId: capturedSessionId,
+          teePath,
           rateLimitTelemetry: lastCodexTelemetry,
         });
+
+        // Post-run hook: append usage to ledger if available (best-effort, never breaks the dispatch)
+        if (capturedUsage) {
+          const usageRecord: UsageRecord = {
+            ts: new Date().toISOString(),
+            worker: worker.name,
+            resource,
+            tokensIn: capturedUsage.tokensIn,
+            tokensOut: capturedUsage.tokensOut,
+            tokensThinking: capturedUsage.tokensThinking,
+            tokensCacheRead: capturedUsage.tokensCacheRead,
+          };
+          // Best-effort append — fire-and-forget, don't await
+          appendUsage(usageRecord).catch(err => logger.warn('worker-exec', 'Failed to append usage record', { error: err?.message ?? String(err) }));
+        }
 
         // Post-exit orphan sweep: fire-and-forget, does not block the result
         if (bgTaskMap.size > 0 && child.pid) {

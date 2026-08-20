@@ -1,0 +1,160 @@
+/**
+ * Postmortem stub creator for production incidents.
+ *
+ * Automatically creates a structured postmortem markdown file when a rollback or
+ * rollback-failed occurs in the self-improvement loop. Each stub includes a checklist
+ * of action items tracked by the human-gated-blocker-watch skill.
+ */
+
+import { mkdir, writeFile, readFile } from 'fs/promises';
+import { join } from 'path';
+import { existsSync } from 'fs';
+
+export interface PostmortemInput {
+  date: string;           // ISO date string (YYYY-MM-DD)
+  slug: string;          // URL-safe identifier (e.g., "rollback-failed-xyz")
+  title: string;         // Human-readable title
+  timelineRefs: string[]; // Ref-IDs from the audit trail (e.g., ["s-abc123def456"])
+  actionItems: string[]; // Checklist items from audit record
+}
+
+export interface PostmortemMetadata {
+  created: string;      // ISO timestamp when stub was created
+  sourceAction: string; // 'rolled-back' | 'rollback-failed'
+  sourceSkill: string;  // Skill that triggered the rollback
+  sourceCommit?: string; // For git-revert rollbacks, the commit that was reverted
+}
+
+const POSTMORTEMS_DIR = 'plans/postmortems';
+const INDEX_PATH = 'plans/INDEX.md';
+
+/**
+ * Appends a row to plans/INDEX.md for a new postmortem.
+ *
+ * The row format matches the existing INDEX.md table structure:
+ * | Date | Title | Status | Link |
+ *
+ * @throws Error if INDEX.md cannot be read or written.
+ */
+async function appendIndexRow(date: string, title: string, filename: string): Promise<void> {
+  const repoRoot = process.cwd();
+  const indexPath = join(repoRoot, INDEX_PATH);
+
+  if (!existsSync(indexPath)) {
+    throw new Error(`INDEX.md not found at ${indexPath}`);
+  }
+
+  const indexContent = await readFile(indexPath, 'utf-8');
+
+  // Build the new row
+  const newRow = `| ${date} | ${title} | TODO | [Local](./postmortems/${filename}) |`;
+
+  // Append the row
+  const updatedContent = indexContent.trimEnd() + '\n' + newRow + '\n';
+
+  await writeFile(indexPath, updatedContent, 'utf-8');
+}
+
+/**
+ * Creates a postmortem stub markdown file from a fixed template.
+ *
+ * Template sections:
+ * - Impact (TODO — filled in by human)
+ * - Detection (how the issue was detected)
+ * - Timeline (ref-ID links via `pa ref` syntax)
+ * - Root cause (TODO)
+ * - Action items (checkboxes from audit record)
+ *
+ * @throws Error if the postmortems directory cannot be created or file cannot be written.
+ */
+export async function createPostmortemStub(
+  input: PostmortemInput,
+  meta: PostmortemMetadata
+): Promise<string> {
+  const repoRoot = process.cwd();
+
+  // Wrong-root guard: only a repo ROOT carries plans/. If cwd lacks it (a test
+  // fixture, a subdirectory, pa/ itself), a rollback hook firing from here
+  // would litter stubs into an unrelated tree — skip silently instead.
+  // Production self-improver runs with cwd = repo root, so real incidents
+  // always have plans/ present.
+  if (!existsSync(join(repoRoot, 'plans'))) {
+    return '';
+  }
+
+  const postmortemsDir = join(repoRoot, POSTMORTEMS_DIR);
+
+  // Ensure the postmortems directory exists
+  if (!existsSync(postmortemsDir)) {
+    await mkdir(postmortemsDir, { recursive: true });
+  }
+
+  const filename = `${input.date}-${input.slug}.md`;
+  const filepath = join(postmortemsDir, filename);
+
+  const content = renderPostmortemTemplate(input, meta);
+
+  await writeFile(filepath, content, 'utf-8');
+
+  // WPD6: Also append a row to INDEX.md
+  try {
+    await appendIndexRow(input.date, input.title, filename);
+  } catch (err) {
+    // Log but don't fail — the postmortem file itself is the critical output
+    console.error(`[postmortem] Failed to append INDEX.md row: ${err}`);
+  }
+
+  return filepath;
+}
+
+function renderPostmortemTemplate(
+  input: PostmortemInput,
+  meta: PostmortemMetadata
+): string {
+  const { date, slug, title, timelineRefs, actionItems } = input;
+  const { created, sourceAction, sourceSkill, sourceCommit } = meta;
+
+  // Build Timeline section with ref-ID links
+  const timelineLines = timelineRefs.map(ref => `- [${ref}](pa://${ref})`).join('\n');
+
+  // Build Action Items section with unchecked checkboxes
+  const actionItemLines = actionItems.map(item => `- [ ] ${item}`).join('\n');
+
+  // Get the commit details for git-revert rollbacks
+  const commitLine = sourceCommit
+    ? `Condemned commit: \`${sourceCommit}\`\n`
+    : '';
+
+  return `# ${title}
+
+**Date:** ${date}
+**Created:** ${created}
+**Source:** ${sourceAction} of skill \`${sourceSkill}\`
+${commitLine}
+
+## Impact
+
+_TODO: Describe the impact of this incident._
+
+## Detection
+
+Detected via the self-improvement loop's rollback mechanism.
+
+## Timeline
+
+${timelineLines || '(No timeline refs available)'}
+
+## Root Cause
+
+_TODO: Investigate and document the root cause._
+
+## Action Items
+
+${actionItemLines || '(No action items defined)'}
+
+---
+
+*This postmortem stub was auto-generated by the self-improvement loop.*
+*Unclosed action items are surfaced by the \`human-gated-blocker-watch\` skill after 30 days.*
+`;
+}

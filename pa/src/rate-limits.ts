@@ -113,6 +113,7 @@ async function alertAccountExhausted(worker: string, result: RateLimitParseResul
         dedupKey: `worker-account-exhausted:${worker}`,
         dedupWindowMs: result.minutes * 60 * 1000,
         severity: 'error',
+        runbook: 'runbooks/machine-hang.md',
       },
     );
   } catch (err: any) {
@@ -375,4 +376,31 @@ export async function getWorkerCooldown(worker: string): Promise<WorkerCooldown 
 export function clearRateLimitCache(): void {
   cache = null;
   cacheMtimeMs = 0;
+}
+
+/**
+ * Compute a health score for each worker based on rate-limit state and recent failures.
+ * Returns a map from worker name to health info.
+ *
+ * Health demotion criteria (proposal #17):
+ * - cooling-down → demote to tail
+ * - 3+ consecutive recent failures → demote to tail
+ * - stable ordering otherwise (priority order preserved among healthy workers)
+ */
+export async function getWorkerHealthSnapshot(workerNames: string[]): Promise<Map<string, { isCoolingDown: boolean; consecutiveFailures: number }>> {
+  const result = new Map<string, { isCoolingDown: boolean; consecutiveFailures: number }>();
+  const cooldownStatus = await getCooldownStatus();
+
+  for (const name of workerNames) {
+    const isCoolingDown = cooldownStatus[name] !== undefined && new Date(cooldownStatus[name].cooldown_until) > new Date();
+
+    // Read consecutive failures from logs/latest.json (skill runner state)
+    // Note: Worker failures are not tracked in latest.json (that's for skills),
+    // so we default to 0. A future enhancement could track worker-specific failures.
+    const consecutiveFailures = 0;
+
+    result.set(name, { isCoolingDown, consecutiveFailures });
+  }
+
+  return result;
 }

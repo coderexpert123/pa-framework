@@ -328,6 +328,38 @@ export function resolveTunable(
   return resolveTunables(worker, sessionOverrides, topicDefaults).find((r) => r.setting === name);
 }
 
+export const KNOWN_CLI_DEFAULT_MODELS: Record<string, string> = {
+  agy: 'gemini-3.7-flash-high',
+  agyc: 'claude-sonnet-4-6',
+  zclaude: 'glm-5.3',
+  claude: 'opusplan',
+  codex: 'gpt-5.4',
+};
+
+/**
+ * Convenience helper to resolve the active LLM (model setting) for a worker.
+ * Checks session overrides, topic defaults, worker tunable default, static args pin,
+ * and falls back to the known CLI default model (or undefined if worker does not declare a model tunable).
+ */
+export function resolveWorkerLlm(
+  worker: WorkerConfig | undefined,
+  sessionOverrides?: TunableOverrides,
+  topicDefaults?: TunableOverrides,
+): string | undefined {
+  if (!worker) return undefined;
+  const resolved = resolveTunable(worker, 'model', sessionOverrides, topicDefaults);
+  if (resolved?.value) return resolved.value;
+  const spec = getTunableSpec(worker, 'model');
+  if (!spec) return undefined;
+  const pinned = extractTunableValues(spec, worker.args);
+  if (pinned.length > 0) return pinned[0];
+  if (spec.default) return spec.default;
+  const known = KNOWN_CLI_DEFAULT_MODELS[worker.name.toLowerCase()];
+  if (known) return known;
+  if (Array.isArray(spec.values) && spec.values.length > 0) return spec.values[0];
+  return 'cli default';
+}
+
 /**
  * Turn resolved settings into the args to APPEND to the worker command.
  *
