@@ -30,6 +30,7 @@ import {
   clearTopicContext,
   handleResetCommand,
   handleNewCommand,
+  handleSunsetLlmCommand,
   renderTunableReport,
   renderTunableSetResult,
   renderTunableClearResult,
@@ -137,9 +138,27 @@ function yesterdayIso(): string {
 // ---------------------------------------------------------------------------
 
 describe('parseTunableCommand', () => {
-  it('bare /llm is a show on the model setting, session scope', () => {
-    const cmd = parseTunableCommand('/llm');
-    assert.deepEqual(cmd, { scope: 'session', label: 'llm', setting: 'model', action: 'show' });
+  it('bare /model is a show on the model setting, session scope', () => {
+    const cmdModel = parseTunableCommand('/model');
+    assert.deepEqual(cmdModel, { scope: 'session', label: 'model', setting: 'model', action: 'show' });
+  });
+
+  it('sunsetted /llm and /default llm return helpful sunset notices', () => {
+    assert.equal(parseTunableCommand('/llm'), undefined);
+    assert.equal(parseTunableCommand('/llm gemini-3.6-flash-high'), undefined);
+    assert.equal(parseTunableCommand('/default llm sonnet'), undefined);
+
+    const s1 = handleSunsetLlmCommand('/llm');
+    assert.equal(s1.matched, true);
+    assert.match(s1.response, /sunset in favor of \/model/);
+
+    const s2 = handleSunsetLlmCommand('/llm gemini-3.6-flash-high');
+    assert.equal(s2.matched, true);
+    assert.match(s2.response, /sunset in favor of \/model/);
+
+    const s3 = handleSunsetLlmCommand('/default llm sonnet');
+    assert.equal(s3.matched, true);
+    assert.match(s3.response, /sunset in favor of \/default model/);
   });
 
   it('bare /effort is a show on the effort setting', () => {
@@ -148,12 +167,12 @@ describe('parseTunableCommand', () => {
     assert.equal(cmd?.setting, 'effort');
   });
 
-  it('/llm <name> sets the session override', () => {
-    const cmd = parseTunableCommand('/llm gemini-3.6-flash-high');
-    assert.equal(cmd?.action, 'set');
-    assert.equal(cmd?.scope, 'session');
-    assert.equal(cmd?.setting, 'model');
-    assert.equal(cmd?.value, 'gemini-3.6-flash-high');
+  it('/model <name> sets the session override for model', () => {
+    const cmd1 = parseTunableCommand('/model gemini-3.6-flash-high');
+    assert.equal(cmd1?.action, 'set');
+    assert.equal(cmd1?.scope, 'session');
+    assert.equal(cmd1?.setting, 'model');
+    assert.equal(cmd1?.value, 'gemini-3.6-flash-high');
   });
 
   it('tolerates the @botname suffix and surrounding whitespace', () => {
@@ -164,7 +183,7 @@ describe('parseTunableCommand', () => {
 
   it('clear / reset / unset / - all mean clear', () => {
     for (const token of ['clear', 'reset', 'unset', '-', 'CLEAR']) {
-      assert.equal(parseTunableCommand(`/llm ${token}`)?.action, 'clear', token);
+      assert.equal(parseTunableCommand(`/model ${token}`)?.action, 'clear', token);
     }
   });
 
@@ -173,27 +192,30 @@ describe('parseTunableCommand', () => {
     assert.deepEqual(cmd, { scope: 'topic', label: 'effort', setting: 'effort', action: 'set', value: 'high' });
   });
 
-  it('/default llm <name> maps the llm alias to the model setting', () => {
-    const cmd = parseTunableCommand('/default llm sonnet');
-    assert.equal(cmd?.scope, 'topic');
-    assert.equal(cmd?.setting, 'model');
-    assert.equal(cmd?.value, 'sonnet');
+  it('/default model <name> maps to the model setting', () => {
+    const cmd1 = parseTunableCommand('/default model sonnet');
+    assert.equal(cmd1?.scope, 'topic');
+    assert.equal(cmd1?.setting, 'model');
+    assert.equal(cmd1?.value, 'sonnet');
   });
 
   it('/default <setting> with no value shows the topic tier', () => {
     assert.equal(parseTunableCommand('/default effort')?.action, 'show');
+    assert.equal(parseTunableCommand('/default model')?.action, 'show');
   });
 
-  it('never hijacks /default <worker> — order-independent, not just by call site', () => {
-    for (const worker of ['claude', 'zclaude', 'codex', 'agy', 'AGY']) {
+  it('never hijacks /default <agent> or /default agent <agent> — order-independent', () => {
+    for (const worker of ['claude', 'zclaude', 'codex', 'agy', 'AGY', 'agyc', 'AGYC']) {
       assert.equal(parseTunableCommand(`/default ${worker}`), undefined, worker);
+      assert.equal(parseTunableCommand(`/default agent ${worker}`), undefined, worker);
     }
   });
 
-  it('ignores bare /default and non-commands', () => {
+  it('ignores bare /default and non-commands, and yields /agent / /model <agent>', () => {
     assert.equal(parseTunableCommand('/default'), undefined);
     assert.equal(parseTunableCommand('what model are you'), undefined);
     assert.equal(parseTunableCommand('/model agy'), undefined);
+    assert.equal(parseTunableCommand('/agent agy'), undefined);
   });
 
   // Regression, 2026-07-22: DEFAULT_SWITCH_PATTERN is end-anchored, so a
@@ -463,7 +485,7 @@ describe('handleTunableCommand', () => {
   it('accepts any model name — an allowlist would already be stale', async () => {
     const state = makeState();
     const reply = await handleTunableCommand(
-      parseTunableCommand('/llm gemini-9.9-flash-nonexistent')!, state, CONFIG, 'agy', noObserved);
+      parseTunableCommand('/model gemini-9.9-flash-nonexistent')!, state, CONFIG, 'agy', noObserved);
     assert.doesNotMatch(reply, /Not a known value/, 'no declared values for model => nothing to warn about');
     assert.equal(state.tunable_overrides?.['agy']?.['model'], 'gemini-9.9-flash-nonexistent');
   });
@@ -519,7 +541,7 @@ describe('handleTunableCommand', () => {
   it('bare command on an unset knob says the CLI decides', async () => {
     const state = makeState();
     const reply = await handleTunableCommand(
-      parseTunableCommand('/llm')!, state, CONFIG, 'agy', noObserved);
+      parseTunableCommand('/model')!, state, CONFIG, 'agy', noObserved);
     assert.match(reply, /Current: \(none/);
     assert.match(reply, /CLI's own default/);
   });
@@ -534,7 +556,7 @@ describe('handleTunableCommand', () => {
       tunables: { model: { args: ['--model', '{value}'] } },
     };
     const reply = await handleTunableCommand(
-      parseTunableCommand('/llm')!, makeState(), { workers: [pinnedWorker] }, 'zclaude', noObserved);
+      parseTunableCommand('/model')!, makeState(), { workers: [pinnedWorker] }, 'zclaude', noObserved);
 
     assert.match(reply, /Current: opusplan/);
     assert.match(reply, /fixed args in config\.yaml/);
@@ -550,7 +572,7 @@ describe('handleTunableCommand', () => {
     const state = makeState();
     setSessionTunable(state, 'zclaude', 'model', 'sonnet');
     const reply = await handleTunableCommand(
-      parseTunableCommand('/llm')!, state, { workers: [pinnedWorker] }, 'zclaude', noObserved);
+      parseTunableCommand('/model')!, state, { workers: [pinnedWorker] }, 'zclaude', noObserved);
 
     assert.match(reply, /Current: sonnet/);
     assert.match(reply, /session override/);
@@ -566,7 +588,7 @@ describe('handleTunableCommand', () => {
   it('survives a failing observed-values read (help must never crash)', async () => {
     const state = makeState();
     const reply = await handleTunableCommand(
-      parseTunableCommand('/llm')!, state, CONFIG, 'agy',
+      parseTunableCommand('/model')!, state, CONFIG, 'agy',
       async () => { throw new Error('disk on fire'); });
     assert.match(reply, /Current:/);
   });
@@ -599,13 +621,13 @@ describe('handleTunableCommand', () => {
     assert.match(reply, /Clear the model/);
   });
 
-  it('bare /llm says which knob it is superseding', async () => {
+  it('bare /model says which knob it is superseding', async () => {
     const state = makeState();
     setSessionTunable(state, 'agy', 'effort', 'high');
     setSessionTunable(state, 'agy', 'model', 'gemini-3.6-flash-high');
 
     const reply = await handleTunableCommand(
-      parseTunableCommand('/llm')!, state, CONFIG, 'agy', noObserved);
+      parseTunableCommand('/model')!, state, CONFIG, 'agy', noObserved);
 
     assert.match(reply, /Current: gemini-3\.6-flash-high/);
     assert.match(reply, /effort.*NOT passed/);

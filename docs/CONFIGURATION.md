@@ -39,6 +39,7 @@ The framework reads configuration from `~/.pa/` (or wherever `PA_HOME` env var p
 | `evaluator` | `EvaluatorConfig` | No | None | LLM consulted when a worker stalls. Without one, stalled workers are killed at idle_timeout. |
 | `topic_defaults` | `Record<string, string>` | No | `{}` | Maps `<chatId>_<threadId>` strings to a preferred worker name. Used by the bot. |
 | `bg_tasks` | `BgTasksConfig` | No | See below | Thresholds for background-leak detection. |
+| `usage` | `UsageConfig` | No | None | Token usage tracking and budget alerts. See below. |
 
 ### `WorkerConfig`
 
@@ -82,6 +83,16 @@ Controls how Telegram voice notes become text. Optional — omit the whole `tran
 | `language` | string \| null | No | `null` (auto-detect) | ISO 639-1 code, optionally region-qualified (`en`, `en-US`). Threaded into every cloud provider call and the local engine's language hint. A non-English value paired with `engine_preference: local` is accepted but warns at config-load time — the bundled local model (`small.en`) is English-only. |
 
 Full walkthrough: docs/BOT_GUIDE.md "Voice messages (speech to text)". Something broken? docs/TROUBLESHOOTING.md "Voice-message transcription". Annotated example: `examples/config.yaml.example`.
+
+### UsageConfig
+
+Controls token usage tracking and budget alerts. Optional — omit the whole `usage:` block and usage tracking still runs, but with no budget alerts.
+
+| Field | Type | Required | Default | Effect |
+|---|---|---|---|---|
+| `budget_monthly_usd` | number | No | None | Optional monthly USD budget. When set, alerts fire at 50/80/100% of month-to-date estimated cost (once per threshold per month, deduped). Without price data configured, tokens are tracked but `estCostUsd` stays null and budget alerts are inert. |
+
+Run `pa costs [--week|--month] [--skill <name>]` to view usage rollups. Token counts are factual; cost estimation requires a price table to be configured (not implemented in v1 — tokens are tracked, costs remain null until pricing is added).
 
 ### Validation
 

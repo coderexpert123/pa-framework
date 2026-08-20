@@ -85,7 +85,7 @@ node pa/dist/bin/pa.js workers
 # If more than one shows as available, ask the user which they prefer.
 # Then open ~/.pa/config.yaml and move the preferred worker to the TOP of the
 # `workers:` list — the dispatcher always tries workers in order, so first = default.
-# (You can change the active model per Telegram topic later with /model <name>.)
+# (You can change the active agent per Telegram topic later with /agent <name> and its model with /model <name>.)
 
 # Copy a sample skill
 cp -r examples/skills/reminders ~/.pa/skills/          # macOS / Linux

@@ -147,13 +147,9 @@ export function parseStopSteer(
   const m = STEER_PATTERN.exec(text);
   if (m) {
     const prompt = m[1]?.trim();
-    // /steer with no prompt degrades to /stop (documented in BOT_COMMANDS),
-    // EXCEPT when hasAttachment is true — return steer with undefined prompt
-    // so the caller can treat the attachment itself as the prompt (E7, A3).
-    if (hasAttachment && !prompt) {
-      return { kind: 'steer', prompt: undefined };
-    }
-    return prompt ? { kind: 'steer', prompt } : { kind: 'stop' };
+    // Bare /steer (with no prompt) retains kind 'steer' with prompt undefined,
+    // so in-flight/queued context is folded and dispatched without extra text.
+    return { kind: 'steer', prompt: prompt || undefined };
   }
   return null;
 }

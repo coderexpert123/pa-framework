@@ -6,14 +6,23 @@ import type {
 } from './types.js';
 import { toIST, todayIST, formatIST } from '../../../pa/dist/src/ist.js';
 import { getSkillTranslationPatterns } from '../../../pa/dist/src/lib/skill-translations.js';
+export {
+  KNOWN_CLI_DEFAULT_MODELS,
+  resolveWorkerLlm,
+  selectWorkerTunables,
+};
 import {
+  KNOWN_CLI_DEFAULT_MODELS,
   TUNABLE_TIER_LABELS,
   declaredValues,
   normalizeTunableName,
+  resolveWorkerLlm,
+  selectWorkerTunables,
   setWorkerTunable,
   type ResolvedTunable,
   type TunableValidation,
 } from '../../../pa/dist/src/lib/tunables.js';
+import type { WorkerConfig } from '../../../pa/dist/src/types.js';
 import { BOT_COMMANDS } from './commands.js';
 import { redactSecrets } from '../../../pa/dist/src/lib/redact.js';
 
@@ -24,8 +33,10 @@ export interface WorkerResult {
   evaluatorSummary?: string; // user-facing summary from LLM evaluator when worker is killed
 }
 
-export const MODEL_SWITCH_PATTERN = /^\/models?(?:@\w+)?\s+(claude|zclaude|codex|agy)\b/i;
-export const DEFAULT_SWITCH_PATTERN = /^\/default(?:@\w+)?(?:\s+(claude|zclaude|codex|agy))?$/i;
+export const AGENT_SWITCH_PATTERN = /^\/agents?(?:@\w+)?(?:\s+(claude|zclaude|codex|agyc|agy))?$/i;
+export const AGENT_BARE_PATTERN = /^\/agents?(?:@\w+)?$/i;
+export const MODEL_SWITCH_PATTERN = /^\/models?(?:@\w+)?\s+(claude|zclaude|codex|agyc|agy)\b/i;
+export const DEFAULT_SWITCH_PATTERN = /^\/default(?:@\w+)?(?:\s+(?:agent\s+)?(claude|zclaude|codex|agyc|agy))?$/i;
 export const CODE_PATTERN = /^\/code(?:@\w+)?(?:\s+(.+))?$/i;
 export const RESET_PATTERN = /^\/reset(?:@\w+)?$/i;
 export const NEW_PATTERN = /^\/new(?:@\w+)?(?:\s+(.+))?$/i;
@@ -34,6 +45,9 @@ export const KEEP_AWAKE_PATTERN = /^\/keepawake(?:@\w+)?$/i;
 export const SKILLS_PATTERN = /^\/skills(?:@\w+)?$/i;
 export const AUTH_PATTERN = /^\/auth(?:@\w+)?\s+(\S+)(?:\s+(\S+))?$/i;
 export const HELP_PATTERN = /^\/help(?:@\w+)?$/i;
+export const HEALTH_PATTERN = /^\/health(?:@\w+)?$/i;
+export const REF_PATTERN = /^\/ref(?:@\w+)?\s+(\S+)\s*$/i;
+export const CLAIMS_PATTERN = /^\/claims(?:@\w+)?$/i;
 // [Voice message]/[Audio file]/[Video note] re-transcription (WP5 of the
 // hardened voice-transcription plan). Wiring (locate the replied media,
 // call voice.ts's findCachedAudio/transcribeVoiceMessage) is WP6's job in
@@ -75,17 +89,17 @@ const PA_META_PROTECTED_SKILLS = new Set([
   'update-brain',
 ]);
 
-// --- Worker tunables: /llm, /effort, /default <setting> [value] -------------
-// `/model` deliberately stays what it has always been (pick the CLI). These are
-// the uniform knobs that work the same way whichever CLI is active; the
-// per-worker differences (flag name, arg shape, vocabulary) live in config.yaml
-// and are resolved by pa/src/lib/tunables.ts.
+// --- Worker tunables: /model, /effort, /default <setting> [value] -------------
+// `/agent` selects the agent CLI harness (agy, claude, codex, zclaude).
+// `/model` sets or shows the model the active agent runs (e.g. /model gemini-3.7-flash-high).
+// `/llm` is sunset in favor of /model (handled via handleSunsetLlmCommand).
+export const MODEL_TUNABLE_PATTERN = /^\/models?(?:@\w+)?(?:\s+([\s\S]+))?$/i;
 export const LLM_PATTERN = /^\/llm(?:@\w+)?(?:\s+([\s\S]+))?$/i;
 export const EFFORT_PATTERN = /^\/effort(?:@\w+)?(?:\s+([\s\S]+))?$/i;
 // Extends the EXISTING /default surface rather than inventing a parallel idiom.
 // Only reachable for a non-worker first token: DEFAULT_SWITCH_PATTERN (anchored
-// to the worker names) is checked first and wins, so `/default agy` still means
-// "make agy this topic's default worker".
+// to the worker names) is checked first and wins, so `/default agy` or `/default agent agy`
+// still means "make agy this topic's default agent".
 export const DEFAULT_TUNABLE_PATTERN = /^\/default(?:@\w+)?\s+([A-Za-z][A-Za-z0-9_-]*)(?:\s+([\s\S]+))?$/i;
 
 export interface StatusCardArgs {
@@ -99,12 +113,12 @@ export interface StatusCardArgs {
 const FALLBACK_DEFAULT_WORKER = 'claude';
 
 const MODEL_STATUS_REASON_TEXT: Record<ModelStatusReasonCode, string> = {
-  default_active: 'Using the configured default worker.',
+  default_active: 'Using the configured default agent.',
   user_override: 'Temporary user override until IST midnight.',
-  user_selected_default: 'User selected the default worker explicitly.',
+  user_selected_default: 'User selected the default agent explicitly.',
   default_changed: 'Topic default updated.',
-  failover: 'Temporary failover due to worker availability.',
-  recovery: 'Recovered to the configured worker.',
+  failover: 'Temporary failover due to agent availability.',
+  recovery: 'Recovered to the configured agent.',
   midnight_reset: 'Temporary override expired at IST midnight.',
   reset: 'Topic reset cleared the temporary override.',
 };
@@ -135,36 +149,72 @@ export function buildModelStatusSnapshot(args: {
   reasonCode: ModelStatusReasonCode;
   changedAt?: string;
   reasonText?: string;
+  currentLlm?: string;
+  defaultLlm?: string;
 }): ModelStatusSnapshot {
-  const currentWorker = args.currentWorker ?? args.defaultWorker;
+  let defaultWorker = args.defaultWorker;
+  if (defaultWorker === 'gemini') defaultWorker = 'agy';
+  let currentWorker = args.currentWorker ?? defaultWorker;
+  if (currentWorker === 'gemini') currentWorker = 'agy';
+
   return {
     current_worker: currentWorker,
-    default_worker: args.defaultWorker,
+    default_worker: defaultWorker,
     reason_code: args.reasonCode,
     reason_text: args.reasonText ?? MODEL_STATUS_REASON_TEXT[args.reasonCode],
     changed_at: args.changedAt ?? new Date().toISOString(),
+    ...(args.currentLlm ? { current_llm: args.currentLlm } : {}),
+    ...(args.defaultLlm ? { default_llm: args.defaultLlm } : {}),
   };
 }
 
 export function hydrateModelStatus(
   state: ConversationState,
-  defaultWorker: string
+  defaultWorker: string,
+  workersOrConfig?: { workers?: WorkerConfig[] } | WorkerConfig[]
 ): ModelStatusSnapshot {
+  const workers = Array.isArray(workersOrConfig)
+    ? workersOrConfig
+    : workersOrConfig?.workers;
+  let normDefaultWorker = defaultWorker;
+  if (normDefaultWorker === 'gemini') normDefaultWorker = 'agy';
+
+  let candidateWorker = state.model_status?.current_worker || state.preferred_worker || state.pinned_worker || normDefaultWorker;
+  if (candidateWorker === 'gemini') candidateWorker = 'agy';
+  const knownWorkers = workers?.map((w) => w.name) ?? [];
+  const currentWorker = (knownWorkers.length > 0 && !knownWorkers.includes(candidateWorker))
+    ? normDefaultWorker
+    : candidateWorker;
+
+  const currentWorkerConfig = workers?.find((w) => w.name === currentWorker);
+  const currentLlm = (currentWorkerConfig
+    ? resolveWorkerLlm(currentWorkerConfig, selectWorkerTunables(state.tunable_overrides, currentWorker), selectWorkerTunables(state.tunable_defaults, currentWorker))
+    : undefined) ?? state.model_status?.current_llm;
+
+  const defaultWorkerConfig = workers?.find((w) => w.name === normDefaultWorker);
+  const defaultLlm = (defaultWorkerConfig
+    ? resolveWorkerLlm(defaultWorkerConfig, undefined, selectWorkerTunables(state.tunable_defaults, normDefaultWorker))
+    : undefined) ?? state.model_status?.default_llm;
+
   if (state.model_status) {
     return {
-      current_worker: state.model_status.current_worker || state.preferred_worker || state.pinned_worker || defaultWorker,
-      default_worker: defaultWorker,
+      current_worker: currentWorker,
+      default_worker: normDefaultWorker,
       reason_code: state.model_status.reason_code,
       reason_text: state.model_status.reason_text || MODEL_STATUS_REASON_TEXT[state.model_status.reason_code],
       changed_at: state.model_status.changed_at || state.preferred_worker_set_at || new Date().toISOString(),
+      ...(currentLlm ? { current_llm: currentLlm } : {}),
+      ...(defaultLlm ? { default_llm: defaultLlm } : {}),
     };
   }
 
   return buildModelStatusSnapshot({
-    currentWorker: state.preferred_worker || state.pinned_worker || defaultWorker,
-    defaultWorker,
-    reasonCode: inferLegacyReasonCode(state, defaultWorker),
+    currentWorker,
+    defaultWorker: normDefaultWorker,
+    reasonCode: inferLegacyReasonCode(state, normDefaultWorker),
     changedAt: state.preferred_worker_set_at,
+    currentLlm,
+    defaultLlm,
   });
 }
 
@@ -176,7 +226,9 @@ export function modelStatusNeedsRefresh(
   return previous.current_worker !== next.current_worker
     || previous.default_worker !== next.default_worker
     || previous.reason_code !== next.reason_code
-    || previous.reason_text !== next.reason_text;
+    || previous.reason_text !== next.reason_text
+    || previous.current_llm !== next.current_llm
+    || previous.default_llm !== next.default_llm;
 }
 
 /**
@@ -185,10 +237,16 @@ export function modelStatusNeedsRefresh(
  */
 export function renderStatusCard(args: StatusCardArgs): string {
   const { snapshot, keepAwake } = args;
+  const defaultModel = snapshot.default_llm || KNOWN_CLI_DEFAULT_MODELS[snapshot.default_worker];
+  const currentModel = snapshot.current_llm || KNOWN_CLI_DEFAULT_MODELS[snapshot.current_worker];
+
+  const defaultLabel = defaultModel ? `${snapshot.default_worker} (${defaultModel})` : snapshot.default_worker;
+  const currentLabel = currentModel ? `${snapshot.current_worker} (${currentModel})` : snapshot.current_worker;
+
   const lines = [
     '📌 Topic Status',
-    `Default: ${snapshot.default_worker}`,
-    `Current: ${snapshot.current_worker}`,
+    `Default: ${defaultLabel}`,
+    `Current: ${currentLabel}`,
     `Reason: ${snapshot.reason_text}`,
     keepAwake.active
       ? `Keep-awake: on${keepAwake.since ? ` since ${keepAwake.since}` : ''}`
@@ -358,6 +416,32 @@ export function handleHelpCommand(): { matched: boolean; response: string } {
   return { matched: true, response: `*Available Commands*\n\n${helpText}` };
 }
 
+/**
+ * Handle the /health command. Returns a marker indicating the command was matched.
+ * The actual health check is executed in main.ts via spawning pa health.
+ */
+export function handleHealthCommand(): { matched: boolean } {
+  return { matched: true };
+}
+
+/**
+ * Handle the /ref <id> command. Extracts the ref ID.
+ * The actual lookup is executed in main.ts via spawning pa ref <id>.
+ */
+export function handleRefCommand(userText: string): { matched: boolean; refId?: string } {
+  const match = REF_PATTERN.exec(userText);
+  if (!match) return { matched: false };
+  return { matched: true, refId: match[1] };
+}
+
+/**
+ * Handle the /claims command. Returns a marker indicating the command was matched.
+ * The actual claims lookup is executed in main.ts via spawning pa claims.
+ */
+export function handleClaimsCommand(): { matched: boolean } {
+  return { matched: true };
+}
+
 export function isPassThroughCommand(userText: string): boolean {
   return PASS_THROUGH_PATTERN.test(userText);
 }
@@ -430,25 +514,29 @@ export function describeForwardOrigin(msg: ForwardableMessageLike): string | und
 }
 
 /**
- * Handle the /branch command. Validates the branch name.
+ * Handle the /branch command. Validates the branch name and extracts optional creation prompt.
  * Pure — no state mutation, no I/O. Topic creation is done in main.ts.
  */
 export function handleBranchCommand(
   _state: ConversationState,
   userText: string
-): { matched: boolean; branchName?: string; response: string } {
+): { matched: boolean; branchName?: string; prompt?: string; response: string } {
   const match = BRANCH_PATTERN.exec(userText);
   if (!match) return { matched: false, response: '' };
 
-  const name = match[1].trim();
-  if (!/^[a-zA-Z0-9_-]{1,50}$/.test(name)) {
+  const full = match[1].trim();
+  const spaceIdx = full.search(/\s/);
+  const branchName = spaceIdx === -1 ? full : full.slice(0, spaceIdx);
+  const prompt = spaceIdx === -1 ? undefined : full.slice(spaceIdx).trim() || undefined;
+
+  if (!/^[a-zA-Z0-9_-]{1,50}$/.test(branchName)) {
     return {
       matched: true,
       response: 'Branch name must be 1–50 alphanumeric, dash, or underscore characters.',
     };
   }
 
-  return { matched: true, branchName: name, response: '' };
+  return { matched: true, branchName, prompt, response: '' };
 }
 
 /**
@@ -602,25 +690,54 @@ export function resolvePendingDescription(
   return { skipWorker: false, response: '' };
 }
 
+export function isKnownAgentName(name: string): boolean {
+  return /^(claude|zclaude|codex|agyc|agy)$/i.test(name.trim());
+}
+
+export interface AgentSwitchResult {
+  target: string;
+  isLegacy?: boolean;
+}
+
+export function getAgentSwitchTarget(userText: string): AgentSwitchResult | undefined {
+  const text = userText.trim();
+  // Primary: /agent <name> or /agents <name>
+  const agentMatch = /^\/agents?(?:@\w+)?\s+(claude|zclaude|codex|agyc|agy)\b/i.exec(text);
+  if (agentMatch?.[1]) {
+    return { target: agentMatch[1].toLowerCase(), isLegacy: false };
+  }
+  // Legacy: /model <name> or /models <name> where <name> is a known agent name
+  const modelMatch = /^\/models?(?:@\w+)?\s+(claude|zclaude|codex|agyc|agy)\b/i.exec(text);
+  if (modelMatch?.[1]) {
+    return { target: modelMatch[1].toLowerCase(), isLegacy: true };
+  }
+  return undefined;
+}
+
 export function getModelSwitchTarget(userText: string): string | undefined {
-  const match = MODEL_SWITCH_PATTERN.exec(userText);
-  return match?.[1]?.toLowerCase();
+  return getAgentSwitchTarget(userText)?.target;
 }
 
 export function handleModelSwitch(
   state: ConversationState,
   userText: string
 ): { switched: boolean; response: string } {
-  const model = getModelSwitchTarget(userText);
-  if (!model) return { switched: false, response: '' };
-  state.preferred_worker = model;
+  const res = getAgentSwitchTarget(userText);
+  if (!res) return { switched: false, response: '' };
+  state.preferred_worker = res.target;
   state.preferred_worker_set_at = new Date().toISOString();
   state.session = undefined;
-  return { switched: true, response: `Switched to ${model} (until midnight IST).` };
+  if (res.isLegacy) {
+    return {
+      switched: true,
+      response: `Switched agent to *${res.target}* (until midnight IST).\n💡 _Tip: use /agent <name> to pick the agent and /model <name> to set its model._`,
+    };
+  }
+  return { switched: true, response: `Switched agent to *${res.target}* (until midnight IST).` };
 }
 
 /**
- * Expire a /model override if it was set on a previous IST calendar day.
+ * Expire a /agent or /model override if it was set on a previous IST calendar day.
  * Returns true if the override was cleared, false if no change.
  */
 export function expirePreferredWorker(state: ConversationState): boolean {
@@ -639,10 +756,10 @@ export function expirePreferredWorker(state: ConversationState): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Worker tunables — /llm, /effort, and the /default <setting> extension
+// Worker tunables — /model, /llm, /effort, and the /default <setting> extension
 //
 // ONE bot-level command per knob, whichever CLI is active. The bot word maps to
-// a config SETTING NAME (`/llm` -> `model`), and the worker's own `tunables:`
+// a config SETTING NAME (`/model` or `/llm` -> `model`), and the worker's own `tunables:`
 // block in config.yaml supplies the arg template. Two rules drive everything
 // here:
 //   STRICT ON THE KNOB — an unknown setting, or one this worker does not
@@ -658,14 +775,40 @@ export function expirePreferredWorker(state: ConversationState): boolean {
 /**
  * Bot command word -> config setting name.
  *
- * `/llm` is the uniform user-facing word; `model` is what the CLIs call the
- * knob (and therefore what config.yaml declares). `/model` is NOT in this map —
- * it keeps its existing meaning of choosing the CLI.
+ * `/model` sets the model tunable.
+ * `/effort` sets the reasoning effort tunable.
  */
 export const TUNABLE_COMMAND_SETTINGS: Record<string, string> = {
-  llm: 'model',
+  model: 'model',
   effort: 'effort',
 };
+
+/**
+ * Explains that /llm (and /default llm) has been sunset in favor of /model and /agent.
+ */
+export function handleSunsetLlmCommand(userText: string): { matched: boolean; response: string } {
+  const text = userText.trim();
+  if (LLM_PATTERN.test(text)) {
+    return {
+      matched: true,
+      response:
+        'ℹ️ */llm has been sunset in favor of /model.*\n\n' +
+        '• Use `/model <name>` (or bare `/model`) to set or view the foundation model for this topic.\n' +
+        '• Use `/agent <name>` (or bare `/agent`) to switch or view the active agent harness (`agy`, `agyc`, `claude`, `codex`, `zclaude`).',
+    };
+  }
+  const defMatch = DEFAULT_TUNABLE_PATTERN.exec(text);
+  if (defMatch && defMatch[1].toLowerCase() === 'llm') {
+    return {
+      matched: true,
+      response:
+        'ℹ️ */default llm has been sunset in favor of /default model.*\n\n' +
+        '• Use `/default model <name>` to set the topic default foundation model.\n' +
+        '• Use `/default <agent>` or `/default agent <name>` to set the topic default agent.',
+    };
+  }
+  return { matched: false, response: '' };
+}
 
 /** Words that mean "unset this tier and fall through to the next one". */
 export const TUNABLE_CLEAR_TOKENS = new Set(['clear', 'reset', 'default', 'unset', '-']);
@@ -674,17 +817,17 @@ export type TunableScope = 'session' | 'topic';
 export type TunableAction = 'show' | 'set' | 'clear';
 
 export interface TunableCommand {
-  scope: TunableScope;   // session = /llm|/effort (expires at IST midnight); topic = /default (persistent)
+  scope: TunableScope;   // session = /model|/effort (expires at IST midnight); topic = /default (persistent)
   setting: string;       // normalized CONFIG setting name, e.g. 'model'
-  label: string;         // the word the user typed, echoed back in help text ('llm', 'effort', …)
+  label: string;         // the word the user typed, echoed back in help text ('model', 'effort', …)
   action: TunableAction;
   value?: string;        // present for action === 'set'
 }
 
 /**
- * Parse /llm, /effort and `/default <setting> [value]` into one shape.
+ * Parse /model, /effort and `/default <setting> [value]` into one shape.
  *
- * Deliberately order-independent: `/default <worker>` is excluded here (not just
+ * Deliberately order-independent: `/default <agent>` and `/agent <name>` are excluded here (not just
  * by call order in main.ts) so this function can never hijack the worker form.
  * Returns undefined when the text is not a tunable command at all.
  */
@@ -698,30 +841,28 @@ export function parseTunableCommand(userText: string): TunableCommand | undefine
     return { scope, label, setting, action: 'set', value };
   };
 
-  const llm = LLM_PATTERN.exec(text);
-  if (llm) return build('session', 'llm', TUNABLE_COMMAND_SETTINGS['llm']!, llm[1]);
+  // If this text is an agent switch (/agent <name> or legacy /model <name>), do not hijack
+  if (getAgentSwitchTarget(text)) return undefined;
+  if (AGENT_BARE_PATTERN.test(text)) return undefined;
+
+  const model = MODEL_TUNABLE_PATTERN.exec(text);
+  if (model) return build('session', 'model', TUNABLE_COMMAND_SETTINGS['model']!, model[1]);
 
   const effort = EFFORT_PATTERN.exec(text);
   if (effort) return build('session', 'effort', TUNABLE_COMMAND_SETTINGS['effort']!, effort[1]);
 
-  if (DEFAULT_SWITCH_PATTERN.test(text)) return undefined;   // `/default agy` — the worker form owns this
+  if (DEFAULT_SWITCH_PATTERN.test(text)) return undefined;   // `/default agy` or `/default agent agy` — the agent form owns this
   const def = DEFAULT_TUNABLE_PATTERN.exec(text);
   if (def) {
     const label = def[1].toLowerCase();
-    // A WORKER NAME always belongs to the worker-switch form, even with
-    // trailing text. Fixed 2026-07-22: DEFAULT_SWITCH_PATTERN is end-anchored
-    // ("/default agy" only, nothing after), so `/default agy can you check
-    // the logs` fell through to here, which previously accepted ANY
-    // word-like first token — rejecting a worker name as if it were an
-    // unrecognized setting, where before this feature existed the whole
-    // message reached the LLM as ordinary chat. Re-use MODEL_SWITCH_PATTERN's
-    // worker list so this can't drift from the worker-switch form it defers
-    // to. A genuinely unknown word (not a worker name) still becomes a
-    // TunableCommand and gets handleTunableCommand's helpful "no setting
-    // called '<x>'" rejection — that behavior is deliberate and tested
-    // (e.g. "/default temperature 0.7") and must not be suppressed too.
-    if (/^(claude|zclaude|codex|agy)$/i.test(label)) return undefined;
+    if (label === 'llm') return undefined; // sunset in favor of /default model
+    if (isKnownAgentName(label)) return undefined;
+    if (label === 'agent') {
+      const rest = def[2]?.trim();
+      if (rest && isKnownAgentName(rest)) return undefined;
+    }
     const setting = TUNABLE_COMMAND_SETTINGS[label] ?? normalizeTunableName(label);
+    if (!setting) return undefined;
     return build('topic', label, setting, def[2]);
   }
 
@@ -1255,6 +1396,14 @@ export function buildWorkerResponse(result: WorkerResult, worker: string): strin
       output = output.replace(/<\/?thought>/gi, '').trim();
     }
 
+    // Remove plain "I will/I'll/I've/I'm" planning statements (agy worker leak)
+    // Matches consecutive lines starting with these phrases at the start of output
+    output = output.replace(
+      /^(?:I will|I'll|I've|I'm)\s+[^\n]*\n+(?:(?:I will|I'll|I've|I'm)\s+[^\n]*\n+)*/,
+      ''
+    ).trim();
+
+    // Remove bold-prefixed planning statements (claude/zclaude format)
     output = output.replace(
       /^(\*\*[A-Z][^*\n]+\*\*\s+(?:I'(?:ve|m)|I will|I'll|My )[^\n]*\n+)+/,
       ''
@@ -1298,7 +1447,7 @@ export function buildWorkerErrorResponse(args: {
 }): string {
   const { worker, exitCode, stderr, emptyResponse, suggestedWorker } = args;
   const suggestion = suggestedWorker
-    ? `Try again, or switch with /model ${suggestedWorker}.`
+    ? `Try again, or switch with /agent ${suggestedWorker}.`
     : `Try again (all other workers cooling down or unavailable).`;
 
   if (emptyResponse) {
@@ -1313,4 +1462,41 @@ export function buildWorkerErrorResponse(args: {
   if (sanitized) parts.push(`\`\`\`\n${sanitized}\n\`\`\``);
   parts.push(suggestion);
   return parts.join('\n\n');
+}
+
+/**
+ * WPE2: Risk-flag surfacing helper for self-improver HITL alerts.
+ * Checks if an audit record carries risk flags that require operator approval
+ * and returns the appropriate InlineKeyboardMarkup for HITL buttons.
+ *
+ * @param auditRecord - The audit record to check (from self-improver-audit.jsonl)
+ * @returns InlineKeyboardMarkup if risk flags present, undefined otherwise
+ */
+export function buildHITLKeyboard(auditRecord: { risk_flags?: string[]; ts?: string }): { inline_keyboard: any[][] } | undefined {
+  if (!auditRecord.risk_flags || auditRecord.risk_flags.length === 0) {
+    return undefined;
+  }
+
+  // Check for high-risk flags that require HITL approval
+  const highRiskFlags = ['critical-skill', 'declares-secrets'];
+  const hasHighRiskFlag = auditRecord.risk_flags.some(flag => highRiskFlags.includes(flag));
+
+  if (!hasHighRiskFlag) {
+    return undefined;
+  }
+
+  // Use timestamp as audit record ID for callback_data
+  const auditId = auditRecord.ts || 'unknown';
+
+  return {
+    inline_keyboard: [
+      [
+        { text: '✅ Approve', callback_data: `pm:${auditId}:approve` },
+        { text: '❌ Reject', callback_data: `pm:${auditId}:reject` },
+      ],
+      [
+        { text: '📄 Show diff', callback_data: `pm:${auditId}:diff` },
+      ],
+    ],
+  };
 }

@@ -11,7 +11,7 @@ const RETENTION_MS = 30 * DAY;
  *  .oga to cover WP4's new audio-file/video_note support (audio, video_note,
  *  and cloud-transcoded formats) — must stay in lockstep with WP4 item 5's
  *  extension derivation, or new-format attachments leak past 30d retention. */
-export const VOICE_ATTACHMENT_FILE_RE = /\.(oga|ogg|opus|mp3|m4a|mp4|wav|webm|flac|aac|amr)$/i;
+export const VOICE_ATTACHMENT_FILE_RE = /\.(oga|ogg|opus|mp3|m4a|mp4|wav|webm|flac|aac|amr|pdf|jpg|jpeg|png|webp|txt|md|csv|xlsx|zip)$/i;
 
 export function voiceAttachmentsDir(): string {
   return join(paHome(), 'attachments');

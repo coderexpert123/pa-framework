@@ -87,6 +87,13 @@ export interface AuditRecord {
   test_run_counts?: AuditTestRunCounts; // F3 verification-gate suite results, when the fix passed far enough to run them
   accepted_at?: string;         // ISO timestamp of the human acceptance decision (rollback-accepted only)
   accepted_by?: string;         // who made it — 'human' by default, a name/handle when known (rollback-accepted only)
+  // Eval gate outcome (Wave H WPH1): golden-task eval results for applied changes
+  eval?: {
+    pass: number;
+    fail: number;
+    skipped: number;
+    detail?: string;
+  };
 }
 
 /**

@@ -26,9 +26,9 @@ describe('parseStopSteer', () => {
     assert.deepEqual(parseStopSteer('/steer@Example_pa_bot multi\nline prompt'), { kind: 'steer', prompt: 'multi\nline prompt' });
   });
 
-  it('/steer without a prompt degrades to /stop', () => {
-    assert.deepEqual(parseStopSteer('/steer'), { kind: 'stop' });
-    assert.deepEqual(parseStopSteer('/steer   '), { kind: 'stop' });
+  it('/steer without a prompt returns steer with undefined prompt', () => {
+    assert.deepEqual(parseStopSteer('/steer'), { kind: 'steer', prompt: undefined });
+    assert.deepEqual(parseStopSteer('/steer   '), { kind: 'steer', prompt: undefined });
   });
 
   it('/steer without a prompt but with attachment returns steer with undefined prompt (E7, A3)', () => {

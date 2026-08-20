@@ -173,6 +173,13 @@ Read that file before concluding the mirror has always been guarded:
 cat ~/.pa/pii-guard-bypass.jsonl
 ```
 
+**Usage / bare invocation** (2026-08-17): `--help`/`-h`/zero-args prints the usage block
+above and exits 0 WITHOUT reading stdin. Git always passes remote args to a pre-push
+hook, so argv count alone identifies a mistaken bare call. Do NOT add an isatty() guard
+here — Windows reports the NUL device as a TTY (`os.isatty()` is True under
+`subprocess.DEVNULL`), which silently defeated the tty-guarded variant and hung a
+push-public run for 47 minutes.
+
 **Full-tree audit mode** (the per-push scan is bounded by what a push touches;
 a file nobody has touched in a year is only ever re-checked here):
 ```sh

@@ -498,4 +498,90 @@ topic_defaults:
     assert.equal(saved.model_status?.current_worker, 'claude');
     assert.equal(saved.model_status?.reason_code, 'default_active');
   });
+
+  it('/model <value> updates the pinned status card with Model', async () => {
+    await writeFile(join(tempDir, 'config.yaml'), `
+workers:
+  - name: agy
+    command: node
+    args: ["-e", "process.exit(0)"]
+    check: node -e "process.exit(0)"
+    tunables:
+      model:
+        args: ["--model", "{value}"]
+topic_defaults:
+  "123_0": "agy"
+`, 'utf8');
+
+    const topicStateFile = join(tempDir, 'telegram-bot-topic-123_0.json');
+    await writeFile(topicStateFile, JSON.stringify({
+      chat_id: 123,
+      thread_id: 0,
+      turns: [],
+      pinned_status_message_id: 100,
+    }), 'utf8');
+
+    const fetchLog: string[] = [];
+    await runOneUpdate('/model gemini-3.7-flash-high', fetchLog);
+
+    // Should edit the pinned message text with Model: gemini-3.7-flash-high
+    const editCalls = fetchLog.filter(u => u.includes('editMessageText'));
+    assert.ok(editCalls.length > 0, 'must call editMessageText to refresh pinned card');
+    assert.ok(editCalls[0].includes('gemini-3.7-flash-high'), 'edited card must contain the new model');
+  });
+
+  it('/agent <name> switches agent and remembers per-agent model across switches', async () => {
+    await writeFile(join(tempDir, 'config.yaml'), `
+workers:
+  - name: agy
+    command: node
+    args: ["-e", "process.exit(0)"]
+    check: node -e "process.exit(0)"
+    tunables:
+      model:
+        args: ["--model", "{value}"]
+  - name: claude
+    command: node
+    args: ["-e", "process.exit(0)"]
+    check: node -e "process.exit(0)"
+    tunables:
+      model:
+        args: ["--model", "{value}"]
+        default: "opusplan"
+topic_defaults:
+  "123_0": "claude"
+`, 'utf8');
+
+    const topicStateFile = join(tempDir, 'telegram-bot-topic-123_0.json');
+    await writeFile(topicStateFile, JSON.stringify({
+      chat_id: 123,
+      thread_id: 0,
+      turns: [],
+      pinned_status_message_id: 100,
+    }), 'utf8');
+
+    // 1. Switch to agy
+    const fetchLog1: string[] = [];
+    await runOneUpdate('/agent agy', fetchLog1);
+
+    // 2. Set model on agy to gemini-3.7-flash-high
+    const fetchLog2: string[] = [];
+    await runOneUpdate('/model gemini-3.7-flash-high', fetchLog2);
+
+    // 3. Switch to claude
+    const fetchLog3: string[] = [];
+    await runOneUpdate('/agent claude', fetchLog3);
+
+    // Check state has both
+    const stateMid = JSON.parse(await readFile(topicStateFile, 'utf8'));
+    assert.equal(stateMid.tunable_overrides?.agy?.model, 'gemini-3.7-flash-high');
+
+    // 4. Switch back to agy
+    const fetchLog4: string[] = [];
+    await runOneUpdate('/agent agy', fetchLog4);
+
+    // The status card for agy must restore gemini-3.7-flash-high
+    const pinCardEdits = fetchLog4.filter(u => u.includes('editMessageText') || u.includes('sendMessage'));
+    assert.ok(pinCardEdits.some(u => u.includes('gemini-3.7-flash-high')), 'status card must reflect remembered model');
+  });
 });

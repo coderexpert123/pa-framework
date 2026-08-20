@@ -9,12 +9,12 @@ removing, or debugging a maintenance job.
 ## Catchup -> Maintenance Runner -> declared jobs (AI-100, 2026-08-02)
 
 `pa catchup`'s maintenance phase is one call — `runDueJobs('pa', jobsForHost('pa'), ...)`
-— driving 10 declared jobs (`pa/src/lib/maintenance/registry.ts`: `orphanWorkerReapJob`,
-`blackboardPurgeJob`, `stalenessCheckJob`, `skillLogRotateJob`, `archivePruneJob`,
-`alertStateGcJob`, `weeklyLearnJob`, `sessionGcJob`, `voiceAttachmentGcJob`, and
-`reservationGcJob` — the last added 2026-08-06 as part of the multi-session coordination
-protocol, GC'ing expired rows in `~/.pa/reservations.json`) against the ledger
-`~/.pa/maintenance-state.json`, un-gated by topic (fixed a live bug:
+— driving 11 declared jobs (`pa/src/lib/maintenance/registry.ts`: `orphanWorkerReapJob`,
+`blackboardPurgeJob`, `stalenessCheckJob`, `skillCadenceAuditJob`, `skillLogRotateJob`,
+`archivePruneJob`, `alertStateGcJob`, `weeklyLearnJob`, `sessionGcJob`,
+`voiceAttachmentGcJob`, and `reservationGcJob` — the last added 2026-08-06 as part of the
+multi-session coordination protocol, GC'ing expired rows in `~/.pa/reservations.json`) against
+the ledger `~/.pa/maintenance-state.json`, un-gated by topic (fixed a live bug:
 `alert-state-gc`/staleness migration had never run in production because it was gated on
 `!opts.topic` while both registered scheduled tasks pass `--topic`).
 
@@ -28,6 +28,14 @@ itself (`WorkerPidEntry.harvestUntil`, stamped by dispatch callers that pass
 honors it without needing its own `excludeSkills` set. See
 `docs/bot-reliability-internals.md`'s "Worker-pid registry & topic-lock invariants"
 section for the full mechanism.
+
+**`skillCadenceAuditJob` dead-man's-switch (2026-08-17, Wave C):** runs hourly (1h cadence,
+`shedWhenDegraded:true`) and audits every scheduled skill's last successful run against
+max(2× interval, 26h). Skills whose last success is older than the threshold trigger a
+pa-alerts notification with the skill name, interval, hours-since-success, and threshold.
+Parked skills (AI-098: consecutive failures ≥5) have their parked status and failure count
+included in the alert message to avoid double-reporting. Deduped via `notifyUser`'s
+dedup key `'skill-cadence-audit'`.
 
 Built after an undeclared bot timer deleted 248 real Claude Code transcripts — full
 audit + governing rule in `plans/2026-08-02-maintenance-framework.md`; enforced in CI by
@@ -68,3 +76,28 @@ Cold-start seeding (`dlq-flush`/`delivered-store-compact`/`proxy-pool-refresh` s
 fired on the very first tick, while `model-override-sweep`/`bot-log-rotation-check` still
 fire immediately — do not seed those two. `grounding-check` (added 2026-08-05) is also
 NOT cold-start-seeded — same reasoning as `model-override-sweep`/`bot-log-rotation-check`.
+
+**`restoreDrillJob` (2026-08-17, Wave D):** runs monthly (30d cadence, `shedWhenDegraded:true`)
+and performs a verify-only restore drill. Downloads the newest `pa-secrets-*.pab` from Drive,
+decrypts to a C: temp directory (never touches live `~/.pa`), validates file formats
+(env files parse as KEY=VALUE, JSON files parse, SQLite files have magic header), and
+reports pass/fail + duration to the ledger. Also checks the newest `pa-fitness-*.fab`
+blob age and header; reports stale (>90 days) or invalid. All deterministic, no LLM.
+Implementation: `pa/scripts/run_restore_drill.py` reuses Drive client and decrypt functions
+from `backup_secrets.py` by import.
+
+**`clobberSentinelJob` (2026-08-17, Wave D):** runs every 30 minutes (30m cadence, `shedWhenDegraded:true`)
+and detects working-tree files reverted to an ancestor of HEAD. Imports the same detection function
+as `pa reconcile --check` directly (no CLI shelling). Pages pa-alerts deduped per-file when drift
+is found. Skips while `@build` or git-workflow locks are held (mid-commit reconcile reads are racy).
+Never mutates anything — pure detection + notification only.
+
+**`redteamRecurringJob` (2026-08-18, Wave G):** runs monthly (30d cadence, `shedWhenDegraded:true`)
+and executes prompt-injection redteam regression tests against deterministic defense layers only
+(no LLM). The script `pa/scripts/redteam_injection.py` tests three layers: (1) credential redaction
+(`pa/src/lib/redact.ts`) verifies sk-/Bearer/ghp_/AIza/xoxb token patterns are redacted,
+(2) PA_META protected-skill gate (`bot PA_META_PROTECTED_SKILLS`) rejects git-workflow skill
+forgeries (commit/push/push-public/commit-and-push/investigate-flagged/update-brain), and
+(3) legitimate PA_META envelopes (positive controls) pass unharmed. Fixture corpus contains
+~25 adversarial inputs across all classes. On failure, pages pa-alerts deduped. Deterministic,
+no LLM calls.

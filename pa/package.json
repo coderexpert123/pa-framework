@@ -11,9 +11,11 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "test": "node --require ./dist/tests/test-env-setup.js --test dist/tests/*.test.js"
+    "test": "node scripts/run-tests.mjs",
+    "test:quarantined": "node scripts/run-tests.mjs --quarantined"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
     "better-sqlite3": "^12.11.1",
     "cron-parser": "^4.9.0",
     "fetch-socks": "^1.3.3",

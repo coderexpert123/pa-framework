@@ -35,6 +35,13 @@ export interface PendingDispatch {
   /** Session the dispatch will try to resume, if one existed. Recovery is only
    * possible for claude-family sessions (transcript path is deterministic). */
   session?: SessionInfo;
+  /** Tee file capturing this dispatch's stdout (set at dispatch time by
+   * processUpdate). Enables recovery even when the worker-pids registry
+   * entry is already cleaned up by the worker's own done() callback. */
+  teePath?: string;
+  /** The worker that was actually dispatched (for native-resume args and
+   * recovery UX when the dispatch has no session). Set at dispatch time. */
+  workerName?: string;
 }
 
 function storePath(): string {
@@ -103,6 +110,26 @@ export async function removePendingDispatch(key: string): Promise<void> {
   return withMutex(async () => {
     const map = await load();
     if (map.delete(key)) await persist(map);
+  });
+}
+
+/**
+ * Merge partial fields into an existing pending-dispatch record.
+ * Used by processUpdate after dispatchMessage returns to enrich the
+ * on-disk record with recovery metadata (teePath, workerName) that the
+ * orphan reaper needs to recover the reply if the bot crashes before
+ * the reply is delivered. No-op if the record has already been removed.
+ */
+export async function updatePendingDispatch(
+  key: string,
+  partial: Partial<PendingDispatch>,
+): Promise<void> {
+  return withMutex(async () => {
+    const map = await load();
+    const existing = map.get(key);
+    if (!existing) return; // already removed (reply delivered or TTL expired)
+    map.set(key, { ...existing, ...partial });
+    await persist(map);
   });
 }
 

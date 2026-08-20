@@ -7,13 +7,12 @@ export interface BotCommand {
 
 export const BOT_COMMANDS: BotCommand[] = [
   // Local Commands (skipWorker = true)
-  // NOTE: /model picks the CLI. /llm picks the model that CLI runs. Keep the
-  // worker list here in sync with MODEL_SWITCH_PATTERN in logic.ts — it read
-  // "(claude, gemini, zclaude, codex)" for weeks after agy became the default.
-  { command: 'model', description: 'Switch CLI for this topic (agy, zclaude, codex, claude)' },
-  { command: 'llm', description: 'Show or set the model the current CLI runs (/llm <name>, /llm clear)' },
-  { command: 'effort', description: 'Show or set reasoning effort for the current CLI (/effort <value>, /effort clear)' },
-  { command: 'default', description: 'Topic defaults: /default <worker>, /default llm <name>, /default effort <value>' },
+  // NOTE: /agent picks the agent/CLI harness (agy, agyc, zclaude, codex, claude).
+  // /model picks the foundation model (gemini-3.7-flash-high, opusplan, etc.).
+  { command: 'agent', description: 'Switch or view active agent for this topic (agy, agyc, zclaude, codex, claude)' },
+  { command: 'model', description: 'Show or set the model for the current agent (/model <name>, /model clear)' },
+  { command: 'effort', description: 'Show or set reasoning effort for the current agent (/effort <value>, /effort clear)' },
+  { command: 'default', description: 'Topic defaults: /default <agent>, /default model <name>, /default effort <value>' },
   { command: 'code', description: 'Set, show, or reset working directory' },
   { command: 'reset', description: 'Clear conversation and session for this topic' },
   { command: 'new', description: 'Clear context and start a fresh session (optionally seed from replied message)' },
@@ -21,12 +20,15 @@ export const BOT_COMMANDS: BotCommand[] = [
   { command: 'skills', description: 'List scheduled skills and last run' },
   { command: 'auth', description: 'Complete OAuth flow using the bridge-page command' },
   { command: 'help', description: 'Show available commands' },
-  { command: 'branch', description: 'Create a branch from this topic (manual topic creation required)' },
+  { command: 'health', description: 'Show pa system health check (read-only)' },
+  { command: 'ref', description: 'Look up a ref-ID: /ref <id> (read-only)' },
+  { command: 'claims', description: 'Show active file reservations and recent changes (read-only)' },
+  { command: 'branch', description: 'Create a branch from this topic: /branch <name> [prompt]' },
   { command: 'child_of', description: 'Link this topic as a child of a named parent topic' },
   { command: 'merge', description: 'Merge this branch context back into the parent topic' },
   { command: 'keepawake', description: 'Toggle machine keep-awake mode' },
   { command: 'stop', description: 'Kill the worker currently running in this topic' },
-  { command: 'steer', description: 'Kill the running worker and resume the session with a new prompt (/steer <prompt>; no prompt = /stop)' },
+  { command: 'steer', description: 'Kill the running worker and resume with folded context (/steer [prompt])' },
   { command: 'retranscribe', description: 'Re-transcribe the voice/audio/video note you replied to (optional engine override)' },
   { command: 'commit', description: 'Commit pending work locally — fast, no push, no test gate, no CI wait' },
   { command: 'commit_and_push', description: 'Update the brain, commit + push pending work, wait for CI, sync the public mirror if eligible' },

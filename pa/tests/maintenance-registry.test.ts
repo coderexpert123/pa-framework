@@ -10,22 +10,26 @@ describe('MAINTENANCE_JOBS registry', () => {
     assert.doesNotThrow(() => validateRegistry([...MAINTENANCE_JOBS]));
   });
 
-  it('declares exactly 17 jobs (11 pa + 6 bot) with the expected names', () => {
-    assert.equal(MAINTENANCE_JOBS.length, 17);
+  it('declares exactly 21 jobs (15 pa + 6 bot) with the expected names', () => {
+    assert.equal(MAINTENANCE_JOBS.length, 21);
     const names = MAINTENANCE_JOBS.map((j) => j.name).sort();
     assert.deepEqual(names, [
       'alert-state-gc',
       'archive-prune',
       'blackboard-purge',
       'bot-log-rotation-check',
+      'clobber-sentinel',
       'delivered-store-compact',
       'dlq-flush',
       'grounding-check',
       'model-override-sweep',
       'orphan-worker-reap',
       'proxy-pool-refresh',
+      'redteam-recurring',
       'reservation-gc',
+      'restore-drill',
       'session-gc',
+      'skill-cadence-audit',
       'skill-log-rotate',
       'staleness-check',
       'voice-attachment-gc',
@@ -34,8 +38,8 @@ describe('MAINTENANCE_JOBS registry', () => {
     ]);
   });
 
-  it('splits jobs correctly by host (11 pa, 6 bot)', () => {
-    assert.equal(jobsForHost('pa').length, 11);
+  it('splits jobs correctly by host (15 pa, 6 bot)', () => {
+    assert.equal(jobsForHost('pa').length, 15);
     assert.equal(jobsForHost('bot').length, 6);
     const botNames = jobsForHost('bot').map((j) => j.name).sort();
     assert.deepEqual(botNames, [
@@ -61,7 +65,7 @@ describe('MAINTENANCE_JOBS registry', () => {
   });
 
   it('locks the declared cadence for the 1-hour jobs', () => {
-    for (const name of ['skill-log-rotate', 'archive-prune', 'alert-state-gc']) {
+    for (const name of ['skill-cadence-audit', 'skill-log-rotate', 'archive-prune', 'alert-state-gc']) {
       const job = findJob(name);
       assert.ok(job, `${name} should exist`);
       assert.equal(resolveEvery(job!), 3_600_000, `${name} cadence`);

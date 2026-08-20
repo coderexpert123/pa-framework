@@ -56,10 +56,12 @@ describe('cleanupExpiredVoiceAttachments', () => {
   });
 
   it('is fail-closed: never touches files outside the allowlist even when old', async () => {
-    await makeAttachment('123', '2026-01-01', 'notes.txt', 400);
+    // WPE3 widened the allowlist to document types (.txt/.png etc. now GC'd),
+    // so the still-rejected class is represented by an executable.
+    await makeAttachment('123', '2026-01-01', 'tool.exe', 400);
     const deleted = await cleanupExpiredVoiceAttachments(Date.now(), attachmentsDir);
     assert.equal(deleted, 0);
-    assert.equal(await exists(join(attachmentsDir, '123', '2026-01-01', 'notes.txt')), true);
+    assert.equal(await exists(join(attachmentsDir, '123', '2026-01-01', 'tool.exe')), true);
   });
 
   it('walks multiple chat_id and date directories independently', async () => {
@@ -89,12 +91,17 @@ describe('cleanupExpiredVoiceAttachments', () => {
 });
 
 describe('VOICE_ATTACHMENT_FILE_RE', () => {
-  it('matches the widened audio/video-note allowlist and rejects everything else (fail-closed, not .*)', () => {
+  it('matches the audio/video-note allowlist AND the WPE3 document types, rejecting the rest (fail-closed, not .*)', () => {
     assert.ok(VOICE_ATTACHMENT_FILE_RE.test('AgADdQADq6cxG.oga'));
     assert.ok(VOICE_ATTACHMENT_FILE_RE.test('AgADdQADq6cxG.ogg'));
     assert.ok(VOICE_ATTACHMENT_FILE_RE.test('AgADdQADq6cxG.OGA'), 'case-insensitive');
-    assert.equal(VOICE_ATTACHMENT_FILE_RE.test('notes.txt'), false);
-    assert.equal(VOICE_ATTACHMENT_FILE_RE.test('image.png'), false);
+    // WPE3 (2026-08-18): documents/photos share the substrate — GC'd too
+    assert.ok(VOICE_ATTACHMENT_FILE_RE.test('notes.txt'));
+    assert.ok(VOICE_ATTACHMENT_FILE_RE.test('image.png'));
+    assert.ok(VOICE_ATTACHMENT_FILE_RE.test('report.pdf'));
+    // ...but still fail-closed to unknown types
+    assert.equal(VOICE_ATTACHMENT_FILE_RE.test('tool.exe'), false);
+    assert.equal(VOICE_ATTACHMENT_FILE_RE.test('archive.7z'), false);
   });
 });
 

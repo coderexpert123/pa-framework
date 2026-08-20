@@ -48,6 +48,15 @@ export interface TelegramMessage {
 export interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
+  callback_query?: CallbackQuery;
+}
+
+export interface CallbackQuery {
+  id: string;
+  from: TelegramUser;
+  message?: TelegramMessage;
+  data?: string;
+  chat_instance?: string;
 }
 
 export interface ConversationTurn {
@@ -88,6 +97,8 @@ export interface ModelStatusSnapshot {
   reason_code: ModelStatusReasonCode;
   reason_text: string;
   changed_at: string;
+  current_llm?: string;
+  default_llm?: string;
 }
 
 export interface ConversationState {

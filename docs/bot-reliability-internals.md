@@ -21,6 +21,14 @@ DLQ TTL), and an in-flight guard keeps at most one flush queued on the dlq mutex
 outages. (See `plans/2026-07-07-autonomous-scale-longevity-hardening.md` +
 `plans/2026-07-08-autonomous-deep-recheck-pass1-fixes.md`.)
 
+**Quarantine contract (2026-08-17):** Each DLQ entry tracks `attempts` (failed flush count).
+At 5 failed attempts, the entry is marked `quarantined: true` and retry stops — it persists
+indefinitely (no TTL purge) awaiting operator action via `pa dlq list|replay|discard`.
+The first quarantine sends a one-time deduped page to pa-alerts (ref-ID + first 80 chars
+preview). This prevents a chronically failing message from spamming Telegram while
+preserving it for manual recovery. Replay resets `quarantined`+`attempts` and warns about
+duplicate risk if the original send eventually succeeded.
+
 ## Delivery semantics
 
 Inbound = exactly-once (offset + `watermark.ts`). Outbound = effectively-once / no
@@ -46,6 +54,26 @@ recovered replies are dedup-guarded via the same delivered-store. Tee files are 
 after 24h by the declared `worker-tee-gc` job (AI-100). The poll loop's
 stop-sentinel watcher (main.ts) aborts a slow proxied `getUpdates` so graceful shutdown
 stays prompt.
+
+**2026-08-17 additions (infra-audit Waves A/B):**
+
+- `extractFinalAssistantText` is position-aware: a `tool_use` block only marks an entry
+  mid-turn when it appears AFTER the last text block. A tool call before/between text
+  blocks with a final text answer is a COMPLETED turn — the old any-tool_use-skip rule
+  delivered death notices for perfectly good recovered replies that ended with a
+  post-answer tool call.
+- `main.ts` runs `watchdogStaleJobs()` on a 5-min gate (allowlisted due-check in
+  `timer-inventory.test.ts`): it clears in-flight markers older than 10× a job's
+  interval, so a job whose promise never settles (the 2026-08-17 model-override-sweep
+  70-skip wedge) self-heals instead of skipping forever.
+- Pinned-worker failure hint: when a topic's effective worker is an explicit choice
+  (preferred/topic-default, not failover) and spawn-fails twice in a row, the failure
+  reply appends "Pinned worker X is failing — /agent <alt> to switch" (rate-limited,
+  resets after showing).
+- Secret redaction on egress: `buildWorkerResponse` runs the final reply through
+  `pa/src/lib/redact.ts`'s `redactSecrets` (literal secrets.env values + generic token
+  shapes) — same net as pa's log/telegram paths. Do not add new reply-sending code that
+  bypasses it.
 
 **AI-095 follow-up (2026-07-08, closes two pre-existing gaps in the above):**
 
@@ -97,9 +125,9 @@ before the kill keeps its real reply. `plans/2026-08-02-autonomous-stop-cancella
   dispatch cancelled by the marker contributes its text via the reply-path A6 flush.
   The marker is ALWAYS set (no unmark-on-killed-0) and TTL is 15 min (covers the
   10-min transcription cap); it is updateId-gated so it can never touch newer messages.
-- Caption parsing: `/stop`/`/steer` are detected from `msg.text ?? msg.caption`;
-  bare `/steer` as a caption on a voice note = the transcript is the steer prompt.
-  A caption that is any slash-command skips transcription entirely (`__skipVoice`).
+- Command & caption parsing: `/stop`/`/steer` are detected from `msg.text ?? msg.caption`;
+  bare `/steer` (text or voice) folds in-flight + queued context and dispatches immediately
+  without degrading to `/stop` (2026-08-20). A caption that is any slash-command skips transcription entirely (`__skipVoice`).
 - Do-not-regress: the stop/steer kill IIFE must NOT drain the queue for `/steer` (it
   resumes at the loop's next await — after the steer's own entry registered — and
   would cancel it); held absorption for a steer happens in ITS normalizer, never at

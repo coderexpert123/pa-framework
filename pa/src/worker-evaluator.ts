@@ -49,11 +49,23 @@ export async function evaluateWorkerState(
     const config = await loadConfig();
     const evalCfg: EvaluatorConfig = config.evaluator ?? { worker: 'claude', timeout: 60 };
 
-    // Don't evaluate yourself — would cause recursion
-    if (evalCfg.worker === stuckWorkerName) return null;
-
-    const evalWorker = config.workers.find((w) => w.name === evalCfg.worker);
-    if (!evalWorker) return null;
+    // Build the evaluator worker chain: the configured worker first (unless
+    // it IS the stuck worker), then all remaining workers SORTED BY PRIORITY
+    // as fallbacks. Sorting is load-bearing — config.workers is in YAML file
+    // order (zclaude first), not priority order, so without the sort zclaude
+    // would be tried before agyc despite being lower priority.
+    const evalWorkers: WorkerConfig[] = [];
+    const primary = config.workers.find((w) => w.name === evalCfg.worker);
+    if (primary && primary.name !== stuckWorkerName) {
+      evalWorkers.push(primary);
+    }
+    const sorted = [...config.workers].sort((a, b) => (a.priority ?? 99) - (b.priority ?? 99));
+    for (const w of sorted) {
+      if (w.name !== stuckWorkerName && !evalWorkers.some(e => e.name === w.name)) {
+        evalWorkers.push(w);
+      }
+    }
+    if (evalWorkers.length === 0) return null;
 
     // DO NOT REGRESS: readUsableStateTail, never readStateTail. Some workers
     // (agy) keep their conversation in a binary SQLite/protobuf store, and the
@@ -86,16 +98,35 @@ Conversation state tail:
 ${stateContent}
 ---`;
 
-    const result = await executor(evalWorker, prompt, {
-      timeout: evalCfg.timeout,
-      idleTimeout: 30,
-      isEvaluator: true,
-      resource: `evaluator-${stuckWorkerName}`,
-      agentName: evalCfg.worker,
-      env,  // pass through secrets so evaluator has API keys
-    });
+    let result: CommandResult | null = null;
+    let evalWorkerUsed: WorkerConfig | undefined;
 
-    if (!result.success || !result.output.trim()) return null;
+    for (const evalWorker of evalWorkers) {
+      try {
+        const attempt = await executor(evalWorker, prompt, {
+          timeout: evalCfg.timeout,
+          idleTimeout: 30,
+          isEvaluator: true,
+          resource: `evaluator-${stuckWorkerName}`,
+          agentName: evalWorker.name,
+          env,
+        });
+        if (attempt.success && attempt.output.trim()) {
+          result = attempt;
+          evalWorkerUsed = evalWorker;
+          break;
+        }
+        // Worker responded but output was empty or failed — try next in chain
+        log('info', 'evaluator', `evaluator worker ${evalWorker.name} produced no usable result, trying next in fallback chain`, {
+          stuckWorker: stuckWorkerName,
+        });
+      } catch {
+        // Worker spawn failed entirely — try next in chain
+        continue;
+      }
+    }
+
+    if (!result || !evalWorkerUsed) return null;
 
     // Strip markdown code fences if the LLM wrapped its response
     const raw = result.output.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');

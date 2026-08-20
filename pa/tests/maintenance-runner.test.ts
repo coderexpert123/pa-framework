@@ -8,6 +8,8 @@ import { readLedger } from '../src/lib/maintenance/state.js';
 import type { MaintenanceJob } from '../src/lib/maintenance/types.js';
 import { rmRetry } from './rm-retry.js';
 
+const HOUR = 3_600_000; // 1 hour in milliseconds
+
 let tempDir: string;
 let originalPaHome: string | undefined;
 
@@ -309,6 +311,136 @@ describe('P2-16: staleness sub-hourly blind spot fix', () => {
 
     const result = await stalenessCheckJob.run(mockCtx);
     assert.equal(result.touched, 0, 'Should NOT fire - below 30-minute minimum threshold');
+  });
+});
+
+describe('Wave C WPC1: skill-cadence-audit dead-man\'s-switch', () => {
+  it('stale skill fires once (dedupe handled by notifyUser)', async () => {
+    const { skillCadenceAuditJob } = await import('../src/lib/maintenance/jobs/skill-cadence-audit.js');
+    const now = Date.now();
+    const lastSuccess = new Date(now - 50 * HOUR).toISOString(); // 50 hours ago (>2× daily = 48h and >26h)
+
+    const mockCtx = {
+      now,
+      everyMs: 3_600_000, // 1 hour
+      async listSkills() {
+        return [{
+          name: 'daily-skill',
+          frontmatter: { cron: '0 0 * * *' }, // daily
+        } as any];
+      },
+      async getLastSuccessfulRun(skillName: string) {
+        if (skillName === 'daily-skill') {
+          return { timestamp: lastSuccess };
+        }
+        return null;
+      },
+      async getFailureState(skillName: string) {
+        return { consecutiveFailures: 0, lastAttemptAt: null };
+      },
+    };
+
+    const result = await skillCadenceAuditJob.run(mockCtx);
+    assert.equal(result.touched, 1, 'Should detect stale daily skill');
+    const detail = result.detail as { skills?: string[] } | undefined;
+    assert.ok((detail?.skills?.length ?? 0) > 0, 'Should report the stale skill');
+    assert.ok(detail?.skills?.[0]?.includes('daily-skill'), 'Alert should name the skill');
+    assert.ok(detail?.skills?.[0]?.includes('50h ago'), 'Alert should show hours since success');
+  });
+
+  it('healthy skill (within threshold) is silent', async () => {
+    const { skillCadenceAuditJob } = await import('../src/lib/maintenance/jobs/skill-cadence-audit.js');
+    const now = Date.now();
+    const lastSuccess = new Date(now - 12 * 60 * 60 * 1000).toISOString(); // 12 hours ago (<2× daily, <26h)
+
+    const mockCtx = {
+      now,
+      everyMs: 3_600_000,
+      async listSkills() {
+        return [{
+          name: 'daily-skill',
+          frontmatter: { cron: '0 0 * * *' },
+        } as any];
+      },
+      async getLastSuccessfulRun(skillName: string) {
+        if (skillName === 'daily-skill') {
+          return { timestamp: lastSuccess };
+        }
+        return null;
+      },
+      async getFailureState(skillName: string) {
+        return { consecutiveFailures: 0, lastAttemptAt: null };
+      },
+    };
+
+    const result = await skillCadenceAuditJob.run(mockCtx);
+    assert.equal(result.touched, 0, 'Should NOT fire - healthy skill within threshold');
+  });
+
+  it('parked skill message references park status', async () => {
+    const { skillCadenceAuditJob } = await import('../src/lib/maintenance/jobs/skill-cadence-audit.js');
+    const now = Date.now();
+    const lastSuccess = new Date(now - 50 * HOUR).toISOString(); // 50 hours ago (>2× daily = 48h)
+
+    const mockCtx = {
+      now,
+      everyMs: 3_600_000,
+      async listSkills() {
+        return [{
+          name: 'failing-skill',
+          frontmatter: { cron: '0 0 * * *' },
+        } as any];
+      },
+      async getLastSuccessfulRun(skillName: string) {
+        if (skillName === 'failing-skill') {
+          return { timestamp: lastSuccess };
+        }
+        return null;
+      },
+      async getFailureState(skillName: string) {
+        // Simulate parked state (5+ consecutive failures)
+        return { consecutiveFailures: 7, lastAttemptAt: new Date(now - 2 * 60 * 60 * 1000).toISOString() };
+      },
+    };
+
+    const result = await skillCadenceAuditJob.run(mockCtx);
+    assert.equal(result.touched, 1, 'Should detect stale parked skill');
+    const detail = result.detail as { skills?: string[] } | undefined;
+    assert.ok((detail?.skills?.length ?? 0) > 0, 'Should report the stale skill');
+    assert.ok(detail?.skills?.[0]?.includes('[PARKED'), 'Alert should mention parked status');
+    assert.ok(detail?.skills?.[0]?.includes('7 consecutive failures'), 'Alert should show failure count');
+  });
+
+  it('respects max(2× interval, 26h) threshold', async () => {
+    const { skillCadenceAuditJob } = await import('../src/lib/maintenance/jobs/skill-cadence-audit.js');
+    const now = Date.now();
+    // Hourly skill: 2× interval = 2h, so 26h threshold applies
+    const lastSuccess = new Date(now - 28 * 60 * 60 * 1000).toISOString(); // 28 hours ago (>26h)
+
+    const mockCtx = {
+      now,
+      everyMs: 3_600_000,
+      async listSkills() {
+        return [{
+          name: 'hourly-skill',
+          frontmatter: { cron: '0 * * * *' }, // hourly
+        } as any];
+      },
+      async getLastSuccessfulRun(skillName: string) {
+        if (skillName === 'hourly-skill') {
+          return { timestamp: lastSuccess };
+        }
+        return null;
+      },
+      async getFailureState(skillName: string) {
+        return { consecutiveFailures: 0, lastAttemptAt: null };
+      },
+    };
+
+    const result = await skillCadenceAuditJob.run(mockCtx);
+    assert.equal(result.touched, 1, 'Should detect stale hourly skill (exceeds 26h threshold)');
+    const detail = result.detail as { skills?: string[] } | undefined;
+    assert.ok(detail?.skills?.[0]?.includes('threshold: 26h'), 'Alert should show 26h threshold for hourly skill');
   });
 });
 

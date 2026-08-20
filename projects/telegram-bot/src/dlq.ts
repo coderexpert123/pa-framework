@@ -1,10 +1,60 @@
-import { appendFile, readFile, unlink, writeFile, rename } from 'fs/promises';
+import { appendFile, readFile, unlink, writeFile, rename, mkdir } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
 import { sendMessage } from './telegram.js';
 import { deliveredKey, wasDelivered, markDelivered } from './delivered-store.js';
+import { log } from '../../../pa/dist/src/lib/log.js';
+import { loadSecrets } from '../../../pa/dist/src/secrets.js';
 
 export const DLQ_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
+export const QUARANTINE_THRESHOLD = 5; // attempts before quarantine
+
+// Dedup state for quarantine alerts (one per entry, by refId or text hash).
+// Resolved at CALL time (not module load) so PA_HOME set by tests/other
+// deployments is honored — the module-load constant silently pointed at the
+// real ~/.pa in tests and raced PA_HOME overrides.
+function quarantineAlertDir(): string {
+  return join(process.env.PA_HOME ?? join(homedir(), '.pa'), 'quarantine-alerts');
+}
+
+async function sendQuarantineAlert(entry: DlqEntry): Promise<void> {
+  try {
+    const secrets = await loadSecrets();
+    // env-first, secrets fallback — the standalone-scripts convention
+    const token = process.env.TELEGRAM_BOT_TOKEN || secrets['TELEGRAM_BOT_TOKEN'];
+    if (!token) return;
+
+    const alertsChatId = process.env.PA_ALERTS_CHAT_ID || secrets['PA_ALERTS_CHAT_ID'] || '';
+    const alertsThreadId = Number(process.env.PA_ALERTS_THREAD_ID || secrets['PA_ALERTS_THREAD_ID'] || '0');
+
+    if (!alertsChatId) return;
+
+    // Dedup: alert already sent for this entry
+    const alertDir = quarantineAlertDir();
+    await mkdir(alertDir, { recursive: true });
+    const alertKey = entry.refId || `${entry.chatId}:${entry.threadId}:${entry.updateId}`;
+    const alertFile = join(alertDir, `${alertKey}.json`);
+    try {
+      await readFile(alertFile, 'utf8');
+      return; // already alerted
+    } catch {
+      // file doesn't exist, proceed with alert
+    }
+
+    const preview = entry.text.slice(0, 80);
+    const subject = `DLQ entry quarantined after ${QUARANTINE_THRESHOLD} failed attempts`;
+    const body = `Ref: ${entry.refId || '(none)'}\nPreview: ${preview}${entry.text.length > 80 ? '...' : ''}\n\nThis entry will not be retried. Use "pa dlq list" to see all quarantined entries and "pa dlq replay <index>" to retry manually.\n\nRunbook: runbooks/dlq-poison.md`;
+
+    await sendMessage(token, Number(alertsChatId), body, undefined, alertsThreadId || undefined);
+
+    // Mark alert as sent
+    await writeFile(alertFile, JSON.stringify({ timestamp: new Date().toISOString() }), 'utf8');
+
+    log('warn', 'dlq', 'quarantine alert sent', { refId: entry.refId, chatId: entry.chatId, threadId: entry.threadId, updateId: entry.updateId });
+  } catch (err: any) {
+    log('error', 'dlq', 'failed to send quarantine alert', { error: err?.message, entry });
+  }
+}
 
 export interface DlqEntry {
   chatId: number;
@@ -14,6 +64,8 @@ export interface DlqEntry {
   timestamp: string;
   updateId: number;
   refId?: string;        // bot reply debug handle (e.g., 's-a1b2c3d4e5f6') — preserved for `pa ref` lookups while queued
+  attempts?: number;     // number of failed flush attempts (quarantined at 5)
+  quarantined?: boolean; // true when attempts >= 5 — stops retry, persists for operator action
 }
 
 function dlqPath(): string {
@@ -53,6 +105,8 @@ async function loadDlqInner(): Promise<DlqEntry[]> {
       .flatMap((line) => {
         try {
           const entry = JSON.parse(line) as DlqEntry;
+          // Quarantined entries persist for operator action (no TTL purge)
+          if (entry.quarantined) return [entry];
           if (now - new Date(entry.timestamp).getTime() > DLQ_MAX_AGE_MS) return [];
           return [entry];
         } catch {
@@ -97,6 +151,12 @@ async function flushDlqInner(token: string): Promise<{ delivered: number; remain
   let deduped = 0;
 
   for (const entry of entries) {
+    // Quarantined entries are never retried
+    if (entry.quarantined) {
+      remaining.push(entry);
+      continue;
+    }
+
     // Idempotency guard: if this reply was already confirmed delivered (e.g. a
     // prior flush delivered it but crashed before persisting the trimmed queue),
     // skip it — re-sending would duplicate. See delivered-store.ts.
@@ -105,6 +165,7 @@ async function flushDlqInner(token: string): Promise<{ delivered: number; remain
       deduped++;
       continue;
     }
+
     const ok = await sendMessage(token, entry.chatId, entry.text, entry.replyToMessageId, entry.threadId || undefined);
     if (ok) {
       // Mark delivered BEFORE moving on, so a crash later in this loop cannot
@@ -112,7 +173,16 @@ async function flushDlqInner(token: string): Promise<{ delivered: number; remain
       await markDelivered(key);
       delivered++;
     } else {
-      remaining.push(entry);
+      // Increment attempts counter
+      const attempts = (entry.attempts || 0) + 1;
+      if (attempts >= QUARANTINE_THRESHOLD) {
+        // Quarantine the entry and alert once
+        const quarantinedEntry: DlqEntry = { ...entry, attempts, quarantined: true };
+        remaining.push(quarantinedEntry);
+        await sendQuarantineAlert(quarantinedEntry);
+      } else {
+        remaining.push({ ...entry, attempts });
+      }
     }
   }
 

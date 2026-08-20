@@ -1,0 +1,38 @@
+# SLO Service Definitions
+#
+# This file defines the service-level objectives for error budget tracking.
+# The default definitions are embedded in the code, but you can override them
+# by placing this file at ~/.pa/slo.yaml.
+
+services:
+  - name: bot-reply-delivery
+    target: 99.5
+    targetHuman: "99.5%"
+    period: month
+    eventSources:
+      - telegram-dlq
+    description: Bot reply delivery success rate (DLQ TTL expiries + death notices)
+
+  - name: daily-mail-brief
+    target: 95.0
+    targetHuman: "≥95%"
+    period: month
+    eventSources:
+      - daily-mail-brief-windows
+    description: Daily mail brief window delivery (missed 19:00/05:00 IST windows)
+
+  - name: catchup-heartbeat
+    target: 100.0
+    targetHuman: "gap <30min"
+    period: month
+    eventSources:
+      - app-log
+    description: Catchup heartbeat gaps (events = gaps >30min)
+
+  - name: ekadashi-alerts
+    target: 100.0
+    targetHuman: "zero-miss"
+    period: month
+    eventSources:
+      - ekadashi-watchdog
+    description: Ekadashi alert delivery (watchdog miss detections)

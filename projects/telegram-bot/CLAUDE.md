@@ -42,14 +42,14 @@ action envelope for cross-skill triggering.
   action, off unless `PA_KB_SOURCES_PATH` set); clobbered-description detector
   `grounding-check.ts` (AI-101, backs the `grounding-check` maintenance job).
 - **Graceful shutdown**: `pa bot stop` writes `~/.pa/telegram-bot.stop` (sentinel file).
-- **Model switching**: `/model zclaude`, `/model claude`, `/model codex`,
-  `/model agy` sets `preferred_worker` for the topic (session-scoped, expires at IST
-  midnight).
-- **Uniform tunables** (`logic.ts`): `/llm <value>` and `/effort <value>` are
-  CLI-agnostic session-scoped counterparts to `/model` (`TUNABLE_COMMAND_SETTINGS` maps
+- **Agent & Model switching**: `/agent zclaude`, `/agent claude`, `/agent codex`,
+  `/agent agy`, `/agent agyc` sets `preferred_worker` for the topic (session-scoped, expires at IST
+  midnight; legacy `/model <agent>` is backward-compatible with a tip).
+- **Uniform tunables** (`logic.ts`): `/model <value>` and `/effort <value>` are
+  CLI-agnostic session-scoped settings (`TUNABLE_COMMAND_SETTINGS` maps
   the uniform word to each CLI's real setting name); `/default <setting> <value>` sets
   the same setting as a PERSISTENT topic default — extends the pre-existing `/default
-  <worker>` syntax (the worker-name form, `DEFAULT_SWITCH_PATTERN`, is checked first and
+  <worker>` (or `/default agent <worker>`) syntax (the agent-name form, `DEFAULT_SWITCH_PATTERN`, is checked first and
   always wins). Resolution cascade: session override → topic default → worker's own
   default → CLI built-in. Per-CLI translation lives in `~/.pa/config.yaml`'s
   `tunables.<name>.args` as an ARG TEMPLATE (`{value}` substituted, not flag+value — some
@@ -57,12 +57,18 @@ action envelope for cross-skill triggering.
   `supersedes:` field marks mutually-exclusive knobs (agy's `model` supersedes `effort`).
   Clear/reset tokens: `clear`, `reset`, `default`, `unset`, `-`. Tested in
   `tunables-commands.test.ts` + `dashboard.test.ts`.
+- **Deterministic command interception (2026-08-18)**: `/new`, `/code`, `/status`, `/skills`, `/help`, `/health`, `/ref <id>`, `/claims` are intercepted locally in `processUpdate` before worker dispatch (`/new` resets context & optionally seeds from replied ref-ID, `/code` validates and manages topic cwd_override). Tested in `logic.test.ts` + `poll-loop.test.ts`.
+- **Auto Topic Descriptions (2026-08-20)**: Topic descriptions auto-set immediately upon creation (manual topics via `forum_topic_created` and branch topics via `/branch <name> [prompt]`) via LLM with deterministic fallbacks, without interactive confirmation (`main.ts`, `logic.ts`).
 - **Telegram-driven Google OAuth reauth**: `/auth <code> [state]` is intercepted before
   archival, archived as `/auth [redacted]`, exchanges the auth code via
   `pa/scripts/finish_google_telegram_reauth.py`, deletes the code-bearing message, and
   can relaunch a saved opaque `resume_action` through `projects/telegram-bot/src/oauth.ts`.
 - **PA_META envelope**: LLMs append `[PA_META]: {"actions":[...]}` as the last line to
-  signal machine-readable actions.
+  signal machine-readable actions. **`run_skill` is authorization-gated (2026-08-17)**:
+  the git-workflow family (`commit`/`push`/`push-public`/`commit-and-push`/
+  `investigate-flagged`/`update-brain`) plus `self-improver` can NEVER fire from PA_META —
+  human-typed commands only (`PA_META_PROTECTED_SKILLS` in `logic.ts`, mirrored by pa's
+  widened `PROTECTED_SKILLS`). Bot replies pass through `redactSecrets` before sending.
 - **Multi-chat support**: `TELEGRAM_CHAT_ID` in secrets.env is comma-separated
   (`"DM_ID,GROUP_ID"`). Supergroup IDs are negative (start with `-`); DM IDs are
   positive. Any new code reading `TELEGRAM_CHAT_ID` must parse by sign, not by position.
@@ -77,6 +83,8 @@ action envelope for cross-skill triggering.
   hardcode bot tokens or chat IDs — use `_secret("TELEGRAM_BOT_TOKEN")` and parse
   `TELEGRAM_CHAT_ID` by sign (negative = supergroup, positive = DM). See
   `projects/coding-dirs-updater/update_coding_dirs.py` for the reference implementation.
+- **agy native resume — FLEET-WIDE since 2026-08-17** (operator directive: rollout-caution gates don't outlive their trial; intended gates like cost/model pins stay). Every agy topic resumes its native conversation (`--conversation <id>`, session captured only on success + session-file validity, kill-drop on cancellation). `AGY_NATIVE_RESUME_EXCLUDED_TOPICS` in main.ts is the emergency per-topic off-switch (empty = all resume). Trial record: 2026-08-16 topic 310 (`plans/2026-08-16-agy-native-resume-trial.md`).
+- **Same-turn KB notes**: ON in production since 2026-08-17 (`PA_KB_SOURCES_PATH` → `D:/My Repos/notes/Ecosystem KB/Sources.md` in secrets.env) — workers can write `kb_note` facts back via PA_META (AI-101 Layer 2).
 - **Voice-note transcription** (`plans/2026-08-04-telegram-voice-transcription.md`): a
   Telegram voice note is downloaded, transcribed, and fed into the identical
   text-dispatch pipeline. Bot side: `voice.ts` (download+dispatch, never throws),
@@ -86,7 +94,7 @@ action envelope for cross-skill triggering.
   its start-race protection is a known, documented, self-healing gap — see the file's
   own comment before "fixing" it). Config split (do not merge): `transcription:` in
   config.yaml is deployment policy, `PA_VOICE_*` is env-var operational tuning.
-  Maintenance job `voice-attachment-gc` (30d retention on `~/.pa/attachments/*.oga`).
+  Maintenance job `voice-attachment-gc` (30d retention on `~/.pa/attachments/` allowlisted files: audio, documents, images).
   Full design + error-code vocabulary in the plan file.
   **2026-08-15: transcription moved to ARRIVAL** (`voice-prefetch.ts` + the poll-loop
   enqueue block) — the transcript becomes the topic-queue entry's text, so voice

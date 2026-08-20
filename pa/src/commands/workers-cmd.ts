@@ -1,4 +1,6 @@
 import { getAvailableWorkers, getWorkerCooldown } from '../workers.js';
+import { readFile, writeFile } from 'fs/promises';
+import { configPath } from '../paths.js';
 
 function fmtDuration(ms: number): string {
   if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
@@ -6,7 +8,14 @@ function fmtDuration(ms: number): string {
   return `${(ms / 3_600_000).toFixed(1)}h`;
 }
 
-export async function workersCommand(): Promise<void> {
+export async function workersCommand(args: string[]): Promise<void> {
+  // Handle 'pa worker pin <name>' subcommand
+  if (args.length >= 2 && args[0] === 'pin') {
+    const workerName = args[1];
+    return workerPinCommand(workerName);
+  }
+
+  // Handle 'pa worker' (status)
   console.log('Checking workers...\n');
   const workers = await getAvailableWorkers();
 
@@ -38,4 +47,29 @@ export async function workersCommand(): Promise<void> {
       `${w.name.padEnd(nameWidth)}  ${w.command.padEnd(cmdWidth)}  ${String(w.priority).padEnd(8)}  [${icon}] ${status}`
     );
   }
+}
+
+/**
+ * Set a worker as the preferred first choice via config.yaml.
+ * Usage: pa worker pin <name>
+ */
+async function workerPinCommand(workerName: string): Promise<void> {
+  const path = configPath();
+  const raw = await readFile(path, 'utf8');
+
+  // Remove existing worker_pin line if present
+  const updated = raw
+    .split('\n')
+    .filter(line => !line.trim().startsWith('worker_pin:'))
+    .join('\n');
+
+  // Add new worker_pin line
+  const pinLine = `worker_pin: "${workerName}"`;
+  const withNewPin = updated.includes('\nworkers:')
+    ? updated.replace(/(\nworkers:)/, `$1\n  ${pinLine}`)
+    : updated + `\n${pinLine}`;
+
+  await writeFile(path, withNewPin.trim() + '\n', 'utf8');
+  console.log(`Worker pinned: ${workerName} will be tried first in all dispatches.`);
+  console.log(`Edit ${path} to remove the 'worker_pin:' line and restore default ordering.`);
 }

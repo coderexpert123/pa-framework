@@ -446,9 +446,10 @@ export async function editMessageText(
 export async function pinChatMessage(
   token: string,
   chatId: number,
-  messageId: number
+  messageId: number,
+  disableNotification: boolean = true
 ): Promise<boolean> {
-  const body = JSON.stringify({ chat_id: chatId, message_id: messageId, disable_notification: true });
+  const body = JSON.stringify({ chat_id: chatId, message_id: messageId, disable_notification: disableNotification });
   const opts = { method: 'POST' as const, headers: { 'Content-Type': 'application/json' }, body };
 
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -638,6 +639,105 @@ export async function deleteMessage(token: string, chatId: number, messageId: nu
     return res.ok;
   } catch (err) {
     logger.warn('telegram', `deleteMessage error: ${(err as Error).message}`);
+    return false;
+  }
+}
+
+/**
+ * Inline keyboard button types for HITL approve/reject/diff interactions
+ */
+export interface InlineKeyboardButton {
+  text: string;
+  callback_data: string;
+}
+
+export interface InlineKeyboardRow {
+  inline_keyboard: InlineKeyboardButton[];
+}
+
+export interface InlineKeyboardMarkup {
+  inline_keyboard: InlineKeyboardButton[][];
+}
+
+/**
+ * Send a message with inline keyboard markup for HITL interactions.
+ * Used for self-improver risk-flagged alerts with approve/reject/diff buttons.
+ */
+export async function sendMessageWithKeyboard(
+  token: string,
+  chatId: number,
+  text: string,
+  keyboard: InlineKeyboardMarkup,
+  replyToMessageId?: number,
+  threadId?: number
+): Promise<boolean> {
+  const trimmed = text.trim();
+  if (!trimmed) return true;
+
+  const chunks = splitMessage(trimmed);
+  let allDelivered = true;
+
+  for (const chunk of chunks) {
+    const body: Record<string, unknown> = {
+      chat_id: chatId,
+      text: sanitizeMdV2(chunk),
+      parse_mode: 'MarkdownV2',
+      reply_markup: keyboard,
+    };
+    if (threadId !== undefined && threadId !== null && threadId !== 0) body.message_thread_id = threadId;
+    if (replyToMessageId) {
+      body.reply_to_message_id = replyToMessageId;
+      replyToMessageId = undefined; // Only reply on the first chunk
+    }
+
+    try {
+      const res = await telegramFetch(`${BASE}/bot${token}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (!res.ok) {
+        const errorText = await safeResponseText(res);
+        console.error(`sendMessageWithKeyboard failed: ${res.status} ${errorText}`);
+        allDelivered = false;
+      }
+    } catch (err) {
+      console.error('sendMessageWithKeyboard network error:', err);
+      allDelivered = false;
+    }
+  }
+
+  return allDelivered;
+}
+
+/**
+ * Answer a callback query from an inline keyboard button press.
+ * Optionally shows a toast notification to the user.
+ */
+export async function answerCallbackQuery(
+  token: string,
+  callbackQueryId: string,
+  text?: string,
+  showAlert: boolean = false
+): Promise<boolean> {
+  try {
+    const body: Record<string, unknown> = {
+      callback_query_id: callbackQueryId,
+    };
+    if (text) {
+      body.text = text;
+      body.show_alert = showAlert;
+    }
+    const res = await telegramFetch(`${BASE}/bot${token}/answerCallbackQuery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(10_000),
+    });
+    return res.ok;
+  } catch (err) {
+    logger.warn('telegram', `answerCallbackQuery error: ${(err as Error).message}`);
     return false;
   }
 }

@@ -9,9 +9,12 @@ import {
   resolveConfirmation,
   resolvePendingDescription,
   buildWorkerResponse,
+  AGENT_SWITCH_PATTERN,
   MODEL_SWITCH_PATTERN,
   handleModelSwitch,
+  getAgentSwitchTarget,
   getModelSwitchTarget,
+  isKnownAgentName,
   expirePreferredWorker,
   DEFAULT_SWITCH_PATTERN,
   handleDefaultQuery,
@@ -24,7 +27,11 @@ import {
   clearTopicContext,
   handleNewCommand,
   handleResetCommand,
+  handleHelpCommand,
   NEW_PATTERN,
+  STATUS_PATTERN,
+  SKILLS_PATTERN,
+  HELP_PATTERN,
   AUTH_PATTERN,
   BRANCH_PATTERN,
   CHILD_OF_PATTERN,
@@ -40,6 +47,12 @@ import {
   RETRANSCRIBE_PATTERN,
   handleRetranscribeCommand,
   describeForwardOrigin,
+  handleHealthCommand,
+  handleRefCommand,
+  handleClaimsCommand,
+  HEALTH_PATTERN,
+  REF_PATTERN,
+  CLAIMS_PATTERN,
   COMMIT_PATTERN,
   COMMIT_AND_PUSH_PATTERN,
   PUSH_PATTERN,
@@ -763,6 +776,39 @@ describe('buildWorkerResponse', () => {
     assert.equal(r, 'Yes, the timing of her UTIs starting only after the IUI is medically logical.');
   });
 
+  // --- agy plain "I will" planning statement stripping (2026-08-20 fix) ---
+
+  it('agy: strips plain "I will" planning statements from start of output', () => {
+    const output = 'I will view the new temporary prompt file.\nI will add the contact.\nI will run a python execution.\nActual response here.';
+    const r = buildWorkerResponse({ success: true, output }, 'agy');
+    assert.equal(r, 'Actual response here.');
+  });
+
+  it('agy: strips consecutive "I\'ll" planning statements', () => {
+    const output = 'I\'ll check the ecosystem knowledge base.\nI\'ll search for contacts.\nI\'ll run python command.\nResult: Found it.';
+    const r = buildWorkerResponse({ success: true, output }, 'agy');
+    assert.equal(r, 'Result: Found it.');
+  });
+
+  it('agy: strips mixed "I will/I\'ve/I\'m" planning statements', () => {
+    const output = 'I will view the prompt file.\nI\'ve checked the sources.\nI\'m parsing the data.\nFinal output.';
+    const r = buildWorkerResponse({ success: true, output }, 'agy');
+    assert.equal(r, 'Final output.');
+  });
+
+  it('agy: does not strip legitimate "I will" in mid-sentence or non-planning context', () => {
+    const output = 'The patient asked what I will do next. I explained the procedure.';
+    const r = buildWorkerResponse({ success: true, output }, 'agy');
+    assert.equal(r, 'The patient asked what I will do next. I explained the procedure.');
+  });
+
+  it('agy: strips exact leaked output from s-52fa4bcb75c0', () => {
+    const output = 'I will view the new temporary prompt file.\nI will add the contact for Sculptor\'s Dental Clinic to the registry.\nI will run a python execution to pass the polished draft to the link builder script and get the final `wa.me` link.\nI will re-run the link builder without double-escaped quotes to ensure the output URL contains the correct spelling of "couldn\'t" and "they\'ll".\nThe saliography couldn\'t succeed, especially on the right side because there was some obstruction.';
+    const r = buildWorkerResponse({ success: true, output }, 'agy');
+    assert.ok(r.startsWith('The saliography couldn\'t succeed'), 'Planning statements removed, actual content preserved');
+    assert.ok(!r.includes('I will'), 'No "I will" planning statements remain');
+  });
+
   // --- Claude noise prefix stripping (claude worker) ---
 
   it('claude: removes "Planning..." noise from the start', () => {
@@ -820,36 +866,42 @@ describe('AUTH_PATTERN', () => {
   });
 });
 
-describe('MODEL_SWITCH_PATTERN', () => {
-  it('matches /model claude', () => assert.ok(MODEL_SWITCH_PATTERN.test('/model claude')));
-  it('matches /model zclaude', () => assert.ok(MODEL_SWITCH_PATTERN.test('/model zclaude')));
-  it('matches /model codex', () => assert.ok(MODEL_SWITCH_PATTERN.test('/model codex')));
-  it('matches /model agy', () => assert.ok(MODEL_SWITCH_PATTERN.test('/model agy')));
-  it('matches /models claude (plural)', () => assert.ok(MODEL_SWITCH_PATTERN.test('/models claude')));
-  it('matches /models zclaude (plural)', () => assert.ok(MODEL_SWITCH_PATTERN.test('/models zclaude')));
-  it('matches /models codex (plural)', () => assert.ok(MODEL_SWITCH_PATTERN.test('/models codex')));
-  it('matches /models agy (plural)', () => assert.ok(MODEL_SWITCH_PATTERN.test('/models agy')));
+describe('AGENT_SWITCH_PATTERN and MODEL_SWITCH_PATTERN', () => {
+  it('matches /agent claude', () => assert.ok(AGENT_SWITCH_PATTERN.test('/agent claude')));
+  it('matches /agent zclaude', () => assert.ok(AGENT_SWITCH_PATTERN.test('/agent zclaude')));
+  it('matches /agent codex', () => assert.ok(AGENT_SWITCH_PATTERN.test('/agent codex')));
+  it('matches /agent agy', () => assert.ok(AGENT_SWITCH_PATTERN.test('/agent agy')));
+  it('matches /agents claude (plural)', () => assert.ok(AGENT_SWITCH_PATTERN.test('/agents claude')));
+  it('matches /model claude (legacy alias)', () => assert.ok(MODEL_SWITCH_PATTERN.test('/model claude')));
   it('matches case-insensitively', () => {
-    assert.ok(MODEL_SWITCH_PATTERN.test('/model Claude'));
-    assert.ok(MODEL_SWITCH_PATTERN.test('/model ZCLAUDE'));
-    assert.ok(MODEL_SWITCH_PATTERN.test('/model CODEX'));
-    assert.ok(MODEL_SWITCH_PATTERN.test('/model AGY'));
+    assert.ok(AGENT_SWITCH_PATTERN.test('/agent Claude'));
+    assert.ok(AGENT_SWITCH_PATTERN.test('/agent ZCLAUDE'));
+    assert.ok(AGENT_SWITCH_PATTERN.test('/agent CODEX'));
+    assert.ok(AGENT_SWITCH_PATTERN.test('/agent AGY'));
   });
-  it('does not match /model unknown-worker', () => assert.ok(!MODEL_SWITCH_PATTERN.test('/model gpt4')));
-  it('does not match plain text', () => assert.ok(!MODEL_SWITCH_PATTERN.test('use claude please')));
-  it('does not match /model with no argument', () => assert.ok(!MODEL_SWITCH_PATTERN.test('/model')));
+  it('does not match /agent unknown-worker', () => assert.ok(!AGENT_SWITCH_PATTERN.test('/agent gpt4')));
+  it('does not match plain text', () => assert.ok(!AGENT_SWITCH_PATTERN.test('use claude please')));
 });
 
 // ---------------------------------------------------------------------------
-// getModelSwitchTarget
+// getAgentSwitchTarget & getModelSwitchTarget
 // ---------------------------------------------------------------------------
 
-describe('getModelSwitchTarget', () => {
-  it('returns the normalized worker name for /model', () => {
-    assert.equal(getModelSwitchTarget('/model ZCLAUDE'), 'zclaude');
+describe('getAgentSwitchTarget & getModelSwitchTarget', () => {
+  it('returns normalized agent name for /agent', () => {
+    assert.deepEqual(getAgentSwitchTarget('/agent ZCLAUDE'), { target: 'zclaude', isLegacy: false });
+  });
+
+  it('returns normalized agent name with isLegacy for /model <agent>', () => {
+    assert.deepEqual(getAgentSwitchTarget('/model AGY'), { target: 'agy', isLegacy: true });
+  });
+
+  it('returns undefined for non-agent model tunable like /model gemini-3.7-flash-high', () => {
+    assert.equal(getAgentSwitchTarget('/model gemini-3.7-flash-high'), undefined);
   });
 
   it('returns undefined for unrelated text', () => {
+    assert.equal(getAgentSwitchTarget('hello'), undefined);
     assert.equal(getModelSwitchTarget('hello'), undefined);
   });
 });
@@ -867,32 +919,41 @@ describe('handleModelSwitch', () => {
     assert.equal(state.preferred_worker, undefined);
   });
 
-  it('sets preferred_worker to agy on /model agy', () => {
+  it('sets preferred_worker to agy on /agent agy', () => {
     const state = makeState();
-    const result = handleModelSwitch(state, '/model agy');
+    const result = handleModelSwitch(state, '/agent agy');
     assert.equal(result.switched, true);
     assert.equal(state.preferred_worker, 'agy');
     assert.ok(state.preferred_worker_set_at, 'preferred_worker_set_at should be set');
     assert.ok(result.response.includes('until midnight IST'), 'response should mention expiry');
+    assert.ok(result.response.includes('Switched agent to *agy*'));
   });
 
-  it('sets preferred_worker to claude on /model claude', () => {
+  it('sets preferred_worker to claude on legacy /model claude with tip', () => {
     const state = makeState();
     const result = handleModelSwitch(state, '/model claude');
     assert.equal(result.switched, true);
     assert.equal(state.preferred_worker, 'claude');
+    assert.ok(result.response.includes('use /agent <name>'));
   });
 
-  it('sets preferred_worker to zclaude on /model zclaude', () => {
+  it('sets preferred_worker to zclaude on /agent zclaude', () => {
     const state = makeState();
-    const result = handleModelSwitch(state, '/model zclaude');
+    const result = handleModelSwitch(state, '/agent zclaude');
     assert.equal(result.switched, true);
     assert.equal(state.preferred_worker, 'zclaude');
   });
 
+  it('sets preferred_worker to agyc on /agent agyc', () => {
+    const state = makeState();
+    const result = handleModelSwitch(state, '/agent agyc');
+    assert.equal(result.switched, true);
+    assert.equal(state.preferred_worker, 'agyc');
+  });
+
   it('normalises to lowercase regardless of input case', () => {
     const state = makeState();
-    handleModelSwitch(state, '/model Claude');
+    handleModelSwitch(state, '/agent Claude');
     assert.equal(state.preferred_worker, 'claude');
   });
 
@@ -2197,17 +2258,26 @@ describe('handleBranchCommand', () => {
     assert.equal(r.matched, false);
   });
 
-  it('returns error for invalid branch name with spaces', () => {
-    const r = handleBranchCommand(makeState(), '/branch invalid name');
+  it('returns error for invalid branch name with invalid characters', () => {
+    const r = handleBranchCommand(makeState(), '/branch invalid@name');
     assert.equal(r.matched, true);
     assert.ok(r.response.includes('1–50'));
     assert.equal(r.branchName, undefined);
   });
 
-  it('returns matched:true with branchName for valid name', () => {
+  it('returns matched:true with branchName for valid name without prompt', () => {
     const r = handleBranchCommand(makeState(), '/branch api-refactor');
     assert.equal(r.matched, true);
     assert.equal(r.branchName, 'api-refactor');
+    assert.equal(r.prompt, undefined);
+    assert.equal(r.response, '');
+  });
+
+  it('returns matched:true with branchName and prompt when prompt is provided', () => {
+    const r = handleBranchCommand(makeState(), '/branch api-refactor refactor auth routes to use jwt');
+    assert.equal(r.matched, true);
+    assert.equal(r.branchName, 'api-refactor');
+    assert.equal(r.prompt, 'refactor auth routes to use jwt');
     assert.equal(r.response, '');
   });
 
@@ -2341,8 +2411,8 @@ describe('renderStatusCard', () => {
       }),
       keepAwake: { active: true, since: '2026-04-21T07:26:00.000Z' }
     });
-    assert.ok(card.includes('Default: zclaude'));
-    assert.ok(card.includes('Current: agy'));
+    assert.ok(card.includes('Default: zclaude (glm-5.3)'));
+    assert.ok(card.includes('Current: agy (gemini-3.7-flash-high)'));
     assert.ok(card.includes('Reason: Temporary user override until IST midnight.'));
     assert.ok(card.includes('Keep-awake: on since 2026-04-21T07:26:00.000Z'));
   });
@@ -2355,8 +2425,83 @@ describe('renderStatusCard', () => {
       }),
       keepAwake: { active: false }
     });
-    assert.ok(card.includes('Current: claude'));
+    assert.ok(card.includes('Default: claude (opusplan)'));
+    assert.ok(card.includes('Current: claude (opusplan)'));
     assert.ok(card.includes('Keep-awake: off'));
+  });
+
+  it('formats card with LLM when current_llm and default_llm are present', () => {
+    const card = renderStatusCard({
+      snapshot: buildModelStatusSnapshot({
+        currentWorker: 'agy',
+        defaultWorker: 'claude',
+        reasonCode: 'default_active',
+        currentLlm: 'gemini-3.7-flash-high',
+        defaultLlm: 'opusplan',
+      }),
+      keepAwake: { active: false }
+    });
+    assert.ok(card.includes('Default: claude (opusplan)'));
+    assert.ok(card.includes('Current: agy (gemini-3.7-flash-high)'));
+  });
+
+  it('hydrateModelStatus resolves LLM from workerConfig tunables and session/topic overrides', () => {
+    const workers = [
+      {
+        name: 'agy',
+        command: 'agy',
+        args: ['--dangerously-skip-permissions', '--model', 'gemini-3.7-flash-high'],
+        check: 'echo ok',
+        rate_limit_patterns: [],
+        priority: 1,
+        tunables: { model: { args: ['--model', '{value}'] } },
+      },
+      {
+        name: 'claude',
+        command: 'claude',
+        args: ['-p'],
+        check: 'echo ok',
+        rate_limit_patterns: [],
+        priority: 2,
+        tunables: { model: { args: ['--model', '{value}'], default: 'opusplan' } },
+      }
+    ];
+
+    const state = makeState();
+    // Default resolution from pinned static args
+    const snapAgy = hydrateModelStatus(state, 'agy', workers);
+    assert.equal(snapAgy.current_llm, 'gemini-3.7-flash-high');
+    assert.equal(snapAgy.default_llm, 'gemini-3.7-flash-high');
+
+    // Default resolution from worker default tunable
+    const snapClaude = hydrateModelStatus(state, 'claude', workers);
+    assert.equal(snapClaude.current_llm, 'opusplan');
+    assert.equal(snapClaude.default_llm, 'opusplan');
+
+    // Resolution with session override
+    state.tunable_overrides = { agy: { model: 'gemini-3.6-flash-high' } };
+    const snapOverride = hydrateModelStatus(state, 'agy', workers);
+    assert.equal(snapOverride.current_llm, 'gemini-3.6-flash-high');
+    assert.equal(snapOverride.default_llm, 'gemini-3.7-flash-high');
+  });
+
+  it('modelStatusNeedsRefresh detects changes in current_llm and default_llm', () => {
+    const snap1 = buildModelStatusSnapshot({
+      currentWorker: 'agy',
+      defaultWorker: 'agy',
+      reasonCode: 'default_active',
+      currentLlm: 'gemini-3.7-flash-high',
+      defaultLlm: 'gemini-3.7-flash-high',
+    });
+    const snap2 = buildModelStatusSnapshot({
+      currentWorker: 'agy',
+      defaultWorker: 'agy',
+      reasonCode: 'default_active',
+      currentLlm: 'gemini-3.6-flash-high',
+      defaultLlm: 'gemini-3.7-flash-high',
+    });
+    assert.equal(modelStatusNeedsRefresh(snap1, snap2), true);
+    assert.equal(modelStatusNeedsRefresh(snap1, snap1), false);
   });
 });
 
@@ -2585,3 +2730,125 @@ describe('describeForwardOrigin', () => {
     assert.equal(describeForwardOrigin({ forward_origin: { type: 'something_new' } }), undefined);
   });
 });
+
+// ---------------------------------------------------------------------------
+// HEALTH_PATTERN, handleHealthCommand
+// ---------------------------------------------------------------------------
+
+describe('HEALTH_PATTERN', () => {
+  it('matches /health', () => assert.ok(HEALTH_PATTERN.test('/health')));
+  it('matches /health@botname', () => assert.ok(HEALTH_PATTERN.test('/health@mybot')));
+  it('rejects /health with extra args', () => assert.ok(!HEALTH_PATTERN.test('/health extra')));
+  it('rejects unrelated text', () => assert.ok(!HEALTH_PATTERN.test('health check')));
+});
+
+describe('handleHealthCommand', () => {
+  it('returns matched:true for /health', () => {
+    const result = handleHealthCommand();
+    assert.ok(result.matched);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// REF_PATTERN, handleRefCommand
+// ---------------------------------------------------------------------------
+
+describe('REF_PATTERN', () => {
+  it('matches /ref s-abc123', () => assert.ok(REF_PATTERN.test('/ref s-abc123')));
+  it('matches /ref@botname s-abc123', () => assert.ok(REF_PATTERN.test('/ref@botname s-abc123')));
+  it('extracts ref ID from /ref s-abc123', () => {
+    const match = REF_PATTERN.exec('/ref s-abc123def');
+    assert.equal(match![1], 's-abc123def');
+  });
+  it('rejects bare /ref', () => assert.ok(!REF_PATTERN.test('/ref')));
+  it('rejects unrelated text', () => assert.ok(!REF_PATTERN.test('reference check')));
+});
+
+describe('handleRefCommand', () => {
+  it('returns matched:false for unrelated text', () => {
+    const result = handleRefCommand('hello there');
+    assert.equal(result.matched, false);
+  });
+
+  it('matches /ref s-abc123 and extracts refId', () => {
+    const result = handleRefCommand('/ref s-abc123def');
+    assert.ok(result.matched);
+    assert.equal(result.refId, 's-abc123def');
+  });
+
+  it('matches /ref@botname s-xyz789 and extracts refId', () => {
+    const result = handleRefCommand('/ref@mybot s-xyz789');
+    assert.ok(result.matched);
+    assert.equal(result.refId, 's-xyz789');
+  });
+
+  it('returns matched:false for bare /ref', () => {
+    const result = handleRefCommand('/ref');
+    assert.equal(result.matched, false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CLAIMS_PATTERN, handleClaimsCommand
+// ---------------------------------------------------------------------------
+
+describe('CLAIMS_PATTERN', () => {
+  it('matches /claims', () => assert.ok(CLAIMS_PATTERN.test('/claims')));
+  it('matches /claims@botname', () => assert.ok(CLAIMS_PATTERN.test('/claims@mybot')));
+  it('rejects /claims with extra args', () => assert.ok(!CLAIMS_PATTERN.test('/claims extra')));
+  it('rejects unrelated text', () => assert.ok(!CLAIMS_PATTERN.test('claims list')));
+});
+
+describe('handleClaimsCommand', () => {
+  it('returns matched:true for /claims', () => {
+    const result = handleClaimsCommand();
+    assert.ok(result.matched);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// STATUS_PATTERN
+// ---------------------------------------------------------------------------
+
+describe('STATUS_PATTERN', () => {
+  it('matches /status', () => assert.ok(STATUS_PATTERN.test('/status')));
+  it('matches /status@botname', () => assert.ok(STATUS_PATTERN.test('/status@mybot')));
+  it('rejects /status with extra args', () => assert.ok(!STATUS_PATTERN.test('/status extra')));
+  it('rejects unrelated text', () => assert.ok(!STATUS_PATTERN.test('status check')));
+});
+
+// ---------------------------------------------------------------------------
+// SKILLS_PATTERN
+// ---------------------------------------------------------------------------
+
+describe('SKILLS_PATTERN', () => {
+  it('matches /skills', () => assert.ok(SKILLS_PATTERN.test('/skills')));
+  it('matches /skills@botname', () => assert.ok(SKILLS_PATTERN.test('/skills@mybot')));
+  it('rejects /skills with extra args', () => assert.ok(!SKILLS_PATTERN.test('/skills extra')));
+  it('rejects unrelated text', () => assert.ok(!SKILLS_PATTERN.test('list skills')));
+});
+
+// ---------------------------------------------------------------------------
+// HELP_PATTERN, handleHelpCommand
+// ---------------------------------------------------------------------------
+
+describe('HELP_PATTERN', () => {
+  it('matches /help', () => assert.ok(HELP_PATTERN.test('/help')));
+  it('matches /help@botname', () => assert.ok(HELP_PATTERN.test('/help@mybot')));
+  it('rejects /help with extra args', () => assert.ok(!HELP_PATTERN.test('/help extra')));
+  it('rejects unrelated text', () => assert.ok(!HELP_PATTERN.test('help me')));
+});
+
+describe('handleHelpCommand', () => {
+  it('returns matched:true and formatted response with available commands', () => {
+    const result = handleHelpCommand();
+    assert.ok(result.matched);
+    assert.ok(result.response.includes('*Available Commands*'));
+    assert.ok(result.response.includes('/new'));
+    assert.ok(result.response.includes('/code'));
+    assert.ok(result.response.includes('/help'));
+    assert.ok(result.response.includes('/status'));
+    assert.ok(result.response.includes('/skills'));
+  });
+});
+

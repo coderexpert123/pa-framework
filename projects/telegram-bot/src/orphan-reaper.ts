@@ -20,16 +20,21 @@
  * the honest death notice.
  */
 import { readFile, stat } from 'fs/promises';
-import { sendMessage, sendTyping } from './telegram.js';
-import { getPriorSessionPath } from './session.js';
-import { parseMetadata } from './logic.js';
+import { sendMessage, sendTyping, editMessageText } from './telegram.js';
+import { getPriorSessionPath, buildResumeArgs } from './session.js';
+import { parseMetadata, buildModelStatusSnapshot, renderStatusCard, resolveWorkerLlm, selectWorkerTunables } from './logic.js';
+import type { ModelStatusReasonCode } from './types.js';
 import { loadTopicState, saveTopicState, addTurn } from './conversation.js';
 import { deliveredKey, wasDelivered, markDelivered } from './delivered-store.js';
 import { listPendingDispatches, removePendingDispatch, pendingDispatchKey, type PendingDispatch } from './pending-dispatches.js';
 import { makeRefId } from './ref-id.js';
 import { markTopicRecovering, clearTopicRecovering } from './recovery-gate.js';
 import { listWorkerPids, isProcessAlive } from '../../../pa/dist/src/worker-pids.js';
+import { getDescendantPids } from '../../../pa/dist/src/process-tree.js';
+import { executeWorker } from '../../../pa/dist/src/worker-exec.js';
+import { loadConfig } from '../../../pa/dist/src/config.js';
 import { logger } from '../../../pa/dist/src/lib/log.js';
+import { getKeepAwakeStatus } from './keepawake.js';
 
 const CLAUDE_FAMILY = new Set(['claude', 'zclaude']);
 
@@ -39,6 +44,9 @@ export const TRANSCRIPT_QUIESCENT_MS = 90_000;
 export const REAP_MAX_WAIT_MS = 45 * 60 * 1000;
 export const REAP_POLL_MS = 20_000;
 export const TYPING_REFRESH_MS = 4_000;
+/** Same value as main.ts's ORPHAN_HARVEST_WINDOW_MS — protects the
+ * re-dispatched worker from the per-minute orphan sweep. */
+const REDISPATCH_HARVEST_MS = 50 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // Pure transcript parsing
@@ -142,6 +150,19 @@ export interface ReaperDeps {
   /** Optional: read file contents for tee recovery (mocked in tests). If omitted,
    * uses the real fs.readFile. */
   readFile?: (path: string, encoding: 'utf8') => Promise<string>;
+  /** Check the best recovery source (tee file or transcript) for a
+   * completed result. Returns the raw result text, or null if nothing
+   * is available yet. */
+  checkRecoverySource?: (record: PendingDispatch) => Promise<string | null>;
+  /** Capture the session ID from a recovery result into the topic state,
+   * so the next normal dispatch resumes the conversation. */
+  captureSession?: (record: PendingDispatch, resultText: string) => Promise<void>;
+  /** Update the pinned status card to show recovery status. */
+  updatePinnedCard?: (record: PendingDispatch, opts: { reasonCode: string }) => Promise<void>;
+  /** Re-dispatch with native conversation resume when the original
+   * worker died without producing a result. Returns the raw output
+   * or null. Injected for testing; default calls the real function. */
+  redispatchWithResume?: (record: PendingDispatch) => Promise<string | null>;
 }
 
 function defaultReadTranscript(record: PendingDispatch): Promise<{ content: string; mtimeMs: number } | null> {
@@ -171,9 +192,22 @@ export async function isTopicWorkerAliveByRegistry(record: PendingDispatch): Pro
   const resource = `topic-${record.chatId}_${record.threadId}`;
   try {
     const entries = await listWorkerPids();
-    return entries.some((e) =>
-      e.skill === resource && (isProcessAlive(e.pid) || (e.descendants ?? []).some((d) => isProcessAlive(d)))
-    );
+    // for...of instead of .some() — the descendants-gap fallback below needs await
+    for (const e of entries) {
+      if (e.skill !== resource) continue;
+      // Direct PID check or descendants check
+      if (isProcessAlive(e.pid) || (e.descendants ?? []).some((d) => isProcessAlive(d))) return true;
+      // Descendants-list gap fix (30-second heartbeat): the worker was
+      // dispatched recently but the heartbeat hasn't fired yet, so the
+      // descendants list is empty. Do a direct process-tree scan.
+      if (!e.descendants || e.descendants.length === 0) {
+        try {
+          const desc = await getDescendantPids(e.pid);
+          if (desc.some((d: { pid: number }) => isProcessAlive(d.pid))) return true;
+        } catch { /* process-tree scan failed — fall through */ }
+      }
+    }
+    return false;
   } catch {
     return false;
   }
@@ -202,7 +236,7 @@ export async function findTeePathByRegistry(record: PendingDispatch): Promise<st
   return null;
 }
 
-export function makeDefaultDeps(token: string): ReaperDeps {
+export function makeDefaultDeps(token: string, secrets?: Record<string, string>): ReaperDeps {
   return {
     send: async (record, text) => {
       const refId = makeRefId();
@@ -237,6 +271,77 @@ export function makeDefaultDeps(token: string): ReaperDeps {
     readFile: readFile,
     now: () => Date.now(),
     sendTyping: (record) => sendTyping(token, record.chatId, record.threadId),
+    checkRecoverySource: async (record) => {
+      // Tee file (from pending dispatch, takes priority over transcript)
+      if (record.teePath) {
+        try {
+          const raw = await readFile(record.teePath, 'utf8');
+          const extracted = extractTeeResult(raw);
+          if (extracted) return extracted;
+        } catch {}
+      }
+      // Transcript (claude-family)
+      if (record.session && CLAUDE_FAMILY.has(record.session.worker)) {
+        const path = getPriorSessionPath(record.session.worker, record.session.session_id, record.cwd);
+        if (!path) return null;
+        try {
+          const [content, s] = await Promise.all([readFile(path, 'utf8'), stat(path)]);
+          const final = extractFinalAssistantText(content, record.startedAt);
+          if (final && Date.now() - s.mtimeMs >= TRANSCRIPT_QUIESCENT_MS) {
+            return final.text;
+          }
+        } catch {}
+      }
+      return null;
+    },
+    captureSession: async (record, resultText) => {
+      const session = record.session;
+      if (!session) return;
+      try {
+        const topicState = await loadTopicState(record.chatId, record.threadId);
+        topicState.session = { ...session, started_at: new Date().toISOString() };
+        await saveTopicState(topicState);
+        logger.info('reaper', 'captured session after recovery', {
+          session_id: session.session_id,
+          worker: session.worker,
+          chatId: record.chatId,
+          threadId: record.threadId,
+        });
+      } catch (err) {
+        logger.warn('reaper', 'failed to capture session after recovery', { error: String(err) });
+      }
+    },
+    updatePinnedCard: async (record, opts) => {
+      try {
+        const topicState = await loadTopicState(record.chatId, record.threadId);
+        const worker = topicState.preferred_worker || 'default';
+        const currentWorker = opts?.reasonCode === 'recovery-resume' ? (record.session?.worker ?? worker) : worker;
+        const config = await loadConfig().catch(() => ({ workers: [] }));
+        const workerConfig = (config as any)?.workers?.find((w: any) => w.name === currentWorker);
+        const currentLlm = workerConfig
+          ? resolveWorkerLlm(workerConfig, selectWorkerTunables(topicState.tunable_overrides, currentWorker), selectWorkerTunables(topicState.tunable_defaults, currentWorker))
+          : undefined;
+        // Build a recovery snapshot — pinned card shows "Recovering..." while waiting
+        const snapshot = buildModelStatusSnapshot({
+          defaultWorker: worker,
+          currentWorker,
+          currentLlm,
+          reasonCode: (opts?.reasonCode ?? 'recovery') as any,
+          reasonText: 'Bot restarted mid-request — recovering reply',
+        });
+        topicState.model_status = snapshot;
+        if (topicState.pinned_status_message_id) {
+          const pinText = renderStatusCard({ snapshot, keepAwake: getKeepAwakeStatus() });
+          await editMessageText(token, record.chatId, topicState.pinned_status_message_id, pinText).catch(() => false);
+        } else {
+          // No pinned message — skip
+        }
+        await saveTopicState(topicState);
+      } catch (err) {
+        logger.warn('reaper', 'failed to update pinned card', { error: String(err) });
+      }
+    },
+    redispatchWithResume: (record) => redispatchWithResume(record, token, secrets ?? Object.fromEntries(Object.entries(process.env).filter(([k,v]) => v !== undefined)) as Record<string, string>),
   };
 }
 
@@ -263,84 +368,197 @@ async function finish(record: PendingDispatch, outcome: 'recovered' | 'dead'): P
   logger.info('reaper', `pending dispatch ${outcome}`, { updateId: record.updateId, chatId: record.chatId, threadId: record.threadId });
 }
 
+/**
+ * Re-dispatch a pending request with native conversation resume.
+ * Called when the worker is dead, no result was recoverable from the tee
+ * file or transcript, but a session ID exists. Spawns a new worker with
+ * resume args and the original user text, returning the raw output.
+ *
+ * Returns the output string, or null if re-dispatch is not possible
+ * (no session, no worker config, execution failed).
+ */
+export async function redispatchWithResume(
+  record: PendingDispatch,
+  token: string,
+  secrets: Record<string, string>,
+): Promise<string | null> {
+  const session = record.session;
+  if (!session || !session.session_id) return null;
+  try {
+    const config = await loadConfig();
+    const workers = config.workers ?? [];
+    const workerConfig = workers.find((w: any) => w.name === session.worker);
+    if (!workerConfig) return null;
+
+    const resource = `topic-${record.chatId}_${record.threadId}`;
+    const resumeArgs = buildResumeArgs(session);
+    const prompt = record.userText;
+
+    // Build a minimal prompt — just the user text. Native resume picks up
+    // conversation context from the worker's own session history.
+    const result = await executeWorker(
+      workerConfig,
+      prompt,
+      {
+        cwd: record.cwd || process.env.PA_BOT_CWD || process.cwd(),
+        env: { ...process.env, ...secrets, PA_BOT_PID: String(process.pid) },
+        extraArgs: undefined, // No tunables for recovery re-dispatch
+        resource,
+        agentName: session.worker,
+        harvestWindowMs: REDISPATCH_HARVEST_MS,
+      },
+    );
+
+    if (result.success && result.output.trim()) {
+      return result.output;
+    }
+    return null;
+  } catch (err) {
+    logger.warn('reaper', 're-dispatch with resume failed', {
+      error: String(err),
+      session_id: session.session_id,
+      worker: session.worker,
+    });
+    return null;
+  }
+}
+
 export async function evaluatePendingDispatch(
   record: PendingDispatch,
   deps: ReaperDeps,
   deadlineMs: number,
 ): Promise<ReapOutcome> {
+  // Step 0: Already delivered?
   const key = deliveredKey(record.chatId, record.threadId, record.updateId);
   if (await wasDelivered(key)) {
     await removePendingDispatch(pendingDispatchKey(record.chatId, record.threadId, record.updateId));
     return 'already-delivered';
   }
 
-  const session = record.session;
-  const recoverable = !!session && CLAUDE_FAMILY.has(session.worker);
   const expired = deps.now() >= deadlineMs;
 
-  if (recoverable) {
-    const transcript = await deps.readTranscript(record);
-    const final = transcript ? extractFinalAssistantText(transcript.content, record.startedAt) : null;
-    const workerAlive = await deps.isTopicWorkerAlive(record);
-    const quiescent = transcript ? deps.now() - transcript.mtimeMs >= TRANSCRIPT_QUIESCENT_MS : false;
+  // Step 1: Worker alive? (ALWAYS first, for ALL records)
+  // The 30-second heartbeat gap means a newly-dispatched worker's
+  // descendants list may be empty, so `isTopicWorkerAliveByRegistry`
+  // can false-negative. The deps implementation adds a direct
+  // process-tree scan fallback for that window.
+  const workerAlive = await deps.isTopicWorkerAlive(record);
 
-    if (final && !workerAlive && (quiescent || expired)) {
-      const { cleaned } = parseMetadata(final.text); // strip [PA_META] — never execute actions from a harvested reply
-      const body = cleaned.trim() || final.text.trim();
-      const sent = await deps.send(record, `♻️ *Recovered reply* (the bot restarted mid-request; the worker finished on its own):\n\n${body}`);
+  if (workerAlive && !expired) {
+    // Worker still running. Check recovery sources for completion.
+    const sourceResult = await deps.checkRecoverySource?.(record) ?? null;
+    if (sourceResult !== null) {
+      // Worker finished producing output while we were checking.
+      // Deliver the harvested reply.
+      const { cleaned } = parseMetadata(sourceResult);
+      const body = cleaned.trim() || sourceResult.trim();
+      const sent = await deps.send(record,
+        `♻️ *Recovered reply* (the bot restarted mid-request; the worker finished on its own):\n\n${body}`);
       if (sent) {
+        await deps.captureSession?.(record, sourceResult);
+        await deps.updatePinnedCard?.(record, { reasonCode: 'recovery-worker-alive' });
         await finish(record, 'recovered');
         return 'recovered';
       }
-      return 'waiting'; // send failed — retry next poll until deadline
+      return 'waiting'; // send failed — retry next poll
     }
-    if (!expired && (workerAlive || !quiescent || !final)) return 'waiting';
-    // Deadline passed with nothing recoverable → fall through to the death notice.
+    return 'waiting'; // worker alive, no result yet
   }
 
-  // Tee-path recovery for sessionless workers (agy). The transcript harvest
-  // above only covers claude-family; agy is sessionless so there is no on-disk
-  // transcript to read. The tee file (written by the shim-chain tee helper)
-  // captures the raw stdout. extractTeeResult pulls the final result event
-  // from the stream-json output, matching what worker-exec would have captured.
-  const teePath = await deps.readTeePath?.(record) ?? null;
-  if (teePath) {
-    const workerAlive = await deps.isTopicWorkerAlive(record);
-    if (workerAlive && !expired) {
-      return 'waiting'; // orphan still running — let it finish
+  // Step 2: Worker dead (or expired). Check recovery sources.
+  // 2a: Tee file (from pending dispatch if set, else from worker-pids registry)
+  let teeRaw: string | null = null;
+  // First try record.teePath (set by processUpdate after dispatch)
+  if (record.teePath) {
+    try {
+      teeRaw = await (deps.readFile ?? readFile)(record.teePath, 'utf8');
+    } catch {
+      teeRaw = null;
     }
-    if (!workerAlive || expired) {
-      let teeRaw: string;
+  }
+  // Fallback: readTeePath dep (reads from worker-pids registry for old records)
+  if (teeRaw === null) {
+    const teePath = await deps.readTeePath?.(record) ?? null;
+    if (teePath) {
       try {
         teeRaw = await (deps.readFile ?? readFile)(teePath, 'utf8');
       } catch {
-        teeRaw = '';
+        teeRaw = null;
       }
-      const extracted = extractTeeResult(teeRaw);
-      if (extracted) {
-        const { cleaned } = parseMetadata(extracted);
-        const body = cleaned.trim() || extracted.trim();
-        const sent = await deps.send(
-          record,
-          `♻️ *Recovered reply* (the bot restarted mid-request; the worker finished on its own):\n\n${body}`,
-        );
+    }
+  }
+  if (teeRaw !== null) {
+    const extracted = extractTeeResult(teeRaw);
+    if (extracted) {
+      const { cleaned } = parseMetadata(extracted);
+      const body = cleaned.trim() || extracted.trim();
+      const sent = await deps.send(record,
+        `♻️ *Recovered reply* (the bot restarted mid-request; the worker finished on its own):\n\n${body}`);
+      if (sent) {
+        await deps.captureSession?.(record, extracted);
+        await deps.updatePinnedCard?.(record, { reasonCode: 'recovery-tee' });
+        await finish(record, 'recovered');
+        return 'recovered';
+      }
+      return 'waiting';
+    }
+    // Tee file exists but has no extractable result — fall through to transcript check
+  }
+
+  // 2b: Transcript (claude-family with session)
+  const session = record.session;
+  const recoverable = !!session && CLAUDE_FAMILY.has(session.worker);
+  if (recoverable) {
+    const transcript = await deps.readTranscript(record);
+    if (transcript) {
+      const final = extractFinalAssistantText(transcript.content, record.startedAt);
+      const quiescent = deps.now() - transcript.mtimeMs >= TRANSCRIPT_QUIESCENT_MS;
+      if (final && (quiescent || expired)) {
+        const { cleaned } = parseMetadata(final.text);
+        const body = cleaned.trim() || final.text.trim();
+        const sent = await deps.send(record,
+          `♻️ *Recovered reply* (the bot restarted mid-request; the worker finished on its own):\n\n${body}`);
         if (sent) {
+          await deps.captureSession?.(record, final.text);
+          await deps.updatePinnedCard?.(record, { reasonCode: 'recovery-transcript' });
           await finish(record, 'recovered');
           return 'recovered';
         }
-        return 'waiting'; // send failed — retry next poll
+        return 'waiting';
       }
-      // tee file empty or no result event — fall through to death notice
+      if (!expired) return 'waiting';
     }
   }
 
-  if (!recoverable || expired) {
-    // Mirror the recovered path: a FAILED death-notice send must not settle
-    // the record — finish() would markDelivered + remove it, leaving the
-    // user's request a silent void (the exact outcome this module exists to
-    // prevent) and foreclosing the next restart's retry. 'waiting' retries
-    // until the giveUpAt grace window; unsettled records stay on disk for
-    // the next restart and TTL out at 24h (PENDING_DISPATCH_MAX_AGE_MS).
+  // Step 3: Native resume re-dispatch (worker dead, no result anywhere, but have session)
+  // Only attempt if session has a valid session_id (empty session_id means
+  // the session was never properly initialized, so skip re-dispatch).
+  let resumeAttemptedAndFailed = false;
+  if (session?.session_id && !expired && deps.redispatchWithResume) {
+    const result = await deps.redispatchWithResume(record);
+    if (result !== null && result !== undefined) {
+      const { cleaned } = parseMetadata(result);
+      const body = cleaned.trim() || result.trim();
+      const sent = await deps.send(record,
+        `♻️ *Recovered reply* (the bot restarted; the original worker died without producing a result — re-dispatched with conversation resume):\n\n${body}`);
+      if (sent) {
+        await deps.captureSession?.(record, result);
+        await deps.updatePinnedCard?.(record, { reasonCode: 'recovery-resume' });
+        await finish(record, 'recovered');
+        return 'recovered';
+      }
+      return 'waiting'; // send failed — retry next poll
+    }
+    // Re-dispatch returned null (execution failed or no worker config) — mark
+    // as attempted-and-failed so we fall through to death notice below.
+    resumeAttemptedAndFailed = true;
+  }
+
+  // Step 4: Death notice (true last resort)
+  // Send death notice when: expired, OR no session, OR session exists but is
+  // non-recoverable (not in CLAUDE_FAMILY), OR all recovery sources have been
+  // exhausted (worker dead + no tee + no transcript + resume failed/skipped).
+  if (expired || !session || !recoverable || resumeAttemptedAndFailed) {
     const sent = await deps.send(record, deathNotice(record)).catch(() => false);
     if (!sent) return 'waiting';
     await finish(record, 'dead');
@@ -373,9 +591,9 @@ function recordTopicKey(record: PendingDispatch): string {
  */
 export async function reapOrphanedDispatches(
   token: string,
-  opts: { deps?: ReaperDeps; maxWaitMs?: number; pollMs?: number; sleep?: (ms: number) => Promise<void> } = {},
+  opts: { deps?: ReaperDeps; maxWaitMs?: number; pollMs?: number; sleep?: (ms: number) => Promise<void>; secrets?: Record<string, string> } = {},
 ): Promise<void> {
-  const deps = opts.deps ?? makeDefaultDeps(token);
+  const deps = opts.deps ?? makeDefaultDeps(token, opts.secrets ?? {});
   const maxWaitMs = opts.maxWaitMs ?? REAP_MAX_WAIT_MS;
   const pollMs = opts.pollMs ?? REAP_POLL_MS;
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));

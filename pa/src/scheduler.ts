@@ -4,7 +4,7 @@ import { promisify } from 'util';
 import { platform, tmpdir, homedir } from 'os';
 import { join, resolve } from 'path';
 import { createHash } from 'crypto';
-import { writeFileSync } from 'fs';
+import { writeFileSync, readFileSync } from 'fs';
 import { writeFile, unlink } from 'fs/promises';
 import { listSkills } from './skills.js';
 import { getLastSuccessfulRun, getFailureState } from './logger.js';
@@ -17,6 +17,43 @@ export interface OverdueSkill {
   skill: Skill;
   lastRun: RunMeta | null;
   missedAt: Date;
+}
+
+// --- cost_tier: off_peak (2026-08-17, audit Tier-1 #8) -----------------------
+// z.ai peak = Mon-Fri 06:00-10:00 UTC (11:30-15:30 IST, 2x credits). Periodic
+// (non-time-pinned) skills marked cost_tier: off_peak defer during that window;
+// they catch up at the next evaluation inside the cheap window (19:30-11:30 IST).
+
+/** True while inside the z.ai peak billing window (Mon-Fri 06:00-10:00 UTC). */
+export function isPeakWindow(now: Date = new Date()): boolean {
+  const d = now.getUTCDay();
+  const h = now.getUTCHours();
+  return d >= 1 && d <= 5 && h >= 6 && h < 10;
+}
+
+/** Log-once-per-day-per-skill deferral marker (catchup is a fresh process each
+ *  minute; a module map would re-log every evaluation). Best-effort: failures
+ *  to read/write the marker never block scheduling. */
+function deferralMarkerPath(): string {
+  return join(paHome(), 'cost-tier-deferrals.json');
+}
+
+function readDeferralMarkers(): Record<string, string> {
+  try {
+    return JSON.parse(readFileSync(deferralMarkerPath(), 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function writeDeferralMarker(skillName: string, dateISO: string): void {
+  try {
+    const markers = readDeferralMarkers();
+    markers[skillName] = dateISO;
+    writeFileSync(deferralMarkerPath(), JSON.stringify(markers, null, 1), 'utf8');
+  } catch {
+    // Best-effort only
+  }
 }
 
 export async function getOverdueSkills(): Promise<OverdueSkill[]> {
@@ -174,6 +211,133 @@ export async function partitionOverdueByFailureBackoff(
       // parked entries only arise when consecutiveFailures > 0 (same reasoning).
       partition.parked.push({ entry, consecutiveFailures: state.consecutiveFailures, lastAttemptAt: state.lastAttemptAt! });
     }
+  }
+
+  return partition;
+}
+
+// ---------------------------------------------------------------------------
+// WPD5: off-peak cost_tier filtering
+// Skills with cost_tier: off_peak run only during z.ai off-peak window
+// (19:30-11:30 IST). During peak hours (11:30-19:30 IST), they are
+// deferred with once-daily logging.
+// ---------------------------------------------------------------------------
+
+/**
+ * Check if a cron expression is time-pinned (no wildcards in hour/minute fields).
+ * A time-pinned cron specifies exact times, e.g., "30 23 * * *" (11:00 PM IST).
+ * A periodic cron has wildcards, e.g., "* slash-5 star star star star" (every 5 minutes).
+ * @param cron - Cron expression (5 fields)
+ * @returns true if cron is time-pinned (hour and minute are both specific numbers)
+ */
+export function isTimePinnedCron(cron: string): boolean {
+  const parts = cron.trim().split(/\s+/);
+  if (parts.length !== 5) return false; // Invalid cron, treat as periodic
+
+  // Minute (field 0) and hour (field 1) must both be specific numbers (no *, */n, ?)
+  const minute = parts[0];
+  const hour = parts[1];
+
+  // Check if both are pure numbers (no wildcards, ranges, or step values)
+  const isSpecificNumber = (field: string) => /^\d+$/.test(field);
+
+  return isSpecificNumber(minute) && isSpecificNumber(hour);
+}
+
+/**
+ * Check if current time is within off-peak window (19:30-11:30 IST).
+ * IST is UTC+5:30, so:
+ * - 19:30 IST = 14:00 UTC
+ * - 11:30 IST = 06:00 UTC
+ *
+ * The off-peak window spans from 19:30 IST to 11:30 IST the next day.
+ * This means in UTC:
+ * - From 14:00 UTC to 24:00 UTC (same day)
+ * - From 00:00 UTC to 06:00 UTC (next day)
+ *
+ * @param now - Current date/time
+ * @returns true if within off-peak window
+ */
+function isOffPeakWindow(now: Date = new Date()): boolean {
+  // The billing truth: z.ai peak = Mon-Fri 06:00-10:00 UTC (11:30-15:30 IST).
+  // Everything else — evenings, nights, weekends, AND 15:30-19:30 IST weekdays —
+  // is off-peak. (The earlier 14:00/06:00 hour-only form misclassified
+  // 15:30-19:30 IST as peak and ignored weekends.)
+  return !isPeakWindow(now);
+}
+
+/**
+ * Partition overdue skills by cost_tier and time window.
+ * - off_peak skills during peak hours are deferred
+ * - time-pinned crons with cost_tier are warned and deferred
+ * - anytime skills are always passed through
+ *
+ * @param overdue - List of overdue skills to filter
+ * @param now - Current time for window check
+ * @returns Partition with runnable and deferred skills
+ */
+export async function partitionOverdueByCostTier(
+  overdue: OverdueSkill[],
+  now: Date = new Date()
+): Promise<{ runnable: OverdueSkill[]; deferred: Array<{ entry: OverdueSkill; reason: string }> }> {
+  const partition: { runnable: OverdueSkill[]; deferred: Array<{ entry: OverdueSkill; reason: string }> } = {
+    runnable: [],
+    deferred: [],
+  };
+
+  const isInOffPeak = isOffPeakWindow(now);
+
+  for (const entry of overdue) {
+    const skill = entry.skill;
+    const costTier = skill.frontmatter.cost_tier || 'anytime';
+
+    // anytime skills always run
+    if (costTier === 'anytime') {
+      partition.runnable.push(entry);
+      continue;
+    }
+
+    // off_peak skill
+    if (costTier === 'off_peak') {
+      const cron = skill.frontmatter.cron;
+
+      // Check if cron is time-pinned (invalid configuration)
+      if (cron && isTimePinnedCron(cron)) {
+        console.warn(
+          `[cost_tier] Ignoring cost_tier on time-pinned cron for skill '${skill.name}': ${cron}. ` +
+              `cost_tier applies only to periodic crons (with wildcards in hour/minute fields).`
+        );
+        // Treat as anytime (allow it to run)
+        partition.runnable.push(entry);
+        continue;
+      }
+
+      // During peak hours, defer off_peak skills
+      if (!isInOffPeak) {
+        // Log once per day per skill (catchup is a fresh process each minute —
+        // a module map would re-log every pass, so a marker file dedupes).
+        const today = now.toISOString().slice(0, 10);
+        if (readDeferralMarkers()[skill.name] !== today) {
+          console.warn(
+            `[cost_tier] Deferring off_peak skill '${skill.name}' during peak hours ` +
+              `(z.ai peak: Mon-Fri 11:30-15:30 IST; runs resume after 15:30 IST)`
+          );
+          writeDeferralMarker(skill.name, today);
+        }
+        partition.deferred.push({
+          entry,
+          reason: 'off_peak skill deferred during peak hours (Mon-Fri 11:30-15:30 IST)',
+        });
+        continue;
+      }
+
+      // During off-peak hours, allow to run
+      partition.runnable.push(entry);
+      continue;
+    }
+
+    // Unknown cost_tier value - treat as anytime (fail open)
+    partition.runnable.push(entry);
   }
 
   return partition;

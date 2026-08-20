@@ -2,6 +2,7 @@ import type { MaintenanceHost, MaintenanceJob } from './types.js';
 import { orphanWorkerReapJob } from './jobs/orphan-worker-reap.js';
 import { blackboardPurgeJob } from './jobs/blackboard-purge.js';
 import { stalenessCheckJob } from './jobs/staleness-check.js';
+import { skillCadenceAuditJob } from './jobs/skill-cadence-audit.js';
 import { skillLogRotateJob } from './jobs/skill-log-rotate.js';
 import { archivePruneJob } from './jobs/archive-prune.js';
 import { alertStateGcJob } from './jobs/alert-state-gc.js';
@@ -10,6 +11,9 @@ import { sessionGcJob } from './jobs/session-gc.js';
 import { voiceAttachmentGcJob } from './jobs/voice-attachment-gc.js';
 import { workerTeeGcJob } from './jobs/worker-tee-gc.js';
 import { reservationGcJob } from './jobs/reservation-gc.js';
+import { restoreDrillJob } from './jobs/restore-drill.js';
+import { clobberSentinelJob } from './jobs/clobber-sentinel.js';
+import { redteamRecurringJob } from './jobs/redteam-recurring.js';
 import { botLogRotationCheckJob } from './jobs/bot-log-rotation-check.js';
 import { modelOverrideSweepJob } from './jobs/model-override-sweep.js';
 import { deliveredStoreCompactJob } from './jobs/delivered-store-compact.js';
@@ -24,6 +28,7 @@ export const MAINTENANCE_JOBS: readonly MaintenanceJob[] = [
   orphanWorkerReapJob,
   blackboardPurgeJob,
   stalenessCheckJob,
+  skillCadenceAuditJob,
   skillLogRotateJob,
   archivePruneJob,
   alertStateGcJob,
@@ -32,6 +37,9 @@ export const MAINTENANCE_JOBS: readonly MaintenanceJob[] = [
   voiceAttachmentGcJob,
   workerTeeGcJob,
   reservationGcJob,
+  restoreDrillJob,
+  clobberSentinelJob,
+  redteamRecurringJob,
   // bot-host jobs
   botLogRotationCheckJob,
   modelOverrideSweepJob,
