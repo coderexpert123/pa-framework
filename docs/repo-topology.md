@@ -89,6 +89,16 @@ never touch anything here again — full design and migration record:
 `plans/2026-08-05-concurrent-session-safety.md`. This entry stays as history so nobody
 re-diagnoses the same incident class from scratch.
 
+## Dependabot configuration (2026-08-17)
+
+Both repos (the private repository and the public pa-framework mirror) track `.github/dependabot.yml` for automated dependency updates. The file is configured for:
+- npm ecosystems: `pa/` and `projects/telegram-bot/`
+- pip ecosystem: `pa/scripts/` (requirements.txt)
+- GitHub Actions: `.github/workflows/`
+- Monthly schedule, minor+patch grouped, majors separate, no automerge
+
+The public mirror receives the file via the `.github/` allowlist entry in `.gitignore-public` (line 9). Dependabot opens separate PRs for each ecosystem and major/minor/patch grouping.
+
 ## 2026-07-21 public history rewrite — PII lives in PATHS, not just contents
 
 The mirror's entire 46-commit history was rewritten with `git-filter-repo` and
@@ -126,6 +136,12 @@ instead. Full record: `plans/2026-07-21-performance-audit-remediation.md`.
     private-only file `public-sync` just wrote as ignored — invisible to `git status`/
     `git add` unless force-added. `push-public`'s Step 2 independently re-checks this via
     `git-public.ps1 check-ignore`/`ls-files` before staging.
+-   **Blocked ≠ silent (2026-08-17, RA-1).** When `pa public-sync` refuses because the
+    private tree is dirty, it now also sends a deduped pa-alerts page naming the blocker
+    and the fix (`/commit` then retry). Before this, a blocked push-public ended with
+    exit 0 and a success-shaped run record while publishing nothing — the mechanism
+    behind the mirror silently drifting 3 days behind (2026-08-16). If a future skill
+    gains its own can't-proceed state, give it the same loud-refusal contract.
 -   **Public-mirror sync scope discipline — now structural, not procedural.**
     `pa public-sync` extracts ONLY from the private repo's committed `HEAD`
     (`git archive`), never the working tree, and refuses to run at all if the private

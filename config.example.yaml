@@ -1,0 +1,156 @@
+# ============================================================================
+# pa-framework — Root Worker & Dispatcher Configuration Template
+# ============================================================================
+# Copy this file to ~/.pa/config.yaml and customize worker commands for your OS.
+#
+# Skills Location:
+# Skills are Markdown definitions stored in ~/.pa/skills/<skill-name>/skill.md
+# (or $PA_HOME/skills/<skill-name>/skill.md). Run `pa list` to discover all skills.
+
+workers:
+  # === agy (Priority 1 — Antigravity CLI / Gemini 3.x Flash) ===
+  - name: agy
+    command: agy
+    args:
+      - "--dangerously-skip-permissions"
+      - "--print-timeout"
+      - "65m"
+      - "-p"
+      - "{prompt}"
+    input_mode: arg
+    output_format: plain-text
+    check: agy --version
+    check_timeout: 10
+    rate_limit_patterns:
+      - "RESOURCE_EXHAUSTED"
+      - "429"
+    priority: 1
+    state_dir: "~/.gemini/antigravity-cli/conversations"
+    state_pattern: "*.db"
+    tunables:
+      model:
+        args: ["--model", "{value}"]
+        values:
+          - "gemini-3.7-flash-high"
+          - "gemini-3.7-flash-medium"
+          - "gemini-3.7-flash-low"
+          - "claude-sonnet-4-6"
+        description: "Model selection for Antigravity CLI."
+
+  # === claude (Priority 2 — Anthropic Claude Code CLI) ===
+  - name: claude
+    command: claude
+    args:
+      - "-p"
+      - "--dangerously-skip-permissions"
+      - "--output-format"
+      - "stream-json"
+      - "--input-format"
+      - "stream-json"
+      - "--verbose"
+    input_mode: stdin-json
+    output_format: stream-json
+    check: claude --version
+    rate_limit_patterns:
+      - "rate limit"
+      - "token limit"
+      - "quota exceeded"
+      - "Usage limit"
+      - "hit your limit"
+      - "429"
+    priority: 2
+    state_dir: "~/.claude/projects"
+    state_pattern: "*.jsonl"
+    tunables:
+      model:
+        args: ["--model", "{value}"]
+        description: "Claude model name (sonnet, opus, haiku)."
+      effort:
+        args: ["--effort", "{value}"]
+        values: [low, medium, high, max]
+        description: "Reasoning effort level."
+
+  # === codex (Priority 3 — OpenAI Codex CLI) ===
+  - name: codex
+    command: codex
+    args:
+      - "exec"
+      - "--dangerously-bypass-approvals-and-sandbox"
+      - "--color"
+      - "never"
+      - "--json"
+      - "-"
+    input_mode: stdin-text
+    output_format: stream-json
+    check: codex --version
+    check_timeout: 15
+    rate_limit_patterns:
+      - "hit your usage limit"
+      - "rate limit"
+      - "quota exceeded"
+      - "429"
+    priority: 3
+    state_dir: "~/.codex"
+    state_pattern: "state_5.sqlite"
+    tunables:
+      model:
+        args: ["--model", "{value}"]
+        description: "OpenAI model name."
+      effort:
+        args: ["-c", "model_reasoning_effort={value}"]
+        values: [minimal, low, medium, high]
+        description: "Reasoning effort configuration."
+
+  # === zclaude (Priority 4 — Extended Claude CLI Wrapper) ===
+  - name: zclaude
+    command: zclaude
+    args:
+      - "-p"
+      - "--dangerously-skip-permissions"
+      - "--output-format"
+      - "stream-json"
+      - "--input-format"
+      - "stream-json"
+      - "--verbose"
+    input_mode: stdin-json
+    output_format: stream-json
+    check: zclaude --version
+    rate_limit_patterns:
+      - "rate limit"
+      - "token limit"
+      - "quota exceeded"
+      - "Usage limit"
+      - "hit your limit"
+      - "429"
+    priority: 4
+    state_dir: "~/.claude/projects"
+    state_pattern: "*.jsonl"
+    tunables:
+      model:
+        args: ["--model", "{value}"]
+        description: "Claude model name (sonnet, opus, haiku)."
+      effort:
+        args: ["--effort", "{value}"]
+        values: [low, medium, high, max]
+        description: "Reasoning effort level."
+
+# === Stuck Agent Evaluator ===
+evaluator:
+  worker: claude
+  timeout: 60
+
+# === Background Maintenance Jobs ===
+maintenance:
+  session-gc: { enabled: true, every: 6h }
+  archive-prune: { enabled: true, every: 1h }
+
+# === Usage & Budget Alerts ===
+usage:
+  budget_monthly_usd: 100
+
+# === Voice Message Transcription ===
+transcription:
+  engine_preference: auto
+  worker_mode: spawn
+  cloud_order: [groq, openai, deepgram]
+  language: null

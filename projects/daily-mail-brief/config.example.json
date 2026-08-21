@@ -1,0 +1,25 @@
+{
+  "sender_categories": {
+    "newsletters": [
+      "newsletter@techcrunch.com",
+      "tldr@tldrnewsletter.com",
+      "news@morningbrew.com"
+    ],
+    "financial": [
+      "alerts@bank.example.com",
+      "statements@brokerage.example.com"
+    ],
+    "receipts": [
+      "auto-confirm@amazon.com",
+      "orders@store.example.com"
+    ]
+  },
+  "priority_senders": [
+    "boss@company.com",
+    "partner@family.com"
+  ],
+  "ignore_senders": [
+    "marketing@promo.example.com",
+    "no-reply@spam.example.com"
+  ]
+}

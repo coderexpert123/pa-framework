@@ -49,10 +49,12 @@ import {
   parseTunableCommand,
   setSessionTunable,
   setTopicTunable,
+  promoteSessionToTopicDefaults,
   expireTunableOverrides,
   renderTunableReport,
   renderTunableSetResult,
   renderTunableClearResult,
+  renderSessionExpiryMessage,
   handleRetranscribeCommand,
   describeForwardOrigin,
   handleHealthCommand,
@@ -72,6 +74,8 @@ import {
   resolveTunable,
   resolveTunableArgs,
   resolveWorkerLlm,
+  resolveWorkerEffort,
+  formatWorkerDescriptor,
   selectWorkerTunables,
   mergeTunableArgs,
   validateTunable,
@@ -345,6 +349,9 @@ async function maybeUpdatePinnedStatusAfterDispatch(
   const dispatchedLlm = dispatchedWorkerConfig
     ? resolveWorkerLlm(dispatchedWorkerConfig, selectWorkerTunables(state.tunable_overrides, dispatchedWorker), selectWorkerTunables(state.tunable_defaults, dispatchedWorker))
     : undefined;
+  const dispatchedEffort = dispatchedWorkerConfig
+    ? resolveWorkerEffort(dispatchedWorkerConfig, selectWorkerTunables(state.tunable_overrides, dispatchedWorker), selectWorkerTunables(state.tunable_defaults, dispatchedWorker))
+    : undefined;
 
   if (dispatchedWorker !== expectedWorker) {
     const nextSnapshot = buildModelStatusSnapshot({
@@ -353,11 +360,11 @@ async function maybeUpdatePinnedStatusAfterDispatch(
       reasonCode: 'failover',
       reasonText: buildFailoverReasonText(failoverPayload, expectedWorker, dispatchedWorker),
       currentLlm: dispatchedLlm,
+      currentEffort: dispatchedEffort,
     });
+    syncModelStatusState(state, nextSnapshot);
     if (modelStatusNeedsRefresh(currentSnapshot, nextSnapshot) || !state.pinned_status_message_id) {
-      await replacePinnedStatusCard(token, chatId, threadId, state, nextSnapshot);
-    } else {
-      syncModelStatusState(state, nextSnapshot);
+      await refreshPinnedStatusCardInPlace(token, chatId, threadId, state, effectiveDefault, getKeepAwakeStatus(), config);
     }
     return;
   }
@@ -369,17 +376,17 @@ async function maybeUpdatePinnedStatusAfterDispatch(
       defaultWorker: effectiveDefault,
       reasonCode,
       currentLlm: dispatchedLlm,
+      currentEffort: dispatchedEffort,
     });
+    syncModelStatusState(state, nextSnapshot);
     if (modelStatusNeedsRefresh(currentSnapshot, nextSnapshot) || !state.pinned_status_message_id) {
-      await replacePinnedStatusCard(token, chatId, threadId, state, nextSnapshot);
-    } else {
-      syncModelStatusState(state, nextSnapshot);
+      await refreshPinnedStatusCardInPlace(token, chatId, threadId, state, effectiveDefault, getKeepAwakeStatus(), config);
     }
     return;
   }
 
   if (!state.pinned_status_message_id) {
-    await replacePinnedStatusCard(token, chatId, threadId, state, currentSnapshot);
+    await refreshPinnedStatusCardInPlace(token, chatId, threadId, state, effectiveDefault, getKeepAwakeStatus(), config);
     return;
   }
 
@@ -418,30 +425,44 @@ export async function runExpiredModelOverrideSweep(
       const topicState = await loadTopicState(ref.chatId, ref.threadId);
       const topicKey = topicKeyFor(ref.chatId, ref.threadId);
       const effectiveDefault = getEffectiveDefaultWorker(config, topicKey);
+
+      // Compute before descriptor BEFORE expiring:
+      const prevWorker = topicState.preferred_worker || effectiveDefault;
+      const prevWorkerConfig = config?.workers?.find((w: WorkerConfig) => w.name === prevWorker);
+      const prevLlm = prevWorkerConfig
+        ? resolveWorkerLlm(prevWorkerConfig, selectWorkerTunables(topicState.tunable_overrides, prevWorker), selectWorkerTunables(topicState.tunable_defaults, prevWorker))
+        : undefined;
+      const prevEffort = prevWorkerConfig
+        ? resolveWorkerEffort(prevWorkerConfig, selectWorkerTunables(topicState.tunable_overrides, prevWorker), selectWorkerTunables(topicState.tunable_defaults, prevWorker))
+        : undefined;
+      const prevDescriptor = formatWorkerDescriptor(prevWorker, prevLlm, prevEffort);
+
       const expired = expirePreferredWorker(topicState);
       // Same IST-day lifecycle, swept for the same reason: a topic nobody has
       // messaged since yesterday must not still be running yesterday's knobs
       // the moment it wakes up.
       const expiredTunables = expireTunableOverrides(topicState);
 
-      if (expired) {
+      if (expired || expiredTunables.length > 0) {
         const defaultWorkerConfig = config?.workers?.find((w: WorkerConfig) => w.name === effectiveDefault);
-        const currentLlm = defaultWorkerConfig
-          ? resolveWorkerLlm(defaultWorkerConfig, selectWorkerTunables(topicState.tunable_overrides, effectiveDefault), selectWorkerTunables(topicState.tunable_defaults, effectiveDefault))
+        const nextLlm = defaultWorkerConfig
+          ? resolveWorkerLlm(defaultWorkerConfig, undefined, selectWorkerTunables(topicState.tunable_defaults, effectiveDefault))
           : undefined;
-        const snapshot = buildModelStatusSnapshot({
-          defaultWorker: effectiveDefault,
-          reasonCode: 'midnight_reset',
-          currentLlm,
-        });
-        await replacePinnedStatusCard(token, ref.chatId, ref.threadId, topicState, snapshot);
+        const nextEffort = defaultWorkerConfig
+          ? resolveWorkerEffort(defaultWorkerConfig, undefined, selectWorkerTunables(topicState.tunable_defaults, effectiveDefault))
+          : undefined;
+        const nextDescriptor = formatWorkerDescriptor(effectiveDefault, nextLlm, nextEffort);
+
+        await refreshPinnedStatusCardInPlace(token, ref.chatId, ref.threadId, topicState, effectiveDefault, getKeepAwakeStatus(), config);
+        const expiryMsg = renderSessionExpiryMessage(prevDescriptor, nextDescriptor, 'expired');
+        await sendMessage(token, ref.chatId, expiryMsg, ref.threadId || undefined);
         await saveTopicState(topicState);
         touched++;
         continue;
       }
 
       const hydrated = hydrateModelStatus(topicState, effectiveDefault, config);
-      if (expiredTunables.length > 0 || modelStatusNeedsRefresh(topicState.model_status, hydrated) || topicState.pinned_worker !== hydrated.current_worker) {
+      if (modelStatusNeedsRefresh(topicState.model_status, hydrated) || topicState.pinned_worker !== hydrated.current_worker) {
         await refreshPinnedStatusCardInPlace(token, ref.chatId, ref.threadId, topicState, effectiveDefault, getKeepAwakeStatus(), config);
         await saveTopicState(topicState);
         touched++;
@@ -725,6 +746,12 @@ export async function handleTunableCommand(
   const validation = validateTunable(workerConfig, cmd.setting);
   if (!validation.ok) return validation.error ?? `Unknown setting '${cmd.setting}'.`;
 
+  const prevSessionSlice = selectWorkerTunables(state.tunable_overrides, workerName);
+  const prevTopicSlice = selectWorkerTunables(state.tunable_defaults, workerName);
+  const prevLlm = resolveWorkerLlm(workerConfig, prevSessionSlice, prevTopicSlice);
+  const prevEffort = resolveWorkerEffort(workerConfig, prevSessionSlice, prevTopicSlice);
+  const previousDescriptor = formatWorkerDescriptor(workerName, prevLlm, prevEffort);
+
   if (cmd.action === 'set') {
     if (cmd.scope === 'session') setSessionTunable(state, workerName, cmd.setting, cmd.value);
     else setTopicTunable(state, workerName, cmd.setting, cmd.value);
@@ -736,6 +763,9 @@ export async function handleTunableCommand(
   const sessionSlice = selectWorkerTunables(state.tunable_overrides, workerName);
   const topicSlice = selectWorkerTunables(state.tunable_defaults, workerName);
   const resolved = resolveTunable(workerConfig, cmd.setting, sessionSlice, topicSlice);
+  const nextLlm = resolveWorkerLlm(workerConfig, sessionSlice, topicSlice);
+  const nextEffort = resolveWorkerEffort(workerConfig, sessionSlice, topicSlice);
+  const currentDescriptor = formatWorkerDescriptor(workerName, nextLlm, nextEffort);
 
   if (cmd.action === 'set') {
     // FREE ON THE VALUE — isKnownValue only decides whether to add a note.
@@ -750,6 +780,8 @@ export async function handleTunableCommand(
       // NOT be sent (or one that just displaced a sibling) says so right here
       // rather than only on a later bare /llm.
       resolved,
+      previousDescriptor,
+      currentDescriptor,
     });
   }
 
@@ -757,6 +789,8 @@ export async function handleTunableCommand(
     return renderTunableClearResult({
       worker: workerName, setting: cmd.setting, scope: cmd.scope, resolved,
       pinned: extractTunableValues(validation.spec, workerConfig?.args),
+      previousDescriptor,
+      currentDescriptor,
     });
   }
 
@@ -1363,13 +1397,11 @@ async function processUpdate(
         env: runtimeEnv,
       });
       response = buildOAuthCompletionMessage(exchangeResult, resumeStatus);
-      
       skipWorker = true;
     }
 
     if (workerExpired) {
-      const expirySnapshot = buildModelStatusSnapshot({ defaultWorker: effectiveDefault, reasonCode: 'midnight_reset' });
-      await replacePinnedStatusCard(token, chatId, threadId, topicState, expirySnapshot);
+      await refreshPinnedStatusCardInPlace(token, chatId, threadId, topicState, effectiveDefault, getKeepAwakeStatus(), config);
     }
 
     if (!userText && !audioAttachment && !msg.document && !msg.photo) {
@@ -1402,26 +1434,39 @@ async function processUpdate(
     const agentSwitch = (!skipWorker && userText) ? getAgentSwitchTarget(userText) : undefined;
     if (agentSwitch) {
       const modelTarget = agentSwitch.target;
-      let nextSnapshot: ModelStatusSnapshot;
+      const prevWorker = topicState.preferred_worker || effectiveDefault;
+      const prevWorkerConfig = config?.workers?.find((w: WorkerConfig) => w.name === prevWorker);
+      const prevLlm = prevWorkerConfig
+        ? resolveWorkerLlm(prevWorkerConfig, selectWorkerTunables(topicState.tunable_overrides, prevWorker), selectWorkerTunables(topicState.tunable_defaults, prevWorker))
+        : undefined;
+      const prevEffort = prevWorkerConfig
+        ? resolveWorkerEffort(prevWorkerConfig, selectWorkerTunables(topicState.tunable_overrides, prevWorker), selectWorkerTunables(topicState.tunable_defaults, prevWorker))
+        : undefined;
+      const prevDescriptor = formatWorkerDescriptor(prevWorker, prevLlm, prevEffort);
+
       const targetWorkerConfig = config?.workers?.find((w: WorkerConfig) => w.name === modelTarget);
-      const currentLlm = targetWorkerConfig
+      const targetLlm = targetWorkerConfig
         ? resolveWorkerLlm(targetWorkerConfig, selectWorkerTunables(topicState.tunable_overrides, modelTarget), selectWorkerTunables(topicState.tunable_defaults, modelTarget))
         : undefined;
+      const targetEffort = targetWorkerConfig
+        ? resolveWorkerEffort(targetWorkerConfig, selectWorkerTunables(topicState.tunable_overrides, modelTarget), selectWorkerTunables(topicState.tunable_defaults, modelTarget))
+        : undefined;
+      const nextDescriptor = formatWorkerDescriptor(modelTarget, targetLlm, targetEffort);
+
       if (modelTarget === effectiveDefault) {
         topicState.preferred_worker = undefined;
         topicState.preferred_worker_set_at = undefined;
-        nextSnapshot = buildModelStatusSnapshot({ defaultWorker: effectiveDefault, reasonCode: 'user_selected_default', currentLlm });
       } else {
         topicState.preferred_worker = modelTarget;
         topicState.preferred_worker_set_at = new Date().toISOString();
-        nextSnapshot = buildModelStatusSnapshot({ currentWorker: modelTarget, defaultWorker: effectiveDefault, reasonCode: 'user_override', changedAt: topicState.preferred_worker_set_at, currentLlm });
       }
       topicState.session = undefined;
-      await replacePinnedStatusCard(token, chatId, threadId, topicState, nextSnapshot);
+      await refreshPinnedStatusCardInPlace(token, chatId, threadId, topicState, effectiveDefault, getKeepAwakeStatus(), config);
+      const lifetime = modelTarget === effectiveDefault ? 'topic default' : 'until midnight IST';
       if (agentSwitch.isLegacy) {
-        response = `Switched agent to *${modelTarget}* (until midnight IST).\n💡 _Tip: use \`/agent <name>\` to pick the agent and \`/model <name>\` to set its model._`;
+        response = `Switched agent: ${prevDescriptor} → ${nextDescriptor} (${lifetime}).\n💡 _Tip: use \`/agent <name>\` to pick the agent and \`/model <name>\` to set its model._`;
       } else {
-        response = `Switched agent to *${modelTarget}* (until midnight IST).`;
+        response = `Switched agent: ${prevDescriptor} → ${nextDescriptor} (${lifetime}).`;
       }
       skipWorker = true;
     }
@@ -1434,12 +1479,28 @@ async function processUpdate(
     }
 
     if (!skipWorker && RESET_PATTERN.test(userText)) {
-      response = handleResetCommand(topicState).response;
+      const prevWorker = topicState.preferred_worker || effectiveDefault;
+      const prevWorkerConfig = config?.workers?.find((w: WorkerConfig) => w.name === prevWorker);
+      const prevLlm = prevWorkerConfig
+        ? resolveWorkerLlm(prevWorkerConfig, selectWorkerTunables(topicState.tunable_overrides, prevWorker), selectWorkerTunables(topicState.tunable_defaults, prevWorker))
+        : undefined;
+      const prevEffort = prevWorkerConfig
+        ? resolveWorkerEffort(prevWorkerConfig, selectWorkerTunables(topicState.tunable_overrides, prevWorker), selectWorkerTunables(topicState.tunable_defaults, prevWorker))
+        : undefined;
+      const prevDescriptor = formatWorkerDescriptor(prevWorker, prevLlm, prevEffort);
+
+      handleResetCommand(topicState);
       const defaultWorkerConfig = config?.workers?.find((w: WorkerConfig) => w.name === effectiveDefault);
       const currentLlm = defaultWorkerConfig
         ? resolveWorkerLlm(defaultWorkerConfig, selectWorkerTunables(topicState.tunable_overrides, effectiveDefault), selectWorkerTunables(topicState.tunable_defaults, effectiveDefault))
         : undefined;
-      await replacePinnedStatusCard(token, chatId, threadId, topicState, buildModelStatusSnapshot({ defaultWorker: effectiveDefault, reasonCode: 'reset', currentLlm }));
+      const currentEffort = defaultWorkerConfig
+        ? resolveWorkerEffort(defaultWorkerConfig, selectWorkerTunables(topicState.tunable_overrides, effectiveDefault), selectWorkerTunables(topicState.tunable_defaults, effectiveDefault))
+        : undefined;
+      const nextDescriptor = formatWorkerDescriptor(effectiveDefault, currentLlm, currentEffort);
+
+      await refreshPinnedStatusCardInPlace(token, chatId, threadId, topicState, effectiveDefault, getKeepAwakeStatus(), config);
+      response = renderSessionExpiryMessage(prevDescriptor, nextDescriptor, 'cleared');
       skipWorker = true;
     }
 
@@ -1518,22 +1579,41 @@ async function processUpdate(
     if (!skipWorker) {
       const dq = handleDefaultQuery(userText);
       if (dq.matched) {
+        const prevDefault = effectiveDefault;
+        const prevDefaultConfig = config?.workers?.find((w: WorkerConfig) => w.name === prevDefault);
+        const prevDefaultDescriptor = formatWorkerDescriptor(
+          prevDefault,
+          prevDefaultConfig ? resolveWorkerLlm(prevDefaultConfig, undefined, selectWorkerTunables(topicState.tunable_defaults, prevDefault)) : undefined,
+          prevDefaultConfig ? resolveWorkerEffort(prevDefaultConfig, undefined, selectWorkerTunables(topicState.tunable_defaults, prevDefault)) : undefined
+        );
+
         if (dq.worker) {
           await saveTopicDefault(topicKey, dq.worker);
           effectiveDefault = dq.worker;
+          topicState.preferred_worker = undefined;
+          topicState.preferred_worker_set_at = undefined;
         } else {
-          await saveTopicDefault(topicKey, undefined);
-          effectiveDefault = resolveEffectiveDefaultWorker(undefined, config?.workers ?? []);
+          // /default with no arguments: make current active configuration default at topic level
+          const currentWorker = topicState.preferred_worker || effectiveDefault;
+          await saveTopicDefault(topicKey, currentWorker);
+          effectiveDefault = currentWorker;
+          promoteSessionToTopicDefaults(topicState, currentWorker);
         }
-        topicState.preferred_worker = undefined;
-        topicState.preferred_worker_set_at = undefined;
         topicState.session = undefined;
-        const defaultWorkerConfig = config?.workers?.find((w: WorkerConfig) => w.name === effectiveDefault);
-        const currentLlm = defaultWorkerConfig
-          ? resolveWorkerLlm(defaultWorkerConfig, selectWorkerTunables(topicState.tunable_overrides, effectiveDefault), selectWorkerTunables(topicState.tunable_defaults, effectiveDefault))
-          : undefined;
-        const nextSnapshot = buildModelStatusSnapshot({ currentWorker: effectiveDefault, defaultWorker: effectiveDefault, reasonCode: 'default_changed', currentLlm });
-        await replacePinnedStatusCard(token, chatId, threadId, topicState, nextSnapshot);
+
+        const nextDefaultConfig = config?.workers?.find((w: WorkerConfig) => w.name === effectiveDefault);
+        const nextDefaultDescriptor = formatWorkerDescriptor(
+          effectiveDefault,
+          nextDefaultConfig ? resolveWorkerLlm(nextDefaultConfig, undefined, selectWorkerTunables(topicState.tunable_defaults, effectiveDefault)) : undefined,
+          nextDefaultConfig ? resolveWorkerEffort(nextDefaultConfig, undefined, selectWorkerTunables(topicState.tunable_defaults, effectiveDefault)) : undefined
+        );
+
+        await refreshPinnedStatusCardInPlace(token, chatId, threadId, topicState, effectiveDefault, getKeepAwakeStatus(), config);
+        if (dq.worker) {
+          response = `Topic default agent set: ${prevDefaultDescriptor} → ${nextDefaultDescriptor} (persists).`;
+        } else {
+          response = `Topic default set to current configuration: ${prevDefaultDescriptor} → ${nextDefaultDescriptor} (persists).`;
+        }
         skipWorker = true;
       }
     }

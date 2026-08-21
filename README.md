@@ -1,141 +1,151 @@
 # pa-framework
 
-> Multi-CLI personal-assistant orchestrator with rate-limit-aware failover, Markdown-based skills, and a Telegram bot.
+> Multi-CLI personal-assistant orchestrator with rate-limit-aware failover, Markdown-based skills, voice transcription, and Telegram bot integration.
 
-`pa` is a substrate, not an application. You define skills as Markdown files with YAML frontmatter; the dispatcher runs them on a cron schedule, routes execution through the highest-priority available worker (Claude Code / Gemini CLI / OpenAI Codex / zClaude), persists state, and pushes output to Telegram (or to disk, or to both). When one CLI is rate-limited, the dispatcher fails over to the next. When a skill's output contains a `[PA_META]: {"actions":[...]}` envelope, the dispatcher can trigger downstream skills automatically.
+`pa` is a substrate, not an application. You define skills as Markdown files with YAML frontmatter; the dispatcher runs them on a cron schedule, routes execution through the highest-priority available worker (Antigravity CLI / Claude Code / OpenAI Codex / zClaude), persists state, and pushes output to Telegram (or to disk, or to both). When one CLI is rate-limited, the dispatcher fails over to the next. When a skill's output contains a `[PA_META]: {"actions":[...]}` envelope, the dispatcher can trigger downstream skills automatically.
 
-Use it to build your own personal automation: inbox triage, periodic reports, reminders, calendar checks, KB updates. One sample project is included as a reference (`projects/daily-mail-brief/`).
+Use it to build your own personal automation: inbox triage, voice-dictated WhatsApp messaging, natural language reminders, periodic digests, and knowledge base updates.
 
-## Architecture (5 layers)
+---
+
+## ⚡ Quickstart (3 Minutes)
+
+Get your personal assistant running in three simple steps:
+
+### 1. Clone & Build
+```bash
+# Clone the repository
+git clone https://github.com/coderexpert123/pa-framework.git
+cd pa-framework
+
+# Install dependencies and build core orchestrator
+cd pa && npm install && npm run build && cd ..
+
+# Install dependencies and build Telegram bot
+cd projects/telegram-bot && npm install && npm run build && cd ../..
+```
+
+### 2. Configure Credentials & Workers
+```bash
+# Scaffold the runtime configuration directory
+mkdir -p ~/.pa
+
+# Copy turnkey environment and worker configuration templates
+cp .env.example ~/.pa/secrets.env
+cp config.example.yaml ~/.pa/config.yaml
+```
+
+Edit `~/.pa/secrets.env` with your API keys:
+- **`TELEGRAM_BOT_TOKEN`**: From [@BotFather](https://t.me/BotFather) on Telegram.
+- **`TELEGRAM_CHAT_ID`**: Your personal chat ID from [@userinfobot](https://t.me/userinfobot) (e.g. `123456789`) or group ID (`-100...`).
+- **LLM API Keys**: Provide at least one (`GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY`).
+- **`GROQ_API_KEY`** *(Recommended)*: For ultra-fast, free cloud voice transcription.
+
+### 3. Verify & Start
+```bash
+# Verify worker CLIs and skill health
+node pa/dist/bin/pa.js health
+node pa/dist/bin/pa.js workers
+
+# Sync scheduled skills with your OS scheduler (Task Scheduler / crontab)
+node pa/dist/bin/pa.js schedules sync
+
+# Launch the Telegram bot
+node pa/dist/bin/pa.js bot start
+```
+
+---
+
+## 🌟 Key Features
+
+### 🔀 Multi-Worker LLM Dispatcher
+- **Cascading Failover**: Dispatches tasks across Antigravity (`agy`), Claude Code (`claude`/`zclaude`), and OpenAI Codex (`codex`).
+- **Rate-Limit Awareness**: Intercepts HTTP 429 and `RESOURCE_EXHAUSTED` responses in real-time, automatically failing over to the next worker in the cascade.
+- **Dynamic Tunables**: Adjust model family and reasoning effort (`/model`, `/effort`) dynamically per chat topic without restarting.
+
+### 🎙️ Voice Notes & Audio Transcription
+- **Cloud & Offline Engines**: Transcribes voice messages via Groq (Whisper large-v3), OpenAI Whisper, Deepgram, or fully offline via local CPU Whisper.
+- **Hands-Free Operation**: Dictate thoughts, reminders, or messages directly in Telegram voice notes.
+
+### 💬 Voice-to-WhatsApp Drafter (`projects/whatsapp-drafts/`)
+- **Dictate & Send**: Convert unstructured voice memos or text requests into clean, formatted WhatsApp messages.
+- **Contact Alias Resolution**: Resolve aliases (`mom`, `john`) from `data/contacts.json` and generate one-tap `wa.me` links.
+
+### ⏰ Natural Language Reminders (`projects/reminders/`)
+- **Timezone-Aware Scheduling**: Parse natural reminder times and store them in atomic JSON state (`~/.pa/reminders.json`).
+- **Automated Delivery**: Minute-cadence scheduler polling with automatic Telegram alerts and delivery receipts.
+
+### 📬 Daily Email Briefing (`projects/daily-mail-brief/`)
+- **Inbox Triage**: Authenticate via Google OAuth, fetch unseen emails, and categorize priority senders, newsletters, and receipts.
+- **AI Executive Summary**: Generates concise morning/evening digests sent directly to your Telegram topic.
+
+### 📊 Weekly Operations Digest (`pa/scripts/weekly_digest.py`)
+- **System Telemetry**: Aggregates skill run metrics, failure rates, worker cost rollups, and memory consolidation audits into an executive weekly briefing.
+
+---
+
+## 🏗️ Architecture (5 Layers)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  Communication       projects/telegram-bot/                 │
-│  (Telegram bot, forum topics, DLQ, conversation archive)    │
+│  1. Communication    projects/telegram-bot/                 │
+│  (Telegram bot, forum topics, voice STT, DLQ, archive)      │
 └────────────────────────┬────────────────────────────────────┘
                          │
 ┌────────────────────────┴────────────────────────────────────┐
-│  Skill substrate     ~/.pa/skills/<name>/skill.md           │
+│  2. Skill Substrate  ~/.pa/skills/<name>/skill.md           │
 │  (YAML frontmatter + Markdown body, PA_META action chain)   │
 └────────────────────────┬────────────────────────────────────┘
                          │
 ┌────────────────────────┴────────────────────────────────────┐
-│  Orchestrator        pa/src/{scheduler,blackboard,...}      │
+│  3. Orchestrator     pa/src/{scheduler,blackboard,...}      │
 │  (cron eval, locking, structured logging, dedup notify)     │
 └────────────────────────┬────────────────────────────────────┘
                          │
 ┌────────────────────────┴────────────────────────────────────┐
-│  Worker pool         pa/src/{workers,worker-exec,...}       │
-│  (claude/gemini/codex/zclaude/agy failover, rate-limit)     │
+│  4. Worker Pool      pa/src/{workers,worker-exec,...}       │
+│  (agy / claude / codex / zclaude failover, rate limits)     │
 └────────────────────────┬────────────────────────────────────┘
                          │
 ┌────────────────────────┴────────────────────────────────────┐
-│  Auth substrate      ~/.pa/google_auth.py + OAuth bridge    │
+│  5. Auth Substrate   ~/.pa/google_auth.py + OAuth bridge    │
 │  (desktop + Telegram/mobile Google OAuth recovery)          │
 └─────────────────────────────────────────────────────────────┘
-
-Domain projects (built on top): projects/daily-mail-brief/ — sample
 ```
 
-Full design: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for complete technical architecture documentation.
 
-## Quickstart (abbreviated)
+---
 
-```bash
-# Build (same on all platforms)
-cd pa && npm install && npm run build && cd ..
-cd projects/telegram-bot && npm install && npm run build && cd ../..
+## 📁 Repository Structure
 
-# Scaffold ~/.pa/
-node pa/dist/bin/pa.js init
+- **`pa/`** — Core CLI dispatcher and orchestrator: `pa run`, `pa list`, `pa schedules`, `pa health`, `pa notify`, `pa bot`.
+- **`projects/telegram-bot/`** — Long-poll Telegram bot with forum-topic support, voice note processing, DLQ, and graceful shutdown.
+- **`projects/whatsapp-drafts/`** — Voice/text dictation to polished WhatsApp drafts with `wa.me` action links.
+- **`projects/reminders/`** — Scheduled natural-language reminder system with atomic storage.
+- **`projects/daily-mail-brief/`** — Gmail triage → LLM summary → Telegram executive briefing.
+- **`projects/google-oauth-redirect/`** — Static bridge page for Telegram and mobile Google OAuth recovery.
+- **`.env.example`** & **`config.example.yaml`** — Root-level turnkey configuration templates for environment and workers.
+- **`examples/`** — Sample skills, OAuth helpers, and topic structures.
+- **`docs/`** — Detailed guides: quickstart, configuration, skills development, workers, and deployment.
 
-# ── Telegram setup (do this in the Telegram app first) ─────────────────────
-#
-# Option A — DM mode (simplest, no group needed):
-#   1. Message @BotFather → /newbot → follow prompts → copy the token
-#   2. Message @userinfobot → it replies with your numeric chat ID (positive number)
-#   3. Add both to ~/.pa/secrets.env:
-#        TELEGRAM_BOT_TOKEN=<token>
-#        TELEGRAM_CHAT_ID=<your personal chat id>
-#
-# Option B — Forum/topic mode (recommended: separate topics per skill/alert):
-#   1. Same as A step 1 — create a bot via @BotFather, copy the token
-#   2. Create a Telegram group → Settings → Group type → enable "Topics"
-#   3. Add your bot to the group as an admin (allow "Manage topics" permission)
-#   4. Get the group's chat ID: forward any group message to @userinfobot
-#      (it will be a negative number, e.g. -1001234567890)
-#   5. Add to ~/.pa/secrets.env:
-#        TELEGRAM_BOT_TOKEN=<token>
-#        TELEGRAM_CHAT_ID=<negative group id>
-#   6. After the bot is running (see below), run:
-#        node pa/dist/bin/pa.js bot setup-topics
-#      This auto-creates the topic structure (skills, alerts, coding, etc.)
-#      from examples/topics-template.json — no manual topic creation needed.
-#
-# ── LLM CLI config ──────────────────────────────────────────────────────────
-#
-# If your LLM CLIs (claude / gemini / codex) aren't in PATH, edit
-# ~/.pa/config.yaml and set the `command:` field to each CLI's absolute path.
+---
 
-# ── Choose your default LLM worker ──────────────────────────────────────────
-#
-# Run this to see which CLIs were found:
-node pa/dist/bin/pa.js workers
-#
-# If more than one shows as available, ask the user which they prefer.
-# Then open ~/.pa/config.yaml and move the preferred worker to the TOP of the
-# `workers:` list — the dispatcher always tries workers in order, so first = default.
-# (You can change the active agent per Telegram topic later with /agent <name> and its model with /model <name>.)
+## 💻 Platform Support
 
-# Copy a sample skill
-cp -r examples/skills/reminders ~/.pa/skills/          # macOS / Linux
-# Copy-Item -Recurse examples/skills/reminders ~/.pa/skills/   # Windows PowerShell
-
-# Verify
-node pa/dist/bin/pa.js list
-node pa/dist/bin/pa.js health
-
-# Register the catchup scheduler (all platforms)
-# Running a second install? Set PA_HOME first — see docs/CONFIGURATION.md#pa_home-env-var
-node pa/dist/bin/pa.js schedules sync
-
-# Run the bot
-bash projects/telegram-bot/run-bot.sh &               # macOS / Linux
-# pwsh projects/telegram-bot/run-bot.ps1              # Windows PowerShell
-```
-
-Detailed walkthrough: [`docs/QUICKSTART.md`](docs/QUICKSTART.md). For deployment patterns (simple fork vs dual-`.git`), see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
-
-## What's included
-
-- **`pa/`** — CLI dispatcher: `pa run`, `pa list`, `pa schedules`, `pa health`, `pa notify`, `pa bot restart`, `pa learn`, ...
-- **`projects/telegram-bot/`** — Long-poll Telegram bot with forum-topic support, conversation archive, DLQ, sentinel-based graceful shutdown.
-- **`projects/daily-mail-brief/`** — Reference sample: Gmail triage → LLM summary → Telegram + optional Obsidian archival.
-- **`projects/google-oauth-redirect/`** — Static bridge page for Telegram/mobile Google OAuth recovery.
-- **`examples/skills/`** — Three sample skills (`reminders`, `daily-mail-brief`, `update-brain`) demonstrating the full feature surface.
-- **`examples/oauth/`** — Google OAuth helpers (`google_auth.py`, `reauth_google.py`, resume-hook example, requirements, walkthrough README) for skills that need Gmail/Drive/Docs access.
-- **`examples/config.yaml.example`** + **`examples/secrets.env.example`** + **`examples/topics-template.json`** — annotated config templates.
-- **`docs/`** — Architecture, quickstart, configuration, skills guide, workers guide, bot guide, deployment, conventions, troubleshooting.
-
-## Status
-
-Substrate extracted from a working personal deployment. Conventions are stable; expect breakage if you build on top of internal/unstable APIs not documented in `docs/`.
-
-## Platform support
-
-The framework runs on **Windows, macOS, and Linux**. Platform-specific notes:
+The framework runs natively on **Windows, macOS, and Linux**.
 
 | Feature | Windows | macOS | Linux |
-|---------|---------|-------|-------|
-| Bot launcher | `run-bot.ps1` + Task Scheduler | `run-bot.sh` + launchd | `run-bot.sh` + systemd |
-| `pa schedules sync` | Windows Task Scheduler | crontab | crontab |
-| Process tree / bgtasks | PowerShell + CIM | `ps` / `pgrep` | `ps` / `pgrep` |
-| `/keepawake` | `SetThreadExecutionState` | `caffeinate -s` (built-in) | `systemd-inhibit` (requires systemd) |
+|---|---|---|---|
+| Bot Launcher | `run-bot.ps1` + Task Scheduler | `run-bot.sh` + launchd | `run-bot.sh` + systemd |
+| Scheduler Sync | Windows Task Scheduler (`pa schedules sync`) | `crontab` | `crontab` |
+| Background Tasks | PowerShell + CIM | `ps` / `pgrep` | `ps` / `pgrep` |
+| `/keepawake` | `SetThreadExecutionState` | `caffeinate -s` | `systemd-inhibit` |
 
-**Other POSIX (FreeBSD, Alpine, musl, etc.):** every OS-specific feature is self-describing when its underlying tool is absent. `pa schedules sync` throws an error naming `scheduler.ts:syncSchedules()` if `crontab` isn't installed. `pa bgtasks` warns once naming `process-tree.ts:getChildPids()` if `pgrep`/`ps` aren't found. `/keepawake` throws naming `keepawake.ts:startKeepAwake()` with the exact implementation contract. All three messages include reference implementations in the same file.
+For detailed per-OS installation instructions and troubleshooting, see [`docs/QUICKSTART.md`](docs/QUICKSTART.md) and [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md).
 
-See [`docs/QUICKSTART.md`](docs/QUICKSTART.md) for per-OS installation steps and [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) for platform-specific caveats (including the adaptation guide for unsupported OSes).
+---
 
-## License
+## 📄 License
 
 [MIT](LICENSE).

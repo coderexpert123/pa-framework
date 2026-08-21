@@ -336,6 +336,12 @@ export const KNOWN_CLI_DEFAULT_MODELS: Record<string, string> = {
   codex: 'gpt-5.4',
 };
 
+export const KNOWN_CLI_DEFAULT_EFFORTS: Record<string, string> = {
+  claude: 'high',
+  zclaude: 'high',
+  codex: 'medium',
+};
+
 /**
  * Convenience helper to resolve the active LLM (model setting) for a worker.
  * Checks session overrides, topic defaults, worker tunable default, static args pin,
@@ -358,6 +364,54 @@ export function resolveWorkerLlm(
   if (known) return known;
   if (Array.isArray(spec.values) && spec.values.length > 0) return spec.values[0];
   return 'cli default';
+}
+
+/**
+ * Convenience helper to resolve the active effort setting for a worker.
+ * Checks session overrides, topic defaults, worker tunable default, and static args pin.
+ */
+export function resolveWorkerEffort(
+  worker: WorkerConfig | undefined,
+  sessionOverrides?: TunableOverrides,
+  topicDefaults?: TunableOverrides,
+): string | undefined {
+  if (!worker) return undefined;
+  const resolved = resolveTunable(worker, 'effort', sessionOverrides, topicDefaults);
+  if (resolved?.value) return resolved.value;
+  const spec = getTunableSpec(worker, 'effort');
+  if (!spec) return undefined;
+  const pinned = extractTunableValues(spec, worker.args);
+  if (pinned.length > 0) return pinned[0];
+  if (spec.default) return spec.default;
+  const known = KNOWN_CLI_DEFAULT_EFFORTS[worker.name.toLowerCase()];
+  if (known) return known;
+  return undefined;
+}
+
+/**
+ * Format worker descriptor in Option B style:
+ * - Both model and effort: `worker (model) [effort]`
+ * - Model only: `worker (model)`
+ * - Effort only: `worker [effort]`
+ * - Neither: `worker`
+ */
+export function formatWorkerDescriptor(
+  worker: string,
+  model?: string,
+  effort?: string,
+): string {
+  const modelPart = model || KNOWN_CLI_DEFAULT_MODELS[worker.toLowerCase()];
+  const effortPart = effort || KNOWN_CLI_DEFAULT_EFFORTS[worker.toLowerCase()];
+  if (modelPart && effortPart) {
+    return `${worker} (${modelPart}) [${effortPart}]`;
+  }
+  if (modelPart) {
+    return `${worker} (${modelPart})`;
+  }
+  if (effortPart) {
+    return `${worker} [${effortPart}]`;
+  }
+  return worker;
 }
 
 /**

@@ -18,6 +18,7 @@ import {
   expirePreferredWorker,
   DEFAULT_SWITCH_PATTERN,
   handleDefaultQuery,
+  promoteSessionToTopicDefaults,
   CODE_PATTERN,
   parseCodeArgs,
   handleCodeCommand,
@@ -40,6 +41,7 @@ import {
   handleChildOfCommand,
   handleMergeCommand,
   renderStatusCard,
+  renderSessionExpiryMessage,
   resolveEffectiveDefaultWorker,
   buildModelStatusSnapshot,
   hydrateModelStatus,
@@ -62,6 +64,7 @@ import {
 } from '../logic.js';
 import type { PAMeta } from '../types.js';
 import type { ConversationState, BranchAncestry } from '../types.js';
+import type { WorkerConfig } from '../../../../pa/dist/src/types.js';
 
 function makeState(): ConversationState {
   return { chat_id: 1, last_update_id: 0, thread_id: 0, turns: [] };
@@ -1168,6 +1171,49 @@ describe('handleDefaultQuery', () => {
   it('does not match unrelated messages', () => {
     const result = handleDefaultQuery('hello');
     assert.equal(result.matched, false);
+  });
+});
+
+describe('promoteSessionToTopicDefaults', () => {
+  it('clears preferred_worker and copies session tunable overrides to topic defaults', () => {
+    const state = makeState();
+    state.preferred_worker = 'claude';
+    state.preferred_worker_set_at = new Date().toISOString();
+    state.tunable_overrides = {
+      claude: { model: 'opusplan', effort: 'high' }
+    };
+    state.tunable_overrides_set_at = {
+      'claude:model': new Date().toISOString(),
+      'claude:effort': new Date().toISOString(),
+    };
+
+    promoteSessionToTopicDefaults(state, 'claude');
+
+    assert.equal(state.preferred_worker, undefined);
+    assert.equal(state.preferred_worker_set_at, undefined);
+    assert.deepEqual(state.tunable_defaults, {
+      claude: { model: 'opusplan', effort: 'high' }
+    });
+    assert.equal(state.tunable_overrides, undefined);
+    assert.equal(state.tunable_overrides_set_at, undefined);
+  });
+
+  it('preserves other workers topic defaults when promoting', () => {
+    const state = makeState();
+    state.tunable_defaults = {
+      agy: { model: 'gemini-3.7-flash-high' }
+    };
+    state.tunable_overrides = {
+      claude: { model: 'sonnet' }
+    };
+
+    promoteSessionToTopicDefaults(state, 'claude');
+
+    assert.deepEqual(state.tunable_defaults, {
+      agy: { model: 'gemini-3.7-flash-high' },
+      claude: { model: 'sonnet' }
+    });
+    assert.equal(state.tunable_overrides, undefined);
   });
 });
 
@@ -2445,8 +2491,24 @@ describe('renderStatusCard', () => {
     assert.ok(card.includes('Current: agy (gemini-3.7-flash-high)'));
   });
 
-  it('hydrateModelStatus resolves LLM from workerConfig tunables and session/topic overrides', () => {
-    const workers = [
+  it('formats card with model and effort in Option B style: worker (model) [effort]', () => {
+    const card = renderStatusCard({
+      snapshot: buildModelStatusSnapshot({
+        currentWorker: 'claude',
+        defaultWorker: 'agy',
+        reasonCode: 'user_override',
+        currentLlm: 'opusplan',
+        currentEffort: 'high',
+        defaultLlm: 'gemini-3.7-flash-high',
+      }),
+      keepAwake: { active: false }
+    });
+    assert.ok(card.includes('Default: agy (gemini-3.7-flash-high)'));
+    assert.ok(card.includes('Current: claude (opusplan) [high]'));
+  });
+
+  it('hydrateModelStatus resolves LLM and effort from workerConfig tunables and session/topic overrides', () => {
+    const workers: WorkerConfig[] = [
       {
         name: 'agy',
         command: 'agy',
@@ -2463,7 +2525,10 @@ describe('renderStatusCard', () => {
         check: 'echo ok',
         rate_limit_patterns: [],
         priority: 2,
-        tunables: { model: { args: ['--model', '{value}'], default: 'opusplan' } },
+        tunables: {
+          model: { args: ['--model', '{value}'], default: 'opusplan' },
+          effort: { args: ['--effort', '{value}'], default: 'medium' }
+        },
       }
     ];
 
@@ -2472,20 +2537,30 @@ describe('renderStatusCard', () => {
     const snapAgy = hydrateModelStatus(state, 'agy', workers);
     assert.equal(snapAgy.current_llm, 'gemini-3.7-flash-high');
     assert.equal(snapAgy.default_llm, 'gemini-3.7-flash-high');
+    assert.equal(snapAgy.current_effort, undefined);
 
     // Default resolution from worker default tunable
     const snapClaude = hydrateModelStatus(state, 'claude', workers);
     assert.equal(snapClaude.current_llm, 'opusplan');
     assert.equal(snapClaude.default_llm, 'opusplan');
+    assert.equal(snapClaude.current_effort, 'medium');
+    assert.equal(snapClaude.default_effort, 'medium');
 
     // Resolution with session override
-    state.tunable_overrides = { agy: { model: 'gemini-3.6-flash-high' } };
+    state.tunable_overrides = {
+      agy: { model: 'gemini-3.6-flash-high' },
+      claude: { effort: 'high' },
+    };
     const snapOverride = hydrateModelStatus(state, 'agy', workers);
     assert.equal(snapOverride.current_llm, 'gemini-3.6-flash-high');
     assert.equal(snapOverride.default_llm, 'gemini-3.7-flash-high');
+
+    const snapClaudeOverride = hydrateModelStatus(state, 'claude', workers);
+    assert.equal(snapClaudeOverride.current_effort, 'high');
+    assert.equal(snapClaudeOverride.default_effort, 'medium');
   });
 
-  it('modelStatusNeedsRefresh detects changes in current_llm and default_llm', () => {
+  it('modelStatusNeedsRefresh detects changes in current_llm, default_llm, current_effort, and default_effort', () => {
     const snap1 = buildModelStatusSnapshot({
       currentWorker: 'agy',
       defaultWorker: 'agy',
@@ -2500,8 +2575,35 @@ describe('renderStatusCard', () => {
       currentLlm: 'gemini-3.6-flash-high',
       defaultLlm: 'gemini-3.7-flash-high',
     });
+    const snap3 = buildModelStatusSnapshot({
+      currentWorker: 'claude',
+      defaultWorker: 'claude',
+      reasonCode: 'default_active',
+      currentLlm: 'opusplan',
+      currentEffort: 'high',
+    });
+    const snap4 = buildModelStatusSnapshot({
+      currentWorker: 'claude',
+      defaultWorker: 'claude',
+      reasonCode: 'default_active',
+      currentLlm: 'opusplan',
+      currentEffort: 'max',
+    });
     assert.equal(modelStatusNeedsRefresh(snap1, snap2), true);
     assert.equal(modelStatusNeedsRefresh(snap1, snap1), false);
+    assert.equal(modelStatusNeedsRefresh(snap3, snap4), true);
+  });
+});
+
+describe('renderSessionExpiryMessage', () => {
+  it('formats cleared message for manual /reset', () => {
+    const msg = renderSessionExpiryMessage('claude (opusplan) [high]', 'agy (gemini-3.7-flash-high)', 'cleared');
+    assert.equal(msg, '🔄 Session overrides cleared: claude (opusplan) [high] → agy (gemini-3.7-flash-high).');
+  });
+
+  it('formats expired message for midnight auto-expiry', () => {
+    const msg = renderSessionExpiryMessage('claude (opusplan) [high]', 'agy (gemini-3.7-flash-high)', 'expired');
+    assert.equal(msg, '🔄 Session overrides expired: claude (opusplan) [high] → agy (gemini-3.7-flash-high).');
   });
 });
 

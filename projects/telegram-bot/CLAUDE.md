@@ -45,18 +45,18 @@ action envelope for cross-skill triggering.
 - **Agent & Model switching**: `/agent zclaude`, `/agent claude`, `/agent codex`,
   `/agent agy`, `/agent agyc` sets `preferred_worker` for the topic (session-scoped, expires at IST
   midnight; legacy `/model <agent>` is backward-compatible with a tip).
-- **Uniform tunables** (`logic.ts`): `/model <value>` and `/effort <value>` are
+- **Uniform tunables & Option B descriptors** (`logic.ts`, `main.ts`): `/model <value>` and `/effort <value>` are
   CLI-agnostic session-scoped settings (`TUNABLE_COMMAND_SETTINGS` maps
-  the uniform word to each CLI's real setting name); `/default <setting> <value>` sets
-  the same setting as a PERSISTENT topic default — extends the pre-existing `/default
-  <worker>` (or `/default agent <worker>`) syntax (the agent-name form, `DEFAULT_SWITCH_PATTERN`, is checked first and
-  always wins). Resolution cascade: session override → topic default → worker's own
-  default → CLI built-in. Per-CLI translation lives in `~/.pa/config.yaml`'s
-  `tunables.<name>.args` as an ARG TEMPLATE (`{value}` substituted, not flag+value — some
-  CLIs need a different shape, e.g. codex: `-c model_reasoning_effort={value}`); a
-  `supersedes:` field marks mutually-exclusive knobs (agy's `model` supersedes `effort`).
-  Clear/reset tokens: `clear`, `reset`, `default`, `unset`, `-`. Tested in
-  `tunables-commands.test.ts` + `dashboard.test.ts`.
+  the uniform word to each CLI's real setting name); `/default` (without arguments) promotes current
+  active session configuration (agent, model, effort) directly to persistent topic defaults. `/default <setting> <value>`
+  or `/default <worker>` sets specific topic defaults. Pinned status cards use Option B format:
+  `agent (model) [effort]` (e.g. `claude (opusplan) [high]`, `zclaude (glm-5.3) [high]`, `codex (gpt-5.4) [medium]`, `agy (gemini-3.7-flash-high)`).
+  All command switches and midnight expiry sweeps update the pinned status card in-place (`editMessageText`) rather than reposting,
+  while interactive commands and midnight expiry emit concise before → now change replies.
+  Resolution cascade: session override → topic default → worker's own default → CLI built-in (`KNOWN_CLI_DEFAULT_MODELS`, `KNOWN_CLI_DEFAULT_EFFORTS`).
+  Per-CLI translation lives in `~/.pa/config.yaml`'s `tunables.<name>.args` as an ARG TEMPLATE (`{value}` substituted);
+  `supersedes:` marks mutually-exclusive knobs. Clear/reset tokens: `clear`, `reset`, `default`, `unset`, `-`. Tested in
+  `tunables-commands.test.ts`, `logic.test.ts`, `dashboard.test.ts`.
 - **Deterministic command interception (2026-08-18)**: `/new`, `/code`, `/status`, `/skills`, `/help`, `/health`, `/ref <id>`, `/claims` are intercepted locally in `processUpdate` before worker dispatch (`/new` resets context & optionally seeds from replied ref-ID, `/code` validates and manages topic cwd_override). Tested in `logic.test.ts` + `poll-loop.test.ts`.
 - **Auto Topic Descriptions (2026-08-20)**: Topic descriptions auto-set immediately upon creation (manual topics via `forum_topic_created` and branch topics via `/branch <name> [prompt]`) via LLM with deterministic fallbacks, without interactive confirmation (`main.ts`, `logic.ts`).
 - **Telegram-driven Google OAuth reauth**: `/auth <code> [state]` is intercepted before

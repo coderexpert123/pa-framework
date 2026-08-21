@@ -9,6 +9,8 @@
 !/.github/
 !/README.md
 !/LICENSE
+!/.env.example
+!/config.example.yaml
 !/docs/
 !/examples/
 !/pa/
@@ -19,6 +21,8 @@ projects/*
 !projects/telegram-bot/
 !projects/daily-mail-brief/
 !projects/google-oauth-redirect/
+!projects/whatsapp-drafts/
+!projects/reminders/
 
 # Inside pa/: exclude personal/build/private artifacts
 pa/data/
@@ -51,22 +55,32 @@ projects/telegram-bot/bot-instructions.md
 projects/telegram-bot/run-bot-hidden.vbs
 projects/telegram-bot/test_repro.mjs
 
-# Inside projects/daily-mail-brief/: track only scripts + README + requirements
+# Inside projects/daily-mail-brief/: track only scripts + README + requirements + config template
 projects/daily-mail-brief/*
 !projects/daily-mail-brief/README.md
 !projects/daily-mail-brief/requirements.txt
+!projects/daily-mail-brief/config.example.json
 !projects/daily-mail-brief/scripts/
 # Exclude personal one-off email helpers (hardcoded recipient/subject/body)
 projects/daily-mail-brief/scripts/draft_reply.py
 
-# Inside projects/whatsapp-drafts/: track only code + docs; the contact
-# directory is a personal-data cache that NEVER ships (regenerable via
-# import_google.py; see private .gitignore rationale).
+# Inside projects/whatsapp-drafts/: track code, docs, tests, and example contact data
 projects/whatsapp-drafts/*
 !projects/whatsapp-drafts/README.md
 !projects/whatsapp-drafts/INSTRUCTIONS.md
 !projects/whatsapp-drafts/scripts/
 !projects/whatsapp-drafts/tests/
+!projects/whatsapp-drafts/data/
+projects/whatsapp-drafts/data/*
+!projects/whatsapp-drafts/data/README.md
+!projects/whatsapp-drafts/data/contacts.example.json
+
+# Inside projects/reminders/: track code, docs, and tests
+projects/reminders/*
+!projects/reminders/README.md
+!projects/reminders/add_reminder.py
+!projects/reminders/process_reminders.py
+!projects/reminders/tests/
 
 # Universal noise excludes
 **/__pycache__/
