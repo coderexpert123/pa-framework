@@ -99,6 +99,8 @@ export interface ModelStatusSnapshot {
   changed_at: string;
   current_llm?: string;
   default_llm?: string;
+  current_effort?: string;
+  default_effort?: string;
 }
 
 export interface ConversationState {

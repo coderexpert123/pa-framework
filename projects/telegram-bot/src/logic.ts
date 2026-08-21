@@ -9,14 +9,18 @@ import { getSkillTranslationPatterns } from '../../../pa/dist/src/lib/skill-tran
 export {
   KNOWN_CLI_DEFAULT_MODELS,
   resolveWorkerLlm,
+  resolveWorkerEffort,
+  formatWorkerDescriptor,
   selectWorkerTunables,
 };
 import {
   KNOWN_CLI_DEFAULT_MODELS,
   TUNABLE_TIER_LABELS,
   declaredValues,
+  formatWorkerDescriptor,
   normalizeTunableName,
   resolveWorkerLlm,
+  resolveWorkerEffort,
   selectWorkerTunables,
   setWorkerTunable,
   type ResolvedTunable,
@@ -151,6 +155,8 @@ export function buildModelStatusSnapshot(args: {
   reasonText?: string;
   currentLlm?: string;
   defaultLlm?: string;
+  currentEffort?: string;
+  defaultEffort?: string;
 }): ModelStatusSnapshot {
   let defaultWorker = args.defaultWorker;
   if (defaultWorker === 'gemini') defaultWorker = 'agy';
@@ -165,6 +171,8 @@ export function buildModelStatusSnapshot(args: {
     changed_at: args.changedAt ?? new Date().toISOString(),
     ...(args.currentLlm ? { current_llm: args.currentLlm } : {}),
     ...(args.defaultLlm ? { default_llm: args.defaultLlm } : {}),
+    ...(args.currentEffort ? { current_effort: args.currentEffort } : {}),
+    ...(args.defaultEffort ? { default_effort: args.defaultEffort } : {}),
   };
 }
 
@@ -190,11 +198,17 @@ export function hydrateModelStatus(
   const currentLlm = (currentWorkerConfig
     ? resolveWorkerLlm(currentWorkerConfig, selectWorkerTunables(state.tunable_overrides, currentWorker), selectWorkerTunables(state.tunable_defaults, currentWorker))
     : undefined) ?? state.model_status?.current_llm;
+  const currentEffort = (currentWorkerConfig
+    ? resolveWorkerEffort(currentWorkerConfig, selectWorkerTunables(state.tunable_overrides, currentWorker), selectWorkerTunables(state.tunable_defaults, currentWorker))
+    : undefined) ?? state.model_status?.current_effort;
 
   const defaultWorkerConfig = workers?.find((w) => w.name === normDefaultWorker);
   const defaultLlm = (defaultWorkerConfig
     ? resolveWorkerLlm(defaultWorkerConfig, undefined, selectWorkerTunables(state.tunable_defaults, normDefaultWorker))
     : undefined) ?? state.model_status?.default_llm;
+  const defaultEffort = (defaultWorkerConfig
+    ? resolveWorkerEffort(defaultWorkerConfig, undefined, selectWorkerTunables(state.tunable_defaults, normDefaultWorker))
+    : undefined) ?? state.model_status?.default_effort;
 
   if (state.model_status) {
     return {
@@ -205,6 +219,8 @@ export function hydrateModelStatus(
       changed_at: state.model_status.changed_at || state.preferred_worker_set_at || new Date().toISOString(),
       ...(currentLlm ? { current_llm: currentLlm } : {}),
       ...(defaultLlm ? { default_llm: defaultLlm } : {}),
+      ...(currentEffort ? { current_effort: currentEffort } : {}),
+      ...(defaultEffort ? { default_effort: defaultEffort } : {}),
     };
   }
 
@@ -215,6 +231,8 @@ export function hydrateModelStatus(
     changedAt: state.preferred_worker_set_at,
     currentLlm,
     defaultLlm,
+    currentEffort,
+    defaultEffort,
   });
 }
 
@@ -228,7 +246,9 @@ export function modelStatusNeedsRefresh(
     || previous.reason_code !== next.reason_code
     || previous.reason_text !== next.reason_text
     || previous.current_llm !== next.current_llm
-    || previous.default_llm !== next.default_llm;
+    || previous.default_llm !== next.default_llm
+    || previous.current_effort !== next.current_effort
+    || previous.default_effort !== next.default_effort;
 }
 
 /**
@@ -237,11 +257,8 @@ export function modelStatusNeedsRefresh(
  */
 export function renderStatusCard(args: StatusCardArgs): string {
   const { snapshot, keepAwake } = args;
-  const defaultModel = snapshot.default_llm || KNOWN_CLI_DEFAULT_MODELS[snapshot.default_worker];
-  const currentModel = snapshot.current_llm || KNOWN_CLI_DEFAULT_MODELS[snapshot.current_worker];
-
-  const defaultLabel = defaultModel ? `${snapshot.default_worker} (${defaultModel})` : snapshot.default_worker;
-  const currentLabel = currentModel ? `${snapshot.current_worker} (${currentModel})` : snapshot.current_worker;
+  const defaultLabel = formatWorkerDescriptor(snapshot.default_worker, snapshot.default_llm, snapshot.default_effort);
+  const currentLabel = formatWorkerDescriptor(snapshot.current_worker, snapshot.current_llm, snapshot.current_effort);
 
   const lines = [
     '📌 Topic Status',
@@ -959,6 +976,25 @@ export function clearSessionTunables(state: ConversationState): boolean {
   return had;
 }
 
+/**
+ * Promote active session configuration (preferred_worker and session tunable overrides)
+ * to persistent topic-tier defaults.
+ */
+export function promoteSessionToTopicDefaults(state: ConversationState, currentWorker: string): void {
+  state.preferred_worker = undefined;
+  state.preferred_worker_set_at = undefined;
+
+  const overrides = state.tunable_overrides?.[currentWorker];
+  if (overrides) {
+    for (const [setting, value] of Object.entries(overrides)) {
+      if (value) {
+        setTopicTunable(state, currentWorker, setting, value);
+        setSessionTunable(state, currentWorker, setting, undefined);
+      }
+    }
+  }
+}
+
 function formatTunableValue(resolved: ResolvedTunable | undefined): string {
   return resolved?.value ?? '(none — the CLI picks)';
 }
@@ -1075,13 +1111,18 @@ export interface TunableSetResultInput {
   known: boolean;             // isKnownValue(spec, value) — a NOTE, never a rejection
   args: string[];             // exactly what will be appended to the worker command
   resolved?: ResolvedTunable; // resolution AFTER the set — carries any supersede outcome
+  previousDescriptor?: string;
+  currentDescriptor?: string;
 }
 
 export function renderTunableSetResult(input: TunableSetResultInput): string {
   const lifetime = input.scope === 'session'
     ? 'until midnight IST'
     : 'topic default — persists';
-  const lines = [`${input.setting} → *${input.value}* on ${input.worker} (${lifetime}).`];
+  const header = input.previousDescriptor && input.currentDescriptor
+    ? `Switched ${input.setting}: ${input.previousDescriptor} → ${input.currentDescriptor} (${lifetime}).`
+    : `${input.setting} → *${input.value}* on ${input.worker} (${lifetime}).`;
+  const lines = [header];
   if (!input.known) {
     lines.push(`⚠️ Not a known value for ${input.worker} — passing through anyway.`);
   }
@@ -1098,18 +1139,35 @@ export interface TunableClearResultInput {
   scope: TunableScope;
   resolved?: ResolvedTunable;   // resolution AFTER the clear — what it falls back to
   pinned?: string[];            // value baked into the worker's static args, if any
+  previousDescriptor?: string;
+  currentDescriptor?: string;
 }
 
 export function renderTunableClearResult(input: TunableClearResultInput): string {
-  const tier = input.resolved?.tier ?? 'cli';
   const scopeLabel = input.scope === 'session' ? 'session override' : 'topic default';
+  const tier = input.resolved?.tier ?? 'cli';
   const pinned = (input.pinned ?? []).filter(Boolean);
   // Same honesty rule as the report: falling back to "nothing" still means
   // `--model opusplan` on a worker that pins one in config.yaml.
   const now = tier === 'cli' && pinned.length > 0
     ? `${pinned[0]} (this worker's fixed args in config.yaml)`
     : `${formatTunableValue(input.resolved)} (${TUNABLE_TIER_LABELS[tier]})`;
+  if (input.previousDescriptor && input.currentDescriptor) {
+    return `Cleared ${scopeLabel} for ${input.setting}: ${input.previousDescriptor} → ${input.currentDescriptor}.\nNow: ${now}.`;
+  }
   return `Cleared ${scopeLabel} for ${input.setting} on ${input.worker}.\nNow: ${now}.`;
+}
+
+/**
+ * Render notification when session overrides are cleared manually via /reset or expired at midnight IST.
+ */
+export function renderSessionExpiryMessage(
+  previousDescriptor: string,
+  currentDescriptor: string,
+  reason: 'cleared' | 'expired' = 'cleared'
+): string {
+  const action = reason === 'expired' ? 'expired' : 'cleared';
+  return `🔄 Session overrides ${action}: ${previousDescriptor} → ${currentDescriptor}.`;
 }
 
 /**

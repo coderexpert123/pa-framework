@@ -1,0 +1,14 @@
+{
+  "contacts": [
+    {
+      "alias": "mom",
+      "phone": "+001234567890",
+      "display_name": "Mom"
+    },
+    {
+      "alias": "john",
+      "phone": "+001234567891",
+      "display_name": "John Doe"
+    }
+  ]
+}
