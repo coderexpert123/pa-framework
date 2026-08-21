@@ -1,3 +1,4 @@
+# pii-scan:ignore-start
 import unittest
 import json
 import os
@@ -300,3 +301,4 @@ class TestImportGoogle(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+# pii-scan:ignore-end

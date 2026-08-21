@@ -1,3 +1,4 @@
+// pii-scan:ignore-start
 /**
  * Tests for log.ts redaction integration
  *
@@ -140,3 +141,4 @@ TOKEN=xyz9876543211234567890abcdefghij
     assert.equal(logEntry.data.text, 'short word abc123');
   });
 });
+// pii-scan:ignore-end

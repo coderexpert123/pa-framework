@@ -1,3 +1,4 @@
+// pii-scan:ignore-start
 /**
  * Tests for telegram.ts redaction integration
  *
@@ -165,3 +166,4 @@ describe('telegram.ts redaction', () => {
     mockFetch.mock.restore();
   });
 });
+// pii-scan:ignore-end

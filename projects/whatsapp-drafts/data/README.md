@@ -9,7 +9,7 @@ This directory stores `contacts.json` — the contact registry for WhatsApp draf
   "contacts": [
     {
       "alias": "mom",
-      "phone": "+919876543210"
+      "phone": "+001234567890"
     }
   ]
 }

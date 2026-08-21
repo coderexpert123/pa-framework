@@ -1,3 +1,4 @@
+# pii-scan:ignore-start
 import unittest
 import os
 import json
@@ -19,8 +20,8 @@ class TestBuildLink(unittest.TestCase):
             json.dump({'contacts': [
                 {'alias': 'mom', 'phone': '+919876543210', 'display_name': 'Jane Smith'},
                 {'alias': 'dad', 'phone': '+15555555555', 'display_name': 'John Smith'},
-                {'alias': 'hema1', 'phone': '+919876543211', 'display_name': 'Hema Shah'},
-                {'alias': 'hema2', 'phone': '+919876543212', 'display_name': 'Hema Patel'}
+                {'alias': 'helen1', 'phone': '+919876543211', 'display_name': 'Helen Shaw'},
+                {'alias': 'helen2', 'phone': '+919876543212', 'display_name': 'Helen Price'}
             ]}, f)
         self.script_path = os.path.join(script_dir, 'build_link.py')
 
@@ -76,7 +77,7 @@ class TestBuildLink(unittest.TestCase):
     def test_multiple_word_name_query(self):
         """Test multiple word name query works."""
         draft = "Hello"
-        result = self.run_build_link(['hema', 'shah'], draft)
+        result = self.run_build_link(['helen', 'shaw'], draft)
         self.assertEqual(result.returncode, 0)
         output = result.stdout.strip()
         self.assertIn('wa.me', output)
@@ -85,7 +86,7 @@ class TestBuildLink(unittest.TestCase):
     def test_digit_hint_disambiguation(self):
         """Test digit hint disambiguates between similar names."""
         draft = "Hello"
-        result = self.run_build_link(['hema', '3211'], draft)
+        result = self.run_build_link(['helen', '3211'], draft)
         self.assertEqual(result.returncode, 0)
         output = result.stdout.strip()
         self.assertIn('wa.me', output)
@@ -94,7 +95,7 @@ class TestBuildLink(unittest.TestCase):
     def test_digit_hint_trailing_position(self):
         """Test digit hint can be in trailing position."""
         draft = "Hello"
-        result = self.run_build_link(['hema', 'shah', '3211'], draft)
+        result = self.run_build_link(['helen', 'shaw', '3211'], draft)
         self.assertEqual(result.returncode, 0)
         output = result.stdout.strip()
         self.assertIn('wa.me', output)
@@ -103,11 +104,11 @@ class TestBuildLink(unittest.TestCase):
     def test_ambiguous_contact_exit_2(self):
         """Test ambiguous contact returns exit code 2 and lists candidates."""
         draft = "Hello"
-        result = self.run_build_link(['hema'], draft)
+        result = self.run_build_link(['helen'], draft)
         self.assertEqual(result.returncode, 2)
         self.assertIn('Ambiguous', result.stderr)
-        self.assertIn('Hema Shah', result.stderr)
-        self.assertIn('Hema Patel', result.stderr)
+        self.assertIn('Helen Shaw', result.stderr)
+        self.assertIn('Helen Price', result.stderr)
 
     def test_no_match_exit_1_with_candidates(self):
         """Test no match returns exit 1 and lists close candidates."""
@@ -207,3 +208,4 @@ class TestBuildLink(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+# pii-scan:ignore-end

@@ -1,3 +1,4 @@
+// pii-scan:ignore-start
 /**
  * Tests for logic.ts redaction integration
  *
@@ -130,3 +131,4 @@ describe('logic.ts redaction', () => {
     assert.ok(response.includes('<redacted:TOKEN>'));
   });
 });
+// pii-scan:ignore-end

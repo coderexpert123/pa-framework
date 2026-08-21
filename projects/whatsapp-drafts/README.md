@@ -12,8 +12,8 @@ The bot does NOT send on your behalf — the final Send tap is yours (show-befor
 
 Contacts are stored in `data/contacts.json` (gitignored). Add contacts via:
 
-1. **In the whatsapp-drafts topic**: Say "add contact mom +919876543210"
-2. **Directly via script**: `python scripts/contacts.py add mom +919876543210`
+1. **In the whatsapp-drafts topic**: Say "add contact mom +001234567890"
+2. **Directly via script**: `python scripts/contacts.py add mom +001234567890`
 
 Phone format: `+` followed by 8-15 digits (full international format).
 

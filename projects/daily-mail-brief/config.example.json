@@ -1,22 +1,22 @@
 {
   "sender_categories": {
     "newsletters": [
-      "newsletter@techcrunch.com",
-      "tldr@tldrnewsletter.com",
-      "news@morningbrew.com"
+      "newsletter@news.example.com",
+      "digest@tech.example.com",
+      "news@daily.example.com"
     ],
     "financial": [
       "alerts@bank.example.com",
       "statements@brokerage.example.com"
     ],
     "receipts": [
-      "auto-confirm@amazon.com",
-      "orders@store.example.com"
+      "auto-confirm@store.example.com",
+      "orders@shop.example.com"
     ]
   },
   "priority_senders": [
-    "boss@company.com",
-    "partner@family.com"
+    "boss@company.example.com",
+    "partner@family.example.com"
   ],
   "ignore_senders": [
     "marketing@promo.example.com",

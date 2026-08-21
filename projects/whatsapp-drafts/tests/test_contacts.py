@@ -1,3 +1,4 @@
+# pii-scan:ignore-start
 import unittest
 import os
 import json
@@ -182,3 +183,4 @@ class TestContacts(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+# pii-scan:ignore-end

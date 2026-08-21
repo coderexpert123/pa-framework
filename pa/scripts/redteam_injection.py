@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# pii-scan:ignore-start
 """
 Prompt-injection redteam regression test — deterministic fixture corpus.
 
@@ -409,3 +410,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+# pii-scan:ignore-end

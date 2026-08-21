@@ -25,11 +25,11 @@ function makeState(): ConversationState {
 describe('buildPrompt attachments (WPE3)', () => {
   it('renders an Attachments section with the spec-exact line format', async () => {
     const prompt = await buildPrompt('summarize this', makeState(), undefined, undefined, undefined, {
-      attachments: [{ filename: 'report.pdf', path: 'C:/Users/mockuser/.pa/attachments/-1001234567890/2026-08-18/x.pdf' }],
+      attachments: [{ filename: 'report.pdf', path: '/home/user/.pa/attachments/-1001234567890/2026-08-18/x.pdf' }],
     });
     assert.ok(prompt.includes('## Attachments'), 'section present');
     assert.ok(
-      prompt.includes('[Attachment: report.pdf at C:/Users/mockuser/.pa/attachments/-1001234567890/2026-08-18/x.pdf]'),
+      prompt.includes('[Attachment: report.pdf at /home/user/.pa/attachments/-1001234567890/2026-08-18/x.pdf]'),
       'spec-exact injection line',
     );
   });
