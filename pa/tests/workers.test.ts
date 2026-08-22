@@ -673,6 +673,71 @@ describe('runWithFailover', () => {
     assert.equal(worker, 'backup');
   });
 
+  // manual_only (2026-08-21, operator directive: agyc manual-only): the worker
+  // is invisible to automatic failover but runs when explicitly named.
+  it('skips manual_only workers during automatic failover', async () => {
+    const manualScript = await writeScript('manual-only.js', 'process.stdout.write("from manual");');
+    const autoScript = await writeScript('auto-backup.js', 'process.stdout.write("from auto");');
+    await createTempConfig(tempDir, [
+      { name: 'manual', command: 'node', args: [manualScript], check: 'echo ok', priority: 1, manual_only: true },
+      { name: 'auto', command: 'node', args: [autoScript], check: 'echo ok', priority: 2 },
+    ]);
+    const { result, worker } = await runWithFailover('unused', { timeout: 10 });
+    assert.equal(result.success, true);
+    assert.equal(worker, 'auto'); // manual was skipped despite priority 1
+    assert.ok(result.output.includes('from auto'));
+  });
+
+  it('runs a manual_only worker when preferredWorker names it', async () => {
+    const manualScript = await writeScript('manual-picked.js', 'process.stdout.write("picked manually");');
+    await createTempConfig(tempDir, [
+      { name: 'manual', command: 'node', args: [manualScript], check: 'echo ok', priority: 1, manual_only: true },
+    ]);
+    const { result, worker } = await runWithFailover('unused', { timeout: 10, preferredWorker: 'manual' });
+    assert.equal(result.success, true);
+    assert.equal(worker, 'manual');
+  });
+
+  // requireNonEmptyOutput (2026-08-21): a telegram_output dispatch must not
+  // accept exit-0-with-empty-output as success — it fails over so another
+  // worker can answer (the isSilentNoOp class, moved into the cascade).
+  it('fails over on exit-0-empty-output when requireNonEmptyOutput is set', async () => {
+    const silentScript = await writeScript('silent-noop.js', 'process.exit(0);');
+    const backupScript = await writeScript('speaks.js', 'process.stdout.write("real reply");');
+    await createTempConfig(tempDir, [
+      { name: 'silent', command: 'node', args: [silentScript], check: 'echo ok', priority: 1 },
+      { name: 'backup', command: 'node', args: [backupScript], check: 'echo ok', priority: 2 },
+    ]);
+    const { result, worker } = await runWithFailover('unused', { timeout: 10, requireNonEmptyOutput: true });
+    assert.equal(result.success, true);
+    assert.equal(worker, 'backup');
+    assert.ok(result.output.includes('real reply'));
+  });
+
+  it('exit-0-empty-output stays a success when requireNonEmptyOutput is not set', async () => {
+    const silentScript = await writeScript('silent-ok.js', 'process.exit(0);');
+    const backupScript = await writeScript('never-reached.js', 'process.stdout.write("should not run");');
+    await createTempConfig(tempDir, [
+      { name: 'silent', command: 'node', args: [silentScript], check: 'echo ok', priority: 1 },
+      { name: 'backup', command: 'node', args: [backupScript], check: 'echo ok', priority: 2 },
+    ]);
+    const { result, worker } = await runWithFailover('unused', { timeout: 10 });
+    assert.equal(result.success, true);
+    assert.equal(worker, 'silent'); // non-telegram_output dispatches are unaffected
+  });
+
+  it('NO_OUTPUT sentinel passes the requireNonEmptyOutput check', async () => {
+    const sentinelScript = await writeScript('sentinel.js', 'process.stdout.write("NO_OUTPUT");');
+    const backupScript = await writeScript('unused-backup.js', 'process.stdout.write("should not run");');
+    await createTempConfig(tempDir, [
+      { name: 'sentinel', command: 'node', args: [sentinelScript], check: 'echo ok', priority: 1 },
+      { name: 'backup', command: 'node', args: [backupScript], check: 'echo ok', priority: 2 },
+    ]);
+    const { result, worker } = await runWithFailover('unused', { timeout: 10, requireNonEmptyOutput: true });
+    assert.equal(result.success, true);
+    assert.equal(worker, 'sentinel'); // explicit "nothing to send" is a valid success
+  });
+
   it('evaluates getExtraArgs dynamically for each candidate worker during failover', async () => {
     const brokenScript = await writeScript('failover-w1.js', 'process.stderr.write("error"); process.exit(1);');
     const backupScript = await writeScript('failover-w2.js', 'process.stdout.write(JSON.stringify(process.argv.slice(2)));');

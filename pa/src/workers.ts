@@ -224,6 +224,17 @@ export async function runWithFailover(
   for (let i = 0; i < workers.length; i++) {
     const worker = workers[i];
 
+    // 0b. manual_only workers never receive automatic failover traffic — they
+    // run only when this dispatch EXPLICITLY names them (preferredWorker from
+    // a bot /agent pick or a skill's `worker:` frontmatter, or a global
+    // worker_pin). (2026-08-21, operator directive: agyc manual-only.)
+    if (worker.manual_only
+        && options.preferredWorker !== worker.name
+        && config.worker_pin !== worker.name) {
+      logger.info('workers', `skip: ${worker.name} — manual_only (not explicitly selected)`, ctx);
+      continue;
+    }
+
     // 0a. Caller abandoned the request — stop, do NOT hand it to another worker.
     // Returns the last real result so the caller still sees a failed dispatch
     // (its own reply path swaps in the cancellation confirmation), and skips
@@ -289,6 +300,34 @@ export async function runWithFailover(
     finalWorkerName = worker.name;
 
     if (result.success) {
+      // Silent no-op failover (2026-08-21): a dispatch that MUST deliver
+      // (requireNonEmptyOutput — run.ts sets it for telegram_output skills)
+      // treats exit-0-with-empty-output as a failure of THIS worker and moves
+      // on, instead of returning a "success" that run.ts can only reclassify
+      // after the cascade has already ended. The NO_OUTPUT sentinel is
+      // non-empty and passes.
+      if (options.requireNonEmptyOutput && (!result.output || !result.output.trim())) {
+        logger.warn('workers', `silent no-op: ${worker.name} exited 0 with empty output — failing over`, ctx);
+        if (options.onWorkerSwitch) {
+          let nextWorker: WorkerConfig | undefined;
+          for (let j = i + 1; j < workers.length; j++) {
+            const w = workers[j];
+            if (!(await isWorkerCoolingDown(w.name)) && (await checkWorker(w, allSecrets)) && (options.checkAvailable ? await options.checkAvailable(w) : true)) {
+              nextWorker = w;
+              break;
+            }
+          }
+          const payload: FailoverNotifyPayload = {
+            from: worker.name,
+            to: nextWorker?.name ?? null,
+            kind: 'failure',
+            reasonText: 'exit:0 — empty output (silent no-op)',
+          };
+          await options.onWorkerSwitch(payload);
+          switchEvents.push({ from: worker.name, to: nextWorker?.name ?? 'none', reason: payload.reasonText });
+        }
+        continue;
+      }
       return { result, worker: worker.name };
     }
 

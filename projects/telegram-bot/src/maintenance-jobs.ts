@@ -26,6 +26,70 @@ import {
 } from '../../../pa/dist/src/lib/maintenance/jobs/index.js';
 import { loadJobState, updateJobState } from '../../../pa/dist/src/lib/maintenance/state.js';
 
+// ─── Registry Content Watch Invariants ─────────────────────────────────────────────
+
+/**
+ * Content invariants for topic-name descriptions.
+ * Each invariant asserts a required condition for a specific topic's description.
+ * Future migrations add lines in one place (this array) — extensible.
+ */
+const REGISTRY_CONTENT_INVARIANTS = [
+  {
+    topicKey: 'whatsapp-drafts',
+    threadId: 9855,
+    test: (desc: string | undefined) => desc?.includes('INSTRUCTIONS.md') ?? false,
+    label: 'Path-0 pointer',
+  },
+  {
+    topicKey: 'pa-alerts',
+    threadId: 3376,
+    test: (desc: string | undefined) => !desc?.includes('Palo Alto'),
+    label: 'no hallucinated gloss',
+  },
+  {
+    topicKey: 'ekadashi',
+    threadId: 7822,
+    test: (desc: string | undefined) => desc?.includes('Sources.md') ?? false,
+    label: 'deterministic routing gate',
+  },
+] as const;
+
+export interface RegistryContentViolation {
+  topicKey: string;
+  threadId: number;
+  invariantLabel: string;
+  description: string | undefined;
+}
+
+/**
+ * Pure check function for registry content invariants.
+ * Returns a list of violations (empty if all pass). Exported for tests.
+ */
+export function checkRegistryContentInvariants(topicNames: TopicNameMap): RegistryContentViolation[] {
+  const violations: RegistryContentViolation[] = [];
+  for (const inv of REGISTRY_CONTENT_INVARIANTS) {
+    let found = false;
+    for (const [chatId, threads] of topicNames.entries()) {
+      const entry = threads.get(inv.threadId);
+      if (entry && entry.name === inv.topicKey) {
+        found = true;
+        if (!inv.test(entry.description)) {
+          violations.push({
+            topicKey: inv.topicKey,
+            threadId: inv.threadId,
+            invariantLabel: inv.label,
+            description: entry.description,
+          });
+        }
+        break;
+      }
+    }
+    // If topic not found, we can't test it — skip (don't alert on missing topics,
+    // only on present-but-violating ones)
+  }
+  return violations;
+}
+
 export interface BotMaintenanceDeps {
   /** Telegram bot token — needed by dlq-flush and proxy-pool-refresh. */
   token: string;
@@ -167,12 +231,37 @@ export function createBotMaintenanceJobs(deps: BotMaintenanceDeps): MaintenanceJ
     },
   };
 
+  const boundRegistryContentWatch: MaintenanceJob = {
+    name: 'registry-content-watch',
+    description: 'Daily content invariants for topic descriptions — watches Path-0 pointer (whatsapp-drafts), no Palo Alto hallucination (pa-alerts), routing gate (ekadashi). Non-destructive — reads and alerts only.',
+    host: 'bot',
+    everyMs: 86_400_000, // daily
+    shedWhenDegraded: true,
+    destructive: false,
+    targets: [], // non-destructive — reads and alerts only
+    async run() {
+      const violations = checkRegistryContentInvariants(deps.topicNames);
+      if (violations.length > 0) {
+        const body = violations
+          .map((v) => `${v.topicKey} (${v.threadId}): failed invariant "${v.invariantLabel}" — description: "${v.description?.slice(0, 120) ?? '(empty)'}"`)
+          .join('\n');
+        logger.warn('maintenance', `${violations.length} registry content invariant violation(s)`, { violations });
+        await notifyUser('Registry Content Invariant Violation(s)', `${body}\n\nRestore source: §C1 table in plans/2026-08-21-brain-migration-SPEC.md`, {
+          dedupKey: 'registry-content-watch',
+          severity: 'warn',
+        }).catch(() => {});
+      }
+      return { touched: violations.length, detail: { violations } };
+    },
+  };
+
   return [
     boundBotLogRotationCheck,
     boundModelOverrideSweep,
     boundDeliveredStoreCompact,
     boundProxyPoolRefresh,
     boundGroundingCheck,
+    boundRegistryContentWatch,
     boundDlqFlush,
   ];
 }

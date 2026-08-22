@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile, mkdtemp, rm } from 'fs/promises';
+import { readFile, mkdtemp, rm, mkdir, writeFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -325,6 +325,143 @@ describe('buildPrompt: topic description', () => {
 });
 
 // ---------------------------------------------------------------------------
+// buildPrompt — topic brain pointer (WP1)
+// ---------------------------------------------------------------------------
+
+describe('buildPrompt: topic brain pointer', () => {
+  // The literal standing-rule sentence from spec §3.5
+  const STANDING_RULE_SENTENCE = 'Topic brains: when the Topic section names a topic brain file, read it before assuming prior context for this topic — it records durable facts, decisions, and open threads; fresh turns override it.';
+
+  it('includes pointer line in Topic section when brain exists with stamp', async () => {
+    const chatId = -1001234567890;
+    const threadId = 8306;
+    const state = makeState({ chat_id: chatId, thread_id: threadId });
+
+    // Create a brain file with the spec §3.2 stamp
+    const topicDir = join(tempDir, 'topic-brains', `${chatId}_${threadId}`);
+    await mkdir(topicDir, { recursive: true });
+    const brainContent = `# Test Topic
+
+> Summary: Test topic.
+
+<!-- topic-brain: consolidated=2026-08-21T21:30:00+05:30 covers=2026-08-21T18:03:11.000Z -->
+
+## Current state
+- Some state.
+`;
+    await writeFile(join(topicDir, 'BRAIN.md'), brainContent, 'utf8');
+
+    const result = await buildPrompt('hello', state);
+    assert.ok(result.includes('## Topic'), 'should have topic section');
+    assert.ok(result.includes('Topic brain:'), 'should include pointer line prefix');
+    assert.ok(result.includes('consolidated 2026-08-21'), 'should include consolidated date');
+    assert.ok(result.includes('covers through 2026-08-21'), 'should include covers date');
+    assert.ok(result.includes('durable per-topic knowledge'), 'should include pointer description');
+  });
+
+  it('includes degraded pointer when stamp is missing', async () => {
+    const chatId = -1001234567890;
+    const threadId = 8306;
+    const state = makeState({ chat_id: chatId, thread_id: threadId });
+
+    const topicDir = join(tempDir, 'topic-brains', `${chatId}_${threadId}`);
+    await mkdir(topicDir, { recursive: true });
+    const brainContent = `# Test Topic\n\n> Summary: No stamp.\n\n## Current state\n- State\n`;
+    await writeFile(join(topicDir, 'BRAIN.md'), brainContent, 'utf8');
+
+    const result = await buildPrompt('hello', state);
+    assert.ok(result.includes('Topic brain:'), 'should include pointer');
+    assert.ok(result.includes('freshness unknown'), 'should show degraded when stamp missing');
+  });
+
+  it('does NOT include pointer line when no brain exists', async () => {
+    const state = makeState({ chat_id: -1001234567890, thread_id: 8306 });
+    const result = await buildPrompt('hello', state);
+    assert.ok(!result.includes('Topic brain:'), 'should not have pointer without brain file');
+  });
+
+  it('Topic section renders from pointer alone when topicNames has no entry', async () => {
+    const chatId = -1001234567890;
+    const threadId = 8306;
+    const state = makeState({ chat_id: chatId, thread_id: threadId });
+
+    const topicDir = join(tempDir, 'topic-brains', `${chatId}_${threadId}`);
+    await mkdir(topicDir, { recursive: true });
+    const brainContent = `# Test Topic\n\n<!-- topic-brain: consolidated=2026-08-21T21:30:00+05:30 covers=2026-08-21T18:03:11.000Z -->\n\n## Current state\n`;
+    await writeFile(join(topicDir, 'BRAIN.md'), brainContent, 'utf8');
+
+    const result = await buildPrompt('hello', state, undefined); // No topicNames
+    assert.ok(result.includes('## Topic'), 'should have topic section from pointer alone');
+    assert.ok(!result.includes('Topic:'), 'should not have topic description line');
+    assert.ok(result.includes('Topic brain:'), 'should have pointer');
+  });
+
+  it('pointer survives omitStatic: true (dynamic content)', async () => {
+    const chatId = -1001234567890;
+    const threadId = 8306;
+    const state = makeState({ chat_id: chatId, thread_id: threadId });
+
+    const topicDir = join(tempDir, 'topic-brains', `${chatId}_${threadId}`);
+    await mkdir(topicDir, { recursive: true });
+    const brainContent = `# Test Topic\n\n<!-- topic-brain: consolidated=2026-08-21T21:30:00+05:30 covers=2026-08-21T18:03:11.000Z -->\n\n## Current state\n`;
+    await writeFile(join(topicDir, 'BRAIN.md'), brainContent, 'utf8');
+
+    const result = await buildPrompt('hello', state, undefined, undefined, undefined, { omitStatic: true });
+    assert.ok(!result.includes('You are a personal assistant'), 'identity should be omitted');
+    assert.ok(!result.includes('Capabilities & Rules'), 'static capabilities should be omitted');
+    assert.ok(result.includes('Topic brain:'), 'pointer should survive omitStatic');
+    assert.ok(result.includes('## Topic'), 'topic section should survive omitStatic');
+  });
+
+  it('buildResumedPrompt does NOT include Topic brain: line (regression guard for decision-7)', async () => {
+    const result = await buildResumedPrompt('hello');
+    assert.ok(!result.includes('Topic brain:'), 'buildResumedPrompt must not include topic brain pointer');
+  });
+
+  it('long-description interim (§3.11): 400+ char hand-set description renders IN FULL alongside pointer line', async () => {
+    const chatId = -1001234567890;
+    const threadId = 8306;
+    const state = makeState({ chat_id: chatId, thread_id: threadId });
+
+    // Create a 400+ char hand-set description
+    const longDescription = 'This is a very long topic description that exceeds four hundred characters in length. It contains detailed information about what this topic covers, including historical context, ongoing discussions, and important decisions made. The description continues with even more details about the domain specifics, technical constraints, and architectural considerations. It goes on to explain the various aspects of the system being discussed, including edge cases, performance considerations, and future plans. This description is meant to test that the system properly preserves long-form hand-authored content without truncation. Additional context paragraphs are included here to ensure we comfortably exceed the four hundred character threshold and verify that the full description renders correctly in the prompt output.';
+
+    assert.ok(longDescription.length > 400, 'test description must be 400+ chars');
+
+    const topicNames: TopicNameMap = new Map([
+      [String(chatId), new Map([[threadId, { name: 'long-desc-topic', description: longDescription }]])],
+    ]);
+
+    // Create a brain file with stamp
+    const topicDir = join(tempDir, 'topic-brains', `${chatId}_${threadId}`);
+    await mkdir(topicDir, { recursive: true });
+    const brainContent = `# Test Topic\n\n<!-- topic-brain: consolidated=2026-08-21T21:30:00+05:30 covers=2026-08-21T18:03:11.000Z -->\n\n## Current state\n`;
+    await writeFile(join(topicDir, 'BRAIN.md'), brainContent, 'utf8');
+
+    const result = await buildPrompt('hello', state, topicNames);
+
+    // Both description and pointer must appear in the same prompt
+    assert.ok(result.includes(longDescription), 'full 400+ char description must render un-truncated');
+    assert.ok(result.includes('Topic brain:'), 'pointer line must also appear');
+    assert.ok(result.includes('Topic: long-desc-topic —'), 'topic name line must appear');
+
+    // Verify the description appears in full, not truncated or restated
+    const descCount = (result.match(new RegExp(longDescription.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
+    assert.equal(descCount, 1, 'description must appear exactly once, not restated or duplicated');
+  });
+
+  it('both-places test: standing-rule sentence appears in bot-instructions.md and inline capabilities', { skip: !BOT_INSTRUCTIONS_EXISTS && 'bot-instructions.md not present locally' }, async () => {
+    // Check bot-instructions.md contains the sentence
+    const botInstructionsContent = await readFile(BOT_INSTRUCTIONS_PATH, 'utf8');
+    assert.ok(botInstructionsContent.includes(STANDING_RULE_SENTENCE), 'bot-instructions.md must contain the standing-rule sentence verbatim');
+
+    // Check buildPrompt inline capabilities contains the same sentence
+    const inlinePrompt = await buildPrompt('hello', makeState(), undefined, undefined, undefined, { omitStatic: false });
+    assert.ok(inlinePrompt.includes(STANDING_RULE_SENTENCE), 'context.ts inline capabilities block must contain the SAME sentence verbatim — keep both in sync');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Integration test — full prompt building flow
 // ---------------------------------------------------------------------------
 
@@ -389,5 +526,58 @@ describe('buildPrompt: priorContext', () => {
     assert.ok(result.includes('some-uuid-here'), 'should include the session ID');
     assert.ok(result.includes('no transcript file available'), 'should include fallback text');
     assert.ok(!result.includes('Session transcript:'), 'should NOT have session transcript label');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildPrompt: cwd sections (WP1)
+// ---------------------------------------------------------------------------
+
+describe('buildPrompt: cwd sections', () => {
+  it('renders no cwd section when workdir option not provided', async () => {
+    const result = await buildPrompt('hello', makeState(), undefined, undefined, undefined);
+    assert.ok(!result.includes('## Working Directory'), 'should NOT have cwd section');
+  });
+
+  it('renders override tier text for cwd_override', async () => {
+    const state = makeState({ cwd_override: 'D:/Custom/path' });
+    const result = await buildPrompt('hello', state, undefined, undefined, undefined, {
+      workdir: { dir: 'D:/Custom/path', tier: 'override' }
+    });
+    assert.ok(result.includes('## Working Directory'), 'should have cwd section');
+    assert.ok(result.includes('You are operating in: \`D:/Custom/path\`'), 'should show the path');
+    assert.ok(result.includes('This is the project root for all file operations'), 'should have override tier text');
+    assert.ok(!result.includes('scratch space'), 'should NOT have topic-home text');
+  });
+
+  it('renders project tier text for project pointer', async () => {
+    const state = makeState();
+    const result = await buildPrompt('hello', state, undefined, undefined, undefined, {
+      workdir: { dir: 'D:/Project/path', tier: 'project' }
+    });
+    assert.ok(result.includes('## Working Directory'), 'should have cwd section');
+    assert.ok(result.includes('You are operating in: \`D:/Project/path\`'), 'should show the path');
+    assert.ok(result.includes('This is the project root for all file operations'), 'should have project tier text');
+    assert.ok(!result.includes('scratch space'), 'should NOT have topic-home text');
+  });
+
+  it('renders topic-home tier text with repo hint', async () => {
+    const state = makeState();
+    const result = await buildPrompt('hello', state, undefined, undefined, undefined, {
+      workdir: { dir: '/tmp/topic-brains/-1001234567890_8306', tier: 'topic-home' }
+    });
+    assert.ok(result.includes('## Working Directory'), 'should have cwd section');
+    assert.ok(result.includes('You are operating in the topic workspace:'), 'should have topic workspace label');
+    assert.ok(result.includes('use \`scratch/\` for files you create'), 'should mention scratch directory');
+    assert.ok(result.includes('It is not a code repository: for repo work use absolute paths'), 'should have repo hint');
+    assert.ok(result.includes('the main repository is at'), 'should name the repo location');
+  });
+
+  it('renders no cwd section when workdir option not provided (fallback)', async () => {
+    const state = makeState();
+    const result = await buildPrompt('hello', state, undefined, undefined, undefined, {
+      // no workdir option - fallback tier produces byte-identical prompts
+    });
+    assert.ok(!result.includes('## Working Directory'), 'should NOT have cwd section (fallback tier produces byte-identical prompts)');
   });
 });

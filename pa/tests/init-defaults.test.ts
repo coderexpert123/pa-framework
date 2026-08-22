@@ -258,3 +258,12 @@ describe('initCommand vs examples/config.yaml.example — drift guard', () => {
     }
   });
 });
+
+describe('initCommand topic-brains scaffolding', () => {
+  it('creates topic-brains directory with empty EXEMPT.json', async () => {
+    await initCommand();
+    const exemptPath = join(process.env.PA_HOME ?? '', 'topic-brains', 'EXEMPT.json');
+    const exemptContent = await readFile(exemptPath, 'utf8');
+    assert.deepEqual(JSON.parse(exemptContent), {}, 'EXEMPT.json should be initialized with empty object');
+  });
+});

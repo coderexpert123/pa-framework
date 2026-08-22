@@ -4,7 +4,7 @@ import { mkdtemp, rm, mkdir, writeFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { createBotMaintenanceJobs, watchdogStaleJobs, type BotMaintenanceDeps } from '../maintenance-jobs.js';
+import { createBotMaintenanceJobs, watchdogStaleJobs, checkRegistryContentInvariants, type BotMaintenanceDeps, type RegistryContentViolation } from '../maintenance-jobs.js';
 import { validateRegistry } from '../../../../pa/dist/src/lib/maintenance/policy.js';
 import { RUNTIME_ARCHIVE_MAX_BYTES } from '../../../../pa/dist/src/lib/archive-files.js';
 import { flushLog } from '../../../../pa/dist/src/lib/log.js';
@@ -49,9 +49,9 @@ describe('createBotMaintenanceJobs', () => {
     assert.doesNotThrow(() => validateRegistry(createBotMaintenanceJobs(stubDeps())));
   });
 
-  it('declares exactly the 6 expected jobs, all host bot', () => {
+  it('declares exactly the 7 expected jobs, all host bot', () => {
     const jobs = createBotMaintenanceJobs(stubDeps());
-    assert.equal(jobs.length, 6);
+    assert.equal(jobs.length, 7);
     const names = jobs.map((j) => j.name).sort();
     assert.deepEqual(names, [
       'bot-log-rotation-check',
@@ -60,6 +60,7 @@ describe('createBotMaintenanceJobs', () => {
       'grounding-check',
       'model-override-sweep',
       'proxy-pool-refresh',
+      'registry-content-watch',
     ]);
     for (const j of jobs) assert.equal(j.host, 'bot');
   });
@@ -79,6 +80,7 @@ describe('createBotMaintenanceJobs', () => {
     assert.equal(byName.get('model-override-sweep')!.shedWhenDegraded, true);
     assert.equal(byName.get('delivered-store-compact')!.shedWhenDegraded, true);
     assert.equal(byName.get('grounding-check')!.shedWhenDegraded, true);
+    assert.equal(byName.get('registry-content-watch')!.shedWhenDegraded, true);
   });
 
   it('locks the destructive set and its targets resolve under paHome()', () => {
@@ -102,6 +104,7 @@ describe('createBotMaintenanceJobs', () => {
     assert.equal(byName.get('delivered-store-compact')!.everyMs, 300_000);
     assert.equal(byName.get('dlq-flush')!.everyMs, 300_000);
     assert.equal(byName.get('grounding-check')!.everyMs, 21_600_000);
+    assert.equal(byName.get('registry-content-watch')!.everyMs, 86_400_000);
     const proxyEveryMs = byName.get('proxy-pool-refresh')!.everyMs;
     assert.equal(typeof proxyEveryMs, 'function');
     const resolved = (proxyEveryMs as () => number)();
@@ -308,6 +311,112 @@ describe('createBotMaintenanceJobs', () => {
       } finally {
         globalThis.fetch = originalFetch;
       }
+    });
+  });
+
+  describe('registry-content-watch', () => {
+    function mapWith(entries: Array<{ chatId: string; threadId: number; name: string; description?: string }>): TopicNameMap {
+      const map: TopicNameMap = new Map();
+      for (const e of entries) {
+        let inner = map.get(e.chatId);
+        if (!inner) { inner = new Map(); map.set(e.chatId, inner); }
+        inner.set(e.threadId, { name: e.name, description: e.description });
+      }
+      return map;
+    }
+
+    it('pure check function: green on current-shaped fixtures (all invariants pass)', () => {
+      const topicNames = mapWith([
+        { chatId: '-100', threadId: 9855, name: 'whatsapp-drafts', description: 'WhatsApp drafting topic — first read projects/whatsapp-drafts/INSTRUCTIONS.md and follow it exactly' },
+        { chatId: '-100', threadId: 3376, name: 'pa-alerts', description: 'PA system alerts and notifications' },
+        { chatId: '-100', threadId: 7822, name: 'ekadashi', description: 'Ekadashi alerts — see Sources.md for schedule' },
+      ]);
+      const violations = checkRegistryContentInvariants(topicNames);
+      assert.deepEqual(violations, []);
+    });
+
+    it('pure check function: red when whatsapp-drafts (9855) lacks INSTRUCTIONS.md pointer', () => {
+      const topicNames = mapWith([
+        { chatId: '-100', threadId: 9855, name: 'whatsapp-drafts', description: 'WhatsApp drafting topic' },
+      ]);
+      const violations = checkRegistryContentInvariants(topicNames);
+      assert.equal(violations.length, 1);
+      assert.equal(violations[0].topicKey, 'whatsapp-drafts');
+      assert.equal(violations[0].invariantLabel, 'Path-0 pointer');
+    });
+
+    it('pure check function: red when pa-alerts (3376) contains Palo Alto hallucination', () => {
+      const topicNames = mapWith([
+        { chatId: '-100', threadId: 3376, name: 'pa-alerts', description: 'PA alerts — Palo Alto system notifications' },
+      ]);
+      const violations = checkRegistryContentInvariants(topicNames);
+      assert.equal(violations.length, 1);
+      assert.equal(violations[0].topicKey, 'pa-alerts');
+      assert.equal(violations[0].invariantLabel, 'no hallucinated gloss');
+    });
+
+    it('pure check function: red when ekadashi (7822) lacks Sources.md pointer', () => {
+      const topicNames = mapWith([
+        { chatId: '-100', threadId: 7822, name: 'ekadashi', description: 'Ekadashi fasting alerts' },
+      ]);
+      const violations = checkRegistryContentInvariants(topicNames);
+      assert.equal(violations.length, 1);
+      assert.equal(violations[0].topicKey, 'ekadashi');
+      assert.equal(violations[0].invariantLabel, 'deterministic routing gate');
+    });
+
+    it('pure check function: reports multiple violations in one pass', () => {
+      const topicNames = mapWith([
+        { chatId: '-100', threadId: 9855, name: 'whatsapp-drafts', description: 'Broken description' },
+        { chatId: '-100', threadId: 3376, name: 'pa-alerts', description: 'Contains Palo Alto' },
+        { chatId: '-100', threadId: 7822, name: 'ekadashi', description: 'No Sources pointer' },
+      ]);
+      const violations = checkRegistryContentInvariants(topicNames);
+      assert.equal(violations.length, 3);
+      const labels = violations.map((v) => v.invariantLabel).sort();
+      assert.deepEqual(labels, ['Path-0 pointer', 'deterministic routing gate', 'no hallucinated gloss']);
+    });
+
+    it('job integration: touched 0 when all invariants pass', async () => {
+      const topicNames = mapWith([
+        { chatId: '-100', threadId: 9855, name: 'whatsapp-drafts', description: 'See INSTRUCTIONS.md for details' },
+        { chatId: '-100', threadId: 3376, name: 'pa-alerts', description: 'Alerts topic' },
+        { chatId: '-100', threadId: 7822, name: 'ekadashi', description: 'Read Sources.md' },
+      ]);
+      const jobs = createBotMaintenanceJobs(stubDeps({ topicNames }));
+      const job = jobs.find((j) => j.name === 'registry-content-watch')!;
+      const result = await job.run({ now: Date.now(), everyMs: 86_400_000 });
+      assert.equal(result.touched, 0);
+      assert.deepEqual(result.detail!.violations, []);
+    });
+
+    it('job integration: touched equals violation count', async () => {
+      const topicNames = mapWith([
+        { chatId: '-100', threadId: 9855, name: 'whatsapp-drafts', description: 'Missing pointer' },
+        { chatId: '-100', threadId: 3376, name: 'pa-alerts', description: 'Has Palo Alto text' },
+      ]);
+      const jobs = createBotMaintenanceJobs(stubDeps({ topicNames }));
+      const job = jobs.find((j) => j.name === 'registry-content-watch')!;
+      const result = await job.run({ now: Date.now(), everyMs: 86_400_000 });
+      assert.equal(result.touched, 2);
+      assert.equal((result.detail!.violations as RegistryContentViolation[]).length, 2);
+    });
+
+    it('job integration: alerts via notifyUser with correct dedup key', async () => {
+      const topicNames = mapWith([
+        { chatId: '-100', threadId: 9855, name: 'whatsapp-drafts', description: 'Missing INSTRUCTIONS.md' },
+      ]);
+      const jobs = createBotMaintenanceJobs(stubDeps({ topicNames }));
+      const job = jobs.find((j) => j.name === 'registry-content-watch')!;
+      await assert.doesNotReject(() => job.run({ now: Date.now(), everyMs: 86_400_000 }));
+    });
+
+    it('pure check function: skips missing topics (no false violations)', () => {
+      const topicNames = mapWith([
+        { chatId: '-100', threadId: 1234, name: 'some-other-topic', description: 'Anything' },
+      ]);
+      const violations = checkRegistryContentInvariants(topicNames);
+      assert.deepEqual(violations, []);
     });
   });
 });

@@ -116,6 +116,18 @@ export interface WorkerConfig {
    * or supply-chain backdoor) can only access secrets it was explicitly granted.
    */
   secret_allowlist?: string[];
+
+  /**
+   * When true, this worker is EXCLUDED from automatic failover ordering —
+   * runWithFailover skips it unless the dispatch EXPLICITLY names it
+   * (options.preferredWorker or config.worker_pin). For workers that are
+   * manually selectable (bot /agent, skill `worker:` frontmatter) but should
+   * never receive another worker's spilled-over traffic. (Added 2026-08-21
+   * for agyc: it had silently swallowed failover runs while its stream
+   * dialect was unparsed — the worker itself is fine for manual use, but the
+   * operator wants it out of every automatic chain.)
+   */
+  manual_only?: boolean;
 }
 
 export interface EvaluatorConfig {
@@ -228,6 +240,15 @@ export interface RunOptions {
   // by design: it is read inside the child's close handler.
   isCancelled?: () => boolean;
   noFallback?: boolean; // when true, stop on first failure instead of continuing to next worker
+  // When true, a worker that exits 0 with empty/whitespace-only output is
+  // treated as FAILED inside the failover loop (log + continue to the next
+  // worker) instead of being returned as success. Set by callers whose
+  // dispatch MUST produce output (run.ts sets it for skills declaring
+  // telegram_output — the isSilentNoOp class, moved up from post-run
+  // reclassification so a silent worker fails over instead of ending the
+  // cascade. 2026-08-21.) The NO_OUTPUT sentinel is non-empty output and
+  // passes this check.
+  requireNonEmptyOutput?: boolean;
   priorAttempts?: string[]; // workers that already failed before runWithFailover was invoked
   contextId?: string; // execution-context UUID; allows nested same-context blackboard lock re-entrancy
   getExtraArgs?: (worker: WorkerConfig) => string[] | undefined; // dynamic extraArgs resolver per failover candidate

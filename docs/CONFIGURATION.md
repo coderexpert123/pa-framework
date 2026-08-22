@@ -56,6 +56,7 @@ The framework reads configuration from `~/.pa/` (or wherever `PA_HOME` env var p
 | `state_pattern` | string | No | `*.jsonl` | Glob for tailing `state_dir`. |
 | `input_mode` | `'arg' \| 'stdin-text' \| 'stdin-json'` | No | `'arg'` | How the prompt reaches the worker. |
 | `output_format` | string | No | undefined | Informational (`'stream-json'` enables NDJSON parsing for session-id extraction). |
+| `manual_only` | boolean | No | undefined | Excludes the worker from automatic failover — runs only when explicitly named (`--worker`/`preferredWorker`, skill `worker:` frontmatter, or `worker_pin`). |
 
 ### `EvaluatorConfig`
 

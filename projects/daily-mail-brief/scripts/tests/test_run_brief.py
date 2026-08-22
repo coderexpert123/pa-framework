@@ -81,6 +81,155 @@ class TestCallGeminiErrorFormat(unittest.TestCase):
         self.assertEqual(result, "real output")
 
 
+# The exact stderr the Gemini CLI emitted on every scheduled run 2026-08-19..21
+# (license invalidated): non-transient, yet the retry loop burned both attempts
+# on every run and alerted as if a catchup retry could fix it.
+RECORDED_GEMINI_AUTH_ERROR = (
+    "Gemini exited 1: Warning: 256-color support not detected. Using a terminal "
+    "with at least 256-color support is recommended for a better visual experience.\n"
+    "YOLO mode is enabled. All tool calls will be automatically approved.\n"
+    "Error authenticating: _GaxiosError: You do not have a valid license of this "
+    "product. Please contact your administrator."
+)
+
+
+class TestIsGeminiAuthFailure(unittest.TestCase):
+    """Auth/license failures must be recognizable so the retry loop can fail fast."""
+
+    def test_recorded_license_error_detected(self):
+        self.assertTrue(run_brief.is_gemini_auth_failure(RECORDED_GEMINI_AUTH_ERROR))
+
+    def test_oauth_rejections_detected(self):
+        for text in (
+            "Gemini exited 1: Error authenticating: _GaxiosError: invalid_grant",
+            "Gemini exited 1: UNAUTHENTICATED: Request had invalid credentials",
+        ):
+            self.assertTrue(run_brief.is_gemini_auth_failure(text), text)
+
+    def test_transient_errors_not_classified_auth(self):
+        for text in (
+            "Gemini exited 1: Connection reset by peer",
+            "Gemini exited 1: quota exceeded, retry later",
+            "Gemini exited 1: internal server error",
+        ):
+            self.assertFalse(run_brief.is_gemini_auth_failure(text), text)
+
+    def test_dedup_key_for_gemini_auth_status(self):
+        self.assertEqual(
+            run_brief._dedup_key_for_status("gemini-auth"), "daily-mail-brief-gemini-auth"
+        )
+
+
+class TestGeminiAuthFailureFailsFast(RunBriefTestCase):
+    """A non-transient auth/license failure must skip the pointless second
+    attempt, write a distinct 'gemini-auth' marker, and alert with actionable
+    guidance instead of 'next catchup will retry'."""
+
+    def _make_fetch_data(self, listed=2):
+        return {
+            "window": "21 Aug 2026 05:00 – 21 Aug 2026 19:00 IST",
+            "window_end_utc": "2026-08-21T13:30:00+00:00",
+            "listed_count": listed,
+            "total_count": listed,
+            "emails": [
+                {"id": f"e{i}", "from": "a@b.com", "subject": "subj",
+                 "gmail_category": "unknown", "in_inbox": True, "is_unread": True, "snippet": ""}
+                for i in range(listed)
+            ],
+        }
+
+    def _patch_run_py(self, fetch_data):
+        fetch_result = MagicMock(returncode=0, stdout=json.dumps(fetch_data))
+
+        def fake_run_py(script, *args, check=True):
+            if "fetch_headers" in script:
+                return fetch_result
+            return MagicMock(returncode=0)
+
+        return fake_run_py
+
+    @patch("run_brief._notify_failure")
+    @patch("run_brief.load_portfolio_context", return_value="")
+    @patch("run_brief.run_py")
+    @patch("run_brief.call_gemini")
+    def test_no_second_attempt_and_no_sleep(self, mock_gemini, mock_run_py, _portfolio, _notify):
+        mock_run_py.side_effect = self._patch_run_py(self._make_fetch_data())
+        mock_gemini.side_effect = RuntimeError(RECORDED_GEMINI_AUTH_ERROR)
+
+        with patch("run_brief.time.sleep") as mock_sleep:
+            with self.assertRaises(SystemExit):
+                run_brief.main()
+
+        self.assertEqual(
+            mock_gemini.call_count, 1,
+            "Auth/license failure is non-transient — must not be retried",
+        )
+        mock_sleep.assert_not_called()
+
+    @patch("run_brief._notify_failure")
+    @patch("run_brief.load_portfolio_context", return_value="")
+    @patch("run_brief.run_py")
+    @patch("run_brief.call_gemini")
+    def test_gemini_auth_marker_written(self, mock_gemini, mock_run_py, _portfolio, _notify):
+        mock_run_py.side_effect = self._patch_run_py(self._make_fetch_data())
+        mock_gemini.side_effect = RuntimeError(RECORDED_GEMINI_AUTH_ERROR)
+
+        with patch("run_brief.time.sleep"):
+            with self.assertRaises(SystemExit):
+                run_brief.main()
+
+        marker_path = os.path.join(self.pa_home, "daily-mail-brief-fetch-failed.json")
+        self.assertTrue(os.path.exists(marker_path), "Failure marker must be written")
+        with open(marker_path, encoding="utf-8") as f:
+            content = json.load(f)
+        self.assertEqual(content.get("status"), "gemini-auth")
+        self.assertIn("valid license", content.get("reason", ""))
+
+    @patch("run_brief._notify_failure")
+    @patch("run_brief.load_portfolio_context", return_value="")
+    @patch("run_brief.run_py")
+    @patch("run_brief.call_gemini")
+    def test_notify_body_is_actionable_not_retry_promise(
+        self, mock_gemini, mock_run_py, _portfolio, mock_notify
+    ):
+        mock_run_py.side_effect = self._patch_run_py(self._make_fetch_data())
+        mock_gemini.side_effect = RuntimeError(RECORDED_GEMINI_AUTH_ERROR)
+
+        with patch("run_brief.time.sleep"):
+            with self.assertRaises(SystemExit):
+                run_brief.main()
+
+        mock_notify.assert_called_once()
+        self.assertEqual(mock_notify.call_args.args[0], "gemini-auth")
+        body = mock_notify.call_args.args[1]
+        self.assertIn("not transient", body)
+        self.assertIn("GEMINI_CMD", body)
+        self.assertNotIn(
+            "next catchup will retry", body,
+            "Auth failure alert must not promise a retry that cannot succeed",
+        )
+
+    @patch("run_brief._notify_failure")
+    @patch("run_brief.load_portfolio_context", return_value="")
+    @patch("run_brief.run_py")
+    @patch("run_brief.call_gemini")
+    def test_transient_failure_still_retries_twice(
+        self, mock_gemini, mock_run_py, _portfolio, mock_notify
+    ):
+        """The fail-fast path must not eat the existing transient retry: generic
+        errors still get both attempts and the plain 'gemini' status."""
+        mock_run_py.side_effect = self._patch_run_py(self._make_fetch_data())
+        mock_gemini.side_effect = RuntimeError("Gemini exited 1: Connection reset by peer")
+
+        with patch("run_brief.time.sleep"):
+            with self.assertRaises(SystemExit):
+                run_brief.main()
+
+        self.assertEqual(mock_gemini.call_count, 2, "Transient failures keep the retry")
+        mock_notify.assert_called_once()
+        self.assertEqual(mock_notify.call_args.args[0], "gemini")
+
+
 class TestStateAdvancementLogic(RunBriefTestCase):
     """State must be written only after Gemini succeeds, not at fetch time."""
 

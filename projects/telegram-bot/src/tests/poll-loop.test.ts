@@ -3641,5 +3641,141 @@ describe('runPollLoop: local command routing (/new, /code, /status, /skills, /he
     assert.ok(sentMessages[1].includes('*Scheduled Skills*'));
     assert.ok(sentMessages[2].includes('*Available Commands*'));
   });
-});
 
+  it('/update_brain in hard-exempt topic returns refusal without dispatching', async () => {
+    const topicKey = '-1001234567890_29';
+    const stateFile = join(tempDir, `telegram-bot-topic${topicKey}.json`);
+    await writeFile(stateFile, JSON.stringify({
+      chat_id: -1001234567890,
+      thread_id: 29,
+      turns: [],
+    }), 'utf8');
+
+    const controller = new AbortController();
+    const state = makeState(-1001234567890, -1);
+    const sentMessages: string[] = [];
+    let getUpdatesCount = 0;
+
+    (globalThis as Record<string, unknown>).fetch = async (url: string, opts?: any) => {
+      const urlStr = url as string;
+      if (urlStr.includes('getUpdates')) {
+        getUpdatesCount++;
+        if (getUpdatesCount === 1) {
+          return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({ ok: true, result: [{
+              update_id: 1,
+              message: {
+                message_id: 10,
+                chat: { id: -1001234567890, type: 'supergroup' },
+                message_thread_id: 29,
+                date: 1719602000,
+                text: '/update_brain',
+              },
+            }]}),
+          } as Response;
+        }
+        controller.abort();
+        return {
+          ok: true, status: 200,
+          text: async () => JSON.stringify({ ok: true, result: [] }),
+        } as Response;
+      }
+
+      if (urlStr.includes('sendMessage')) {
+        const body = typeof opts?.body === 'string' ? JSON.parse(opts.body) : {};
+        if (body.text) sentMessages.push(body.text);
+        return {
+          ok: true, status: 200,
+          text: async () => JSON.stringify({ ok: true, result: { message_id: 100 } }),
+        } as Response;
+      }
+
+      return {
+        ok: true, status: 200,
+        text: async () => JSON.stringify({ ok: true, result: true }),
+      } as Response;
+    };
+
+    await runPollLoop('token', [-1001234567890], state, {}, controller.signal, fastSleep);
+
+    assert.equal(sentMessages.length, 1);
+    assert.match(sentMessages[0], /🚫.*exempt from topic brains.*output-only/);
+  });
+
+  it('/update_brain stages learnings for non-exempt topics (rewrites userText and dispatches)', async () => {
+    const topicKey = '-1001234567890_8306';
+    const stateFile = join(tempDir, `telegram-bot-topic${topicKey}.json`);
+    await writeFile(stateFile, JSON.stringify({
+      chat_id: -1001234567890,
+      thread_id: 8306,
+      turns: [],
+    }), 'utf8');
+
+    const controller = new AbortController();
+    const state = makeState(-1001234567890, -1);
+    const sentMessages: string[] = [];
+    let getUpdatesCount = 0;
+    let dispatchCount = 0;
+
+    (globalThis as Record<string, unknown>).fetch = async (url: string, opts?: any) => {
+      const urlStr = url as string;
+      if (urlStr.includes('getUpdates')) {
+        getUpdatesCount++;
+        if (getUpdatesCount === 1) {
+          return {
+            ok: true, status: 200,
+            text: async () => JSON.stringify({ ok: true, result: [{
+              update_id: 1,
+              message: {
+                message_id: 10,
+                chat: { id: -1001234567890, type: 'supergroup' },
+                message_thread_id: 8306,
+                date: 1719602000,
+                text: '/update_brain',
+              },
+            }]}),
+          } as Response;
+        }
+        controller.abort();
+        return {
+          ok: true, status: 200,
+          text: async () => JSON.stringify({ ok: true, result: [] }),
+        } as Response;
+      }
+
+      if (urlStr.includes('executeWorker') || urlStr.includes('claude')) {
+        dispatchCount++;
+        // Verify the instruction was rewritten
+        const body = typeof opts?.body === 'string' ? JSON.parse(opts.body) : {};
+        const instruction = body.userText as string;
+        assert.match(instruction, /Capture this topic's learnings for its topic brain/);
+        assert.match(instruction, /<BRAIN_PATH_ABS>/);
+        return {
+          ok: true, status: 200,
+          text: async () => JSON.stringify({ ok: true, result: { message_id: 100 } }),
+        } as Response;
+      }
+
+      if (urlStr.includes('sendMessage')) {
+        const body = typeof opts?.body === 'string' ? JSON.parse(opts.body) : {};
+        if (body.text) sentMessages.push(body.text);
+        return {
+          ok: true, status: 200,
+          text: async () => JSON.stringify({ ok: true, result: { message_id: 100 } }),
+        } as Response;
+      }
+
+      return {
+        ok: true, status: 200,
+        text: async () => JSON.stringify({ ok: true, result: true }),
+      } as Response;
+    };
+
+    await runPollLoop('token', [-1001234567890], state, {}, controller.signal, fastSleep);
+
+    assert.equal(dispatchCount, 1, 'should dispatch once with rewritten instruction');
+    assert.equal(sentMessages.length, 1, 'should send one status message');
+    assert.match(sentMessages[0], /Staging topic brain/);
+  });
+});

@@ -442,6 +442,7 @@ export async function loadConfig(): Promise<PaConfig> {
       check_timeout: w.check_timeout || 30,
       tunables: parseTunables(w.tunables, w.name),
       secret_allowlist: w.secret_allowlist,
+      manual_only: w.manual_only === true ? true : undefined,
     };
   });
 

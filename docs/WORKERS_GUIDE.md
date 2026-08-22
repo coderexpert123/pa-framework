@@ -79,6 +79,10 @@ workers:
     check_timeout: 5
     rate_limit_patterns: []  # local model — no rate limits
     priority: 5              # lowest priority (only used when others unavailable)
+    # manual_only: true      # OPTIONAL: exclude from automatic failover — the
+    #                         # worker then runs ONLY when a dispatch explicitly
+    #                         # names it (bot /agent <name>, skill `worker:`
+    #                         # frontmatter, or a global worker_pin).
 ```
 
 ### Step 3: Verify `pa workers`
@@ -135,6 +139,8 @@ When the orchestrator needs to run a skill:
    - If it exits non-zero → log, alert (`pa notify`), try next.
    - If it stalls (no stdout for `idle_timeout` seconds) → consult the evaluator (if configured). The evaluator decides: extend, kill, or fail-over.
    - If rate-limit pattern matched → set cooldown timer, fail-over.
+   - If it exits 0 with empty output on a `telegram_output` skill → fail over to the next worker (silent no-op guard, 2026-08-21).
+   - A dispatch cancelled by the caller (`/stop`) never advances the cascade — the kill is not a worker failure (AI-092).
 3. If all candidates exhausted → return error, `pa notify` an "all workers failed" alert.
 
 `no_fallback: true` on the skill disables steps 3 — once the preferred worker fails, the skill errors immediately.
