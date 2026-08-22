@@ -256,13 +256,12 @@ describe('partitionOverdueByCostTier', () => {
   });
 
   it('off_peak skills are deferred just before off-peak starts', async () => {
-    const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
-    await setupSkillWithCostTier('offpeak-skill', '0 * * * *', 'off_peak', threeHoursAgo);
+    // Fully fixed clock — wall-clock-relative fixtures made this test pass at
+    // night and fail when the suite ran during peak hours (found 2026-08-22).
+    const justBefore = new Date('2026-08-19T05:59:00Z'); // 11:29 IST
+    const threeHoursBeforeBoundary = new Date(justBefore.getTime() - 3 * 60 * 60 * 1000).toISOString();
+    await setupSkillWithCostTier('offpeak-skill', '0 * * * *', 'off_peak', threeHoursBeforeBoundary);
     const overdue = await getOverdueSkills();
-
-    // Test at 11:29 IST = 05:59 UTC (just before off-peak ends)
-    const justBefore = new Date();
-    justBefore.setUTCHours(5, 59, 0, 0);
 
     const partition = await partitionOverdueByCostTier(overdue, justBefore);
     assert.equal(partition.runnable.length, 1, 'off_peak skill should run at 11:29 IST (still off-peak)');
@@ -270,13 +269,11 @@ describe('partitionOverdueByCostTier', () => {
   });
 
   it('off_peak skills are deferred just after peak starts', async () => {
-    const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
-    await setupSkillWithCostTier('offpeak-skill', '0 * * * *', 'off_peak', threeHoursAgo);
+    // Same fixed-clock discipline (wall-clock independence).
+    const justAfter = new Date('2026-08-19T06:01:00Z'); // 11:31 IST
+    const threeHoursBeforeBoundary = new Date(justAfter.getTime() - 3 * 60 * 60 * 1000).toISOString();
+    await setupSkillWithCostTier('offpeak-skill', '0 * * * *', 'off_peak', threeHoursBeforeBoundary);
     const overdue = await getOverdueSkills();
-
-    // Test at 11:31 IST = 06:01 UTC (just after peak starts)
-    const justAfter = new Date();
-    justAfter.setUTCHours(6, 1, 0, 0);
 
     const partition = await partitionOverdueByCostTier(overdue, justAfter);
     assert.equal(partition.runnable.length, 0, 'off_peak skill should not run at 11:31 IST (peak started)');

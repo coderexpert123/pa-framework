@@ -1,7 +1,7 @@
 import { spawn, execFile } from 'child_process';
 import { randomBytes, randomUUID } from 'crypto';
 import { existsSync, unlinkSync, writeFileSync, mkdirSync } from 'fs';
-import { readdir, unlink, rename, writeFile, readFile, stat } from 'fs/promises';
+import { readdir, unlink, rename, writeFile, readFile, stat, mkdir } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
 import { acquireLock, releaseLock } from './lock.js';
@@ -60,15 +60,18 @@ import {
   handleHealthCommand,
   handleRefCommand,
   handleClaimsCommand,
+  handleUpdateBrainCommand,
   COMMIT_PATTERN,
   COMMIT_AND_PUSH_PATTERN,
   PUSH_PATTERN,
   PUSH_PUBLIC_PATTERN,
   INVESTIGATE_FLAGGED_PATTERN,
+  UPDATE_BRAIN_PATTERN,
   HEALTH_PATTERN,
   REF_PATTERN,
   CLAIMS_PATTERN,
   type TunableCommand,
+  type UpdateBrainResult,
 } from './logic.js';
 import {
   resolveTunable,
@@ -115,6 +118,8 @@ import { loadTopicNames, updateTopicName, setTopicDescription, extractTopicEvent
 import { appendKbNote } from './kb-notes.js';
 import { formatFailoverMessage, escapeMd } from './notify-format.js';
 import { registerBotCommands } from './commands.js';
+import { resolveTopicWorkdir, ensureTopicWorkdir, type TopicWorkdir } from './topic-workdir.js';
+import { getTopicBrainInfo, getTopicExemptions } from './topic-brains.js';
 import {
   buildOAuthCompletionMessage,
   launchOAuthResumeAction,
@@ -194,10 +199,6 @@ export function threadIdFromResource(resource: string): string {
   const parts = resource.replace(/^topic-/, '').split('_');
   if (parts.length < 2) return ''; // malformed: no underscore, no threadId
   return parts.pop() ?? '';
-}
-
-function effectiveCwd(state: ConversationState): string {
-  return state.cwd_override || BOT_CWD;
 }
 
 /**
@@ -862,6 +863,7 @@ export async function dispatchMessage(
   topicNames?: TopicNameMap,
   onNotify?: (payload: FailoverNotifyPayload) => Promise<void>,
   updateId?: number,
+  workdir?: TopicWorkdir,
   contextId?: string,
 ): Promise<{
   response: string;
@@ -878,6 +880,9 @@ export async function dispatchMessage(
   const failedWorkers = new Set<string>();
   let lastFailedSession: { worker: string; sessionId: string } | undefined;
   const config = await loadConfig();
+
+  // Default workdir if not provided (should always be provided from processUpdate)
+  const resolvedWorkdir = workdir ?? { dir: BOT_CWD, tier: 'bot-cwd' };
 
   // AI-092: /stop and /steer kill the worker running right now, so EVERY
   // attempt below has to consult the marker — the between-phase checks alone
@@ -917,13 +922,13 @@ export async function dispatchMessage(
       currentSession = undefined;
     }
   }
-  if (currentSession && await isSessionValid(currentSession, effectiveCwd(state))) {
+  if (currentSession && await isSessionValid(currentSession, resolvedWorkdir.dir)) {
     const activeSession = currentSession;
     try {
       const worker = config.workers.find((w) => w.name === activeSession.worker);
       if (worker) {
         const prompt = await buildResumedPrompt(userText, replyContext, pendingDesc, topicNames, { omitStatic: workerSupportsSystemPrompt(activeSession.worker) });
-        const result = await executeWorker(worker, prompt, { cwd: effectiveCwd(state), env: secrets, extraArgs: buildDispatchExtraArgs(state, worker, buildResumeArgs(activeSession)), resource, agentName: activeSession.worker, contextId, isCancelled, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS });
+        const result = await executeWorker(worker, prompt, { cwd: resolvedWorkdir.dir, env: secrets, extraArgs: buildDispatchExtraArgs(state, worker, buildResumeArgs(activeSession)), resource, agentName: activeSession.worker, contextId, isCancelled, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS });
         if (result.success) {
           dispatchResult = { result, worker: activeSession.worker, session: activeSession };
         } else if (!isCancelled()) {
@@ -947,9 +952,9 @@ export async function dispatchMessage(
     if (state.preferred_worker && !failedWorkers.has(state.preferred_worker) && !(await isWorkerCoolingDown(state.preferred_worker))) {
       const preferredWorkerConfig = config.workers.find((w) => w.name === state.preferred_worker);
       if (preferredWorkerConfig) {
-        const priorCtx = lastFailedSession ? { ...lastFailedSession, sessionPath: getPriorSessionPath(lastFailedSession.worker, lastFailedSession.sessionId, effectiveCwd(state)) } : undefined;
-        const prompt = await buildPrompt(userText, state, topicNames, replyContext, pendingDesc, { omitStatic: workerSupportsSystemPrompt(preferredWorkerConfig.name), priorContext: priorCtx });
-        const prefResult = await executeWorker(preferredWorkerConfig, prompt, { cwd: effectiveCwd(state), env: secrets, extraArgs: buildDispatchExtraArgs(state, preferredWorkerConfig), resource, agentName: state.preferred_worker, contextId, isCancelled, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS });
+        const priorCtx = lastFailedSession ? { ...lastFailedSession, sessionPath: getPriorSessionPath(lastFailedSession.worker, lastFailedSession.sessionId, resolvedWorkdir.dir) } : undefined;
+        const prompt = await buildPrompt(userText, state, topicNames, replyContext, pendingDesc, { omitStatic: workerSupportsSystemPrompt(preferredWorkerConfig.name), priorContext: priorCtx, workdir: resolvedWorkdir.tier === 'bot-cwd' ? undefined : { dir: resolvedWorkdir.dir, tier: resolvedWorkdir.tier } });
+        const prefResult = await executeWorker(preferredWorkerConfig, prompt, { cwd: resolvedWorkdir.dir, env: secrets, extraArgs: buildDispatchExtraArgs(state, preferredWorkerConfig), resource, agentName: state.preferred_worker, contextId, isCancelled, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS });
         if (prefResult.success) freshResult = { result: prefResult, worker: preferredWorkerConfig.name };
         else if (!isCancelled()) {
           const co = await tryClassifyAndNotify(state.preferred_worker, prefResult, prefResult.sessionId, preferredWorkerConfig, config, state, defaultWorker, onNotify);
@@ -968,9 +973,9 @@ export async function dispatchMessage(
     if (!freshResult && defaultWorker && !failedWorkers.has(defaultWorker) && !(await isWorkerCoolingDown(defaultWorker))) {
       const defaultWorkerConfig = config.workers.find((w) => w.name === defaultWorker);
       if (defaultWorkerConfig) {
-        const priorCtxDef = lastFailedSession ? { ...lastFailedSession, sessionPath: getPriorSessionPath(lastFailedSession.worker, lastFailedSession.sessionId, effectiveCwd(state)) } : undefined;
-        const prompt = await buildPrompt(userText, state, topicNames, replyContext, pendingDesc, { omitStatic: workerSupportsSystemPrompt(defaultWorkerConfig.name), priorContext: priorCtxDef });
-        const defResult = await executeWorker(defaultWorkerConfig, prompt, { cwd: effectiveCwd(state), env: secrets, extraArgs: buildDispatchExtraArgs(state, defaultWorkerConfig), resource, agentName: defaultWorker, contextId, isCancelled, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS });
+        const priorCtxDef = lastFailedSession ? { ...lastFailedSession, sessionPath: getPriorSessionPath(lastFailedSession.worker, lastFailedSession.sessionId, resolvedWorkdir.dir) } : undefined;
+        const prompt = await buildPrompt(userText, state, topicNames, replyContext, pendingDesc, { omitStatic: workerSupportsSystemPrompt(defaultWorkerConfig.name), priorContext: priorCtxDef, workdir: resolvedWorkdir.tier === 'bot-cwd' ? undefined : { dir: resolvedWorkdir.dir, tier: resolvedWorkdir.tier } });
+        const defResult = await executeWorker(defaultWorkerConfig, prompt, { cwd: resolvedWorkdir.dir, env: secrets, extraArgs: buildDispatchExtraArgs(state, defaultWorkerConfig), resource, agentName: defaultWorker, contextId, isCancelled, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS });
         if (defResult.success) freshResult = { result: defResult, worker: defaultWorkerConfig.name };
         else if (!isCancelled()) {
           const co = await tryClassifyAndNotify(defaultWorker, defResult, defResult.sessionId, defaultWorkerConfig, config, state, defaultWorker, onNotify);
@@ -985,10 +990,10 @@ export async function dispatchMessage(
       if (isCancelled()) {
         return { response: '', session: maybeDropAgySession(state.session, resource, true), meta: null, workerError: true };
       }
-      const priorCtxFo = lastFailedSession ? { ...lastFailedSession, sessionPath: getPriorSessionPath(lastFailedSession.worker, lastFailedSession.sessionId, effectiveCwd(state)) } : undefined;
-      const failoverPrompt = await buildPrompt(userText, state, topicNames, replyContext, pendingDesc, { omitStatic: false, priorContext: priorCtxFo });
+      const priorCtxFo = lastFailedSession ? { ...lastFailedSession, sessionPath: getPriorSessionPath(lastFailedSession.worker, lastFailedSession.sessionId, resolvedWorkdir.dir) } : undefined;
+      const failoverPrompt = await buildPrompt(userText, state, topicNames, replyContext, pendingDesc, { omitStatic: false, priorContext: priorCtxFo, workdir: resolvedWorkdir.tier === 'bot-cwd' ? undefined : { dir: resolvedWorkdir.dir, tier: resolvedWorkdir.tier } });
       freshResult = await runWithFailover(failoverPrompt, {
-        cwd: effectiveCwd(state),
+        cwd: resolvedWorkdir.dir,
         env: secrets,
         resource,
         updateId,
@@ -1261,6 +1266,9 @@ async function processUpdate(
     let config: any = { workers: [] };
     try { config = await loadConfig(); } catch {}
     let effectiveDefault = getEffectiveDefaultWorker(config, topicKey);
+
+    // Resolve workdir once per processUpdate (§3.3)
+    const workdir = await ensureTopicWorkdir(await resolveTopicWorkdir(topicState), BOT_CWD);
 
     // Hoisted above the voice-handling block (hardened plan WP6 item 4) —
     // load-bearing: without this, a failed note's bracketed error text
@@ -1543,7 +1551,7 @@ async function processUpdate(
     }
 
     if (!skipWorker && CODE_PATTERN.test(userText)) {
-      const codeCmd = handleCodeCommand(topicState, userText);
+      const codeCmd = handleCodeCommand(topicState, userText, { dir: workdir.dir, tier: workdir.tier });
       if (codeCmd.action === 'show' || codeCmd.action === 'reset') {
         response = codeCmd.response;
         skipWorker = true;
@@ -1749,6 +1757,37 @@ async function processUpdate(
       skipWorker = true;
     }
 
+    // /update_brain interception (§3.4) — deterministic staging or refusal
+    if (!skipWorker && UPDATE_BRAIN_PATTERN.test(userText)) {
+      const exemptions = await getTopicExemptions();
+      const updateBrainResult = handleUpdateBrainCommand(topicState, userText, exemptions);
+      if (updateBrainResult.action === 'refusal') {
+        response = updateBrainResult.response;
+        skipWorker = true;
+      } else {
+        // mkdir .staged directory (failure → refusal)
+        const PA_HOME = process.env.PA_HOME ?? join(homedir(), '.pa');
+        const stagedDir = join(PA_HOME, 'topic-brains', '.staged');
+        try {
+          await mkdir(stagedDir, { recursive: true });
+        } catch {
+          response = '⚠️ Could not prepare the topic staging directory. Nothing staged.';
+          skipWorker = true;
+        }
+        if (!skipWorker) {
+          // Rewrite userText to staging instruction
+          userText = updateBrainResult.instruction;
+          // Check if brain exists to include brain path in instruction
+          const brainInfo = await getTopicBrainInfo(chatId, threadId);
+          if (brainInfo) {
+            userText = userText.replace('<BRAIN_PATH_ABS>', brainInfo.path);
+          } else {
+            userText = userText.replace(/ If the topic brain at <BRAIN_PATH_ABS> already records a fact, stage only what is new or changed\./, '');
+          }
+        }
+      }
+    }
+
     // AI-028: /branch <name> [prompt] — create a child topic linked to this one.
     if (!skipWorker) {
       const br = handleBranchCommand(topicState, userText);
@@ -1905,7 +1944,7 @@ async function processUpdate(
       await addPendingDispatch({
         updateId: update.update_id, chatId, threadId, messageId,
         userText: archivedUserText, startedAt: new Date().toISOString(),
-        cwd: effectiveCwd(topicState), session: topicState.session,
+        cwd: workdir.dir, session: topicState.session,
       }).catch((err) => logger.warn('dispatch', 'failed to persist pending dispatch', { error: String(err) }));
       // Hardened plan WP6 item 5: resolved here (not at receipt) so a slow
       // archive scan never delays the crash-recovery record above, and so
@@ -1925,7 +1964,7 @@ async function processUpdate(
 
       let workerErrored = false;
       try {
-        const dr = await dispatchMessage(userText, replyContext, topicState.pending_action?.description, topicState, secrets, resourceId, effectiveDefault, topicNames, onNotify, update.update_id, contextId);
+        const dr = await dispatchMessage(userText, replyContext, topicState.pending_action?.description, topicState, secrets, resourceId, effectiveDefault, topicNames, onNotify, update.update_id, workdir, contextId);
         response = dr.response; topicState.session = dr.session;
         workerErrored = !!dr.workerError;
         // AI-151: capture the actual worker that handled this dispatch

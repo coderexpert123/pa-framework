@@ -28,9 +28,11 @@ import {
   clearTopicContext,
   handleNewCommand,
   handleResetCommand,
+  handleUpdateBrainCommand,
   handleHelpCommand,
   NEW_PATTERN,
   STATUS_PATTERN,
+  UPDATE_BRAIN_PATTERN,
   SKILLS_PATTERN,
   HELP_PATTERN,
   AUTH_PATTERN,
@@ -64,10 +66,11 @@ import {
 } from '../logic.js';
 import type { PAMeta } from '../types.js';
 import type { ConversationState, BranchAncestry } from '../types.js';
+import type { UpdateBrainResult } from '../logic.js';
 import type { WorkerConfig } from '../../../../pa/dist/src/types.js';
 
-function makeState(): ConversationState {
-  return { chat_id: 1, last_update_id: 0, thread_id: 0, turns: [] };
+function makeState(overrides: Partial<ConversationState> = {}): ConversationState {
+  return { chat_id: 1, last_update_id: 0, thread_id: 0, turns: [], ...overrides };
 }
 
 function withPending(description: string, ageMs = 0): ConversationState {
@@ -1846,6 +1849,69 @@ describe('parseCodeArgs', () => {
 });
 
 // ---------------------------------------------------------------------------
+// handleUpdateBrainCommand
+// ---------------------------------------------------------------------------
+
+describe('handleUpdateBrainCommand', () => {
+  const mockExemptions = new Map([
+    ['-1001234567890_29', 'output-only'],
+    ['-1001234567890_1759', 'dormant'],
+  ]);
+
+  it('refuses for thread_id === 0 (general/DM collision)', () => {
+    const state = makeState({ thread_id: 0 });
+    const result = handleUpdateBrainCommand(state, '/update_brain', mockExemptions);
+    assert.equal(result.action, 'refusal');
+    assert.match(result.response, /General.*DM topics don't get topic brains/);
+  });
+
+  it('refuses for hard-exempt classes', () => {
+    const state = makeState({ chat_id: -1001234567890, thread_id: 29 });
+    const result = handleUpdateBrainCommand(state, '/update_brain', mockExemptions);
+    assert.equal(result.action, 'refusal');
+    assert.match(result.response, /exempt from topic brains/);
+    assert.match(result.response, /output-only/);
+  });
+
+  it('allows staging for dormant topics (not a refusal)', () => {
+    const state = makeState({ chat_id: -1001234567890, thread_id: 1759 });
+    const result = handleUpdateBrainCommand(state, '/update_brain', mockExemptions);
+    assert.equal(result.action, 'stage');
+    assert.match(result.response, /Capture this topic's learnings for its topic brain/);
+  });
+
+  it('stages learnings for non-exempt topics', () => {
+    const state = makeState({ chat_id: -1001234567890, thread_id: 8306 });
+    const result = handleUpdateBrainCommand(state, '/update_brain', mockExemptions);
+    assert.equal(result.action, 'stage');
+    assert.match(result.response, /Capture this topic's learnings for its topic brain/);
+  });
+
+  it('includes guidance text in instruction when provided', () => {
+    const state = makeState({ chat_id: -1001234567890, thread_id: 8306 });
+    const result = handleUpdateBrainCommand(state, '/update_brain add note: API auth needs refresh', mockExemptions);
+    assert.equal(result.action, 'stage');
+    assert.match(result.response, /add note: API auth needs refresh/);
+  });
+
+  it('matches both /update_brain and /update-brain forms', () => {
+    const state = makeState({ chat_id: -1001234567890, thread_id: 8306 });
+
+    const result1 = handleUpdateBrainCommand(state, '/update_brain', mockExemptions);
+    assert.equal(result1.action, 'stage');
+
+    const result2 = handleUpdateBrainCommand(state, '/update-brain', mockExemptions);
+    assert.equal(result2.action, 'stage');
+  });
+
+  it('matches optional @botname', () => {
+    const state = makeState({ chat_id: -1001234567890, thread_id: 8306 });
+    const result = handleUpdateBrainCommand(state, '/update_brain@mybot', mockExemptions);
+    assert.equal(result.action, 'stage');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // handleCodeCommand
 // ---------------------------------------------------------------------------
 
@@ -1977,6 +2043,60 @@ describe('handleCodeCommand', () => {
     const state = makeState();
     const result = handleCodeCommand(state, '/code C:/test-repos/project');
     assert.equal(result.path, 'C:/test-repos/project');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// handleUpdateBrainCommand
+// ---------------------------------------------------------------------------
+
+
+describe('handleCodeCommand tier labels', () => {
+  const TEST_BOT_CWD = 'C:/test-project';
+  let originalBotCwd: string | undefined;
+  before(() => {
+    originalBotCwd = process.env.BOT_CWD;
+    process.env.BOT_CWD = TEST_BOT_CWD;
+  });
+  after(() => {
+    if (originalBotCwd === undefined) delete process.env.BOT_CWD;
+    else process.env.BOT_CWD = originalBotCwd;
+  });
+
+  it('shows "pinned" tier for override tier', () => {
+    const state = makeState({ cwd_override: 'D:/Custom/path' });
+    const result = handleCodeCommand(state, '/code', { dir: 'D:/Custom/path', tier: 'override' });
+    assert.equal(result.action, 'show');
+    assert.match(result.response, /pinned/);
+  });
+
+  it('shows "project" tier for project tier', () => {
+    const state = makeState();
+    const result = handleCodeCommand(state, '/code', { dir: 'D:/Project/path', tier: 'project' });
+    assert.equal(result.action, 'show');
+    assert.match(result.response, /project/);
+  });
+
+  it('shows "topic workspace" tier for topic-home tier', () => {
+    const state = makeState();
+    const result = handleCodeCommand(state, '/code', { dir: '/tmp/topic-brains/123_456', tier: 'topic-home' });
+    assert.equal(result.action, 'show');
+    assert.match(result.response, /topic workspace/);
+  });
+
+  it('shows "default" tier when resolvedWorkdir not provided (fallback)', () => {
+    const state = makeState();
+    const result = handleCodeCommand(state, '/code');
+    assert.equal(result.action, 'show');
+    assert.match(result.response, /Current working directory:/);
+    assert.match(result.response, new RegExp(TEST_BOT_CWD));
+  });
+
+  it('preserves old format when resolvedWorkdir not provided', () => {
+    const state = makeState({ cwd_override: 'D:/Custom/path' });
+    const result = handleCodeCommand(state, '/code');
+    assert.equal(result.action, 'show');
+    assert.match(result.response, /D:\/Custom\/path/);
   });
 });
 

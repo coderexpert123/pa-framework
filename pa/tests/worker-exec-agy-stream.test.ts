@@ -169,4 +169,39 @@ describe('worker-exec agy stream-json parsing', () => {
     assert.equal(result.exitCode, 0);
     assert.equal(result.output, 'hello from claude');
   });
+
+  // agyc is the same agy.exe binary with a pinned non-gemini model — it emits
+  // the identical event dialect. Regression guard for the 2026-08-21 incident:
+  // parsing was gated on the literal name 'agy', so every agyc reply was
+  // discarded (exit 0, output '', "silent no-op" — three failed commit runs).
+  it('agyc stream-json: same dialect as agy, response extracted from result event', async () => {
+    const stub = await writeNdjsonStub('agyc-full', AGY_FIXTURE_RUN1);
+    const worker = makeWorker({ name: 'agyc', command: stub.command, args: stub.args });
+
+    const result = await executeWorker(worker, 'test prompt', { timeout: 10 });
+
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.output, 'ok\n');
+    assert.equal(result.sessionId, '9b2b429c-9579-47e9-8c95-477e4a0cbebb');
+  });
+
+  it('agyc stream-json: text_delta fallback accumulates when no result event', async () => {
+    const stub = await writeNdjsonStub('agyc-fallback', AGY_INIT_AND_STEP_UPDATE);
+    const worker = makeWorker({ name: 'agyc', command: stub.command, args: stub.args });
+
+    const result = await executeWorker(worker, 'test prompt', { timeout: 10 });
+
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.output, 'fallback response\n');
+  });
+
+  it('agyc stream-json: captures error text from non-SUCCESS result', async () => {
+    const stub = await writeNdjsonStub('agyc-error', AGY_ERROR_RESULT);
+    const worker = makeWorker({ name: 'agyc', command: stub.command, args: stub.args });
+
+    const result = await executeWorker(worker, 'test prompt', { timeout: 10 });
+
+    assert.equal(result.exitCode, 0);
+    assert.ok(result.error && result.error.includes('API quota exceeded'), `Expected error to contain 'API quota exceeded', got: ${result.error}`);
+  });
 });

@@ -96,6 +96,18 @@ function quoteArg(a: string): string {
   return /[\s'"\\$`!|&;()<>]/.test(a) ? `'${a.replace(/'/g, "'\\''")}'` : a;
 }
 
+// agy and agyc are the SAME binary (agy.exe via the gemini-shim) emitting the
+// SAME stream-json dialect — `event.event` as discriminator, response in
+// result events, text_delta on step_update. agyc only pins a non-gemini
+// model. Gating dialect parsing on the literal name 'agy' silently discarded
+// every agyc reply: exit 0, parsed output '' — the "silent no-op" that
+// failed three commit runs (2026-08-18 ×2, 2026-08-21; the agent's completed
+// report was in the tee file, unparse-gated). Any future worker that shells
+// through the agy shim must be added here.
+function isAgyStreamWorker(worker: WorkerConfig): boolean {
+  return worker.name === 'agy' || worker.name === 'agyc';
+}
+
 async function writeTempPrompt(prompt: string): Promise<string> {
   const id = randomBytes(8).toString('hex');
   const tmpPath = join(tmpdir(), `pa-prompt-${id}.txt`);
@@ -683,7 +695,7 @@ export async function executeWorker(
 
               // Tool boundary tracking (agy): record stdout position after each tool_result
               // so we can discard intermediate planning narration on exit.
-              if (event.type === 'tool_result' && worker.name === 'agy') {
+              if (event.type === 'tool_result' && isAgyStreamWorker(worker)) {
                 lastToolBoundary = stdout.length;
               }
 
@@ -713,7 +725,7 @@ export async function executeWorker(
 
               // agy stream-json: uses event.event (not event.type) as discriminator.
               // Gated on worker name to prevent codex/claude/gemini events from matching.
-              if (worker.name === 'agy' && event.event) {
+              if (isAgyStreamWorker(worker) && event.event) {
                 // Session ID from init event (belt) and result event (suspenders)
                 if ((event.event === 'init' || event.event === 'result') && typeof event.conversation_id === 'string') {
                   capturedSessionId = event.conversation_id;
@@ -799,7 +811,7 @@ export async function executeWorker(
             }
             if (event.type === 'item.completed' && event.item?.type === 'agent_message' && event.item?.text) {
               stdout += event.item.text;
-            } else if (event.type === 'tool_result' && worker.name === 'agy') {
+            } else if (event.type === 'tool_result' && isAgyStreamWorker(worker)) {
               lastToolBoundary = stdout.length;
             } else if (event.type === 'result' && event.result) {
               stdout = event.result;
@@ -817,7 +829,7 @@ export async function executeWorker(
             }
 
             // agy stream-json: trailing buffer flush (same logic as stdout handler)
-            if (worker.name === 'agy' && event.event) {
+            if (isAgyStreamWorker(worker) && event.event) {
               if ((event.event === 'init' || event.event === 'result') && typeof event.conversation_id === 'string') {
                 capturedSessionId = event.conversation_id;
               }
@@ -868,7 +880,7 @@ export async function executeWorker(
         // from '' — and whitespace is not a final response segment worth paying the
         // whole output for. Runs that DID emit text after the last tool call are
         // unaffected; they trim exactly as before.
-        if (worker.name === 'agy' && lastToolBoundary > 0) {
+        if (isAgyStreamWorker(worker) && lastToolBoundary > 0) {
           const trimmed = stdout.slice(lastToolBoundary);
           if (trimmed.trim()) stdout = trimmed;
         }

@@ -1,3 +1,4 @@
+import * as os from 'os';
 import type {
   ConversationState,
   PAMeta,
@@ -78,6 +79,11 @@ export const COMMIT_PATTERN = /^\/commit(?:@\w+)?\s*$/i;
 export const PUSH_PATTERN = /^\/push(?:@\w+)?\s*$/i;
 export const PUSH_PUBLIC_PATTERN = /^\/push_public(?:@\w+)?\s*$/i;
 export const INVESTIGATE_FLAGGED_PATTERN = /^\/investigate_flagged(?:@\w+)?\s*$/i;
+
+// Deterministic trigger for /update_brain — stages learnings for nightly topic-brain fold.
+// Pattern (logic.ts, exported): /^\/update[-_]brain(?:@\w+)?(?:\s+([\s\S]+))?$/i
+// — bare, with optional guidance text, both slash forms, optional @botname.
+export const UPDATE_BRAIN_PATTERN = /^\/update[-_]brain(?:@\w+)?(?:\s+([\s\S]+))?$/i;
 
 // PA_META run_skill authorization (2026-08-17 audit P1-2). These skills may only be
 // invoked by explicit human commands (/commit, /push, etc.) — never via PA_META
@@ -308,6 +314,10 @@ export interface CodeCommandResult {
   instruction?: string; // optional trailing instruction for 'set' action
 }
 
+export type UpdateBrainResult =
+  | { action: 'refusal'; response: string }
+  | { action: 'stage'; instruction: string; stagedPath: string; response: string };
+
 /**
  * Parse a /code argument into a path and optional trailing instruction.
  * Handles quoted paths: /code "C:/code/some project" do something
@@ -339,7 +349,11 @@ export function parseCodeArgs(arg: string): { path: string; rest: string } {
  * Path validation (stat check) is intentionally left to the caller (main.ts) to keep
  * this function pure and easily testable.
  */
-export function handleCodeCommand(state: ConversationState, userText: string): CodeCommandResult {
+export function handleCodeCommand(
+  state: ConversationState,
+  userText: string,
+  resolvedWorkdir?: { dir: string; tier: string }
+): CodeCommandResult {
   const match = CODE_PATTERN.exec(userText);
   if (!match) return { matched: false, action: 'none', response: '' };
 
@@ -348,9 +362,22 @@ export function handleCodeCommand(state: ConversationState, userText: string): C
   // Default cwd label — mirror main.ts's BOT_CWD resolution (env-first, then process.cwd()).
   const defaultCwd = process.env.BOT_CWD || process.cwd();
 
-  // /code with no args: show current cwd
+  // /code with no args: show current cwd with tier label
   if (!arg) {
-    const current = state.cwd_override ?? `default (${defaultCwd})`;
+    let current: string;
+    if (resolvedWorkdir) {
+      // Tier labels per §3.9: pinned, project, topic workspace, default
+      const tierLabel: Record<string, string> = {
+        override: 'pinned',
+        project: 'project',
+        'topic-home': 'topic workspace',
+      };
+      const label = tierLabel[resolvedWorkdir.tier];
+      current = `${resolvedWorkdir.dir} (\`${label}\`)`;
+    } else {
+      // OLD format (pre-WP1): just the path, no tier labels
+      current = state.cwd_override ?? defaultCwd;
+    }
     return { matched: true, action: 'show', response: `Current working directory: \`${current}\`` };
   }
 
@@ -377,6 +404,74 @@ export function handleCodeCommand(state: ConversationState, userText: string): C
     response: '',
     path,
     instruction: rest || undefined,
+  };
+}
+
+/**
+ * Handle the /update_brain command — deterministic interception + worker-executed staging.
+ *
+ * Returns:
+ * - action: 'refusal' → skipWorker, send response locally
+ * - action: 'stage' → rewrite userText to staging instruction, proceed to dispatch
+ *
+ * Pure function — no mkdir here (that's main.ts's job before calling this).
+ */
+export function handleUpdateBrainCommand(
+  state: ConversationState,
+  userText: string,
+  exemptions: ReadonlyMap<string, string>
+): UpdateBrainResult {
+  const match = UPDATE_BRAIN_PATTERN.exec(userText);
+  if (!match) {
+    // Should not happen if pattern matched, but handle gracefully
+    return { action: 'refusal', response: 'Invalid /update_brain command.' };
+  }
+
+  const guidanceText = match[1]?.trim() || '';
+
+  // Refusal 1: thread 0 (general + DM collision, F5)
+  if (state.thread_id === 0) {
+    return {
+      action: 'refusal',
+      response: "🚫 General/DM topics don't get topic brains — the archive can't separate thread 0 across chats. Nothing staged.",
+    };
+  }
+
+  // Refusal 2: hard-exempt classes
+  const topicKey = `${state.chat_id}_${state.thread_id}`;
+  const exemptClass = exemptions.get(topicKey);
+  if (exemptClass && ['output-only', 'duplicate', 'one-off', 'pinned-guide'].includes(exemptClass)) {
+    return {
+      action: 'refusal',
+      response: `🚫 This topic is exempt from topic brains (${exemptClass}). Nothing staged.`,
+    };
+  }
+
+  // Build staging instruction
+  const PA_HOME = process.env.PA_HOME ?? os.homedir() + '/.pa';
+  const stagedPath = `${PA_HOME}/topic-brains/.staged/${topicKey}.md`;
+  const now = new Date();
+  const dateStr = now.toISOString().slice(0, 10); // YYYY-MM-DD
+  const hours = String(now.getUTCHours() + 5).padStart(2, '0').slice(-2); // IST is UTC+5:30
+  const minutes = String(now.getUTCMinutes() + 30).padStart(2, '0').slice(-2);
+  const timeStr = `${hours}:${minutes}`;
+
+  // Check if brain exists (async, but main.ts will need brainPath anyway for the check)
+  // For now, build the instruction template
+  let instruction = `The user ran /update_brain in this topic. Capture this topic's durable learnings: extract the facts, decisions, conventions, and open threads from this conversation that belong in the topic's long-term memory. APPEND them as one new markdown section titled "## Staged ${dateStr} (${timeStr} IST)" to the file ${stagedPath} — create the file if it does not exist; plain bullets; recency wins over older statements. If the topic brain at <BRAIN_PATH_ABS> already records a fact, stage only what is new or changed. Do NOT edit BRAIN.md, INDEX.md, or anything else under the topic-brains directory — the nightly consolidation pass folds staged sections into the brain. Finish with a one-line confirmation of what you staged.`;
+
+  // Append guidance if provided
+  if (guidanceText) {
+    instruction += `\nUser guidance: ${guidanceText}`;
+  }
+
+  return {
+    action: 'stage',
+    instruction,
+    stagedPath,
+    response: guidanceText
+      ? `Capture this topic's learnings for its topic brain — with your note: ${guidanceText}`
+      : `Capture this topic's learnings for its topic brain`,
   };
 }
 

@@ -25,6 +25,10 @@ workers:
       - "RESOURCE_EXHAUSTED"
       - "429"
     priority: 1
+    # manual_only: true   # OPTIONAL: exclude this worker from automatic
+    #                     # failover ordering — it runs ONLY when a dispatch
+    #                     # explicitly names it (skill `worker:` frontmatter,
+    #                     # bot /agent pick, or worker_pin).
     state_dir: "~/.gemini/antigravity-cli/conversations"
     state_pattern: "*.db"
     tunables:

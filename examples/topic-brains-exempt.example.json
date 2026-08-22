@@ -1,0 +1,8 @@
+{
+  "_comment": "Example EXEMPT.json with placeholder topic keys. Deploy to $PA_HOME/topic-brains/EXEMPT.json with real topic keys from your deployment.",
+  "-100xxxxxxxxxx_1": "output-only",
+  "-100xxxxxxxxxx_2": "duplicate",
+  "-100xxxxxxxxxx_3": "one-off",
+  "-100xxxxxxxxxx_4": "pinned-guide",
+  "-100xxxxxxxxxx_5": "dormant"
+}

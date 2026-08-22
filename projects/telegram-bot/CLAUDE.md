@@ -1,17 +1,12 @@
 # Agentic Brain — Telegram Bot (`projects/telegram-bot/`)
 
 This file auto-loads whenever Claude Code reads a file under `projects/telegram-bot/`
-(native Claude Code directory-scoped `CLAUDE.md` behavior — see the root `CLAUDE.md`'s
-Communication Layer bullet and `docs/CONVENTIONS.md` § "Brain-file organization" for why
-this file exists as a separate directory-scoped file rather than living inline in the
-root brain). It carries the bot-internal detail that used to sit in root `CLAUDE.md`'s
-Communication Layer bullet, extracted 2026-08-07 to keep the root file under its size
-budget while still firing unprompted for anyone actually touching this directory.
+(native directory-scoped `CLAUDE.md` behavior — see root `CLAUDE.md` and `docs/CONVENTIONS.md`).
+Carries bot-internal detail extracted to keep the root file under size budget.
 
 **This file publishes to the public mirror** (`pa-framework`) — no personal data,
-secrets, or private-repo-only detail belongs here. `bot-instructions.md` (the static
-system-prompt content appended to claude/zclaude spawns) is itself excluded from the
-mirror; referencing it by name is fine.
+secrets, or private-repo-only detail belongs here. `bot-instructions.md` (static
+system-prompt content) is excluded from the mirror; referencing it by name is fine.
 
 ## What this project is
 
@@ -45,20 +40,21 @@ action envelope for cross-skill triggering.
 - **Agent & Model switching**: `/agent zclaude`, `/agent claude`, `/agent codex`,
   `/agent agy`, `/agent agyc` sets `preferred_worker` for the topic (session-scoped, expires at IST
   midnight; legacy `/model <agent>` is backward-compatible with a tip).
+- **Dispatch failover shape**: resumed-session, preferred-worker, and default-worker attempts are each SINGLE tries advancing only on rate-limit classification; total failure falls through to the full `runWithFailover` cascade with prior-context injection (`main.ts`). Resumed-session timeouts surface as errors, not silent model switches.
 - **Uniform tunables & Option B descriptors** (`logic.ts`, `main.ts`): `/model <value>` and `/effort <value>` are
   CLI-agnostic session-scoped settings (`TUNABLE_COMMAND_SETTINGS` maps
   the uniform word to each CLI's real setting name); `/default` (without arguments) promotes current
   active session configuration (agent, model, effort) directly to persistent topic defaults. `/default <setting> <value>`
   or `/default <worker>` sets specific topic defaults. Pinned status cards use Option B format:
-  `agent (model) [effort]` (e.g. `claude (opusplan) [high]`, `zclaude (glm-5.3) [high]`, `codex (gpt-5.4) [medium]`, `agy (gemini-3.7-flash-high)`).
+  `agent (model) [effort]` (e.g. `claude (opusplan) [high]`, `agy (gemini-3.7-flash-high)`).
   All command switches and midnight expiry sweeps update the pinned status card in-place (`editMessageText`) rather than reposting,
   while interactive commands and midnight expiry emit concise before → now change replies.
-  Resolution cascade: session override → topic default → worker's own default → CLI built-in (`KNOWN_CLI_DEFAULT_MODELS`, `KNOWN_CLI_DEFAULT_EFFORTS`).
+  Resolution cascade: session override → topic default → worker default → CLI built-in (`KNOWN_CLI_DEFAULT_MODELS`, `KNOWN_CLI_DEFAULT_EFFORTS`).
   Per-CLI translation lives in `~/.pa/config.yaml`'s `tunables.<name>.args` as an ARG TEMPLATE (`{value}` substituted);
   `supersedes:` marks mutually-exclusive knobs. Clear/reset tokens: `clear`, `reset`, `default`, `unset`, `-`. Tested in
   `tunables-commands.test.ts`, `logic.test.ts`, `dashboard.test.ts`.
 - **Deterministic command interception (2026-08-18)**: `/new`, `/code`, `/status`, `/skills`, `/help`, `/health`, `/ref <id>`, `/claims` are intercepted locally in `processUpdate` before worker dispatch (`/new` resets context & optionally seeds from replied ref-ID, `/code` validates and manages topic cwd_override). Tested in `logic.test.ts` + `poll-loop.test.ts`.
-- **Auto Topic Descriptions (2026-08-20)**: Topic descriptions auto-set immediately upon creation (manual topics via `forum_topic_created` and branch topics via `/branch <name> [prompt]`) via LLM with deterministic fallbacks, without interactive confirmation (`main.ts`, `logic.ts`).
+- **Auto Topic Descriptions (2026-08-20)**: Topic descriptions auto-set on creation (manual via `forum_topic_created`, branches via `/branch`) via LLM with deterministic fallbacks (`main.ts`, `logic.ts`). **Descriptions are registry-internal prompt metadata** — `editForumTopic` has NO description parameter (re-verified 2026-08-21), so never plan a Telegram-side sync. **The bot loads the topic-names map once at startup and rewrites the whole file on every change** — hand edits are clobbered unless made in a `pa bot stop` → edit → restart window.
 - **Telegram-driven Google OAuth reauth**: `/auth <code> [state]` is intercepted before
   archival, archived as `/auth [redacted]`, exchanges the auth code via
   `pa/scripts/finish_google_telegram_reauth.py`, deletes the code-bearing message, and
@@ -101,6 +97,7 @@ action envelope for cross-skill triggering.
   participates in /stop//steer flush semantics exactly like text; see
   `docs/bot-reliability-internals.md`'s AI-092 section for the flush model and the
   do-not-regress list (steer-drain, held ordering, prefetch env).
+- **Topic brains (per-topic durable context)**: Pointer-line injection in `context.ts` (fresh dispatches only), `topic-brains.ts` reader with fail-to-absent behavior, both-places standing rule in `capabilities` and `bot-instructions.md`. Single-writer: bot only reads; nightly pass (`finalize`) and `--stamp` adoption are the only writers (all atomic). `/merge` folds via `ancestry.mergedAt` nightly; INDEX.md regenerated nightly. Hand-set descriptions uncapped. **Exempt registry**: `$PA_HOME/topic-brains/EXEMPT.json` (PAHOME-local); hard classes (`output-only`/`duplicate`/`one-off`/`pinned-guide`) skip nightly work and refuse `/update_brain`; `dormant` (30d stale) skips while stale. **Workdir cascade**: `cwd_override` > brain Project pointer (first absolute path in `## Project pointers`) > topic home (`{key}/` with `scratch/`) > BOT_CWD. agy/agyc/codex cwd stays repo-root (shim cd / `-C` pin); claude/zclaude get real per-topic dirs + per-topic CLAUDE.md shim. **`/update_brain`**: deterministic interception stages into `.staged/{topicKey}.md` (folded nightly by `finalize`); refuses thread-0 and hard-exempt. Specs: `plans/2026-08-21-topic-brains-SPEC.md` and `plans/2026-08-22-topic-brains-wave1.5-SPEC.md`.
 
 ## Reliability internals
 
@@ -111,3 +108,6 @@ library defaults** — both exist because of a real July crash RCA): read
 `docs/bot-reliability-internals.md` before touching reply delivery, the DLQ,
 delivered-store dedup, pending-dispatches, orphan-reaper, `worker-stop.ts`/cancellation,
 or `health.ts`/DEGRADED shedding.
+
+Declared bot maintenance jobs (AI-100): log rotation, model sweep, compaction, proxy
+refresh, grounding-check, registry-content-watch (daily content invariants), DLQ flush.

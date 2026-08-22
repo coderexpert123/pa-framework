@@ -88,6 +88,25 @@ def call_gemini(prompt: str) -> str:
     return output.strip()
 
 
+# Signatures of non-transient Gemini CLI credential failures. A 10s retry cannot
+# fix these: the 2026-08-19..21 license invalidation burned both attempts on
+# every scheduled run because the retry loop treated a dead license as a
+# transient blip. Matched case-insensitively against the raised error text.
+GEMINI_AUTH_FAILURE_SIGNATURES = (
+    "error authenticating",  # "Error authenticating: _GaxiosError: You do not have a valid license..."
+    "valid license",
+    "invalid_grant",         # OAuth refresh token rejected
+    "unauthenticated",       # API-level credential rejection
+)
+
+
+def is_gemini_auth_failure(error_text: str) -> bool:
+    """True when a gemini CLI error indicates a credential/license failure
+    (non-transient), so callers fail fast instead of retrying."""
+    lowered = (error_text or "").lower()
+    return any(signature in lowered for signature in GEMINI_AUTH_FAILURE_SIGNATURES)
+
+
 PORTFOLIO_JSON_DIR = os.path.normpath(
     os.path.join(PROJECT_ROOT, "..", "portfolio-reports", "data", "prompt_processed", "json")
 )
@@ -489,14 +508,19 @@ def main():
     portfolio_context = load_portfolio_context()
     prompt = build_prompt(window, total_count, emails_text, portfolio_context)
 
-    def fail_gemini(reason: str) -> None:
-        write_failure_marker("gemini", reason)
-        _notify_failure(
-            "gemini",
-            f"Mail brief failed — Gemini error.\n"
-            f"Window: {window}\nError: {reason[:300]}\n\n"
-            f"State not advanced — next catchup will retry.",
-        )
+    def fail_gemini(reason: str, auth_failure: bool = False) -> None:
+        status = "gemini-auth" if auth_failure else "gemini"
+        body = f"Mail brief failed — Gemini error.\nWindow: {window}\nError: {reason[:300]}\n\n"
+        if auth_failure:
+            body += (
+                "This failure is not transient — catchup retries will keep failing until "
+                "the Gemini CLI credential/license is fixed. Re-authenticate the Gemini CLI "
+                "(GEMINI_CMD) or restore its license, then re-run `pa run daily-mail-brief`."
+            )
+        else:
+            body += "State not advanced — next catchup will retry."
+        write_failure_marker(status, reason)
+        _notify_failure(status, body)
         sys.exit(1)
 
     print(f"[run_brief] Calling gemini for {total_count} emails in {window}...")
@@ -506,6 +530,12 @@ def main():
         try:
             candidate = call_gemini(current_prompt)
         except Exception as e:
+            if is_gemini_auth_failure(str(e)):
+                # Credential/license failures are non-transient: the second
+                # attempt re-fails identically (2026-08-19..21 license
+                # incident), so fail fast with the actionable gemini-auth alert.
+                print(f"[ERROR] Gemini auth/license failure — not retrying: {e}", file=sys.stderr)
+                fail_gemini(str(e), auth_failure=True)
             if attempt == 0:
                 print(f"[WARN] Gemini attempt 1 failed, retrying in 10s: {e}", file=sys.stderr)
                 time.sleep(10)

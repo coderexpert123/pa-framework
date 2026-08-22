@@ -39,7 +39,7 @@ export const BOT_COMMANDS: BotCommand[] = [
   // Pass-through Commands (skipWorker = false)
   { command: 'deep_plan', description: 'Detailed implementation planning skill' },
   { command: 'deep_recheck', description: 'Deep verification of plans or implementation' },
-  { command: 'update_brain', description: 'Update Agentic Brain from current session' },
+  { command: 'update_brain', description: 'Capture this topic\'s learnings for its topic brain (folded nightly)' },
   { command: 'claude_sync', description: 'Sync settings and memories to Google Drive' },
   { command: 'check_brain', description: 'Audit the project Agentic Brain architecture' },
   { command: 'simplify', description: 'Analyze code for potential simplifications' },
@@ -50,7 +50,6 @@ export const BOT_COMMANDS: BotCommand[] = [
 export const PASS_THROUGH_COMMANDS = new Set([
   'deep_plan',
   'deep_recheck',
-  'update_brain',
   'claude_sync',
   'check_brain',
   'simplify',

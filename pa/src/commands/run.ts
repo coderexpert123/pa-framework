@@ -543,8 +543,17 @@ export async function runCommand(
         suppressExitAlert: willFailover,
       });
       if (prefResult.success) {
-        await handleSkillResult(prefResult, workerPref, skillName, Date.now() - start, extraArgs, depth, preferredWorker, skill.frontmatter.telegram_output, secrets);
-        return prefResult;
+        // Silent no-op (telegram_output skill, exit 0, empty output) is a
+        // failure of the pinned worker too — fall into failover rather than
+        // returning a "success" that handleSkillResult can only reclassify
+        // after the chance to try another worker has passed (2026-08-21).
+        // NO_OUTPUT sentinel is non-empty output and passes.
+        if (skill.frontmatter.telegram_output && (!prefResult.output || !prefResult.output.trim()) && willFailover) {
+          console.warn(`[run] preferred worker ${workerPref} exited 0 with empty output for ${skillName} (silent no-op), falling back to failover`);
+        } else {
+          await handleSkillResult(prefResult, workerPref, skillName, Date.now() - start, extraArgs, depth, preferredWorker, skill.frontmatter.telegram_output, secrets);
+          return prefResult;
+        }
       }
       // Pinned worker failed
       if (willFailover) {
@@ -567,6 +576,10 @@ export async function runCommand(
     extraArgs: workerExtraArgs,
     resource: `skill-${skillName}`,
     noFallback: !!skill.frontmatter.no_fallback,
+    // A telegram_output skill exists to DELIVER — a worker that exits 0 with
+    // empty output fails over instead of ending the cascade as a fake
+    // success (workers.ts applies the check inside the loop).
+    requireNonEmptyOutput: !!skill.frontmatter.telegram_output,
   };
   // When pinned worker failed and we're falling back, exclude it and record the prior attempt
   if (workerPref && willFailover) {

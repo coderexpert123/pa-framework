@@ -93,11 +93,40 @@ async function pathExists(p: string): Promise<boolean> {
   }
 }
 
-/** Pipes `git archive --format=tar HEAD` from privateDir directly into `tar -x` inside publicDir. */
+import { resolvePythonCommand } from './python.js';
+
+/** Pipes `git archive --format=tar HEAD` from privateDir into tar extraction in publicDir. */
 function extractHead(privateDir: string, publicDir: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const archive = spawn('git', ['-C', privateDir, 'archive', '--format=tar', 'HEAD'], { windowsHide: true });
-    const extract = spawn(resolveTarCommand(), ['-x', '-C', publicDir], { windowsHide: true });
+    
+    // Windows: CreateSymbolicLinkW fails without Developer Mode / Admin (common in standard user sessions).
+    // Python tarfile extracts regular files and falls back to writing symlink target content as text files
+    // on OSError (matching git's core.symlinks=false Windows behavior).
+    const pythonCmd = resolvePythonCommand();
+    const pythonScript = [
+      'import sys, tarfile, os',
+      'target = sys.argv[1]',
+      'with tarfile.open(fileobj=sys.stdin.buffer, mode="r|*") as tar:',
+      '    for member in tar:',
+      '        dest_path = os.path.join(target, member.name)',
+      '        if member.issym() or member.islnk():',
+      '            os.makedirs(os.path.dirname(dest_path), exist_ok=True)',
+      '            try:',
+      '                if os.path.lexists(dest_path):',
+      '                    os.remove(dest_path)',
+      '                os.symlink(member.linkname, dest_path)',
+      '            except OSError:',
+      '                with open(dest_path, "w", encoding="utf-8") as f:',
+      '                    f.write(member.linkname)',
+      '        else:',
+      '            try:',
+      '                tar.extract(member, path=target, filter="tar")',
+      '            except TypeError:',
+      '                tar.extract(member, path=target)',
+    ].join('\n');
+
+    const extract = spawn(pythonCmd, ['-c', pythonScript, publicDir], { windowsHide: true });
 
     let archiveStderr = '';
     let extractStderr = '';

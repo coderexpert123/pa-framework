@@ -248,6 +248,9 @@ const DEFAULT_BRAIN_FILES = `{
 }
 `;
 
+const DEFAULT_EXEMPT_JSON = `{}`;
+
+
 import { join } from 'path';
 
 export async function initCommand(): Promise<void> {
@@ -293,6 +296,24 @@ export async function initCommand(): Promise<void> {
   } catch {
     await writeFile(brainFilesPath, DEFAULT_BRAIN_FILES, 'utf8');
     console.log(`[+] Created brain-files.json (empty; opt-in for the update-brain sample skill)`);
+  }
+
+  const topicBrainsDir = join(home, 'topic-brains');
+  try {
+    await access(topicBrainsDir);
+    console.log(`[skip] topic-brains directory already exists.`);
+  } catch {
+    await mkdir(topicBrainsDir, { recursive: true });
+    console.log(`[+] Created topic-brains directory`);
+  }
+
+  const exemptJsonPath = join(topicBrainsDir, 'EXEMPT.json');
+  try {
+    await access(exemptJsonPath);
+    console.log(`[skip] topic-brains/EXEMPT.json already exists.`);
+  } catch {
+    await writeFile(exemptJsonPath, DEFAULT_EXEMPT_JSON, 'utf8');
+    console.log(`[+] Created topic-brains/EXEMPT.json (empty exemption registry)`);
   }
 
   console.log('\n========================================');

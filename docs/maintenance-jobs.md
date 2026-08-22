@@ -59,6 +59,9 @@ gap):
   `[Voice message]`/`[ATTACHMENT:` artifacts — and pages pa-alerts deduped; deliberately
   does NOT flag a merely-missing description, a separate larger pre-existing gap, to
   avoid alert fatigue)
+- `registry-content-watch` (2026-08-22, R10, 24h, asserts content invariants on topic
+  descriptions — Path-0 pointer in 9855, no Palo Alto hallucination in 3376, routing
+  gate in 7822; pages pa-alerts deduped on violation)
 
 `health-probe` was deliberately EXCLUDED — its 15s cadence is incompatible with the poll
 loop's 30s long-poll floor and would falsely trigger permanent DEGRADED.

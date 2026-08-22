@@ -44,6 +44,8 @@ pa/scripts/memory_consolidation.py
 pa/scripts/tests/test_memory_consolidation.py
 pa/scripts/migrate_profile_metadata.py
 pa/scripts/tests/test_migrate_profile_metadata.py
+pa/scripts/profile_repair.py
+pa/scripts/tests/test_profile_repair.py
 pa/scripts/run_restore_drill.py
 pa/scripts/tests/test_run_restore_drill.py
 pa/scripts/rotate_secrets.py

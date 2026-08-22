@@ -1,6 +1,7 @@
 import type { ConversationState } from './types.js';
 import { formatHistory } from './conversation.js';
 import type { TopicNameMap } from './topic-names.js';
+import { getTopicBrainInfo } from './topic-brains.js';
 
 // Import pa modules from compiled output
 import { listSkills } from '../../../pa/dist/src/skills.js';
@@ -107,6 +108,7 @@ export async function buildPrompt(
     omitStatic?: boolean;
     priorContext?: { worker: string; sessionId: string; sessionPath: string | null };
     attachments?: Array<{ filename: string; path: string }>;
+    workdir?: { dir: string; tier: 'override' | 'project' | 'topic-home' };
   }
 ): Promise<string> {
   const today = todayIST();
@@ -168,6 +170,7 @@ export async function buildPrompt(
 - Ambiguous intent: ask exactly ONE clarifying question.
 - Never fabricate data. If you don't know, say so.
 - Grounding Sources first: Systems of record: D:/My Repos/notes/Ecosystem KB/ (start with Sources.md). Before answering a date-sensitive or domain-deterministic factual question, check Sources.md and the file(s) it names, and cite them. Never answer such a question from general/parametric knowledge when a named source exists. (Mirrors bot-instructions.md's Factual Integrity item 4 — claude/zclaude get that file via --append-system-prompt-file, agy/codex only get this inline block, so this rule must exist in both places; keep them in sync, enforced by context.test.ts.)
+- Topic brains: when the Topic section names a topic brain file, read it before assuming prior context for this topic — it records durable facts, decisions, and open threads; fresh turns override it.
 - Infrastructure outside the repo tree — worker shims (D:/gemini-shim), ~/.pa config, installed CLI binaries — is never to be rewritten, replaced, or worked around to fix a failure. Diagnose, then surface the blocker to the operator and stop. Substituting one CLI for another behind a worker's name breaks every assumption the dispatcher, guards, and docs make about that worker (2026-08-14: agy's shim was silently rerouted to a different CLI).
 - PA_META (optional last line, single-line JSON, nothing after it):
   [PA_META]: {"actions":[{"type":"T",...}]}
@@ -178,23 +181,48 @@ export async function buildPrompt(
     ? ''
     : `You are a personal assistant for ${PA_USER_NAME}, responding via Telegram.\n`;
 
-  const cwdSection = state.cwd_override
-    ? `\n## Working Directory\nYou are operating in: \`${state.cwd_override}\`\nThis is the project root for all file operations. Read the project's CLAUDE.md if present.\n`
-    : '';
+  // CWD section per §3.8 — tier-specific texts
+  let cwdSection = '';
+  if (options?.workdir) {
+    const { dir, tier } = options.workdir;
+    if (tier === 'override' || tier === 'project') {
+      cwdSection = `\n## Working Directory\nYou are operating in: \`${dir}\`\nThis is the project root for all file operations. Read the project's CLAUDE.md if present.\n`;
+    } else if (tier === 'topic-home') {
+      const botCwd = process.env.BOT_CWD || process.cwd();
+      cwdSection = `\n## Working Directory\nYou are operating in the topic workspace: \`${dir}\`\nThis is a scratch space for this conversation — use \`scratch/\` for files you create; a CLAUDE.md here (if present) points to this topic's brain. It is not a code repository: for repo work use absolute paths — the main repository is at \`${botCwd}\`.\n`;
+    }
+    // bot-cwd/undefined → no section (fallback tier produces byte-identical prompts)
+  }
 
   const skillStatusSection = includeSkillStatus
     ? `\n## PA Skill Status (last scheduled run)\n${skillStatus}\n`
     : '';
 
+  // Topic brain pointer (WP1: §3.4 pointer line, §3.5 standing-rule bullet)
+  const brainInfo = await getTopicBrainInfo(state.chat_id, state.thread_id);
+  let brainPointerLine = '';
+  if (brainInfo) {
+    const consolidated = brainInfo.consolidated
+      ? `consolidated ${brainInfo.consolidated.slice(0, 10)}`
+      : 'freshness unknown';
+    const covers = brainInfo.covers
+      ? `covers through ${brainInfo.covers.slice(0, 10)}`
+      : '';
+    brainPointerLine = `\nTopic brain: ${brainInfo.path} (${consolidated}${covers ? `, ${covers}` : ''}) — durable per-topic knowledge: what was discussed, decided, and left open. Read it before assuming prior context in this topic; fresh turns override it.`;
+  }
+
   const topicDesc = buildTopicDescription(state, topicNames);
-  const topicDescSection = topicDesc ? `\n## Topic\n${topicDesc}\n` : '';
+  // Topic section renders if EITHER topic description OR brain pointer exists
+  const topicSection = (topicDesc || brainPointerLine)
+    ? `\n## Topic\n${topicDesc}${brainPointerLine}\n`
+    : '';
 
   const telegramMeta = `\n## Telegram Metadata\nChat ID: ${state.chat_id}\nThread ID: ${state.thread_id}\n`;
 
   const capabilitiesSection = capabilities ? `\n${capabilities}` : '';
 
   return `${identity}Today is ${today}. Current time (IST): ${now}.
-${cwdSection}${skillStatusSection}${topicDescSection}${telegramMeta}
+${cwdSection}${skillStatusSection}${topicSection}${telegramMeta}
 ## Conversation History
 ${historySection}
 ${priorContextSection}
