@@ -53,6 +53,16 @@ export const HELP_PATTERN = /^\/help(?:@\w+)?$/i;
 export const HEALTH_PATTERN = /^\/health(?:@\w+)?$/i;
 export const REF_PATTERN = /^\/ref(?:@\w+)?\s+(\S+)\s*$/i;
 export const CLAIMS_PATTERN = /^\/claims(?:@\w+)?$/i;
+// Deterministic trigger for a Google OAuth reauth link. Local, never LLM-inferred:
+// the operator asks for this precisely when four skills are already blocked, and
+// the link has a 12 h fuse. `/reauth [skill]` optionally names the skill to resume.
+export const REAUTH_PATTERN = /^\/reauth(?:@\w+)?(?:\s+([a-z0-9][a-z0-9-]*))?\s*$/i;
+// Callback-data contract for the inline "Re-authorize Google" button carried by every
+// reauth notice (bot + Python sender share this shape): `reauth:google` or
+// `reauth:google:<skill>` where `<skill>` matches [a-z0-9-]{1,50}.
+// `reauth:google:` is 14 bytes, so 50 is the largest suffix that fits Telegram's
+// 64-byte `callback_data` limit.
+export const REAUTH_CALLBACK_PATTERN = /^reauth:(google)(?::([a-z0-9-]{1,50}))?$/;
 // [Voice message]/[Audio file]/[Video note] re-transcription (WP5 of the
 // hardened voice-transcription plan). Wiring (locate the replied media,
 // call voice.ts's findCachedAudio/transcribeVoiceMessage) is WP6's job in
@@ -89,7 +99,7 @@ export const UPDATE_BRAIN_PATTERN = /^\/update[-_]brain(?:@\w+)?(?:\s+([\s\S]+))
 // invoked by explicit human commands (/commit, /push, etc.) — never via PA_META
 // run_skill, because LLM inference about when to git-commit/push is too unreliable for
 // an operation that mutates the live tree.
-const PA_META_PROTECTED_SKILLS = new Set([
+export const PA_META_PROTECTED_SKILLS = new Set([
   'self-improver',
   'commit',
   'push',
@@ -554,6 +564,29 @@ export function handleClaimsCommand(): { matched: boolean } {
   return { matched: true };
 }
 
+/**
+ * Handle the /reauth [skill] command. Extracts the optional resume-skill name.
+ * The actual link request is executed in main.ts via spawning
+ * pa/scripts/start_google_telegram_reauth.py.
+ */
+export function handleReauthCommand(userText: string): { matched: boolean; skill?: string } {
+  const m = REAUTH_PATTERN.exec(userText);
+  if (!m) return { matched: false };
+  return { matched: true, skill: m[1] };
+}
+
+/**
+ * Parses the `reauth:google[:skill]` inline-button callback_data. Pure — no I/O.
+ * The actual link request is executed in main.ts via spawnReauthLink, same as
+ * handleReauthCommand above.
+ */
+export function parseReauthCallback(data: string | undefined): { provider: 'google'; skill?: string } | null {
+  if (!data) return null;
+  const m = REAUTH_CALLBACK_PATTERN.exec(data);
+  if (!m) return null;
+  return { provider: 'google', skill: m[2] };
+}
+
 export function isPassThroughCommand(userText: string): boolean {
   return PASS_THROUGH_PATTERN.test(userText);
 }
@@ -741,6 +774,16 @@ export function resolveConfirmation(
   // Unrelated message — clear pending and let worker handle it
   state.pending_action = undefined;
   return { skipWorker: false, response: '' };
+}
+
+/** Reads the pending action's description and CLEARS it, so a second "yes" (typed,
+ *  tapped, or 👍'd) inside the 5-minute TTL cannot re-run the same confirmed action.
+ *  Implements what resolveConfirmation's own comment has claimed since it was written
+ *  (main.ts never did clear it — plans/2026-08-24-buttons-program-SPEC.md correction 3). */
+export function consumeConfirmation(state: ConversationState): string | undefined {
+  const desc = state.pending_action?.description;
+  state.pending_action = undefined;
+  return desc;
 }
 
 // AI-029 (hardened 2026-08-05, ekadashi-topic incident): resolves a pending
@@ -1622,34 +1665,12 @@ export function buildWorkerErrorResponse(args: {
  * Checks if an audit record carries risk flags that require operator approval
  * and returns the appropriate InlineKeyboardMarkup for HITL buttons.
  *
+ * Moved to pa/src/lib/hitl-keyboard.ts (2026-08-24 buttons program, P5) so pa's
+ * self-improver can attach the same keyboard without importing bot code — this is a
+ * re-export, not a reimplementation; output must stay byte-identical (verified by this
+ * file's own hitl-buttons.test.ts and pa/tests/hitl-keyboard.test.ts).
+ *
  * @param auditRecord - The audit record to check (from self-improver-audit.jsonl)
  * @returns InlineKeyboardMarkup if risk flags present, undefined otherwise
  */
-export function buildHITLKeyboard(auditRecord: { risk_flags?: string[]; ts?: string }): { inline_keyboard: any[][] } | undefined {
-  if (!auditRecord.risk_flags || auditRecord.risk_flags.length === 0) {
-    return undefined;
-  }
-
-  // Check for high-risk flags that require HITL approval
-  const highRiskFlags = ['critical-skill', 'declares-secrets'];
-  const hasHighRiskFlag = auditRecord.risk_flags.some(flag => highRiskFlags.includes(flag));
-
-  if (!hasHighRiskFlag) {
-    return undefined;
-  }
-
-  // Use timestamp as audit record ID for callback_data
-  const auditId = auditRecord.ts || 'unknown';
-
-  return {
-    inline_keyboard: [
-      [
-        { text: '✅ Approve', callback_data: `pm:${auditId}:approve` },
-        { text: '❌ Reject', callback_data: `pm:${auditId}:reject` },
-      ],
-      [
-        { text: '📄 Show diff', callback_data: `pm:${auditId}:diff` },
-      ],
-    ],
-  };
-}
+export { buildHITLKeyboard } from '../../../pa/dist/src/lib/hitl-keyboard.js';

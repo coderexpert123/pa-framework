@@ -4,6 +4,7 @@ import { runWithFailover } from './workers.js';
 import { parseProposalResponse, readRecentConversations } from './analyzer.js';
 import type { ConversationTurn } from './analyzer.js';
 import { notifyUser } from './lib/notify.js';
+import { ANALYZER_TURN_CHARS } from './lib/skill-candidates.js';
 import type { DraftProposal } from './types.js';
 
 /**
@@ -32,7 +33,7 @@ export function buildFeedbackPrompt(
   const conversationBlock = Array.from(byDay.entries())
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([day, dayTurns]) => {
-      const lines = dayTurns.map((t) => `[${t.role.toUpperCase()}] ${t.text.slice(0, 300)}`).join('\n');
+      const lines = dayTurns.map((t) => `[${t.role.toUpperCase()}] ${t.text.slice(0, ANALYZER_TURN_CHARS)}`).join('\n');
       return `## ${day}\n${lines}`;
     })
     .join('\n\n');

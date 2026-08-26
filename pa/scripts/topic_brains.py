@@ -655,6 +655,7 @@ Auto-generated pointer file; the nightly consolidation pass owns it. Do not edit
 
 - Topic brain: {brain_normalized} — durable knowledge for this topic; read it before assuming prior context here
 - Central brain: {repo_root_normalized}/CLAUDE.md — framework truths and routing
+- Shared tree: {repo_root_normalized}/ is written by other sessions and skills while you work. Before editing a tracked file there run `pa claims`; claim multi-file work with `pa claim <paths> --session <label> --note "<what you are doing>"`; never run git commit/push/stash/checkout/reset/clean yourself; do not claim `@build` yourself — `npm run build`/`npm test` take and release it automatically, and a "waiting for @build" line means another session is building, not stuck. Full rules: {repo_root_normalized}/docs/multi-session-protocol.md
 {kb_line}- Scratch: scratch/ — ephemeral files for this topic's work sessions
 """
 

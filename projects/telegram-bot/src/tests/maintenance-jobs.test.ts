@@ -1,11 +1,12 @@
 import { describe, it, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, mkdir, writeFile } from 'fs/promises';
+import { mkdtemp, rm, mkdir, writeFile, readdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createBotMaintenanceJobs, watchdogStaleJobs, checkRegistryContentInvariants, type BotMaintenanceDeps, type RegistryContentViolation } from '../maintenance-jobs.js';
 import { validateRegistry } from '../../../../pa/dist/src/lib/maintenance/policy.js';
+import { registryContentWatchJob as registryContentWatchStub } from '../../../../pa/dist/src/lib/maintenance/jobs/registry-content-watch.js';
 import { RUNTIME_ARCHIVE_MAX_BYTES } from '../../../../pa/dist/src/lib/archive-files.js';
 import { flushLog } from '../../../../pa/dist/src/lib/log.js';
 import { loadJobState, updateJobState } from '../../../../pa/dist/src/lib/maintenance/state.js';
@@ -49,12 +50,13 @@ describe('createBotMaintenanceJobs', () => {
     assert.doesNotThrow(() => validateRegistry(createBotMaintenanceJobs(stubDeps())));
   });
 
-  it('declares exactly the 7 expected jobs, all host bot', () => {
+  it('declares exactly the 8 expected jobs, all host bot', () => {
     const jobs = createBotMaintenanceJobs(stubDeps());
-    assert.equal(jobs.length, 7);
+    assert.equal(jobs.length, 8);
     const names = jobs.map((j) => j.name).sort();
     assert.deepEqual(names, [
       'bot-log-rotation-check',
+      'bot-self-restart',
       'delivered-store-compact',
       'dlq-flush',
       'grounding-check',
@@ -65,10 +67,11 @@ describe('createBotMaintenanceJobs', () => {
     for (const j of jobs) assert.equal(j.host, 'bot');
   });
 
-  it('orders bot-log-rotation-check first and dlq-flush last', () => {
+  it('orders bot-log-rotation-check first, dlq-flush last, and bot-self-restart second-to-last', () => {
     const jobs = createBotMaintenanceJobs(stubDeps());
     assert.equal(jobs[0].name, 'bot-log-rotation-check');
     assert.equal(jobs[jobs.length - 1].name, 'dlq-flush');
+    assert.equal(jobs[jobs.length - 2].name, 'bot-self-restart');
   });
 
   it('locks shedWhenDegraded per job', () => {
@@ -314,6 +317,39 @@ describe('createBotMaintenanceJobs', () => {
     });
   });
 
+  describe('bot-self-restart', () => {
+    it('bound job stays in parity with the frozen pa-side stub contract (name/host/everyMs/destructive/shedWhenDegraded)', () => {
+      // pa/src/lib/maintenance/jobs/bot-self-restart.ts (WP-D's stub) is
+      // frozen byte-for-byte in
+      // plans/2026-08-24-recall-traces-wave-SPEC.md §3.4 step 10. WP-D lands
+      // in a later batch than WP-G (§4 batch 1 vs batch 2), so at WP-G build
+      // time that module does not exist in pa/dist and cannot be imported
+      // here (unlike the registry-content-watch parity case above). These
+      // five literals are copied byte-for-byte from that frozen contract —
+      // see the INTEGRATOR note above botSelfRestartJobStub in
+      // ../maintenance-jobs.ts once WP-D's real stub lands.
+      const jobs = createBotMaintenanceJobs(stubDeps());
+      const bound = jobs.find((j) => j.name === 'bot-self-restart')!;
+      assert.equal(bound.name, 'bot-self-restart');
+      assert.equal(bound.host, 'bot');
+      assert.equal(bound.everyMs, 60_000);
+      assert.equal(bound.destructive, false);
+      assert.equal(bound.shedWhenDegraded, true);
+    });
+
+    it('run() with sentinelPath undefined returns touched:0 and writes nothing (early return before any I/O)', async () => {
+      const deps = stubDeps({ sentinelPath: undefined });
+      const jobs = createBotMaintenanceJobs(deps);
+      const job = jobs.find((j) => j.name === 'bot-self-restart')!;
+      const before = await readdir(tempDir);
+      const result = await job.run({ now: Date.now(), everyMs: 60_000 });
+      assert.equal(result.touched, 0);
+      assert.equal(result.detail?.reason, 'no-sentinel');
+      const after = await readdir(tempDir);
+      assert.deepEqual(after, before);
+    });
+  });
+
   describe('registry-content-watch', () => {
     function mapWith(entries: Array<{ chatId: string; threadId: number; name: string; description?: string }>): TopicNameMap {
       const map: TopicNameMap = new Map();
@@ -417,6 +453,16 @@ describe('createBotMaintenanceJobs', () => {
       ]);
       const violations = checkRegistryContentInvariants(topicNames);
       assert.deepEqual(violations, []);
+    });
+
+    it('bound job stays in parity with the pa-side static stub (name/everyMs/host/destructive/shedWhenDegraded)', () => {
+      const jobs = createBotMaintenanceJobs(stubDeps());
+      const bound = jobs.find((j) => j.name === 'registry-content-watch')!;
+      assert.equal(bound.name, registryContentWatchStub.name);
+      assert.equal(bound.everyMs, registryContentWatchStub.everyMs);
+      assert.equal(bound.host, registryContentWatchStub.host);
+      assert.equal(bound.destructive, registryContentWatchStub.destructive);
+      assert.equal(bound.shedWhenDegraded, registryContentWatchStub.shedWhenDegraded);
     });
   });
 });

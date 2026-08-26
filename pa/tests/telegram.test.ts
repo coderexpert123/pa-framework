@@ -1,10 +1,12 @@
+import './test-env-guard.js';
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'fs/promises';
-import { tmpdir } from 'os';
+import { mkdtemp, readFile, rm, stat } from 'fs/promises';
+import { tmpdir, homedir } from 'os';
 import { join } from 'path';
 import { splitMessage, sendToTelegram } from '../src/telegram.js';
 import { flushLog } from '../src/lib/log.js';
+import { cleanup } from './helpers.js';
 import type { TelegramOutput } from '../src/types.js';
 
 type FetchResponse = { ok: boolean; status?: number; bodyText?: string };
@@ -432,5 +434,35 @@ describe('sendToTelegram — 429 rate-limit handling', () => {
     // Third call (after 429) should still have parse_mode undefined (plain text)
     const body3 = JSON.parse(calls[2].init!.body as string);
     assert.equal(body3.parse_mode, undefined, 'should retry plain-text form on 429');
+  });
+});
+
+describe('test isolation (helpers.cleanup)', () => {
+  it('never falls back to the real ~/.pa when PA_TEST_LOG_HOME is unset (WP-H, 2026-08-23)', async () => {
+    const savedHome = process.env.PA_HOME;
+    const savedTestLogHome = process.env.PA_TEST_LOG_HOME;
+    const savedNotifyDisabled = process.env.PA_NOTIFY_DISABLED;
+    const probeDir = await mkdtemp(join(tmpdir(), 'pa-test-cleanup-probe-'));
+    try {
+      delete process.env.PA_TEST_LOG_HOME;
+      await cleanup(probeDir);
+
+      assert.ok(process.env.PA_HOME, 'PA_HOME must remain a non-empty string after cleanup()');
+      assert.notEqual(
+        process.env.PA_HOME,
+        join(homedir(), '.pa'),
+        'PA_HOME must not resolve to the real ~/.pa'
+      );
+      const st = await stat(process.env.PA_HOME as string);
+      assert.ok(st.isDirectory(), 'the minted fallback PA_HOME must actually exist as a directory');
+    } finally {
+      if (savedHome === undefined) delete process.env.PA_HOME;
+      else process.env.PA_HOME = savedHome;
+      if (savedTestLogHome === undefined) delete process.env.PA_TEST_LOG_HOME;
+      else process.env.PA_TEST_LOG_HOME = savedTestLogHome;
+      if (savedNotifyDisabled === undefined) delete process.env.PA_NOTIFY_DISABLED;
+      else process.env.PA_NOTIFY_DISABLED = savedNotifyDisabled;
+      await rm(probeDir, { recursive: true, force: true });
+    }
   });
 });

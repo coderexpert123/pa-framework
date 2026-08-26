@@ -9,6 +9,7 @@ import { writeFile, unlink } from 'fs/promises';
 import { listSkills } from './skills.js';
 import { getLastSuccessfulRun, getFailureState } from './logger.js';
 import { paHome } from './paths.js';
+import { repoRootFromModule } from './lib/git-root.js';
 import type { Skill, RunMeta } from './types.js';
 
 const execAsync = promisify(exec);
@@ -495,6 +496,18 @@ export async function syncSchedules(): Promise<void> {
   }
 }
 
+/** Pure, unit-tested (same pattern as resolveWindowsPaPath/resolvePosixPaPath).
+ *  The CurrentDirectory line is load-bearing: without it wscript inherits Task
+ *  Scheduler's cwd (C:\Windows\System32) and every cwd-relative path inside
+ *  `pa catchup` resolves there. The bot's launcher had this exact bug fixed in
+ *  303f439; the generator never got the fix (alerts-week-review §5.2). */
+export function buildLauncherVbs(paPathCmd: string, args: string, repoRoot: string): string {
+  const rootVbs = repoRoot.replace(/"/g, '""');
+  return `Set WshShell = CreateObject("WScript.Shell")\n` +
+    `WshShell.CurrentDirectory = "${rootVbs}"\n` +
+    `WshShell.Run "cmd /c ""${paPathCmd}"" ${args}", 0, True\n`;
+}
+
 async function syncSchedulesWindows(): Promise<boolean> {
   // Find pa executable path and sanitize for shell safety
   let whereStdout: string | null;
@@ -511,6 +524,7 @@ async function syncSchedulesWindows(): Promise<boolean> {
     return false;
   }
   const paPath = resolution.paPath;
+  const repoRoot = await repoRootFromModule(__filename);
 
   // Write VBScript launchers to ~/.pa/
   const createVbs = (name: string, args: string) => {
@@ -518,8 +532,7 @@ async function syncSchedulesWindows(): Promise<boolean> {
     const paPathCmd = paPath.replace(/"/g, '""');
     writeFileSync(
       vbsPath,
-      `Set WshShell = CreateObject("WScript.Shell")\n` +
-      `WshShell.Run "cmd /c ""${paPathCmd}"" ${args}", 0, True\n`,
+      buildLauncherVbs(paPathCmd, args, repoRoot),
       'utf8'
     );
     return vbsPath.replace(/'/g, "''");

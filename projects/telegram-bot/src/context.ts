@@ -7,6 +7,7 @@ import { getTopicBrainInfo } from './topic-brains.js';
 import { listSkills } from '../../../pa/dist/src/skills.js';
 import { getLastRun } from '../../../pa/dist/src/logger.js';
 import { todayIST, nowIST, formatIST } from '../../../pa/dist/src/ist.js';
+import { readActive } from '../../../pa/dist/src/lib/reservations.js';
 
 const SKILL_STATUS_TTL_MS = 60_000;
 let skillStatusCache: { value: string; expiresAt: number } | null = null;
@@ -71,6 +72,37 @@ export async function buildSkillStatus(): Promise<string> {
   }
 }
 
+const MAX_RESERVATION_ROWS = 10;
+const MAX_PATHS_PER_ROW = 3;
+
+// C1b (coordination-remediation Wave C, W-C6): surfaces live `~/.pa/reservations.json`
+// state to every dispatched worker (agy/codex/claude/zclaude alike), which is the half
+// the Claude-Code-only PreToolUse hook (W-C4) cannot reach. Fail-silent by design — a
+// coordination hint must never break a dispatch — and injected into buildPrompt's full
+// `## Capabilities & Rules` branch only (see call site below).
+async function buildReservationLines(readActiveFn: typeof readActive = readActive): Promise<string> {
+  try {
+    const active = await readActiveFn();
+    if (active.length === 0) {
+      return '- Active reservations right now: none.';
+    }
+    const rows = active.slice(0, MAX_RESERVATION_ROWS).map((r) => {
+      const extraPaths = r.paths.length - MAX_PATHS_PER_ROW;
+      const pathsText =
+        r.paths.slice(0, MAX_PATHS_PER_ROW).join(', ') + (extraPaths > 0 ? ` (+${extraPaths} more)` : '');
+      const row = `  - ${r.id} — ${pathsText} — session "${r.session}" — "${r.note}" — expires ${r.expiresAt}`;
+      return row.length > 160 ? row.slice(0, 160) : row;
+    });
+    const extraRows = active.length - MAX_RESERVATION_ROWS;
+    if (extraRows > 0) {
+      rows.push(`  - (+${extraRows} more — run \`pa claims\`)`);
+    }
+    return `- Active reservations right now (do not edit these paths unless the reservation is yours):\n${rows.join('\n')}`;
+  } catch {
+    return '';
+  }
+}
+
 export async function buildResumedPrompt(
   userMessage: string,
   replyContext?: string,
@@ -109,6 +141,7 @@ export async function buildPrompt(
     priorContext?: { worker: string; sessionId: string; sessionPath: string | null };
     attachments?: Array<{ filename: string; path: string }>;
     workdir?: { dir: string; tier: 'override' | 'project' | 'topic-home' };
+    readActiveFn?: typeof readActive;
   }
 ): Promise<string> {
   const today = todayIST();
@@ -156,6 +189,11 @@ export async function buildPrompt(
     ? `\n- Today's briefs: ${process.env.PA_BRIEFS_DIR}/${today}-{morning|evening}.md`
     : '';
 
+  // W-C6: only computed for the full capabilities branch (never lean/omitStatic, never
+  // execution/pendingAction mode) — matches the interpolation site inside `capabilities` below.
+  const reservationLines =
+    omitStatic || pendingAction ? '' : await buildReservationLines(options?.readActiveFn);
+
   const capabilities = omitStatic
     ? ''
     : pendingAction
@@ -165,12 +203,19 @@ export async function buildPrompt(
 - pa logs: ${PA_LOGS_DIR_HINT}${briefsLine}
 - Run a pa skill: pa run <skill-name>
 - Write actions (email, skill runs, file edits): describe the plan and end with exactly "Reply *yes* to confirm or *no* to cancel." Do NOT execute yet.
-- Telegram output: write standard Markdown — **bold**, _italic_, ~~strikethrough~~, # Heading, - bullets, \`code\`, [text](url). The system converts to Telegram format automatically. Do NOT use raw Telegram MarkdownV2 syntax. Never add backslash escapes like \\. or \\( — the system handles all escaping.
+- Telegram output: write standard Markdown — **bold**, _italic_, ~~strikethrough~~, # Heading, - bullets, \`code\`, [text](url). The system converts to Telegram format automatically. Do NOT use raw Telegram MarkdownV2 syntax. Never add backslash escapes like \\. or \\( — the system handles all escaping. Never use LaTeX/math syntax or delimiters (\`$...$\`, \`$$...$$\`, \`\\text{}\`, \`\\frac{}{}\`, \`\\cdot\`, \`\\mathbf{}\`, etc.) — Telegram has no LaTeX renderer. Write formulas and math using plain text or standard Unicode symbols (e.g. "P = power", "×", "Δ", "≈", "→", "²").
 - Multi-step artifacts (uploads, links, plan summaries) MUST appear in the final response. Never send bare "done". For \`/plan\` or \`/deep-plan\`, include a ~400-char summary (goal, phase count, key risks) and the Google Drive link.
 - Ambiguous intent: ask exactly ONE clarifying question.
 - Never fabricate data. If you don't know, say so.
 - Grounding Sources first: Systems of record: D:/My Repos/notes/Ecosystem KB/ (start with Sources.md). Before answering a date-sensitive or domain-deterministic factual question, check Sources.md and the file(s) it names, and cite them. Never answer such a question from general/parametric knowledge when a named source exists. (Mirrors bot-instructions.md's Factual Integrity item 4 — claude/zclaude get that file via --append-system-prompt-file, agy/codex only get this inline block, so this rule must exist in both places; keep them in sync, enforced by context.test.ts.)
+- Shared working tree: other sessions, skills and agents write this repo at the same time you do.
+- Before editing a tracked file, run \`pa claims\`; if your path appears under an active reservation or in the recently-modified list, say so and pick different work rather than editing over it.
+- For work spanning more than one file, claim first: \`pa claim <paths> --session <label> --note "<what you are doing>"\`, and \`pa release <id>\` when you are done.
+- Never run \`git commit\`, \`git push\`, \`git stash\`, \`git checkout --\`, \`git reset\` or \`git clean\` yourself — commits and pushes go through the commit/push skill family, and stashing or checking out a file you do not own destroys another session's uncommitted work.
+- Never run a build or test in the repo while another one is running: \`npm run build\` and \`npm test\` take the \`@build\` reservation themselves and release it when they finish, so a "waiting for @build" line means another build is in flight and yours will start when it ends — that is expected, not stuck. Do not claim \`@build\` by hand; a manual claim collides with the one the npm script takes and stalls your own build for 15 minutes.
+- (Mirrors the Shared working tree block in bot-instructions.md and examples/bot-instructions.example.md — claude/zclaude get that file via --append-system-prompt-file, agy/codex only get this inline block, so this rule must exist in both places; kept in sync by context.test.ts.)${reservationLines ? '\n' + reservationLines : ''}
 - Topic brains: when the Topic section names a topic brain file, read it before assuming prior context for this topic — it records durable facts, decisions, and open threads; fresh turns override it.
+- Recall before assuming: everything outside this window is indexed and searchable — past turns from any topic, past worker runs and their tool calls, topic brains, and the Ecosystem KB. Run \`pa recall "<terms>" --thread <id> --json\` before answering "I don't know", before asking the user to repeat something, and before assuming a past decision was never made.
 - Infrastructure outside the repo tree — worker shims (D:/gemini-shim), ~/.pa config, installed CLI binaries — is never to be rewritten, replaced, or worked around to fix a failure. Diagnose, then surface the blocker to the operator and stop. Substituting one CLI for another behind a worker's name breaks every assumption the dispatcher, guards, and docs make about that worker (2026-08-14: agy's shim was silently rerouted to a different CLI).
 - PA_META (optional last line, single-line JSON, nothing after it):
   [PA_META]: {"actions":[{"type":"T",...}]}
@@ -211,10 +256,12 @@ export async function buildPrompt(
     brainPointerLine = `\nTopic brain: ${brainInfo.path} (${consolidated}${covers ? `, ${covers}` : ''}) — durable per-topic knowledge: what was discussed, decided, and left open. Read it before assuming prior context in this topic; fresh turns override it.`;
   }
 
+  const recallPointerLine = `\nRecall: \`pa recall "<terms>" --thread ${state.thread_id} --json\` searches this topic's full history, worker traces, topic brains and the Ecosystem KB — use it instead of guessing about anything before the window above.`;
+
   const topicDesc = buildTopicDescription(state, topicNames);
   // Topic section renders if EITHER topic description OR brain pointer exists
   const topicSection = (topicDesc || brainPointerLine)
-    ? `\n## Topic\n${topicDesc}${brainPointerLine}\n`
+    ? `\n## Topic\n${topicDesc}${brainPointerLine}${recallPointerLine}\n`
     : '';
 
   const telegramMeta = `\n## Telegram Metadata\nChat ID: ${state.chat_id}\nThread ID: ${state.thread_id}\n`;

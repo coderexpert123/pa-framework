@@ -256,6 +256,11 @@ The pa CLI can run as a local MCP server, exposing read-only tools to LLM client
 | `pa_maintenance_status` | Show maintenance ledger (last run, outcome, consecutive failures/skips) |
 | `pa_costs` | Usage/cost rollup by worker, model, and skill |
 | `pa_slo_report` | SLO error budget report for bot-reply-delivery, daily-mail-brief, catchup-heartbeat, ekadashi-alerts |
+| `pa_recall` | Full-text search over archived conversation turns, worker run traces, per-topic brains, the Ecosystem KB and pending review-digest conflicts (2026-08-24). `q` required; `thread`/`source`/`limit` optional (`limit` clamped to 50). |
+
+### Searching past context
+
+`pa recall "<query>" [--thread <id>] [--source conversation|trace|brain|kb|review] [--role user|assistant] [--since <YYYY-MM-DD>] [--until <YYYY-MM-DD>] [--limit <n>] [--json] [--reindex] [--rebuild]` searches everything a worker or the bot might otherwise re-ask about: past turns from any topic, past worker runs and their tool calls/commands/files/errors, topic brains, and the Ecosystem KB. `--reindex`/`--rebuild` alone (no query) run the incremental or full index pass and print a summary. Backed by `pa/src/lib/recall-store.ts` (FTS5 via `better-sqlite3`, in-process — no spawn); kept fresh every 10 minutes by the `recall-index` maintenance job (`docs/maintenance-jobs.md`). Full design: `docs/ARCHITECTURE.md` § "Recall (`pa recall`, 2026-08-24)".
 
 ### Starting the server
 

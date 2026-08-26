@@ -277,6 +277,8 @@ This enables post-factum review via `pa improvements --show <draft>`.
 
 Stale locks (heartbeat > 10 minutes old) are flagged by `pa health` and can be cleared via `pa purge-locks`. Each worker process refreshes its heartbeat periodically while running.
 
+Lock rows are `(resource, agent, pid, heartbeat, contextId?)`. A holder that runs longer than `PA_HEARTBEAT_STALE_MS` must renew via `startLockRenewal()` and handle its `onLost` callback — a bare `setInterval(updateHeartbeat)` discards the `false` that means "your row was purged", which is silent double-occupancy. Since 2026-08-23 `startLockRenewal` is the only heartbeat mechanism in the codebase (`commands/run.ts`, `commands/catchup.ts` and `code-fixer.ts` were migrated onto it) and accepts an optional `client` for dependency-injected callers. `releaseLock(resource, agent, contextId?, { pid })` scopes the delete: without a `contextId` and `pid` it removes every row for that `(resource, agent)` pair, so a stale holder's cleanup can delete a live same-named holder's lock. Two resources exist: `git-workflow` (the private tree, declared by five skills — `commit`, `push`, `push-public`, `investigate-flagged`, `update-brain` — via `exclusive_resource`, deliberately NOT declared by `commit-and-push` itself since it chains those five as child `pa run` processes, and taken directly by `code-fixer.ts` and `self-improver.ts`) and `git-public-workflow` (the derived `pa-public/` tree, taken by `pa public-sync`).
+
 ## Conversation archive + DLQ
 
 - **Archive**: `~/.pa/conversation-history.jsonl` — append-only log of every bot turn (one JSON object per line). Read by the `ecosystem-kb`-style skills for KB synthesis.
@@ -294,6 +296,73 @@ Every notable message in the system gets a 4-character ref ID with a single-lett
 - `s-XXXX` — Skill output
 
 The `pa ref <id>` command resolves any ref to its source. Used in alert bodies (`_Ref: l-AB12_`) so the user can `pa ref l-AB12` to drill into the originating message.
+
+## Turn-trace sidecar (2026-08-24)
+
+Every `executeWorker` run (`pa/src/worker-exec.ts`) writes one JSONL line to
+`~/.pa/turn-traces.jsonl` — a deterministic record of what the worker actually did,
+beyond the 300-char text preview the analyzer sees. Built by `pa/src/lib/turn-trace.ts`;
+never blocks or fails a dispatch (`appendTurnTrace` never throws or rejects; the write
+is fired with `void`, not awaited).
+
+Schema v1 (`TurnTraceV1`): `v`, `run_id` (uuid, `CommandResult.runId`), `ts_start`/`ts_end`/
+`duration_ms`, `origin` (`'bot'|'skill'|'self-improver'|'other'`, from the dispatch's
+`resource` string), `chat_id`/`thread_id`/`update_id` for bot origins, `skill` for skill
+origins, `worker`/`model`/`session_id`, `exit_code`/`outcome`
+(`'ok'|'error'|'timeout'|'killed'|'failover'`), `parsed` (whether the stream dialect was
+recognized at all), `tool_calls[]`/`commands[]`/`files[]`/`errors[]` (each capped —
+200/50/50/5 entries, 200/300 chars per string), `retries` (always 0 in v1 — the seam for
+a future retry loop), `tokens`, `bytes_out`, `truncated`. Two dialects are parsed: agy/agyc
+`step_update` stream events, and claude-family `tool_use`/`tool_result` blocks; codex
+matches neither (`parsed:false`) until it comes off cooldown.
+
+Join keys: `run_id` resolves any run directly (`pa ref <uuid>` — see below). A bot-origin
+turn's archive row (`~/.pa/conversation-history.jsonl`) does **not** carry `run_id` —
+`pa ref <refId>` instead resolves the trace via `(thread_id, update_id)`, both written on
+the archive row by `main.ts`. `pa ref` prints a `--- trace (turn-traces.jsonl) ---` block
+(outcome, worker, model, duration, tool-call counts by name, commands/files/errors) after
+the resolved text, when a trace is found.
+
+Rotated `-turn-traces.jsonl` shards are derived debugging data (rebuildable from
+nothing) and prune at 90 days via the existing `archive-prune` maintenance job —
+`PRUNABLE_ARCHIVE_SUFFIXES` (`pa/src/lib/archive-files.ts`) now includes the suffix, so
+no new job or registry entry was needed (C7 in the wave spec). The `recall-index`
+maintenance job (below) refreshes `~/.pa/recall.sqlite` from the live file every 10
+minutes, so a trace becomes searchable without any manual step.
+
+## Recall (`pa recall`, 2026-08-24)
+
+Full-text search over five sources, so a worker (or a human) can answer "did we discuss
+this" / "what did that run actually do" without grepping raw JSONL by hand:
+
+| Source | What's indexed | Doc unit |
+|---|---|---|
+| `conversation` | `~/.pa/conversation-history.jsonl` + rotated shards | one bot turn |
+| `trace` | `~/.pa/turn-traces.jsonl` + rotated shards | one worker run |
+| `brain` | `~/.pa/topic-brains/*/BRAIN.md` + `INDEX.md` | one `## ` section |
+| `kb` | the Ecosystem KB directory (`dirname(PA_KB_SOURCES_PATH)`) | one `## ` section per `.md` file |
+| `review` | `~/.pa/review-digest-pending.jsonl` | one pending conflict |
+
+Engine: `pa/src/lib/recall-store.ts`, an in-process TypeScript module over
+`better-sqlite3`'s FTS5 (already a `pa` dependency — no Python, no spawn; the earlier
+plan assumed FTS5 wasn't available and was wrong, see the wave spec's C8). Schema:
+`docs`/`docs_fts` (FTS5)/`cursors`, WAL mode. Indexing is incremental per source
+(byte-offset cursors for the two append-only JSONL sources; mtime+size→sha256 cursors
+for the three whole-file-reparse sources), so a query never re-scans everything.
+
+Query shape: tokens are ANDed first (`ftsSanitize`, FTS5 `MATCH`, ranked by `bm25`); if
+that pass returns fewer than `--limit` rows, an OR-joined rescue pass
+(`ftsOrForm`) fills the remainder and those rows are flagged `rescue:true` with a `note`
+explaining why. `total` is the AND-pass count (never inflated by the rescue rows).
+`--limit` clamps to 50 (`RECALL_MAX_LIMIT`). Filters: `--thread`, `--source`, `--role`,
+`--since`/`--until`.
+
+Surfaces: `pa recall "<query>" [--thread <id>] [--source <s>] [--role <user|assistant>] [--since <d>] [--until <d>] [--limit <n>] [--json] [--reindex] [--rebuild]`
+(`pa/src/commands/recall.ts`); the `pa_recall` MCP tool (`docs/WORKERS_GUIDE.md` §
+"MCP integration"); the `recall-index` maintenance job (pa host, every 10 minutes,
+non-destructive — `recall.sqlite` is fully derived and rebuildable with `pa recall
+--rebuild`); and a standing prompt bullet + per-thread pointer line in the bot's system
+prompt (`projects/telegram-bot/src/context.ts`, `projects/telegram-bot/CLAUDE.md`).
 
 ## Logging
 
@@ -313,6 +382,8 @@ Use `pa logs <skill>` to read recent runs.
 - **Gemini CLI cwd → project slug**: The Gemini CLI derives an on-disk slug at `~/.gemini/tmp/<slug>/chats/` from the cwd (lowercase + spaces → hyphens). `projects/telegram-bot/src/main.ts:GEMINI_PROJECT_DIR` must match. Changing cwd requires updating this constant in lockstep.
 - **Marker-based content insertion**: Skills like `update-brain` use `<!-- AUTO:* -->` markers to identify auto-managed sections within manually-edited files. The skill validates markers exist post-update and refuses to write if any disappeared.
 - **Line-count floor**: Stateful skills that rewrite files should refuse to write the new content if it's < 80% of the old size — a guard against accidental wipes.
+
+Multi-session coordination (claims, @build, clobber detection, destructive-git ban, test isolation): docs/multi-session-protocol.md. The `@build` reservation is taken by the npm scripts themselves (`pa/scripts/build.mjs`, `pa/scripts/run-tests.mjs` and the bot's copies, all via `pa/src/lib/build-lock.ts`); a `PreToolUse` hook (`pa/scripts/hooks/reservation-guard.py`) warns on edits under a foreign reservation.
 
 See also — the full `docs/` index (rebuilt 2026-08-07, see `docs/CONVENTIONS.md` § "Brain-file organization" for the naming/size rules behind this split):
 

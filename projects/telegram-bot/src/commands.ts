@@ -19,6 +19,7 @@ export const BOT_COMMANDS: BotCommand[] = [
   { command: 'status', description: 'Show bot health and worker status' },
   { command: 'skills', description: 'List scheduled skills and last run' },
   { command: 'auth', description: 'Complete OAuth flow using the bridge-page command' },
+  { command: 'reauth', description: 'Request a fresh Google OAuth link in this topic (/reauth [skill])' },
   { command: 'help', description: 'Show available commands' },
   { command: 'health', description: 'Show pa system health check (read-only)' },
   { command: 'ref', description: 'Look up a ref-ID: /ref <id> (read-only)' },

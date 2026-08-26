@@ -99,6 +99,10 @@ export async function sendToTelegram(
   config: TelegramOutput,
   token: string,
   parseMode?: string | false,
+  /** Inline keyboard attached to the LAST chunk only (one keyboard per message;
+   *  the press must land where the reader finishes). Carried into the plain-text
+   *  fallback because that path mutates the same `body` (2026-08-24 buttons program, P3). */
+  replyMarkup?: Record<string, unknown>,
 ): Promise<SendResult> {
   const refId = `s-${randomBytes(6).toString('hex')}`;
 
@@ -152,6 +156,9 @@ export async function sendToTelegram(
     };
     if (config.thread_id !== undefined && config.thread_id !== 0) {
       body.message_thread_id = config.thread_id;
+    }
+    if (replyMarkup !== undefined && chunkIndex === chunks.length - 1) {
+      body.reply_markup = replyMarkup;
     }
 
     let attempt = 0;

@@ -20,13 +20,15 @@
  * the honest death notice.
  */
 import { readFile, stat } from 'fs/promises';
-import { sendMessage, sendTyping, editMessageText } from './telegram.js';
+import { sendMessage, sendMessageWithKeyboard, sendTyping, editMessageText, type InlineKeyboardMarkup } from './telegram.js';
 import { getPriorSessionPath, buildResumeArgs } from './session.js';
 import { parseMetadata, buildModelStatusSnapshot, renderStatusCard, resolveWorkerLlm, selectWorkerTunables } from './logic.js';
 import type { ModelStatusReasonCode } from './types.js';
 import { loadTopicState, saveTopicState, addTurn } from './conversation.js';
 import { deliveredKey, wasDelivered, markDelivered } from './delivered-store.js';
 import { listPendingDispatches, removePendingDispatch, pendingDispatchKey, type PendingDispatch } from './pending-dispatches.js';
+import { putResend } from './resend-store.js';
+import { buildResendKeyboard } from './callbacks.js';
 import { makeRefId } from './ref-id.js';
 import { markTopicRecovering, clearTopicRecovering } from './recovery-gate.js';
 import { listWorkerPids, isProcessAlive } from '../../../pa/dist/src/worker-pids.js';
@@ -135,7 +137,7 @@ export function extractTeeResult(raw: string): string | null {
 // ---------------------------------------------------------------------------
 
 export interface ReaperDeps {
-  send: (record: PendingDispatch, text: string) => Promise<boolean>;
+  send: (record: PendingDispatch, text: string, replyMarkup?: InlineKeyboardMarkup) => Promise<boolean>;
   readTranscript: (record: PendingDispatch) => Promise<{ content: string; mtimeMs: number } | null>;
   isTopicWorkerAlive: (record: PendingDispatch) => Promise<boolean>;
   now: () => number;
@@ -238,9 +240,12 @@ export async function findTeePathByRegistry(record: PendingDispatch): Promise<st
 
 export function makeDefaultDeps(token: string, secrets?: Record<string, string>): ReaperDeps {
   return {
-    send: async (record, text) => {
+    send: async (record, text, replyMarkup) => {
       const refId = makeRefId();
-      const delivered = await sendMessage(token, record.chatId, `${text}\n\n_Ref: ${refId}_`, record.messageId, record.threadId);
+      const fullText = `${text}\n\n_Ref: ${refId}_`;
+      const delivered = replyMarkup !== undefined
+        ? (await sendMessageWithKeyboard(token, record.chatId, fullText, replyMarkup, record.messageId, record.threadId)) !== null
+        : await sendMessage(token, record.chatId, fullText, record.messageId, record.threadId);
       if (delivered) {
         logger.info('bot', 'system message sent', { refId, kind: 'recovered', chatId: record.chatId, threadId: record.threadId, textPreview: text.slice(0, 200) });
         // Restore conversational continuity. The ASSISTANT turn is always
@@ -559,7 +564,16 @@ export async function evaluatePendingDispatch(
   // non-recoverable (not in CLAUDE_FAMILY), OR all recovery sources have been
   // exhausted (worker dead + no tee + no transcript + resume failed/skipped).
   if (expired || !session || !recoverable || resumeAttemptedAndFailed) {
-    const sent = await deps.send(record, deathNotice(record)).catch(() => false);
+    await putResend({
+      chatId: record.chatId,
+      threadId: record.threadId,
+      updateId: record.updateId,
+      messageId: record.messageId,
+      userText: record.userText,
+      storedAt: new Date().toISOString(),
+    }).catch(() => {});
+    const keyboard = buildResendKeyboard(record.chatId, record.threadId, record.updateId);
+    const sent = await deps.send(record, deathNotice(record), keyboard).catch(() => false);
     if (!sent) return 'waiting';
     await finish(record, 'dead');
     return 'dead';

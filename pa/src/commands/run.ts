@@ -1,3 +1,4 @@
+import { randomUUID, randomBytes } from 'crypto';
 import { loadSkill, listSkills } from '../skills.js';
 import { loadSecrets } from '../secrets.js';
 import { runWithFailover, executeWorker } from '../workers.js';
@@ -8,10 +9,8 @@ import { addWorkerPid, removeWorkerPid } from '../worker-pids.js';
 import { killProcessTree } from '../process-tree.js';
 import { log } from '../lib/log.js';
 import { notifyUser } from '../lib/notify.js';
-import { blackboard } from '../blackboard.js';
+import { blackboard, startLockRenewal } from '../blackboard.js';
 import type { RunMeta, CommandResult, TelegramOutput, RunOptions } from '../types.js';
-
-const LOCK_HEARTBEAT_MS = 60_000;
 
 /**
  * Lock key for a skill's `exclusive_resource`. Shared by acquire/heartbeat/release
@@ -146,6 +145,28 @@ function recordDeliveryFailure(
 }
 
 /**
+ * Subject/severity/dedupKey for a skill-failure alert, discriminating on
+ * `worker === 'lock'` — the sentinel runCommand passes when the
+ * exclusive_resource wait timed out (run.ts:399, see runSkillBody). Lock
+ * contention is expected multi-session behaviour, not a page: it read to the
+ * operator as "Skill failed: commit" three times in one week
+ * (plans/2026-08-23-alerts-week-review.md §5.5). Extracted as a pure,
+ * directly-testable function (2026-08-23).
+ */
+export function lockSkipAlertFields(
+  worker: string,
+  skillName: string,
+): { subject: string; severity: 'info' | 'warn' | 'error'; dedupKey: string; topicDedupKey: string } {
+  const isLockSkip = worker === 'lock';
+  return {
+    subject: isLockSkip ? `Skill skipped (lock busy): ${skillName}` : `Skill failed: ${skillName}`,
+    severity: isLockSkip ? 'info' : 'error',
+    dedupKey: isLockSkip ? `skill-lock-busy-${skillName}` : `skill-failed-${skillName}`,
+    topicDedupKey: isLockSkip ? `skill-lock-busy-topic-${skillName}` : `skill-fail-topic-${skillName}`,
+  };
+}
+
+/**
  * Post-execution handler: deliver output, log result, print output, detect and run
  * trigger skills. Extracted to avoid duplicating this logic across the
  * preferred-worker and failover paths.
@@ -254,12 +275,18 @@ async function handleSkillResult(
     console.log(`[FAIL] ${skillName} failed via ${worker} (${(duration / 1000).toFixed(1)}s)`);
     if (result.error) console.log(`Error: ${result.error.slice(0, 500)}`);
 
+    // The pa-alerts page is already suppressed for a lock skip via
+    // alreadyAlertedPaSupport, but the telegram_output page below is not — see
+    // lockSkipAlertFields for why this distinction exists.
+    const { subject: failSubject, severity: failSeverity, dedupKey: paDedupKey, topicDedupKey } =
+      lockSkipAlertFields(worker, skillName);
+
     // Alert pa-alerts on skill failure (unless already alerted by runWithFailover exhaustion)
     if (!result.alreadyAlertedPaSupport) {
       notifyUser(
-        `Skill failed: ${skillName}`,
+        failSubject,
         `Skill: ${skillName}\nWorker: ${worker}\nDuration: ${(duration / 1000).toFixed(1)}s\nError: ${(result.error ?? '').slice(0, 500)}`,
-        { dedupKey: `skill-failed-${skillName}`, severity: 'error' },
+        { dedupKey: paDedupKey, severity: failSeverity },
       ).catch(() => {});
     }
 
@@ -274,12 +301,12 @@ async function handleSkillResult(
       const token = secrets[telegramOutput.token_secret];
       if (token) {
         notifyUser(
-          `Skill failed: ${skillName}`,
+          failSubject,
           `Worker: ${worker}\nError: ${(result.error ?? 'unknown error').slice(0, 300)}`,
           {
-            dedupKey: `skill-fail-topic-${skillName}`,
+            dedupKey: topicDedupKey,
             topic: { chat_id: telegramOutput.chat_id, thread_id: telegramOutput.thread_id },
-            severity: 'error',
+            severity: failSeverity,
           },
         ).catch(() => {});
       }
@@ -384,12 +411,19 @@ export async function runCommand(
   const exclusiveResource = skill.frontmatter.exclusive_resource;
   const lockKey = exclusiveResource ? exclusiveLockKey(exclusiveResource) : undefined;
   let lockHeld = false;
-  let lockHeartbeat: ReturnType<typeof setInterval> | undefined;
+  let lockContextId: string | undefined;
+  let lockRenewal: { stop: () => void } | undefined;
+  // Set by startLockRenewal's onLost (D2/D3/D4, 2026-08-23): a purged row mid-run means
+  // another process may be mutating the shared tree concurrently — the run's own result is
+  // downgraded to a failure once runSkillBody() resolves, rather than trusting a "success"
+  // that raced an unknown concurrent mutation.
+  let lockLost: 'expired' | 'purged' | undefined;
 
   if (lockKey && exclusiveResource) {
     const waitStart = Date.now();
     const lockWaitMs = lockWaitBudgetMs(skill.frontmatter.timeout);
-    lockHeld = await blackboard.acquireLock(lockKey, skillName, process.pid, lockWaitMs);
+    lockContextId = randomUUID();
+    lockHeld = await blackboard.acquireLock(lockKey, skillName, process.pid, lockWaitMs, lockContextId);
     if (!lockHeld) {
       const waitedS = Math.round((Date.now() - waitStart) / 1000);
       const lockResult: CommandResult = {
@@ -407,18 +441,38 @@ export async function runCommand(
     // is alive (see blackboard.ts), and push/push-public/investigate-flagged
     // can all legitimately run well past that. Without this, a second run
     // would steal the lock mid-work. Mirrors catchup.ts's own heartbeat.
-    lockHeartbeat = setInterval(() => {
-      void blackboard.updateHeartbeat(lockKey, skillName).catch(() => {});
-    }, LOCK_HEARTBEAT_MS);
-    lockHeartbeat.unref?.();
+    // startLockRenewal (2026-08-23) additionally detects a PURGED row via
+    // onLost — the old hand-rolled setInterval renewed blindly and never
+    // noticed a purge, so a concurrent commit could land undetected.
+    lockRenewal = startLockRenewal(lockKey, skillName, lockContextId, {
+      onLost: (reason) => {
+        lockLost = reason;
+        const refId = `s-${randomBytes(6).toString('hex')}`;
+        log('error', 'run', `Lock lost mid-run for skill ${skillName}`, { skill: skillName, lockKey, reason, refId });
+        void notifyUser(
+          'Skill failed (lock lost)',
+          `Skill: ${skillName}\nLock: ${lockKey}\nReason: ${reason}\n\n_Ref: ${refId}_`,
+          { dedupKey: `skill-lock-lost:${skillName}`, severity: 'error' },
+        ).catch(() => {});
+      },
+    });
   }
 
   try {
-    return await runSkillBody();
+    const result = await runSkillBody();
+    if (lockLost && lockKey) {
+      return {
+        ...result,
+        success: false,
+        alreadyAlertedPaSupport: true,
+        error: `Lock lost (${lockLost}) mid-run — ${lockKey} was purged while this run held it; another process may have committed concurrently. Treat this run's tree mutations as unverified.`,
+      };
+    }
+    return result;
   } finally {
-    if (lockHeartbeat) clearInterval(lockHeartbeat);
+    if (lockRenewal) lockRenewal.stop();
     if (lockHeld && lockKey) {
-      await blackboard.releaseLock(lockKey, skillName).catch(() => {});
+      await blackboard.releaseLock(lockKey, skillName, lockContextId, { pid: process.pid }).catch(() => {});
     }
   }
 

@@ -93,6 +93,10 @@ projects/reminders/*
 !projects/reminders/process_reminders.py
 !projects/reminders/tests/
 
+# Inside projects/google-oauth-redirect/: exclude the deployment-specific
+# bot-username config (names the bot; config.example.js stays tracked).
+projects/google-oauth-redirect/config.js
+
 # Universal noise excludes
 **/__pycache__/
 **/*.pyc

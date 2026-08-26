@@ -2,7 +2,6 @@ import type { MaintenanceHost, MaintenanceJob } from './types.js';
 import { orphanWorkerReapJob } from './jobs/orphan-worker-reap.js';
 import { blackboardPurgeJob } from './jobs/blackboard-purge.js';
 import { stalenessCheckJob } from './jobs/staleness-check.js';
-import { skillCadenceAuditJob } from './jobs/skill-cadence-audit.js';
 import { skillLogRotateJob } from './jobs/skill-log-rotate.js';
 import { archivePruneJob } from './jobs/archive-prune.js';
 import { alertStateGcJob } from './jobs/alert-state-gc.js';
@@ -12,6 +11,7 @@ import { voiceAttachmentGcJob } from './jobs/voice-attachment-gc.js';
 import { workerTeeGcJob } from './jobs/worker-tee-gc.js';
 import { reservationGcJob } from './jobs/reservation-gc.js';
 import { restoreDrillJob } from './jobs/restore-drill.js';
+import { alertCensusJob } from './jobs/alert-census.js';
 import { clobberSentinelJob } from './jobs/clobber-sentinel.js';
 import { redteamRecurringJob } from './jobs/redteam-recurring.js';
 import { botLogRotationCheckJob } from './jobs/bot-log-rotation-check.js';
@@ -20,6 +20,10 @@ import { deliveredStoreCompactJob } from './jobs/delivered-store-compact.js';
 import { proxyPoolRefreshJob } from './jobs/proxy-pool-refresh.js';
 import { dlqFlushJob } from './jobs/dlq-flush.js';
 import { groundingCheckJob } from './jobs/grounding-check.js';
+import { registryContentWatchJob } from './jobs/registry-content-watch.js';
+import { reviewConflictButtonsJob } from './jobs/review-conflict-buttons.js';
+import { recallIndexJob } from './jobs/recall-index.js';
+import { botSelfRestartJob } from './jobs/bot-self-restart.js';
 
 /** THE single declared table. Every declared maintenance job across pa and bot hosts
  *  lives under this array — that is the point of the construct. */
@@ -28,7 +32,6 @@ export const MAINTENANCE_JOBS: readonly MaintenanceJob[] = [
   orphanWorkerReapJob,
   blackboardPurgeJob,
   stalenessCheckJob,
-  skillCadenceAuditJob,
   skillLogRotateJob,
   archivePruneJob,
   alertStateGcJob,
@@ -38,14 +41,19 @@ export const MAINTENANCE_JOBS: readonly MaintenanceJob[] = [
   workerTeeGcJob,
   reservationGcJob,
   restoreDrillJob,
+  alertCensusJob,
   clobberSentinelJob,
   redteamRecurringJob,
+  reviewConflictButtonsJob,
+  recallIndexJob,
   // bot-host jobs
   botLogRotationCheckJob,
   modelOverrideSweepJob,
   deliveredStoreCompactJob,
   proxyPoolRefreshJob,
   groundingCheckJob,
+  registryContentWatchJob,
+  botSelfRestartJob,
   dlqFlushJob,
 ];
 

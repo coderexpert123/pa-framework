@@ -1,3 +1,4 @@
+import './test-env-guard.js';
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'child_process';

@@ -9,7 +9,7 @@
     "pa": "./dist/bin/pa.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "node scripts/build.mjs",
     "dev": "tsc --watch",
     "test": "node scripts/run-tests.mjs",
     "test:quarantined": "node scripts/run-tests.mjs --quarantined"

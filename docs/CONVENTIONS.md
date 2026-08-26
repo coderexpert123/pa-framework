@@ -106,6 +106,8 @@ CLAUDE.md" community guidance assumes — a line budget is the wrong unit here.
 | Router/index file (a file that replaced a monolith with pointers) | — | 4,000 chars | it stopped being a router; re-split |
 | Evergreen audience-facing guide (the 9 evergreen `UPPERCASE.md` guides under `docs/`) | — | 24,000 chars | separate class from operational-detail docs |
 | Append-only archive file (`backlog/archive-*.md`, `backlog/not-valid.md`) — looked up by ID, never read front to back | — | no hard ceiling | see note below |
+| Completed-item lookup index (`backlog/completed-index.md`) — one row per archived item, grows monotonically with shipped work, never auto-loaded | 16,000 chars | 20,000 chars | raise this row rather than splitting; splitting breaks its "every item exactly once, in one place" contract |
+| Open-program body file (`backlog/programs-*.md`) — bodies lifted out of `BACKLOG.md`, looked up by ID | — | no hard ceiling | same class as the archives |
 
 **Note on the auto-managed inventory row**: this class exists because its size is bounded
 by *how many source files a glob pattern matches*, not by narrative verbosity — splitting

@@ -8,13 +8,14 @@
  * - pa_maintenance_status: Show maintenance ledger
  * - pa_costs: Usage/cost rollup
  * - pa_slo_report: SLO error budget report
+ * - pa_recall: Full-text search over turns, traces, brains, KB
  *
  * Usage: pa mcp serve
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { tools, pa_ref_lookup, pa_claims, pa_maintenance_status, pa_costs, pa_slo_report } from './tools.js';
+import { tools, pa_ref_lookup, pa_claims, pa_maintenance_status, pa_costs, pa_slo_report, pa_recall } from './tools.js';
 
 /**
  * Create and start the MCP server.
@@ -54,6 +55,9 @@ async function main() {
           break;
         case 'pa_slo_report':
           result = await pa_slo_report.handler(args);
+          break;
+        case 'pa_recall':
+          result = await pa_recall.handler(args);
           break;
         default:
           throw new Error(`Unknown tool: ${toolName}`);

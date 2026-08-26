@@ -3,21 +3,27 @@ import { promisify } from 'util';
 import { writeFile, mkdtemp, rm, readFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join, relative } from 'path';
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { loadSkill } from './skills.js';
 import { runWithFailover } from './workers.js';
 import { botRestartCommand } from './commands/bot.js';
 import { checkBotProcess } from './commands/health.js';
 import { exclusiveLockKey } from './commands/run.js';
-import { blackboard } from './blackboard.js';
+import { blackboard, startLockRenewal } from './blackboard.js';
 import { appendAuditRecord, skillRunStats, toAuditBaseline } from './lib/improvement-audit.js';
 import { resolvePythonCommand } from './lib/python.js';
 import { recentActivity } from './commands/claim.js';
 import { readActive } from './lib/reservations.js';
+import { withBuildLock } from './lib/build-lock.js';
+import { parsePorcelainPaths } from './lib/git-status.js';
 import type { DraftProposal, Skill } from './types.js';
 import type { FailureRecord } from './failure-analyzer.js';
 import type { AuditTestRunCounts } from './lib/improvement-audit.js';
 import type { CheckResult } from './commands/health.js';
+
+// C12: re-exported (not just imported) because self-improver.ts:30 imports
+// parsePorcelainPaths from THIS module, not from lib/git-status.ts directly.
+export { parsePorcelainPaths };
 
 // ---------------------------------------------------------------------------
 // Autonomous CODE-fix capability (2026-07-11) — see
@@ -37,9 +43,12 @@ import type { CheckResult } from './commands/health.js';
 //   F3. Post-apply verification gate, same run: build + full relevant suites (+ bot
 //       restart/health poll if the bot was touched). ANY failure reverts everything.
 //   F4. Working-tree-clean precondition — never mixes an autonomous diff with human WIP.
-//   F5. One fix per nightly run (enforced by self-improver.ts's orchestrator, not here) +
-//       a data-destruction guard, both in the coding worker's brief AND enforced here via
-//       touchesGuardedDataPath (diff inspection, not just the brief — same F1 principle).
+//   F5. Blast-radius bounds — per-run: one attempt per target skill, disjoint files across a
+//       run's applied fixes (same-run-overlap guard below), wall-clock budget (all three
+//       enforced by self-improver.ts's orchestrator / this module's diff inspection; the
+//       pre-2026-08-23 global one-fix-per-night cap is gone — see
+//       plans/2026-08-23-code-fix-multi-per-night-SPEC.md) + the data-destruction guard
+//       (touchesGuardedDataPath).
 //   F6. Commit + push PRIVATE origin only. NEVER the public mirror (.git-public) — this
 //       module only ever calls plain `git`, which always resolves to `.git`.
 // ---------------------------------------------------------------------------
@@ -87,7 +96,12 @@ export type CodeFixOutcome =
   | 'code-fix-skipped-git-lock-busy'
   | 'code-fix-skipped-stranger-overlap'
   | 'code-fix-skipped-staged-mismatch'
-  | 'code-fix-skipped-concurrent-activity';
+  | 'code-fix-skipped-concurrent-activity'
+  // 2026-08-23 (F5 rework, plans/2026-08-23-code-fix-multi-per-night-SPEC.md): the global
+  // one-fix-per-night cap is gone; these three replace it as the per-run bounds.
+  | 'code-fix-skipped-same-run-overlap'      // code-fixer: diff touches a file an earlier fix THIS run already changed
+  | 'code-fix-skipped-target-already-attempted' // orchestrator: one attempt per target skill per run
+  | 'code-fix-skipped-budget-exhausted';      // orchestrator: per-run wall-clock budget spent
 
 export interface CodeFixResult {
   outcome: CodeFixOutcome;
@@ -110,6 +124,16 @@ export interface CodeFixOptions {
   recentActivityFn?: () => Promise<string[]>;
   /** Test-only: overrides readActive probe. */
   readActiveFn?: () => Promise<import('./lib/reservations.js').Reservation[]>;
+  /** Test-only: overrides withBuildLock so tests never touch the real reservation store. */
+  withBuildLockFn?: typeof withBuildLock;
+  /**
+   * Repo-relative paths changed by code fixes ALREADY APPLIED earlier in the same nightly
+   * run (2026-08-23 F5 rework). A diff that touches any of them is reverted and recorded as
+   * 'code-fix-skipped-same-run-overlap': every applied fix must stay independently
+   * `git revert`-able, and a second commit on the same file would make reverting the first
+   * one conflict. Orchestrator-supplied; empty/undefined = first fix of the run.
+   */
+  sameRunAppliedFiles?: string[];
 }
 
 // --- F1: protected framework paths — the loop's own execution/audit/rollback chain and the
@@ -191,21 +215,6 @@ export const CHURN_PATHSPEC_ARGS = DIRTY_IGNORE_PREFIXES.map((p) => `"${p}*"`).j
 export function isChurnPath(path: string): boolean {
   const norm = normalizePath(path);
   return DIRTY_IGNORE_PREFIXES.some((pre) => norm.startsWith(pre));
-}
-
-export function parsePorcelainPaths(porcelain: string): string[] {
-  const paths: string[] = [];
-  for (const rawLine of porcelain.split('\n')) {
-    const line = rawLine.replace(/\r$/, '');
-    if (!line.trim()) continue;
-    // Porcelain v1: exactly 2 status chars, a space, then the path (renames: "old -> new").
-    const rest = line.slice(3);
-    const arrowIdx = rest.indexOf(' -> ');
-    const path = arrowIdx !== -1 ? rest.slice(arrowIdx + 4) : rest;
-    const unquoted = path.startsWith('"') && path.endsWith('"') ? path.slice(1, -1) : path;
-    paths.push(normalizePath(unquoted));
-  }
-  return paths;
 }
 
 async function getWorkingTreePaths(exec: ExecFn, repoRoot: string): Promise<string[]> {
@@ -336,11 +345,19 @@ export function buildCodeFixBrief(
     ? evidence.slice(0, 10).map((f) => `- [${f.timestamp}] ${f.error}`).join('\n')
     : '(no recorded failure evidence available)';
 
+  // 2026-08-23 (alerts wave, WP-J2a): a maintenance-job target has no project directory of its
+  // own to name — it names the declared job and the ledger error that triggered the proposal
+  // instead, and its scope instruction points at the job's own source file rather than a dir.
+  const isJobTarget = proposal.target_kind === 'maintenance-job';
+  const targetBlock = isJobTarget
+    ? `Declared maintenance job: ${proposal.target_skill}\nJob file: ${proposal.code_target ?? ''}\nLedger error: ${evidence[0]?.error ?? '(none recorded)'}`
+    : `Project directory: ${projectRelDir}\n${proposal.code_target ? `Likely file: ${proposal.code_target}` : ''}`;
+  const scopeTarget = isJobTarget ? `\`${proposal.code_target}\` and its test file` : projectRelDir;
+
   return `You are fixing a recurring bug in an automated skill's own script — not its LLM prompt (this skill's prompt is documentation only; the real behavior lives in the code below).
 
 ## Target
-Project directory: ${projectRelDir}
-${proposal.code_target ? `Likely file: ${proposal.code_target}` : ''}
+${targetBlock}
 
 ## Recorded failure evidence (last 14 days)
 ${evidenceBlock}
@@ -350,7 +367,7 @@ ${proposal.reason}
 
 ## Requirements
 1. Write a failing test FIRST that reproduces the recorded failure (TDD), confirm it fails, then fix the code so it passes. Add new test files or add lines to existing tests — do not weaken or delete existing test coverage.
-2. Scope your changes to ${projectRelDir} only. Do NOT touch any of the following protected paths under any circumstances — these are the self-improvement loop's own execution/audit/rollback machinery and repo-boundary tooling:
+2. Scope your changes to ${scopeTarget} only. Do NOT touch any of the following protected paths under any circumstances — these are the self-improvement loop's own execution/audit/rollback machinery and repo-boundary tooling:
 ${PROTECTED_LIST_TEXT}
 3. Data-destruction guard: do not touch, modify, or delete anything under a data/ directory, any .env file, or anything with "secrets" in its name or path. Do not run the live skill itself as a form of validation — tests only.
 4. Run the relevant test suite yourself before declaring done, and only declare done if it passes.
@@ -367,11 +384,40 @@ interface VerificationOutcome {
   ok: boolean;
   excerpt?: string;
   testRunCounts?: AuditTestRunCounts;
+  /** Which verification arms ran (2026-08-23 WP-J2a scoped gate): any of 'pa-node',
+   *  'pa-pytest', 'bot-node', 'project-pytest', 'py-compile'. Surfaced into the audit
+   *  record's `reason` text (a sibling of test_run_counts) so a human reading the trail can
+   *  tell which gates actually covered a given fix. */
+  gates?: string[];
 }
 
 function excerptOf(err: unknown): string {
   const e = err as { message?: string; stdout?: string; stderr?: string };
   return (e.stderr || e.stdout || e.message || String(err)).slice(0, 500);
+}
+
+/** Formats VerificationOutcome.gates for embedding into an audit record's `reason` text —
+ *  chosen over a new top-level AuditRecord field (2026-08-23 WP-J2a: pa/src/lib/improvement-
+ *  audit.ts is not owned by this wave's code-fixer work package). Empty/undefined → ''. */
+function gatesSuffixText(gates?: string[]): string {
+  return gates && gates.length > 0 ? ` Gates run: ${gates.join(', ')}.` : '';
+}
+
+/**
+ * Verification-gate diagnosability (2026-08-23 F5 rework,
+ * plans/2026-08-23-code-fix-multi-per-night-SPEC.md): a bare 500-char slice of raw `npm test`
+ * output rarely lands on the actual failure — two 08-19/08-20 reverts were unexplainable from
+ * the audit trail because of it. TAP's `not ok` lines and the `# tests/# pass/# fail` summary
+ * are what actually matter, so pull those out instead. Falls back to excerptOf(err) (first 500
+ * chars) when the output carries no `not ok` line (e.g. a non-TAP failure).
+ */
+export function testFailureExcerpt(err: unknown): string {
+  const e = err as { message?: string; stdout?: string; stderr?: string };
+  const text = `${e.stderr ?? ''}\n${e.stdout ?? ''}`;
+  const notOkLines = text.match(/^not ok\b.*$/gm) ?? [];
+  if (notOkLines.length === 0) return excerptOf(err);
+  const summaryLines = text.match(/^# (tests|pass|fail) \d+$/gm) ?? [];
+  return [...notOkLines.slice(0, 8), ...summaryLines].join('\n').slice(0, 1000);
 }
 
 function parseNodeTestSummary(text: string): AuditTestRunCounts | undefined {
@@ -432,6 +478,28 @@ async function collectProjectTests(
   return { failedIds: parsePytestFailedIds(out), counts: parsePytestSummary(out) };
 }
 
+/**
+ * Run pa/scripts/tests (pa's own Python helper-script suite) from the repo root. Mirrors
+ * collectProjectTests' new-failures-only pattern but targets a fixed directory rather than a
+ * project's own layout — added 2026-08-23 (WP-J2a scoped verification) so a fix touching
+ * pa/scripts/**.py or pa/src/**.py gets Python coverage the pa node suite alone can't provide.
+ * Never throws — pytest's nonzero exit on failures is data, not a crash.
+ */
+async function collectPaPyTests(
+  repoRoot: string,
+  exec: ExecFn
+): Promise<{ failedIds: Set<string>; counts?: AuditTestRunCounts }> {
+  const python = resolvePythonCommand();
+  let out = '';
+  try {
+    const { stdout, stderr } = await exec(`${python} -m pytest pa/scripts/tests -q`, { cwd: repoRoot });
+    out = `${stdout}\n${stderr}`;
+  } catch (err: any) {
+    out = `${err?.stdout ?? ''}\n${err?.stderr ?? err?.message ?? ''}`;
+  }
+  return { failedIds: parsePytestFailedIds(out), counts: parsePytestSummary(out) };
+}
+
 function mergeCounts(...counts: Array<AuditTestRunCounts | undefined>): AuditTestRunCounts | undefined {
   const present = counts.filter((c): c is AuditTestRunCounts => !!c);
   if (present.length === 0) return undefined;
@@ -454,6 +522,19 @@ async function pollBotHealth(
   return false;
 }
 
+/**
+ * Scoped verification (2026-08-23, plans/2026-08-23-alerts-wave-SPEC.md WP-J2a). Previously
+ * this ran the pa build + full pa node suite unconditionally on every fix regardless of what
+ * it touched — 12-20 min per fix on this machine, and an unexplained-cause candidate behind
+ * two 2026-08-19/20 reverts the audit trail couldn't diagnose (review §4). Invariant: a fix
+ * may only skip a gate that its own touched paths provably cannot affect.
+ *
+ *   any pa/**, .github/**, or a repo-root config path -> pa build + pa npm test
+ *   any pa/scripts/**.py or pa/src/**.py               -> additionally pytest pa/scripts/tests
+ *   any projects/telegram-bot/**                       -> bot build + bot npm test + restart/health
+ *   ONLY projects/<x>/** (x != telegram-bot)            -> py_compile + that project's pytest,
+ *                                                          and NOTHING else
+ */
 async function runVerificationGate(
   touchedPaths: string[],
   repoRoot: string,
@@ -462,50 +543,70 @@ async function runVerificationGate(
   checkBotProcessFn: () => Promise<CheckResult>,
   sleep: (ms: number) => Promise<void>,
   targetProjectDir?: string,
-  projectBaselineFailures?: Set<string>
+  projectBaselineFailures?: Set<string>,
+  paPyBaselineFailures?: Set<string>
 ): Promise<VerificationOutcome> {
-  // pa: build + full suite, always — the substrate everything else (including this module)
-  // depends on, cheap enough to run unconditionally as the primary safety net.
-  try {
-    await exec('npm run build', { cwd: join(repoRoot, 'pa') });
-  } catch (err) {
-    return { ok: false, excerpt: `pa build failed: ${excerptOf(err)}` };
-  }
+  const gates: string[] = [];
+  const paTouched = touchedPaths.some((p) => p.startsWith('pa/') || p.startsWith('.github/') || !p.includes('/'));
+
   let paCounts: AuditTestRunCounts | undefined;
-  try {
-    const { stdout, stderr } = await exec('npm test', { cwd: join(repoRoot, 'pa') });
-    paCounts = parseNodeTestSummary(stdout) ?? parseNodeTestSummary(stderr);
-  } catch (err) {
-    return { ok: false, excerpt: `pa test suite failed: ${excerptOf(err)}` };
+  if (paTouched) {
+    gates.push('pa-node');
+    try {
+      await exec('npm run build', { cwd: join(repoRoot, 'pa') });
+    } catch (err) {
+      return { ok: false, excerpt: `pa build failed: ${excerptOf(err)}`, gates };
+    }
+    try {
+      const { stdout, stderr } = await exec('npm test', { cwd: join(repoRoot, 'pa') });
+      paCounts = parseNodeTestSummary(stdout) ?? parseNodeTestSummary(stderr);
+    } catch (err) {
+      return { ok: false, excerpt: `pa test suite failed: ${testFailureExcerpt(err)}`, gates };
+    }
+  }
+
+  // Additional Python arm for pa's own scripts — only when the diff actually touches a pa
+  // Python file; the pa node suite above does not exercise pa/scripts/tests at all.
+  const paPyTouched = touchedPaths.some((p) => /^pa\/(scripts|src)\/.*\.py$/.test(p));
+  let paPyCounts: AuditTestRunCounts | undefined;
+  if (paPyTouched) {
+    gates.push('pa-pytest');
+    const post = await collectPaPyTests(repoRoot, exec);
+    paPyCounts = post.counts;
+    const baseline = paPyBaselineFailures ?? new Set<string>();
+    const newFailures = [...post.failedIds].filter((id) => !baseline.has(id));
+    if (newFailures.length > 0) {
+      return { ok: false, excerpt: `pa/scripts/tests: fix introduced ${newFailures.length} new test failure(s): ${newFailures.slice(0, 5).join(', ')}`, gates };
+    }
   }
 
   const botTouched = touchedPaths.some((p) => p.startsWith('projects/telegram-bot/'));
   let botCounts: AuditTestRunCounts | undefined;
   if (botTouched) {
+    gates.push('bot-node');
     try {
       await exec('npm run build', { cwd: join(repoRoot, 'projects/telegram-bot') });
     } catch (err) {
-      return { ok: false, excerpt: `bot build failed: ${excerptOf(err)}` };
+      return { ok: false, excerpt: `bot build failed: ${excerptOf(err)}`, gates };
     }
     try {
       const { stdout, stderr } = await exec('npm test', { cwd: join(repoRoot, 'projects/telegram-bot') });
       botCounts = parseNodeTestSummary(stdout) ?? parseNodeTestSummary(stderr);
     } catch (err) {
-      return { ok: false, excerpt: `bot test suite failed: ${excerptOf(err)}` };
+      return { ok: false, excerpt: `bot test suite failed: ${testFailureExcerpt(err)}`, gates };
     }
 
     await botRestartFn();
     const healthy = await pollBotHealth(checkBotProcessFn, sleep);
     if (!healthy) {
-      return { ok: false, excerpt: 'bot restart triggered but the health check never confirmed the bot came back up' };
+      return { ok: false, excerpt: 'bot restart triggered but the health check never confirmed the bot came back up', gates };
     }
   }
 
-  // Touched project's pytest suite — tested from the project dir so both
-  // tests/ and scripts/tests/ layouts are found. Blocks only NEW failures
-  // (post minus the pre-fix baseline), so a project carrying pre-existing reds
-  // a human left in place doesn't permanently freeze autonomous fixes to it,
-  // while a genuine regression the fix introduced still reverts.
+  // Project-only case: neither pa nor bot touched, and every touched path belongs to one
+  // non-bot project. py_compile catches a syntax error before pytest would even collect it;
+  // pytest itself is the same new-failures-only gate the pre-scoping code always ran, tested
+  // from the project dir so both tests/ and scripts/tests/ layouts are found.
   let projectCounts: AuditTestRunCounts | undefined;
   const rawProjectDir = targetProjectDir
     ?? touchedPaths.find((p) => p.startsWith('projects/') && !p.startsWith('projects/telegram-bot/'))
@@ -513,19 +614,30 @@ async function runVerificationGate(
   // telegram-bot is a node project verified by the bot npm-test arm above, not pytest.
   const projectDir = rawProjectDir && !rawProjectDir.startsWith('projects/telegram-bot')
     ? rawProjectDir : undefined;
-  if (projectDir) {
+  const projectOnly = !paTouched && !botTouched && projectDir !== undefined;
+  if (projectOnly) {
+    const changedPyFiles = touchedPaths.filter((p) => p.startsWith(`${projectDir}/`) && p.endsWith('.py'));
+    if (changedPyFiles.length > 0) {
+      gates.push('py-compile');
+      try {
+        await exec(`${resolvePythonCommand()} -m py_compile ${changedPyFiles.join(' ')}`, { cwd: repoRoot });
+      } catch (err) {
+        return { ok: false, excerpt: `py_compile failed: ${excerptOf(err)}`, gates };
+      }
+    }
+    gates.push('project-pytest');
     const post = await collectProjectTests(projectDir, repoRoot, exec);
     if (post) {
       projectCounts = post.counts;
       const baseline = projectBaselineFailures ?? new Set<string>();
       const newFailures = [...post.failedIds].filter((id) => !baseline.has(id));
       if (newFailures.length > 0) {
-        return { ok: false, excerpt: `${projectDir}: fix introduced ${newFailures.length} new test failure(s): ${newFailures.slice(0, 5).join(', ')}` };
+        return { ok: false, excerpt: `${projectDir}: fix introduced ${newFailures.length} new test failure(s): ${newFailures.slice(0, 5).join(', ')}`, gates };
       }
     }
   }
 
-  return { ok: true, testRunCounts: mergeCounts(paCounts, botCounts, projectCounts) };
+  return { ok: true, testRunCounts: mergeCounts(paCounts, paPyCounts, botCounts, projectCounts), gates };
 }
 
 // ---------------------------------------------------------------------------
@@ -537,7 +649,13 @@ function buildCommitMessage(proposal: DraftProposal, evidence: FailureRecord[]):
     ? evidence.slice(0, 5).map((f) => `- [${f.timestamp}] ${f.error}`).join('\n')
     : '(no recorded failure evidence)';
 
-  return `autonomous-code-fix: ${proposal.name}
+  // 2026-08-23 (alerts wave, WP-J2a): distinguish a maintenance-job fix's commit subject from
+  // an ordinary skill fix — the Target: line below already names the job via target_skill.
+  const subject = proposal.target_kind === 'maintenance-job'
+    ? `autonomous-code-fix: maintenance-job ${proposal.target_skill}`
+    : `autonomous-code-fix: ${proposal.name}`;
+
+  return `${subject}
 
 Target: ${proposal.target_skill ?? proposal.name}
 Reason: ${proposal.reason}
@@ -570,11 +688,17 @@ export async function attemptCodeFix(
   const checkBotProcessFn = opts.checkBotProcessFn ?? checkBotProcess;
   const sleep = opts.sleepFn ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
 
+  // 2026-08-23 (alerts wave, WP-J2a): what target_skill names. Explicit `const` type
+  // annotation (not `as const`) so the literal union survives into baseAudit below without
+  // widening to `string` — pa/src/lib/improvement-audit.ts's AuditRecord isn't imported here,
+  // so this can't be cross-checked via an `as AuditRecord['target_kind']` cast.
+  const targetKind: 'skill' | 'maintenance-job' = proposal.target_kind ?? 'skill';
   const baseAudit = {
     ts: new Date().toISOString(),
     draft: proposal.name,
     source_type: 'failure' as const,
     target_skill: proposal.target_skill,
+    target_kind: targetKind,
     risk_flags: [] as string[],
     reason: proposal.reason,
     evidence_excerpt: evidence.slice(0, 10).map((f) => `[${f.timestamp}] ${f.error}`).join('\n').slice(0, 2000),
@@ -590,24 +714,36 @@ export async function attemptCodeFix(
   // proposal.target_skill itself doesn't carry across the function boundary.
   const targetSkillName = proposal.target_skill;
 
+  // 2026-08-23 (alerts wave, WP-J2a): a maintenance-job target has no skill.md to load — its
+  // "target" is a declared MaintenanceJob whose source file is proposal.code_target instead.
+  const isJobTarget = targetKind === 'maintenance-job';
+  if (isJobTarget) {
+    if (!proposal.code_target || !proposal.code_target.startsWith('pa/src/lib/maintenance/jobs/')) {
+      const reason = `Proposal '${proposal.name}' targets maintenance job '${proposal.target_skill}' but code_target '${proposal.code_target ?? ''}' is not under pa/src/lib/maintenance/jobs/.`;
+      await appendAuditRecord({ ...baseAudit, action: 'code-fix-skipped-worker-failed', reason });
+      return { outcome: 'code-fix-skipped-no-target', reason };
+    }
+  }
+
   // Explicitly typed (not inferred) because runBody(), a nested function declared further
   // down, closes over this variable — TypeScript's control-flow narrowing for a bare `let`
   // doesn't carry across a function boundary, so an inferred `any` would silently widen.
-  let target: Skill;
-  try {
-    target = await loadSkill(proposal.target_skill);
-  } catch (err: any) {
-    const reason = `Could not load target skill '${proposal.target_skill}': ${err.message}`;
-    await appendAuditRecord({ ...baseAudit, action: 'code-fix-skipped-worker-failed', reason });
-    return { outcome: 'code-fix-skipped-no-target', reason };
+  // Stays undefined for a maintenance-job target, which skips loadSkill entirely.
+  let target: Skill | undefined;
+  if (!isJobTarget) {
+    try {
+      target = await loadSkill(proposal.target_skill);
+    } catch (err: any) {
+      const reason = `Could not load target skill '${proposal.target_skill}': ${err.message}`;
+      await appendAuditRecord({ ...baseAudit, action: 'code-fix-skipped-worker-failed', reason });
+      return { outcome: 'code-fix-skipped-no-target', reason };
+    }
+    if (!target.frontmatter.cwd) {
+      const reason = `Target skill '${proposal.target_skill}' has no cwd — cannot resolve a project directory to fix.`;
+      await appendAuditRecord({ ...baseAudit, action: 'code-fix-skipped-worker-failed', reason });
+      return { outcome: 'code-fix-skipped-no-target', reason };
+    }
   }
-  if (!target.frontmatter.cwd) {
-    const reason = `Target skill '${proposal.target_skill}' has no cwd — cannot resolve a project directory to fix.`;
-    await appendAuditRecord({ ...baseAudit, action: 'code-fix-skipped-worker-failed', reason });
-    return { outcome: 'code-fix-skipped-no-target', reason };
-  }
-  // Same cross-closure narrowing reason as `target`/`targetSkillName` above.
-  const targetCwd = target.frontmatter.cwd;
 
   let repoRoot: string;
   try {
@@ -618,6 +754,12 @@ export async function attemptCodeFix(
     await appendAuditRecord({ ...baseAudit, action: 'code-fix-skipped-worker-failed', reason });
     return { outcome: 'code-fix-skipped-no-target', reason };
   }
+
+  // Same cross-closure narrowing reason as `target`/`targetSkillName` above. A maintenance-job
+  // fix has no project directory of its own — pointing targetCwd at the repo root makes
+  // projectRelDir (below) compute to '', so the job's diff is verified by the pa gate only,
+  // never a nonexistent "project" pytest suite.
+  const targetCwd = isJobTarget ? repoRoot : target!.frontmatter.cwd!;
 
   const { stdout: branchRaw } = await exec('git rev-parse --abbrev-ref HEAD', { cwd: repoRoot });
   const branch = branchRaw.trim();
@@ -632,22 +774,27 @@ export async function attemptCodeFix(
   // git-workflow skill of its own while this lock is held.
   const bb = opts.blackboardFn ?? blackboard;
   const lockKey = exclusiveLockKey(GIT_WORKFLOW_RESOURCE);
-  const lockAcquired = await bb.acquireLock(lockKey, CODE_FIX_LOCK_AGENT, process.pid, GIT_LOCK_WAIT_MS);
+  const contextId = randomUUID();
+  const lockAcquired = await bb.acquireLock(lockKey, CODE_FIX_LOCK_AGENT, process.pid, GIT_LOCK_WAIT_MS, contextId);
   if (!lockAcquired) {
     const reason = `Skipped: another skill/process is holding exclusive_resource "${GIT_WORKFLOW_RESOURCE}" — waited ${Math.round(GIT_LOCK_WAIT_MS / 1000)}s.`;
     await appendAuditRecord({ ...baseAudit, action: 'code-fix-skipped-git-lock-busy', reason });
     return { outcome: 'code-fix-skipped-git-lock-busy', reason };
   }
-  const lockHeartbeat = setInterval(() => {
-    void bb.updateHeartbeat(lockKey, CODE_FIX_LOCK_AGENT).catch(() => {});
-  }, opts.lockHeartbeatMs ?? LOCK_HEARTBEAT_MS);
-  lockHeartbeat.unref?.();
+  // Set by startLockRenewal's onLost (D2/D3/D4, 2026-08-23): checked in runBody()
+  // right after workerPaths is computed, before the stranger-overlap guard.
+  let lockLost: 'expired' | 'purged' | undefined;
+  const renewal = startLockRenewal(lockKey, CODE_FIX_LOCK_AGENT, contextId, {
+    intervalMs: opts.lockHeartbeatMs ?? LOCK_HEARTBEAT_MS,
+    client: bb,
+    onLost: (reason) => { lockLost = reason; },
+  });
 
   try {
     return await runBody();
   } finally {
-    clearInterval(lockHeartbeat);
-    await bb.releaseLock(lockKey, CODE_FIX_LOCK_AGENT).catch(() => {});
+    renewal.stop();
+    await bb.releaseLock(lockKey, CODE_FIX_LOCK_AGENT, contextId, { pid: process.pid }).catch(() => {});
   }
 
   async function runBody(): Promise<CodeFixResult> {
@@ -691,10 +838,18 @@ export async function attemptCodeFix(
   // tree, before the worker touches anything — so the post-fix gate can tell a
   // regression the fix introduced from reds a human already left in the project.
   // (telegram-bot is a node project checked by the bot npm-test arm, not pytest.)
-  const preFixProject = projectRelDir.startsWith('projects/telegram-bot')
-    ? null
-    : await collectProjectTests(projectRelDir, repoRoot, exec).catch(() => null);
+  // A maintenance-job target has no project dir (projectRelDir === '') — guarded off
+  // (2026-08-23 WP-J2a) so this doesn't run collectProjectTests('', ...) against the whole repo.
+  const preFixProject = (!isJobTarget && projectRelDir && !projectRelDir.startsWith('projects/telegram-bot'))
+    ? await collectProjectTests(projectRelDir, repoRoot, exec).catch(() => null)
+    : null;
   const projectBaselineFailures = preFixProject?.failedIds ?? new Set<string>();
+
+  // Pre-fix baseline for the pa/scripts/tests pytest arm (2026-08-23 WP-J2a scoped gate) —
+  // captured the same way as projectBaselineFailures above, before the worker touches
+  // anything, so the post-fix gate blocks only NEW failures a fix introduces.
+  const preFixPaPy = await collectPaPyTests(repoRoot, exec).catch(() => null);
+  const paPyBaselineFailures = preFixPaPy?.failedIds ?? new Set<string>();
 
   // Pre-flight snapshot for stranger-overlap detection (2026-08-15): hash every preExisting
   // file NOW, before the worker runs, so we can detect if the worker modified a file that was
@@ -739,6 +894,21 @@ export async function attemptCodeFix(
     return { outcome: 'code-fix-skipped-no-changes', reason };
   }
 
+  // Lock-loss check (D2/D3/D4, 2026-08-23): the git-workflow lock this run
+  // holds may have been purged out from under it while the coding worker ran
+  // (up to 30 min). Checked here — after workerPaths exists (hardRevert needs
+  // it) and after the no-changes guard, before the stranger-overlap guard —
+  // so a lost lock always reverts before any further inspection or the
+  // eventual commit. Reuses the existing code-fix-skipped-concurrent-activity
+  // outcome/action (C14): the lock was lost BECAUSE another process is
+  // concurrently active, so no new closed-union member is needed.
+  if (lockLost) {
+    await hardRevert(exec, repoRoot, preFixHead, workerPaths);
+    const reason = `Lock lost mid-run (${lockLost}): ${lockKey} was purged while this fix held it — another process may be mutating the tree. Reverted worker paths only, deferring to the next run.`;
+    await appendAuditRecord({ ...baseAudit, action: 'code-fix-skipped-concurrent-activity', reason, files_changed: workerPaths });
+    return { outcome: 'code-fix-skipped-concurrent-activity', reason };
+  }
+
   // Stranger-overlap guard (2026-08-15): if any preExisting file's content CHANGED post-flight,
   // the worker edited a file that already carried someone else's uncommitted work. That file's
   // diff now mixes both changes and must never be committed or reverted. Before 2026-08-15,
@@ -763,6 +933,19 @@ export async function attemptCodeFix(
     const reason = `Stranger overlap: worker edited file(s) with pre-existing uncommitted work: ${overlapped.join(', ')} — reverted worker paths only.`;
     await appendAuditRecord({ ...baseAudit, action: 'code-fix-skipped-stranger-overlap', reason, files_changed: workerPaths });
     return { outcome: 'code-fix-skipped-stranger-overlap', reason };
+  }
+
+  // Same-run-overlap guard (2026-08-23 F5 rework, plans/2026-08-23-code-fix-multi-per-night-
+  // SPEC.md): if this diff touches a file a fix applied EARLIER IN THE SAME RUN already
+  // changed, revert — every applied fix in a run must stay independently `git revert`-able,
+  // and a second commit on the same file would make reverting the first one conflict.
+  const sameRun = new Set(opts.sameRunAppliedFiles ?? []);
+  const sameRunHit = workerPaths.filter((p) => sameRun.has(p));
+  if (sameRunHit.length) {
+    await hardRevert(exec, repoRoot, preFixHead, workerPaths);
+    const reason = `Same-run overlap: diff touches file(s) already changed by a fix applied earlier this run: ${sameRunHit.join(', ')} — reverted worker paths only (keeps each applied fix independently revertable).`;
+    await appendAuditRecord({ ...baseAudit, action: 'code-fix-skipped-same-run-overlap', reason, files_changed: workerPaths });
+    return { outcome: 'code-fix-skipped-same-run-overlap', reason };
   }
 
   // F1: protected-path diff inspection.
@@ -793,11 +976,26 @@ export async function attemptCodeFix(
     return { outcome: 'code-fix-reverted', reason };
   }
 
-  // F3: post-apply verification gate — build + full relevant suites (+ bot restart/health).
-  const verification = await runVerificationGate(workerPaths, repoRoot, exec, botRestartFn, checkBotProcessFn, sleep, projectRelDir, projectBaselineFailures);
+  // F3: post-apply verification gate — scoped to what the diff actually touched (2026-08-23
+  // WP-J2a; see runVerificationGate's own doc comment for the matrix). A maintenance-job
+  // target has no project dir of its own, so its gate is the pa arms only.
+  //
+  // W-C8 (AI-156 Wave C): holds @build for the gate's duration so a concurrent build/test
+  // elsewhere can't tear pa/dist out from under it. MUST stay below the quiet-tree gate
+  // (readActiveFn, above) — claiming @build any earlier would make code-fixer read its own
+  // reservation and skip itself every night (V16).
+  const withBuildLockFn = opts.withBuildLockFn ?? withBuildLock;
+  const verification = await withBuildLockFn(
+    `code-fixer-${process.pid}`,
+    () => runVerificationGate(
+      workerPaths, repoRoot, exec, botRestartFn, checkBotProcessFn, sleep,
+      isJobTarget ? undefined : projectRelDir, projectBaselineFailures, paPyBaselineFailures,
+    ),
+    { ttlMinutes: 60 },
+  );
   if (!verification.ok) {
     await hardRevert(exec, repoRoot, preFixHead, workerPaths);
-    const reason = `Verification failed: ${verification.excerpt ?? 'unknown failure'} — reverted.`;
+    const reason = `Verification failed: ${verification.excerpt ?? 'unknown failure'} — reverted.${gatesSuffixText(verification.gates)}`;
     await appendAuditRecord({
       ...baseAudit, action: 'reverted-verification-failed', reason, files_changed: workerPaths,
       test_run_counts: verification.testRunCounts,
@@ -852,7 +1050,7 @@ export async function attemptCodeFix(
 
   await exec(`git push origin ${branch}`, { cwd: repoRoot });
 
-  const reason = `Applied and pushed autonomous code fix for '${proposal.target_skill}' (commit ${commitHash ?? 'unknown'}).`;
+  const reason = `Applied and pushed autonomous code fix for '${proposal.target_skill}' (commit ${commitHash ?? 'unknown'}).${gatesSuffixText(verification.gates)}`;
   await appendAuditRecord({
     ...baseAudit,
     action: 'applied-code-fix',

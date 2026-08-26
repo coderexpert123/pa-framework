@@ -22,6 +22,7 @@ import {
 } from '../pending-dispatches.js';
 import { deliveredKey, wasDelivered, markDelivered, _resetDeliveredCacheForTest } from '../delivered-store.js';
 import { isTopicRecovering, _resetRecoveryGateForTest } from '../recovery-gate.js';
+import { takeResend, resendKey, _resetResendStoreForTest } from '../resend-store.js';
 
 let home: string;
 
@@ -31,6 +32,7 @@ beforeEach(() => {
   _resetPendingDispatchesForTest();
   _resetDeliveredCacheForTest();
   _resetRecoveryGateForTest();
+  _resetResendStoreForTest();
 });
 
 afterEach(() => {
@@ -38,6 +40,7 @@ afterEach(() => {
   _resetPendingDispatchesForTest();
   _resetDeliveredCacheForTest();
   _resetRecoveryGateForTest();
+  _resetResendStoreForTest();
   try { rmSync(home, { recursive: true, force: true }); } catch {}
 });
 
@@ -179,12 +182,12 @@ interface FakeDepsConfig {
   sendResult?: boolean;
 }
 
-function makeFakeDeps(cfg: FakeDepsConfig): { deps: ReaperDeps; sent: Array<{ record: PendingDispatch; text: string }> } {
-  const sent: Array<{ record: PendingDispatch; text: string }> = [];
+function makeFakeDeps(cfg: FakeDepsConfig): { deps: ReaperDeps; sent: Array<{ record: PendingDispatch; text: string; replyMarkup?: unknown }> } {
+  const sent: Array<{ record: PendingDispatch; text: string; replyMarkup?: unknown }> = [];
   return {
     sent,
     deps: {
-      send: async (record, text) => { sent.push({ record, text }); return cfg.sendResult ?? true; },
+      send: async (record, text, replyMarkup) => { sent.push({ record, text, replyMarkup }); return cfg.sendResult ?? true; },
       readTranscript: async () => cfg.transcript ?? null,
       isTopicWorkerAlive: async () => cfg.workerAlive ?? false,
       now: () => cfg.nowMs ?? Date.now(),
@@ -217,6 +220,32 @@ describe('evaluatePendingDispatch', () => {
     assert.ok(sent[0].text.includes('do the thing'), 'notice quotes the lost message');
     assert.deepEqual(await listPendingDispatches(), []);
     assert.equal(await wasDelivered(deliveredKey(rec.chatId, rec.threadId, rec.updateId)), true);
+  });
+
+  it('death-notice path stores a resend record and passes a resend keyboard (WP-B3)', async () => {
+    const rec = makeRecord({ session: undefined });
+    await addPendingDispatch(rec);
+    const { deps, sent } = makeFakeDeps({});
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(outcome, 'dead');
+    assert.equal(sent.length, 1);
+
+    // The resend record was written BEFORE the death notice was sent, keyed by
+    // the pending-dispatch's own (chatId, threadId, updateId).
+    const stored = await takeResend(resendKey(rec.chatId, rec.threadId, rec.updateId));
+    assert.ok(stored, 'resend-store should hold the original message for the Resend button');
+    assert.equal(stored?.chatId, rec.chatId);
+    assert.equal(stored?.threadId, rec.threadId);
+    assert.equal(stored?.updateId, rec.updateId);
+    assert.equal(stored?.messageId, rec.messageId);
+    assert.equal(stored?.userText, rec.userText);
+
+    // The keyboard passed to send() carries the rs: callback for this dispatch.
+    const kb = sent[0].replyMarkup as { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } | undefined;
+    assert.ok(kb, 'a resend keyboard should be passed to send()');
+    const buttons = kb!.inline_keyboard.flat();
+    assert.equal(buttons.length, 1);
+    assert.equal(buttons[0].callback_data, `rs:${rec.chatId}:${rec.threadId}:${rec.updateId}`);
   });
 
   it('sends a death notice for an agy session (recovery is claude-family only)', async () => {

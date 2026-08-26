@@ -268,3 +268,8 @@ projects/*.py
 # The private repo's existing tracked copy is unaffected — gitignore only
 # prevents NEW additions in fresh clones (e.g. of the future public repo).
 projects/telegram-bot/bot-instructions.md
+
+# The OAuth bridge page's optional deep-link config (plans/2026-08-24-buttons-
+# program-SPEC.md §3.5) names the bot's Telegram username — deployment-
+# specific, never committed. config.example.js stays tracked as the template.
+projects/google-oauth-redirect/config.js

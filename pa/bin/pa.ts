@@ -18,6 +18,7 @@ import { healthCommand } from '../src/commands/health.js';
 import { notifyCommand } from '../src/commands/notify-cmd.js';
 import { bgtasksCommand } from '../src/commands/bgtasks.js';
 import { refCommand } from '../src/commands/ref.js';
+import { recallCommand } from '../src/commands/recall.js';
 import { improvementsCommand, acceptRollbackCommand } from '../src/commands/improvements.js';
 import { costsCommand } from '../src/commands/costs.js';
 import { maintenanceCommand } from '../src/commands/maintenance.js';
@@ -59,6 +60,10 @@ async function mcpManifestCommand(): Promise<void> {
       {
         name: 'pa_slo_report',
         description: 'Generate SLO error budget report. Shows service-level objectives, error budget consumed/remaining, and event breakdowns.',
+      },
+      {
+        name: 'pa_recall',
+        description: 'Full-text search across archived conversation turns, worker run traces, per-topic brains and the Ecosystem KB. Use before assuming something was never discussed.',
       },
     ],
     transport: 'stdio',
@@ -123,6 +128,7 @@ Usage:
   pa notify --subject <s> (--body <b> | --body-file <path> | --body-stdin) [--dedup-key <k>] [--topic-thread <id>] [--severity info|warn|error]
   pa bgtasks [--json] [--kill <pid>]  List or kill background descendant processes
   pa ref <refId>              Look up what message produced a Ref ID (e.g. 'pa ref c-a59a')
+  pa recall "<q>" [--thread N] [--json]   Full-text search over turns, traces, brains, KB
   pa improvements [--since N] Eval self-improver's applied/rolled-back changes (default 30d)
   pa improvements accept <commit_hash> [--reason "..."]  Record a human decision to KEEP a commit whose rollback failed
   pa maintenance list         List declared maintenance jobs + resolved target paths
@@ -132,8 +138,8 @@ Usage:
   pa claim <path...> --session <label> --note "<text>" [--ttl <minutes>] [--force] [--wait <seconds>]
                                Reserve path(s)/@logical-resource for multi-session coordination
   pa claim --renew <id> [--ttl <minutes>]  Extend an existing reservation
-  pa release <id>             Release a reservation by id
-  pa claims                   Show active reservations + recently modified paths (mtime layer)
+  pa release <id> [--session <label>] [--force]  Release a reservation by id (ownership-checked when --session is given)
+  pa claims [--stats [--days N] [--json]]  Show active reservations + recently modified paths, or a reservation-activity rollup
   pa reconcile [--check] [--restore <path>] [--merge <path>]  Detect/restore/diagnose files reverted to an ancestor of HEAD
   pa dlq list                 List Dead Letter Queue entries (age, attempts, quarantined, preview)
   pa dlq replay <index|all>   Clear quarantined flag and reset attempts (retry on next flush)
@@ -301,7 +307,11 @@ async function main(): Promise<void> {
         break;
 
       case 'claims':
-        process.exitCode = await claimsCommand();
+        process.exitCode = await claimsCommand(args.slice(1));
+        break;
+
+      case 'recall':
+        process.exitCode = await recallCommand(args.slice(1));
         break;
 
       case 'reconcile':

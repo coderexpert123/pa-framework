@@ -34,7 +34,8 @@ files into the auto-update pipeline.
 
 ## Execution
 
-1. **Pre-snapshot git commit** — `cd "$root" && git add -A && git commit -m "update-brain: pre-update snapshot"`. Allows post-hoc inspection of changes.
+1. **Pre-snapshot git commit** — `cd "$root" && git add <the files from brain-files.json> && git commit -m "update-brain: pre-update snapshot"`. Allows post-hoc inspection of changes. Name the managed files explicitly; a blanket -A sweeps unrelated work into the snapshot.
+   - **Coordination:** if the project provides a reservation command, list active reservations first and skip the pre-snapshot commit for any managed file another session currently holds — defer that file, do not abort the refresh. A nightly sweep-commit that stages whatever happens to be dirty will eventually commit an operator's in-progress work.
 2. **For each file** in `brain-files.json`:
    - Read current content.
    - For each marker (e.g., `<!-- AUTO:SKILL-INVENTORY -->`), find the auto-managed section between the marker and the next marker / EOF.
