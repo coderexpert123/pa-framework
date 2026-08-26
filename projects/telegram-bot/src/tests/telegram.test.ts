@@ -1,3 +1,12 @@
+// Guard against the same real-Telegram/real-log leak test-env-setup.ts fixes
+// for the preloaded suite path, but for a direct `node --test x.test.js` run
+// (no --import preload) of THIS file alone: sendTyping's failure path logs
+// { chatId: 123, threadId: 456 } via pa's logger (telegram.ts:545), whose
+// paHome() is resolved fresh on every call — an unset PA_HOME there writes
+// straight into the real ~/.pa/app.log.jsonl. Shared guard (2026-08-23,
+// D16/WP-D) replaces this file's former inlined ad-hoc copy.
+import './test-env-guard.js';
+
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { splitMessage, sanitizeMdV2, getUpdates, sendMessage, sendMessageWithId, pinChatMessage, unpinChatMessage, sendTyping, SEND_TYPING_TIMEOUT_MS } from '../telegram.js';
@@ -902,6 +911,59 @@ describe('sendMessage', () => {
     const fallbackBody = JSON.parse(calls[1].init!.body as string);
     assert.ok(fallbackBody.text.includes('Ref: s-a1b2c3d4e5f6'), '12-hex ref ID preserved in fallback text');
     assert.ok(!fallbackBody.text.includes('_Ref:'), 'italic markers stripped in fallback');
+  });
+
+  // -------------------------------------------------------------------------
+  // Reply-target-gone fallback (bp-replyfix): a reply whose target message
+  // was deleted (e.g. /auth's delete-then-reply flow) must not dead-letter.
+  // -------------------------------------------------------------------------
+
+  it('retries without reply_to_message_id when Telegram reports the reply target is gone', async () => {
+    const calls = setupFetchMock([
+      { ok: false, status: 400, bodyText: 'Bad Request: message to be replied not found' },
+      { ok: true, bodyJson: { ok: true } },
+    ]);
+    const result = await sendMessage('token', 123, 'hello', 99);
+    assert.equal(calls.length, 2, 'should retry after reply-target-gone failure');
+    const firstBody = JSON.parse(calls[0].init!.body as string);
+    const retryBody = JSON.parse(calls[1].init!.body as string);
+    assert.equal(firstBody.reply_to_message_id, 99, 'initial attempt still targets the reply');
+    assert.equal(retryBody.reply_to_message_id, undefined, 'retry must omit reply_to_message_id');
+    assert.equal(retryBody.text, 'hello', 'retry keeps the original text');
+    assert.equal(retryBody.parse_mode, 'MarkdownV2', 'retry does not touch parse_mode (unrelated cause)');
+    assert.equal(result, true, 'reports success once the retry lands');
+  });
+
+  it('does not retry on an unrelated 400 even when a reply target was set', async () => {
+    const calls = setupFetchMock([
+      { ok: false, status: 400, bodyText: 'Bad Request: chat not found' },
+    ]);
+    const result = await sendMessage('token', 123, 'hello', 99);
+    assert.equal(calls.length, 1, 'no retry for an unrelated error');
+    assert.equal(result, false, 'reports failure exactly as before this fix');
+  });
+
+  it('terminates after one retry per cause when parse and reply-target errors both occur, without looping', async () => {
+    const calls = setupFetchMock([
+      { ok: false, status: 400, bodyText: "can't parse entities" },
+      { ok: false, status: 400, bodyText: 'Bad Request: message to be replied not found' },
+      { ok: false, status: 400, bodyText: 'Bad Request: message to be replied not found' },
+    ]);
+    const result = await sendMessage('token', 123, 'hello *world', 99);
+    assert.equal(calls.length, 3, 'exactly 2 corrective retries — one per cause — then it stops');
+    const finalBody = JSON.parse(calls[2].init!.body as string);
+    assert.equal(finalBody.parse_mode, undefined, 'final body has no parse_mode');
+    assert.equal(finalBody.reply_to_message_id, undefined, 'final body has no reply_to_message_id');
+    assert.equal(result, false, 'still-failing final attempt reports failure, not a false success');
+  });
+
+  it('a successful first send still passes reply_to_message_id (no unconditional stripping)', async () => {
+    const calls = setupFetchMock([{ ok: true, bodyJson: { ok: true } }]);
+    const result = await sendMessage('token', 123, 'hello', 99);
+    assert.equal(calls.length, 1);
+    const body = JSON.parse(calls[0].init!.body as string);
+    assert.equal(body.reply_to_message_id, 99);
+    assert.equal(result, true);
   });
 });
 

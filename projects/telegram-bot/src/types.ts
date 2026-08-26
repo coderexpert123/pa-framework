@@ -45,10 +45,29 @@ export interface TelegramMessage {
   forward_sender_name?: string;
 }
 
+export interface ReactionType {
+  type: 'emoji' | 'custom_emoji' | 'paid';
+  emoji?: string;
+  custom_emoji_id?: string;
+}
+
+/** Bot API `MessageReactionUpdated` — delivered only when getUpdates asks for
+ *  `message_reaction` (telegram.ts ALLOWED_UPDATES) and the bot is a chat admin. */
+export interface MessageReactionUpdated {
+  chat: TelegramChat;
+  message_id: number;
+  user?: TelegramUser;
+  actor_chat?: TelegramChat;
+  date: number;
+  old_reaction: ReactionType[];
+  new_reaction: ReactionType[];
+}
+
 export interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
   callback_query?: CallbackQuery;
+  message_reaction?: MessageReactionUpdated;
 }
 
 export interface CallbackQuery {
@@ -68,11 +87,15 @@ export interface ConversationTurn {
   worker?: string;      // the specific model that generated this turn (e.g., 'claude', 'agy')
   session_id?: string;  // the CLI session ID associated with this turn
   refId?: string;       // bot reply debug handle (e.g., 'c-a59a') — set on assistant turns; queryable via `pa ref`
+  /** Set when this turn came from a button press or a reaction instead of typed text. */
+  via?: 'button' | 'reaction';
 }
 
 export interface PendingAction {
   description: string;
   proposed_at: string;
+  /** message_id of the reply that asked the question — the anchor for the ✅/❌ keyboard and for 👍/👎 reaction approval. */
+  message_id?: number;
 }
 
 export interface SessionInfo {

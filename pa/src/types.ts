@@ -328,6 +328,12 @@ export interface DraftProposal {
   prompt: string;
   target_skill?: string; // set by failure-analyzer.ts/feedback-analyzer.ts for fix/reinforce proposals — the existing skill this proposal targets. Proposal-authoring metadata, NOT part of SkillFrontmatter (never written into a deployed skill.md).
   code_target?: string;  // set by failure-analyzer.ts (2026-07-11) when its evidence names a specific source file likely causing the failure — a relative repo path (e.g. "projects/daily-mail-brief/scripts/run_brief.py"), validated in analyzer.ts's parseProposalResponse. A hint for code-fixer.ts's attemptCodeFix(), not authoritative on its own — the coding worker still explores the project itself.
+  // 2026-08-23 (alert-census wave, plans/2026-08-23-alerts-wave-SPEC.md): what `target_skill`
+  // names. Default/undefined = 'skill' (a ~/.pa/skills entry). 'maintenance-job' = a declared
+  // maintenance job (pa/src/lib/maintenance/registry.ts) whose name is in `target_skill` and
+  // whose source file is in `code_target` — routed straight to code-fixer.ts (no skill.md exists
+  // to prompt-fix), verified by the pa build+suite, rolled back on the job's ledger failures.
+  target_kind?: 'skill' | 'maintenance-job';
 }
 
 export interface RunMeta {
@@ -356,4 +362,9 @@ export interface CommandResult {
   /** Path to the tee file capturing this dispatch's stdout (for crash
    * recovery). Undefined when no tee was set up. */
   teePath?: string;
+  /** Per-execution uuid minted by executeWorker. Joins this run to its line in
+   * ~/.pa/turn-traces.jsonl and to the archive row the bot writes for the turn
+   * (2026-08-24, plans/2026-08-24-recall-traces-wave-SPEC.md). Present on every
+   * executeWorker return, including failures. */
+  runId?: string;
 }

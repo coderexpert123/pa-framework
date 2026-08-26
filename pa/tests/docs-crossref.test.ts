@@ -282,18 +282,21 @@ describe('docs cross-reference checker', () => {
     assert.deepEqual(failures, [], failures.join('\n'));
   });
 
-  it('backlog/completed-index.md (the lookup table, not the archives) stays within its 16k budget', () => {
+  it('backlog/completed-index.md (the lookup table, not the archives) stays within its 20k budget', () => {
     // docs/CONVENTIONS.md § "Brain-file organization": archive-*.md/not-valid.md
     // are the "append-only archive" class with NO hard ceiling -- their size
     // tracks how much work shipped in a window, not anything a reader holds in
     // mind, and splitting one purely to hit a number would separate
     // cross-referenced items that must stay findable together. Only the
-    // lookup-table file gets budget-checked here.
+    // lookup-table file gets budget-checked here. Budget raised 16,000 -> 20,000
+    // chars 2026-08-23 (Wave C, W-C13): the index is a monotonically growing
+    // one-row-per-completed-item lookup table, never auto-loaded, so a fixed
+    // ceiling is the wrong instrument -- raise this row rather than splitting.
     const content = readIfExists(join(REPO_ROOT, 'backlog', 'completed-index.md'));
     if (content === null) return; // absent in the public mirror and pre-Phase-4 checkouts
     assert.ok(
-      content.length <= 16000,
-      `backlog/completed-index.md is ${content.length} chars, over the 16,000-char budget -- it's a lookup table, not an archive, and should stay scannable`
+      content.length <= 20000,
+      `backlog/completed-index.md is ${content.length} chars, over the 20,000-char budget -- it's a lookup table, not an archive, and should stay scannable`
     );
   });
 

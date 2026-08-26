@@ -29,6 +29,21 @@ describe('buildFeedbackPrompt', () => {
     assert.match(prompt, /target_skill/);
     assert.match(prompt, /out of scope/i);
   });
+
+  it('does not truncate a 3,000-char turn (replaces the old 300-char cut, D3.5)', () => {
+    const longText = 'a'.repeat(3000);
+    const turns = [{ role: 'user', text: longText, timestamp: '2026-08-01T09:00:00.000Z' }];
+    const prompt = buildFeedbackPrompt(turns, [], []);
+    assert.match(prompt, new RegExp('a'.repeat(3000)));
+  });
+
+  it('cuts a 5,000-char turn at ANALYZER_TURN_CHARS (4000)', () => {
+    const longText = 'b'.repeat(5000);
+    const turns = [{ role: 'user', text: longText, timestamp: '2026-08-01T09:00:00.000Z' }];
+    const prompt = buildFeedbackPrompt(turns, [], []);
+    assert.match(prompt, new RegExp('b'.repeat(4000)));
+    assert.ok(!prompt.includes('b'.repeat(4001)));
+  });
 });
 
 describe('analyzeFeedbackPatterns', () => {

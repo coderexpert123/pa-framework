@@ -6,18 +6,53 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFile, mkdir, readFile, stat } from 'fs/promises';
 import { join } from 'path';
-import { analyzeConversationPatterns } from '../src/analyzer.js';
+import {
+  analyzeConversationPatterns,
+  analyzeConversationWindow,
+  _resetAnalyzerStateForTest,
+} from '../src/analyzer.js';
 import { analyzeFailurePatterns } from '../src/failure-analyzer.js';
 import { saveDraft, loadDraft, approveDraft, rejectDraft, isDuplicate } from '../src/drafts.js';
+import { loadAnalyzerState, skillCandidatesPath } from '../src/lib/skill-candidates.js';
 import type { DraftProposal } from '../src/types.js';
 import type { RunMeta } from '../src/types.js';
 import { createTempPaHome, cleanup } from './helpers.js';
 
-// Fake runner that returns a canned JSON response
+// Fake runner that returns a canned JSON response — used only for the
+// analyzeFailurePatterns cases (a single-pass analyzer, unaffected by this
+// wave's two-pass rewrite of analyzeConversationPatterns/analyzeConversationWindow).
 function makeRunner(proposals: DraftProposal[]) {
   return async (_prompt: string, _opts: any) => {
     return {
       result: { success: true, output: JSON.stringify(proposals), exitCode: 0 as number | null },
+      worker: 'mock',
+    };
+  };
+}
+
+/**
+ * Fake runner for the two-pass conversation analyzer. Pass 1 (keying) and
+ * Pass 2 (proposal) are distinguished via the `resource` tag analyzer.ts sets
+ * on each runner call ('skill-learner-keying' / 'skill-learner-proposal').
+ * Pass 1 keys every turn id found in the prompt (bracketed `[id]` lines,
+ * matching buildKeyingPrompt's rendering) to `opts.key`; Pass 2 returns
+ * `opts.proposals` verbatim. `key` must be UNIQUE per test that expects a
+ * Pass-2 call to fire — a key already proposed earlier in this file is
+ * suppressed for 14 days (SKILL_CANDIDATE_REPROPOSE_MS), so reusing one
+ * would silently make eligibleCandidates skip it.
+ */
+function makeTwoPassRunner(opts: { key: string; proposals: DraftProposal[] }) {
+  return async (prompt: string, callOpts: any) => {
+    if (callOpts?.resource === 'skill-learner-proposal') {
+      return {
+        result: { success: true, output: JSON.stringify(opts.proposals), exitCode: 0 as number | null },
+        worker: 'mock',
+      };
+    }
+    const ids = [...prompt.matchAll(/^\[([^\]]*)\]/gm)].map((m) => m[1]);
+    const results = ids.map((id) => ({ message_id: id, key: opts.key, intent: 'test intent' }));
+    return {
+      result: { success: true, output: JSON.stringify(results), exitCode: 0 as number | null },
       worker: 'mock',
     };
   };
@@ -100,7 +135,8 @@ describe('learn end-to-end pipeline', () => {
   };
 
   it('analyzeConversationPatterns returns proposals from mocked LLM', async () => {
-    const runner = makeRunner([emailSummaryProposal]);
+    await _resetAnalyzerStateForTest();
+    const runner = makeTwoPassRunner({ key: 'email-summary', proposals: [emailSummaryProposal] });
     const proposals = await analyzeConversationPatterns(30, runner);
     assert.equal(proposals.length, 1);
     assert.equal(proposals[0].name, 'email-summary');
@@ -166,12 +202,14 @@ describe('learn end-to-end pipeline', () => {
   });
 
   it('mocked runner returning empty array produces no proposals', async () => {
-    const runner = makeRunner([]);
+    await _resetAnalyzerStateForTest();
+    const runner = makeRunner([]); // shared canned '[]' response for every pass
     const proposals = await analyzeConversationPatterns(7, runner);
     assert.deepEqual(proposals, []);
   });
 
   it('analyzeConversationPatterns short-circuits and returns [] without LLM call when no turns', async () => {
+    await _resetAnalyzerStateForTest();
     let runnerCalled = false;
     const runner = async (_p: string, _o: any) => {
       runnerCalled = true;
@@ -225,6 +263,7 @@ describe('learn end-to-end pipeline', () => {
   });
 
   it('batch dedup prevents same-name proposals from overwriting each other', async () => {
+    await _resetAnalyzerStateForTest();
     // LLM returns two proposals with the same name but different prompts
     const dupProposal1: DraftProposal = {
       name: 'dup-skill',
@@ -241,7 +280,7 @@ describe('learn end-to-end pipeline', () => {
       prompt: 'Second completely different prompt.',
     };
 
-    const runner = makeRunner([dupProposal1, dupProposal2]);
+    const runner = makeTwoPassRunner({ key: 'dup-test-key', proposals: [dupProposal1, dupProposal2] });
     const proposals = await analyzeConversationPatterns(30, runner);
 
     // Only one proposal should survive
@@ -249,5 +288,65 @@ describe('learn end-to-end pipeline', () => {
     assert.equal(dupProposals.length, 1);
     // It should be the first one
     assert.equal(dupProposals[0].prompt, dupProposal1.prompt);
+  });
+
+  // --- C26: watermark isolation cases (this wave's two-pass rewrite) --------
+
+  it('a first advancing call writes analyzer-state.json and skill-candidates.json', async () => {
+    await _resetAnalyzerStateForTest();
+    const runner = makeTwoPassRunner({ key: 'watermark-write-test', proposals: [] });
+    await analyzeConversationPatterns(30, runner);
+
+    const state = await loadAnalyzerState();
+    assert.ok(state.covers_through, 'covers_through should be set after a successful advancing run');
+    assert.ok(state.last_run_at);
+
+    await assert.doesNotReject(() => stat(skillCandidatesPath()));
+  });
+
+  it('an immediate second call without a reset returns [] and makes no runner call (watermark honoured)', async () => {
+    await _resetAnalyzerStateForTest();
+    const firstRunner = makeTwoPassRunner({ key: 'immediate-second-call-test', proposals: [] });
+    await analyzeConversationPatterns(30, firstRunner);
+
+    let callCount = 0;
+    const spyRunner = async (_p: string, _o: any) => {
+      callCount++;
+      return { result: { success: true, output: '[]', exitCode: 0 as number | null }, worker: 'mock' };
+    };
+
+    const proposals = await analyzeConversationPatterns(30, spyRunner);
+    assert.deepEqual(proposals, []);
+    assert.equal(callCount, 0, 'the watermark already covers every fixture turn, so no runner call should happen');
+  });
+
+  it('analyzeConversationWindow after an advancing call still re-processes and leaves covers_through unchanged', async () => {
+    await _resetAnalyzerStateForTest();
+    const advancingRunner = makeTwoPassRunner({ key: 'window-rerun-test', proposals: [] });
+    await analyzeConversationPatterns(30, advancingRunner);
+    const stateAfterAdvance = await loadAnalyzerState();
+    assert.ok(stateAfterAdvance.covers_through);
+
+    const windowProposal: DraftProposal = {
+      name: 'window-test-skill',
+      reason: 'produced by the window (non-advancing) path',
+      source_message_ids: [],
+      frontmatter: {},
+      prompt: 'p.',
+    };
+
+    let callCount = 0;
+    const windowRunner = async (prompt: string, callOpts: any) => {
+      callCount++;
+      return makeTwoPassRunner({ key: 'window-rerun-test', proposals: [windowProposal] })(prompt, callOpts);
+    };
+
+    const proposals = await analyzeConversationWindow(30, windowRunner);
+    assert.ok(callCount > 0, 'analyzeConversationWindow must re-process the window, ignoring the watermark');
+    assert.equal(proposals.length, 1);
+    assert.equal(proposals[0].name, 'window-test-skill');
+
+    const stateAfterWindow = await loadAnalyzerState();
+    assert.deepEqual(stateAfterWindow, stateAfterAdvance, 'analyzeConversationWindow must never touch analyzer-state.json');
   });
 });

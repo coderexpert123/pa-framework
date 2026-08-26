@@ -10,14 +10,16 @@ describe('MAINTENANCE_JOBS registry', () => {
     assert.doesNotThrow(() => validateRegistry([...MAINTENANCE_JOBS]));
   });
 
-  it('declares exactly 21 jobs (15 pa + 6 bot) with the expected names', () => {
-    assert.equal(MAINTENANCE_JOBS.length, 21);
+  it('declares exactly 25 jobs (17 pa + 8 bot) with the expected names', () => {
+    assert.equal(MAINTENANCE_JOBS.length, 25);
     const names = MAINTENANCE_JOBS.map((j) => j.name).sort();
     assert.deepEqual(names, [
+      'alert-census',
       'alert-state-gc',
       'archive-prune',
       'blackboard-purge',
       'bot-log-rotation-check',
+      'bot-self-restart',
       'clobber-sentinel',
       'delivered-store-compact',
       'dlq-flush',
@@ -25,11 +27,13 @@ describe('MAINTENANCE_JOBS registry', () => {
       'model-override-sweep',
       'orphan-worker-reap',
       'proxy-pool-refresh',
+      'recall-index',
       'redteam-recurring',
+      'registry-content-watch',
       'reservation-gc',
       'restore-drill',
+      'review-conflict-buttons',
       'session-gc',
-      'skill-cadence-audit',
       'skill-log-rotate',
       'staleness-check',
       'voice-attachment-gc',
@@ -38,18 +42,40 @@ describe('MAINTENANCE_JOBS registry', () => {
     ]);
   });
 
-  it('splits jobs correctly by host (15 pa, 6 bot)', () => {
-    assert.equal(jobsForHost('pa').length, 15);
-    assert.equal(jobsForHost('bot').length, 6);
+  it('splits jobs correctly by host (17 pa, 8 bot)', () => {
+    assert.equal(jobsForHost('pa').length, 17);
+    assert.equal(jobsForHost('bot').length, 8);
     const botNames = jobsForHost('bot').map((j) => j.name).sort();
     assert.deepEqual(botNames, [
       'bot-log-rotation-check',
+      'bot-self-restart',
       'delivered-store-compact',
       'dlq-flush',
       'grounding-check',
       'model-override-sweep',
       'proxy-pool-refresh',
+      'registry-content-watch',
     ]);
+  });
+
+  it('recall-index is declared for host pa with a 10-minute cadence and no targets', () => {
+    const job = findJob('recall-index');
+    assert.ok(job, 'recall-index should exist');
+    assert.equal(job!.host, 'pa');
+    assert.equal(resolveEvery(job!), 600_000);
+    assert.deepEqual(job!.targets, []);
+    assert.equal(job!.destructive, false);
+    assert.equal(job!.shedWhenDegraded, true);
+  });
+
+  it('bot-self-restart is declared for host bot with a 60s cadence and no targets', () => {
+    const job = findJob('bot-self-restart');
+    assert.ok(job, 'bot-self-restart should exist');
+    assert.equal(job!.host, 'bot');
+    assert.equal(resolveEvery(job!), 60_000);
+    assert.deepEqual(job!.targets, []);
+    assert.equal(job!.destructive, false);
+    assert.equal(job!.shedWhenDegraded, true);
   });
 
   function resolveEvery(job: (typeof MAINTENANCE_JOBS)[number]): number {
@@ -65,7 +91,7 @@ describe('MAINTENANCE_JOBS registry', () => {
   });
 
   it('locks the declared cadence for the 1-hour jobs', () => {
-    for (const name of ['skill-cadence-audit', 'skill-log-rotate', 'archive-prune', 'alert-state-gc']) {
+    for (const name of ['skill-log-rotate', 'archive-prune', 'alert-state-gc']) {
       const job = findJob(name);
       assert.ok(job, `${name} should exist`);
       assert.equal(resolveEvery(job!), 3_600_000, `${name} cadence`);
@@ -76,6 +102,27 @@ describe('MAINTENANCE_JOBS registry', () => {
     assert.equal(resolveEvery(findJob('session-gc')!), 21_600_000);
     assert.equal(resolveEvery(findJob('grounding-check')!), 21_600_000);
     assert.equal(resolveEvery(findJob('weekly-learn')!), 604_800_000);
+    assert.equal(resolveEvery(findJob('alert-census')!), 86_400_000);
+  });
+
+  it('registry-content-watch is declared for host bot with a 24h cadence and no targets', () => {
+    const job = findJob('registry-content-watch');
+    assert.ok(job, 'registry-content-watch should exist');
+    assert.equal(job!.host, 'bot');
+    assert.equal(resolveEvery(job!), 86_400_000);
+    assert.deepEqual(job!.targets, []);
+    assert.equal(job!.destructive, false);
+    assert.equal(job!.shedWhenDegraded, true);
+  });
+
+  it('review-conflict-buttons is declared for host pa with a 24h cadence and no targets', () => {
+    const job = findJob('review-conflict-buttons');
+    assert.ok(job, 'review-conflict-buttons should exist');
+    assert.equal(job!.host, 'pa');
+    assert.equal(resolveEvery(job!), 86_400_000);
+    assert.deepEqual(job!.targets, []);
+    assert.equal(job!.destructive, false);
+    assert.equal(job!.shedWhenDegraded, true);
   });
 
   it('locks the declared destructive set across both hosts', () => {

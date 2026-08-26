@@ -22,6 +22,7 @@ import { spawn } from 'child_process';
 import { createHash, randomBytes } from 'crypto';
 import { mkdir, readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
+import { parsePorcelainEntries, type PorcelainEntry } from './git-status.js';
 
 // ---- Git subprocess runner (injectable for test instrumentation — always
 // backed by a real `git` process; nothing here fakes git's behavior) ----
@@ -96,32 +97,9 @@ function assertSafeRelPath(relPath: string): void {
   }
 }
 
-interface StatusEntry {
-  x: string;
-  y: string;
-  path: string;
-}
-
-/** Parses `git status --porcelain` (v1) output into status-code + path rows. */
-function parsePorcelainStatus(output: string): StatusEntry[] {
-  const entries: StatusEntry[] = [];
-  for (const line of output.split('\n')) {
-    if (line.length < 4) continue;
-    const x = line[0];
-    const y = line[1];
-    let rest = line.slice(3);
-    // Renames/copies report "old -> new"; only the new path is a WT concern here.
-    const arrowIdx = rest.indexOf(' -> ');
-    if (arrowIdx !== -1) rest = rest.slice(arrowIdx + 4);
-    if (rest.length >= 2 && rest.startsWith('"') && rest.endsWith('"')) rest = rest.slice(1, -1);
-    entries.push({ x, y, path: rest });
-  }
-  return entries;
-}
-
 /** Tracked files with worktree content to compare — excludes untracked (`??`) and
  *  anything without live worktree bytes (deleted, staged-deletion-only). */
-function isDriftCandidate(entry: StatusEntry): boolean {
+function isDriftCandidate(entry: PorcelainEntry): boolean {
   if (entry.x === '?' && entry.y === '?') return false;
   if (entry.y === 'D') return false;
   if (entry.x === 'D' && entry.y === ' ') return false;
@@ -202,7 +180,7 @@ export async function detectDrift(repoRoot: string, opts: DetectDriftOptions = {
   if (statusRes.code !== 0) {
     throw new Error(`git status failed (exit ${statusRes.code}): ${statusRes.stderr.toString('utf8').trim()}`);
   }
-  const candidates = parsePorcelainStatus(statusRes.stdout.toString('utf8')).filter(isDriftCandidate);
+  const candidates = parsePorcelainEntries(statusRes.stdout.toString('utf8')).filter(isDriftCandidate);
 
   const findings: DriftFinding[] = [];
   // Sequential, not Promise.all — this machine's D: drive starves under concurrent

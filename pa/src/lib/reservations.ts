@@ -19,6 +19,7 @@ import lockfile from 'proper-lockfile';
 import { paHome } from '../paths.js';
 import { safeLockOptions } from './safe-lock.js';
 import { log } from './log.js';
+import { writeJsonAtomic } from './atomic-write.js';
 
 export interface Reservation {
   id: string;          // "r-" + 8 hex
@@ -56,6 +57,12 @@ export interface ReleaseOptions {
   id?: string;
   /** Release every reservation held by this session. */
   session?: string;
+  /** Logging-only: marks this release as a forced override of another session's ownership. */
+  force?: boolean;
+  /** Logging-only: the session that owned the reservation being force-released. */
+  ownerSession?: string;
+  /** Logging-only: the session performing the forced release. */
+  bySession?: string;
 }
 
 export const DEFAULT_TTL_MINUTES = 45;
@@ -146,7 +153,11 @@ async function readStore(path: string): Promise<ReservationStore> {
     if (!data || !Array.isArray(data.reservations)) return { reservations: [] };
     return data;
   } catch (err) {
-    console.warn('[reservations] Failed to read reservations.json, resetting:', err);
+    log('error', 'reservations', 'store unreadable — resetting to empty', {
+      refId: `s-${randomBytes(6).toString('hex')}`,
+      path,
+      error: String(err),
+    });
     return { reservations: [] };
   }
 }
@@ -175,7 +186,7 @@ function mutate<T>(fn: (store: ReservationStore) => T): Promise<T> {
     try {
       const store = await readStore(path);
       const result = fn(store);
-      await fs.writeJson(path, store, { spaces: 2 });
+      await writeJsonAtomic(path, store, { spaces: 2 });
       return result;
     } finally {
       await release();
@@ -207,6 +218,12 @@ export async function claim(opts: ClaimOptions): Promise<ClaimResult> {
     );
 
     if (conflicts.length > 0 && !opts.force) {
+      log('warn', 'reservations', 'claim denied', {
+        refId: `s-${randomBytes(6).toString('hex')}`,
+        session: opts.session,
+        paths,
+        conflicts: conflicts.map((c) => ({ id: c.id, session: c.session })),
+      });
       return { ok: false, conflicts };
     }
 
@@ -220,7 +237,9 @@ export async function claim(opts: ClaimOptions): Promise<ClaimResult> {
     };
     store.reservations.push(reservation);
 
-    if (conflicts.length > 0 && opts.force) {
+    const forced = conflicts.length > 0 && !!opts.force;
+
+    if (forced) {
       log('warn', 'reservations', 'force-claim over active conflict', {
         refId: `s-${randomBytes(6).toString('hex')}`,
         session: opts.session,
@@ -229,6 +248,15 @@ export async function claim(opts: ClaimOptions): Promise<ClaimResult> {
         conflicts: conflicts.map((c) => ({ id: c.id, session: c.session, note: c.note })),
       });
     }
+
+    log('info', 'reservations', 'claim granted', {
+      refId: `s-${randomBytes(6).toString('hex')}`,
+      id: reservation.id,
+      session: opts.session,
+      paths,
+      ttlMinutes,
+      forced,
+    });
 
     return { ok: true, reservation };
   });
@@ -246,12 +274,17 @@ export async function renew(
     const entry = store.reservations.find((r) => r.id === id);
     if (!entry) return null;
     entry.expiresAt = new Date(now + ttlMinutes * MINUTE_MS).toISOString();
+    log('info', 'reservations', 'reservation renewed', {
+      refId: `s-${randomBytes(6).toString('hex')}`,
+      id: entry.id,
+      expiresAt: entry.expiresAt,
+    });
     return entry;
   });
 }
 
 export async function release(opts: ReleaseOptions): Promise<{ released: number }> {
-  return mutate((store) => {
+  const result = await mutate((store) => {
     const before = store.reservations.length;
     store.reservations = store.reservations.filter((r) => {
       if (opts.id !== undefined) return r.id !== opts.id;
@@ -260,13 +293,41 @@ export async function release(opts: ReleaseOptions): Promise<{ released: number 
     });
     return { released: before - store.reservations.length };
   });
+
+  if (result.released > 0) {
+    log('info', 'reservations', 'reservation released', {
+      refId: `s-${randomBytes(6).toString('hex')}`,
+      id: opts.id,
+      session: opts.session,
+      releasedCount: result.released,
+    });
+    if (opts.force) {
+      log('warn', 'reservations', "forced release of another session's reservation", {
+        refId: `s-${randomBytes(6).toString('hex')}`,
+        id: opts.id,
+        owner: opts.ownerSession,
+        releasedBy: opts.bySession,
+      });
+    }
+  }
+
+  return result;
 }
 
 /** Drop every reservation whose expiresAt has passed. Returns the count removed. */
 export async function gcExpired(now: number = Date.now()): Promise<number> {
-  return mutate((store) => {
+  const removed = await mutate((store) => {
     const before = store.reservations.length;
     store.reservations = store.reservations.filter((r) => new Date(r.expiresAt).getTime() > now);
     return before - store.reservations.length;
   });
+
+  if (removed > 0) {
+    log('info', 'reservations', 'reservations gc-expired', {
+      refId: `s-${randomBytes(6).toString('hex')}`,
+      removed,
+    });
+  }
+
+  return removed;
 }

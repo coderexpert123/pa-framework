@@ -7,7 +7,6 @@ On failure: writes .fetch-failed.json with status/reason, alerts pa-support,
 and exits 2.
 """
 
-import json
 import os
 import sys
 import traceback
@@ -61,42 +60,47 @@ def main():
         
         if status == "auth":
             try:
-                pa_home = os.environ.get("PA_HOME", os.path.join(os.path.expanduser("~"), ".pa"))
                 # Path to start_google_telegram_reauth.py relative to projects/daily-mail-brief/scripts/preflight.py
                 # D:\Personal Assistant\projects\daily-mail-brief\scripts\preflight.py
                 # -> D:\Personal Assistant\pa\scripts\start_google_telegram_reauth.py
-                start_script = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(SCRIPT_DIR))), "pa", "scripts", "start_google_telegram_reauth.py")
-                
-                chat_id = os.environ.get("TELEGRAM_BRIEFING_CHAT_ID", "").split(",")[0].strip() or os.environ.get("TELEGRAM_CHAT_ID", "").split(",")[0].strip()
-                thread_id = os.environ.get("TELEGRAM_DAILY_BRIEFING_THREAD_ID")
-                
+                repo_root = os.path.dirname(os.path.dirname(os.path.dirname(SCRIPT_DIR)))
+                pa_scripts_dir = os.path.join(repo_root, "pa", "scripts")
+                start_script = os.path.join(pa_scripts_dir, "start_google_telegram_reauth.py")
+
+                # WP-G (AI-147): resolve chat/thread via google_reauth_kick's
+                # resolver — this deliberately targets the OPERATOR's general
+                # topic (PA_REAUTH_CHAT_ID -> TELEGRAM_CHAT_ID), not the
+                # daily-briefing-specific chat/thread (decision (e) of
+                # plans/2026-08-23-alerts-wave-SPEC.md: NOT pa-alerts, and not
+                # buried in a low-visibility topic either). Falls back to the
+                # pre-WP-G expression only if the import itself fails.
+                try:
+                    sys.path.insert(0, pa_scripts_dir)
+                    from google_reauth_kick import _resolve_chat_id, _resolve_thread_id
+                    chat_id = _resolve_chat_id(None)
+                    thread_id = _resolve_thread_id(None)
+                except ImportError:
+                    chat_id = (os.environ.get("TELEGRAM_BRIEFING_CHAT_ID", "").split(",")[0].strip()
+                              or os.environ.get("TELEGRAM_CHAT_ID", "").split(",")[0].strip())
+                    thread_id = os.environ.get("TELEGRAM_DAILY_BRIEFING_THREAD_ID") or 0
+
                 redirect_uri = os.environ.get("GOOGLE_AUTH_REDIRECT_URI", "").strip()
                 if not redirect_uri:
                     raise RuntimeError("GOOGLE_AUTH_REDIRECT_URI is not configured in ~/.pa/secrets.env")
 
-                resume_action = {
-                    "type": "run_pa_skill",
-                    "skill": "daily-mail-brief",
-                    "description": "Retry the daily mail brief",
-                }
-
                 if os.path.exists(start_script) and chat_id:
-                    cmd = [sys.executable, start_script, "--redirect-uri", redirect_uri, "--chat-id", chat_id]
-                    if thread_id:
-                        cmd.extend(["--thread-id", thread_id])
-                    cmd.extend(["--resume-action-json", json.dumps(resume_action)])
-                    
+                    cmd = [sys.executable, start_script, "--reuse-pending",
+                          "--chat-id", str(chat_id), "--thread-id", str(thread_id),
+                          "--resume-skill", "daily-mail-brief", "--redirect-uri", redirect_uri]
+
                     res = subprocess.run(cmd, capture_output=True, text=True)
                     if res.returncode == 0:
-                        auth_data = json.loads(res.stdout)
-                        auth_url = auth_data["auth_url"]
-                        reason = (
-                            "Google authentication expired.\n\n"
-                            f"1. [Tap here to authorize]({auth_url}) on your phone.\n"
-                            "2. Copy the full `/auth ...` command from the page.\n"
-                            "3. Return here and paste that command into Telegram.\n\n"
-                            "PA will automatically retry the mail brief after success."
-                        )
+                        # The start script now delivers the link itself (WP-G) —
+                        # no markdown link needed here, and none of send_text's
+                        # underscore/parenthesis mangling risk (memory 2026-08-15).
+                        reason = ("Google authentication expired. A reauth link was "
+                                 "sent to your Telegram. Tap it, then paste the "
+                                 "/auth ... command back.")
             except Exception as auth_err:
                 print(f"[preflight] Failed to start reauth flow: {auth_err}", file=sys.stderr)
 

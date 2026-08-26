@@ -16,6 +16,15 @@ import { logger } from './lib/log.js';
 import { notifyUser } from './lib/notify.js';
 import { getSkillTranslationPatterns } from './lib/skill-translations.js';
 import { appendUsage, extractUsageFromEvent, type UsageRecord } from './lib/usage-ledger.js';
+import {
+  TraceCollector,
+  appendTurnTrace,
+  classifyOrigin,
+  classifyOutcome,
+  parseBotResource,
+  skillFromResource,
+  type TurnTraceV1,
+} from './lib/turn-trace.js';
 
 function sanitizeCmdline(cmdline: string): string {
   return cmdline.replace(/([?&](api_key|token|password|secret)=)[^\s&]*/gi, '$1<redacted>').slice(0, 200);
@@ -147,6 +156,8 @@ export async function executeWorker(
   const agentName = options.agentName || worker.name;
   const contextId = options.contextId;
   const maxTimeoutMs = (options.timeout || DEFAULT_TIMEOUT) * 1000;
+  const runId = randomUUID();
+  const tsStartMs = Date.now();
 
   // Codex Translation Layer: Translate /skill -> $skill for pass-through commands.
   // Skill list is loaded from ~/.pa/codex-skill-translations.json (scaffolded by `pa init`)
@@ -166,6 +177,7 @@ export async function executeWorker(
       output: '',
       error: `Failed to acquire lock for resource: ${resource} after ${maxTimeoutMs / 1000}s`,
       exitCode: -1,
+      runId,
     };
   }
 
@@ -191,6 +203,7 @@ export async function executeWorker(
       output: '',
       error: `All worker slots busy after ${maxTimeoutMs / 1000}s (PA_MAX_CONCURRENT_WORKERS=${workerSlotCount()}) — dispatch queued too long`,
       exitCode: -1,
+      runId,
     };
   }
 
@@ -276,7 +289,40 @@ export async function executeWorker(
           (pidTracked || Promise.resolve()).then(() => removeWorkerPid(child.pid!)).catch(err => logger.warn('worker-exec', 'removeWorkerPid failed on done', { error: err?.message ?? String(err) }));
         }
         if (teeWriteStream) { teeWriteStream.end(); }
-        resolve({ teePath: r.teePath ?? teePath, ...r });
+        const outcome = classifyOutcome({
+          exitCode: r.exitCode,
+          cancelled: (() => { try { return options.isCancelled?.() === true; } catch { return false; } })(),
+          suppressExitAlert: options.suppressExitAlert === true,
+          error: r.error,
+        });
+        const bot = parseBotResource(options.resource);
+        const h = trace.harvest();
+        void appendTurnTrace({
+          v: 1,
+          run_id: runId,
+          ts_start: new Date(tsStartMs).toISOString(),
+          ts_end: new Date().toISOString(),
+          duration_ms: Date.now() - tsStartMs,
+          origin: classifyOrigin(options.resource),
+          ...(bot ? { chat_id: bot.chatId, thread_id: bot.threadId } : {}),
+          ...(options.updateId !== undefined ? { update_id: options.updateId } : {}),
+          ...(skillFromResource(options.resource) ? { skill: skillFromResource(options.resource) } : {}),
+          worker: worker.name,
+          ...(trace.model ? { model: trace.model } : {}),
+          ...(r.sessionId ?? capturedSessionId ? { session_id: r.sessionId ?? capturedSessionId } : {}),
+          exit_code: r.exitCode,
+          outcome,
+          parsed: trace.parsed,
+          tool_calls: h.tool_calls,
+          commands: h.commands,
+          files: h.files,
+          errors: h.errors,
+          retries: 0,
+          ...(trace.tokens ? { tokens: trace.tokens } : {}),
+          bytes_out: Buffer.byteLength(r.output ?? '', 'utf8'),
+          truncated: h.truncated,
+        } satisfies TurnTraceV1);
+        resolve({ teePath: r.teePath ?? teePath, runId, ...r });
       };
 
       let stdout = '';
@@ -288,6 +334,7 @@ export async function executeWorker(
       let agyResultSeen = false; // tracks whether an agy result event was parsed (for fallback logic)
       let capturedUsage: { tokensIn: number; tokensOut: number; tokensThinking?: number; tokensCacheRead?: number } | undefined; // tracks usage from stream events
       const isStreamJson = worker.output_format === 'stream-json';
+      const trace = new TraceCollector({ isAgyDialect: isAgyStreamWorker(worker) });
 
       const child = spawn(worker.command, args, {
         cwd: options.cwd || process.cwd(),
@@ -575,12 +622,22 @@ export async function executeWorker(
             const alerting = collectBgAlerts(bgTaskMap, now, bgAlertMs, bgRepeatMs);
             if (alerting.length > 0) {
               const lines = alerting.map(a => `  PID ${a.pid} (age ${a.ageSec}s): ${a.cmdline}`);
-              const body = `Worker: ${worker.name} (pid ${child.pid})\nResource: ${resource}\n${lines.join('\n')}`;
-              // No dedupKey — per-PID lastRepeatBucket gate is the dedup mechanism
-              bgNotify(
-                `bg-leak: ${alerting.length} long-running descendant(s) of ${worker.name} (pid ${child.pid})`,
-                body.slice(0, 3500),
-              ).catch(err => logger.warn('worker-exec', 'bgNotify failed for bg-leak alert', { error: err?.message ?? String(err) }));
+              // Log only — no Telegram (2026-08-23). 88 of the week's 548 alerts were
+              // bg-leak pages, and all 153 sampled bodies resolved to conhost.exe, pa's
+              // own worker_stdout_tee.js wrapper, the worker binary, or its in-flight
+              // tool call (npm test, a gh check-runs CI wait). Descendants ARE reaped
+              // (killWorkerTree on every exit path); the real-leak detector is bg-orphan
+              // below, which is post-exit and HAS a dedupKey — one occurrence ever.
+              // The subject embedded a PID, so its dedup could never apply, and it is
+              // not a threshold problem: CI waits legitimately exceed 30 minutes.
+              // (plans/2026-08-23-alerts-week-review.md §5.1.)
+              logger.info('worker-exec', 'bg-leak', {
+                worker: worker.name,
+                pid: child.pid,
+                resource,
+                descendants: alerting.length,
+                detail: lines.join('\n').slice(0, 3500),
+              });
             }
 
             // Check 1: process tree (idle-timer reset)
@@ -664,6 +721,7 @@ export async function executeWorker(
             if (!line.trim()) continue;
             try {
               const event = JSON.parse(line);
+              trace.observe(event);
 
               // Session ID detection
               if (event.sessionId) capturedSessionId = event.sessionId;
@@ -789,6 +847,7 @@ export async function executeWorker(
         if (isStreamJson && ndjsonBuffer.trim()) {
           try {
             const event = JSON.parse(ndjsonBuffer);
+            trace.observe(event);
             if (event.type === 'thread.started' && event.thread_id) capturedSessionId = event.thread_id;
             // Codex error events in trailing buffer (no terminating newline)
             if (event.type === 'error' && typeof event.message === 'string' && worker.name === 'codex') {

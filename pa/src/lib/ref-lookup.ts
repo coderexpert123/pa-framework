@@ -15,6 +15,7 @@ import { createReadStream, existsSync, statSync } from 'fs';
 import { createInterface } from 'readline';
 import { join } from 'path';
 import { paHome } from '../paths.js';
+import { turnTracesPath } from './turn-trace.js';
 
 const TAIL_LINES = 10_000;
 
@@ -29,6 +30,14 @@ export interface RefRecord {
   sessionId?: string;
   text?: string;
   source: 'conversation-history' | 'app-log';
+  /** Sidecar join key (2026-08-24, recall-traces wave). Populated only when the
+   * underlying record carries a run_id — normally undefined for a bot turn,
+   * whose join key is (threadId, updateId) instead (C24). Read only; no writer
+   * populates this yet. */
+  runId?: string;
+  /** Telegram update_id the archive row was written for — the bot-origin join
+   * key into ~/.pa/turn-traces.jsonl (thread_id + update_id; C24). */
+  updateId?: number;
 }
 
 interface ConversationTurnEntry {
@@ -40,6 +49,11 @@ interface ConversationTurnEntry {
   worker?: string;
   session_id?: string;
   refId?: string;
+  /** Sidecar join fields (2026-08-24). run_id is read only — no writer
+   * populates it on an archive row yet (C24); update_id is written by the bot
+   * at both archive-append call sites (WP-B). */
+  run_id?: string;
+  update_id?: number;
 }
 
 interface AppLogEntry {
@@ -106,6 +120,8 @@ async function scanConversationHistory(refId: string): Promise<RefRecord | null>
         sessionId: entry.session_id,
         text: entry.text,
         source: 'conversation-history',
+        runId: entry.run_id,
+        updateId: entry.update_id,
       };
       foundMessageId = entry.message_id;
       foundText = entry.text;
@@ -212,6 +228,44 @@ function appLogKind(entry: AppLogEntry): RefRecord['kind'] {
     return 'system';
   }
   return 'skill_alert';
+}
+
+export interface TraceLine { run_id: string; [k: string]: unknown }
+
+/**
+ * Last matching line of ~/.pa/turn-traces.jsonl by run_id, scanning the live
+ * file's tail only (rotated shards are debug history, not a lookup surface).
+ * Returns null on any failure — this backs an interactive CLI.
+ */
+export async function lookupTrace(runId: string): Promise<TraceLine | null> {
+  return scanTraces((entry) => entry.run_id === runId);
+}
+
+/**
+ * Last matching line by the BOT-ORIGIN join key. This is the form `pa ref`
+ * actually uses for a Telegram turn: the archive row carries thread_id +
+ * update_id, never run_id (C24). Matches on BOTH fields — update_id alone is
+ * not unique across topics. Returns null on any failure.
+ */
+export async function lookupTraceByUpdate(threadId: number, updateId: number): Promise<TraceLine | null> {
+  return scanTraces((entry) => entry.thread_id === threadId && entry.update_id === updateId);
+}
+
+async function scanTraces(pred: (entry: TraceLine) => boolean): Promise<TraceLine | null> {
+  try {
+    const path = turnTracesPath();
+    if (!existsSync(path)) return null;
+    const lines = await tailLines(path, TAIL_LINES, 400);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      let entry: TraceLine;
+      try { entry = JSON.parse(lines[i]); } catch { continue; }
+      if (typeof entry !== 'object' || entry === null) continue;
+      if (pred(entry)) return entry;
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 /**

@@ -81,6 +81,32 @@ describe('updateJobState', () => {
   });
 });
 
+describe('lastAttemptAt (2026-08-23 alerts wave)', () => {
+  it('round-trips through updateJobState/readLedger', async () => {
+    const iso = new Date().toISOString();
+    await updateJobState('y', (p) => ({ ...p, lastAttemptAt: iso }));
+    const ledger = await readLedger();
+    assert.equal(ledger.jobs['y'].lastAttemptAt, iso);
+  });
+
+  it('a ledger row written before this change (no lastAttemptAt) reads back as undefined without throwing', async () => {
+    const legacyRow = {
+      firstSeenAt: new Date().toISOString(),
+      lastRunAt: new Date().toISOString(),
+      lastOutcome: 'ran',
+      consecutiveFailures: 0,
+      consecutiveSkips: 0,
+    };
+    await writeFile(
+      maintenanceStatePath(),
+      JSON.stringify({ version: 1, jobs: { 'legacy-job': legacyRow } }),
+      'utf8',
+    );
+    const ledger = await readLedger();
+    assert.equal(ledger.jobs['legacy-job'].lastAttemptAt, undefined);
+  });
+});
+
 describe('migrateLastLearnState', () => {
   it('migrates a legacy last-learn.json into the ledger and deletes the file', async () => {
     const legacyPath = join(process.env.PA_HOME!, 'last-learn.json');

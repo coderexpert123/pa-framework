@@ -1,12 +1,16 @@
+import './test-env-guard.js';
+
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFile, mkdir } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { createTempPaHome, createTempSecrets, cleanup } from './helpers.js';
-import { executeWorker } from '../src/workers.js';
-import type { WorkerConfig, RunOptions } from '../src/types.js';
+import { executeWorker, collectBgAlerts } from '../src/workers.js';
+import type { BgEntry } from '../src/workers.js';
+import type { WorkerConfig, RunOptions, CommandResult } from '../src/types.js';
 import { getDescendantPids, getCommandLines, areProcessesAlive } from '../src/process-tree.js';
+import { logger } from '../src/lib/log.js';
 
 let tempDir: string;
 let scriptDir: string;
@@ -57,13 +61,13 @@ async function runWithBgHooks(
     fakeAreAlive?: Record<number, boolean>;
     heartbeatIntervalMs?: number;
   }
-): Promise<string[]> {
+): Promise<{ notified: string[]; result: CommandResult }> {
   const notified: string[] = [];
   const { fakeDescendants = [], fakeAreAlive = {}, heartbeatIntervalMs = 30, ...opts } = overrides;
 
   const worker = makeWorker({ args: [scriptPath] });
 
-  await executeWorker(worker, '', {
+  const result = await executeWorker(worker, '', {
     timeout: 10,
     resource: uniqueResource(), // unique per-test to avoid blackboard lock collisions
     bgTasksConfig: { alert_seconds: 0, alert_repeat_seconds: 1 },
@@ -88,71 +92,69 @@ async function runWithBgHooks(
     ...opts,
   });
 
-  return notified;
+  return { notified, result };
 }
 
 describe('BG-task tracking: age alert', () => {
-  it('fires alert when descendant age exceeds alert_seconds', async () => {
+  it('does NOT send a Telegram bg-leak alert when descendant age exceeds alert_seconds (logged only, 2026-08-23)', async () => {
     // Worker runs briefly; fake descendant always present
     const script = await writeScript('quick.js', 'setTimeout(() => process.stdout.write("done"), 1500);');
-    const notified = await runWithBgHooks(script, { fakeDescendants: [99991] });
+    const { notified, result } = await runWithBgHooks(script, { fakeDescendants: [99991] });
 
-    assert.ok(notified.some(s => s.startsWith('bg-leak:')), `Expected bg-leak alert, got: ${JSON.stringify(notified)}`);
+    assert.ok(!notified.some(s => s.startsWith('bg-leak:')), `Expected no bg-leak Telegram alert, got: ${JSON.stringify(notified)}`);
+    assert.ok(result.output.includes('done'), 'worker run should still complete normally');
   });
 
-  it('lastRepeatBucket gate blocks re-alert within same repeat bucket', async () => {
-    // alert_repeat_seconds=60 — first bucket is [0, 60s). The child runs far
-    // below the bucket width (2s vs 60s), so every heartbeat during its life
-    // is deterministically still bucket 0 — the exact `=== 1` assert below
-    // isn't sensitive to CI/system-load timing jitter the way a tight
-    // 300ms-child/10s-bucket margin was.
-    const script = await writeScript('medium.js', 'setTimeout(() => process.stdout.write("done"), 2000);');
-    const notified: string[] = [];
-    const worker = makeWorker({ args: [script] });
+  it('lastRepeatBucket gate blocks re-alert within same repeat bucket', () => {
+    // Re-pointed at collectBgAlerts directly (2026-08-23): bg-leak Telegram
+    // alerts are gone (worker-exec.ts logs only now, see worker-exec.ts:576),
+    // so the bucket-gating behaviour is verified against collectBgAlerts'
+    // return value, not a notifyUser call count. alert_repeat_seconds=60 —
+    // first bucket is [0, 60s). The simulated run stays far below the bucket
+    // width (2s vs 60s), so every heartbeat during its life is
+    // deterministically still bucket 0.
+    const bgTaskMap = new Map<number, BgEntry>([
+      [99992, { firstSeen: 0, cmdline: 'sleep', lastRepeatBucket: -1 }],
+    ]);
+    const repeatMs = 60_000;
+    let totalAlerts = 0;
+    // Simulate ~20 heartbeats across a 2000ms run (100ms apart), same margin
+    // as the original executeWorker-based test.
+    for (let now = 100; now <= 2000; now += 100) {
+      totalAlerts += collectBgAlerts(bgTaskMap, now, 0, repeatMs).length;
+    }
 
-    await executeWorker(worker, '', {
-      timeout: 10,
-      resource: uniqueResource(),
-      bgTasksConfig: { alert_seconds: 0, alert_repeat_seconds: 60 },
-      _bgTaskHooks: {
-        heartbeatIntervalMs: 100, // fires multiple times in 2000ms
-        getDescendantPids: async () => [{ pid: 99992, parentPid: 0 }],
-        getCommandLines: async (pids) => new Map(pids.map(p => [p, 'sleep'])),
-        areProcessesAlive: async (pids) => new Map(pids.map(p => [p, false])),
-        notifyUser: async (subject) => { notified.push(subject); return { sent: true, suppressed: false }; },
-      },
-    });
-
-    const leakAlerts = notified.filter(s => s.startsWith('bg-leak:'));
     // Multiple heartbeats within bucket 0 → exactly 1 alert
-    assert.equal(leakAlerts.length, 1, `Expected 1 alert within same bucket, got ${leakAlerts.length}`);
+    assert.equal(totalAlerts, 1, `Expected 1 alert within same bucket, got ${totalAlerts}`);
   });
 
-  it('lastRepeatBucket: -1 ensures first bucket-0 crossing fires', async () => {
-    const script = await writeScript('fast.js', 'setTimeout(() => process.stdout.write("done"), 1500);');
-    const notified = await runWithBgHooks(script, { fakeDescendants: [99993] });
+  it('lastRepeatBucket: -1 ensures first bucket-0 crossing fires', () => {
+    // Re-pointed at collectBgAlerts directly (2026-08-23) — see note above.
+    const bgTaskMap = new Map<number, BgEntry>([
+      [99993, { firstSeen: 0, cmdline: 'sleep', lastRepeatBucket: -1 }],
+    ]);
 
     // With alert_seconds=0 and repeat_seconds=1, age=0 → bucket=0, 0 > -1 → fires
-    assert.ok(notified.some(s => s.startsWith('bg-leak:')), 'First bucket-0 crossing should fire');
+    const alerting = collectBgAlerts(bgTaskMap, 1, 0, 1000);
+    assert.equal(alerting.length, 1, 'First bucket-0 crossing should fire');
+    assert.equal(alerting[0].pid, 99993);
   });
 
-  it('multi-descendant: 10 PIDs crossing threshold → exactly 1 notifyUser per heartbeat', async () => {
+  it('multi-descendant: 10 PIDs crossing threshold → still no Telegram bg-leak alert, run completes', async () => {
     const fakePids = Array.from({ length: 10 }, (_, i) => 90000 + i);
     const script = await writeScript('multi.js', 'setTimeout(() => process.stdout.write("done"), 1500);');
-    const notified = await runWithBgHooks(script, { fakeDescendants: fakePids });
+    const { notified, result } = await runWithBgHooks(script, { fakeDescendants: fakePids });
 
-    // All 10 PIDs cross the threshold in the same heartbeat → 1 batched alert
-    const leakAlerts = notified.filter(s => s.startsWith('bg-leak:'));
-    assert.ok(leakAlerts.length >= 1, 'Expected at least 1 batched alert');
-    assert.ok(leakAlerts[0].includes('10 long-running'), `Alert subject should mention count: ${leakAlerts[0]}`);
+    assert.ok(!notified.some(s => s.startsWith('bg-leak:')), `Expected no bg-leak Telegram alert, got: ${JSON.stringify(notified)}`);
+    assert.ok(result.output.includes('done'), 'worker run should still complete normally');
   });
 
-  it('alert subject includes worker name and pid', async () => {
+  it('does NOT send a Telegram bg-leak alert (worker name/pid case), run completes', async () => {
     const script = await writeScript('name.js', 'setTimeout(() => process.stdout.write("done"), 1500);');
-    const notified = await runWithBgHooks(script, { fakeDescendants: [99994], heartbeatIntervalMs: 100 });
-    const leakAlert = notified.find(s => s.startsWith('bg-leak:'));
-    assert.ok(leakAlert, 'Expected a bg-leak alert');
-    assert.ok(leakAlert.includes('worker-under-test'), `Alert should include worker name: ${leakAlert}`);
+    const { notified, result } = await runWithBgHooks(script, { fakeDescendants: [99994], heartbeatIntervalMs: 100 });
+
+    assert.ok(!notified.some(s => s.startsWith('bg-leak:')), `Expected no bg-leak Telegram alert, got: ${JSON.stringify(notified)}`);
+    assert.ok(result.output.includes('done'), 'worker run should still complete normally');
   });
 });
 
@@ -286,31 +288,49 @@ describe('BG-task tracking: no descendants', () => {
   });
 });
 
+// bg-leak alerts are logged only now (2026-08-23, notify removed at
+// worker-exec.ts:576 — see spec correction #7) — the notifier is gone, so
+// these tests spy on logger.info (the replacement code path) instead of the
+// removed notifyUser hook to verify the sanitizer still redacts secrets.
+function spyOnLoggerInfo(): { logged: Array<{ module: string; message: string; ctx?: Record<string, unknown> }>; restore: () => void } {
+  const original = logger.info;
+  const logged: Array<{ module: string; message: string; ctx?: Record<string, unknown> }> = [];
+  logger.info = (module: string, message: string, ctx?: Record<string, unknown>) => {
+    logged.push({ module, message, ctx });
+  };
+  return { logged, restore: () => { logger.info = original; } };
+}
+
 describe('cmdline sanitizer', () => {
   it('strips api_key, token, password, secret from query strings', async () => {
     const script = await writeScript('sanitize.js', 'setTimeout(() => process.stdout.write("done"), 1500);');
-    const bodies: string[] = [];
     const worker = makeWorker({ args: [script] });
+    const spy = spyOnLoggerInfo();
 
-    await executeWorker(worker, '', {
-      timeout: 5,
-      resource: uniqueResource(),
-      bgTasksConfig: { alert_seconds: 0, alert_repeat_seconds: 1 },
-      _bgTaskHooks: {
-        heartbeatIntervalMs: 30,
-        getDescendantPids: async () => [{ pid: 77771, parentPid: 0 }],
-        getCommandLines: async () => new Map([
-          [77771, 'curl https://api.example.com?api_key=SECRET123&other=value'],
-        ]),
-        areProcessesAlive: async () => new Map([[77771, false]]),
-        notifyUser: async (_subject, body) => { bodies.push(body); return { sent: true, suppressed: false }; },
-      },
-    });
+    try {
+      await executeWorker(worker, '', {
+        timeout: 5,
+        resource: uniqueResource(),
+        bgTasksConfig: { alert_seconds: 0, alert_repeat_seconds: 1 },
+        _bgTaskHooks: {
+          heartbeatIntervalMs: 30,
+          getDescendantPids: async () => [{ pid: 77771, parentPid: 0 }],
+          getCommandLines: async () => new Map([
+            [77771, 'curl https://api.example.com?api_key=SECRET123&other=value'],
+          ]),
+          areProcessesAlive: async () => new Map([[77771, false]]),
+        },
+      });
+    } finally {
+      spy.restore();
+    }
 
-    const leakBody = bodies.find(b => b.includes('77771'));
-    assert.ok(leakBody, 'Expected alert body with PID 77771');
-    assert.ok(!leakBody.includes('SECRET123'), 'api_key value should be redacted');
-    assert.ok(leakBody.includes('<redacted>'), 'Should contain <redacted>');
+    const bgLeakLog = spy.logged.find(l => l.module === 'worker-exec' && l.message === 'bg-leak');
+    assert.ok(bgLeakLog, 'Expected a bg-leak log entry');
+    const detail = String(bgLeakLog?.ctx?.detail ?? '');
+    assert.ok(detail.includes('77771'), 'Expected log detail with PID 77771');
+    assert.ok(!detail.includes('SECRET123'), 'api_key value should be redacted');
+    assert.ok(detail.includes('<redacted>'), 'Should contain <redacted>');
   });
 
   it('sanitizes token, password, and secret params', async () => {
@@ -327,25 +347,29 @@ describe('cmdline sanitizer', () => {
     ];
 
     for (const cmdline of paramTests) {
-      const bodies: string[] = [];
       const script = await writeScript(`san-${paramTests.indexOf(cmdline)}.js`, 'setTimeout(() => process.stdout.write("done"), 1500);');
       const worker = makeWorker({ args: [script] });
+      const spy = spyOnLoggerInfo();
 
-      await executeWorker(worker, '', {
-        timeout: 5,
-        resource: uniqueResource(),
-        bgTasksConfig: { alert_seconds: 0, alert_repeat_seconds: 1 },
-        _bgTaskHooks: {
-          heartbeatIntervalMs: 30,
-          getDescendantPids: async () => [{ pid: 77772, parentPid: 0 }],
-          getCommandLines: async () => new Map([[77772, cmdline]]),
-          areProcessesAlive: async () => new Map([[77772, false]]),
-          notifyUser: async (_s, body) => { bodies.push(body); return { sent: true, suppressed: false }; },
-        },
-      });
+      try {
+        await executeWorker(worker, '', {
+          timeout: 5,
+          resource: uniqueResource(),
+          bgTasksConfig: { alert_seconds: 0, alert_repeat_seconds: 1 },
+          _bgTaskHooks: {
+            heartbeatIntervalMs: 30,
+            getDescendantPids: async () => [{ pid: 77772, parentPid: 0 }],
+            getCommandLines: async () => new Map([[77772, cmdline]]),
+            areProcessesAlive: async () => new Map([[77772, false]]),
+          },
+        });
+      } finally {
+        spy.restore();
+      }
 
-      const leakBody = bodies.find(b => b.includes('77772'));
-      assert.ok(!leakBody?.includes('abc123'), `"abc123" should be redacted in cmdline: ${cmdline}`);
+      const bgLeakLog = spy.logged.find(l => l.module === 'worker-exec' && l.message === 'bg-leak');
+      const detail = String(bgLeakLog?.ctx?.detail ?? '');
+      assert.ok(!detail.includes('abc123'), `"abc123" should be redacted in cmdline: ${cmdline}`);
     }
   });
 });
@@ -462,10 +486,13 @@ describe('process-tree helpers: areProcessesAlive', () => {
 // against actual OS process tree. Total runtime ~35s (test 1: 15s, test 2: 18s, test 3: ~2s).
 // concurrency:false avoids PA_HOME race (outer beforeEach writes process.env.PA_HOME each test).
 describe('BG-task tracking: real process integration', { concurrency: false }, () => {
-  it('fires bg-leak alert when real descendant outlives alert_seconds threshold', async () => {
+  it('logs a bg-leak entry (no Telegram) when real descendant outlives alert_seconds threshold', async () => {
     // Worker spawns a real node subprocess and keeps it alive for 15s.
-    // alert_seconds=2, heartbeat=1000ms: alert should fire well within the 15s window
-    // even if WMI takes 3-4s to register the child under system load.
+    // alert_seconds=2, heartbeat=1000ms: the log entry should appear well
+    // within the 15s window even if WMI takes 3-4s to register the child
+    // under system load. bg-leak alerts are logged only now (2026-08-23,
+    // notify removed at worker-exec.ts:576) — spy on logger.info (the
+    // replacement code path) instead of the removed notifyUser hook.
     await createTempSecrets(tempDir, '');
     const workerScript = await writeScript('real-leak-worker.js', `
 const { spawn } = require('child_process');
@@ -476,27 +503,31 @@ const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 30000)'], {
 setTimeout(() => { child.kill(); process.exit(0); }, 15000);
 `);
 
-    const notified: string[] = [];
     const worker = makeWorker({ args: [workerScript] });
+    const spy = spyOnLoggerInfo();
 
-    await executeWorker(worker, '', {
-      timeout: 25,
-      resource: uniqueResource(),
-      bgTasksConfig: { alert_seconds: 2, alert_repeat_seconds: 60 },
-      _bgTaskHooks: {
-        heartbeatIntervalMs: 1000,
-        notifyUser: async (subject) => { notified.push(subject); return { sent: true, suppressed: false }; },
-      },
-    });
+    try {
+      await executeWorker(worker, '', {
+        timeout: 25,
+        resource: uniqueResource(),
+        bgTasksConfig: { alert_seconds: 2, alert_repeat_seconds: 60 },
+        _bgTaskHooks: {
+          heartbeatIntervalMs: 1000,
+        },
+      });
+    } finally {
+      spy.restore();
+    }
 
-    const leakAlerts = notified.filter(s => s.startsWith('bg-leak:'));
-    assert.ok(leakAlerts.length >= 1, `Expected bg-leak alert from real process tree, got: ${JSON.stringify(notified)}`);
-    assert.ok(leakAlerts[0].includes('worker-under-test'), `Alert subject should include worker name: ${leakAlerts[0]}`);
+    const leakLogs = spy.logged.filter(l => l.module === 'worker-exec' && l.message === 'bg-leak');
+    assert.ok(leakLogs.length >= 1, `Expected a bg-leak log entry from real process tree, got: ${JSON.stringify(spy.logged)}`);
+    assert.equal(leakLogs[0].ctx?.worker, 'worker-under-test', `Log entry should include worker name: ${JSON.stringify(leakLogs[0])}`);
   });
 
-  it('fires repeat bg-leak alert when descendant persists past alert_repeat_seconds', async () => {
-    // Worker keeps child alive for 18s; alert_seconds=2, repeat=4 → first alert ~2s in,
-    // second alert ~6s in. Long window tolerates WMI latency under system load.
+  it('logs a repeat bg-leak entry (no Telegram) when descendant persists past alert_repeat_seconds', async () => {
+    // Worker keeps child alive for 18s; alert_seconds=2, repeat=4 → first
+    // log entry ~2s in, second ~6s in. Long window tolerates WMI latency
+    // under system load. Re-pointed at logger.info — see note above.
     await createTempSecrets(tempDir, '');
     const workerScript = await writeScript('real-repeat-worker.js', `
 const { spawn } = require('child_process');
@@ -507,21 +538,24 @@ const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 30000)'], {
 setTimeout(() => { child.kill(); process.exit(0); }, 18000);
 `);
 
-    const notified: string[] = [];
     const worker = makeWorker({ args: [workerScript] });
+    const spy = spyOnLoggerInfo();
 
-    await executeWorker(worker, '', {
-      timeout: 30,
-      resource: uniqueResource(),
-      bgTasksConfig: { alert_seconds: 2, alert_repeat_seconds: 4 },
-      _bgTaskHooks: {
-        heartbeatIntervalMs: 1000,
-        notifyUser: async (subject) => { notified.push(subject); return { sent: true, suppressed: false }; },
-      },
-    });
+    try {
+      await executeWorker(worker, '', {
+        timeout: 30,
+        resource: uniqueResource(),
+        bgTasksConfig: { alert_seconds: 2, alert_repeat_seconds: 4 },
+        _bgTaskHooks: {
+          heartbeatIntervalMs: 1000,
+        },
+      });
+    } finally {
+      spy.restore();
+    }
 
-    const leakAlerts = notified.filter(s => s.startsWith('bg-leak:'));
-    assert.ok(leakAlerts.length >= 2, `Expected at least 2 bg-leak alerts (initial + repeat), got ${leakAlerts.length}: ${JSON.stringify(notified)}`);
+    const leakLogs = spy.logged.filter(l => l.module === 'worker-exec' && l.message === 'bg-leak');
+    assert.ok(leakLogs.length >= 2, `Expected at least 2 bg-leak log entries (initial + repeat), got ${leakLogs.length}: ${JSON.stringify(spy.logged)}`);
   });
 
   it('fires bg-orphan alert when descendant survives worker exit', async () => {

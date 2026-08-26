@@ -2,13 +2,15 @@
 Orchestrator for daily mail brief.
 
 Runs all fetch/send/pdf/obsidian steps as Python code.
-Calls gemini CLI only for LLM analysis (text-in, text-out, no tool use).
+Calls an LLM CLI (agy by default; legacy gemini via DAILY_MAIL_BRIEF_LLM=gemini)
+only for LLM analysis (text-in, text-out, no tool use).
 """
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone, timedelta
 
@@ -17,8 +19,16 @@ from runtime_state import read_failure_marker, write_failure_marker, write_last_
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 
-# Env-driven gemini binary path. Default to plain "gemini" (in PATH).
-# User with a wrapper/shim sets GEMINI_CMD in ~/.pa/secrets.env.
+# Antigravity CLI (agy) — the successor to the sunset gemini CLI. This script was
+# the ONLY production caller still shelling the legacy binary after AI-131 retired
+# it for the worker fleet on 2026-08-08; its Code-Assist licence died on
+# 2026-08-19 and the brief did not deliver for four days
+# (plans/2026-08-23-alerts-week-review.md §2.2).
+AGY_CMD = os.environ.get("AGY_CMD", "D:/gemini-shim/agy.cmd")
+AGY_MODEL = os.environ.get("DAILY_MAIL_BRIEF_MODEL", "gemini-3.7-flash-high")
+AGY_PRINT_TIMEOUT = os.environ.get("DAILY_MAIL_BRIEF_PRINT_TIMEOUT", "10m")
+# Legacy escape hatch: DAILY_MAIL_BRIEF_LLM=gemini restores the pre-2026-08-23 path.
+DAILY_MAIL_BRIEF_LLM = os.environ.get("DAILY_MAIL_BRIEF_LLM", "agy")
 GEMINI_CMD = os.environ.get("GEMINI_CMD", "gemini")
 
 
@@ -62,12 +72,79 @@ def run_py(script, *args, check=True):
     return result
 
 
-def call_gemini(prompt: str) -> str:
+def build_agy_command(prompt_path: str) -> list:
+    """agy argv for a one-shot text completion.
+
+    The prompt is passed as an @-file reference, never inline: ~/.pa/config.yaml's
+    agy worker block pins `-p '{prompt}'` and worker-exec.ts substitutes
+    '@<tempfile>' (worker-exec.ts:231) precisely because a briefing prompt with
+    email headers blows past the ~32 KB Windows command-line cap. agy resolves
+    the @-reference client-side, verified from %TEMP% on 2026-07-21.
+
+    --output-format text probe-confirmed 2026-08-23 (WP-F step 2c): a bounded
+    "reply with the single word OK" call through this exact flag pair printed
+    plain text containing OK, so the pair is kept.
+    """
+    return ["cmd", "/c", AGY_CMD,
+            "--dangerously-skip-permissions",
+            "--model", AGY_MODEL,
+            "--print-timeout", AGY_PRINT_TIMEOUT,
+            "--output-format", "text",
+            "-p", f"@{prompt_path}"]
+
+
+def call_llm(prompt: str) -> str:
+    """Call the configured LLM CLI and return cleaned response text.
+
+    Default path shells agy via a temp-file @-reference (see build_agy_command),
+    since the prompt can carry email headers well past the ~32 KB Windows
+    command-line cap. DAILY_MAIL_BRIEF_LLM=gemini restores the pre-2026-08-23
+    legacy stdin-pipe path (_call_gemini_legacy) as an escape hatch.
+    """
+    if DAILY_MAIL_BRIEF_LLM == "gemini":
+        return _call_gemini_legacy(prompt)
+
+    prompt_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".txt", delete=False, encoding="utf-8", newline="\n"
+        ) as f:
+            f.write(prompt)
+            prompt_path = f.name
+        result = subprocess.run(
+            build_agy_command(prompt_path),
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            cwd=PROJECT_ROOT,
+        )
+    finally:
+        if prompt_path:
+            try:
+                os.unlink(prompt_path)
+            except OSError:
+                pass
+
+    if result.returncode != 0:
+        raise RuntimeError(f"agy exited {result.returncode}: {result.stderr[:300]}")
+
+    # Strip session hook noise a CLI may append after the real response
+    # (harmless and cheap to keep checking for on this path too).
+    output = result.stdout
+    noise_marker = "Created execution plan for SessionEnd:"
+    if noise_marker in output:
+        output = output[:output.index(noise_marker)]
+    return output.strip()
+
+
+def _call_gemini_legacy(prompt: str) -> str:
     """Call gemini CLI non-interactively via stdin pipe, return cleaned response text.
 
     Uses -p '' to trigger non-interactive mode; full prompt is sent via stdin
     (gemini appends stdin to the -p value), avoiding the Windows 32KB arg limit.
     Session hook noise is stripped from the output.
+
+    Legacy path (2026-08-23): the primary path now shells agy instead — see
+    call_llm / build_agy_command. Kept unchanged as the DAILY_MAIL_BRIEF_LLM=gemini
+    escape hatch.
     """
     result = subprocess.run(
         ["cmd", "/c", GEMINI_CMD, "--yolo", "--output-format", "text", "-p", ""],
@@ -88,23 +165,26 @@ def call_gemini(prompt: str) -> str:
     return output.strip()
 
 
-# Signatures of non-transient Gemini CLI credential failures. A 10s retry cannot
+# Signatures of non-transient LLM CLI (agy or legacy gemini) credential failures.
+# A 10s retry cannot
 # fix these: the 2026-08-19..21 license invalidation burned both attempts on
 # every scheduled run because the retry loop treated a dead license as a
 # transient blip. Matched case-insensitively against the raised error text.
-GEMINI_AUTH_FAILURE_SIGNATURES = (
+LLM_AUTH_FAILURE_SIGNATURES = (
     "error authenticating",  # "Error authenticating: _GaxiosError: You do not have a valid license..."
     "valid license",
     "invalid_grant",         # OAuth refresh token rejected
     "unauthenticated",       # API-level credential rejection
+    "individual quota reached",  # agy quota exhaustion (project_worker_fleet_state memory)
 )
 
 
-def is_gemini_auth_failure(error_text: str) -> bool:
-    """True when a gemini CLI error indicates a credential/license failure
-    (non-transient), so callers fail fast instead of retrying."""
+def is_llm_auth_failure(error_text: str) -> bool:
+    """True when an LLM CLI (agy or legacy gemini) error indicates a
+    credential/license/quota failure (non-transient), so callers fail fast
+    instead of retrying."""
     lowered = (error_text or "").lower()
-    return any(signature in lowered for signature in GEMINI_AUTH_FAILURE_SIGNATURES)
+    return any(signature in lowered for signature in LLM_AUTH_FAILURE_SIGNATURES)
 
 
 PORTFOLIO_JSON_DIR = os.path.normpath(
@@ -229,9 +309,9 @@ def load_portfolio_context() -> str:
 
 
 def detect_portfolio_statement_emails(emails: list) -> list:
-    """Ask Gemini to identify emails that are personal account/portfolio statements.
+    """Ask the LLM to identify emails that are personal account/portfolio statements.
 
-    Returns a list of email IDs that Gemini classifies as personal statements.
+    Returns a list of email IDs that the LLM classifies as personal statements.
     Falls back to [] on any error (conservative: don't trigger if uncertain).
     """
     if not emails:
@@ -276,7 +356,7 @@ def detect_portfolio_statement_emails(emails: list) -> list:
             f"Emails:\n{email_text}"
         )
 
-        response = call_gemini(prompt)
+        response = call_llm(prompt)
         # Try parsing the full response as JSON first.
         # A top-level dict (e.g. {"ids": [...]}) is treated as unrecognised — return [].
         # A top-level list is the expected response format.
@@ -470,7 +550,14 @@ def main():
             f"Reason: {reason[:400]}\n"
             f"Re-auth: run `python ~/.pa/reauth_google.py`",
         )
-        return
+        # A bare `return` here made preflight failures look like `status: success`
+        # to the scheduler — latestSuccess kept advancing, so staleness/cadence
+        # detectors stayed quiet and the self-improver's failure analyzer (which
+        # reads only `.meta status:error`) could not see the 2026-08-19..21
+        # four-day outage (review §2.2). Exit code 2, not 1, distinguishes
+        # "blocked on a human-gated auth failure" from a generic step failure —
+        # matching preflight.py's own sys.exit(2).
+        sys.exit(2)
 
     # Step 2: Fetch email headers; state is advanced only after a successful primary delivery.
     r = run_py("fetch_headers.py", check=False)
@@ -503,19 +590,20 @@ def main():
         print(f"No emails in window: {window}")
         return
 
-    # Step 3: Call gemini for triage + briefing composition (1 retry on failure)
+    # Step 3: Call the LLM for triage + briefing composition (1 retry on failure)
     emails_text = format_emails_for_prompt(emails)
     portfolio_context = load_portfolio_context()
     prompt = build_prompt(window, total_count, emails_text, portfolio_context)
 
-    def fail_gemini(reason: str, auth_failure: bool = False) -> None:
-        status = "gemini-auth" if auth_failure else "gemini"
-        body = f"Mail brief failed — Gemini error.\nWindow: {window}\nError: {reason[:300]}\n\n"
+    def fail_llm(reason: str, auth_failure: bool = False) -> None:
+        status = "llm-auth" if auth_failure else "llm"
+        body = f"Mail brief failed — LLM error.\nWindow: {window}\nError: {reason[:300]}\n\n"
         if auth_failure:
             body += (
                 "This failure is not transient — catchup retries will keep failing until "
-                "the Gemini CLI credential/license is fixed. Re-authenticate the Gemini CLI "
-                "(GEMINI_CMD) or restore its license, then re-run `pa run daily-mail-brief`."
+                "the LLM credential/license/quota is fixed. Re-authenticate agy (AGY_CMD) or "
+                "restore its license/quota (legacy path: GEMINI_CMD via "
+                "DAILY_MAIL_BRIEF_LLM=gemini), then re-run `pa run daily-mail-brief`."
             )
         else:
             body += "State not advanced — next catchup will retry."
@@ -523,48 +611,48 @@ def main():
         _notify_failure(status, body)
         sys.exit(1)
 
-    print(f"[run_brief] Calling gemini for {total_count} emails in {window}...")
+    print(f"[run_brief] Calling LLM for {total_count} emails in {window}...")
     response = None
     current_prompt = prompt
     for attempt in range(2):
         try:
-            candidate = call_gemini(current_prompt)
+            candidate = call_llm(current_prompt)
         except Exception as e:
-            if is_gemini_auth_failure(str(e)):
+            if is_llm_auth_failure(str(e)):
                 # Credential/license failures are non-transient: the second
                 # attempt re-fails identically (2026-08-19..21 license
-                # incident), so fail fast with the actionable gemini-auth alert.
-                print(f"[ERROR] Gemini auth/license failure — not retrying: {e}", file=sys.stderr)
-                fail_gemini(str(e), auth_failure=True)
+                # incident), so fail fast with the actionable llm-auth alert.
+                print(f"[ERROR] LLM auth/license failure — not retrying: {e}", file=sys.stderr)
+                fail_llm(str(e), auth_failure=True)
             if attempt == 0:
-                print(f"[WARN] Gemini attempt 1 failed, retrying in 10s: {e}", file=sys.stderr)
+                print(f"[WARN] LLM attempt 1 failed, retrying in 10s: {e}", file=sys.stderr)
                 time.sleep(10)
                 continue
-            print(f"[ERROR] Gemini call failed after 2 attempts: {e}", file=sys.stderr)
-            fail_gemini(str(e))
+            print(f"[ERROR] LLM call failed after 2 attempts: {e}", file=sys.stderr)
+            fail_llm(str(e))
 
         if "===BRIEFING_START===" in candidate and "===BRIEFING_END===" in candidate:
             response = candidate
             break
 
-        # No markers: Gemini didn't return a real briefing (e.g. it went agentic
+        # No markers: the LLM didn't return a real briefing (e.g. it went agentic
         # and replied with meta-commentary like "saved to output.json" instead of
         # the requested text). Retry once rather than silently fabricating an
         # assert header that would bypass send_telegram.py's hallucination check.
         if attempt == 0:
             current_prompt = build_marker_retry_prompt(prompt)
-            print("[WARN] Gemini attempt 1 returned no BRIEFING markers, retrying in 10s", file=sys.stderr)
+            print("[WARN] LLM attempt 1 returned no BRIEFING markers, retrying in 10s", file=sys.stderr)
             time.sleep(10)
         else:
-            print("[ERROR] Gemini returned no BRIEFING markers after 2 attempts", file=sys.stderr)
-            fail_gemini(f"Response missing BRIEFING markers. Raw response: {candidate[:300]}")
+            print("[ERROR] LLM returned no BRIEFING markers after 2 attempts", file=sys.stderr)
+            fail_llm(f"Response missing BRIEFING markers. Raw response: {candidate[:300]}")
     if response is None:
-        print("[ERROR] Gemini returned no response.", file=sys.stderr)
+        print("[ERROR] LLM returned no response.", file=sys.stderr)
         sys.exit(1)
 
     window_end_dt = parse_window_end(window_end_utc_str)
 
-    # Step 4: Parse gemini output (markers guaranteed present at this point)
+    # Step 4: Parse LLM output (markers guaranteed present at this point)
     b_start = response.index("===BRIEFING_START===") + len("===BRIEFING_START===")
     b_end = response.index("===BRIEFING_END===")
     briefing_output = response[b_start:b_end].strip()
@@ -578,7 +666,7 @@ def main():
         # Extraction between markers was empty or malformed — don't fabricate an
         # assert header, that's exactly what let a hallucinated response through
         # send_telegram.py's count check last time.
-        fail_gemini(f"Malformed briefing content between markers: {briefing_output[:300] or '<empty>'}")
+        fail_llm(f"Malformed briefing content between markers: {briefing_output[:300] or '<empty>'}")
 
     # Step 5: Write output files
     briefing_path = os.path.join(PROJECT_ROOT, "briefing_output.md")
