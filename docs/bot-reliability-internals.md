@@ -49,7 +49,8 @@ dispatches; the shim's `worker_stdout_tee.js` mirrors stdout to
 `~/.pa/logs/worker-tee/<contextId>.out`, which survives a bot-only kill because the shim
 chain outlives the bot; the reaper's tee-fallback branch waits for the orphan then
 harvests the file — `extractTeeResult` handles NDJSON `type:'result'` events AND
-plain-text) — or sends a death notice;
+plain-text) — or auto-requeues the request through the normal dispatch pipeline (past
+the ladder cap, a neutral notice);
 recovered replies are dedup-guarded via the same delivered-store. Tee files are GC'd
 after 24h by the declared `worker-tee-gc` job (AI-100). The poll loop's
 stop-sentinel watcher (main.ts) aborts a slow proxied `getUpdates` so graceful shutdown
@@ -86,17 +87,36 @@ stays prompt.
    placeholder at the same key. `isAcceptableUpdate(update, allowedChatIds)` is the
    single shared predicate both the enqueue-time write and `processUpdate`'s own guard
    call, so they can't drift.
-2. *No gate during active recovery* — `recovery-gate.ts` (new module,
-   `markTopicRecovering`/`clearTopicRecovering`/`isTopicRecovering`, mirrors
-   `worker-stop.ts`'s module-level-state pattern) is owned entirely by
-   `orphan-reaper.ts`: marks every topic with a pending record at reap start, clears a
-   topic **per-round** (once a full pass confirms none of that topic's records are still
-   `waiting` — not per-individual-record, which would prematurely unmark a topic with a
-   sibling record still pending) and via a `finally` backstop on every exit path.
-   `processUpdate` checks `!skipWorker && isTopicRecovering(topicKey)` immediately
-   before dispatch — `!skipWorker` is load-bearing: a skip-worker command (`/reset`,
-   `/model`, etc.) to a recovering topic must still execute, not get swallowed by the
-   deferral notice.
+2. *Gate during active recovery — QUEUE, never bounce (2026-08-27 seamless-restart-recovery
+   wave; supersedes the 2026-07-08 deferral-notice behavior)* — `recovery-gate.ts`
+   (`markTopicRecovering`/`clearTopicRecovering`/`isTopicRecovering`/`waitForTopicRecovery`)
+   is owned entirely by `orphan-reaper.ts`: marks every topic with a pending record at reap
+   start, clears a topic **per-round** and via a `finally` backstop. `processUpdate` no
+   longer deflects a follow-up with a "please resend" notice — it WAITS on
+   `waitForTopicRecovery` (waiter registry, typing pulse, `PA_RECOVERY_WAIT_MS` default
+   50 min > the reaper's 45-min window) inside the already-held topic lock, then dispatches
+   normally. `!skipWorker` gating is load-bearing and unchanged: a command (`/reset`,
+   `/model`, `/stop`) on a recovering topic executes immediately. A timed-out wait (stale
+   gate, reaper gone) logs and proceeds. **Recovered replies ride the SAME pipeline as
+   normal replies** — `formatWorkerReply` (logic.ts; thought-strip, noise-strip,
+   `normalizeMarkdown`, `redactSecrets`) with no "Recovered reply" prefix; restart
+   narration is banned from every user-visible string. **Exhausted recovery auto-requeues**
+   instead of death-noticing: `requeueSyntheticUpdate` (main.ts) injects the original
+   request as a synthetic update reusing the original `update_id` (delivered-store keys
+   align; offset comes from the real batch only), so the full normal path re-dispatches it.
+   The requeue is a durable ladder — a failed requeued dispatch below `PA_REQUEUE_MAX`
+   (default 2) parks (`requeueNotBefore`, `PA_REQUEUE_BACKOFF_MS` default 15 min) and the
+   `requeue-drain` maintenance job re-injects when due; a /stop during the window cancels
+   the parked record. Three hard rules: the "retrying automatically" status line goes
+   OUT-OF-BAND (raw `sendMessage` + `appendRefIdAndLog`) — a reply-path send would
+   `markDelivered` the key and the retry's REAL reply would be dedup-skipped at
+   main.ts's reply block; a requeued record must NEVER be `finish()`ed by the reaper
+   (`markDelivered` would silently drop the synthetic's reply — settle via
+   `updatePendingDispatch` only); parked records return the NEW outcome `'parked'`
+   (skipped entirely, never `'waiting'` — the drain owns them, so the topic's gate clears
+   and the drain's synthetic is never wedged behind it). Voice placeholders carrying
+   `voiceFileId` are re-downloaded and re-transcribed through the arrival pipeline instead
+   of noticed.
 
 ## /stop -> executor cancellation (AI-092; voice-prefetch + flush semantics 2026-08-15)
 

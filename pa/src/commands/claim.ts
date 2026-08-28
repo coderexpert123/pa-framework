@@ -2,11 +2,21 @@ import { randomBytes } from 'crypto';
 import { spawn } from 'child_process';
 import { join } from 'path';
 import fs from 'fs-extra';
-import { claim, release, renew, readActive } from '../lib/reservations.js';
+import { claim, release, renew, readActive, type ReleaseOptions } from '../lib/reservations.js';
 import { resolveRepoRoot } from '../lib/git-root.js';
+import { parsePorcelainPaths } from '../lib/git-status.js';
+import { paHome } from '../paths.js';
 
 const RECENT_WINDOW_MS = 15 * 60 * 1000;
 const POLL_INTERVAL_MS = 5000;
+
+const CLAIM_USAGE =
+  'Usage: pa claim <path...> --session <label> --note "<what you are doing>" [--ttl <minutes>] [--force] [--wait <seconds>]\n' +
+  '       pa claim --renew <id> [--ttl <minutes>]';
+
+const RELEASE_USAGE = 'Usage: pa release <id> [--session <label>] [--force]';
+
+const CLAIMS_USAGE = 'Usage: pa claims [--stats [--days N] [--json]]';
 
 interface ParsedClaimArgs {
   paths: string[];
@@ -16,6 +26,8 @@ interface ParsedClaimArgs {
   force: boolean;
   waitSeconds?: number;
   renewId?: string;
+  help: boolean;
+  unknownFlags: string[];
 }
 
 function parseClaimArgs(args: string[]): ParsedClaimArgs {
@@ -26,6 +38,8 @@ function parseClaimArgs(args: string[]): ParsedClaimArgs {
   let force = false;
   let waitSeconds: number | undefined;
   let renewId: string | undefined;
+  let help = false;
+  const unknownFlags: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -35,10 +49,22 @@ function parseClaimArgs(args: string[]): ParsedClaimArgs {
     if (arg === '--force') { force = true; continue; }
     if (arg === '--wait') { waitSeconds = Number(args[++i]); continue; }
     if (arg === '--renew') { renewId = args[++i]; continue; }
+    if (arg === '--help' || arg === '-h') { help = true; continue; }
+    if (arg.startsWith('-')) { unknownFlags.push(arg); continue; }
     paths.push(arg);
   }
 
-  return { paths, session: session ?? process.env.PA_SESSION, note, ttlMinutes, force, waitSeconds, renewId };
+  return {
+    paths,
+    session: session ?? process.env.PA_SESSION,
+    note,
+    ttlMinutes,
+    force,
+    waitSeconds,
+    renewId,
+    help,
+    unknownFlags,
+  };
 }
 
 /**
@@ -53,6 +79,17 @@ function parseClaimArgs(args: string[]): ParsedClaimArgs {
  */
 export async function claimCommand(args: string[]): Promise<number> {
   const parsed = parseClaimArgs(args);
+
+  if (parsed.help) {
+    console.log(CLAIM_USAGE);
+    return 0;
+  }
+
+  if (parsed.unknownFlags.length > 0) {
+    console.error(CLAIM_USAGE);
+    console.error(`Unrecognized option(s): ${parsed.unknownFlags.join(', ')}`);
+    return 2;
+  }
 
   if (parsed.renewId) {
     const result = await renew(parsed.renewId, { ttlMinutes: parsed.ttlMinutes });
@@ -117,20 +154,113 @@ export async function claimCommand(args: string[]): Promise<number> {
   }
 }
 
-/** `pa release <id>` */
+interface ParsedReleaseArgs {
+  id?: string;
+  session?: string;
+  force: boolean;
+  help: boolean;
+  unknownFlags: string[];
+}
+
+function parseReleaseArgs(args: string[]): ParsedReleaseArgs {
+  let id: string | undefined;
+  let session: string | undefined;
+  let force = false;
+  let help = false;
+  const unknownFlags: string[] = [];
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--session') { session = args[++i]; continue; }
+    if (arg === '--force') { force = true; continue; }
+    if (arg === '--help' || arg === '-h') { help = true; continue; }
+    if (arg.startsWith('-')) { unknownFlags.push(arg); continue; }
+    if (id === undefined) { id = arg; continue; }
+    // extra positional args beyond the first are ignored — only args[0] was
+    // ever read as the id, unchanged from pre-existing behaviour.
+  }
+
+  return { id, session, force, help, unknownFlags };
+}
+
+/**
+ * `pa release <id> [--session <label>] [--force]`
+ *
+ * `--session` is optional (falls back to PA_SESSION). When given and it does
+ * not match the reservation's owning session, the release is refused (exit 3)
+ * unless `--force` is also given.
+ */
 export async function releaseCommand(args: string[]): Promise<number> {
-  const id = args[0];
-  if (!id) {
+  const parsed = parseReleaseArgs(args);
+
+  if (parsed.help) {
+    console.log(RELEASE_USAGE);
+    return 0;
+  }
+
+  if (parsed.unknownFlags.length > 0) {
+    console.error(RELEASE_USAGE);
+    console.error(`Unrecognized option(s): ${parsed.unknownFlags.join(', ')}`);
+    return 2;
+  }
+
+  if (!parsed.id) {
     console.error('Usage: pa release <id>');
     return 1;
   }
-  const { released } = await release({ id });
+
+  const session = parsed.session ?? process.env.PA_SESSION;
+  let releaseOpts: ReleaseOptions = { id: parsed.id };
+
+  if (session) {
+    const active = await readActive();
+    const reservation = active.find((r) => r.id === parsed.id);
+    if (reservation && reservation.session !== session) {
+      if (!parsed.force) {
+        console.error(
+          `pa release: ${parsed.id} is held by "${reservation.session}" (${reservation.note}) — pass --session ${reservation.session}, or --force to release it anyway.`
+        );
+        return 3;
+      }
+      releaseOpts = { id: parsed.id, force: true, ownerSession: reservation.session, bySession: session };
+    }
+  }
+
+  const { released } = await release(releaseOpts);
   if (released === 0) {
-    console.error(`No reservation found with id ${id}`);
+    console.error(`No reservation found with id ${parsed.id}`);
     return 1;
   }
-  console.log(`Released ${id}.`);
+  console.log(`Released ${parsed.id}.`);
   return 0;
+}
+
+interface ParsedClaimsArgs {
+  stats: boolean;
+  json: boolean;
+  days?: number;
+  help: boolean;
+  unknownFlags: string[];
+}
+
+function parseClaimsArgs(args: string[]): ParsedClaimsArgs {
+  let stats = false;
+  let json = false;
+  let days: number | undefined;
+  let help = false;
+  const unknownFlags: string[] = [];
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--stats') { stats = true; continue; }
+    if (arg === '--json') { json = true; continue; }
+    if (arg === '--days') { days = Number(args[++i]); continue; }
+    if (arg === '--help' || arg === '-h') { help = true; continue; }
+    if (arg.startsWith('-')) { unknownFlags.push(arg); continue; }
+    // non-flag positional args are silently ignored — `pa claims` takes none.
+  }
+
+  return { stats, json, days, help, unknownFlags };
 }
 
 /**
@@ -138,8 +268,36 @@ export async function releaseCommand(args: string[]): Promise<number> {
  * explicit reservations (cooperation required), and mtime-derived recent
  * activity from `git status --porcelain` (zero cooperation required, so it
  * catches the Telegram bot and any non-participating editor too).
+ *
+ * `pa claims --stats [--days N] [--json]` instead prints a rollup of
+ * reservation activity (claims/forces/denials/releases/renewals/GC-expiries)
+ * logged to app.log.jsonl over the last N days (default 7).
  */
-export async function claimsCommand(): Promise<number> {
+export async function claimsCommand(args: string[] = []): Promise<number> {
+  const parsed = parseClaimsArgs(args);
+
+  if (parsed.help) {
+    console.log(CLAIMS_USAGE);
+    return 0;
+  }
+
+  if (parsed.unknownFlags.length > 0) {
+    console.error(CLAIMS_USAGE);
+    console.error(`Unrecognized option(s): ${parsed.unknownFlags.join(', ')}`);
+    return 2;
+  }
+
+  if (parsed.stats) {
+    const days = parsed.days !== undefined && Number.isFinite(parsed.days) && parsed.days > 0 ? parsed.days : 7;
+    const stats = await coordinationStats({ days });
+    if (parsed.json) {
+      console.log(JSON.stringify(stats, null, 2));
+    } else {
+      console.log(renderCoordinationStats(stats));
+    }
+    return 0;
+  }
+
   const active = await readActive();
   console.log('Active reservations:');
   if (active.length === 0) {
@@ -174,7 +332,8 @@ export async function recentActivity(): Promise<string[]> {
   } catch {
     return []; // not inside a git repo — nothing to report, not a crash
   }
-  const changed = await gitStatusPaths(repoRoot);
+  const out = await runGitStatus(repoRoot);
+  const changed = parsePorcelainPaths(out);
   const cutoff = Date.now() - RECENT_WINDOW_MS;
   const recent: string[] = [];
   for (const rel of changed) {
@@ -188,7 +347,7 @@ export async function recentActivity(): Promise<string[]> {
   return recent;
 }
 
-function gitStatusPaths(cwd: string): Promise<string[]> {
+function runGitStatus(cwd: string): Promise<string> {
   return new Promise((resolve) => {
     const child = spawn('git', ['status', '--porcelain'], {
       cwd,
@@ -197,15 +356,172 @@ function gitStatusPaths(cwd: string): Promise<string[]> {
     });
     let out = '';
     child.stdout?.on('data', (d: Buffer) => { out += d.toString(); });
-    child.on('close', () => {
-      const paths = out
-        .split('\n')
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0)
-        .map((line) => line.slice(3).trim())
-        .map((p) => (p.includes(' -> ') ? p.split(' -> ')[1] : p));
-      resolve(paths);
-    });
-    child.on('error', () => resolve([]));
+    child.on('close', () => resolve(out));
+    child.on('error', () => resolve(''));
   });
+}
+
+// ---- pa claims --stats ----
+
+export interface CoordinationStats {
+  days: number;
+  claims: number;
+  forced: number;
+  denied: number;
+  released: number;
+  forcedReleases: number;
+  renewed: number;
+  gcExpired: number;
+  hookWarnings: number;
+  distinctSessions: number;
+  autoSessionIds: number;
+  sessions: Array<{ session: string; claims: number }>;
+}
+
+const AUTO_SESSION_ID_RE = /^s-[0-9a-f]{6}$/;
+const ARCHIVE_LOG_RE = /-app\.log\.jsonl$/;
+
+async function listArchiveLogFiles(logDir: string): Promise<string[]> {
+  try {
+    const names = await fs.readdir(join(logDir, 'archive'));
+    return names.filter((n) => ARCHIVE_LOG_RE.test(n)).map((n) => join(logDir, 'archive', n));
+  } catch {
+    return [];
+  }
+}
+
+async function readLogLines(path: string): Promise<string[]> {
+  try {
+    const content = await fs.readFile(path, 'utf8');
+    return content.split('\n').filter((l) => l.trim().length > 0);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Rolls up `module: 'reservations'` lines from app.log.jsonl (plus rotated
+ * archive shards) over the last `days` days. Zero matching lines is not an
+ * error — the caller renders a zeroed block. Unparseable lines are skipped
+ * silently; the log is append-only and a torn line (mid-write crash) is an
+ * expected, not exceptional, condition.
+ */
+export async function coordinationStats(
+  opts?: { days?: number; now?: number; logDir?: string }
+): Promise<CoordinationStats> {
+  const days = opts?.days !== undefined && Number.isFinite(opts.days) && opts.days > 0 ? opts.days : 7;
+  const now = opts?.now ?? Date.now();
+  const windowStart = now - days * 24 * 60 * 60 * 1000;
+  const logDir = opts?.logDir ?? paHome();
+
+  const files = [join(logDir, 'app.log.jsonl'), ...(await listArchiveLogFiles(logDir))];
+
+  let claims = 0;
+  let forced = 0;
+  let denied = 0;
+  let released = 0;
+  let forcedReleases = 0;
+  let renewed = 0;
+  let gcExpired = 0;
+  let hookWarnings = 0;
+  const sessionCounts = new Map<string, number>();
+
+  for (const file of files) {
+    const lines = await readLogLines(file);
+    for (const line of lines) {
+      let entry: any;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (!entry || entry.module !== 'reservations') continue;
+      const ts = Date.parse(entry.timestamp);
+      if (!Number.isFinite(ts) || ts < windowStart || ts > now) continue;
+
+      switch (entry.message) {
+        case 'claim granted':
+          claims++;
+          if (entry.forced === true) forced++;
+          if (typeof entry.session === 'string') {
+            sessionCounts.set(entry.session, (sessionCounts.get(entry.session) ?? 0) + 1);
+          }
+          break;
+        case 'claim denied':
+          denied++;
+          break;
+        case 'reservation released':
+          released += Number(entry.releasedCount) || 0;
+          break;
+        case "forced release of another session's reservation":
+          forcedReleases++;
+          break;
+        case 'reservation renewed':
+          renewed++;
+          break;
+        case 'reservations gc-expired':
+          gcExpired += Number(entry.removed) || 0;
+          break;
+        case 'hook warning':
+          hookWarnings++;
+          break;
+        default:
+          break;
+      }
+    }
+  }
+
+  const distinctSessions = sessionCounts.size;
+  const autoSessionIds = Array.from(sessionCounts.keys()).filter((s) => AUTO_SESSION_ID_RE.test(s)).length;
+  const sessions = Array.from(sessionCounts.entries())
+    .map(([session, count]) => ({ session, claims: count }))
+    .sort((a, b) => b.claims - a.claims)
+    .slice(0, 10);
+
+  return {
+    days,
+    claims,
+    forced,
+    denied,
+    released,
+    forcedReleases,
+    renewed,
+    gcExpired,
+    hookWarnings,
+    distinctSessions,
+    autoSessionIds,
+    sessions,
+  };
+}
+
+const STATS_LABEL_COL = 21;
+
+function statsLabel(label: string): string {
+  return ('  ' + label).padEnd(STATS_LABEL_COL);
+}
+
+function renderCoordinationStats(stats: CoordinationStats): string {
+  const lines: string[] = [];
+  lines.push(`Coordination stats (last ${stats.days} days):`);
+  lines.push(statsLabel('claims granted:') + `${stats.claims}  (${stats.forced} forced)`);
+  lines.push(statsLabel('claims denied:') + `${stats.denied}`);
+  lines.push(statsLabel('released:') + `${stats.released}  (${stats.forcedReleases} forced)`);
+  lines.push(statsLabel('renewed:') + `${stats.renewed}`);
+  lines.push(statsLabel('gc-expired:') + `${stats.gcExpired}`);
+  lines.push(statsLabel('hook warnings:') + `${stats.hookWarnings}`);
+  lines.push(
+    statsLabel('session labels:') +
+      `${stats.distinctSessions} distinct, ${stats.autoSessionIds} auto-generated (s-xxxxxx)`
+  );
+  const topSessions = stats.sessions.length > 0
+    ? stats.sessions.map((s) => `${s.session}(${s.claims})`).join(', ')
+    : '(none)';
+  lines.push(statsLabel('top sessions:') + topSessions);
+
+  const hasActivity = stats.claims + stats.denied + stats.released + stats.renewed + stats.gcExpired + stats.hookWarnings > 0;
+  if (!hasActivity) {
+    lines.push('  (no reservation activity logged in this window)');
+  }
+
+  return lines.join('\n');
 }

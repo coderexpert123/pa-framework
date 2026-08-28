@@ -63,7 +63,7 @@ describe('threadIdFromResource', () => {
   });
 
   it('extracts thread ID from negative (supergroup) chat ID', () => {
-    assert.equal(threadIdFromResource('topic--1001234567890_310'), '310');
+    assert.equal(threadIdFromResource('topic--1001234567890_12345'), '12345');
   });
 
   it('handles malformed resource gracefully', () => {
@@ -79,7 +79,7 @@ describe('threadIdFromResource', () => {
 describe('agy session capture (fleet-wide since 2026-08-17)', () => {
   it('exclusion list is empty — every agy topic resumes natively', () => {
     assert.equal(AGY_NATIVE_RESUME_EXCLUDED_TOPICS.size, 0);
-    assert.ok(!AGY_NATIVE_RESUME_EXCLUDED_TOPICS.has('310'));
+    assert.ok(!AGY_NATIVE_RESUME_EXCLUDED_TOPICS.has('12345'));
     assert.ok(!AGY_NATIVE_RESUME_EXCLUDED_TOPICS.has('999'));
   });
 
@@ -131,7 +131,7 @@ describe('agy session capture integration behavior', () => {
     // Expected behavior: dispatchMessage should capture the session
     // when: worker is 'agy', result.success is true, sessionId exists,
     // the topic is NOT in the exclusion set, and session file exists
-    assert.ok(!AGY_NATIVE_RESUME_EXCLUDED_TOPICS.has('310'), '310 not excluded');
+    assert.ok(!AGY_NATIVE_RESUME_EXCLUDED_TOPICS.has('12345'), '12345 not excluded');
     assert.ok(!AGY_NATIVE_RESUME_EXCLUDED_TOPICS.has('999'), '999 not excluded');
     assert.ok(agyResult.sessionId, 'Result has sessionId');
     assert.ok(agyResult.success, 'Result is successful');
@@ -143,7 +143,7 @@ describe('agy session capture integration behavior', () => {
     // The maybeDropAgySession function in main.ts returns undefined when:
     // session.worker === 'agy', topic not excluded, shouldDrop is true
     const resumingSession = { session_id: 'abc-123', worker: 'agy', started_at: '2026-08-17T00:00:00.000Z' };
-    const resource = 'topic-999_310';
+    const resource = 'topic-999_12345';
     const shouldDrop = true;
 
     // Simulate maybeDropAgySession logic (exclusion semantics)

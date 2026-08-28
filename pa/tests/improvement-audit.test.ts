@@ -27,7 +27,7 @@ async function createTempMeta(skillName: string, meta: RunMeta, nonce = 'abc123'
 
 function makeMeta(overrides: Partial<RunMeta> = {}): RunMeta {
   return {
-    worker: 'gemini',
+    worker: 'codex',
     status: 'success',
     exitCode: 0,
     duration: 1000,

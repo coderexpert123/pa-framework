@@ -1,6 +1,13 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, writeFile, utimes, readFile } from 'fs/promises';
+import { join } from 'path';
+import { tmpdir } from 'os';
+import { exec as execCb } from 'child_process';
+import { promisify } from 'util';
 import { createTempPaHome, cleanup } from './helpers.js';
+
+const runShell = promisify(execCb);
 
 // CLI-layer tests for pa/src/commands/claim.ts — the layer pa/tests/reservations.test.ts
 // does NOT cover (that file tests lib/reservations.ts's claim()/renew()/release()/
@@ -67,5 +74,175 @@ describe('claimCommand', () => {
 
     const exitCode = await claimCommand(['pa/src/baz.ts', '--session', 'me', '--note', 'testing', '--wait', '5']);
     assert.equal(exitCode, 0, 'must succeed once the conflicting reservation is released within the wait window');
+  });
+});
+
+describe('claimCommand — flag hardening (D8)', () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await createTempPaHome();
+  });
+
+  afterEach(async () => {
+    await cleanup(dir);
+  });
+
+  it('pa claim --release x exits 2 with a usage line', async () => {
+    const { claimCommand } = await import('../src/commands/claim.js');
+    const exitCode = await claimCommand(['--release', 'x']);
+    assert.equal(exitCode, 2, '--release is not a known claim flag — must be rejected as unrecognized, not silently absorbed as a path');
+  });
+
+  it('pa claim --unknown-flag exits 2', async () => {
+    const { claimCommand } = await import('../src/commands/claim.js');
+    const exitCode = await claimCommand(['--unknown-flag']);
+    assert.equal(exitCode, 2);
+  });
+
+  it('pa claim --help exits 0', async () => {
+    const { claimCommand } = await import('../src/commands/claim.js');
+    const exitCode = await claimCommand(['--help']);
+    assert.equal(exitCode, 0);
+  });
+
+  it('a genuine no-paths call still exits 1 (unchanged existing behavior)', async () => {
+    const { claimCommand } = await import('../src/commands/claim.js');
+    const exitCode = await claimCommand(['--session', 'me', '--note', 'nothing to claim']);
+    assert.equal(exitCode, 1);
+  });
+});
+
+describe('releaseCommand — ownership hardening (D9)', () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await createTempPaHome();
+  });
+
+  afterEach(async () => {
+    await cleanup(dir);
+  });
+
+  it('pa release <id> --session <wrong> exits 3 and does not remove the reservation', async () => {
+    const { claim, readActive } = await import('../src/lib/reservations.js');
+    const { releaseCommand } = await import('../src/commands/claim.js');
+
+    const result = await claim({ paths: ['pa/src/owned-a.ts'], session: 'owner-session', note: 'work' });
+    assert.equal(result.ok, true);
+
+    const exitCode = await releaseCommand([result.reservation!.id, '--session', 'wrong-session']);
+    assert.equal(exitCode, 3);
+
+    const active = await readActive();
+    assert.equal(active.length, 1, 'reservation must still be present after a rejected release');
+    assert.equal(active[0].id, result.reservation!.id);
+  });
+
+  it('pa release <id> --session <wrong> --force exits 0, removes it, and logs a forced-release warn', async () => {
+    const { claim, readActive } = await import('../src/lib/reservations.js');
+    const { releaseCommand } = await import('../src/commands/claim.js');
+    const { flushLog } = await import('../src/lib/log.js');
+
+    const result = await claim({ paths: ['pa/src/owned-b.ts'], session: 'owner-session', note: 'work' });
+    assert.equal(result.ok, true);
+
+    const exitCode = await releaseCommand([result.reservation!.id, '--session', 'wrong-session', '--force']);
+    assert.equal(exitCode, 0);
+
+    const active = await readActive();
+    assert.equal(active.length, 0, 'reservation must be removed on a forced release');
+
+    await flushLog();
+    const content = await readFile(join(dir, 'app.log.jsonl'), 'utf8');
+    const lines = content.split('\n').filter((l) => l.trim().length > 0).map((l) => JSON.parse(l));
+    const forcedEntry = lines.find((l) => l.message === "forced release of another session's reservation");
+    assert.ok(forcedEntry, 'expected a forced-release warn logged to app.log.jsonl');
+    assert.equal(forcedEntry.level, 'warn');
+    assert.equal(forcedEntry.owner, 'owner-session');
+    assert.equal(forcedEntry.releasedBy, 'wrong-session');
+  });
+
+  it('pa release <id> with no --session still works (backward compatible)', async () => {
+    const { claim, readActive } = await import('../src/lib/reservations.js');
+    const { releaseCommand } = await import('../src/commands/claim.js');
+
+    const result = await claim({ paths: ['pa/src/owned-c.ts'], session: 'owner-session', note: 'work' });
+    assert.equal(result.ok, true);
+
+    const exitCode = await releaseCommand([result.reservation!.id]);
+    assert.equal(exitCode, 0);
+
+    const active = await readActive();
+    assert.equal(active.length, 0);
+  });
+
+  it('pa release --unknown-flag exits 2', async () => {
+    const { releaseCommand } = await import('../src/commands/claim.js');
+    const exitCode = await releaseCommand(['--unknown-flag']);
+    assert.equal(exitCode, 2);
+  });
+});
+
+// recentActivity() is claim.ts's own porcelain-parsing call site — the ONE that
+// had the C1 bug (trim-before-slice dropped every ' M path' line's first
+// character, so fs.stat threw and the caller silently skipped it). These tests
+// run against a REAL temp git repo, not a stubbed parser, because that is the
+// only way to prove the bug is actually gone rather than just re-testing the
+// (already-correct) shared parser in isolation (C18).
+describe('recentActivity — real git repo instrument (C18)', () => {
+  let dir: string;
+  let repo: string;
+  let originalCwd: string;
+
+  const git = async (cmd: string): Promise<{ stdout: string; stderr: string }> => {
+    const { stdout, stderr } = await runShell(cmd, { cwd: repo });
+    return { stdout: String(stdout), stderr: String(stderr) };
+  };
+
+  beforeEach(async () => {
+    dir = await createTempPaHome();
+    repo = await mkdtemp(join(tmpdir(), 'pa-recent-activity-repo-'));
+    originalCwd = process.cwd();
+
+    await git('git init -q');
+    await git('git config user.email pa-test@example.com');
+    await git('git config user.name "pa test"');
+    await git('git config commit.gpgsign false');
+
+    await writeFile(join(repo, 'tracked.md'), 'original\n', 'utf8');
+    await git('git add -A');
+    await git('git commit -q -m base');
+  });
+
+  afterEach(async () => {
+    process.chdir(originalCwd);
+    await cleanup(dir);
+    await rm(repo, { recursive: true, force: true }).catch(() => {});
+  });
+
+  it('sees an unstaged edit in a real temp git repo — the C1 regression test', async () => {
+    const { recentActivity } = await import('../src/commands/claim.js');
+    await writeFile(join(repo, 'tracked.md'), 'edited, unstaged\n', 'utf8');
+
+    process.chdir(repo);
+    const recent = await recentActivity();
+
+    assert.ok(
+      recent.includes('tracked.md'),
+      `expected 'tracked.md' (full filename, not the C1-truncated 'racked.md') in ${JSON.stringify(recent)}`
+    );
+  });
+
+  it('ignores a file older than the 15-minute window', async () => {
+    const { recentActivity } = await import('../src/commands/claim.js');
+    await writeFile(join(repo, 'tracked.md'), 'edited, unstaged\n', 'utf8');
+    const old = new Date(Date.now() - 20 * 60_000);
+    await utimes(join(repo, 'tracked.md'), old, old);
+
+    process.chdir(repo);
+    const recent = await recentActivity();
+
+    assert.ok(!recent.includes('tracked.md'), `expected 'tracked.md' to be excluded as stale, got ${JSON.stringify(recent)}`);
   });
 });

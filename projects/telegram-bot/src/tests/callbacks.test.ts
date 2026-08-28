@@ -1,0 +1,1312 @@
+import { describe, it, beforeEach, afterEach } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, mkdir, writeFile, rm } from 'fs/promises';
+import { existsSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
+import {
+  parseCallbackData,
+  gateFor,
+  buildConfirmKeyboard,
+  buildControlCardKeyboard,
+  buildAgentPickerKeyboard,
+  buildValuePickerKeyboard,
+  buildFailoverKeyboard,
+  buildRunNowKeyboard,
+  buildReminderKeyboard,
+  buildResendKeyboard,
+  buildDlqReplayKeyboard,
+  syntheticTextFor,
+  buildSyntheticUpdate,
+  nextSyntheticUpdateId,
+  handleCallbackQuery,
+  handleMessageReaction,
+  rememberConfirmMessage,
+  currentCardKeyboard,
+  _setSpawnForTest,
+  _restoreSpawnForTest,
+  type CallbackDeps,
+  type ParsedCallback,
+} from '../callbacks.js';
+import { editMessageText } from '../telegram.js';
+import { _resetResendStoreForTest, putResend } from '../resend-store.js';
+import type { CallbackQuery, ConversationState, MessageReactionUpdated, TelegramUser } from '../types.js';
+
+// ---------------------------------------------------------------------------
+// parseCallbackData — one valid example per §3.2 row, plus the invalid list.
+// ---------------------------------------------------------------------------
+
+describe('parseCallbackData — valid examples (one per §3.2 row)', () => {
+  it('reauth:google (no skill)', () => {
+    const p = parseCallbackData('reauth:google');
+    assert.deepEqual(p, { prefix: 'reauth', provider: 'google', skill: undefined, raw: 'reauth:google' });
+  });
+
+  it('reauth:google:<skill>', () => {
+    const p = parseCallbackData('reauth:google:daily-mail-brief');
+    assert.equal(p?.prefix, 'reauth');
+    assert.equal((p as any).skill, 'daily-mail-brief');
+  });
+
+  it('cf:y / cf:n', () => {
+    assert.deepEqual(parseCallbackData('cf:y'), { prefix: 'cf', answer: 'y', raw: 'cf:y' });
+    assert.deepEqual(parseCallbackData('cf:n'), { prefix: 'cf', answer: 'n', raw: 'cf:n' });
+  });
+
+  it('cc:menu (and the other 7 simple cc actions)', () => {
+    for (const action of ['menu', 'agent', 'model', 'effort', 'back', 'new', 'stop', 'ka']) {
+      const p = parseCallbackData(`cc:${action}`);
+      assert.deepEqual(p, { prefix: 'cc', action, raw: `cc:${action}` });
+    }
+  });
+
+  it('cc:set:agent|model|effort:<value>', () => {
+    assert.deepEqual(parseCallbackData('cc:set:agent:agy'), { prefix: 'cc', action: 'set', setting: 'agent', value: 'agy', raw: 'cc:set:agent:agy' });
+    assert.deepEqual(parseCallbackData('cc:set:model:opus'), { prefix: 'cc', action: 'set', setting: 'model', value: 'opus', raw: 'cc:set:model:opus' });
+    assert.deepEqual(parseCallbackData('cc:set:effort:high'), { prefix: 'cc', action: 'set', setting: 'effort', value: 'high', raw: 'cc:set:effort:high' });
+  });
+
+  it('wf:retry / wf:switch:<worker> / wf:revert:<worker>', () => {
+    assert.deepEqual(parseCallbackData('wf:retry'), { prefix: 'wf', action: 'retry', raw: 'wf:retry' });
+    assert.deepEqual(parseCallbackData('wf:switch:agy'), { prefix: 'wf', action: 'switch', worker: 'agy', raw: 'wf:switch:agy' });
+    assert.deepEqual(parseCallbackData('wf:revert:claude'), { prefix: 'wf', action: 'revert', worker: 'claude', raw: 'wf:revert:claude' });
+  });
+
+  it('pm:<auditId>:approve|reject|diff — including a colon-bearing ISO timestamp id', () => {
+    // Regression case: main.ts's old inline regex (`[^:]+`) could never match an id
+    // containing a colon, even though real audit ids are ISO timestamps
+    // (buildHITLKeyboard's own doc example is '2026-08-18T00:00:00Z'). This parser
+    // resolves it correctly via greedy-with-backtrack against the fixed action suffix.
+    const p = parseCallbackData('pm:2026-08-18T00:00:00Z:approve');
+    assert.deepEqual(p, { prefix: 'pm', auditId: '2026-08-18T00:00:00Z', action: 'approve', raw: 'pm:2026-08-18T00:00:00Z:approve' });
+  });
+
+  it('dr:<name>:approve|reject|show', () => {
+    assert.deepEqual(parseCallbackData('dr:my-draft:show'), { prefix: 'dr', draft: 'my-draft', action: 'show', raw: 'dr:my-draft:show' });
+  });
+
+  it('sk:run:<skill>[:c] / sk:job:<job>[:c]', () => {
+    assert.deepEqual(parseCallbackData('sk:run:daily-mail-brief'), { prefix: 'sk', kind: 'run', name: 'daily-mail-brief', confirmed: false, raw: 'sk:run:daily-mail-brief' });
+    assert.deepEqual(parseCallbackData('sk:job:dlq-flush:c'), { prefix: 'sk', kind: 'job', name: 'dlq-flush', confirmed: true, raw: 'sk:job:dlq-flush:c' });
+  });
+
+  it('rm:done / rm:1h / rm:tmrw', () => {
+    assert.deepEqual(parseCallbackData('rm:done'), { prefix: 'rm', action: 'done', raw: 'rm:done' });
+    assert.deepEqual(parseCallbackData('rm:1h'), { prefix: 'rm', action: '1h', raw: 'rm:1h' });
+    assert.deepEqual(parseCallbackData('rm:tmrw'), { prefix: 'rm', action: 'tmrw', raw: 'rm:tmrw' });
+  });
+
+  it('mc:<conflictId>:a|r|x', () => {
+    const p = parseCallbackData('mc:cf-20260818120000-001:a');
+    assert.deepEqual(p, { prefix: 'mc', conflictId: 'cf-20260818120000-001', action: 'a', raw: 'mc:cf-20260818120000-001:a' });
+  });
+
+  it('rs:<chatId>:<threadId>:<updateId> — negative supergroup chat id', () => {
+    const p = parseCallbackData('rs:-1001234567890:7822:1700000000123');
+    assert.deepEqual(p, { prefix: 'rs', chatId: -1001234567890, threadId: 7822, updateId: 1700000000123, raw: 'rs:-1001234567890:7822:1700000000123' });
+  });
+
+  it('dq:replay:<index>[:c]', () => {
+    assert.deepEqual(parseCallbackData('dq:replay:3'), { prefix: 'dq', index: 3, confirmed: false, raw: 'dq:replay:3' });
+    assert.deepEqual(parseCallbackData('dq:replay:12:c'), { prefix: 'dq', index: 12, confirmed: true, raw: 'dq:replay:12:c' });
+  });
+});
+
+describe('parseCallbackData — invalid / null cases', () => {
+  it('undefined and empty string', () => {
+    assert.equal(parseCallbackData(undefined), null);
+    assert.equal(parseCallbackData(''), null);
+  });
+
+  it('reauth skill over the 50-byte cap (14 + 51 = 65 bytes)', () => {
+    assert.equal(parseCallbackData('reauth:google:' + 'a'.repeat(51)), null);
+  });
+
+  it('cf:maybe — not y or n', () => {
+    assert.equal(parseCallbackData('cf:maybe'), null);
+  });
+
+  it('cc:set:model value over the 40-byte cap', () => {
+    assert.equal(parseCallbackData('cc:set:model:' + 'x'.repeat(41)), null);
+  });
+
+  it('sk:run:push parses fine — the protected-skill refusal is in the handler, not the parser', () => {
+    assert.deepEqual(parseCallbackData('sk:run:push'), { prefix: 'sk', kind: 'run', name: 'push', confirmed: false, raw: 'sk:run:push' });
+  });
+
+  it('a bare 65-byte string with no recognised prefix', () => {
+    assert.equal(parseCallbackData('x'.repeat(65)), null);
+  });
+
+  it('pm:abc — no action segment', () => {
+    assert.equal(parseCallbackData('pm:abc'), null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// gateFor
+// ---------------------------------------------------------------------------
+
+describe('gateFor', () => {
+  const cases: Array<[string, 'chat' | 'operator']> = [
+    ['reauth:google', 'chat'],
+    ['cf:y', 'chat'],
+    ['cc:menu', 'chat'],
+    ['wf:retry', 'chat'],
+    ['rm:done', 'chat'],
+    ['pm:t1:approve', 'operator'],
+    ['dr:d1:approve', 'operator'],
+    ['sk:run:push', 'operator'],
+    ['mc:cf-1:a', 'operator'],
+    ['rs:1:0:2', 'operator'],
+    ['dq:replay:1', 'operator'],
+  ];
+  for (const [data, expected] of cases) {
+    it(`${data} -> ${expected}`, () => {
+      const parsed = parseCallbackData(data);
+      assert.ok(parsed, `expected ${data} to parse`);
+      assert.equal(gateFor(parsed!), expected);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// nextSyntheticUpdateId
+// ---------------------------------------------------------------------------
+
+describe('nextSyntheticUpdateId', () => {
+  it('is strictly increasing across 3 calls and always above any plausible Telegram update_id', () => {
+    const a = nextSyntheticUpdateId();
+    const b = nextSyntheticUpdateId();
+    const c = nextSyntheticUpdateId();
+    assert.ok(a < b, `${a} < ${b}`);
+    assert.ok(b < c, `${b} < ${c}`);
+    for (const id of [a, b, c]) assert.ok(id > 4_000_000_000, `${id} > 4e9`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildSyntheticUpdate
+// ---------------------------------------------------------------------------
+
+describe('buildSyntheticUpdate', () => {
+  it('sets __synthetic, copies chat/thread/from, and puts the text on message.text', () => {
+    const from = { id: 9, first_name: 'Op', username: 'op' };
+    const upd = buildSyntheticUpdate({
+      updateId: 4_100_000_000,
+      chatId: 555,
+      threadId: 777,
+      messageId: 42,
+      from,
+      text: 'hello',
+      via: 'button',
+    });
+    assert.equal((upd as any).__synthetic, 'button');
+    assert.equal(upd.update_id, 4_100_000_000);
+    assert.equal(upd.message?.chat.id, 555);
+    assert.equal(upd.message?.message_thread_id, 777);
+    assert.equal(upd.message?.message_id, 42);
+    assert.deepEqual(upd.message?.from, from);
+    assert.equal(upd.message?.text, 'hello');
+  });
+
+  it('via:"reaction" is carried through', () => {
+    const upd = buildSyntheticUpdate({
+      updateId: 4_100_000_001,
+      chatId: 1,
+      threadId: 0,
+      messageId: 1,
+      from: { id: 1, first_name: 'U' },
+      text: 'yes',
+      via: 'reaction',
+    });
+    assert.equal((upd as any).__synthetic, 'reaction');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// syntheticTextFor
+// ---------------------------------------------------------------------------
+
+describe('syntheticTextFor', () => {
+  it('cf:y -> yes, cf:n -> no', () => {
+    assert.equal(syntheticTextFor({ prefix: 'cf', answer: 'y', raw: 'cf:y' }), 'yes');
+    assert.equal(syntheticTextFor({ prefix: 'cf', answer: 'n', raw: 'cf:n' }), 'no');
+  });
+
+  it('cc:set:agent|model|effort synthesize the matching slash command', () => {
+    assert.equal(syntheticTextFor({ prefix: 'cc', action: 'set', setting: 'agent', value: 'agy', raw: '' }), '/agent agy');
+    assert.equal(syntheticTextFor({ prefix: 'cc', action: 'set', setting: 'model', value: 'x', raw: '' }), '/model x');
+    assert.equal(syntheticTextFor({ prefix: 'cc', action: 'set', setting: 'effort', value: 'high', raw: '' }), '/effort high');
+  });
+
+  it('cc:new -> /new, cc:stop -> /stop, cc:ka -> /keepawake', () => {
+    assert.equal(syntheticTextFor({ prefix: 'cc', action: 'new', raw: 'cc:new' }), '/new');
+    assert.equal(syntheticTextFor({ prefix: 'cc', action: 'stop', raw: 'cc:stop' }), '/stop');
+    assert.equal(syntheticTextFor({ prefix: 'cc', action: 'ka', raw: 'cc:ka' }), '/keepawake');
+  });
+
+  it('null for menu-navigation and in-process-only prefixes', () => {
+    assert.equal(syntheticTextFor({ prefix: 'cc', action: 'menu', raw: 'cc:menu' }), null);
+    assert.equal(syntheticTextFor({ prefix: 'cc', action: 'back', raw: 'cc:back' }), null);
+    assert.equal(syntheticTextFor({ prefix: 'pm', auditId: 't', action: 'approve', raw: '' }), null);
+    assert.equal(syntheticTextFor({ prefix: 'dr', draft: 'd', action: 'approve', raw: '' }), null);
+    assert.equal(syntheticTextFor({ prefix: 'sk', kind: 'run', name: 'x', confirmed: false, raw: '' }), null);
+    assert.equal(syntheticTextFor({ prefix: 'mc', conflictId: 'c', action: 'a', raw: '' }), null);
+    assert.equal(syntheticTextFor({ prefix: 'dq', index: 1, confirmed: false, raw: '' }), null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Keyboard builders — byte budget + shape
+// ---------------------------------------------------------------------------
+
+function allButtons(kb: { inline_keyboard: Array<Array<{ callback_data?: string }>> } | undefined): string[] {
+  if (!kb) return [];
+  return kb.inline_keyboard.flat().map((b) => b.callback_data).filter((d): d is string => !!d);
+}
+
+describe('keyboard builders stay within the 64-byte callback_data budget', () => {
+  it('buildConfirmKeyboard', () => {
+    for (const d of allButtons(buildConfirmKeyboard())) assert.ok(Buffer.byteLength(d) <= 64, d);
+  });
+  it('buildControlCardKeyboard', () => {
+    for (const d of allButtons(buildControlCardKeyboard())) assert.ok(Buffer.byteLength(d) <= 64, d);
+  });
+  it('buildAgentPickerKeyboard with a 16-char worker name (the cap)', () => {
+    const worker = 'w'.repeat(16);
+    for (const d of allButtons(buildAgentPickerKeyboard([worker], worker))) assert.ok(Buffer.byteLength(d) <= 64, d);
+  });
+  it('buildValuePickerKeyboard(model) with a 40-char value (the cap)', () => {
+    const value = 'v'.repeat(40);
+    for (const d of allButtons(buildValuePickerKeyboard('model', [value], value))) assert.ok(Buffer.byteLength(d) <= 64, d);
+  });
+  it('buildValuePickerKeyboard(effort) with a 16-char value (the cap)', () => {
+    const value = 'e'.repeat(16);
+    for (const d of allButtons(buildValuePickerKeyboard('effort', [value]))) assert.ok(Buffer.byteLength(d) <= 64, d);
+  });
+  it('buildFailoverKeyboard with 16-char worker names', () => {
+    const kb = buildFailoverKeyboard({ next: 'n'.repeat(16), previous: 'p'.repeat(16) });
+    for (const d of allButtons(kb)) assert.ok(Buffer.byteLength(d) <= 64, d);
+  });
+  it('buildRunNowKeyboard with a 40-char name (the cap), confirmed and unconfirmed', () => {
+    const name = 'a' + '-'.repeat(39); // 40 chars, matches SK_NAME_RE
+    for (const confirmed of [false, true]) {
+      const kb = buildRunNowKeyboard('job', name, confirmed);
+      for (const d of allButtons(kb)) assert.ok(Buffer.byteLength(d) <= 64, d);
+    }
+  });
+  it('buildReminderKeyboard', () => {
+    for (const d of allButtons(buildReminderKeyboard())) assert.ok(Buffer.byteLength(d) <= 64, d);
+  });
+  it('buildResendKeyboard with worst-case-length ids', () => {
+    const kb = buildResendKeyboard(-1001234567890123, 9999999999, 4999999999999);
+    if (kb) for (const d of allButtons(kb)) assert.ok(Buffer.byteLength(d) <= 64, d);
+  });
+  it('buildDlqReplayKeyboard with a 4-digit index (the cap), confirmed and unconfirmed', () => {
+    for (const confirmed of [false, true]) {
+      const kb = buildDlqReplayKeyboard(9999, confirmed);
+      for (const d of allButtons(kb)) assert.ok(Buffer.byteLength(d) <= 64, d);
+    }
+  });
+});
+
+describe('buildValuePickerKeyboard', () => {
+  it('drops an over-long value and always ends with a cc:back row', () => {
+    const kb = buildValuePickerKeyboard('model', ['ok', 'x'.repeat(41)], 'ok');
+    const buttons = allButtons(kb);
+    assert.ok(buttons.includes('cc:set:model:ok'));
+    assert.ok(!buttons.some((d) => d.startsWith('cc:set:model:x')), 'the over-long value must be dropped');
+    const lastRow = kb.inline_keyboard[kb.inline_keyboard.length - 1];
+    assert.equal(lastRow.length, 1);
+    assert.equal(lastRow[0].callback_data, 'cc:back');
+  });
+
+  it('lays out 1 per row for 6 or fewer values', () => {
+    const values = ['a', 'b', 'c', 'd', 'e', 'clear'];
+    const kb = buildValuePickerKeyboard('model', values);
+    const dataRows = kb.inline_keyboard.slice(0, -1);
+    assert.equal(dataRows.length, values.length);
+    for (const row of dataRows) assert.equal(row.length, 1);
+    assert.equal(kb.inline_keyboard[kb.inline_keyboard.length - 1][0].callback_data, 'cc:back');
+  });
+
+  it('lays out 2 per row once more than 6 values survive, preserving order, back row last', () => {
+    const values = ['m1', 'm2', 'm3', 'm4', 'm5', 'm6', 'm7', 'clear']; // 8 values
+    const kb = buildValuePickerKeyboard('model', values);
+    const dataRows = kb.inline_keyboard.slice(0, -1);
+    assert.equal(dataRows.length, 4); // ceil(8/2)
+    for (const row of dataRows) assert.equal(row.length, 2);
+    const flatData = dataRows.flat().map((b) => b.callback_data);
+    assert.deepEqual(flatData, values.map((v) => `cc:set:model:${v}`), 'declared order must be preserved across rows');
+    const lastRow = kb.inline_keyboard[kb.inline_keyboard.length - 1];
+    assert.equal(lastRow.length, 1);
+    assert.equal(lastRow[0].callback_data, 'cc:back');
+  });
+});
+
+describe('buildRunNowKeyboard', () => {
+  it("buildRunNowKeyboard('run', 'push', false) returns undefined — 'push' is protected", () => {
+    assert.equal(buildRunNowKeyboard('run', 'push', false), undefined);
+  });
+
+  it('a job named the same as a protected skill is NOT refused — protection only applies to kind:run', () => {
+    assert.ok(buildRunNowKeyboard('job', 'push', false) !== undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// handleCallbackQuery / handleMessageReaction — real logic against stubbed
+// network + deps. PA_HOME is a fresh temp dir per test so listSkills() (a REAL
+// pa/dist function, not a mock) sees a controlled fixture instead of the live
+// ~/.pa/skills — this drives the real producer (listSkills) rather than a hand-built
+// fixture standing in for it.
+// ---------------------------------------------------------------------------
+
+interface RecordedCall {
+  url: string;
+  body: any;
+}
+
+function stubFetch(): { calls: RecordedCall[]; restore: () => void } {
+  const saved = globalThis.fetch;
+  const calls: RecordedCall[] = [];
+  (globalThis as any).fetch = async (url: string, init?: RequestInit) => {
+    let body: any = undefined;
+    try {
+      body = init?.body ? JSON.parse(String(init.body)) : undefined;
+    } catch {
+      body = init?.body;
+    }
+    calls.push({ url, body });
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ ok: true, result: {} }),
+      json: async () => ({ ok: true, result: { message_id: 999 } }),
+    };
+  };
+  return {
+    calls,
+    restore: () => {
+      (globalThis as any).fetch = saved;
+    },
+  };
+}
+
+function makeCb(data: string | undefined, overrides: Partial<CallbackQuery> = {}): CallbackQuery {
+  const from: TelegramUser = { id: 1, first_name: 'Tester' };
+  return {
+    id: 'cbq-1',
+    from,
+    message: {
+      message_id: 100,
+      chat: { id: 555, type: 'supergroup' },
+      date: Math.floor(Date.now() / 1000),
+      text: 'card',
+      message_thread_id: 0,
+    },
+    data,
+    ...overrides,
+  };
+}
+
+function makeDeps(overrides: Partial<CallbackDeps> = {}): CallbackDeps & { injected: any[] } {
+  const injected: any[] = [];
+  const state: ConversationState = { chat_id: 555, last_update_id: 0, thread_id: 0, turns: [] };
+  const deps: CallbackDeps & { injected: any[] } = {
+    token: 'tok',
+    secrets: {},
+    runtimeEnv: process.env,
+    botCwd: process.cwd(),
+    injectUpdate: (u) => injected.push(u),
+    spawnReauthLink: () => '🔐 link',
+    loadTopicState: async () => state,
+    listWorkerNames: async () => ['agy', 'claude'],
+    observedValues: async () => [],
+    declaredValues: async () => [],
+    effectiveDefaultWorker: async () => 'agy',
+    injected,
+    ...overrides,
+  };
+  return deps;
+}
+
+describe('handleCallbackQuery', () => {
+  let fetchStub: ReturnType<typeof stubFetch>;
+
+  beforeEach(() => {
+    fetchStub = stubFetch();
+  });
+
+  afterEach(() => {
+    fetchStub.restore();
+    _restoreSpawnForTest();
+  });
+
+  it('an unparsed data string answers once and injects nothing', async () => {
+    const deps = makeDeps();
+    const outcome = await handleCallbackQuery(makeCb('not-a-real-callback!!'), deps);
+    assert.equal(outcome, 'unparsed');
+    assert.equal(deps.injected.length, 0);
+    const answerCalls = fetchStub.calls.filter((c) => c.url.includes('answerCallbackQuery'));
+    assert.equal(answerCalls.length, 1);
+    assert.equal(answerCalls[0].body.text, 'Unknown button');
+  });
+
+  it('an operator-gated callback with no PA_OPERATOR_USER_ID answers with show_alert and injects nothing', async () => {
+    const deps = makeDeps({ secrets: {} });
+    const outcome = await handleCallbackQuery(makeCb('pm:t1:approve'), deps);
+    assert.equal(outcome, 'no-operator-id');
+    assert.equal(deps.injected.length, 0);
+    const answerCalls = fetchStub.calls.filter((c) => c.url.includes('answerCallbackQuery'));
+    assert.equal(answerCalls.length, 1);
+    assert.equal(answerCalls[0].body.show_alert, true);
+  });
+
+  it('an operator-gated callback from the wrong user is refused even when PA_OPERATOR_USER_ID is set', async () => {
+    const deps = makeDeps({ secrets: { PA_OPERATOR_USER_ID: '999' } });
+    const outcome = await handleCallbackQuery(makeCb('pm:t1:approve', { from: { id: 1, first_name: 'Not-operator' } }), deps);
+    assert.equal(outcome, 'unauthorized');
+    assert.equal(deps.injected.length, 0);
+  });
+
+  it('cf:y injects exactly one update whose message.text === "yes"', async () => {
+    const deps = makeDeps();
+    const outcome = await handleCallbackQuery(makeCb('cf:y'), deps);
+    assert.equal(outcome, 'cf:y');
+    assert.equal(deps.injected.length, 1);
+    assert.equal(deps.injected[0].message.text, 'yes');
+    assert.equal((deps.injected[0] as any).__synthetic, 'button');
+  });
+
+  it('cf:n injects exactly one update whose message.text === "no"', async () => {
+    const deps = makeDeps();
+    await handleCallbackQuery(makeCb('cf:n'), deps);
+    assert.equal(deps.injected.length, 1);
+    assert.equal(deps.injected[0].message.text, 'no');
+  });
+
+  describe('cc:model / cc:effort — value picker source (declared over hardcoded default)', () => {
+    function stateWithWorker(worker: string): ConversationState {
+      return { chat_id: 555, last_update_id: 0, thread_id: 0, turns: [], preferred_worker: worker };
+    }
+
+    it('cc:model with a worker declaring 11 models shows every declared model, in declared order, 2 per row', async () => {
+      const declared = ['m1', 'm2', 'm3', 'm4', 'm5', 'm6', 'm7', 'm8', 'm9', 'm10', 'm11'];
+      const deps = makeDeps({
+        loadTopicState: async () => stateWithWorker('agy'),
+        declaredValues: async (w, s) => (w === 'agy' && s === 'model' ? declared : []),
+        observedValues: async () => [],
+      });
+      const outcome = await handleCallbackQuery(makeCb('cc:model'), deps);
+      assert.equal(outcome, 'cc:model');
+      const editCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageReplyMarkup'));
+      assert.equal(editCalls.length, 1);
+      const buttons = allButtons(editCalls[0].body.reply_markup);
+      for (const m of declared) assert.ok(buttons.includes(`cc:set:model:${m}`), `missing ${m}`);
+      assert.ok(buttons.includes('cc:set:model:clear'));
+      // declared order preserved, clear last (before the back row, which is separate)
+      const dataRows = editCalls[0].body.reply_markup.inline_keyboard.slice(0, -1);
+      const flat = dataRows.flat().map((b: any) => b.callback_data);
+      assert.deepEqual(flat, [...declared, 'clear'].map((v) => `cc:set:model:${v}`));
+      for (const row of dataRows) assert.ok(row.length <= 2, '2 per row once > 6 values');
+      const lastRow = editCalls[0].body.reply_markup.inline_keyboard.slice(-1)[0];
+      assert.equal(lastRow[0].callback_data, 'cc:back');
+    });
+
+    it('an observed value already in the declared list is not duplicated; an observed-only value appears after declared', async () => {
+      const declared = ['opus', 'sonnet'];
+      const deps = makeDeps({
+        loadTopicState: async () => stateWithWorker('claude'),
+        declaredValues: async () => declared,
+        observedValues: async () => ['Opus', 'haiku-legacy'], // case-insensitive dup of 'opus' + a novel one
+      });
+      const outcome = await handleCallbackQuery(makeCb('cc:model'), deps);
+      assert.equal(outcome, 'cc:model');
+      const editCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageReplyMarkup'));
+      const buttons = allButtons(editCalls[0].body.reply_markup).filter((d) => d.startsWith('cc:set:'));
+      assert.deepEqual(
+        buttons,
+        ['opus', 'sonnet', 'haiku-legacy', 'clear'].map((v) => `cc:set:model:${v}`),
+        'declared values first, then observed-only, deduped case-insensitively, then clear'
+      );
+    });
+
+    it('a worker with no declared values falls back to the known default + observed + clear, 1 per row', async () => {
+      const deps = makeDeps({
+        loadTopicState: async () => stateWithWorker('unknown-worker'),
+        declaredValues: async () => [],
+        observedValues: async () => ['seen-once'],
+      });
+      const outcome = await handleCallbackQuery(makeCb('cc:effort'), deps);
+      assert.equal(outcome, 'cc:effort');
+      const editCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageReplyMarkup'));
+      const buttons = allButtons(editCalls[0].body.reply_markup).filter((d) => d.startsWith('cc:set:'));
+      // 'unknown-worker' has no KNOWN_CLI_DEFAULT_EFFORTS entry either, so this is just observed + clear.
+      assert.deepEqual(buttons, ['cc:set:effort:seen-once', 'cc:set:effort:clear']);
+      const dataRows = editCalls[0].body.reply_markup.inline_keyboard.slice(0, -1);
+      for (const row of dataRows) assert.equal(row.length, 1, '6 or fewer values stay 1 per row');
+    });
+
+    it('every callback_data in the picker stays within the 64-byte budget', async () => {
+      const declared = Array.from({ length: 11 }, (_, i) => `claude-opus-4-6-thinking-variant-${i}`);
+      const deps = makeDeps({
+        loadTopicState: async () => stateWithWorker('agy'),
+        declaredValues: async () => declared,
+        observedValues: async () => [],
+      });
+      await handleCallbackQuery(makeCb('cc:model'), deps);
+      const editCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageReplyMarkup'));
+      const buttons = allButtons(editCalls[0].body.reply_markup);
+      for (const d of buttons) assert.ok(Buffer.byteLength(d) <= 64, d);
+    });
+  });
+
+  describe('sk:run:reminders — two-step confirm against a real listSkills() fixture', () => {
+    let paHome: string;
+    let savedPaHome: string | undefined;
+
+    beforeEach(async () => {
+      paHome = await mkdtemp(join(tmpdir(), 'tgbot-cb-pahome-'));
+      await mkdir(join(paHome, 'skills', 'reminders'), { recursive: true });
+      await writeFile(join(paHome, 'skills', 'reminders', 'skill.md'), 'Send reminders.', 'utf8');
+      savedPaHome = process.env.PA_HOME;
+      process.env.PA_HOME = paHome;
+    });
+
+    afterEach(async () => {
+      if (savedPaHome === undefined) delete process.env.PA_HOME;
+      else process.env.PA_HOME = savedPaHome;
+      await rm(paHome, { recursive: true, force: true });
+    });
+
+    it('first tap (unconfirmed) injects nothing and rewrites the keyboard to the confirm state', async () => {
+      const deps = makeDeps({ secrets: { PA_OPERATOR_USER_ID: '1' } });
+      const outcome = await handleCallbackQuery(makeCb('sk:run:reminders'), deps);
+      assert.equal(outcome, 'sk:run:unconfirmed');
+      assert.equal(deps.injected.length, 0);
+      const editCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageReplyMarkup'));
+      assert.equal(editCalls.length, 1);
+      assert.ok(editCalls[0].body.reply_markup, 'the confirm-state keyboard must be attached, not removed');
+      const data = editCalls[0].body.reply_markup.inline_keyboard.flat().map((b: any) => b.callback_data);
+      assert.ok(data.includes('sk:run:reminders:c'));
+    });
+
+    it('the second tap (:c) spawns exactly once and removes the keyboard', async () => {
+      const spawnCalls: Array<{ cmd: string; args: string[] }> = [];
+      _setSpawnForTest(((cmd: string, args: string[]) => {
+        spawnCalls.push({ cmd, args });
+        return { unref: () => {} } as any;
+      }) as any);
+
+      const deps = makeDeps({ secrets: { PA_OPERATOR_USER_ID: '1' } });
+      const outcome = await handleCallbackQuery(makeCb('sk:run:reminders:c'), deps);
+      assert.equal(outcome, 'sk:run:started');
+      assert.equal(spawnCalls.length, 1);
+      assert.equal(spawnCalls[0].cmd, 'pa');
+      assert.deepEqual(spawnCalls[0].args, ['run', 'reminders']);
+      const editCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageText'));
+      assert.equal(editCalls.length, 1);
+      assert.equal(editCalls[0].body.reply_markup, undefined, 'a terminal action removes the keyboard entirely');
+    });
+
+    it('a protected skill (push) is refused even when confirmed, and never spawns', async () => {
+      const spawnCalls: unknown[] = [];
+      _setSpawnForTest(((..._args: unknown[]) => {
+        spawnCalls.push(_args);
+        return { unref: () => {} } as any;
+      }) as any);
+      const deps = makeDeps({ secrets: { PA_OPERATOR_USER_ID: '1' } });
+      const outcome = await handleCallbackQuery(makeCb('sk:run:push:c'), deps);
+      assert.equal(outcome, 'sk:protected');
+      assert.equal(spawnCalls.length, 0);
+    });
+  });
+
+  describe('rs: resend', () => {
+    beforeEach(() => {
+      _resetResendStoreForTest();
+    });
+
+    it('a valid resend key injects the stored userText and removes the keyboard', async () => {
+      let paHome: string | undefined;
+      // resend-store resolves PA_HOME lazily too — reuse the ambient env if already set
+      // by an outer test, otherwise create one so putResend has somewhere durable to write.
+      const needsOwnHome = !process.env.PA_HOME;
+      let ownHome: string | undefined;
+      if (needsOwnHome) {
+        ownHome = await mkdtemp(join(tmpdir(), 'tgbot-cb-resend-'));
+        process.env.PA_HOME = ownHome;
+        _resetResendStoreForTest();
+      }
+      try {
+        await putResend({ chatId: 555, threadId: 0, updateId: 42, messageId: 10, userText: 'please retry this', storedAt: new Date().toISOString() });
+        const deps = makeDeps({ secrets: { PA_OPERATOR_USER_ID: '1' } });
+        const outcome = await handleCallbackQuery(makeCb('rs:555:0:42'), deps);
+        assert.equal(outcome, 'rs:resent');
+        assert.equal(deps.injected.length, 1);
+        assert.equal(deps.injected[0].message.text, 'please retry this');
+      } finally {
+        if (needsOwnHome) {
+          delete process.env.PA_HOME;
+          if (ownHome) await rm(ownHome, { recursive: true, force: true });
+          _resetResendStoreForTest();
+        }
+      }
+    });
+
+    it('an already-consumed / unknown resend key answers with show_alert and injects nothing', async () => {
+      const deps = makeDeps({ secrets: { PA_OPERATOR_USER_ID: '1' } });
+      const outcome = await handleCallbackQuery(makeCb('rs:1:0:999999999999'), deps);
+      assert.equal(outcome, 'rs:expired');
+      assert.equal(deps.injected.length, 0);
+    });
+
+    it('a placeholder-userText record is refused with rs:untranscribed — nothing injected, keyboard removed', async () => {
+      let paHome: string | undefined;
+      const needsOwnHome = !process.env.PA_HOME;
+      let ownHome: string | undefined;
+      if (needsOwnHome) {
+        ownHome = await mkdtemp(join(tmpdir(), 'tgbot-cb-resend-'));
+        process.env.PA_HOME = ownHome;
+        _resetResendStoreForTest();
+      }
+      try {
+        await putResend({ chatId: 556, threadId: 0, updateId: 43, messageId: 11, userText: '[Voice message]', storedAt: new Date().toISOString() });
+        const deps = makeDeps({ secrets: { PA_OPERATOR_USER_ID: '1' } });
+        const outcome = await handleCallbackQuery(makeCb('rs:556:0:43'), deps);
+        assert.equal(outcome, 'rs:untranscribed');
+        assert.equal(deps.injected.length, 0, 'nothing injected for placeholder-userText refusal');
+        const editCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageText'));
+        assert.equal(editCalls.length, 1, 'exactly one editMessageText call to remove keyboard');
+        assert.equal((editCalls[0].body as { reply_markup?: unknown }).reply_markup, undefined, 'keyboard removed (reply_markup set to undefined)');
+      } finally {
+        if (needsOwnHome) {
+          delete process.env.PA_HOME;
+          if (ownHome) await rm(ownHome, { recursive: true, force: true });
+          _resetResendStoreForTest();
+        }
+      }
+    });
+
+    it('a userTextSettled record resends its transcript normally (marker bypasses the guard)', async () => {
+      let paHome: string | undefined;
+      const needsOwnHome = !process.env.PA_HOME;
+      let ownHome: string | undefined;
+      if (needsOwnHome) {
+        ownHome = await mkdtemp(join(tmpdir(), 'tgbot-cb-resend-'));
+        process.env.PA_HOME = ownHome;
+        _resetResendStoreForTest();
+      }
+      try {
+        await putResend({ chatId: 557, threadId: 0, updateId: 44, messageId: 12, userText: '[Voice message] hello there', userTextSettled: true, storedAt: new Date().toISOString() });
+        const deps = makeDeps({ secrets: { PA_OPERATOR_USER_ID: '1' } });
+        const outcome = await handleCallbackQuery(makeCb('rs:557:0:44'), deps);
+        assert.equal(outcome, 'rs:resent', 'settled transcript resends normally (not rs:untranscribed)');
+        assert.equal(deps.injected.length, 1);
+        assert.equal(deps.injected[0].message.text, '[Voice message] hello there');
+      } finally {
+        if (needsOwnHome) {
+          delete process.env.PA_HOME;
+          if (ownHome) await rm(ownHome, { recursive: true, force: true });
+          _resetResendStoreForTest();
+        }
+      }
+    });
+  });
+
+  // bp-retry (2026-08-25): wf:retry used to always pick the topic's most-recent user
+  // turn, which can have moved on to an unrelated message by the time a stale
+  // failover card is tapped. The failover notice is sent as a reply to the message
+  // that failed (main.ts's sendMessageWithKeyboard passes the failed message_id as
+  // reply_to_message_id), so the press carries its own anchor — match on it.
+  describe('wf:retry — reply-anchored turn resolution (bp-retry)', () => {
+    function stateWithTurns(turns: ConversationState['turns']): ConversationState {
+      return { chat_id: 555, last_update_id: 0, thread_id: 0, turns };
+    }
+
+    it('reply_to_message.message_id matching an OLDER user turn injects that turn\'s text, not the newest', async () => {
+      const state = stateWithTurns([
+        { role: 'user', text: 'older message A (this failed)', timestamp: new Date().toISOString(), message_id: 10 },
+        { role: 'assistant', text: 'failover notice', timestamp: new Date().toISOString() },
+        { role: 'user', text: 'newer unrelated message B', timestamp: new Date().toISOString(), message_id: 30 },
+      ]);
+      const deps = makeDeps({ loadTopicState: async () => state });
+      const cb = makeCb('wf:retry', {
+        message: {
+          message_id: 40, // the failover notice itself
+          chat: { id: 555, type: 'supergroup' },
+          date: Math.floor(Date.now() / 1000),
+          text: 'failover card',
+          message_thread_id: 0,
+          reply_to_message: { message_id: 10, chat: { id: 555, type: 'supergroup' }, date: 0 },
+        },
+      });
+      const outcome = await handleCallbackQuery(cb, deps);
+      assert.equal(outcome, 'wf:retry');
+      assert.equal(deps.injected.length, 1);
+      assert.equal(deps.injected[0].message.text, 'older message A (this failed)');
+    });
+
+    it('no reply_to_message falls back to the newest user turn (legacy behaviour preserved)', async () => {
+      const state = stateWithTurns([
+        { role: 'user', text: 'older message A', timestamp: new Date().toISOString(), message_id: 10 },
+        { role: 'user', text: 'newest message B', timestamp: new Date().toISOString(), message_id: 30 },
+      ]);
+      const deps = makeDeps({ loadTopicState: async () => state });
+      const cb = makeCb('wf:retry', {
+        message: {
+          message_id: 40,
+          chat: { id: 555, type: 'supergroup' },
+          date: Math.floor(Date.now() / 1000),
+          text: 'failover card (legacy, no reply_to_message)',
+          message_thread_id: 0,
+        },
+      });
+      const outcome = await handleCallbackQuery(cb, deps);
+      assert.equal(outcome, 'wf:retry');
+      assert.equal(deps.injected.length, 1);
+      assert.equal(deps.injected[0].message.text, 'newest message B');
+    });
+
+    it('a reply_to_message anchor that matches no turn (aged out of the window) refuses instead of resending the wrong message', async () => {
+      const state = stateWithTurns([
+        { role: 'user', text: 'newest message B', timestamp: new Date().toISOString(), message_id: 30 },
+      ]);
+      const deps = makeDeps({ loadTopicState: async () => state });
+      const cb = makeCb('wf:retry', {
+        message: {
+          message_id: 40,
+          chat: { id: 555, type: 'supergroup' },
+          date: Math.floor(Date.now() / 1000),
+          text: 'failover card',
+          message_thread_id: 0,
+          reply_to_message: { message_id: 999, chat: { id: 555, type: 'supergroup' }, date: 0 }, // not in state.turns
+        },
+      });
+      const outcome = await handleCallbackQuery(cb, deps);
+      assert.equal(outcome, 'wf:retry:anchor-not-found');
+      assert.equal(deps.injected.length, 0, 'must NOT silently resend an unrelated turn');
+    });
+  });
+
+  // bp-retry (2026-08-25): cc:agent/cc:model/cc:effort used to terminate the worker
+  // cascade on '' when a topic had neither preferred_worker nor a hydrated
+  // model_status (fresh/never-hydrated topic, legacy state file), collapsing the
+  // picker to a single 'clear' button while typed /model showed the full declared
+  // list. Mirror the canonical cascade via the new effectiveDefaultWorker fallback.
+  describe('cc:agent / cc:model — effective-default worker fallback (bp-retry)', () => {
+    it('cc:model on a state with no preferred_worker and no model_status still shows the declared list for the effective default worker', async () => {
+      const state: ConversationState = { chat_id: 555, last_update_id: 0, thread_id: 0, turns: [] };
+      const deps = makeDeps({
+        loadTopicState: async () => state,
+        effectiveDefaultWorker: async () => 'agy',
+        declaredValues: async (w, s) => (w === 'agy' && s === 'model' ? ['m1', 'm2'] : []),
+        observedValues: async () => [],
+      });
+      const outcome = await handleCallbackQuery(makeCb('cc:model'), deps);
+      assert.equal(outcome, 'cc:model');
+      const editCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageReplyMarkup'));
+      assert.equal(editCalls.length, 1);
+      const buttons = allButtons(editCalls[0].body.reply_markup).filter((d) => d.startsWith('cc:set:'));
+      assert.deepEqual(buttons, ['cc:set:model:m1', 'cc:set:model:m2', 'cc:set:model:clear'], 'must show the declared list, not collapse to just clear');
+    });
+
+    it('cc:agent on a state with no preferred_worker and no model_status marks the effective default as current', async () => {
+      const state: ConversationState = { chat_id: 555, last_update_id: 0, thread_id: 0, turns: [] };
+      const deps = makeDeps({
+        loadTopicState: async () => state,
+        listWorkerNames: async () => ['agy', 'claude'],
+        effectiveDefaultWorker: async () => 'agy',
+      });
+      const outcome = await handleCallbackQuery(makeCb('cc:agent'), deps);
+      assert.equal(outcome, 'cc:agent');
+      const editCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageReplyMarkup'));
+      const marked = editCalls[0].body.reply_markup.inline_keyboard.flat().find((b: any) => b.text.startsWith('•'));
+      assert.equal(marked?.text, '• agy', 'the effective default worker must be marked current, not left unmarked');
+    });
+  });
+
+  // bp-retry (2026-08-25): refreshPinnedStatusCardInPlace (main.ts) is driven by a
+  // periodic cross-topic sweep and used to unconditionally rewrite the pinned card's
+  // keyboard back to the top-level menu — even mid-navigation through a cc:agent/
+  // cc:model/cc:effort submenu on the same message id. currentCardKeyboard is the
+  // accessor that lets the sweep re-apply the submenu instead, while it's fresh.
+  describe('currentCardKeyboard — submenu strand protection (bp-retry)', () => {
+    function makeCardCb(data: string, chatId: number, messageId: number): CallbackQuery {
+      return makeCb(data, {
+        message: {
+          message_id: messageId,
+          chat: { id: chatId, type: 'supergroup' },
+          date: Math.floor(Date.now() / 1000),
+          text: 'card',
+          message_thread_id: 0,
+        },
+      });
+    }
+
+    it('a recorded submenu is returned by currentCardKeyboard while fresh', async () => {
+      const chatId = 70001;
+      const messageId = 100;
+      const deps = makeDeps({ loadTopicState: async () => ({ chat_id: chatId, last_update_id: 0, thread_id: 0, turns: [], preferred_worker: 'agy' }) });
+      await handleCallbackQuery(makeCardCb('cc:model', chatId, messageId), deps);
+      const kb = currentCardKeyboard(chatId, messageId);
+      assert.ok(kb, 'submenu keyboard must be recorded');
+      const editCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageReplyMarkup'));
+      assert.deepEqual(kb, editCalls[0].body.reply_markup, 'recorded keyboard must match what was actually rendered');
+    });
+
+    it('cc:back clears the recorded submenu', async () => {
+      const chatId = 70002;
+      const messageId = 100;
+      const deps = makeDeps({ loadTopicState: async () => ({ chat_id: chatId, last_update_id: 0, thread_id: 0, turns: [], preferred_worker: 'agy' }) });
+      await handleCallbackQuery(makeCardCb('cc:model', chatId, messageId), deps);
+      assert.ok(currentCardKeyboard(chatId, messageId), 'precondition: submenu recorded');
+      await handleCallbackQuery(makeCardCb('cc:back', chatId, messageId), deps);
+      assert.equal(currentCardKeyboard(chatId, messageId), undefined, 'cc:back must clear the recorded submenu');
+    });
+
+    it('a recorded submenu older than 2 minutes is no longer returned (clock injected, no sleep)', async () => {
+      const chatId = 70003;
+      const messageId = 100;
+      const deps = makeDeps({ loadTopicState: async () => ({ chat_id: chatId, last_update_id: 0, thread_id: 0, turns: [], preferred_worker: 'agy' }) });
+      await handleCallbackQuery(makeCardCb('cc:effort', chatId, messageId), deps);
+      assert.ok(currentCardKeyboard(chatId, messageId), 'fresh: still returned right after recording (real clock)');
+      // Inject a "now" well past the 2-minute freshness window — generously margined
+      // above the actual recording instant so this can never flake on real-clock skew
+      // between capturing a timestamp and the recording call actually running.
+      const wellPastFreshWindow = Date.now() + 2 * 60 * 1000 + 5000;
+      assert.equal(currentCardKeyboard(chatId, messageId, wellPastFreshWindow), undefined, 'stale: must not be returned past the 2-minute freshness window');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Button-ack tests (2026-08-28 spec WP4)
+  // ---------------------------------------------------------------------------
+
+  describe('Button-ack — terminal branches call editMessageText with acknowledgment', () => {
+    it('cf:y calls editMessageText with "✅ Selected: Yes" and strips keyboard', async () => {
+      const deps = makeDeps();
+      const outcome = await handleCallbackQuery(makeCb('cf:y'), deps);
+      assert.equal(outcome, 'cf:y');
+      const editCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageText'));
+      assert.equal(editCalls.length, 1);
+      assert.ok(editCalls[0].body.text.includes('✅ Selected: Yes'), 'text must contain acknowledgment');
+      assert.equal(editCalls[0].body.reply_markup, undefined, 'keyboard must be stripped');
+    });
+
+    it('wf:retry calls editMessageText with "✅ Selected: Retry last message"', async () => {
+      const state = { chat_id: 555, last_update_id: 0, thread_id: 0, turns: [{ role: 'user' as const, text: 'old message', timestamp: new Date().toISOString(), message_id: 10 }] };
+      const deps = makeDeps({ loadTopicState: async () => state });
+      const cb = makeCb('wf:retry', {
+        message: {
+          message_id: 40,
+          chat: { id: 555, type: 'supergroup' },
+          date: Math.floor(Date.now() / 1000),
+          text: 'failover card',
+          message_thread_id: 0,
+          reply_to_message: { message_id: 10, chat: { id: 555, type: 'supergroup' }, date: 0 },
+        },
+      });
+      const outcome = await handleCallbackQuery(cb, deps);
+      assert.equal(outcome, 'wf:retry');
+      const editCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageText'));
+      assert.equal(editCalls.length, 1);
+      assert.ok(editCalls[0].body.text.includes('✅ Selected: Retry last message'));
+      assert.equal(editCalls[0].body.reply_markup, undefined);
+    });
+
+    it('rm:1h calls editMessageText with "✅ Selected: Snoozed 1 h"', async () => {
+      const deps = makeDeps();
+      const outcome = await handleCallbackQuery(makeCb('rm:1h', {
+        message: {
+          message_id: 12345,
+          chat: { id: -1009999999999, type: 'supergroup' },
+          date: Math.floor(Date.now() / 1000),
+          text: 'Reminder: call the clinic',
+          message_thread_id: 4242,
+        },
+      }), deps);
+      assert.equal(outcome, 'rm:1h');
+      const editCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageText'));
+      assert.equal(editCalls.length, 1);
+      assert.ok(editCalls[0].body.text.includes('✅ Selected: Snoozed 1 h'));
+      assert.equal(editCalls[0].body.reply_markup, undefined);
+    });
+
+    it('mc:a calls editMessageText with "✅ Selected: Accept"', async () => {
+      const deps = makeDeps({ secrets: { PA_OPERATOR_USER_ID: '1' } });
+      const outcome = await handleCallbackQuery(makeCb('mc:cf-20260818120000-001:a'), deps);
+      assert.equal(outcome, 'mc:a');
+      const editCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageText'));
+      assert.equal(editCalls.length, 1);
+      assert.ok(editCalls[0].body.text.includes('✅ Selected: Accept'));
+      assert.equal(editCalls[0].body.reply_markup, undefined);
+    });
+
+  });
+
+  describe('Button-ack — keyboard-swap branches do NOT call editMessageText', () => {
+    it('cc:agent submenu calls editMessageReplyMarkup with keyboard, not editMessageText', async () => {
+      const deps = makeDeps();
+      const outcome = await handleCallbackQuery(makeCb('cc:agent'), deps);
+      assert.equal(outcome, 'cc:agent');
+      const editCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageText'));
+      assert.equal(editCalls.length, 0, 'editMessageText must not be called for keyboard swap');
+      const markupCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageReplyMarkup'));
+      assert.equal(markupCalls.length, 1);
+      assert.ok(markupCalls[0].body.reply_markup, 'keyboard must be present');
+    });
+
+    it('sk unconfirmed calls editMessageReplyMarkup with keyboard, not editMessageText', async () => {
+      let paHome: string;
+      let savedPaHome: string | undefined;
+      paHome = await mkdtemp(join(tmpdir(), 'tgbot-cb-pahome-'));
+      await mkdir(join(paHome, 'skills', 'reminders'), { recursive: true });
+      await writeFile(join(paHome, 'skills', 'reminders', 'skill.md'), 'Send reminders.', 'utf8');
+      savedPaHome = process.env.PA_HOME;
+      process.env.PA_HOME = paHome;
+      try {
+        const deps = makeDeps({ secrets: { PA_OPERATOR_USER_ID: '1' } });
+        const outcome = await handleCallbackQuery(makeCb('sk:run:reminders'), deps);
+        assert.equal(outcome, 'sk:run:unconfirmed');
+        const editCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageText'));
+        assert.equal(editCalls.length, 0, 'editMessageText must not be called for keyboard swap');
+        const markupCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageReplyMarkup'));
+        assert.equal(markupCalls.length, 1);
+        assert.ok(markupCalls[0].body.reply_markup, 'keyboard must be present');
+      } finally {
+        if (savedPaHome === undefined) delete process.env.PA_HOME;
+        else process.env.PA_HOME = savedPaHome;
+        await rm(paHome, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // Removed dq:replay test - requires mocking DLQ functions which are not injected through CallbackDeps
+});
+
+// ---------------------------------------------------------------------------
+// handleMessageReaction
+// ---------------------------------------------------------------------------
+
+function makeReaction(overrides: Partial<MessageReactionUpdated> = {}): MessageReactionUpdated {
+  return {
+    chat: { id: 555, type: 'private' },
+    message_id: 10,
+    user: { id: 1, first_name: 'Tester' },
+    date: Math.floor(Date.now() / 1000),
+    old_reaction: [],
+    new_reaction: [{ type: 'emoji', emoji: '👍' }],
+    ...overrides,
+  };
+}
+
+describe('handleMessageReaction', () => {
+  it('a 👍 ADD on the pending message injects "yes"', async () => {
+    const state: ConversationState = {
+      chat_id: 555,
+      last_update_id: 0,
+      thread_id: 0,
+      turns: [],
+      pending_action: { description: 'x', proposed_at: new Date().toISOString(), message_id: 10 },
+    };
+    const fetchStub = stubFetch();
+    try {
+      const deps = makeDeps({ loadTopicState: async () => state });
+      const outcome = await handleMessageReaction(makeReaction(), deps);
+      assert.equal(outcome, 'reaction:yes');
+      assert.equal(deps.injected.length, 1);
+      assert.equal(deps.injected[0].message.text, 'yes');
+      assert.equal((deps.injected[0] as any).__synthetic, 'reaction');
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('a 👍 REMOVAL (old_reaction non-empty, new_reaction empty) injects nothing', async () => {
+    const state: ConversationState = {
+      chat_id: 555,
+      last_update_id: 0,
+      thread_id: 0,
+      turns: [],
+      pending_action: { description: 'x', proposed_at: new Date().toISOString(), message_id: 10 },
+    };
+    const deps = makeDeps({ loadTopicState: async () => state });
+    const outcome = await handleMessageReaction(makeReaction({ old_reaction: [{ type: 'emoji', emoji: '👍' }], new_reaction: [] }), deps);
+    assert.equal(outcome, 'ignored');
+    assert.equal(deps.injected.length, 0);
+  });
+
+  it('a 👍 on a DIFFERENT message id injects nothing', async () => {
+    const state: ConversationState = {
+      chat_id: 555,
+      last_update_id: 0,
+      thread_id: 0,
+      turns: [],
+      pending_action: { description: 'x', proposed_at: new Date().toISOString(), message_id: 10 },
+    };
+    const deps = makeDeps({ loadTopicState: async () => state });
+    const outcome = await handleMessageReaction(makeReaction({ message_id: 999 }), deps);
+    assert.equal(outcome, 'ignored');
+    assert.equal(deps.injected.length, 0);
+  });
+
+  it('a non-approval emoji (🎉) injects nothing', async () => {
+    const state: ConversationState = {
+      chat_id: 555,
+      last_update_id: 0,
+      thread_id: 0,
+      turns: [],
+      pending_action: { description: 'x', proposed_at: new Date().toISOString(), message_id: 10 },
+    };
+    const deps = makeDeps({ loadTopicState: async () => state });
+    const outcome = await handleMessageReaction(makeReaction({ new_reaction: [{ type: 'emoji', emoji: '🎉' }] }), deps);
+    assert.equal(outcome, 'ignored');
+    assert.equal(deps.injected.length, 0);
+  });
+
+  it('👎 add is treated as a valid rejection reaction, injecting "no"', async () => {
+    const state: ConversationState = {
+      chat_id: 555,
+      last_update_id: 0,
+      thread_id: 0,
+      turns: [],
+      pending_action: { description: 'x', proposed_at: new Date().toISOString(), message_id: 10 },
+    };
+    const deps = makeDeps({ loadTopicState: async () => state });
+    const outcome = await handleMessageReaction(makeReaction({ new_reaction: [{ type: 'emoji', emoji: '👎' }] }), deps);
+    assert.equal(outcome, 'reaction:no');
+    assert.equal(deps.injected[0].message.text, 'no');
+  });
+
+  it('resolves the thread via rememberConfirmMessage for a reaction outside thread 0', async () => {
+    rememberConfirmMessage(555, 555, 42);
+    const state: ConversationState = {
+      chat_id: 555,
+      last_update_id: 0,
+      thread_id: 42,
+      turns: [],
+      pending_action: { description: 'x', proposed_at: new Date().toISOString(), message_id: 555 },
+    };
+    const loadTopicStateCalls: Array<{ chatId: number; threadId: number }> = [];
+    const deps = makeDeps({
+      loadTopicState: async (chatId: number, threadId: number) => {
+        loadTopicStateCalls.push({ chatId, threadId });
+        return state;
+      },
+    });
+    const outcome = await handleMessageReaction(makeReaction({ message_id: 555 }), deps);
+    assert.equal(outcome, 'reaction:yes');
+    assert.equal(loadTopicStateCalls.length, 1);
+    assert.equal(loadTopicStateCalls[0].threadId, 42, 'must resolve the remembered thread, not default to 0');
+    assert.equal(deps.injected.length, 1);
+    assert.equal(deps.injected[0].message.text, 'yes');
+    assert.equal(deps.injected[0].message.message_thread_id, 42);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Decision capture (AI-164 WP-D)
+// ---------------------------------------------------------------------------
+
+describe('Decision capture — rm: buttons record judgment calls', () => {
+  let paHome: string | undefined;
+  let savedPaHome: string | undefined;
+  let Database: any;
+
+  beforeEach(async () => {
+    savedPaHome = process.env.PA_HOME;
+    paHome = await mkdtemp(join(tmpdir(), 'tgbot-decision-'));
+    process.env.PA_HOME = paHome;
+    const require = createRequire(import.meta.url);
+    // Load better-sqlite3 from pa/node_modules (relative to dist/tests/)
+    // dist/tests/ -> dist/ -> telegram-bot/ -> projects/ -> worktree root -> pa/node_modules
+    Database = require(join(fileURLToPath(import.meta.url), '../../../../../pa/node_modules/better-sqlite3'));
+  });
+
+  afterEach(async () => {
+    if (savedPaHome === undefined) delete process.env.PA_HOME;
+    else process.env.PA_HOME = savedPaHome;
+    if (paHome) await rm(paHome, { recursive: true, force: true });
+  });
+
+  function makeRmCb(action: 'done' | '1h' | 'tmrw', messageText: string): CallbackQuery {
+    return makeCb(`rm:${action}`, {
+      message: {
+        message_id: 12345,
+        chat: { id: -1009999999999, type: 'supergroup' },
+        date: Math.floor(Date.now() / 1000),
+        text: `Reminder: ${messageText}`,
+        message_thread_id: 4242,
+      },
+      from: { id: 1, first_name: 'TestUser' },
+    });
+  }
+
+  it('rm:1h press records a decision row with snoozed 1 h', async () => {
+    const fetchStub = stubFetch();
+    try {
+      const deps = makeDeps();
+      const outcome = await handleCallbackQuery(makeRmCb('1h', 'call the clinic'), deps);
+      assert.equal(outcome, 'rm:1h');
+      assert.equal(fetchStub.calls.filter((c) => c.url.includes('answerCallbackQuery')).length, 1, 'acks the press');
+
+      const dbPath = join(paHome!, 'decisions.sqlite');
+      const db = new Database(dbPath, { readonly: true });
+      const rows = db.prepare('SELECT decision_id, source, skill, decision, request_excerpt, chat_id, message_id, thread_id FROM decisions').all() as any[];
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].source, 'bot');
+      assert.equal(rows[0].skill, 'reminders');
+      assert.equal(rows[0].decision, 'snoozed 1 h');
+      assert.match(rows[0].request_excerpt, /call the clinic/);
+      assert.equal(rows[0].chat_id, -1009999999999);
+      assert.equal(rows[0].message_id, 12345);
+      assert.equal(rows[0].thread_id, 4242);
+      db.close();
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('rm:done press records a decision row with dismissed (done)', async () => {
+    const fetchStub = stubFetch();
+    try {
+      const deps = makeDeps();
+      const outcome = await handleCallbackQuery(makeRmCb('done', 'pay bill'), deps);
+      assert.equal(outcome, 'rm:done');
+      const answerCalls = fetchStub.calls.filter((c) => c.url.includes('answerCallbackQuery'));
+      assert.equal(answerCalls.length, 1);
+      assert.match(answerCalls[0].body.text, /✅ Done/);
+
+      const dbPath = join(paHome!, 'decisions.sqlite');
+      const db = new Database(dbPath, { readonly: true });
+      const rows = db.prepare('SELECT decision, request_excerpt FROM decisions').all() as any[];
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].decision, 'dismissed (done)');
+      assert.match(rows[0].request_excerpt, /pay bill/);
+      db.close();
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('rm:tmrw press records a decision row with snoozed to tomorrow', async () => {
+    const fetchStub = stubFetch();
+    try {
+      const deps = makeDeps();
+      await handleCallbackQuery(makeRmCb('tmrw', 'dentist appointment'), deps);
+
+      const dbPath = join(paHome!, 'decisions.sqlite');
+      const db = new Database(dbPath, { readonly: true });
+      const rows = db.prepare('SELECT decision FROM decisions').all() as any[];
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].decision, 'snoozed to tomorrow 09:00 IST');
+      db.close();
+    } finally {
+      fetchStub.restore();
+    }
+  });
+});
+
+describe('Decision capture — reaction updates decision rows', () => {
+  let paHome: string | undefined;
+  let savedPaHome: string | undefined;
+  let Database: any;
+  let paHomeCounter = 0;
+
+  beforeEach(async () => {
+    savedPaHome = process.env.PA_HOME;
+    paHome = await mkdtemp(join(tmpdir(), `tgbot-reaction-dec-${paHomeCounter++}-`));
+    process.env.PA_HOME = paHome;
+    const require = createRequire(import.meta.url);
+    // Load better-sqlite3 from pa/node_modules (relative to dist/tests/)
+    Database = require(join(fileURLToPath(import.meta.url), '../../../../../pa/node_modules/better-sqlite3'));
+  });
+
+  afterEach(async () => {
+    if (savedPaHome === undefined) delete process.env.PA_HOME;
+    else process.env.PA_HOME = savedPaHome;
+    if (paHome) await rm(paHome, { recursive: true, force: true });
+  });
+
+  it('👍 on a message with TWO decision rows updates both (matched=2)', async () => {
+    const fetchStub = stubFetch();
+    let db: any;
+    try {
+      const dbPath = join(paHome!, 'decisions.sqlite');
+      db = new Database(dbPath);
+      db.exec('PRAGMA journal_mode = WAL;');
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS decisions (
+          decision_id TEXT PRIMARY KEY,
+          refId TEXT,
+          session_id TEXT,
+          thread_id INTEGER,
+          source TEXT NOT NULL CHECK (source IN ('skill','bot')),
+          skill TEXT,
+          request_excerpt TEXT NOT NULL,
+          context_refs TEXT,
+          decision TEXT NOT NULL,
+          rationale TEXT NOT NULL,
+          alternatives TEXT,
+          outcome TEXT,
+          reaction TEXT,
+          chat_id INTEGER,
+          message_id INTEGER,
+          ts TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+      `);
+      const stmt = db.prepare(`
+        INSERT INTO decisions (decision_id, source, skill, request_excerpt, decision, rationale, chat_id, message_id, thread_id, ts, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      // Use makeReaction defaults: chat_id=555, message_id=10
+      stmt.run('d-test1', 'bot', 'reminders', 'test reminder 1', 'snoozed 1 h', 'test rationale', 555, 10, 4242, new Date().toISOString(), new Date().toISOString());
+      stmt.run('d-test2', 'bot', 'reminders', 'test reminder 2', 'snoozed to tomorrow', 'test rationale', 555, 10, 4242, new Date().toISOString(), new Date().toISOString());
+      db.close();
+
+      const deps = makeDeps();
+      const outcome = await handleMessageReaction(makeReaction(), deps);
+      assert.equal(outcome, 'ignored', 'no pending_action, so returns ignored');
+
+      const verifyDb = new Database(dbPath, { readonly: true });
+      const rows = verifyDb.prepare('SELECT reaction, outcome FROM decisions WHERE chat_id = ? AND message_id = ?').all(555, 10) as any[];
+      assert.equal(rows.length, 2);
+      assert.equal(rows[0].reaction, '👍');
+      assert.equal(rows[0].outcome, 'approved');
+      assert.equal(rows[1].reaction, '👍');
+      assert.equal(rows[1].outcome, 'approved');
+      verifyDb.close();
+    } finally {
+      if (db) db.close();
+      fetchStub.restore();
+    }
+  });
+
+  it('👎 on an ordinary message (no decision rows) creates no row, returns ignored', async () => {
+    const fetchStub = stubFetch();
+    try {
+      const deps = makeDeps();
+      const outcome = await handleMessageReaction(makeReaction({ new_reaction: [{ type: 'emoji', emoji: '👎' }] }), deps);
+      assert.equal(outcome, 'ignored');
+
+      // Since no decision rows exist, the DB might not exist or be empty
+      // If it exists from a previous test, it should have 0 rows for this chat/message
+      const dbPath = join(paHome!, 'decisions.sqlite');
+      const exists = existsSync(dbPath);
+      if (exists) {
+        const verifyDb = new Database(dbPath, { readonly: true });
+        const count = verifyDb.prepare('SELECT COUNT(*) as c FROM decisions').get() as { c: number };
+        verifyDb.close();
+        assert.equal(count.c, 0, 'no rows in DB (DB may exist but should be empty for this test)');
+      }
+    } finally {
+      fetchStub.restore();
+    }
+  });
+});

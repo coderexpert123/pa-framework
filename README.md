@@ -8,51 +8,16 @@ Use it to build your own personal automation: inbox triage, voice-dictated Whats
 
 ---
 
-## ⚡ Quickstart (3 Minutes)
+## ⚡ Quickstart
 
-Get your personal assistant running in three simple steps:
+From `git clone` to a running skill with Telegram delivery in about 30 minutes.
 
-### 1. Clone & Build
 ```bash
-# Clone the repository
 git clone https://github.com/coderexpert123/pa-framework.git
 cd pa-framework
-
-# Install dependencies and build core orchestrator
-cd pa && npm install && npm run build && cd ..
-
-# Install dependencies and build Telegram bot
-cd projects/telegram-bot && npm install && npm run build && cd ../..
 ```
 
-### 2. Configure Credentials & Workers
-```bash
-# Scaffold the runtime configuration directory
-mkdir -p ~/.pa
-
-# Copy turnkey environment and worker configuration templates
-cp .env.example ~/.pa/secrets.env
-cp config.example.yaml ~/.pa/config.yaml
-```
-
-Edit `~/.pa/secrets.env` with your API keys:
-- **`TELEGRAM_BOT_TOKEN`**: From [@BotFather](https://t.me/BotFather) on Telegram.
-- **`TELEGRAM_CHAT_ID`**: Your personal chat ID from [@userinfobot](https://t.me/userinfobot) (e.g. `123456789`) or group ID (`-100...`).
-- **LLM API Keys**: Provide at least one (`GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY`).
-- **`GROQ_API_KEY`** *(Recommended)*: For ultra-fast, free cloud voice transcription.
-
-### 3. Verify & Start
-```bash
-# Verify worker CLIs and skill health
-node pa/dist/bin/pa.js health
-node pa/dist/bin/pa.js workers
-
-# Sync scheduled skills with your OS scheduler (Task Scheduler / crontab)
-node pa/dist/bin/pa.js schedules sync
-
-# Launch the Telegram bot
-node pa/dist/bin/pa.js bot start
-```
+Then follow [`docs/QUICKSTART.md`](docs/QUICKSTART.md) — the one canonical setup path (build, `pa init`, secrets, workers, first skill, scheduling, bot).
 
 ---
 
@@ -78,6 +43,12 @@ node pa/dist/bin/pa.js bot start
 ### 📬 Daily Email Briefing (`projects/daily-mail-brief/`)
 - **Inbox Triage**: Authenticate via Google OAuth, fetch unseen emails, and categorize priority senders, newsletters, and receipts.
 - **AI Executive Summary**: Generates concise morning/evening digests sent directly to your Telegram topic.
+
+### 🧠 Knowledge & Self-Improvement Loops
+- **Per-Topic Memory**: Nightly distill of each Telegram conversation into its own brain (`topic-brain-distill` skill), with automatic pointer injection.
+- **Project Brains**: Enroll your projects' `CLAUDE.md` files for nightly sweeps (`update-brain` skill), keeping architecture and decisions fresh.
+- **Self-Improvement Loop**: Analyzes logs, failures, and alert census to propose and apply fixes with validation floors (`self-improver` skill).
+- See [`docs/QUICKSTART.md §13`](docs/QUICKSTART.md#13-your-assistant-has-a-brain) for the full brain system.
 
 ### 📊 Weekly Operations Digest (`pa/scripts/weekly_digest.py`)
 - **System Telemetry**: Aggregates skill run metrics, failure rates, worker cost rollups, and memory consolidation audits into an executive weekly briefing.

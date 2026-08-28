@@ -171,6 +171,6 @@ export function buildResumeArgs(session: SessionInfo): string[] {
     // Antigravity CLI uses --conversation instead of --resume
     return ['--conversation', session.session_id];
   }
-  // Both Claude and Gemini accept --resume <uuid>
+  // Claude-family CLIs take --resume <uuid>; agy takes --conversation (see below).
   return ['--resume', session.session_id];
 }

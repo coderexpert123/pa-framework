@@ -1,3 +1,5 @@
+import './test-env-guard.js';
+
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile, mkdir } from 'fs/promises';

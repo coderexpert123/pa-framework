@@ -175,9 +175,12 @@ export const DEFAULT_ARCHIVE_RETENTION: Required<ArchiveRetention> = {
  * "Permanent Archive" / "Deep Context Retrieval" instructs agents to scan them
  * for context beyond the rolling 20-turn window) and must never be deleted;
  * this also protects manually-parked files like TROUBLESHOOTING.md's
- * `conv-YYYY-MM-DD.jsonl`.
+ * `conv-YYYY-MM-DD.jsonl`. Rotated turn-traces.jsonl shards (AI-161,
+ * 2026-08-24) are DERIVED — rebuildable from nothing, a debugging aid rather
+ * than a record of user content — so they prune at 90 days like the other
+ * entries here, unlike the permanent conversation-history shards.
  */
-export const PRUNABLE_ARCHIVE_SUFFIXES = ['-app.log.jsonl', '-telegram-bot.log'];
+export const PRUNABLE_ARCHIVE_SUFFIXES = ['-app.log.jsonl', '-telegram-bot.log', '-turn-traces.jsonl'];
 
 function isPrunableArchiveFile(name: string): boolean {
   return PRUNABLE_ARCHIVE_SUFFIXES.some((s) => name.endsWith(s));
