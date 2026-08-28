@@ -1,3 +1,5 @@
+import './test-env-guard.js';
+
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFile, mkdir, rm } from 'fs/promises';
@@ -9,7 +11,7 @@ import type { WorkerConfig } from '../src/types.js';
 
 // Fixture data from scratch/agy-stream-json-fixtures.jsonl (inlined to avoid gitignore dependency)
 const AGY_FIXTURE_RUN1 = [
-  '{"event":"init","conversation_id":"9b2b429c-9579-47e9-8c95-477e4a0cbebb","init":{"model":"gemini-3.7-flash-low","cwd":"D:/repo","tools":["ask_permission","ask_question","browser_click_element","browser_drag_pixel_to_pixel","browser_get_dom","browser_get_network_request","browser_input","browser_list_network_requests","browser_mouse_down","browser_mouse_up","browser_move_mouse","browser_press_key","browser_refresh_page","browser_resize_window","browser_scroll","browser_scroll_dom","browser_select_option","browser_subagent","call_mcp_tool","capture_browser_console_logs","capture_browser_screenshot","click_browser_pixel","command_status","define_subagent","delete_knowledge","execute_browser_javascript","find_by_name","finish","generate_image","grep_search","invoke_subagent","list_browser_pages","list_dir","list_permissions","list_resources","manage_inbox","manage_subagents","manage_task","multi_replace_file_content","notebook_edit","notebook_execution","open_browser_url","read_browser_page","read_resource","read_url_content","replace_file_content","run_command","schedule","search_web","sed_file_content","send_command_input","send_message","view_file","wait","wait_5_seconds","write_to_file"],"permission_mode":"always-proceed"}}',
+  '{"event":"init","conversation_id":"9b2b429c-9579-47e9-8c95-477e4a0cbebb","init":{"model":"gemini-3.7-flash-low","cwd":"C:/work/repo","tools":["ask_permission","ask_question","browser_click_element","browser_drag_pixel_to_pixel","browser_get_dom","browser_get_network_request","browser_input","browser_list_network_requests","browser_mouse_down","browser_mouse_up","browser_move_mouse","browser_press_key","browser_refresh_page","browser_resize_window","browser_scroll","browser_scroll_dom","browser_select_option","browser_subagent","call_mcp_tool","capture_browser_console_logs","capture_browser_screenshot","click_browser_pixel","command_status","define_subagent","delete_knowledge","execute_browser_javascript","find_by_name","finish","generate_image","grep_search","invoke_subagent","list_browser_pages","list_dir","list_permissions","list_resources","manage_inbox","manage_subagents","manage_task","multi_replace_file_content","notebook_edit","notebook_execution","open_browser_url","read_browser_page","read_resource","read_url_content","replace_file_content","run_command","schedule","search_web","sed_file_content","send_command_input","send_message","view_file","wait","wait_5_seconds","write_to_file"],"permission_mode":"always-proceed"}}',
   '{"event":"step_update","step_update":{"conversation_id":"9b2b429c-9579-47e9-8c95-477e4a0cbebb","step_index":0,"state":"DONE","step_type":"user_input"}}',
   '{"event":"step_update","step_update":{"conversation_id":"9b2b429c-9579-47e9-8c95-477e4a0cbebb","step_index":2,"state":"DONE","step_type":"agent_response","text_delta":"ok\\n","duration_seconds":1.614421,"usage":{"input_tokens":20537,"output_tokens":1,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":20538}}}',
   '{"event":"result","result":{"conversation_id":"9b2b429c-9579-47e9-8c95-477e4a0cbebb","status":"SUCCESS","response":"ok\\n","duration_seconds":3.1579471,"num_turns":1,"usage":{"input_tokens":20634,"output_tokens":5,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":20639}}}',
@@ -21,7 +23,7 @@ const AGY_FIXTURE_RUN2 = [
 ];
 
 const AGY_INIT_ONLY = [
-  '{"event":"init","conversation_id":"9b2b429c-9579-47e9-8c95-477e4a0cbebb","init":{"model":"gemini-3.7-flash-low","cwd":"D:/repo","tools":["ask_permission"],"permission_mode":"always-proceed"}}',
+  '{"event":"init","conversation_id":"9b2b429c-9579-47e9-8c95-477e4a0cbebb","init":{"model":"gemini-3.7-flash-low","cwd":"C:/work/repo","tools":["ask_permission"],"permission_mode":"always-proceed"}}',
 ];
 
 const AGY_INIT_AND_STEP_UPDATE = [

@@ -76,7 +76,7 @@ export interface MaintenanceJob {
   run(ctx: MaintenanceJobContext): Promise<MaintenanceJobResult>;
 }
 
-export type SkipReason = 'disabled' | 'degraded' | 'in-flight' | 'not-due';
+export type SkipReason = 'disabled' | 'degraded' | 'in-flight' | 'not-due' | 'failure-backoff';
 
 export type JobOutcome = 'ran' | 'failed' | 'skipped';
 

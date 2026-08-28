@@ -1,15 +1,17 @@
 import { mkdir, writeFile, access } from 'fs/promises';
 import { configPath, secretsPath, skillsDir, logsDir, draftsDir, paHome } from '../paths.js';
+import { loadSecrets } from '../secrets.js';
+import { notifyUser } from '../lib/notify.js';
 
 const DEFAULT_CONFIG = `
 # Adjust command paths for your system (e.g. absolute paths or .cmd extensions on Windows)
 workers:
-  - name: zclaude
-    command: zclaude
+  - name: claude
+    command: claude
     args: ["-p", "--dangerously-skip-permissions", "--output-format", "stream-json", "--input-format", "stream-json", "--verbose"]
     input_mode: stdin-json
     output_format: stream-json
-    check: zclaude --version
+    check: claude --version
     rate_limit_patterns:
       - "rate limit"
       - "token limit"
@@ -17,18 +19,18 @@ workers:
       - "Usage limit"
       - "over your limit"
       - "hit your limit"
-      - "429"
     priority: 1
     state_dir: "~/.claude/projects"
     state_pattern: "*.jsonl"
-    # Optional defense-in-depth: limit which secrets this worker receives.
-    # If absent, the worker gets ALL secrets from secrets.env (current behavior).
-    # If present, ONLY the named secrets are injected into the worker's environment.
-    # Secret names must match pattern [A-Z0-9_]+ (uppercase alphanumeric + underscore).
-    # LLM workers (agy, claude, codex, zclaude): this field controls which secrets
-    #   from secrets.env are injected. Shell skills (cmd:) are unaffected.
-    # Example: secret_allowlist: [TELEGRAM_BOT_TOKEN, OPENAI_API_KEY]
-    # secret_allowlist:
+    # secret_allowlist: []  # Uncomment and list secrets this worker may access
+    tunables:
+      model:
+        args: ["--model", "{value}"]
+        description: "Model name passed to the CLI (e.g. opusplan, opus, sonnet)."
+      effort:
+        args: ["--effort", "{value}"]
+        values: [low, medium, high, xhigh, max]
+        description: "Effort level for the session (Claude Code 2.x --effort)."
 
   - name: codex
     command: codex
@@ -42,7 +44,7 @@ workers:
       - "rate limit"
       - "quota exceeded"
       - "429"
-    priority: 4
+    priority: 2
     state_dir: "~/.codex"
     state_pattern: "state_5.sqlite"
     # codex has no --effort flag; reasoning effort is a -c config override —
@@ -57,32 +59,7 @@ workers:
         values: [minimal, low, medium, high]
         description: "Reasoning effort, via codex's -c config override."
 
-  - name: claude
-    command: claude
-    args: ["-p", "--dangerously-skip-permissions", "--output-format", "stream-json", "--input-format", "stream-json", "--verbose"]
-    input_mode: stdin-json
-    output_format: stream-json
-    check: claude --version
-    rate_limit_patterns:
-      - "rate limit"
-      - "token limit"
-      - "quota exceeded"
-      - "Usage limit"
-      - "over your limit"
-      - "hit your limit"
-    priority: 5
-    state_dir: "~/.claude/projects"
-    state_pattern: "*.jsonl"
-    # secret_allowlist: []  # Uncomment and list secrets this worker may access
-    tunables:
-      model:
-        args: ["--model", "{value}"]
-        description: "Model name passed to the CLI (e.g. opusplan, opus, sonnet)."
-      effort:
-        args: ["--effort", "{value}"]
-        values: [low, medium, high, xhigh, max]
-        description: "Effort level for the session (Claude Code 2.x --effort)."
-
+  # Antigravity CLI (agy) — setup-required; the dispatcher skips it if not installed.
   - name: agy
     command: agy
     # --print-timeout is required: agy's print mode self-kills at 5m0s by default.
@@ -98,7 +75,7 @@ workers:
     rate_limit_patterns:
       - "RESOURCE_EXHAUSTED"
       - "429"
-    priority: 2
+    priority: 3
     state_dir: "~/.gemini/antigravity-cli/conversations"
     # agy stores each conversation as a SQLite database in WAL mode, hence the
     # sibling <id>.db-shm / <id>.db-wal files (the '*.db' glob deliberately
@@ -137,6 +114,33 @@ workers:
           - gpt-oss-120b-medium
         description: "Model for this CLI session; agy's reasoning effort is EMBEDDED in its gemini model names (-high/-medium/-low), and a base name with no suffix is rejected. There is deliberately NO effort knob (v1.1.13 rejects a bare --effort, AI-155). Run 'agy models' for the current list - from PowerShell/cmd, not Git Bash, where it hangs (verified 2026-07-22: 242s, rc=124, 0 bytes; NOT a TTY gate - it works with stdout redirected)."
 
+  # zclaude — example Claude-compatible wrapper CLI; setup-required.
+  - name: zclaude
+    command: zclaude
+    args: ["-p", "--dangerously-skip-permissions", "--output-format", "stream-json", "--input-format", "stream-json", "--verbose"]
+    input_mode: stdin-json
+    output_format: stream-json
+    check: zclaude --version
+    rate_limit_patterns:
+      - "rate limit"
+      - "token limit"
+      - "quota exceeded"
+      - "Usage limit"
+      - "over your limit"
+      - "hit your limit"
+      - "429"
+    priority: 4
+    state_dir: "~/.claude/projects"
+    state_pattern: "*.jsonl"
+    # Optional defense-in-depth: limit which secrets this worker receives.
+    # If absent, the worker gets ALL secrets from secrets.env (current behavior).
+    # If present, ONLY the named secrets are injected into the worker's environment.
+    # Secret names must match pattern [A-Z0-9_]+ (uppercase alphanumeric + underscore).
+    # LLM workers (agy, claude, codex, zclaude): this field controls which secrets
+    #   from secrets.env are injected. Shell skills (cmd:) are unaffected.
+    # Example: secret_allowlist: [TELEGRAM_BOT_TOKEN, OPENAI_API_KEY]
+    # secret_allowlist:
+
 bg_tasks:
   alert_seconds: 300
   alert_repeat_seconds: 1800
@@ -151,12 +155,20 @@ bg_tasks:
 
 # === usage (optional) ===
 # Track token usage and set budget alerts. The \`pa costs\` command reports
-# usage rollups by worker, model, and skill. When budget_monthly_usd is set,
-# alerts fire at 50/80/100% of the monthly budget (once per threshold per month).
+# usage rollups by worker, model, and skill. The budget_monthly_usd field is
+# parsed but budget alerting is not implemented yet — reserved for future budget alerts.
 # Cost estimation requires a price table to be configured — without prices,
-# tokens are tracked but costs remain null, and budget alerts are inert.
+# tokens are tracked but costs remain null.
 # usage:
-#   budget_monthly_usd: 100   # optional monthly USD budget; alerts fire at 50/80/100%
+#   budget_monthly_usd: 100   # optional monthly USD budget; alerting not implemented yet
+
+# === model_pricing (optional) ===
+# Per-million-token USD pricing for cost estimation. Built-in defaults cover
+# common models; override here to adjust or add entries. Keys are model names;
+# a key matching a worker name prices records that carry no model field.
+# model_pricing:
+#   gemini-3.7-flash: { input: 0.75, output: 3.75, cache_read: 0.075 }
+#   agy: { input: 0.75, output: 3.75, cache_read: 0.075 }
 
 # === quota-aware failover (optional) ===
 # Opt-in flag for health-score-based worker ordering. When ON, cooldown
@@ -253,7 +265,7 @@ const DEFAULT_EXEMPT_JSON = `{}`;
 
 import { join } from 'path';
 
-export async function initCommand(): Promise<void> {
+export async function initCommand(opts?: { notify?: typeof notifyUser }): Promise<void> {
   const home = paHome();
   console.log(`Initializing PA at ${home}...`);
 
@@ -326,6 +338,9 @@ export async function initCommand(): Promise<void> {
   console.log('  Personal docs go OUTSIDE the repo (~/Documents/personal-imports/),');
   console.log('  not at the repo root. For deployment patterns, see docs/DEPLOYMENT.md.');
   console.log('');
+  console.log('  0. After filling secrets.env, re-run `pa init` to send a');
+  console.log('     verification message and confirm Telegram delivery works.');
+  console.log('');
   console.log('  1. Set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID in', sp);
   console.log('     See docs/BOT_GUIDE.md for Telegram setup.');
   console.log('');
@@ -337,5 +352,29 @@ export async function initCommand(): Promise<void> {
   console.log('       Bash:       cp -r examples/skills/reminders ~/.pa/skills/');
   console.log('     See docs/SKILLS_GUIDE.md.');
   console.log('');
-  console.log('  4. Verify: `pa health` should report all 10 checks as PASS or WARN.');
+  console.log('  4. Verify: `pa health` should report every check as PASS or WARN.');
+
+  // Alive message per D8
+  const notify = opts?.notify ?? notifyUser;
+  try {
+    const secrets = await loadSecrets();
+    const token = secrets.TELEGRAM_BOT_TOKEN;
+    const chatIdRaw = secrets.TELEGRAM_CHAT_ID;
+
+    if (!token || !chatIdRaw) {
+      console.log('[skip] Alive message not sent — set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID in secrets.env, then re-run pa init.');
+      return;
+    }
+
+    const chatId = chatIdRaw.split(',')[0].trim();
+    await notify('Your assistant is alive', `pa initialized at ${home} and Telegram delivery is working.\n\nNext: run \`pa health\`, then try \`pa run reminders\`.`, {
+      dedupKey: 'init-alive',
+      escalate: false,
+      severity: 'info',
+      topic: { chat_id: chatId, thread_id: 0 }
+    });
+    console.log(`[i] Sent alive message to chat ${chatId}`);
+  } catch (err) {
+    console.log('[skip] Alive message failed:', err instanceof Error ? err.message : String(err));
+  }
 }

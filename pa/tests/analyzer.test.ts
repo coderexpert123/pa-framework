@@ -2,8 +2,17 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFile } from 'fs/promises';
 import { join } from 'path';
-import { buildAnalysisPrompt, parseProposalResponse, readRecentConversations } from '../src/analyzer.js';
-import type { ConversationTurn } from '../src/analyzer.js';
+import {
+  buildKeyingPrompt,
+  parseKeyingResponse,
+  buildProposalPrompt,
+  parseProposalResponse,
+  readRecentConversations,
+  readTurnsSince,
+} from '../src/analyzer.js';
+import type { ConversationTurn, EvidenceTurn } from '../src/analyzer.js';
+import { ANALYZER_TURN_CHARS } from '../src/lib/skill-candidates.js';
+import type { SkillCandidate } from '../src/lib/skill-candidates.js';
 import { createTempPaHome, cleanup } from './helpers.js';
 
 function makeTurn(overrides: Partial<ConversationTurn> = {}): ConversationTurn {
@@ -11,6 +20,32 @@ function makeTurn(overrides: Partial<ConversationTurn> = {}): ConversationTurn {
     role: 'user',
     text: 'Check my unread emails',
     timestamp: new Date().toISOString(),
+    ...overrides,
+  };
+}
+
+function makeEvidenceTurn(overrides: Partial<EvidenceTurn> = {}): EvidenceTurn {
+  return {
+    role: 'user',
+    text: 'Check my unread emails',
+    timestamp: '2026-08-01T09:00:00.000Z',
+    message_id: '1',
+    ...overrides,
+  };
+}
+
+function makeCandidate(overrides: Partial<SkillCandidate> = {}): SkillCandidate {
+  return {
+    key: 'email-summary',
+    intent: 'summarize unread emails',
+    count: 3,
+    days: ['2026-07-30', '2026-07-31', '2026-08-01'],
+    turn_refs: [],
+    first_seen: '2026-07-30T09:00:00.000Z',
+    last_seen: '2026-08-01T09:00:00.000Z',
+    origin: 'analyzer',
+    proposed_at: null,
+    draft_id: null,
     ...overrides,
   };
 }
@@ -26,49 +61,202 @@ describe('analyzer', () => {
     await cleanup(dir);
   });
 
-  describe('buildAnalysisPrompt', () => {
-    it('includes conversation content', () => {
-      const turns = [
-        makeTurn({ text: 'Summarize my emails', timestamp: '2026-04-01T09:00:00.000Z' }),
-        makeTurn({ role: 'assistant', text: 'Here is your summary...', timestamp: '2026-04-01T09:01:00.000Z' }),
-      ];
-      const prompt = buildAnalysisPrompt(turns, [], []);
-      assert.match(prompt, /Summarize my emails/);
-      assert.match(prompt, /Here is your summary/);
+  describe('buildKeyingPrompt', () => {
+    it('renders full turn text, NOT cut at 300 chars', () => {
+      const longText = 'x'.repeat(1200);
+      const turns = [makeEvidenceTurn({ text: longText })];
+      const prompt = buildKeyingPrompt(turns, [], []);
+      assert.match(prompt, new RegExp('x'.repeat(1200)));
     });
 
-    it('groups turns by date', () => {
-      const turns = [
-        makeTurn({ timestamp: '2026-04-01T09:00:00.000Z', text: 'Day one message' }),
-        makeTurn({ timestamp: '2026-04-02T09:00:00.000Z', text: 'Day two message' }),
-      ];
-      const prompt = buildAnalysisPrompt(turns, [], []);
-      assert.match(prompt, /2026-04-01/);
-      assert.match(prompt, /2026-04-02/);
-      assert.match(prompt, /Day one message/);
-      assert.match(prompt, /Day two message/);
+    it('cuts a turn over ANALYZER_TURN_CHARS at exactly that cap', () => {
+      const longText = 'y'.repeat(5000);
+      const turns = [makeEvidenceTurn({ text: longText })];
+      const prompt = buildKeyingPrompt(turns, [], []);
+      assert.match(prompt, new RegExp('y'.repeat(ANALYZER_TURN_CHARS)));
+      assert.ok(!prompt.includes('y'.repeat(ANALYZER_TURN_CHARS + 1)));
     });
 
-    it('lists existing skills in exclusion list', () => {
-      const prompt = buildAnalysisPrompt([], ['daily-mail-brief', 'fitness-sync'], []);
+    it('omits assistant turns from the prompt even when handed a mixed-role list', () => {
+      const turns = [
+        makeEvidenceTurn({ role: 'user', text: 'user text marker', message_id: '1' }),
+        makeEvidenceTurn({ role: 'assistant', text: 'assistant text marker', message_id: '2' }),
+      ];
+      const prompt = buildKeyingPrompt(turns, [], []);
+      assert.match(prompt, /user text marker/);
+      assert.ok(!prompt.includes('assistant text marker'));
+    });
+
+    it('lists existing keys and intents', () => {
+      const prompt = buildKeyingPrompt([], [{ key: 'daily-mail-brief', intent: 'send the daily brief' }], []);
       assert.match(prompt, /daily-mail-brief/);
+      assert.match(prompt, /send the daily brief/);
+    });
+
+    it('lists existing skill names and descriptions', () => {
+      const prompt = buildKeyingPrompt([], [], [{ name: 'fitness-sync', description: 'syncs COROS workouts' }]);
       assert.match(prompt, /fitness-sync/);
+      assert.match(prompt, /syncs COROS workouts/);
     });
 
-    it('lists existing drafts in exclusion list', () => {
-      const prompt = buildAnalysisPrompt([], [], ['draft-skill-one']);
-      assert.match(prompt, /draft-skill-one/);
+    it('states the verbatim key-reuse-is-default sentence', () => {
+      const prompt = buildKeyingPrompt([], [], []);
+      assert.match(prompt, /Reusing an existing key is the default\. Only mint a new key when no existing key describes the same intent\./);
+    });
+  });
+
+  describe('parseKeyingResponse', () => {
+    it('parses a valid JSON array', () => {
+      const raw = JSON.stringify([{ message_id: '1', key: 'email-summary', intent: 'summarize emails' }]);
+      const results = parseKeyingResponse(raw);
+      assert.equal(results.length, 1);
+      assert.equal(results[0].message_id, '1');
+      assert.equal(results[0].key, 'email-summary');
+      assert.equal(results[0].intent, 'summarize emails');
     });
 
-    it('instructs LLM to require 3+ occurrences across different days', () => {
-      const prompt = buildAnalysisPrompt([], [], []);
-      assert.match(prompt, /3 or more times/);
-      assert.match(prompt, /DIFFERENT days/);
+    it('strips markdown fences before parsing', () => {
+      const raw = '```json\n[{"message_id":"1","key":"k","intent":"i"}]\n```';
+      const results = parseKeyingResponse(raw);
+      assert.equal(results.length, 1);
+      assert.equal(results[0].key, 'k');
     });
 
-    it('returns no conversations message when turns is empty', () => {
-      const prompt = buildAnalysisPrompt([], [], []);
-      assert.match(prompt, /no conversations in this period/);
+    it('returns empty array on garbage input', () => {
+      assert.deepEqual(parseKeyingResponse('not json at all'), []);
+      assert.deepEqual(parseKeyingResponse(''), []);
+      assert.deepEqual(parseKeyingResponse('{}'), []); // not an array
+    });
+
+    it('preserves an explicit null key', () => {
+      const raw = JSON.stringify([{ message_id: '1', key: null, intent: 'not actionable' }]);
+      const results = parseKeyingResponse(raw);
+      assert.equal(results.length, 1);
+      assert.equal(results[0].key, null);
+    });
+
+    it('coerces a missing or empty key to null', () => {
+      const raw = JSON.stringify([
+        { message_id: '1', intent: 'no key field' },
+        { message_id: '2', key: '', intent: 'empty key' },
+      ]);
+      const results = parseKeyingResponse(raw);
+      assert.equal(results.length, 2);
+      assert.equal(results[0].key, null);
+      assert.equal(results[1].key, null);
+    });
+
+    it('drops entries with a non-string message_id', () => {
+      const raw = JSON.stringify([
+        { message_id: '1', key: 'k', intent: 'i' },
+        { message_id: 2, key: 'k', intent: 'i' }, // number, not string
+        { key: 'k', intent: 'i' }, // missing entirely
+      ]);
+      const results = parseKeyingResponse(raw);
+      assert.equal(results.length, 1);
+      assert.equal(results[0].message_id, '1');
+    });
+  });
+
+  describe('buildProposalPrompt', () => {
+    it('renders "no trace recorded" when the occurrence has no trace', () => {
+      const candidate = makeCandidate();
+      const prompt = buildProposalPrompt(candidate, [{ turn: makeEvidenceTurn() }], [], []);
+      assert.match(prompt, /no trace recorded/);
+    });
+
+    it('renders the tool/command summary from WP-A\'s real trace shape (tool_calls[], not tools)', () => {
+      const candidate = makeCandidate();
+      // Real TurnTraceToolCall[] shape (spec §3.1/A5, corrected 2026-08-24):
+      // { n, name, arg, ok, ms? } — optional fields omitted when absent.
+      const trace = {
+        v: 1,
+        run_id: 'abc-123',
+        tool_calls: [
+          { n: 1, name: 'view_file', arg: 'a.ts', ok: true },
+          { n: 2, name: 'run_command', arg: 'echo ok', ok: true, ms: 12 },
+        ],
+        commands: ['echo ok'],
+        files: ['a.ts'],
+        errors: [],
+        outcome: 'ok',
+        worker: 'agy',
+        parsed: true,
+        truncated: false,
+      };
+      const prompt = buildProposalPrompt(candidate, [{ turn: makeEvidenceTurn(), trace }], [], []);
+      assert.match(prompt, /Trace for this run \(run_id abc-123\):/);
+      assert.match(prompt, /tools=run_command×1, view_file×1/); // count desc, then name asc — both count 1 so alphabetical
+      assert.match(prompt, /commands=echo ok/);
+      assert.match(prompt, /files=a\.ts/);
+      assert.match(prompt, /outcome=ok/);
+    });
+
+    it('aggregates repeated tool_calls by name, ordered count desc then name asc', () => {
+      const candidate = makeCandidate();
+      const trace = {
+        v: 1,
+        run_id: 'agg-run',
+        tool_calls: [
+          { n: 1, name: 'view_file', arg: 'a.ts', ok: true },
+          { n: 2, name: 'run_command', arg: 'echo a', ok: true },
+          { n: 3, name: 'view_file', arg: 'b.ts', ok: true },
+          { n: 4, name: 'run_command', arg: 'echo b', ok: true },
+          { n: 5, name: 'view_file', arg: 'c.ts', ok: false },
+          { n: 6, name: 'edit_file', arg: 'd.ts', ok: true },
+        ],
+        commands: [],
+        files: [],
+        outcome: 'ok',
+      };
+      const prompt = buildProposalPrompt(candidate, [{ turn: makeEvidenceTurn(), trace }], [], []);
+      // view_file×3 (highest count) first, then run_command×2, then edit_file×1 (name asc among count-1 ties would apply, but only one here)
+      assert.match(prompt, /tools=view_file×3, run_command×2, edit_file×1/);
+    });
+
+    it('degrades gracefully when the trace object is present but missing/wrong-shaped fields (never throws, never crashes on unknown WP-A payloads)', () => {
+      const candidate = makeCandidate();
+      // Degenerate trace: no tool_calls at all, non-array commands/files, no
+      // outcome, no run_id — lookupTraceByUpdate never throws per contract,
+      // but a returned TraceLine can still be missing everything but run_id.
+      const trace = { run_id: 'bare-run' } as Record<string, unknown>;
+      const prompt = buildProposalPrompt(candidate, [{ turn: makeEvidenceTurn(), trace }], [], []);
+      assert.match(prompt, /Trace for this run \(run_id bare-run\):/);
+      assert.match(prompt, /tools=none/);
+      assert.match(prompt, /commands=none/);
+      assert.match(prompt, /files=none/);
+      assert.match(prompt, /outcome=unknown/);
+    });
+
+    it('falls back to the occurrence turn\'s run_id when the trace object omits run_id', () => {
+      const candidate = makeCandidate();
+      const trace = { tool_calls: [{ n: 1, name: 'view_file', arg: 'a.ts', ok: true }] };
+      const prompt = buildProposalPrompt(candidate, [{ turn: makeEvidenceTurn({ run_id: 'turn-run-id' }), trace }], [], []);
+      assert.match(prompt, /Trace for this run \(run_id turn-run-id\):/);
+    });
+
+    it('labels the assistant reply as context only, NOT evidence', () => {
+      const candidate = makeCandidate();
+      const prompt = buildProposalPrompt(candidate, [{ turn: makeEvidenceTurn(), assistantReply: 'Here are your emails.' }], [], []);
+      assert.match(prompt, /Assistant reply \(context only, NOT evidence\): Here are your emails\./);
+    });
+
+    it('caps occurrences at 5', () => {
+      const candidate = makeCandidate();
+      const occurrences = Array.from({ length: 8 }, (_, i) =>
+        ({ turn: makeEvidenceTurn({ text: `occurrence-marker-${i}`, message_id: String(i) }) }));
+      const prompt = buildProposalPrompt(candidate, occurrences, [], []);
+      for (let i = 0; i < 5; i++) assert.match(prompt, new RegExp(`occurrence-marker-${i}`));
+      for (let i = 5; i < 8; i++) assert.ok(!prompt.includes(`occurrence-marker-${i}`));
+    });
+
+    it('renders today\'s DraftProposal JSON response contract', () => {
+      const candidate = makeCandidate();
+      const prompt = buildProposalPrompt(candidate, [{ turn: makeEvidenceTurn() }], ['existing-skill'], ['existing-draft']);
+      assert.match(prompt, /"source_message_ids": \["id1", "id2"\]/);
+      assert.match(prompt, /"trigger_description": "When to fire this skill automatically"/);
+      assert.match(prompt, /existing-skill/);
+      assert.match(prompt, /existing-draft/);
     });
   });
 
@@ -251,6 +439,86 @@ describe('analyzer', () => {
       const turns = await readRecentConversations(1);
       assert.equal(turns.length, 1);
       assert.equal(turns[0].text, 'Valid');
+    });
+  });
+
+  describe('readTurnsSince', () => {
+    it('returns only user turns', async () => {
+      const rtsDir = dir + '-rts-roles';
+      const origHome = process.env.PA_HOME;
+      try {
+        const { mkdir } = await import('fs/promises');
+        await mkdir(rtsDir + '/skills', { recursive: true });
+        await mkdir(rtsDir + '/skill-drafts', { recursive: true });
+        await mkdir(rtsDir + '/logs', { recursive: true });
+        process.env.PA_HOME = rtsDir;
+
+        const lines = [
+          JSON.stringify({ role: 'user', text: 'User turn', timestamp: new Date().toISOString() }),
+          JSON.stringify({ role: 'assistant', text: 'Assistant turn', timestamp: new Date().toISOString() }),
+        ].join('\n');
+        await writeFile(join(rtsDir, 'conversation-history.jsonl'), lines, 'utf8');
+
+        const turns = await readTurnsSince(null, 7);
+        assert.equal(turns.length, 1);
+        assert.equal(turns[0].role, 'user');
+      } finally {
+        process.env.PA_HOME = origHome;
+      }
+    });
+
+    it('respects the watermark strictly (> not >=)', async () => {
+      const rtsDir = dir + '-rts-watermark';
+      const origHome = process.env.PA_HOME;
+      try {
+        const { mkdir } = await import('fs/promises');
+        await mkdir(rtsDir + '/skills', { recursive: true });
+        await mkdir(rtsDir + '/skill-drafts', { recursive: true });
+        await mkdir(rtsDir + '/logs', { recursive: true });
+        process.env.PA_HOME = rtsDir;
+
+        const watermark = '2026-08-01T12:00:00.000Z';
+        const lines = [
+          JSON.stringify({ role: 'user', text: 'At watermark', timestamp: watermark }),
+          JSON.stringify({ role: 'user', text: 'After watermark', timestamp: '2026-08-01T12:00:00.001Z' }),
+          JSON.stringify({ role: 'user', text: 'Before watermark', timestamp: '2026-08-01T11:59:59.999Z' }),
+        ].join('\n');
+        await writeFile(join(rtsDir, 'conversation-history.jsonl'), lines, 'utf8');
+
+        const turns = await readTurnsSince(watermark, 30);
+        const texts = turns.map((t) => t.text);
+        assert.deepEqual(texts, ['After watermark']);
+      } finally {
+        process.env.PA_HOME = origHome;
+      }
+    });
+
+    it('falls back to the day window when the watermark is null', async () => {
+      const rtsDir = dir + '-rts-window';
+      const origHome = process.env.PA_HOME;
+      try {
+        const { mkdir } = await import('fs/promises');
+        await mkdir(rtsDir + '/skills', { recursive: true });
+        await mkdir(rtsDir + '/skill-drafts', { recursive: true });
+        await mkdir(rtsDir + '/logs', { recursive: true });
+        process.env.PA_HOME = rtsDir;
+
+        const now = new Date();
+        const recent = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+        const old = new Date(now.getTime() - 10 * 24 * 60 * 60 * 1000);
+        const lines = [
+          JSON.stringify({ role: 'user', text: 'Recent', timestamp: recent.toISOString() }),
+          JSON.stringify({ role: 'user', text: 'Old', timestamp: old.toISOString() }),
+        ].join('\n');
+        await writeFile(join(rtsDir, 'conversation-history.jsonl'), lines, 'utf8');
+
+        const turns = await readTurnsSince(null, 3);
+        const texts = turns.map((t) => t.text);
+        assert.ok(texts.includes('Recent'));
+        assert.ok(!texts.includes('Old'));
+      } finally {
+        process.env.PA_HOME = origHome;
+      }
     });
   });
 });

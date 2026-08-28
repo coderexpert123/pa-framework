@@ -16,13 +16,13 @@ The root `.gitignore` is the source of truth. These patterns are auto-gitignored
 - `/extracted_facts.md` — extraction outputs
 - `/*.py` — ALL root-level Python (root is sparse, so any `.py` here is an ad-hoc/personal-data script; closes the `analysis.py`-class gap prefix patterns silently missed)
 
-### Action Items and Personal Notes
+### Personal Notes and Action Items
 - `/scratch_*` — scratch files
-- `/Action Items.md` — personal action items (should live in Ecosystem KB)
-- `/Preferences.md` — personal preferences (should live in Ecosystem KB)
-- `/Financial.md` — personal financial notes (should live in Ecosystem KB)
-- `/People & Contacts.md` — personal contacts (should live in Ecosystem KB)
-- `/Health & Medical.md` — personal health records (should live in Ecosystem KB)
+- `/notes-actions.md` — personal action items (should live in your external knowledge base)
+- `/notes-preferences.md` — personal preferences (should live in your external knowledge base)
+- `/notes-financial.md` — personal financial notes (should live in your external knowledge base)
+- `/notes-contacts.md` — personal contacts (should live in your external knowledge base)
+- `/notes-health.md` — personal health records (should live in your external knowledge base)
 
 ### Agent Outputs and Logs
 - `/message_to_user.md` — agent outputs

@@ -221,6 +221,28 @@ export async function runWithFailover(
     }
   };
 
+  // True when a LATER candidate could still be tried, so this hop's non-zero
+  // exit is not the run's verdict. Deliberately cheap — it repeats the loop's
+  // own manual_only/excluded/cooling filters but NOT checkWorker(), which
+  // spawns a process per candidate. Over-optimism is safe: if every remaining
+  // candidate turns out unavailable, the loop still ends at the
+  // `Skill exhausted: <resource>` page below, so the failure is never silent.
+  // Under noFallback there is no next hop by definition.
+  // Why this exists: an intermediate failover hop paged
+  // "Worker exited with code 1: <worker>" even when the next worker answered
+  // (plans/2026-08-23-alerts-week-review.md §5.3).
+  const hasEligibleCandidateAfter = async (index: number): Promise<boolean> => {
+    if (options.noFallback) return false;
+    for (let j = index + 1; j < workers.length; j++) {
+      const w = workers[j];
+      if (w.manual_only && options.preferredWorker !== w.name && config.worker_pin !== w.name) continue;
+      if (options.excludeWorkers?.has(w.name)) continue;
+      if (await isWorkerCoolingDown(w.name)) continue;
+      return true;
+    }
+    return false;
+  };
+
   for (let i = 0; i < workers.length; i++) {
     const worker = workers[i];
 
@@ -289,12 +311,14 @@ export async function runWithFailover(
     const workerSecrets = filterSecretsForWorker(allSecrets, worker);
 
     const workerExtraArgs = options.getExtraArgs ? options.getExtraArgs(worker) : options.extraArgs;
+    const nextHopExists = await hasEligibleCandidateAfter(i);
     const result = await executeWorker(worker, prompt, {
       ...options,
       extraArgs: workerExtraArgs,
       env: workerSecrets,
       agentName: worker.name,
       bgTasksConfig: options.bgTasksConfig ?? config.bg_tasks,
+      suppressExitAlert: nextHopExists ? true : options.suppressExitAlert,
     });
     finalResult = result;
     finalWorkerName = worker.name;

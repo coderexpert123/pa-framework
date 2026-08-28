@@ -40,6 +40,7 @@ The framework reads configuration from `~/.pa/` (or wherever `PA_HOME` env var p
 | `topic_defaults` | `Record<string, string>` | No | `{}` | Maps `<chatId>_<threadId>` strings to a preferred worker name. Used by the bot. |
 | `bg_tasks` | `BgTasksConfig` | No | See below | Thresholds for background-leak detection. |
 | `usage` | `UsageConfig` | No | None | Token usage tracking and budget alerts. See below. |
+| `model_pricing` | `Record<string, {input, output, cache_read?}>` | No | No | Built-in defaults. Per-MTok USD price overrides for cost estimates. Keys are model names, with worker-name fallback. See below. |
 
 ### `WorkerConfig`
 
@@ -87,13 +88,45 @@ Full walkthrough: docs/BOT_GUIDE.md "Voice messages (speech to text)". Something
 
 ### UsageConfig
 
-Controls token usage tracking and budget alerts. Optional — omit the whole `usage:` block and usage tracking still runs, but with no budget alerts.
+Controls token usage tracking. Optional — omit the whole `usage:` block and usage tracking still runs.
 
 | Field | Type | Required | Default | Effect |
 |---|---|---|---|---|
-| `budget_monthly_usd` | number | No | None | Optional monthly USD budget. When set, alerts fire at 50/80/100% of month-to-date estimated cost (once per threshold per month, deduped). Without price data configured, tokens are tracked but `estCostUsd` stays null and budget alerts are inert. |
+| `budget_monthly_usd` | number | No | None | Optional monthly USD budget. Parsed but alerting is not implemented yet — this field is reserved for future budget alert features. |
 
-Run `pa costs [--week|--month] [--skill <name>]` to view usage rollups. Token counts are factual; cost estimation requires a price table to be configured (not implemented in v1 — tokens are tracked, costs remain null until pricing is added).
+Run `pa costs [--day|--week|--month] [--skill <name>] [--json]` to view usage rollups by worker, model, and skill. Token counts are factual; cost estimates use built-in list prices (verified 2026-08-27) plus any `model_pricing` overrides from config.yaml. Unpriced workers/models show `-` in the table and `null` in JSON output.
+
+### CostTierConfig
+
+Controls the cost_tier peak window for `off_peak` skills. Optional — omit the whole `cost_tier:` block and the default Mon-Fri 06:00-10:00 UTC window applies.
+
+| Field | Type | Required | Default | Effect |
+|---|---|---|---|---|
+| `peak_window_utc.days` | number[] | No | `[1,2,3,4,5]` | Days of week treated as peak (0=Sunday, 6=Saturday). Weekends are off-peak regardless. |
+| `peak_window_utc.start_hour` | number | No | `6` | Start of peak window in UTC (0-23). |
+| `peak_window_utc.end_hour` | number | No | `10` | End of peak window in UTC (0-23, must be > start_hour). |
+
+The default window matches the [Zhipu/z.ai peak billing window](https://platform.openai.com/docs/price) (Mon-Fri 06:00-10:00 UTC, 2x credits). `off_peak` skills defer during this window and run during off-peak hours (19:30-11:30 IST the next day). Customizing this allows you to align with other providers' schedules or your own cost optimization strategy.
+
+**Non-wrapping windows (v1):** `start_hour` must be less than `end_hour`. Wrap-around windows (e.g., 22:00-02:00 UTC) are not supported in this version; the parser warns and falls back to the default on invalid input.
+
+### ModelPricing
+
+Optional per-worker and per-model price overrides for `pa costs` dollar estimates. Configured under the top-level `model_pricing:` key in `~/.pa/config.yaml` (or `config.example.yaml` at scaffold time). Omitted entirely → built-in defaults only.
+
+Table semantics (per-million-token USD):
+
+```yaml
+model_pricing:
+  gemini-3.7-flash: { input: 0.75, output: 3.75, cache_read: 0.075 }
+  agy:              { input: 0.75, output: 3.75, cache_read: 0.075 }   # worker fallback
+```
+
+Key resolution: per-record lookup tries `record.model` (trimmed) if present, else `record.worker`. Config entries merge over built-in defaults key-by-key (config wins). All providers bill thinking tokens at the output rate. The `cache_read` field defaults to 0 when omitted. A key with no pricing data → `estCostUsd: null` in `pa costs` output.
+
+The pricing table is parsed by `pa/src/lib/model-pricing.ts` (not by `loadConfig`). On any read/parse failure, the loader warns and falls back to built-in defaults; a missing or malformed `model_pricing:` section never crashes `pa costs`.
+
+Worker-level fallbacks exist because usage records often carry no model field (100% of this deployment's ledger as of 2026-08-27). The built-in defaults include `agy` (gemini-3.7-flash rates) and `zclaude` (glm-5.3 rates); `claude` and `codex` have no worker-level defaults (their billing model is not verifiable — records price via model key or show unpriced).
 
 ### Validation
 
@@ -124,8 +157,12 @@ The framework itself reads these (independent of any specific skill):
 | `CLAUDE_CMD` | No | Path to Claude CLI for LLM-based bot topic description generation |
 | `PA_REPOS_BASE` | No | Base for `/code <short-name>` resolution in the bot |
 | `PA_TZ_OFFSET_MINUTES` | No | IST offset override (default 330 = UTC+5:30) |
-| `PA_GEMINI_RESET_TZ` | No | Gemini's daily quota reset timezone (default America/Los_Angeles) |
+| `PA_GEMINI_RESET_TZ` | No | Google API daily-quota reset timezone for the agy worker's rate-limit classifier (default America/Los_Angeles) |
 | `CLAUDE_CODE_GIT_BASH_PATH` | Win only | Claude Code CLI needs this on Windows |
+| `PA_OPERATOR_USER_ID` | No (required for operator-gated buttons) | Telegram user id gating the operator-only inline-button callback classes (`pm`/`dr`/`sk`/`mc`/`rs`/`dq`, see `projects/telegram-bot/CLAUDE.md`'s Inline buttons / callbacks table); unset → those buttons answer with a "set it" alert instead of acting. The positive entry in `TELEGRAM_CHAT_ID` (a DM chat id) equals the user id. |
+| `PA_RICH_MESSAGES` | No | Set to `1` to route bot replies over 3,500 chars or containing a markdown table through `sendRichMessage` (Bot API 10.1/10.2), falling back to the existing chunked `sendMessage` path on any API error. Unset = off, zero behavior change. |
+
+**`PA_KB_SOURCES_PATH` is also read by `pa recall`** (2026-08-24): it is a *file* path (`.../Ecosystem KB/Sources.md`), but recall's Ecosystem-KB source is that file's *directory* — every `.md` file in it gets indexed, not just `Sources.md`. Unset means the KB source is skipped entirely, the same "unset means off" convention `kb-notes.ts` already documents for this variable. As of 2026-08-24 the new env vars are `PA_BOT_SELF_RESTART` (above; recall-&-traces wave) and `PA_OPERATOR_USER_ID`/`PA_RICH_MESSAGES` (above; buttons-program wave) — no other new knob exists, so don't go looking for one.
 
 All others are skill-specific — see individual skill files.
 
@@ -147,17 +184,25 @@ When set, the framework derives all paths from `${PA_HOME}/` instead of `~/.pa/`
 |----------|---------|---------|
 | `PA_MAX_CONCURRENT_WORKERS` | `3` | Machine-wide cap on concurrently running LLM CLI workers (bot dispatches + LLM skills share the pool via blackboard slot locks). Excess dispatches queue until a slot frees. Set `0` or negative to disable limiting. Evaluator calls are exempt (they run while a slot-holding worker awaits their verdict). Shell/`cmd:` skills are unaffected. |
 | `UV_THREADPOOL_SIZE` | Node default `4` | Recommended `16` for the bot and catchup processes: Node's fs and DNS lookups share this libuv pool, so heavy disk I/O can starve DNS and take all networking down with it. Set it in the process launcher (Task Scheduler wrapper, systemd unit, shell profile) — it must exist before Node starts. |
+| `PA_SELF_IMPROVER_CODE_FIX_BUDGET_MS` | `2400000` (40 min) | Per-run wall-clock budget for the self-improver's autonomous code-fix loop. Once elapsed time since the run started exceeds this, a new fix attempt is skipped (`code-fix-skipped-budget-exhausted`) rather than started, so it can't be killed mid-verification by the skill's own 3600s timeout. Replaced the earlier global one-fix-per-night cap (2026-08-23) — see `plans/2026-08-23-code-fix-multi-per-night-SPEC.md`. |
+| `PA_SELF_IMPROVER_MAX_CODE_FIXES` | unset (unlimited) | Optional hard cap on the number of code-fix attempts (applied or not) in one self-improver run (`code-fix-skipped-limit-reached` past the cap). Unset or `0` = unlimited — the real per-run bounds are one attempt per target skill and the wall-clock budget above. |
+| `PA_ALERT_CENSUS_NOTIFY_PER_DAY` | `50` | Threshold for the `alert-census` maintenance job (2026-08-23, daily, pa host). The job always writes `~/.pa/alert-census.json`; it posts a one-line "Alert census (7d)" summary to pa-alerts only when `totalSent / windowDays` is at or above this value. |
+| `PA_BUILD_LOCK` | unset (lock ON) | Set to `0` to skip the `@build` reservation that `npm run build` / `npm test` take automatically. For scoped test runs inside an orchestrated wave, where several builders would otherwise serialize behind one another. Never set it for a full-suite or pre-push gate. |
+| `PA_BUILD_LOCK_HELD` | unset | Set automatically by `pa/src/lib/build-lock.ts` while it holds `@build`, to the reservation id. Its presence makes a nested `npm run build` / `npm test` skip its own acquisition, which is what stops a lock-holding parent from deadlocking against its own child. Do not set it by hand. |
 
 ## Blackboard lock env vars (AI-113)
 
 Only relevant if you're debugging a lock that's expiring too early/late, or writing a
-test that needs a short TTL instead of waiting out the real one:
+test that needs a short TTL instead of waiting out the real one. See `docs/multi-session-protocol.md` Rule 10 for the surrounding test-isolation discipline.
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `PA_HEARTBEAT_STALE_MS` | `600000` (10 min) | How long a blackboard lock can go without a heartbeat before it's considered stale and purged. Read fresh per-call, not just at process start. |
 | `PA_LOCK_RENEW_INTERVAL_MS` | `60000` (1 min) | How often `startLockRenewal()` refreshes a held lock's heartbeat. |
 | `PA_LOCK_RENEW_MAX_MS` | `21600000` (6 h) | Absolute cap on how long `startLockRenewal()` will keep renewing — past this it stops and the lock is allowed to go stale via the normal TTL/purge mechanism, so a genuinely-hung dispatch (event loop healthy, an `await` never resolving) still eventually releases its lock rather than holding it forever. |
+| `PA_PUBLIC_SYNC_LOCK_WAIT_MS` | `300000` (5 min) | How long `pa public-sync` waits for the `skill-exclusive:git-public-workflow` blackboard lock before exiting with code 5 (lock busy). Test-only override in practice — leave unset in production. |
+| `PA_TEST_TMP_DIR` | unset | Directory `pa/scripts/run-tests.mjs` and the bot's copy point `TMP`/`TEMP` at for the spawned test process, so temp files (sqlite fsyncs especially) land off the D: HDD. Used only when the directory exists; otherwise the runners fall back to `C:/wt/tmp` if that exists, and leave the OS default alone if neither does. Never set on CI. |
+| `PA_BOT_SELF_RESTART` | unset (enabled) | Set to `0` to disable the `bot-self-restart` maintenance job (`projects/telegram-bot/src/maintenance-jobs.ts`, `boundBotSelfRestart`) — a graceful stop-sentinel restart the bot performs on itself when `pa/dist/.build-stamp` or `projects/telegram-bot/dist/.build-stamp` is newer than the running process's start time AND the bot is idle (no in-flight dispatch, no pending topic action, no held topic lock, `@build` not held). Never an in-process restart — Task Scheduler relaunches the process on the newer `dist/`. See `docs/maintenance-jobs.md`. |
 
 ## Voice transcription env vars
 
@@ -188,7 +233,7 @@ Full walkthrough: docs/BOT_GUIDE.md "Voice messages (speech to text)". Something
 
 Running `node pa/dist/bin/pa.js init` scaffolds:
 
-- A minimal `config.yaml` with 5 default workers (zclaude, gemini, codex, claude, agy) at standard PATH-resolved commands
+- A minimal `config.yaml` with the default workers (claude, codex, agy, zclaude) at standard PATH-resolved commands
 - An empty `secrets.env` (you fill it in)
 - The codex-skill-translations.json + brain-files.json (defaults)
 - The `skills/`, `logs/`, `skill-drafts/` directories
@@ -202,11 +247,27 @@ The following variables can be set in ~/.pa/secrets.env to configure the Google 
 
 | Variable | Purpose | Default (if PA_HOME is set) |
 |---|---|---|
-| PA_OAUTH_START_SCRIPT | Path to the OAuth start script | pa/scripts/start_google_telegram_reauth.py |
+| PA_OAUTH_START_SCRIPT | Path to the OAuth start script. Read by the Telegram bot's `/reauth` command (`projects/telegram-bot/src/main.ts`) when it spawns a fresh reauth link (2026-08-23) — `preflight.py` and `google_reauth_kick.py` locate the same script by relative path instead, so this override only affects `/reauth`. | pa/scripts/start_google_telegram_reauth.py |
 | PA_OAUTH_FINISH_SCRIPT | Path to the OAuth finish script | pa/scripts/finish_google_telegram_reauth.py |
 | PA_OAUTH_SECRETS_FILE | Path to the Google client secrets JSON | ~/.pa/google-credentials-telegram.json |
 | PA_OAUTH_STATE_FILE | Path to store pending auth session state | ~/.pa/google-telegram-auth.json |
 | PA_OAUTH_TOKEN_FILE | Path to save the resulting Google token | ~/.pa/google-token.json |
 | GOOGLE_AUTH_REDIRECT_URI | The registered redirect URI (bridge page URL) | None (Required) |
 | PA_TELEGRAM_OAUTH_RESUME_HOOK | Path to an optional Python hook called after /auth success | ~/.pa/oauth_resume_hook.py |
+| PA_REAUTH_CHAT_ID | (2026-08-23) Chat that reauth links are delivered to — `google_reauth_kick.py`'s resolver reads it (env, then `~/.pa/secrets.env`) before falling back to `TELEGRAM_CHAT_ID`'s first entry. Deliberately the operator's general topic, never pa-alerts. | `TELEGRAM_CHAT_ID` (first entry) |
+| PA_REAUTH_THREAD_ID | (2026-08-23) Forum thread for reauth link delivery, same resolver as above. | `0` |
+
+## `run_brief.py` LLM env vars (2026-08-23)
+
+`projects/daily-mail-brief/scripts/run_brief.py` shells the Antigravity CLI (`agy`) for its
+one-shot completion, replacing the sunset `gemini` CLI (AI-131, retired for the rest of the
+worker fleet 2026-08-08). The prompt is always written to a temp file and passed as `@<path>`,
+never inlined — a briefing prompt with email headers can exceed the ~32 KB Windows
+command-line cap.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `AGY_CMD` | `<path-to-agy>` | Path to the agy shim/binary. Same variable the pre-push PII guard already reads (`examples/secrets.env.example`) — one setting covers both. |
+| `DAILY_MAIL_BRIEF_MODEL` | `gemini-3.7-flash-high` | `--model` value passed to agy. |
+| `DAILY_MAIL_BRIEF_PRINT_TIMEOUT` | `10m` | `--print-timeout` value passed to agy. |
 

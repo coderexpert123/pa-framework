@@ -7,13 +7,13 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'crypto';
 import { join } from 'path';
 import { mkdir, rm } from 'fs/promises';
-import { tools, pa_ref_lookup, pa_claims, pa_maintenance_status, pa_costs, pa_slo_report } from '../mcp/tools.js';
+import { tools, pa_ref_lookup, pa_claims, pa_maintenance_status, pa_costs, pa_slo_report, pa_recall } from '../mcp/tools.js';
 
 describe('MCP tool definitions (Wave H WPH2)', () => {
-  it('exports exactly five read-only tools', () => {
-    assert.equal(tools.length, 5);
+  it('exports exactly six read-only tools', () => {
+    assert.equal(tools.length, 6);
     const names = tools.map(t => t.name);
-    assert.deepEqual(names.sort(), ['pa_claims', 'pa_costs', 'pa_maintenance_status', 'pa_ref_lookup', 'pa_slo_report']);
+    assert.deepEqual(names.sort(), ['pa_claims', 'pa_costs', 'pa_maintenance_status', 'pa_recall', 'pa_ref_lookup', 'pa_slo_report']);
   });
 
   it('every tool has name, description, inputSchema, and handler', () => {
@@ -34,6 +34,15 @@ describe('MCP tool definitions (Wave H WPH2)', () => {
     assert.ok(pa_costs.inputSchema.properties.period);
     assert.ok(pa_costs.inputSchema.properties.skill);
     assert.equal(pa_costs.inputSchema.properties.period.enum?.includes('week'), true);
+  });
+
+  it('pa_recall requires q', () => {
+    assert.ok(pa_recall.inputSchema.required.includes('q'));
+    assert.ok(pa_recall.inputSchema.properties.q);
+  });
+
+  it('pa_recall source enum includes decisions (AI-164)', () => {
+    assert.ok(pa_recall.inputSchema.properties.source.enum.includes('decisions'));
   });
 
   it('no tool has a mutating verb in its name (read-only surface)', () => {

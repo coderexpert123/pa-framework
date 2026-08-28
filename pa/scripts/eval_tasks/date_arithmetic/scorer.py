@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Deterministic scorer for date arithmetic (Ekadashi-style).
+Deterministic scorer for date arithmetic (lunar calendar).
 Validates that the output contains a date in the expected range.
 """
 import re
@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 def score(output: str) -> dict:
     """
     Score the output for date arithmetic correctness.
-    The next Ekadashi after 2026-08-18 should be 2026-08-25 (11 days later).
+    The next lunar day 11 after 2026-08-18 should be 2026-08-25 (11 days later).
     We accept dates within ±1 day to account for interpretation.
     """
     # Match ISO date format YYYY-MM-DD
@@ -24,7 +24,7 @@ def score(output: str) -> dict:
 
     try:
         output_date = datetime.strptime(date_match.group(), '%Y-%m-%d')
-        expected_date = datetime(2026, 8, 25)  # 11 days after 2026-08-14 (Ekadashi) + cycle
+        expected_date = datetime(2026, 8, 25)  # 11 days after 2026-08-14 (lunar day 11) + cycle
 
         # Allow ±1 day tolerance
         diff = abs((output_date - expected_date).days)

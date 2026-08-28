@@ -169,6 +169,22 @@ describe('pending-dispatches store', () => {
     assert.equal(listed[0].workerName, 'claude');
   });
 
+  it('updatePendingDispatch persists the userTextSettled marker through a simulated restart (Edit A shape)', async () => {
+    const rec = makeRecord();
+    const key = pendingDispatchKey(rec.chatId, rec.threadId, rec.updateId);
+    await addPendingDispatch(rec);
+    await updatePendingDispatch(key, { userText: '[Voice message] hello', userTextSettled: true });
+    _resetPendingDispatchesForTest();
+    const listed = await listPendingDispatches();
+    assert.equal(listed.length, 1);
+    const updated = listed[0];
+    assert.equal(updated.userText, '[Voice message] hello');
+    assert.equal(updated.userTextSettled, true);
+    // Original fields preserved
+    assert.equal(updated.cwd, 'D:/Personal Assistant');
+    assert.equal(updated.session?.session_id, 'abc-123');
+  });
+
   it('backward compat: loading an old on-disk record without new fields still works', async () => {
     // Write a JSON file directly with a record that has no teePath/workerName
     const legacy = makeRecord();

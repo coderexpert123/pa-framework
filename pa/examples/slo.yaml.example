@@ -29,10 +29,10 @@ services:
       - app-log
     description: Catchup heartbeat gaps (events = gaps >30min)
 
-  - name: ekadashi-alerts
+  - name: my-scheduled-skill
     target: 100.0
     targetHuman: "zero-miss"
     period: month
     eventSources:
-      - ekadashi-watchdog
-    description: Ekadashi alert delivery (watchdog miss detections)
+      - my-skill-receipts
+    description: My scheduled skill delivery (example — customize for your scheduled tasks)

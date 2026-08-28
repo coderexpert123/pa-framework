@@ -8,7 +8,7 @@
 node pa/dist/bin/pa.js health
 ```
 
-It runs 10 checks. Each one prints `PASS`, `WARN`, or `FAIL` with a short message. The improved messages (Phase 6 of the publication plan) include actionable remediation hints — read them carefully.
+It runs 11 checks. Each one prints `PASS`, `WARN`, or `FAIL` with a short message. The improved messages (Phase 6 of the publication plan) include actionable remediation hints — read them carefully.
 
 ## Common failure modes
 
@@ -76,7 +76,7 @@ Or manually move `~/.pa/logs/telegram-bot.log` to `~/.pa/archive/`.
 
 None of your configured workers passed their `check`. Causes:
 
-1. **Worker CLI not installed** — install at least one (Claude Code, gemini-cli, openai-codex).
+1. **Worker CLI not installed** — install at least one (Claude Code, openai-codex).
 2. **`command` path wrong** in `~/.pa/config.yaml` — see [`WORKERS_GUIDE.md`](WORKERS_GUIDE.md).
 3. **All workers cooling** (rate-limited) — wait, or `rm ~/.pa/rate-limit-state.json` to clear cooldowns (only if you're certain they're stale).
 4. **PATH issue** — if commands work in a fresh shell but `pa workers` reports unavailable, the bot's environment may not include the right PATH. Set `command` to an absolute path.
@@ -166,11 +166,10 @@ Then `pa list` will show it.
 
 ### "Worker 'zclaude' check failed or script missing"
 
-The default `pa init` config lists 5 workers by name (zclaude, gemini, codex, claude, agy). If none are installed, `pa run` fails immediately.
+The default `pa init` config lists 4 workers by name (claude, codex, agy, zclaude). If none are installed, `pa run` fails immediately.
 
 Fix: install at least one of:
 - Claude Code: [installation guide](https://github.com/anthropics/claude-code)
-- Gemini CLI: [installation guide](https://github.com/google-gemini/gemini-cli)
 - OpenAI Codex: [installation guide](https://github.com/openai/codex)
 
 Then verify with `pa workers`. Adjust `command` paths in `~/.pa/config.yaml` if needed.

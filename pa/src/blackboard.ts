@@ -1,8 +1,11 @@
 import { join } from 'path';
+import { randomBytes } from 'crypto';
 import fs from 'fs-extra';
 import lockfile from 'proper-lockfile';
 import { paHome } from './paths.js';
 import { safeLockOptions } from './lib/safe-lock.js';
+import { log } from './lib/log.js';
+import { writeJsonAtomic } from './lib/atomic-write.js';
 
 export interface LockEntry {
   resource: string;
@@ -90,7 +93,8 @@ export class Blackboard {
     try {
       return await fs.readJson(this.path);
     } catch (err) {
-      console.warn('[blackboard] Failed to read blackboard.json, resetting:', err);
+      const refId = `s-${randomBytes(6).toString('hex')}`;
+      log('error', 'blackboard', 'store unreadable — resetting to empty', { refId, path: this.path, error: String(err) });
       return { active_locks: [] };
     }
   }
@@ -175,7 +179,7 @@ export class Blackboard {
           ...(contextId !== undefined ? { contextId } : {}),
         });
 
-        await fs.writeJson(this.path, { active_locks: nextLocks }, { spaces: 2 });
+        await writeJsonAtomic(this.path, { active_locks: nextLocks }, { spaces: 2 });
         return true;
       } catch (err) {
         console.error('[blackboard] acquireLock error:', err);
@@ -196,17 +200,26 @@ export class Blackboard {
    *   for `pa catchup` / `pa purge-locks` which don't use contextId).
    * - Provided → remove only the entry whose contextId matches, leaving any
    *   other concurrent entries untouched.
+   *
+   * opts.pid (4th param, optional, D4 — additive): when given, only rows whose
+   * pid matches are removed too. Omitting it preserves every existing caller's
+   * behaviour unchanged (matches on resource+agent+contextId only).
    */
-  async releaseLock(resource: string, agent: string, contextId?: string): Promise<void> {
+  async releaseLock(resource: string, agent: string, contextId?: string, opts?: { pid?: number }): Promise<void> {
     await this.ensureFile();
     let release: (() => Promise<void>) | undefined;
     try {
       release = await lockfile.lock(this.path, safeLockOptions('blackboard', { retries: 5 }));
       const data = await this.readData();
       const activeLocks = data.active_locks.filter(
-        (l) => !(l.resource === resource && l.agent === agent && (!contextId || l.contextId === contextId))
+        (l) => !(
+          l.resource === resource &&
+          l.agent === agent &&
+          (!contextId || l.contextId === contextId) &&
+          (opts?.pid === undefined || l.pid === opts.pid)
+        )
       );
-      await fs.writeJson(this.path, { active_locks: activeLocks }, { spaces: 2 });
+      await writeJsonAtomic(this.path, { active_locks: activeLocks }, { spaces: 2 });
     } catch (err) {
       console.error('[blackboard] releaseLock error:', err);
     } finally {
@@ -232,7 +245,7 @@ export class Blackboard {
       );
       if (entry) {
         entry.heartbeat = new Date().toISOString();
-        await fs.writeJson(this.path, data, { spaces: 2 });
+        await writeJsonAtomic(this.path, data, { spaces: 2 });
         return true;
       }
       return false;
@@ -270,7 +283,7 @@ export class Blackboard {
       const activeLocks = data.active_locks.filter((lock) => {
         return isPidAlive(lock.pid) && (now.getTime() - new Date(lock.heartbeat).getTime() < heartbeatStaleMs());
       });
-      await fs.writeJson(this.path, { active_locks: activeLocks }, { spaces: 2 });
+      await writeJsonAtomic(this.path, { active_locks: activeLocks }, { spaces: 2 });
       return before - activeLocks.length;
     } catch (err) {
       console.error('[blackboard] purgeStaleLocks error:', err);
@@ -294,6 +307,12 @@ export interface LockRenewalOptions {
    * setInterval can't fire). */
   maxMs?: number;
   onLost?: (reason: 'expired' | 'purged') => void;
+  /** Renew through this client instead of the module-singleton `blackboard`
+   * (C13) — callers that inject a fake/BlackboardLockClient for their own
+   * acquire/release (code-fixer.ts, self-improver.ts) must renew through the
+   * SAME client, or their tests' fakes silently start hitting the real
+   * blackboard singleton the moment they migrate onto this helper. */
+  client?: Pick<Blackboard, 'updateHeartbeat'>;
 }
 
 /**
@@ -314,6 +333,7 @@ export function startLockRenewal(
   const intervalMs = opts?.intervalMs ?? envMs('PA_LOCK_RENEW_INTERVAL_MS') ?? 60_000;
   const maxMs = opts?.maxMs ?? envMs('PA_LOCK_RENEW_MAX_MS') ?? 6 * 60 * 60 * 1000;
   const onLost = opts?.onLost;
+  const client = opts?.client ?? blackboard;
   const start = Date.now();
   let stopped = false;
   let inFlight = false;
@@ -340,7 +360,7 @@ export function startLockRenewal(
     }
     if (inFlight) return; // overlap guard: skip the UPDATE if the previous hasn't settled
     inFlight = true;
-    blackboard.updateHeartbeat(resource, agent, contextId)
+    client.updateHeartbeat(resource, agent, contextId)
       .then((refreshed) => {
         // Row already purged (e.g. a competing holder acquired it, or it went
         // stale before this renewer's first tick) — latched, never re-acquire,

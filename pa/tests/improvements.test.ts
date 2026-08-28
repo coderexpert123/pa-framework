@@ -32,7 +32,7 @@ async function createTempMeta(skillName: string, meta: RunMeta, nonce: string): 
 }
 
 function makeMeta(overrides: Partial<RunMeta> = {}): RunMeta {
-  return { worker: 'gemini', status: 'success', exitCode: 0, duration: 1000, timestamp: new Date().toISOString(), ...overrides };
+  return { worker: 'codex', status: 'success', exitCode: 0, duration: 1000, timestamp: new Date().toISOString(), ...overrides };
 }
 
 function makeRecord(overrides: Partial<AuditRecord> = {}): AuditRecord {
@@ -508,5 +508,182 @@ describe('improvementsCommand', () => {
     assert.match(text, /rolled-back/);
     assert.match(text, /reverted commit abc1234/);
     assert.match(text, /revert: def5678/);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Outcome column tests (AI-168 WP-C)
+  // ---------------------------------------------------------------------------
+  describe('outcome column (±14d acted_on rate)', () => {
+    it('renders delta line when both before and after windows have decision data', async () => {
+      const record = makeRecord({
+        draft: 'test-fix', action: 'applied-fix', target_skill: 'test-skill',
+        baseline: { window_days: 14, runs: 1, successes: 1, failures: 0 },
+      });
+
+      // Manually build an entry with outcome data (bypassing improvementsCommand for direct testing)
+      const entry: EvalEntry = {
+        record,
+        current: { windowDays: 14, runs: 2, successes: 2, failures: 0 },
+        outcome: {
+          before: { skill: 'test-skill', total: 3, approved: 2, rejected: 0, replied: 0, pending: 1, other_reaction: 0 },
+          after: { skill: 'test-skill', total: 5, approved: 4, rejected: 0, replied: 0, pending: 1, other_reaction: 0 },
+        },
+      };
+
+      const report = buildEvalReport([entry], 30);
+      assert.match(report, /outcome \(±14d acted_on\): 67% \(2\/3\) → 80% \(4\/5\) \(delta \+13pp\)/);
+    });
+
+    it('renders "only after" when before window has no decision data', async () => {
+      const entry: EvalEntry = {
+        record: makeRecord({
+          draft: 'test-fix', action: 'applied-fix', target_skill: 'test-skill',
+          baseline: { window_days: 14, runs: 1, successes: 1, failures: 0 },
+        }),
+        current: { windowDays: 14, runs: 1, successes: 1, failures: 0 },
+        outcome: {
+          before: null,
+          after: { skill: 'test-skill', total: 4, approved: 3, rejected: 0, replied: 0, pending: 1, other_reaction: 0 },
+        },
+      };
+
+      const report = buildEvalReport([entry], 30);
+      assert.match(report, /outcome \(±14d acted_on\): after 75% \(3\/4\) \(delta n\/a — no before-window rows\)/);
+    });
+
+    it('renders "only before" when after window has no decision data yet', async () => {
+      const entry: EvalEntry = {
+        record: makeRecord({
+          draft: 'test-fix', action: 'applied-fix', target_skill: 'test-skill',
+          baseline: { window_days: 14, runs: 1, successes: 1, failures: 0 },
+        }),
+        current: { windowDays: 14, runs: 1, successes: 1, failures: 0 },
+        outcome: {
+          before: { skill: 'test-skill', total: 3, approved: 2, rejected: 0, replied: 0, pending: 1, other_reaction: 0 },
+          after: null,
+        },
+      };
+
+      const report = buildEvalReport([entry], 30);
+      assert.match(report, /outcome \(±14d acted_on\): before 67% \(2\/3\) \(delta n\/a — no after-window rows yet\)/);
+    });
+
+    it('renders "n/a (no decision data)" when both windows are null or empty', async () => {
+      const entry: EvalEntry = {
+        record: makeRecord({
+          draft: 'test-fix', action: 'applied-fix', target_skill: 'test-skill',
+          baseline: { window_days: 14, runs: 1, successes: 1, failures: 0 },
+        }),
+        current: { windowDays: 14, runs: 1, successes: 1, failures: 0 },
+        outcome: {
+          before: null,
+          after: null,
+        },
+      };
+
+      const report = buildEvalReport([entry], 30);
+      assert.match(report, /outcome \(±14d acted_on\): n\/a \(no decision data\)/);
+    });
+
+    it('renders "n/a (no decision data)" when stats object has total === 0', async () => {
+      const entry: EvalEntry = {
+        record: makeRecord({
+          draft: 'test-fix', action: 'applied-fix', target_skill: 'test-skill',
+          baseline: { window_days: 14, runs: 1, successes: 1, failures: 0 },
+        }),
+        current: { windowDays: 14, runs: 1, successes: 1, failures: 0 },
+        outcome: {
+          before: { skill: 'test-skill', total: 0, approved: 0, rejected: 0, replied: 0, pending: 0, other_reaction: 0 },
+          after: { skill: 'test-skill', total: 0, approved: 0, rejected: 0, replied: 0, pending: 0, other_reaction: 0 },
+        },
+      };
+
+      const report = buildEvalReport([entry], 30);
+      assert.match(report, /outcome \(±14d acted_on\): n\/a \(no decision data\)/);
+    });
+
+    it('shows "n/a (no decision data)" for rollback-failed records even when outcome data exists', async () => {
+      const entry: EvalEntry = {
+        record: makeRecord({
+          draft: 'pii-fix', action: 'rollback-failed', target_skill: 'pii-audit',
+          commit_hash: '7b82c88', reason: 'git revert failed', baseline: undefined,
+        }),
+        current: { windowDays: 30, runs: 1, successes: 0, failures: 1 },
+        outcome: {
+          before: { skill: 'pii-audit', total: 3, approved: 2, rejected: 0, replied: 0, pending: 1, other_reaction: 0 },
+          after: { skill: 'pii-audit', total: 5, approved: 4, rejected: 0, replied: 0, pending: 1, other_reaction: 0 },
+        },
+      };
+
+      const report = buildEvalReport([entry], 30);
+      assert.match(report, /outcome \(±14d acted_on\): n\/a \(no decision data\)/);
+    });
+
+    it('shows "n/a (no decision data)" for rollback-accepted records', async () => {
+      const entry: EvalEntry = {
+        record: makeRecord({
+          draft: 'pii-fix', action: 'rollback-accepted', target_skill: 'pii-audit',
+          commit_hash: '7b82c88', accepted_at: '2026-07-22T09:00:00.000Z', accepted_by: 'human',
+          reason: 'Accepted', baseline: undefined,
+        }),
+        current: { windowDays: 30, runs: 1, successes: 0, failures: 1 },
+        outcome: {
+          before: { skill: 'pii-audit', total: 3, approved: 2, rejected: 0, replied: 0, pending: 1, other_reaction: 0 },
+          after: { skill: 'pii-audit', total: 5, approved: 4, rejected: 0, replied: 0, pending: 1, other_reaction: 0 },
+        },
+      };
+
+      const report = buildEvalReport([entry], 30);
+      assert.match(report, /outcome \(±14d acted_on\): n\/a \(no decision data\)/);
+    });
+
+    it('handles records with no outcome field (pre-AI-168 entries)', async () => {
+      const entry: EvalEntry = {
+        record: makeRecord({
+          draft: 'old-fix', action: 'applied-fix', target_skill: 'old-skill',
+          baseline: { window_days: 14, runs: 1, successes: 1, failures: 0 },
+        }),
+        current: { windowDays: 14, runs: 1, successes: 1, failures: 0 },
+        // No outcome field
+      };
+
+      const report = buildEvalReport([entry], 30);
+      assert.match(report, /outcome \(±14d acted_on\): n\/a \(no decision data\)/);
+    });
+
+    it('computes acted_on rate correctly with replied decisions', async () => {
+      const entry: EvalEntry = {
+        record: makeRecord({
+          draft: 'test-fix', action: 'applied-fix', target_skill: 'test-skill',
+          baseline: { window_days: 14, runs: 1, successes: 1, failures: 0 },
+        }),
+        current: { windowDays: 14, runs: 1, successes: 1, failures: 0 },
+        outcome: {
+          before: { skill: 'test-skill', total: 10, approved: 5, rejected: 2, replied: 2, pending: 1, other_reaction: 0 },
+          after: { skill: 'test-skill', total: 10, approved: 6, rejected: 1, replied: 2, pending: 1, other_reaction: 0 },
+        },
+      };
+
+      const report = buildEvalReport([entry], 30);
+      // acted_on = approved + replied = 5+2=7 (70%) before, 6+2=8 (80%) after
+      assert.match(report, /outcome \(±14d acted_on\): 70% \(7\/10\) → 80% \(8\/10\) \(delta \+10pp\)/);
+    });
+
+    it('computes negative delta for rate regression', async () => {
+      const entry: EvalEntry = {
+        record: makeRecord({
+          draft: 'regression-fix', action: 'applied-fix', target_skill: 'regression-skill',
+          baseline: { window_days: 14, runs: 1, successes: 1, failures: 0 },
+        }),
+        current: { windowDays: 14, runs: 1, successes: 1, failures: 0 },
+        outcome: {
+          before: { skill: 'regression-skill', total: 10, approved: 8, rejected: 1, replied: 0, pending: 1, other_reaction: 0 },
+          after: { skill: 'regression-skill', total: 10, approved: 5, rejected: 3, replied: 0, pending: 2, other_reaction: 0 },
+        },
+      };
+
+      const report = buildEvalReport([entry], 30);
+      assert.match(report, /outcome \(±14d acted_on\): 80% \(8\/10\) → 50% \(5\/10\) \(delta -30pp\)/);
+    });
   });
 });

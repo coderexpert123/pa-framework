@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { addTurn, formatHistory, loadState, saveState, loadTopicState, saveTopicState, findHistoricalSessionTurns, findRecentTurnsByTopic, listTopicStateRefs, findArchivedTurnByMessageId } from '../conversation.js';
+import { addTurn, formatHistory, loadState, saveState, loadTopicState, saveTopicState, findHistoricalSessionTurns, findRecentTurnsByTopic, listTopicStateRefs, findArchivedTurnByMessageId, type JoinableTurn } from '../conversation.js';
 import type { ConversationState, ConversationTurn } from '../types.js';
 
 let tempDir: string;
@@ -594,6 +594,31 @@ describe('conversation archival', () => {
     assert.ok(assistantTurn, 'assistant turn must be archived');
     assert.equal(assistantTurn.refId, 'c-a59a');
   });
+
+  it('a plain ConversationTurn archives unchanged alongside a JoinableTurn one — old rows and new rows must both parse', async () => {
+    const state = makeState();
+    // Plain ConversationTurn — no update_id, no run_id (pre-wave shape).
+    addTurn(state, makeTurn('user', 'plain turn', 200));
+    // JoinableTurn — carries the new join field.
+    const joined: JoinableTurn = {
+      role: 'assistant',
+      text: 'joined turn',
+      timestamp: new Date().toISOString(),
+      worker: 'agy',
+      update_id: 777333,
+    };
+    addTurn(state, joined);
+    await saveState(state);
+
+    const archived = await readArchive();
+    assert.equal(archived.length, 2);
+    const plainRow = archived.find((t) => t.text === 'plain turn');
+    const joinedRow = archived.find((t) => t.text === 'joined turn') as ConversationTurn & { update_id?: number };
+    assert.ok(plainRow, 'plain ConversationTurn row must still parse and archive');
+    assert.equal((plainRow as any).update_id, undefined, 'plain row must not gain an update_id');
+    assert.ok(joinedRow, 'JoinableTurn row must still parse and archive');
+    assert.equal(joinedRow.update_id, 777333, 'JoinableTurn row must keep its update_id');
+  });
 });
 
 describe('preferred_worker persistence', () => {
@@ -800,6 +825,45 @@ describe('saveTopicState', () => {
       .filter((t: any) => t && t.thread_id === 29);
 
     assert.equal(thread29Lines.length, 2, `expected 2 thread-29 entries, got ${thread29Lines.length}`);
+  });
+
+  it('a JoinableTurn assistant turn carrying session_id + update_id round-trips through saveTopicState into conversation-history.jsonl with both fields present', async () => {
+    const state = await loadTopicState(123, 7822);
+    const assistantTurn: JoinableTurn = {
+      role: 'assistant',
+      text: 'answer with join fields',
+      timestamp: new Date().toISOString(),
+      worker: 'agy',
+      session_id: 'sess-join-1',
+      update_id: 555111,
+    };
+    addTurn(state, assistantTurn);
+    await saveTopicState(state);
+
+    const raw = await readFile(join(tempDir, 'conversation-history.jsonl'), 'utf8');
+    const archived = raw.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const row = archived.find((t) => t.role === 'assistant');
+    assert.ok(row, 'assistant turn must be archived');
+    assert.equal(row.session_id, 'sess-join-1', 'session_id must survive the archive round-trip');
+    assert.equal(row.update_id, 555111, 'update_id must survive the archive round-trip');
+  });
+
+  it('a JoinableTurn survives into the topic-state file without breaking loadTopicState', async () => {
+    const state = await loadTopicState(123, 7823);
+    const userTurn: JoinableTurn = {
+      role: 'user',
+      text: 'question with update_id',
+      timestamp: new Date().toISOString(),
+      message_id: 42,
+      update_id: 555222,
+    };
+    addTurn(state, userTurn);
+    await saveTopicState(state);
+
+    const loaded = await loadTopicState(123, 7823);
+    assert.equal(loaded.turns.length, 1, 'topic state must load the JoinableTurn back');
+    assert.equal((loaded.turns[0] as JoinableTurn).update_id, 555222, 'update_id must survive the topic-state round-trip');
+    assert.equal(loaded.turns[0].text, 'question with update_id');
   });
 });
 
@@ -1072,5 +1136,67 @@ describe('findArchivedTurnByMessageId', () => {
     const padding = 'x'.repeat(9 * 1024 * 1024);
     await writeFile(archivePath, `${matchingLine}\n// ${padding}\n`, 'utf8');
     assert.equal(await findArchivedTurnByMessageId(5, 42), null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// saveState / saveTopicState atomicity (WP-E, 2026-08-23) — V4-F5
+// ---------------------------------------------------------------------------
+
+describe('saveState atomicity', () => {
+  it('saveState leaves no .tmp and produces parseable JSON', async () => {
+    const state = makeState();
+    addTurn(state, makeTurn('user', 'atomic check'));
+    await saveState(state);
+
+    const tmpPath = join(tempDir, 'telegram-bot-state.json.tmp');
+    await assert.rejects(readFile(tmpPath, 'utf8'), { code: 'ENOENT' }, 'no .tmp file must survive a successful save');
+
+    const raw = await readFile(join(tempDir, 'telegram-bot-state.json'), 'utf8');
+    assert.doesNotThrow(() => JSON.parse(raw), 'saved state file must be parseable JSON');
+  });
+
+  it('a pre-existing stale telegram-bot-state.json.tmp does not corrupt the next save', async () => {
+    const tmpPath = join(tempDir, 'telegram-bot-state.json.tmp');
+    await writeFile(tmpPath, 'stale garbage from a prior crash', 'utf8');
+
+    const state = makeState();
+    addTurn(state, makeTurn('user', 'fresh save'));
+    await saveState(state);
+
+    const loaded = await loadState(123);
+    assert.equal(loaded.turns.length, 1);
+    assert.equal(loaded.turns[0].text, 'fresh save');
+
+    await assert.rejects(readFile(tmpPath, 'utf8'), { code: 'ENOENT' }, 'stale .tmp must be consumed/replaced, not left behind');
+  });
+});
+
+describe('saveTopicState atomicity', () => {
+  it('saveTopicState is atomic: leaves no .tmp and produces parseable JSON', async () => {
+    const state = await loadTopicState(123, 88);
+    addTurn(state, { role: 'user', text: 'atomic topic check', timestamp: new Date().toISOString() });
+    await saveTopicState(state);
+
+    const tmpPath = join(tempDir, 'telegram-bot-topic-123_88.json.tmp');
+    await assert.rejects(readFile(tmpPath, 'utf8'), { code: 'ENOENT' }, 'no .tmp file must survive a successful save');
+
+    const raw = await readFile(join(tempDir, 'telegram-bot-topic-123_88.json'), 'utf8');
+    assert.doesNotThrow(() => JSON.parse(raw), 'saved topic state file must be parseable JSON');
+  });
+
+  it('a pre-existing stale topic .tmp does not corrupt the next save', async () => {
+    const tmpPath = join(tempDir, 'telegram-bot-topic-123_89.json.tmp');
+    await writeFile(tmpPath, 'stale garbage from a prior crash', 'utf8');
+
+    const state = await loadTopicState(123, 89);
+    addTurn(state, { role: 'user', text: 'fresh topic save', timestamp: new Date().toISOString() });
+    await saveTopicState(state);
+
+    const loaded = await loadTopicState(123, 89);
+    assert.equal(loaded.turns.length, 1);
+    assert.equal(loaded.turns[0].text, 'fresh topic save');
+
+    await assert.rejects(readFile(tmpPath, 'utf8'), { code: 'ENOENT' }, 'stale .tmp must be consumed/replaced, not left behind');
   });
 });

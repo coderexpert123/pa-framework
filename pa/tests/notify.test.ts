@@ -1,3 +1,5 @@
+import './test-env-guard.js';
+
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFile, readFile, mkdir, readdir } from 'fs/promises';
@@ -350,18 +352,24 @@ describe('notifyUser — route resolution and confirmed delivery', () => {
     assert.equal(await dedupFileExists('rejected-key'), false, 'a rejected alert must stay un-deduped');
   });
 
-  it('reports a timed-out send honestly and writes NO dedup state', async () => {
+  it('reports a timed-out send honestly and writes only the short timeout mute, never an escalated window', async () => {
     await createTempSecrets(tempDir, 'TELEGRAM_BOT_TOKEN=tok\nPA_ALERTS_CHAT_ID=-100777\n');
     process.env.PA_NOTIFY_TIMEOUT_MS = '20';
     setupFetchMock(['hang']);
-    const { notifyUser } = await import('../src/lib/notify.js');
+    const { notifyUser, TIMEOUT_DEDUP_MS } = await import('../src/lib/notify.js');
 
     const result = await notifyUser('Test', 'body', { dedupKey: 'timeout-key' });
 
     assert.equal(result.sent, false);
     assert.equal(result.suppressed, false);
     assert.equal(result.reason, 'timeout-unknown-outcome', 'the race does not cancel the send — outcome is unknown, not failed');
-    assert.equal(await dedupFileExists('timeout-key'), false);
+    // 2026-08-23 (alerts wave, WP-D): a timeout used to write NO dedup state, so a
+    // chronically-timing-out alert re-fired on every per-minute tick (the 429 loop of
+    // plans/2026-08-23-alerts-week-review.md §5.4). It now writes a SHORT mute only —
+    // TIMEOUT_DEDUP_MS, count not advanced — never the confirmed-send escalated window.
+    const record = await readDedupFile('timeout-key');
+    assert.equal(record.windowMs, TIMEOUT_DEDUP_MS, 'timeout writes the short mute, not a confirmed-send window');
+    assert.equal(record.count ?? 0, 0, 'a timeout is not a confirmed send — escalation count must not advance');
   });
 
   it('suppresses the second alert once the first is confirmed delivered', async () => {
@@ -390,6 +398,177 @@ describe('notifyUser — route resolution and confirmed delivery', () => {
     assert.equal(result.reason, 'disabled');
     assert.equal(calls.length, 0);
     assert.equal(await dedupFileExists('disabled-route-key'), false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Escalating dedup + timeout short-dedup (2026-08-23 alerts wave, WP-D).
+//
+// A permanently failing condition used to page every flat dedup window
+// forever (restore-drill: 180 sends in 7.5 days). An UNCHANGED body now
+// doubles its stored window on each confirmed send, capped at
+// ESCALATION_CAP_MS (24h); a CHANGED body resets to count 1 / the base
+// window. A send that TIMES OUT (unknown outcome) writes a short
+// TIMEOUT_DEDUP_MS mute instead — the 429 loop of review §5.4 was a
+// timed-out send re-firing on every per-minute catchup tick because dedup
+// was written only on confirmed success.
+// ---------------------------------------------------------------------------
+
+describe('notifyUser — escalating dedup', () => {
+  let savedEnv: Record<string, string | undefined>;
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    savedEnv = {};
+    for (const key of ROUTE_ENV_KEYS) {
+      savedEnv[key] = process.env[key];
+      delete process.env[key];
+    }
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    for (const key of ROUTE_ENV_KEYS) {
+      if (savedEnv[key] !== undefined) process.env[key] = savedEnv[key];
+      else delete process.env[key];
+    }
+    globalThis.fetch = originalFetch;
+  });
+
+  it('doubles the stored window on each confirmed send of an unchanged body, capped at 24h', async () => {
+    await createTempSecrets(tempDir, 'TELEGRAM_BOT_TOKEN=tok\nPA_ALERTS_CHAT_ID=-100777\n');
+    const { notifyUser } = await import('../src/lib/notify.js');
+
+    // count 1..7 -> 1h, 2h, 4h, 8h, 16h, 24h, 24h (capped)
+    const expectedWindows = [3_600_000, 7_200_000, 14_400_000, 28_800_000, 57_600_000, 86_400_000, 86_400_000];
+    for (const windowMs of expectedWindows) {
+      setupFetchMock([{ ok: true }]);
+      await notifyUser('Test', 'same body', { dedupKey: 'escalate-key' });
+      const record = await readDedupFile('escalate-key');
+      assert.equal(record.windowMs, windowMs);
+      // Push the just-written record's timestamp into the past so the NEXT
+      // call lands past its (now-escalated) window and attempts a send
+      // instead of being dedup-suppressed.
+      await writeFile(dedupPath('escalate-key'), JSON.stringify({ ...record, timestamp: new Date(Date.now() - windowMs - 1000).toISOString() }), 'utf8');
+    }
+  });
+
+  it('resets count and window to the base when the body changes', async () => {
+    await createTempSecrets(tempDir, 'TELEGRAM_BOT_TOKEN=tok\nPA_ALERTS_CHAT_ID=-100777\n');
+    const { notifyUser } = await import('../src/lib/notify.js');
+
+    setupFetchMock([{ ok: true }]);
+    await notifyUser('Test', 'body A', { dedupKey: 'change-key' });
+    let record = await readDedupFile('change-key');
+    assert.equal(record.count, 1);
+    assert.equal(record.windowMs, 3_600_000);
+
+    // Escalate once more with the SAME body so count/window move off base.
+    await writeFile(dedupPath('change-key'), JSON.stringify({ ...record, timestamp: new Date(Date.now() - record.windowMs - 1000).toISOString() }), 'utf8');
+    setupFetchMock([{ ok: true }]);
+    await notifyUser('Test', 'body A', { dedupKey: 'change-key' });
+    record = await readDedupFile('change-key');
+    assert.equal(record.count, 2);
+    assert.equal(record.windowMs, 7_200_000);
+
+    // Push past the window again and send a DIFFERENT body — count/window
+    // must reset to base, not continue escalating.
+    await writeFile(dedupPath('change-key'), JSON.stringify({ ...record, timestamp: new Date(Date.now() - record.windowMs - 1000).toISOString() }), 'utf8');
+    setupFetchMock([{ ok: true }]);
+    await notifyUser('Test', 'body B — different', { dedupKey: 'change-key' });
+    record = await readDedupFile('change-key');
+    assert.equal(record.count, 1, 'a changed body resets count to 1');
+    assert.equal(record.windowMs, 3_600_000, 'a changed body resets the window to the caller base');
+  });
+
+  it('escalate: false keeps count and window flat across repeated confirmed sends', async () => {
+    await createTempSecrets(tempDir, 'TELEGRAM_BOT_TOKEN=tok\nPA_ALERTS_CHAT_ID=-100777\n');
+    const { notifyUser } = await import('../src/lib/notify.js');
+
+    for (let i = 0; i < 3; i++) {
+      setupFetchMock([{ ok: true }]);
+      await notifyUser('Test', 'same body', { dedupKey: 'noescalate-key', dedupWindowMs: 60_000, escalate: false });
+      const record = await readDedupFile('noescalate-key');
+      assert.equal(record.count, 1);
+      assert.equal(record.windowMs, 60_000);
+      await writeFile(dedupPath('noescalate-key'), JSON.stringify({ ...record, timestamp: new Date(Date.now() - 61_000).toISOString() }), 'utf8');
+    }
+  });
+
+  it('treats a legacy record (no count/bodyHash) as same-body and escalates from 1', async () => {
+    await createTempSecrets(tempDir, 'TELEGRAM_BOT_TOKEN=tok\nPA_ALERTS_CHAT_ID=-100777\n');
+    // Legacy shape: {timestamp, key} only — written by writeDedupFile — 2h old,
+    // past the 1h default window so the next call is not dedup-suppressed.
+    await writeDedupFile('legacy-key', new Date(Date.now() - 2 * 3_600_000).toISOString());
+    setupFetchMock([{ ok: true }]);
+    const { notifyUser } = await import('../src/lib/notify.js');
+
+    await notifyUser('Test', 'body', { dedupKey: 'legacy-key' });
+    const record = await readDedupFile('legacy-key');
+    assert.equal(record.count, 1);
+    assert.equal(record.windowMs, 3_600_000);
+    assert.equal(typeof record.bodyHash, 'string');
+  });
+
+  it('gcAlertState respects an escalated window, not the flat 24h default, at deletion time', async () => {
+    const { gcAlertState } = await import('../src/lib/notify.js');
+    await mkdir(join(tempDir, 'alert-state'), { recursive: true });
+
+    // Escalated to 8h (count 4): timestamp 9h ago -> past its own window -> deleted.
+    await writeFile(dedupPath('escalated-expired'), JSON.stringify({
+      timestamp: new Date(Date.now() - 9 * 3_600_000).toISOString(), key: 'escalated-expired', windowMs: 8 * 3_600_000, count: 4, bodyHash: 'abc',
+    }), 'utf8');
+    // Escalated to 24h (count 6): timestamp 9h ago -> still within its window -> kept.
+    await writeFile(dedupPath('escalated-alive'), JSON.stringify({
+      timestamp: new Date(Date.now() - 9 * 3_600_000).toISOString(), key: 'escalated-alive', windowMs: 24 * 3_600_000, count: 6, bodyHash: 'def',
+    }), 'utf8');
+
+    await gcAlertState();
+
+    const expiredExists = await readFile(dedupPath('escalated-expired'), 'utf8').then(() => true).catch(() => false);
+    const aliveExists = await readFile(dedupPath('escalated-alive'), 'utf8').then(() => true).catch(() => false);
+    assert.equal(expiredExists, false, 'a record whose escalated window has passed must be GC-ed');
+    assert.equal(aliveExists, true, 'a record whose escalated window has not passed must survive');
+  });
+});
+
+describe('notifyUser — timeout short-dedup', () => {
+  let savedEnv: Record<string, string | undefined>;
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    savedEnv = {};
+    for (const key of ROUTE_ENV_KEYS) {
+      savedEnv[key] = process.env[key];
+      delete process.env[key];
+    }
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    for (const key of ROUTE_ENV_KEYS) {
+      if (savedEnv[key] !== undefined) process.env[key] = savedEnv[key];
+      else delete process.env[key];
+    }
+    globalThis.fetch = originalFetch;
+  });
+
+  it('writes a short TIMEOUT_DEDUP_MS mute (count unchanged) and suppresses the immediate retry', async () => {
+    await createTempSecrets(tempDir, 'TELEGRAM_BOT_TOKEN=tok\nPA_ALERTS_CHAT_ID=-100777\n');
+    process.env.PA_NOTIFY_TIMEOUT_MS = '20';
+    setupFetchMock(['hang']);
+    const { notifyUser, TIMEOUT_DEDUP_MS } = await import('../src/lib/notify.js');
+
+    const first = await notifyUser('Test', 'body', { dedupKey: 'timeout-dedup-key' });
+    assert.equal(first.reason, 'timeout-unknown-outcome');
+
+    const record = await readDedupFile('timeout-dedup-key');
+    assert.equal(record.windowMs, TIMEOUT_DEDUP_MS);
+    assert.equal(record.count, 0, 'a timeout is not a confirmed send — count must not advance');
+
+    const second = await notifyUser('Test', 'body', { dedupKey: 'timeout-dedup-key' });
+    assert.equal(second.suppressed, true);
+    assert.equal(second.reason, 'dedup-suppressed');
   });
 });
 

@@ -8,9 +8,8 @@ secrets:
   - TELEGRAM_BRIEFING_CHAT_ID
   - TELEGRAM_DAILY_BRIEFING_THREAD_ID
   - OBSIDIAN_BRIEFS_DIR
-  - GEMINI_CMD
   - PA_FRAMEWORK_ROOT
-worker: gemini
+worker: agy
 telegram_output:
   chat_id: '${TELEGRAM_BRIEFING_CHAT_ID}'
   thread_id: '${TELEGRAM_DAILY_BRIEFING_THREAD_ID}'
@@ -34,7 +33,7 @@ Gmail headers, triage them via an LLM, and post a concise briefing to Telegram.
 
 1. **Preflight auth check** (`scripts/preflight.py`) — verifies Gmail OAuth still works.
 2. **Fetch headers** (`scripts/fetch_headers.py`) — pulls all email headers for the 12-hour window since last run.
-3. **Triage** — the gemini worker classifies each as `ACTION_REQUIRED`, `NOTEWORTHY`, or `SKIP`.
+3. **Triage** — the agy worker classifies each as `ACTION_REQUIRED`, `NOTEWORTHY`, or `SKIP`.
 4. **Fetch bodies** (`scripts/fetch_bodies.py`) — selective full-body fetch for ambiguous entries.
 5. **Compose briefing** — markdown summary with sections per category.
 6. **Send to Telegram** (`scripts/send_telegram.py`) — the worker output is also routed via `telegram_output` envelope.
@@ -44,9 +43,9 @@ Gmail headers, triage them via an LLM, and post a concise briefing to Telegram.
 This skill demonstrates:
 
 - **`on_missed: all`** — catch-up mode processes all missed windows (up to 10), not just the latest.
-- **`worker: gemini`** — explicit worker override (default would be priority-ordered).
+- **`worker: agy`** — explicit worker override (default would be priority-ordered).
 - **Env interpolation** — `cwd`, `telegram_output.chat_id`, and `telegram_output.thread_id` all use `${VAR}` syntax substituted at skill-load time from `~/.pa/secrets.env`.
 - **`secrets: [...]`** — env vars from secrets.env are injected into the spawned worker process.
 - **Assertion contract** — `scripts/send_telegram.py` verifies the briefing's `[pa assert] emails.json listed={n}` header matches the actual email count before sending.
 
-The body above is the prompt sent to gemini, but since `cmd:` is also set, the framework runs the Python script directly without delegating to the LLM. Comment out `cmd:` to switch to LLM-delegated mode where gemini receives the body as its prompt and orchestrates the Python scripts via tool use.
+The body above is the prompt sent to agy, but since `cmd:` is also set, the framework runs the Python script directly without delegating to the LLM. Comment out `cmd:` to switch to LLM-delegated mode where agy receives the body as its prompt and orchestrates the Python scripts via tool use.
