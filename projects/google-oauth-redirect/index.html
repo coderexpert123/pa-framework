@@ -93,6 +93,7 @@
         </div>
     </div>
 
+    <script src="config.js" onerror="window.__paConfigMissing=true"></script>
     <script>
         const urlParams = new URLSearchParams(window.location.search);
         const code = urlParams.get('code');
@@ -101,6 +102,25 @@
         const copyBtn = document.getElementById('copy-btn');
         const successMsg = document.getElementById('success-msg');
         const authCommand = code ? `/auth ${code}${state ? ` ${state}` : ''}` : '';
+
+        // Optional "Send to PA" deep link (plans/2026-08-24-buttons-program-SPEC.md
+        // §3.5). Only rendered when config.js was deployed AND set a valid
+        // Telegram username — without it (the default), this page behaves
+        // exactly as it did before this button existed. No fetch, no new
+        // external request: t.me is a link the user taps, never loaded here.
+        const botUsername = typeof window.PA_BOT_USERNAME === 'string' ? window.PA_BOT_USERNAME : '';
+        if (code && /^[A-Za-z0-9_]{5,32}$/.test(botUsername)) {
+            const sendToPaBtn = document.createElement('a');
+            sendToPaBtn.id = 'send-to-pa-btn';
+            sendToPaBtn.className = 'copy-btn';
+            sendToPaBtn.style.display = 'block';
+            sendToPaBtn.style.boxSizing = 'border-box';
+            sendToPaBtn.style.textDecoration = 'none';
+            sendToPaBtn.style.marginTop = '10px';
+            sendToPaBtn.textContent = 'Send to PA';
+            sendToPaBtn.href = `https://t.me/${botUsername}?text=${encodeURIComponent(authCommand)}`;
+            copyBtn.insertAdjacentElement('afterend', sendToPaBtn);
+        }
 
         if (code) {
             commandDisplay.textContent = authCommand;

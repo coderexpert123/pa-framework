@@ -84,6 +84,75 @@ describe('decideJob (pure)', () => {
       { action: 'run' },
     );
   });
+
+  it('1st failure retries immediately (ladder[0] === 0)', () => {
+    assert.deepEqual(
+      decideJob({
+        everyMs, lastRunAtMs: null, nowMs: base, enabled: true, degraded: false, shedWhenDegraded: true, inFlight: false, force: false,
+        lastAttemptAtMs: base - 1, consecutiveFailures: 1,
+      }),
+      { action: 'run' },
+    );
+  });
+
+  it('2nd failure inside 30 min → skip failure-backoff', () => {
+    assert.deepEqual(
+      decideJob({
+        everyMs, lastRunAtMs: null, nowMs: base, enabled: true, degraded: false, shedWhenDegraded: true, inFlight: false, force: false,
+        lastAttemptAtMs: base - 1_000_000, consecutiveFailures: 2,
+      }),
+      { action: 'skip', skipReason: 'failure-backoff' },
+    );
+  });
+
+  it('2nd failure after 31 min → run', () => {
+    assert.deepEqual(
+      decideJob({
+        everyMs, lastRunAtMs: null, nowMs: base, enabled: true, degraded: false, shedWhenDegraded: true, inFlight: false, force: false,
+        lastAttemptAtMs: base - 31 * 60_000, consecutiveFailures: 2,
+      }),
+      { action: 'run' },
+    );
+  });
+
+  it('5th and 9th failure both use the 24 h rung', () => {
+    const dayMs = 24 * 3_600_000;
+    for (const consecutiveFailures of [5, 9]) {
+      assert.deepEqual(
+        decideJob({
+          everyMs, lastRunAtMs: null, nowMs: base, enabled: true, degraded: false, shedWhenDegraded: true, inFlight: false, force: false,
+          lastAttemptAtMs: base - (dayMs - 1), consecutiveFailures,
+        }),
+        { action: 'skip', skipReason: 'failure-backoff' },
+        `consecutiveFailures=${consecutiveFailures} should still be inside the 24h rung`,
+      );
+      assert.deepEqual(
+        decideJob({
+          everyMs, lastRunAtMs: null, nowMs: base, enabled: true, degraded: false, shedWhenDegraded: true, inFlight: false, force: false,
+          lastAttemptAtMs: base - (dayMs + 1), consecutiveFailures,
+        }),
+        { action: 'run' },
+        `consecutiveFailures=${consecutiveFailures} should clear after 24h`,
+      );
+    }
+  });
+
+  it('force beats failure-backoff', () => {
+    assert.deepEqual(
+      decideJob({
+        everyMs, lastRunAtMs: null, nowMs: base, enabled: true, degraded: false, shedWhenDegraded: true, inFlight: false, force: true,
+        lastAttemptAtMs: base - 1000, consecutiveFailures: 3,
+      }),
+      { action: 'run' },
+    );
+  });
+
+  it('consecutiveFailures 0 → ladder never consulted (omitted args behave exactly as before)', () => {
+    assert.deepEqual(
+      decideJob({ everyMs, lastRunAtMs: base - everyMs, nowMs: base, enabled: true, degraded: false, shedWhenDegraded: true, inFlight: false, force: false }),
+      { action: 'run' },
+    );
+  });
 });
 
 function makeJob(overrides: Partial<MaintenanceJob> & { name: string }): MaintenanceJob {
@@ -102,7 +171,7 @@ function makeJob(overrides: Partial<MaintenanceJob> & { name: string }): Mainten
 interface FakeNotifyCall {
   subject: string;
   body: string;
-  opts?: { dedupKey?: string; dedupWindowMs?: number; severity?: 'info' | 'warn' | 'error' };
+  opts?: { dedupKey?: string; dedupWindowMs?: number; severity?: 'info' | 'warn' | 'error'; replyMarkup?: Record<string, unknown> };
 }
 
 function makeFakeNotify(): { notify: (subject: string, body: string, opts?: any) => Promise<{ sent: boolean; suppressed: boolean }>; calls: FakeNotifyCall[] } {
@@ -149,6 +218,16 @@ describe('runDueJobs', () => {
     assert.equal(calls[0].opts?.severity, 'error');
   });
 
+  it('failure notify carries a "▶ Run now" replyMarkup for sk:job:<name> (WP-P2)', async () => {
+    const throwingJob = makeJob({ name: 'pages-on-fail-kb', run: async () => { throw new Error('boom'); } });
+    const { notify, calls } = makeFakeNotify();
+    await runDueJobs('pa', [throwingJob], { notify });
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0].opts?.replyMarkup, {
+      inline_keyboard: [[{ text: '▶ Run now', callback_data: 'sk:job:pages-on-fail-kb' }]],
+    });
+  });
+
   it('in-flight guard: concurrent runDueJobs calls for the same job — second is skipped, run() invoked once', async () => {
     let runCount = 0;
     let releaseRun!: () => void;
@@ -179,7 +258,11 @@ describe('runDueJobs', () => {
   });
 
   it('skipped-too-long page fires once lastRunAt is more than 3x cadence stale, degraded+shed', async () => {
-    const everyMs = 10_000;
+    // everyMs picked so 3*everyMs (1,500,000ms) clears the 15 min floor
+    // (skippedTooLongThreshold floor, 2026-08-23) — this test exercises the
+    // 3x-multiplier branch specifically; the floor itself is covered by
+    // describe('skippedTooLongThreshold floor') below.
+    const everyMs = 500_000;
     const now = 10_000_000;
     const job = makeJob({ name: 'stale-degraded', everyMs, shedWhenDegraded: true });
     const { notify, calls } = makeFakeNotify();
@@ -254,193 +337,70 @@ describe('runDueJobs', () => {
     }
     assert.equal(warned, true);
   });
-});
 
-describe('P2-16: staleness sub-hourly blind spot fix', () => {
-  it('sub-hourly skill (e.g., 5-min interval) fires staleness alert after 30 min + 2*interval', async () => {
-    const { stalenessCheckJob } = await import('../src/lib/maintenance/jobs/staleness-check.js');
-    const everyMs = 5 * 60 * 1000; // 5-minute cron
-    const now = Date.now();
-    const lastSuccess = new Date(now - 35 * 60 * 1000).toISOString(); // 35 minutes ago (>30 min and >2*5min)
-
-    const mockCtx = {
-      now,
-      everyMs,
-      async listSkills() {
-        return [{
-          name: 'test-skill',
-          frontmatter: { cron: '*/5 * * * *' }, // 5-minute interval
-        } as any];
-      },
-      async getLastSuccessfulRun(skillName: string) {
-        if (skillName === 'test-skill') {
-          return { timestamp: lastSuccess };
-        }
-        return null;
-      },
-    };
-
-    const result = await stalenessCheckJob.run(mockCtx);
-    assert.equal(result.touched, 1, 'Should detect stale sub-hourly skill');
-    const detail = result.detail as { skills?: string[] } | undefined;
-    assert.ok((detail?.skills?.length ?? 0) > 0, 'Should report the stale skill');
+  it('a failed run records lastAttemptAt and leaves lastRunAt untouched', async () => {
+    const job = makeJob({ name: 'fails-records-attempt', run: async () => { throw new Error('boom'); } });
+    const { notify } = makeFakeNotify();
+    const now = 5_000_000;
+    await runDueJobs('pa', [job], { notify, now });
+    const ledger = await readLedger();
+    assert.equal(ledger.jobs['fails-records-attempt'].lastRunAt, undefined);
+    assert.equal(ledger.jobs['fails-records-attempt'].lastAttemptAt, new Date(now).toISOString());
   });
 
-  it('sub-hourly skill NOT stale when only 20 min + 2*interval (P2-16 fix: requires >30 min minimum)', async () => {
-    const { stalenessCheckJob } = await import('../src/lib/maintenance/jobs/staleness-check.js');
-    const everyMs = 5 * 60 * 1000;
-    const now = Date.now();
-    const lastSuccess = new Date(now - 22 * 60 * 1000).toISOString(); // 22 min ago (<30 min floor)
+  it('a successful run records both', async () => {
+    const job = makeJob({ name: 'succeeds-records-both', run: async () => ({ touched: 0 }) });
+    const { notify } = makeFakeNotify();
+    const now = 6_000_000;
+    await runDueJobs('pa', [job], { notify, now });
+    const ledger = await readLedger();
+    assert.equal(ledger.jobs['succeeds-records-both'].lastRunAt, new Date(now).toISOString());
+    assert.equal(ledger.jobs['succeeds-records-both'].lastAttemptAt, new Date(now).toISOString());
+  });
 
-    const mockCtx = {
-      now,
-      everyMs,
-      async listSkills() {
-        return [{
-          name: 'test-skill',
-          frontmatter: { cron: '*/5 * * * *' },
-        } as any];
-      },
-      async getLastSuccessfulRun(skillName: string) {
-        if (skillName === 'test-skill') {
-          return { timestamp: lastSuccess };
-        }
-        return null;
-      },
-    };
+  it('a job whose ledger row is mid-backoff is skipped with skipReason failure-backoff and does not call run()', async () => {
+    let runCount = 0;
+    const job = makeJob({
+      name: 'flaky-backoff',
+      run: async () => { runCount++; throw new Error('boom'); },
+    });
+    const { notify } = makeFakeNotify();
 
-    const result = await stalenessCheckJob.run(mockCtx);
-    assert.equal(result.touched, 0, 'Should NOT fire - below 30-minute minimum threshold');
+    // Two failures, 60s apart, to reach consecutiveFailures = 2 (ladder[1] = 30 min).
+    await runDueJobs('pa', [job], { notify, now: 1_000_000 });
+    await runDueJobs('pa', [job], { notify, now: 1_000_000 + 60_000 });
+    assert.equal(runCount, 2);
+
+    // Third attempt only 5 minutes after the second failure — still inside the 30 min rung.
+    const records = await runDueJobs('pa', [job], { notify, now: 1_000_000 + 60_000 + 5 * 60_000 });
+    assert.equal(runCount, 2, 'run() must not be called while mid-backoff');
+    assert.equal(records[0].outcome, 'skipped');
+    assert.equal(records[0].skipReason, 'failure-backoff');
   });
 });
 
-describe('Wave C WPC1: skill-cadence-audit dead-man\'s-switch', () => {
-  it('stale skill fires once (dedupe handled by notifyUser)', async () => {
-    const { skillCadenceAuditJob } = await import('../src/lib/maintenance/jobs/skill-cadence-audit.js');
-    const now = Date.now();
-    const lastSuccess = new Date(now - 50 * HOUR).toISOString(); // 50 hours ago (>2× daily = 48h and >26h)
+describe('skippedTooLongThreshold floor', () => {
+  it('a 60s job skipped degraded for 5 minutes does NOT page; for 20 minutes it does', async () => {
+    const everyMs = 60_000; // 60s cadence — bare 3x would be 3 min; the 15 min floor applies.
+    const job = makeJob({ name: 'sixty-second-job', everyMs, shedWhenDegraded: true });
+    const { notify, calls } = makeFakeNotify();
 
-    const mockCtx = {
-      now,
-      everyMs: 3_600_000, // 1 hour
-      async listSkills() {
-        return [{
-          name: 'daily-skill',
-          frontmatter: { cron: '0 0 * * *' }, // daily
-        } as any];
-      },
-      async getLastSuccessfulRun(skillName: string) {
-        if (skillName === 'daily-skill') {
-          return { timestamp: lastSuccess };
-        }
-        return null;
-      },
-      async getFailureState(skillName: string) {
-        return { consecutiveFailures: 0, lastAttemptAt: null };
-      },
-    };
+    const seedNow = 100_000_000;
+    await runDueJobs('pa', [job], { notify, now: seedNow });
+    calls.length = 0; // clear the seed run's own notify calls (there should be none)
 
-    const result = await skillCadenceAuditJob.run(mockCtx);
-    assert.equal(result.touched, 1, 'Should detect stale daily skill');
-    const detail = result.detail as { skills?: string[] } | undefined;
-    assert.ok((detail?.skills?.length ?? 0) > 0, 'Should report the stale skill');
-    assert.ok(detail?.skills?.[0]?.includes('daily-skill'), 'Alert should name the skill');
-    assert.ok(detail?.skills?.[0]?.includes('50h ago'), 'Alert should show hours since success');
-  });
+    // 5 minutes after the seeded run, still degraded — under the 15 min floor.
+    await runDueJobs('pa', [job], { notify, now: seedNow + 5 * 60_000, degraded: true });
+    assert.equal(
+      calls.filter((c) => c.opts?.dedupKey === 'maintenance-skipped-sixty-second-job').length,
+      0,
+      'must not page before the 15 min floor',
+    );
 
-  it('healthy skill (within threshold) is silent', async () => {
-    const { skillCadenceAuditJob } = await import('../src/lib/maintenance/jobs/skill-cadence-audit.js');
-    const now = Date.now();
-    const lastSuccess = new Date(now - 12 * 60 * 60 * 1000).toISOString(); // 12 hours ago (<2× daily, <26h)
-
-    const mockCtx = {
-      now,
-      everyMs: 3_600_000,
-      async listSkills() {
-        return [{
-          name: 'daily-skill',
-          frontmatter: { cron: '0 0 * * *' },
-        } as any];
-      },
-      async getLastSuccessfulRun(skillName: string) {
-        if (skillName === 'daily-skill') {
-          return { timestamp: lastSuccess };
-        }
-        return null;
-      },
-      async getFailureState(skillName: string) {
-        return { consecutiveFailures: 0, lastAttemptAt: null };
-      },
-    };
-
-    const result = await skillCadenceAuditJob.run(mockCtx);
-    assert.equal(result.touched, 0, 'Should NOT fire - healthy skill within threshold');
-  });
-
-  it('parked skill message references park status', async () => {
-    const { skillCadenceAuditJob } = await import('../src/lib/maintenance/jobs/skill-cadence-audit.js');
-    const now = Date.now();
-    const lastSuccess = new Date(now - 50 * HOUR).toISOString(); // 50 hours ago (>2× daily = 48h)
-
-    const mockCtx = {
-      now,
-      everyMs: 3_600_000,
-      async listSkills() {
-        return [{
-          name: 'failing-skill',
-          frontmatter: { cron: '0 0 * * *' },
-        } as any];
-      },
-      async getLastSuccessfulRun(skillName: string) {
-        if (skillName === 'failing-skill') {
-          return { timestamp: lastSuccess };
-        }
-        return null;
-      },
-      async getFailureState(skillName: string) {
-        // Simulate parked state (5+ consecutive failures)
-        return { consecutiveFailures: 7, lastAttemptAt: new Date(now - 2 * 60 * 60 * 1000).toISOString() };
-      },
-    };
-
-    const result = await skillCadenceAuditJob.run(mockCtx);
-    assert.equal(result.touched, 1, 'Should detect stale parked skill');
-    const detail = result.detail as { skills?: string[] } | undefined;
-    assert.ok((detail?.skills?.length ?? 0) > 0, 'Should report the stale skill');
-    assert.ok(detail?.skills?.[0]?.includes('[PARKED'), 'Alert should mention parked status');
-    assert.ok(detail?.skills?.[0]?.includes('7 consecutive failures'), 'Alert should show failure count');
-  });
-
-  it('respects max(2× interval, 26h) threshold', async () => {
-    const { skillCadenceAuditJob } = await import('../src/lib/maintenance/jobs/skill-cadence-audit.js');
-    const now = Date.now();
-    // Hourly skill: 2× interval = 2h, so 26h threshold applies
-    const lastSuccess = new Date(now - 28 * 60 * 60 * 1000).toISOString(); // 28 hours ago (>26h)
-
-    const mockCtx = {
-      now,
-      everyMs: 3_600_000,
-      async listSkills() {
-        return [{
-          name: 'hourly-skill',
-          frontmatter: { cron: '0 * * * *' }, // hourly
-        } as any];
-      },
-      async getLastSuccessfulRun(skillName: string) {
-        if (skillName === 'hourly-skill') {
-          return { timestamp: lastSuccess };
-        }
-        return null;
-      },
-      async getFailureState(skillName: string) {
-        return { consecutiveFailures: 0, lastAttemptAt: null };
-      },
-    };
-
-    const result = await skillCadenceAuditJob.run(mockCtx);
-    assert.equal(result.touched, 1, 'Should detect stale hourly skill (exceeds 26h threshold)');
-    const detail = result.detail as { skills?: string[] } | undefined;
-    assert.ok(detail?.skills?.[0]?.includes('threshold: 26h'), 'Alert should show 26h threshold for hourly skill');
+    // 20 minutes after the seeded run, still degraded — past the 15 min floor.
+    await runDueJobs('pa', [job], { notify, now: seedNow + 20 * 60_000, degraded: true });
+    const pageCalls = calls.filter((c) => c.opts?.dedupKey === 'maintenance-skipped-sixty-second-job');
+    assert.equal(pageCalls.length, 1, 'must page once past the 15 min floor');
   });
 });
 

@@ -311,4 +311,218 @@ describe('costs command', () => {
       assert.ok(agyIndex > zclaudeIndex);
     });
   });
+
+  describe('--day flag', () => {
+    it('should filter records to last 24h', async () => {
+      const now = new Date();
+      const recentDate = new Date(now.getTime() - 2 * 60 * 60 * 1000); // 2 hours ago
+      const oldDate = new Date(now.getTime() - 30 * 60 * 60 * 1000); // 30 hours ago
+
+      const records: UsageRecord[] = [
+        {
+          ts: recentDate.toISOString(),
+          worker: 'agy',
+          resource: 'skill1',
+          tokensIn: 100,
+          tokensOut: 50,
+        },
+        {
+          ts: oldDate.toISOString(),
+          worker: 'claude',
+          resource: 'skill2',
+          tokensIn: 200,
+          tokensOut: 100,
+        },
+      ];
+
+      await writeUsageRecords(records);
+      await costsCommand(['--day']);
+
+      assert.ok(consoleOutput.some(line => line.includes('agy')));
+      assert.ok(!consoleOutput.some(line => line.includes('claude')));
+    });
+  });
+
+  describe('--json flag', () => {
+    it('should emit valid JSON shape', async () => {
+      const now = new Date().toISOString();
+      const records: UsageRecord[] = [
+        {
+          ts: now,
+          worker: 'agy',
+          resource: 'skill1',
+          tokensIn: 100000,
+          tokensOut: 50000,
+        },
+      ];
+
+      await writeUsageRecords(records);
+      await costsCommand(['--json']);
+
+      const jsonOutput = consoleOutput.join('');
+      const parsed = JSON.parse(jsonOutput);
+
+      assert.strictEqual(parsed.period, 'all');
+      assert.ok(parsed.generatedAt);
+      assert.ok(Array.isArray(parsed.rows));
+      assert.strictEqual(parsed.rows.length, 1);
+      assert.ok(parsed.totals);
+      assert.ok(Array.isArray(parsed.unpricedKeys));
+    });
+
+    it('should include estCostUsd in JSON rows', async () => {
+      const now = new Date().toISOString();
+      const records: UsageRecord[] = [
+        {
+          ts: now,
+          worker: 'agy',
+          resource: 'skill1',
+          tokensIn: 100000,
+          tokensOut: 50000,
+        },
+      ];
+
+      await writeUsageRecords(records);
+      await costsCommand(['--json']);
+
+      const jsonOutput = consoleOutput.join('');
+      const parsed = JSON.parse(jsonOutput);
+
+      assert.ok(typeof parsed.rows[0].estCostUsd === 'number');
+      assert.ok(parsed.totals.estCostUsd > 0);
+    });
+
+    it('should list unpriced keys', async () => {
+      const now = new Date().toISOString();
+      const records: UsageRecord[] = [
+        {
+          ts: now,
+          worker: 'unknown-worker',
+          resource: 'skill1',
+          tokensIn: 100,
+          tokensOut: 50,
+        },
+      ];
+
+      await writeUsageRecords(records);
+      await costsCommand(['--json']);
+
+      const jsonOutput = consoleOutput.join('');
+      const parsed = JSON.parse(jsonOutput);
+
+      assert.ok(parsed.unpricedKeys.includes('unknown-worker'));
+      assert.strictEqual(parsed.rows[0].estCostUsd, null);
+    });
+
+    it('should emit full shape with no records', async () => {
+      await costsCommand(['--json']);
+
+      const jsonOutput = consoleOutput.join('');
+      const parsed = JSON.parse(jsonOutput);
+
+      assert.ok(parsed.generatedAt);
+      assert.strictEqual(parsed.rows.length, 0);
+      assert.strictEqual(parsed.totals.runs, 0);
+      assert.strictEqual(parsed.totals.estCostUsd, 0);
+      assert.ok(Array.isArray(parsed.unpricedKeys));
+    });
+  });
+
+  describe('pricing', () => {
+    it('should price agy records via worker fallback key', async () => {
+      const now = new Date().toISOString();
+      const records: UsageRecord[] = [
+        {
+          ts: now,
+          worker: 'agy',
+          resource: 'skill1',
+          tokensIn: 100000,
+          tokensOut: 50000,
+        },
+      ];
+
+      await writeUsageRecords(records);
+      await costsCommand([]);
+
+      // Should have an Est.$ value (agy is in DEFAULT_MODEL_PRICING)
+      const agyLine = consoleOutput.find(line => line.includes('agy'));
+      assert.ok(agyLine);
+      assert.ok(agyLine!.includes('$'));
+    });
+
+    it('should show unpriced worker in table and footer', async () => {
+      const now = new Date().toISOString();
+      const records: UsageRecord[] = [
+        {
+          ts: now,
+          worker: 'unknown-worker',
+          resource: 'skill1',
+          tokensIn: 100,
+          tokensOut: 50,
+        },
+      ];
+
+      await writeUsageRecords(records);
+      await costsCommand([]);
+
+      assert.ok(consoleOutput.some(line => line.includes('unknown-worker')));
+      assert.ok(consoleOutput.some(line => line.includes('Unpriced: unknown-worker')));
+    });
+
+    it('should use config override when present', async () => {
+      // Write a config.yaml with pricing override
+      const { writeFile } = await import('fs/promises');
+      const { join } = await import('path');
+      const yaml = await import('yaml');
+      const configPath = join(TEST_PA_HOME, 'config.yaml');
+      await writeFile(
+        configPath,
+        yaml.stringify({
+          model_pricing: {
+            'test-worker': { input: 1.0, output: 2.0 },
+          },
+        }),
+        'utf8'
+      );
+
+      const now = new Date().toISOString();
+      const records: UsageRecord[] = [
+        {
+          ts: now,
+          worker: 'test-worker',
+          resource: 'skill1',
+          tokensIn: 1000000,
+          tokensOut: 500000,
+        },
+      ];
+
+      await writeUsageRecords(records);
+      await costsCommand([]);
+
+      // (1000000*1.0 + 500000*2.0) / 1e6 = 2.0
+      assert.ok(consoleOutput.some(line => line.includes('$2.0000')));
+    });
+
+    it('should show Est.$ column and footer in table', async () => {
+      const now = new Date().toISOString();
+      const records: UsageRecord[] = [
+        {
+          ts: now,
+          worker: 'agy',
+          resource: 'skill1',
+          tokensIn: 100000,
+          tokensOut: 50000,
+        },
+      ];
+
+      await writeUsageRecords(records);
+      await costsCommand([]);
+
+      // Check for Est.$ header
+      assert.ok(consoleOutput.some(line => line.includes('Est.$')));
+      // Check for footer
+      assert.ok(consoleOutput.some(line => line.includes('Estimates: built-in list prices')));
+      assert.ok(consoleOutput.some(line => line.includes('verified 2026-08-27')));
+    });
+  });
 });

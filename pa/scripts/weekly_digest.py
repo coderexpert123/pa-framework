@@ -18,6 +18,7 @@ Deterministic — NO LLM.
 
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone, timedelta
 
@@ -25,6 +26,9 @@ from datetime import datetime, timezone, timedelta
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PA_SRC = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "src"))
 sys.path.insert(0, PA_SRC)
+
+# Budget start constant (operator-editable - the first month with no new features)
+BUDGET_START = "2026-09-01"
 
 
 def _pa_home() -> str:
@@ -178,58 +182,429 @@ def read_pending_conflicts(days: int = 7) -> list:
     return conflicts
 
 
-def get_slo_summary() -> str:
+def read_alert_census(max_age_days: int = 8) -> dict | None:
     """
-    Get SLO error budget status summary for current month.
-    Calls 'pa slo report --month current' and parses output.
-    Returns a one-line summary.
+    Read ~/.pa/alert-census.json (written daily by the alert-census maintenance
+    job — plans/2026-08-23-alerts-wave-SPEC.md). Returns None when the file is
+    absent, unparseable, or its generatedAt is older than max_age_days; the
+    digest never omits the Alerts section silently, it renders an
+    "unavailable" line instead (compose_digest handles that).
     """
+    census_path = os.path.join(_pa_home(), "alert-census.json")
     try:
+        with open(census_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+    generated_at = data.get("generatedAt")
+    if not generated_at:
+        return None
+
+    try:
+        generated_dt = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    if generated_dt < cutoff:
+        return None
+
+    return data
+
+
+def read_coordination_stats(days: int = 7, runner=None) -> dict | None:
+    """
+    Shell out to `pa claims --stats --days N --json` (the pa CLI at
+    <repo root>/pa/dist/bin/pa.js) and parse the JSON result. One
+    implementation of the computation lives in the CLI
+    (pa/src/commands/claim.ts: coordinationStats); this function and
+    compose_digest only render it — mirrors get_slo_summary()'s existing
+    subprocess pattern.
+
+    `runner` is an injectable callable (cmd: list[str]) -> a result object
+    with `.returncode` and `.stdout`, for tests; defaults to a real
+    `subprocess.run(cmd, capture_output=True, text=True, timeout=20)`. Any
+    failure — the runner raising (e.g. subprocess.TimeoutExpired), a non-zero
+    exit code, or unparseable JSON — returns None and NEVER raises;
+    compose_digest renders the fallback line in that case.
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    pa_js = os.path.join(repo_root, "pa", "dist", "bin", "pa.js")
+    cmd = ["node", pa_js, "claims", "--stats", "--days", str(days), "--json"]
+
+    def _default_runner(cmd):
         import subprocess
-        now = datetime.now(timezone.utc)
-        month_str = now.strftime("%Y-%m")
-        result = subprocess.run(
-            ["node", os.path.join(SCRIPT_DIR, "..", "dist", "bin", "pa.js"), "slo", "report", "--month", month_str],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        output = result.stdout.strip()
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=20)
 
-        # Parse the table to extract status summary
-        lines = output.split("\n")
-        statuses = []
-        for line in lines:
-            if "bot-reply-delivery" in line:
-                parts = line.split()
-                if len(parts) >= 6:
-                    status = parts[-1].upper()
-                    statuses.append(f"bot:{status}")
-            elif "daily-mail-brief" in line:
-                parts = line.split()
-                if len(parts) >= 6:
-                    status = parts[-1].upper()
-                    statuses.append(f"mail:{status}")
-            elif "catchup-heartbeat" in line:
-                parts = line.split()
-                if len(parts) >= 6:
-                    status = parts[-1].upper()
-                    statuses.append(f"heartbeat:{status}")
-            elif "ekadashi-alerts" in line:
-                parts = line.split()
-                if len(parts) >= 6:
-                    status = parts[-1].upper()
-                    statuses.append(f"ekadashi:{status}")
+    run = runner or _default_runner
 
-        if statuses:
-            return " | ".join(statuses)
+    try:
+        result = run(cmd)
+    except Exception:
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    try:
+        return json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def get_rules_summary(runner=None) -> dict | None:
+    """
+    Get standing rules summary from `pa rules weekly --json`.
+
+    Calls `pa rules weekly --json` and returns the parsed dict or None on any
+    failure (the pa CLI at <repo root>/pa/dist/bin/pa.js). Mirrors
+    get_slo_summary()'s subprocess pattern with injectable runner for tests.
+
+    `runner` is an injectable callable (cmd: list[str]) -> a result object with
+    `.returncode` and `.stdout`, for tests; defaults to a real
+    `subprocess.run(cmd, capture_output=True, text=True, timeout=30)`. Any
+    failure — the runner raising, a non-zero exit code, or unparseable JSON —
+    returns None and NEVER raises; compose_digest renders the
+    fallback line in that case.
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    pa_js = os.path.join(repo_root, "pa", "dist", "bin", "pa.js")
+    cmd = ["node", pa_js, "rules", "weekly", "--json"]
+
+    def _default_runner(cmd):
+        import subprocess
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+
+    run = runner or _default_runner
+
+    try:
+        result = run(cmd)
+    except Exception:
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    try:
+        return json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def render_rules_section(data: dict | None) -> list[str]:
+    """
+    Render the Standing Rules section from rules summary data.
+
+    data is the parsed JSON from `pa rules weekly --json` or None on failure.
+    Renders violation counts, pending rules, and escalation hints.
+    """
+    lines = []
+    lines.append("## Standing Rules")
+
+    if data is None or not data.get("ok", False):
+        lines.append("*Rules status unavailable (`pa rules weekly --json` failed).*")
+        lines.append("")
+        return lines
+
+    # New violations this week
+    new_violations = data.get("new_violations", 0)
+    violations_7d = data.get("violations_7d", [])
+    pending_rules = data.get("pending_rules", [])
+
+    if new_violations > 0:
+        lines.append(f"**{new_violations} new rule violation(s) this week**")
+
+    # Escalated violations (≥2/7d)
+    escalated = [v for v in violations_7d if v.get("count", 0) >= 2]
+    if escalated:
+        lines.append("Escalated violations (≥2/7d, consider superseding):")
+        for v in escalated:
+            key = v.get("key", "unknown")
+            count = v.get("count", 0)
+            rule_id = v.get("rule_id", "unknown")
+            lines.append(f"- **{key}** ({count}×) — `pa rules supersede {rule_id} --reason \"repeated violation\"`")
+        lines.append("")
+
+    # Single-count violations
+    singles = [v for v in violations_7d if v.get("count", 0) == 1]
+    if singles and not escalated:
+        lines.append("Single-count violations (7d):")
+        for v in singles:
+            key = v.get("key", "unknown")
+            lines.append(f"- {key}")
+        lines.append("")
+
+    # Pending rules awaiting operator accept
+    if pending_rules:
+        lines.append("**Pending rules awaiting operator accept:**")
+        for r in pending_rules:
+            r_id = r.get("id", "unknown")
+            r_key = r.get("key", "unknown")
+            r_text = r.get("text", "").replace("\n", " ")[:80]  # Truncate long text
+            lines.append(f"- `{r_key}` (ID: {r_id}) — `pa rules accept {r_id}`")
+            lines.append(f"  Text: \"{r_text}\"")
+        lines.append("")
+
+    if new_violations == 0 and not escalated and not singles and not pending_rules:
+        lines.append("*No rule violations; no rules pending accept.*")
+        lines.append("")
+
+    return lines
+
+
+def render_coordination_line(stats: dict | None) -> str:
+    """Renders the exact one-line coordination rollup for the weekly digest."""
+    if stats is None:
+        return "**Coordination (7d):** unavailable (`pa claims --stats` failed)."
+    return (
+        f"**Coordination (7d):** {stats.get('claims', 0)} claims "
+        f"({stats.get('forced', 0)} forced), {stats.get('denied', 0)} denied, "
+        f"{stats.get('released', 0)} released, {stats.get('gcExpired', 0)} GC-expired; "
+        f"{stats.get('autoSessionIds', 0)} of {stats.get('distinctSessions', 0)} session labels auto-generated."
+    )
+
+
+def _days_since(iso_str: str) -> int:
+    """Whole days between an ISO timestamp and now. 0 on any parse failure."""
+    try:
+        dt = datetime.fromisoformat((iso_str or "").replace("Z", "+00:00"))
+    except ValueError:
+        return 0
+    return max(0, (datetime.now(timezone.utc) - dt).days)
+
+
+def get_slo_summary(month: str | None = None, runner=None) -> str:
+    """
+    Get SLO error budget status summary for the given month (default: current UTC month).
+    Calls `pa slo report --month <month> --json` and renders the generic D2 format:
+    "<service>:<STATUS>" joined by " | ", where STATUS is uppercased.
+
+    `runner` is an injectable callable (cmd: list[str]) -> a result object with
+    `.returncode` and `.stdout`, for tests; defaults to a real
+    `subprocess.run(cmd, capture_output=True, text=True, timeout=30)`. Any
+    failure — the runner raising, a non-zero exit code, or unparseable JSON —
+    returns a deterministic unavailable line and NEVER raises.
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    pa_js = os.path.join(repo_root, "pa", "dist", "bin", "pa.js")
+
+    # Default month: current UTC YYYY-MM
+    if month is None:
+        month = datetime.now(timezone.utc).strftime("%Y-%m")
+
+    cmd = ["node", pa_js, "slo", "report", "--month", month, "--json"]
+
+    def _default_runner(cmd):
+        import subprocess
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+
+    run = runner or _default_runner
+
+    try:
+        result = run(cmd)
+    except Exception:
+        return "unavailable (`pa slo report --json` failed)"
+
+    if result.returncode != 0:
+        return "unavailable (`pa slo report --json` failed)"
+
+    try:
+        data = json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return "unavailable (`pa slo report --json` failed)"
+
+    services = data.get("services", [])
+    if not services:
+        return "No services configured"
+
+    # Render per D2: "<service>:<STATUS>" joined by " | "
+    statuses = [f"{s['service']}:{s['status'].upper()}" for s in services]
+    return " | ".join(statuses)
+
+
+def read_skill_engagement(max_age_days: int = 35) -> dict | None:
+    """
+    Read ~/.pa/skill-engagement.json (written monthly by the
+    skill-engagement-audit maintenance job). Returns None when the file is
+    absent, unparseable, or its generatedAt is older than max_age_days.
+    """
+    engagement_path = os.path.join(_pa_home(), "skill-engagement.json")
+    try:
+        with open(engagement_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+    generated_at = data.get("generatedAt")
+    if not generated_at:
+        return None
+
+    try:
+        generated_dt = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    if generated_dt < cutoff:
+        return None
+
+    return data
+
+
+def read_intervention_counts(days: int = 7) -> dict:
+    """
+    Read intervention counts for the last N days:
+    - blockers: ~/.pa/human-gated-blockers.json entries with first_detected_at >= cutoff
+    - reauthKicks: ~/.pa/reauth-kicks.jsonl lines with ts >= cutoff
+    Returns {"blockers": int, "reauthKicks": int}; absent files count as 0.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat().replace("+00:00", "Z")
+    blockers = 0
+    reauth_kicks = 0
+
+    # Read human-gated-blockers.json
+    blockers_path = os.path.join(_pa_home(), "human-gated-blockers.json")
+    try:
+        with open(blockers_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for key, entry in data.get("blockers", {}).items():
+            first_detected = entry.get("first_detected_at", "")
+            if first_detected >= cutoff:
+                blockers += 1
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        pass
+
+    # Read reauth-kicks.jsonl
+    kicks_path = os.path.join(_pa_home(), "reauth-kicks.jsonl")
+    try:
+        with open(kicks_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    ts = entry.get("ts", "")
+                    if ts >= cutoff:
+                        reauth_kicks += 1
+                except (json.JSONDecodeError, KeyError):
+                    continue
+    except FileNotFoundError:
+        pass
+
+    return {"blockers": blockers, "reauthKicks": reauth_kicks}
+
+
+def read_new_feature_count(since_iso: str) -> int:
+    """
+    Parse <repo_root>/plans/INDEX.md and count feature rows since the given date.
+    A feature row matches: | YYYY-MM-DD | <title> | ... | where:
+    - date >= since_iso
+    - title does NOT match (case-insensitive): assessment, study, audit, scoping, postmortem, review
+    Returns the count; 0 if the file is absent or unparseable.
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    index_path = os.path.join(repo_root, "plans", "INDEX.md")
+
+    try:
+        with open(index_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except FileNotFoundError:
+        return 0
+
+    # Regex for table rows: | YYYY-MM-DD | <title> | ...
+    row_pattern = r"^\|\s*(\d{4}-\d{2}-\d{2})\s*\|\s*([^|]+)"
+    exclusion_keywords = {"assessment", "study", "audit", "scoping", "postmortem", "review"}
+
+    count = 0
+    for match in re.finditer(row_pattern, content, re.MULTILINE):
+        date_str = match.group(1)
+        title = match.group(2).strip()
+
+        if date_str >= since_iso:
+            # Check if title contains any exclusion keyword
+            title_lower = title.lower()
+            if not any(keyword in title_lower for keyword in exclusion_keywords):
+                count += 1
+
+    return count
+
+
+def render_retire_section(data: dict | None) -> list[str]:
+    """Render the 'Retire?' section from skill-engagement data."""
+    lines = []
+    lines.append("## Skills — Retire? (90d zero engagement)")
+
+    if data is None:
+        lines.append("_*Skill engagement audit unavailable (job has not run in the last 35 days)._")
+    else:
+        stale = data.get("stale", [])
+        if not stale:
+            lines.append("*No zero-engagement skills.*")
         else:
-            return "No data"
-    except Exception as e:
-        return f"Error: {e}"
+            for skill in stale:
+                name = skill.get("skill", "unknown")
+                scheduled = skill.get("scheduled", False)
+                label = "scheduled" if scheduled else "manual"
+                last_success = skill.get("lastSuccessAt")
+                rows = skill.get("decisionRows90d", 0)
+                alerts = skill.get("alertSent7d", 0)
+
+                if last_success:
+                    days_ago = _days_since(last_success)
+                    time_str = f"{days_ago}d ago"
+                else:
+                    time_str = "never"
+
+                alert_str = f", {alerts} alerts/7d" if alerts > 0 else ""
+                lines.append(f"- **{name}** ({label}): last success {time_str}, {rows} decision rows{alert_str}")
+
+            lines.append("Nothing is auto-deleted — retiring is an operator decision.")
+
+    lines.append("")
+    return lines
 
 
-def compose_digest(audit_entries: list, maintenance_summary: dict, parked_skills: list, pending_conflicts: list) -> str:
+def render_scorecard_section(
+    alert_census: dict | None,
+    audit_entries: list,
+    intervention_counts: dict,
+    feature_count: int
+) -> list[str]:
+    """Render the complexity budget scorecard section."""
+    lines = []
+    lines.append(f"## Complexity budget (since {BUDGET_START})")
+
+    # Alerts line
+    if alert_census is None:
+        lines.append("- alerts: unavailable (census stale)")
+    else:
+        total = alert_census.get("totalSent", 0)
+        lines.append(f"- alerts: {total} sent / 7d (census)")
+
+    # Operator interventions
+    blockers = intervention_counts.get("blockers", 0)
+    reauth = intervention_counts.get("reauthKicks", 0)
+    lines.append(f"- operator interventions: {blockers} new human-gated blockers, {reauth} reauth kicks / 7d")
+
+    # Self-improver counts
+    applied_set = {"applied-fix", "approved-new-skill", "applied-code-fix"}
+    rolled_back_set = {"rolled-back", "reverted-protected-path", "reverted-test-weakening", "reverted-verification-failed"}
+
+    applied = sum(1 for e in audit_entries if e.get("action") in applied_set)
+    rolled_back = sum(1 for e in audit_entries if e.get("action") in rolled_back_set)
+
+    lines.append(f"- self-improver: {applied} applied, {rolled_back} rolled back / 7d")
+
+    # New plan/spec rows
+    lines.append(f"- new plan/spec rows since start: {feature_count} (target: 0)")
+
+    lines.append("")
+    return lines
+
+
+def compose_digest(audit_entries: list, maintenance_summary: dict, parked_skills: list, pending_conflicts: list, alert_census: dict | None = None, coordination_stats: dict | None = None) -> str:
     """Compose the weekly digest markdown."""
     lines = []
 
@@ -297,6 +672,62 @@ def compose_digest(audit_entries: list, maintenance_summary: dict, parked_skills
         lines.append("*No parked skills.*")
         lines.append("")
 
+    # Section 3.5: Alerts (7d) (NEW, 2026-08-23 — plans/2026-08-23-alerts-wave-SPEC.md).
+    # Never omitted silently: an absent/stale census still renders the header
+    # plus an explicit "unavailable" line, so "0 proposals — nothing to report"
+    # can never again mean "the census job hasn't run" (review §4).
+    lines.append("## Alerts (7d)")
+    if alert_census is None:
+        lines.append("_No alert census available (job has not run in the last 8 days)._")
+        lines.append("")
+        lines.append(render_coordination_line(coordination_stats))
+        lines.append("")
+    else:
+        lines.append(alert_census.get("topLine", ""))
+        lines.append("")
+        lines.append(render_coordination_line(coordination_stats))
+        lines.append("")
+
+        families = alert_census.get("families", [])
+        if families:
+            lines.append("| Family | Sent | Owner | Owner Status | Classification |")
+            lines.append("|---|---|---|---|---|")
+            for fam in families[:5]:
+                name = fam.get("family", "unknown")
+                sent = fam.get("sent", 0)
+                owner_kind = fam.get("ownerKind", "unknown")
+                owner = fam.get("owner")
+                owner_label = f"{owner_kind}:{owner}" if owner else owner_kind
+                owner_status = fam.get("ownerStatus") or {}
+                status_label = owner_status.get("status", "unknown")
+                classification = fam.get("classification", "unknown")
+                lines.append(f"| {name} | {sent} | {owner_label} | {status_label} | {classification} |")
+            lines.append("")
+
+        masked = alert_census.get("maskedFailures", [])
+        if masked:
+            lines.append("**Masked failures:**")
+            for m in masked:
+                skill = m.get("skill", "unknown")
+                last_run = m.get("lastRunAt", "")
+                marker = m.get("marker", "")
+                lines.append(f"- **{skill}** (last run {last_run}): {marker}")
+            lines.append("")
+
+        human_gated = [f for f in families if f.get("classification") == "human-gated"]
+        if human_gated:
+            lines.append("**Operator action needed:**")
+            for fam in human_gated:
+                name = fam.get("family", "unknown")
+                owner_kind = fam.get("ownerKind", "unknown")
+                owner = fam.get("owner")
+                owner_label = f"{owner_kind}:{owner}" if owner else owner_kind
+                age_days = _days_since(fam.get("firstSeen", ""))
+                owner_status = fam.get("ownerStatus") or {}
+                last_error = (owner_status.get("lastError") or "")[:200]
+                lines.append(f"- **{name}** ({owner_label}), {age_days}d old: {last_error}")
+            lines.append("")
+
     # Section 4: Secrets Due for Rotation
     lines.append("## Secrets Due for Rotation")
     try:
@@ -347,6 +778,22 @@ def compose_digest(audit_entries: list, maintenance_summary: dict, parked_skills
         lines.append("*No memory conflicts pending review.*")
         lines.append("")
 
+    # Section 6: Standing Rules (AI-165)
+    rules_summary = get_rules_summary()
+    rules_lines = render_rules_section(rules_summary)
+    lines.extend(rules_lines)
+
+    # Section 7: Skills — Retire? (90d zero engagement) (NEW, AI-168)
+    engagement_data = read_skill_engagement()
+    retire_lines = render_retire_section(engagement_data)
+    lines.extend(retire_lines)
+
+    # Section 8: Complexity budget scorecard (NEW, AI-168)
+    intervention_counts = read_intervention_counts(days=7)
+    feature_count = read_new_feature_count(BUDGET_START)
+    scorecard_lines = render_scorecard_section(alert_census, audit_entries, intervention_counts, feature_count)
+    lines.extend(scorecard_lines)
+
     return "\n".join(lines)
 
 
@@ -359,9 +806,11 @@ def main():
     maintenance_summary = read_maintenance_state(days)
     parked_skills = read_parked_skills()
     pending_conflicts = read_pending_conflicts(days)
+    alert_census = read_alert_census()
+    coordination_stats = read_coordination_stats(days)
 
     # Compose digest
-    digest = compose_digest(audit_entries, maintenance_summary, parked_skills, pending_conflicts)
+    digest = compose_digest(audit_entries, maintenance_summary, parked_skills, pending_conflicts, alert_census, coordination_stats)
 
     # Print to stdout — the pa runner relays this to pa-alerts via the skill's
     # telegram_output. Do NOT dispatch telegram_notify from here: cmd skills run

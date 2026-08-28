@@ -2,9 +2,10 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'child_process';
 import { mkdtemp, mkdir, writeFile, rm } from 'fs/promises';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import { tmpdir } from 'os';
-import { resolveRepoRoot } from '../src/lib/git-root.js';
+import { fileURLToPath, pathToFileURL } from 'url';
+import { resolveRepoRoot, repoRootFromModule, walkUpToRepoRoot } from '../src/lib/git-root.js';
 
 // Real throwaway git repos in temp dirs — no mocked git (repo convention).
 
@@ -63,6 +64,72 @@ describe('resolveRepoRoot', () => {
       await assert.rejects(() => resolveRepoRoot(dir), /not a git repository|show-toplevel/);
     } finally {
       await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('repoRootFromModule', () => {
+  it('returns the repo root when called with this test module\'s own __filename (pa/ is CommonJS; import.meta is unavailable)', async () => {
+    const startDir = dirname(__filename);
+    const expected = execFileSync('git', ['rev-parse', '--show-toplevel'], {
+      cwd: startDir,
+      encoding: 'utf8',
+      windowsHide: true,
+    }).trim();
+
+    const root = await repoRootFromModule(__filename);
+    assert.equal(root, expected);
+  });
+
+  it('memoises per module URL — a second call does not re-spawn git (proven by deleting the backing repo between calls)', async () => {
+    const dir = await initRepo();
+    const fakeModuleUrl = pathToFileURL(join(dir, 'fake-module.js')).href;
+    try {
+      const expected = git(dir, ['rev-parse', '--show-toplevel']).trim();
+      const first = await repoRootFromModule(fakeModuleUrl);
+      assert.equal(first, expected);
+
+      // Remove the backing repo entirely. A non-memoised second call would
+      // now either reject (no .git found) or walk up to some unrelated
+      // ancestor — the cache must short-circuit before either happens.
+      await rm(dir, { recursive: true, force: true });
+
+      const second = await repoRootFromModule(fakeModuleUrl);
+      assert.equal(second, first, 'cached value must survive the repo disappearing');
+    } finally {
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+});
+
+describe('walkUpToRepoRoot', () => {
+  it('finds the root from a nested dist-like path', async () => {
+    const fakeRoot = await mkdtemp(join(tmpdir(), 'pa-walkup-'));
+    try {
+      const nested = join(fakeRoot, 'pa', 'dist', 'tests');
+      await mkdir(nested, { recursive: true });
+      await writeFile(join(fakeRoot, 'pa', 'package.json'), '{}', 'utf8');
+
+      const root = walkUpToRepoRoot(nested);
+      assert.equal(root, fakeRoot);
+    } finally {
+      await rm(fakeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('throws with a clear message when no repo root exists above the start dir', async () => {
+    // Create a temp directory under system temp root — its walk-up path is
+    // guaranteed not to contain .git (system temp is outside any repo).
+    // CI runners execute inside a git checkout, so we cannot assume C:\ or /
+    // is repo-free.
+    const repoFreeDir = await mkdtemp(join(tmpdir(), 'pa-git-root-notrepo-'));
+    try {
+      assert.throws(
+        () => walkUpToRepoRoot(repoFreeDir),
+        /no repo root above/
+      );
+    } finally {
+      await rm(repoFreeDir, { recursive: true, force: true });
     }
   });
 });

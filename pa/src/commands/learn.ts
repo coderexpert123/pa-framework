@@ -1,6 +1,7 @@
-import { analyzeConversationPatterns } from '../analyzer.js';
+import { analyzeConversationWindow } from '../analyzer.js';
 import { analyzeFailurePatterns } from '../failure-analyzer.js';
 import { saveDraft } from '../drafts.js';
+import { skillCandidatesPath } from '../lib/skill-candidates.js';
 
 export async function learnCommand(
   days: number = 14,
@@ -11,7 +12,7 @@ export async function learnCommand(
   if (!options.failuresOnly) {
     console.log(`Analyzing last ${days} days of conversation history...`);
     try {
-      const proposals = await analyzeConversationPatterns(days);
+      const proposals = await analyzeConversationWindow(days);
       for (const proposal of proposals) {
         await saveDraft(proposal, 'conversation');
         console.log(`  + Proposed: ${proposal.name} (${proposal.reason.slice(0, 60)}...)`);
@@ -20,6 +21,7 @@ export async function learnCommand(
       if (proposals.length === 0) {
         console.log('  No conversation patterns found.');
       }
+      console.log(`  Candidate ledger: ${skillCandidatesPath()}`);
     } catch (err: any) {
       console.error(`  Conversation analysis failed: ${err.message}`);
     }

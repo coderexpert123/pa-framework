@@ -2,7 +2,7 @@
 Copy a briefing file to the Obsidian notes path.
 Usage: python write_obsidian.py <destination_path> <source_path>
 
-Exists because Gemini CLI's sandbox blocks writes outside its workspace.
+Exists because the LLM CLI's sandbox blocks writes outside its workspace.
 This script runs as a subprocess call from within the skill, bypassing that restriction.
 """
 import os

@@ -1,5 +1,6 @@
 import { acceptedRollbackCommits, appendAuditRecord, findAcceptance, normalizeCommitKey, readAuditRecords, skillRunStats } from '../lib/improvement-audit.js';
 import type { AuditRecord, SkillRunStats } from '../lib/improvement-audit.js';
+import { decisionStatsBySkill, type SkillDecisionStats } from '../lib/decisions.js';
 
 const DEFAULT_SINCE_DAYS = 30;
 
@@ -32,6 +33,7 @@ const NO_BASELINE_GLOSS_ACTIONS: ReadonlySet<AuditRecord['action']> = new Set([
 export interface EvalEntry {
   record: AuditRecord;
   current: SkillRunStats;
+  outcome?: { before: SkillDecisionStats | null; after: SkillDecisionStats | null };
 }
 
 function fmtStats(s: { runs: number; successes: number; failures: number }): string {
@@ -172,7 +174,7 @@ export function buildEvalReport(
   lines.push(...buildFailedRollbackBanner(records, acceptances));
   lines.push(...buildAcceptedRollbackBanner(records, acceptances));
 
-  for (const { record, current } of entries) {
+  for (const { record, current, outcome } of entries) {
     const date = record.ts.slice(0, 10);
     const target = record.target_skill ?? `${record.draft} (new)`;
     const riskSuffix = record.risk_flags.length > 0 ? `  risk: ${record.risk_flags.join(', ')}` : '';
@@ -211,6 +213,35 @@ export function buildEvalReport(
       const gloss = NO_BASELINE_GLOSS_ACTIONS.has(record.action) ? '' : ' (no baseline recorded — newly created)';
       lines.push(`  current (${sinceDays}d now): ${fmtStats(current)}${gloss}`);
     }
+
+    // Render outcome line for non-rollback-failed/rollback-accepted entries (AI-168)
+    if (outcome && !NO_BASELINE_GLOSS_ACTIONS.has(record.action)) {
+      const beforeHasRows = outcome.before && outcome.before.total > 0;
+      const afterHasRows = outcome.after && outcome.after.total > 0;
+
+      if (beforeHasRows && afterHasRows) {
+        const beforeRate = Math.round(((outcome.before!.approved + outcome.before!.replied) / outcome.before!.total) * 100);
+        const afterRate = Math.round(((outcome.after!.approved + outcome.after!.replied) / outcome.after!.total) * 100);
+        const delta = afterRate - beforeRate;
+        const sign = delta >= 0 ? '+' : '';
+        lines.push(`  outcome (±14d acted_on): ${beforeRate}% (${outcome.before!.approved + outcome.before!.replied}/${outcome.before!.total}) → ${afterRate}% (${outcome.after!.approved + outcome.after!.replied}/${outcome.after!.total}) (delta ${sign}${delta}pp)`);
+      } else if (afterHasRows) {
+        const afterRate = Math.round(((outcome.after!.approved + outcome.after!.replied) / outcome.after!.total) * 100);
+        lines.push(`  outcome (±14d acted_on): after ${afterRate}% (${outcome.after!.approved + outcome.after!.replied}/${outcome.after!.total}) (delta n/a — no before-window rows)`);
+      } else if (beforeHasRows) {
+        const beforeRate = Math.round(((outcome.before!.approved + outcome.before!.replied) / outcome.before!.total) * 100);
+        lines.push(`  outcome (±14d acted_on): before ${beforeRate}% (${outcome.before!.approved + outcome.before!.replied}/${outcome.before!.total}) (delta n/a — no after-window rows yet)`);
+      } else {
+        lines.push(`  outcome (±14d acted_on): n/a (no decision data)`);
+      }
+    } else if (outcome && NO_BASELINE_GLOSS_ACTIONS.has(record.action)) {
+      // rollback-failed/rollback-accepted entries show "n/a (no decision data)" even when outcome is computed
+      lines.push(`  outcome (±14d acted_on): n/a (no decision data)`);
+    } else if (!outcome) {
+      // No decision data available (DB absent or both windows null)
+      lines.push(`  outcome (±14d acted_on): n/a (no decision data)`);
+    }
+
     lines.push('');
   }
 
@@ -232,7 +263,23 @@ export async function improvementsCommand(sinceDays: number = DEFAULT_SINCE_DAYS
     const skillName = record.target_skill ?? record.draft;
     const windowDays = record.baseline?.window_days ?? sinceDays;
     const current = await skillRunStats(skillName, windowDays);
-    entries.push({ record, current });
+
+    // Compute outcome windows for non-maintenance-job targets (AI-168)
+    let outcome: { before: SkillDecisionStats | null; after: SkillDecisionStats | null } | undefined;
+    if (record.target_kind !== 'maintenance-job') {
+      const recordTs = new Date(record.ts).getTime();
+      const beforeIso = new Date(recordTs - 14 * 24 * 60 * 60 * 1000).toISOString();
+      const afterIso = new Date(recordTs + 14 * 24 * 60 * 60 * 1000).toISOString();
+      const beforeStats = decisionStatsBySkill(beforeIso, record.ts)?.get(skillName) ?? null;
+      const afterStats = decisionStatsBySkill(record.ts, afterIso)?.get(skillName) ?? null;
+
+      // Only attach the field if at least one half has data
+      if (beforeStats !== null || afterStats !== null) {
+        outcome = { before: beforeStats, after: afterStats };
+      }
+    }
+
+    entries.push({ record, current, outcome });
   }
 
   // Acceptances come from the UNFILTERED trail, not `relevant`: a human acceptance can easily

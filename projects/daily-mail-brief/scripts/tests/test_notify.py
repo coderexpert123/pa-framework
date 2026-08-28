@@ -91,5 +91,58 @@ class TestNotifySend(unittest.TestCase):
             self.assertEqual(_resolve_pa_bin(), '/custom/pa')
 
 
+class TestNotifyRobustness(unittest.TestCase):
+    """The recorded `[notify.py] failed: timeout (10s)` lines (2026-08-21,
+    2026-08-24): `pa notify` boots a Node CLI off the D: HDD and exceeded the
+    10s subprocess timeout, silently dropping the very alert that reports a
+    brief failure — the outage became invisible. The send must be robust
+    against a slow pa boot, not just fail-soft."""
+
+    def _send_linux(self):
+        """send() with the posix direct-argv path pinned on."""
+        with patch('sys.platform', 'linux'), \
+             patch('shutil.which', return_value='/usr/local/bin/pa'), \
+             patch.dict(os.environ, {}, clear=True):
+            send("S", "B", "k")
+
+    @patch('subprocess.run')
+    def test_timeout_exceeds_recorded_ten_seconds(self, mock_run):
+        """10s is demonstrably not enough (timed out twice in evidence) — the
+        default timeout must exceed it."""
+        mock_run.return_value = MagicMock(returncode=0)
+        self._send_linux()
+        timeout = mock_run.call_args[1]['timeout']
+        self.assertGreater(timeout, 10)
+
+    @patch('subprocess.run', side_effect=subprocess.TimeoutExpired(cmd='pa', timeout=60))
+    def test_timeout_retried_once(self, mock_run):
+        """A timed-out attempt must be retried once before the alert is
+        dropped; both failures logged, never raised."""
+        import io
+        with patch('sys.stderr', new_callable=io.StringIO) as mock_err:
+            self._send_linux()
+        self.assertEqual(mock_run.call_count, 2, "timeout must trigger exactly one retry")
+        self.assertIn("timeout", mock_err.getvalue())
+
+    @patch('subprocess.run', side_effect=[
+        subprocess.TimeoutExpired(cmd='pa', timeout=60),
+        MagicMock(returncode=0),
+    ])
+    def test_alert_survives_when_retry_succeeds(self, mock_run):
+        """First attempt times out, retry completes — the alert must not be
+        lost to the first timeout."""
+        self._send_linux()  # must not raise
+        self.assertEqual(mock_run.call_count, 2)
+
+    @patch('subprocess.run', side_effect=FileNotFoundError("not found"))
+    def test_non_timeout_errors_not_retried(self, mock_run):
+        """The retry is timeout-only: a missing binary fails once — a second
+        attempt cannot start either."""
+        import io
+        with patch('sys.stderr', new_callable=io.StringIO):
+            self._send_linux()
+        self.assertEqual(mock_run.call_count, 1)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -11,6 +11,7 @@ import {
   reapOrphanedDispatches,
   isTopicWorkerAliveByRegistry,
   findTeePathByRegistry,
+  placeholderKindAndCaption,
   TRANSCRIPT_QUIESCENT_MS,
   type ReaperDeps,
 } from '../orphan-reaper.js';
@@ -22,6 +23,8 @@ import {
 } from '../pending-dispatches.js';
 import { deliveredKey, wasDelivered, markDelivered, _resetDeliveredCacheForTest } from '../delivered-store.js';
 import { isTopicRecovering, _resetRecoveryGateForTest } from '../recovery-gate.js';
+import { markTopicStopped, _clearStoppedForTest } from '../worker-stop.js';
+import { takeResend, resendKey, _resetResendStoreForTest } from '../resend-store.js';
 
 let home: string;
 
@@ -31,6 +34,7 @@ beforeEach(() => {
   _resetPendingDispatchesForTest();
   _resetDeliveredCacheForTest();
   _resetRecoveryGateForTest();
+  _resetResendStoreForTest();
 });
 
 afterEach(() => {
@@ -38,6 +42,7 @@ afterEach(() => {
   _resetPendingDispatchesForTest();
   _resetDeliveredCacheForTest();
   _resetRecoveryGateForTest();
+  _resetResendStoreForTest();
   try { rmSync(home, { recursive: true, force: true }); } catch {}
 });
 
@@ -177,19 +182,25 @@ interface FakeDepsConfig {
   workerAlive?: boolean;
   nowMs?: number;
   sendResult?: boolean;
+  requeueUpdate?: (record: PendingDispatch) => void;
+  reviveVoiceNote?: (record: PendingDispatch) => Promise<string | null>;
 }
 
-function makeFakeDeps(cfg: FakeDepsConfig): { deps: ReaperDeps; sent: Array<{ record: PendingDispatch; text: string }> } {
-  const sent: Array<{ record: PendingDispatch; text: string }> = [];
-  return {
-    sent,
-    deps: {
-      send: async (record, text) => { sent.push({ record, text }); return cfg.sendResult ?? true; },
-      readTranscript: async () => cfg.transcript ?? null,
-      isTopicWorkerAlive: async () => cfg.workerAlive ?? false,
-      now: () => cfg.nowMs ?? Date.now(),
-    },
+function makeFakeDeps(cfg: FakeDepsConfig): { deps: ReaperDeps; sent: Array<{ record: PendingDispatch; text: string; replyMarkup?: unknown }> } {
+  const sent: Array<{ record: PendingDispatch; text: string; replyMarkup?: unknown }> = [];
+  const deps: ReaperDeps = {
+    send: async (record, text, replyMarkup) => { sent.push({ record, text, replyMarkup }); return cfg.sendResult ?? true; },
+    readTranscript: async () => cfg.transcript ?? null,
+    isTopicWorkerAlive: async () => cfg.workerAlive ?? false,
+    now: () => cfg.nowMs ?? Date.now(),
   };
+  if (cfg.requeueUpdate) {
+    (deps as any).requeueUpdate = cfg.requeueUpdate;
+  }
+  if (cfg.reviveVoiceNote) {
+    (deps as any).reviveVoiceNote = cfg.reviveVoiceNote;
+  }
+  return { deps, sent };
 }
 
 const FAR_DEADLINE = Date.now() + 60 * 60 * 1000;
@@ -213,10 +224,88 @@ describe('evaluatePendingDispatch', () => {
     const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
     assert.equal(outcome, 'dead');
     assert.equal(sent.length, 1);
-    assert.ok(sent[0].text.includes('could not be recovered'));
+    assert.ok(sent[0].text.includes("couldn't be completed"));
     assert.ok(sent[0].text.includes('do the thing'), 'notice quotes the lost message');
     assert.deepEqual(await listPendingDispatches(), []);
     assert.equal(await wasDelivered(deliveredKey(rec.chatId, rec.threadId, rec.updateId)), true);
+  });
+
+  it('death-notice path stores a resend record and passes a resend keyboard (WP-B3)', async () => {
+    const rec = makeRecord({ session: undefined });
+    await addPendingDispatch(rec);
+    const { deps, sent } = makeFakeDeps({});
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(outcome, 'dead');
+    assert.equal(sent.length, 1);
+
+    // The resend record was written BEFORE the death notice was sent, keyed by
+    // the pending-dispatch's own (chatId, threadId, updateId).
+    const stored = await takeResend(resendKey(rec.chatId, rec.threadId, rec.updateId));
+    assert.ok(stored, 'resend-store should hold the original message for the Resend button');
+    assert.equal(stored?.chatId, rec.chatId);
+    assert.equal(stored?.threadId, rec.threadId);
+    assert.equal(stored?.updateId, rec.updateId);
+    assert.equal(stored?.messageId, rec.messageId);
+    assert.equal(stored?.userText, rec.userText);
+
+    // The keyboard passed to send() carries the rs: callback for this dispatch.
+    const kb = sent[0].replyMarkup as { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } | undefined;
+    assert.ok(kb, 'a resend keyboard should be passed to send()');
+    const buttons = kb!.inline_keyboard.flat();
+    assert.equal(buttons.length, 1);
+    assert.equal(buttons[0].callback_data, `rs:${rec.chatId}:${rec.threadId}:${rec.updateId}`);
+  });
+
+  it('guidance path: a placeholder-userText record asks for the note again — no resend record, no keyboard (2026-08-27 honest-resend)', async () => {
+    const rec = makeRecord({ session: undefined, userText: '[Voice message]' });
+    await addPendingDispatch(rec);
+    await _resetResendStoreForTest();
+    const { deps, sent } = makeFakeDeps({});
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(outcome, 'dead');
+    assert.equal(sent.length, 1);
+    assert.ok(!sent[0].text.includes('«'), 'guidance notice does NOT quote the text');
+    assert.ok(sent[0].text.includes('send it again'), 'guidance asks to resend the note itself');
+    assert.equal(sent[0].replyMarkup, undefined, 'no keyboard for guidance path');
+    const stored = await takeResend(resendKey(rec.chatId, rec.threadId, rec.updateId));
+    assert.equal(stored, null, 'no resend record stored for guidance path');
+    assert.deepEqual(await listPendingDispatches(), []);
+  });
+
+  it('guidance path also fires for a captioned placeholder ([Voice message] <raw caption>)', async () => {
+    const rec = makeRecord({ session: undefined, userText: '[Voice message] call mom' });
+    await addPendingDispatch(rec);
+    await _resetResendStoreForTest();
+    const { deps, sent } = makeFakeDeps({});
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(outcome, 'dead');
+    assert.equal(sent.length, 1);
+    assert.ok(!sent[0].text.includes('«'));
+    assert.ok(sent[0].text.includes('please send it again'));
+    assert.equal(sent[0].replyMarkup, undefined);
+    const stored = await takeResend(resendKey(rec.chatId, rec.threadId, rec.updateId));
+    assert.equal(stored, null);
+    assert.deepEqual(await listPendingDispatches(), []);
+  });
+
+  it('a settled transcript (userTextSettled: true) is NOT guided — quoting death notice, resend record, and keyboard as before', async () => {
+    const rec = makeRecord({ session: undefined, userText: '[Voice message] hello there', userTextSettled: true });
+    await addPendingDispatch(rec);
+    await _resetResendStoreForTest();
+    const { deps, sent } = makeFakeDeps({});
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(outcome, 'dead');
+    assert.equal(sent.length, 1);
+    assert.ok(sent[0].text.includes('«'), 'quoting death notice for settled transcript');
+    const stored = await takeResend(resendKey(rec.chatId, rec.threadId, rec.updateId));
+    assert.ok(stored, 'resend record stored for settled transcript');
+    assert.equal(stored?.userText, '[Voice message] hello there');
+    assert.equal(stored?.userTextSettled, true, 'userTextSettled marker propagated to resend store');
+    const kb = sent[0].replyMarkup as { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } | undefined;
+    assert.ok(kb, 'resend keyboard passed for settled transcript');
+    const buttons = kb!.inline_keyboard.flat();
+    assert.equal(buttons.length, 1);
+    assert.equal(buttons[0].callback_data, `rs:${rec.chatId}:${rec.threadId}:${rec.updateId}`);
   });
 
   it('sends a death notice for an agy session (recovery is claude-family only)', async () => {
@@ -265,7 +354,8 @@ describe('evaluatePendingDispatch', () => {
     const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
     assert.equal(outcome, 'recovered');
     assert.equal(sent.length, 1);
-    assert.ok(sent[0].text.includes('Recovered reply'));
+    assert.ok(!sent[0].text.includes('Recovered reply'), 'prefix removed by parity change');
+    assert.ok(!sent[0].text.includes('restarted'), 'prefix removed by parity change');
     assert.ok(sent[0].text.includes('here is your answer'));
     assert.deepEqual(await listPendingDispatches(), []);
     assert.equal(await wasDelivered(deliveredKey(rec.chatId, rec.threadId, rec.updateId)), true);
@@ -294,7 +384,7 @@ describe('evaluatePendingDispatch', () => {
     const outcome = await evaluatePendingDispatch(rec, deps, now - 1); // deadline already passed
     assert.equal(outcome, 'dead');
     assert.equal(sent.length, 1);
-    assert.ok(sent[0].text.includes('could not be recovered'));
+    assert.ok(sent[0].text.includes("couldn't be completed"));
   });
 
   it('past the deadline, a completed transcript is still recovered (no quiescence wait)', async () => {
@@ -373,7 +463,7 @@ describe('evaluatePendingDispatch', () => {
     const { deps, sent } = makeFakeDeps({ workerAlive: false });
     assert.equal(await evaluatePendingDispatch(rec, deps, FAR_DEADLINE), 'dead');
     assert.equal(sent.length, 1);
-    assert.ok(sent[0].text.includes('could not be recovered'));
+    assert.ok(sent[0].text.includes("couldn't be completed"));
   });
 
   // --------------------------------------------------------------------
@@ -563,7 +653,7 @@ describe('reapOrphanedDispatches', () => {
       sleep: async () => { fakeNow += 60_000; }, // each poll jumps past the deadline
     });
     assert.equal(sent.length, 2);
-    assert.ok(sent.every((t) => t.includes('could not be recovered')));
+    assert.ok(sent.every((t) => t.includes("couldn't be completed")));
     assert.deepEqual(await listPendingDispatches(), []);
   });
 });
@@ -820,7 +910,8 @@ describe('evaluatePendingDispatch — tee-fallback (agy)', () => {
     const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
     assert.equal(outcome, 'recovered');
     assert.equal(sent.length, 1);
-    assert.ok(sent[0].text.includes('Recovered reply'));
+    assert.ok(!sent[0].text.includes('Recovered reply'), 'prefix removed by parity change');
+    assert.ok(!sent[0].text.includes('restarted'), 'prefix removed by parity change');
     assert.ok(sent[0].text.includes('agy reply here'));
     assert.deepEqual(await listPendingDispatches(), []);
     assert.equal(await wasDelivered(deliveredKey(rec.chatId, rec.threadId, rec.updateId)), true);
@@ -837,7 +928,7 @@ describe('evaluatePendingDispatch — tee-fallback (agy)', () => {
     const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
     assert.equal(outcome, 'dead');
     assert.equal(sent.length, 1);
-    assert.ok(sent[0].text.includes('could not be recovered'));
+    assert.ok(sent[0].text.includes("couldn't be completed"));
   });
 
   it('agy dispatch + teePath + worker still alive → waiting', async () => {
@@ -889,6 +980,190 @@ describe('evaluatePendingDispatch — tee-fallback (agy)', () => {
     assert.equal(sent.length, 1, 'no additional send attempted');
   });
 });
+
+  // ---------------------------------------------------------------------
+  // WP-A requeue ladder, parked skip, voice revive (2026-08-27 spec §3)
+  // ---------------------------------------------------------------------
+
+  it('requeue: exhausted record with requeueUpdate dep → outcome requeued, dep called with incremented record, nothing sent, record NOT delivered-marked and NOT removed', async () => {
+    const rec = makeRecord({ session: undefined });
+    await addPendingDispatch(rec);
+    const requeued: PendingDispatch[] = [];
+    const { deps, sent } = makeFakeDeps({ requeueUpdate: (r) => requeued.push(r) });
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(outcome, 'requeued');
+    assert.equal(sent.length, 0);
+    assert.equal(requeued.length, 1);
+    assert.equal(requeued[0].requeueCount, 1);
+    assert.equal(await wasDelivered(deliveredKey(rec.chatId, rec.threadId, rec.updateId)), false, 'V10 regression lock');
+    const remaining = await listPendingDispatches();
+    assert.equal(remaining.length, 1);
+    assert.equal(remaining[0].requeueCount, 1);
+  });
+
+  it('requeue: cap — a record at PA_REQUEUE_MAX falls to the neutral death notice', async () => {
+    const rec = makeRecord({ session: undefined, requeueCount: 2 });
+    await addPendingDispatch(rec);
+    const requeued: PendingDispatch[] = [];
+    const { deps, sent } = makeFakeDeps({ requeueUpdate: (r) => requeued.push(r) });
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(outcome, 'dead');
+    assert.equal(sent.length, 1);
+    assert.ok(sent[0].replyMarkup !== undefined, 'resend keyboard present');
+    assert.equal(requeued.length, 0);
+  });
+
+  it('requeue: cap is env-tunable', async () => {
+    const oldMax = process.env.PA_REQUEUE_MAX;
+    try {
+      process.env.PA_REQUEUE_MAX = '1';
+      const rec = makeRecord({ session: undefined, requeueCount: 1 });
+      await addPendingDispatch(rec);
+      const requeued: PendingDispatch[] = [];
+      const { deps, sent } = makeFakeDeps({ requeueUpdate: (r) => requeued.push(r) });
+      const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+      assert.equal(outcome, 'dead');
+      assert.equal(sent.length, 1);
+      assert.equal(requeued.length, 0);
+    } finally {
+      if (oldMax === undefined) delete process.env.PA_REQUEUE_MAX;
+      else process.env.PA_REQUEUE_MAX = oldMax;
+    }
+  });
+
+  it('requeue: a voice placeholder without voiceFileId gets the neutral notice (no requeue)', async () => {
+    const rec = makeRecord({ session: undefined, userText: '[Voice message]' });
+    await addPendingDispatch(rec);
+    const requeued: PendingDispatch[] = [];
+    const { deps, sent } = makeFakeDeps({ requeueUpdate: (r) => requeued.push(r) });
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(outcome, 'dead');
+    assert.equal(requeued.length, 0, 'no requeue without voiceFileId');
+    assert.ok(sent[0].text.includes('send it again'));
+  });
+
+  it('requeue: a topic stopped since before this update is never requeued', async () => {
+    const rec = makeRecord({ session: undefined });
+    await addPendingDispatch(rec);
+    const requeued: PendingDispatch[] = [];
+    const { deps, sent } = makeFakeDeps({ requeueUpdate: (r) => requeued.push(r) });
+    markTopicStopped('-100555_9', 'stop', rec.updateId + 5);
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(outcome, 'dead');
+    assert.equal(requeued.length, 0);
+    _clearStoppedForTest();
+  });
+
+  it('parked: a record with requeueNotBefore is skipped entirely — outcome parked, no send, no delivered-mark, record untouched, and the topic gate is NOT held', async () => {
+    const rec = makeRecord({ session: undefined, requeueNotBefore: Date.now() + 60_000 });
+    await addPendingDispatch(rec);
+    const { deps, sent } = makeFakeDeps({});
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(outcome, 'parked');
+    assert.equal(sent.length, 0);
+    assert.equal(await wasDelivered(deliveredKey(rec.chatId, rec.threadId, rec.updateId)), false);
+    const remaining = await listPendingDispatches();
+    assert.equal(remaining.length, 1);
+    assert.equal(remaining[0].requeueNotBefore, rec.requeueNotBefore, 'record untouched');
+    // Drive through reapOrphanedDispatches to verify gate-clear
+    const rec2 = makeRecord({ chatId: -999999, threadId: 0, updateId: 999, session: undefined });
+    await addPendingDispatch(rec2);
+    await reapOrphanedDispatches('test-token', { deps, maxWaitMs: 0, pollMs: 1, sleep: async () => Promise.resolve() });
+    assert.equal(await isTopicRecovering('-100555_9'), false, 'V18 gate-clear lock: parked topic not held');
+  });
+
+  it('parked: a PAST-due requeueNotBefore record also skips (never death-notices on restart — V24)', async () => {
+    const rec = makeRecord({ session: undefined, requeueNotBefore: Date.now() - 60_000 });
+    await addPendingDispatch(rec);
+    const { deps, sent } = makeFakeDeps({});
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(outcome, 'parked', 'PAST-due record still skipped; drain owns re-injection');
+    assert.equal(sent.length, 0, 'no send for past-due parked record');
+    const remaining = await listPendingDispatches();
+    assert.equal(remaining.length, 1);
+    assert.equal(remaining[0].requeueNotBefore, rec.requeueNotBefore, 'record intact');
+  });
+
+  it('voice revive: placeholder + voiceFileId + successful revive → requeued with transcript as userText and userTextSettled', async () => {
+    const rec = makeRecord({ session: undefined, userText: '[Voice message] call mom', voiceFileId: 'FID123' });
+    await addPendingDispatch(rec);
+    const requeued: PendingDispatch[] = [];
+    const revived: PendingDispatch[] = [];
+    const { deps, sent } = makeFakeDeps({
+      requeueUpdate: (r) => requeued.push(r),
+      reviveVoiceNote: async () => '[Voice message] hey there',
+    });
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(outcome, 'requeued');
+    assert.equal(requeued.length, 1);
+    assert.equal(requeued[0].userText, '[Voice message] hey there');
+    assert.equal(requeued[0].userTextSettled, true);
+    assert.equal(requeued[0].requeueCount, 1);
+    assert.equal(sent.length, 0);
+  });
+
+  it('voice revive: revive failure falls to the neutral untranscribed notice', async () => {
+    const rec = makeRecord({ session: undefined, userText: '[Voice message] call mom', voiceFileId: 'FID123' });
+    await addPendingDispatch(rec);
+    const { deps, sent } = makeFakeDeps({ reviveVoiceNote: async () => null });
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(outcome, 'dead');
+    assert.ok(sent[0].text.includes('send it again'));
+  });
+
+  it('voice revive: a command-captioned placeholder is never revived', async () => {
+    const rec = makeRecord({ session: undefined, userText: '[Voice message] /reset', voiceFileId: 'FID123' });
+    await addPendingDispatch(rec);
+    const revived: PendingDispatch[] = [];
+    const { deps, sent } = makeFakeDeps({ reviveVoiceNote: async (r) => { revived.push(r); return null; } });
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(outcome, 'dead');
+    assert.equal(revived.length, 0, 'command caption guards - revive not called');
+    assert.ok(sent[0].text.includes('send it again'));
+  });
+
+  describe('placeholderKindAndCaption', () => {
+    it('bare [Voice message] → {kind:voice}', () => {
+      const kc = placeholderKindAndCaption('[Voice message]');
+      assert.deepEqual(kc, { kind: 'voice' });
+    });
+
+    it('[Audio file] x.mp3 caption → {kind:audio, caption}', () => {
+      const kc = placeholderKindAndCaption('[Audio file] x.mp3 caption');
+      assert.deepEqual(kc, { kind: 'audio', caption: 'x.mp3 caption' });
+    });
+
+    it('[Video note] → {kind:video_note}', () => {
+      const kc = placeholderKindAndCaption('[Video note]');
+      assert.deepEqual(kc, { kind: 'video_note' });
+    });
+
+    it('non-placeholder text → null', () => {
+      assert.equal(placeholderKindAndCaption('hello world'), null);
+      assert.equal(placeholderKindAndCaption('some other text'), null);
+    });
+  });
+
+  it('recovered reply is formatWorkerReply output: CommonMark normalized, secrets redacted, no prefix', async () => {
+    const rec = makeRecord({ workerName: 'claude' });
+    await addPendingDispatch(rec);
+    const now = Date.now();
+    const replyWithMetadata = '**bold**\n### Header\nsk-TESTSECRET123456';
+    const { deps, sent } = makeFakeDeps({
+      workerAlive: false,
+      transcript: { content: assistantLine(replyWithMetadata, '2026-07-03T15:10:00Z'), mtimeMs: now - TRANSCRIPT_QUIESCENT_MS - 1000 },
+      nowMs: now,
+    });
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(outcome, 'recovered');
+    assert.equal(sent.length, 1);
+    assert.ok(sent[0].text.includes('*bold*'), 'CommonMark normalized (**bold** → *bold*)');
+    assert.ok(sent[0].text.includes('*Header*'), 'CommonMark normalized (### Header → *Header*)');
+    assert.ok(!sent[0].text.includes('sk-TESTSECRET123456'), 'secrets redacted');
+    assert.ok(!sent[0].text.includes('♻️'), 'prefix removed');
+    assert.ok(!sent[0].text.includes('Recovered reply'), 'prefix removed');
+    assert.ok(!sent[0].text.includes('restarted'), 'prefix removed');
+  });
 
 // ---------------------------------------------------------------------------
 // findTeePathByRegistry (WP2)

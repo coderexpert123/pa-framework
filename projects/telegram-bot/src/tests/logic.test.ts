@@ -9,6 +9,7 @@ import {
   resolveConfirmation,
   resolvePendingDescription,
   buildWorkerResponse,
+  formatWorkerReply,
   AGENT_SWITCH_PATTERN,
   MODEL_SWITCH_PATTERN,
   handleModelSwitch,
@@ -58,11 +59,11 @@ import {
   REF_PATTERN,
   CLAIMS_PATTERN,
   COMMIT_PATTERN,
-  COMMIT_AND_PUSH_PATTERN,
   PUSH_PATTERN,
   PUSH_PUBLIC_PATTERN,
   INVESTIGATE_FLAGGED_PATTERN,
   type StatusCardArgs,
+  workerReceivesStaticPromptFile,
 } from '../logic.js';
 import type { PAMeta } from '../types.js';
 import type { ConversationState, BranchAncestry } from '../types.js';
@@ -1770,7 +1771,7 @@ describe('applyMetaActions', () => {
 
   it('rejects PA_META run_skill for protected git-workflow skills', () => {
     const state = makeState();
-    const protectedSkills = ['commit', 'push', 'push-public', 'commit-and-push', 'investigate-flagged', 'update-brain', 'self-improver'];
+    const protectedSkills = ['commit', 'push', 'push-public', 'investigate-flagged', 'update-brain', 'self-improver'];
     for (const skill of protectedSkills) {
       const { skillToRun, response } = applyMetaActions(
         'Done.',
@@ -2244,6 +2245,52 @@ describe('buildWorkerResponse: agy thought blocks', () => {
   });
 });
 
+describe('formatWorkerReply', () => {
+  it('is byte-identical to buildWorkerResponse for the same worker output', () => {
+    const cases = [
+      '**bold** text with ### header',
+      '[Thought: true]\nMulti-block answer\n[Thought: false]\n[Thought: true]\nFinal block\n[Thought: false]',
+      '<thought>planning</thought>\nReal answer',
+      '**Strategy** I will analyze this.\nActual content',
+    ];
+    for (const raw of cases) {
+      for (const worker of ['claude', 'agy', 'zclaude']) {
+        const formatted = formatWorkerReply(raw, worker);
+        const viaBuild = buildWorkerResponse({ success: true, output: raw }, worker);
+        assert.equal(formatted, viaBuild, `formatWorkerReply must match buildWorkerResponse for worker=${worker}`);
+      }
+    }
+  });
+
+  it('redacts secrets.env-shaped literals', () => {
+    // Concatenated so the literal never matches token-shape scans at rest;
+    // the runtime string is the full token the redaction path must catch.
+    const apiToken = 'sk-' + 'TESTSECRET123456abcdefghijklmn';
+    const slackToken = 'xoxb-' + '1234567890abcdef';
+    const output = `The API key is ${apiToken} and token is ${slackToken}`;
+    const result = formatWorkerReply(output, 'claude');
+    assert.ok(!result.includes(apiToken), 'secret-like token must be redacted');
+    assert.ok(!result.includes(slackToken), 'Slack token must be redacted');
+  });
+
+  it('returns empty string for the NO_OUTPUT sentinel', () => {
+    const sentinel = 'Checking...NO_OUTPUT';
+    const result = formatWorkerReply(sentinel, 'agy');
+    assert.equal(result, '', 'NO_OUTPUT sentinel must return empty string');
+  });
+
+  it('returns empty string for empty input', () => {
+    assert.equal(formatWorkerReply('', 'claude'), '');
+    assert.equal(formatWorkerReply('   \n\t  ', 'claude'), '');
+  });
+
+  it('normalizes markdown: **bold** becomes *bold*', () => {
+    const input = '**Hello world**\nThis is **formatted** text.';
+    const result = formatWorkerReply(input, 'claude');
+    assert.equal(result, '*Hello world*\nThis is *formatted* text.');
+  });
+});
+
 describe('normalizeMarkdown: pre-escape stripping', () => {
   it('strips \\. to .', () => {
     assert.equal(normalizeMarkdown('version 1\\.0'), 'version 1.0');
@@ -2307,6 +2354,13 @@ describe('NEW_PATTERN', () => {
     const m = NEW_PATTERN.exec('/new');
     assert.equal(m?.[1], undefined);
   });
+  it('matches multi-line instruction (quoted ref + question)', () => {
+    assert.ok(NEW_PATTERN.test('/new \n> Ref: s-29c910953ae0\nwhat does this mean?'));
+  });
+  it('captures multi-line instruction verbatim', () => {
+    const m = NEW_PATTERN.exec('/new \n> Ref: s-29c910953ae0\nwhat does this mean?');
+    assert.equal(m?.[1], '> Ref: s-29c910953ae0\nwhat does this mean?');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2365,6 +2419,13 @@ describe('handleNewCommand', () => {
     const result = handleNewCommand(state, '/new summarise the project');
     assert.ok(result.matched);
     assert.equal(result.instruction, 'summarise the project');
+  });
+
+  it('extracts multi-line instruction (regression: used to fall through to the worker)', () => {
+    const state = makeState();
+    const result = handleNewCommand(state, '/new \n> Ref: s-daaa221fe2f0\ncan you debug this?');
+    assert.ok(result.matched);
+    assert.equal(result.instruction, '> Ref: s-daaa221fe2f0\ncan you debug this?');
   });
 
   it('preserves cwd_override after /new', () => {
@@ -2784,7 +2845,7 @@ describe('handleRetranscribeCommand', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Git-workflow skill triggers: COMMIT_PATTERN, COMMIT_AND_PUSH_PATTERN,
+// Git-workflow skill triggers: COMMIT_PATTERN,
 // PUSH_PATTERN, PUSH_PUBLIC_PATTERN, INVESTIGATE_FLAGGED_PATTERN
 // ---------------------------------------------------------------------------
 
@@ -2797,8 +2858,8 @@ describe('COMMIT_PATTERN', () => {
     assert.ok(COMMIT_PATTERN.test('/commit@my_bot'));
   });
 
-  it('does NOT match /commit_and_push — the two commands must never shadow each other', () => {
-    assert.equal(COMMIT_PATTERN.test('/commit_and_push'), false);
+  it('does NOT match /push_public — the two commands must never shadow each other', () => {
+    assert.equal(COMMIT_PATTERN.test('/push_public'), false);
   });
 
   it('does not match unrelated text', () => {
@@ -2806,23 +2867,8 @@ describe('COMMIT_PATTERN', () => {
   });
 });
 
-describe('COMMIT_AND_PUSH_PATTERN', () => {
-  it('matches bare /commit_and_push', () => {
-    assert.ok(COMMIT_AND_PUSH_PATTERN.test('/commit_and_push'));
-  });
-
-  it('matches with a bot-username suffix', () => {
-    assert.ok(COMMIT_AND_PUSH_PATTERN.test('/commit_and_push@my_bot'));
-  });
-
-  it('does not match unrelated text', () => {
-    assert.equal(COMMIT_AND_PUSH_PATTERN.test('please commit and push this'), false);
-  });
-
-  it('does not match trailing arguments', () => {
-    assert.equal(COMMIT_AND_PUSH_PATTERN.test('/commit_and_push now'), false);
-  });
-});
+// COMMIT_AND_PUSH_PATTERN retired with the skill (2026-08-28, AI-148 D-b) — the
+// describe block above's non-shadowing case was re-anchored to /push_public.
 
 describe('PUSH_PATTERN', () => {
   it('matches bare /push', () => {
@@ -3071,6 +3117,53 @@ describe('handleHelpCommand', () => {
     assert.ok(result.response.includes('/help'));
     assert.ok(result.response.includes('/status'));
     assert.ok(result.response.includes('/skills'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// workerReceivesStaticPromptFile
+// ---------------------------------------------------------------------------
+
+describe('workerReceivesStaticPromptFile', () => {
+  it('returns true for worker with bare --append-system-prompt-file arg', () => {
+    const worker = { name: 'claude', args: ['--append-system-prompt-file'] };
+    const result = workerReceivesStaticPromptFile(worker);
+    assert.strictEqual(result, true);
+  });
+
+  it('returns true for worker with =form --append-system-prompt-file=/path/to/file.md', () => {
+    const worker = { name: 'claude', args: ['--append-system-prompt-file=/some/path/bot-instructions.md'] };
+    const result = workerReceivesStaticPromptFile(worker);
+    assert.strictEqual(result, true);
+  });
+
+  it('returns true for worker with flag among other args', () => {
+    const worker = { name: 'zclaude', args: ['--model', 'opus', '--append-system-prompt-file', '--timeout', '60'] };
+    const result = workerReceivesStaticPromptFile(worker);
+    assert.strictEqual(result, true);
+  });
+
+  it('returns false for worker without the flag in args', () => {
+    const worker = { name: 'agy', args: ['--model', 'gemini-3.7-flash-high'] };
+    const result = workerReceivesStaticPromptFile(worker);
+    assert.strictEqual(result, false);
+  });
+
+  it('returns false for worker with empty args array', () => {
+    const worker = { name: 'codex', args: [] };
+    const result = workerReceivesStaticPromptFile(worker);
+    assert.strictEqual(result, false);
+  });
+
+  it('returns false for worker with undefined args', () => {
+    const worker = { name: 'claude', args: undefined };
+    const result = workerReceivesStaticPromptFile(worker);
+    assert.strictEqual(result, false);
+  });
+
+  it('returns false for undefined worker', () => {
+    const result = workerReceivesStaticPromptFile(undefined);
+    assert.strictEqual(result, false);
   });
 });
 

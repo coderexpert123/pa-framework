@@ -11,7 +11,7 @@ SLO (Service-Level Objective) error budget tracking is available via `pa slo rep
 - **bot-reply-delivery**: 99.5% monthly target. Events are DLQ TTL expiries and death notices.
 - **daily-mail-brief**: ≥95% monthly target. Events are missed 19:00/05:00 IST delivery windows.
 - **catchup-heartbeat**: Gap <30min target. Events are heartbeat gaps >30min from app.log.
-- **ekadashi-alerts**: Zero-miss target. Events are watchdog miss detections.
+(Add your own services via `~/.pa/slo.yaml` — see `examples/slo.yaml.example`)
 
 ### SLO Configuration File
 
@@ -29,6 +29,5 @@ The report computes error budgets deterministically from existing logs:
 - DLQ file: `~/.pa/telegram-dlq.jsonl`
 - App log: `~/.pa/app.log.jsonl`
 - Mail brief: `~/.pa/daily-mail-brief/latest.json`
-- Ekadashi receipts: `~/.pa/ekadashi-receipts.jsonl`
 
 **Note:** SLO data feeds into the weekly digest summary. Error budget exhaustion does not freeze the self-improver in v1 (that hook is a follow-up once a month of data exists).
