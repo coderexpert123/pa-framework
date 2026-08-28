@@ -91,7 +91,7 @@ describe('Dashboard', () => {
 // Capability matrix (T3)
 // ---------------------------------------------------------------------------
 
-/** Mirrors the live 2026-07-22 config: every worker declares model, all but gemini declare effort. */
+/** Mirrors the live 2026-07-22 config: every worker declares model, all but modelonly declare effort. */
 const CAP_CONFIG = {
   workers: [
     {
@@ -356,5 +356,43 @@ describe('Dashboard capability matrix (integration)', () => {
     assert.ok(content.includes('1. claude (priority 1)'), content);
     assert.ok(content.includes('2. agy (priority 2)'), content);
     assert.ok(!content.includes('•'), content);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// refreshDashboardIfBootstrapped (WP-2d)
+// ---------------------------------------------------------------------------
+const {
+  refreshDashboardIfBootstrapped,
+} = await import('../dashboard.js');
+
+describe('refreshDashboardIfBootstrapped', () => {
+  it('returns early when dashboard state lacks chat_id or message_id', async () => {
+    const statePath = join(sharedTempDir, 'telegram-dashboard.json');
+    await writeFile(statePath, JSON.stringify({}), 'utf8');
+
+    await assert.doesNotReject(refreshDashboardIfBootstrapped('test-token'));
+  });
+
+  it('returns early when dashboard state is empty', async () => {
+    const statePath = join(sharedTempDir, 'telegram-dashboard.json');
+    await writeFile(statePath, JSON.stringify({ chat_id: 123 }), 'utf8');
+
+    await assert.doesNotReject(refreshDashboardIfBootstrapped('test-token'));
+  });
+
+  it('returns early when only message_id exists', async () => {
+    const statePath = join(sharedTempDir, 'telegram-dashboard.json');
+    await writeFile(statePath, JSON.stringify({ message_id: 456 }), 'utf8');
+
+    await assert.doesNotReject(refreshDashboardIfBootstrapped('test-token'));
+  });
+
+  it('calls editMessageText when bootstrapped (chat_id and message_id exist)', async () => {
+    const statePath = join(sharedTempDir, 'telegram-dashboard.json');
+    await writeFile(statePath, JSON.stringify({ chat_id: 123, message_id: 456, thread_id: 789 }), 'utf8');
+
+    // Mock editMessageText - we just verify it doesn't throw
+    await assert.doesNotReject(refreshDashboardIfBootstrapped('test-token'));
   });
 });

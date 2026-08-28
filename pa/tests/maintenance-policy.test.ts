@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { homedir, tmpdir } from 'os';
+import { homedir, tmpdir, platform } from 'os';
 import { join, resolve } from 'path';
 import { validateRegistry, isUnderRoot } from '../src/lib/maintenance/policy.js';
 import type { MaintenanceJob, RetentionTarget } from '../src/lib/maintenance/types.js';
@@ -68,7 +68,11 @@ describe('validateRegistry', () => {
     assert.throws(
       () => validateRegistry([job({
         destructive: true,
-        targets: [t({ resolve: () => resolve(tmpdir(), 'nowhere') })],
+        // The parent of the homedir is outside every ALLOWED root. (A plain
+        // tmpdir() fixture stopped being "outside" when the shared-tmp-sweep
+        // job made the test scratch dir an allowed root — its default and the
+        // suite's PA_TEST_TMP_DIR both live under tmpdir() on this machine.)
+        targets: [t({ resolve: () => resolve(homedir(), '..', 'nowhere-outside') })],
       })]),
       /outside every ALLOWED root/,
     );
@@ -109,6 +113,39 @@ describe('validateRegistry', () => {
       })]),
     );
   });
+
+  if (process.platform === 'win32') {
+    it('C:/wt/tmp (PA_TEST_TMP_DIR default) is an ALLOWED root with path precision', () => {
+      // Default path should be allowed
+      assert.doesNotThrow(
+        () => validateRegistry([job({
+          destructive: true,
+          targets: [t({ resolve: () => resolve('C:/wt/tmp') })],
+        })]),
+      );
+      // Sibling directory should NOT be allowed (path precision)
+      assert.throws(
+        () => validateRegistry([job({
+          destructive: true,
+          targets: [t({ resolve: () => resolve('C:/wt/tmpfoo') })],
+        })]),
+        /outside every ALLOWED root/,
+      );
+      // Honor PA_TEST_TMP_DIR override
+      process.env.PA_TEST_TMP_DIR = 'D:/custom/tmp';
+      try {
+        assert.doesNotThrow(
+          () => validateRegistry([job({
+            destructive: true,
+            targets: [t({ resolve: () => resolve('D:/custom/tmp') })],
+          })]),
+        );
+      } finally {
+        delete process.env.PA_TEST_TMP_DIR;
+      }
+    });
+  }
+
 
   it('empty evidence throws', () => {
     assert.throws(

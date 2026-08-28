@@ -319,6 +319,18 @@ const KIND_LABEL: Record<AudioAttachmentKind, string> = {
   video_note: 'Video note',
 };
 
+/** True for the enqueue-time placeholder shape `[Voice message|Audio file|Video note]`
+ * plus optional RAW trailing caption (placeholderDispatchText's output — main.ts keeps
+ * its own copy next to isAcceptableUpdate by design). Deliberately ALSO matches a
+ * bare-label SUCCESS transcript (`[Voice message] <text>` — byte-identical shape, see
+ * the HARD GATE test): callers MUST pair it with `record.userTextSettled !== true` to
+ * tell a lost transcript from a recovered one (2026-08-27 honest-resend spec).
+ * Labels are pinned to KIND_LABEL's values by the drift-guard test in voice.test.ts. */
+const BARE_PLACEHOLDER_RE = /^\[(Voice message|Audio file|Video note)\](?: .*)?$/;
+export function isBarePlaceholderUserText(text: string): boolean {
+  return BARE_PLACEHOLDER_RE.test(text);
+}
+
 function sanitizeCaption(caption: string): string {
   return caption.replace(/\s+/g, ' ').trim().replace(/"/g, "'");
 }

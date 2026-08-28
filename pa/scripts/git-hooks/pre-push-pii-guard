@@ -683,10 +683,10 @@ def zclaude_check(content: str, tripwires: list[str]) -> tuple[bool, str, bool]:
     """Fallback semantic scan via zclaude when agy is unavailable (2026-08-14).
 
     Same prompt, same CLEAN/VIOLATION format. zclaude (a Zhipu GLM wrapper via
-    api.z.ai, recharged 2026-08-14) doesn't support the @<file> prompt-file
-    syntax agy uses, so the full prompt is written to a temp file and the CLI
-    is given a short instruction to read it — claude's print mode uses tools
-    (Read) under --dangerously-skip-permissions. This avoids the Windows 32KB
+    api.z.ai) doesn't support the @<file> prompt-file syntax agy uses, so the
+    full prompt is written to a temp file and the CLI is given a short instruction
+    to read it — claude's print mode uses tools (Read) under
+    --dangerously-skip-permissions. This avoids the Windows 32KB
     argv ceiling that a direct -p pass of the full prompt would hit."""
     argv = resolve_zclaude_argv()
     if argv is None:
@@ -1342,11 +1342,10 @@ def main() -> int:
             return 0
         is_clean, reason, ok = agy_check(added_content, tripwires)
         if not ok:
-            # Fallback: try zclaude when agy is unavailable (2026-08-14).
-            # zclaude is a GLM wrapper (api.z.ai) that was recharged after the
-            # 46h Google quota outage stranded a public sync. One attempt,
-            # same prompt, same verdict format — if zclaude produces a real
-            # verdict, use it; if zclaude also fails, the fail-closed path
+            # Fallback: try zclaude when agy is unavailable.
+            # zclaude is a GLM wrapper (api.z.ai). One attempt, same prompt,
+            # same verdict format — if zclaude produces a real verdict, use it;
+            # if zclaude also fails, the fail-closed path
             # below runs unchanged.
             print("ℹ  PII guard: agy unavailable — trying zclaude fallback…",
                   file=sys.stderr)

@@ -124,7 +124,7 @@ pa/data/profile-history-archive.jsonl
 # the skill's own step 6 ("Present the final briefing here").
 # **/glm-[0-9]* added 2026-08-13: zclaude (GLM-family models) writes its
 # response to a file NAMED AFTER THE MODEL at cwd — observed as glm-4.7,
-# glm-5.2[1m] at repo root AND in subdirs (pa/, projects/ekadashi-manager/),
+# glm-5.2[1m] at repo root AND in project subdirs (pa/, projects/*),
 # i.e. wherever the worker's cwd happened to be. Digit-anchored so a
 # hypothetical docs/glm-guide.md stays trackable.
 /message_to_user.md
@@ -254,10 +254,6 @@ projects/health-reports/scripts/create_knee_recovery_pdf.py
 projects/health-reports/scripts/create_report.py
 projects/health-reports/scripts/knee_recovery_link.txt
 projects/pan-transfer/scripts/create_account_transfer_report.py
-# Captured invoice-template dumps (full PAN/address) moved to
-# ~/Documents/personal-imports/2026-07-27/ — block re-capture at these paths.
-projects/hemir-invoice/template_analysis.txt
-projects/hemir-invoice/scripts/template_content_check.txt
 # No loose code directly under projects/ — every project is a directory (same
 # class of gap as the root /*.py rule; ad-hoc Gmail scripts accumulated here).
 projects/*.py
@@ -268,3 +264,8 @@ projects/*.py
 # The private repo's existing tracked copy is unaffected — gitignore only
 # prevents NEW additions in fresh clones (e.g. of the future public repo).
 projects/telegram-bot/bot-instructions.md
+
+# The OAuth bridge page's optional deep-link config (plans/2026-08-24-buttons-
+# program-SPEC.md §3.5) names the bot's Telegram username — deployment-
+# specific, never committed. config.example.js stays tracked as the template.
+projects/google-oauth-redirect/config.js

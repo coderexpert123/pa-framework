@@ -2,11 +2,13 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, writeFile } from 'fs/promises';
 import { join } from 'path';
-import { readRecentFailures, buildFailurePrompt, checkForRollbacks } from '../src/failure-analyzer.js';
-import type { FailureRecord } from '../src/failure-analyzer.js';
+import { readRecentFailures, buildFailurePrompt, checkForRollbacks, censusProposals, tracebackCodeTarget } from '../src/failure-analyzer.js';
+import type { FailureRecord, CensusProposalInput } from '../src/failure-analyzer.js';
 import { createTempPaHome, createTempSkill, createTempDraft, cleanup } from './helpers.js';
 import { appendAuditRecord } from '../src/lib/improvement-audit.js';
+import { updateJobState } from '../src/lib/maintenance/state.js';
 import type { DraftMeta, RunMeta } from '../src/types.js';
+import type { AlertCensus, CensusFamily } from '../src/lib/alert-census.js';
 
 async function createTempMeta(dir: string, skillName: string, meta: RunMeta): Promise<void> {
   const logDir = join(dir, 'logs', skillName);
@@ -17,7 +19,7 @@ async function createTempMeta(dir: string, skillName: string, meta: RunMeta): Pr
 
 function makeErrorMeta(overrides: Partial<RunMeta> = {}): RunMeta {
   return {
-    worker: 'gemini',
+    worker: 'codex',
     status: 'error',
     exitCode: -1,
     duration: 300000,
@@ -86,8 +88,8 @@ describe('failure-analyzer', () => {
   describe('buildFailurePrompt', () => {
     it('groups failures by skill and includes counts', () => {
       const failures: FailureRecord[] = [
-        { skillName: 'my-skill', error: 'Timeout', timestamp: new Date().toISOString(), duration: 600000, worker: 'gemini' },
-        { skillName: 'my-skill', error: 'Timeout', timestamp: new Date().toISOString(), duration: 600000, worker: 'gemini' },
+        { skillName: 'my-skill', error: 'Timeout', timestamp: new Date().toISOString(), duration: 600000, worker: 'codex' },
+        { skillName: 'my-skill', error: 'Timeout', timestamp: new Date().toISOString(), duration: 600000, worker: 'codex' },
         { skillName: 'other-skill', error: 'Auth error', timestamp: new Date().toISOString(), duration: 1000, worker: 'claude' },
         { skillName: 'other-skill', error: 'Auth error', timestamp: new Date().toISOString(), duration: 1000, worker: 'claude' },
       ];
@@ -102,7 +104,7 @@ describe('failure-analyzer', () => {
 
     it('excludes skills with only 1 failure', () => {
       const failures: FailureRecord[] = [
-        { skillName: 'one-off', error: 'Fluke', timestamp: new Date().toISOString(), duration: 100, worker: 'gemini' },
+        { skillName: 'one-off', error: 'Fluke', timestamp: new Date().toISOString(), duration: 100, worker: 'codex' },
       ];
 
       const prompt = buildFailurePrompt(failures, [], []);
@@ -117,8 +119,8 @@ describe('failure-analyzer', () => {
 
     it('requests an optional code_target file-path hint (2026-07-11 code-fix capability)', () => {
       const failures: FailureRecord[] = [
-        { skillName: 'daily-mail-brief', error: 'Missing BRIEFING marker', timestamp: new Date().toISOString(), duration: 5000, worker: 'gemini' },
-        { skillName: 'daily-mail-brief', error: 'Missing BRIEFING marker', timestamp: new Date().toISOString(), duration: 5000, worker: 'gemini' },
+        { skillName: 'daily-mail-brief', error: 'Missing BRIEFING marker', timestamp: new Date().toISOString(), duration: 5000, worker: 'codex' },
+        { skillName: 'daily-mail-brief', error: 'Missing BRIEFING marker', timestamp: new Date().toISOString(), duration: 5000, worker: 'codex' },
       ];
       const prompt = buildFailurePrompt(failures, ['daily-mail-brief'], []);
       assert.match(prompt, /code_target/);
@@ -145,7 +147,7 @@ describe('failure-analyzer', () => {
         await createTempMeta(dir, skillName, makeErrorMeta({ timestamp: new Date(Date.now() - i * 60000).toISOString() }));
       }
       await createTempMeta(dir, skillName, {
-        worker: 'gemini', status: 'success', exitCode: 0, duration: 1000,
+        worker: 'codex', status: 'success', exitCode: 0, duration: 1000,
         timestamp: new Date().toISOString(),
       });
     }
@@ -199,7 +201,7 @@ describe('failure-analyzer', () => {
       await createTempDraft(dir, 'healthy-skill', 'Original.', draftMeta({ approved_autonomously: true }));
       for (let i = 0; i < 4; i++) {
         await createTempMeta(dir, 'healthy-skill', {
-          worker: 'gemini', status: 'success', exitCode: 0, duration: 1000,
+          worker: 'codex', status: 'success', exitCode: 0, duration: 1000,
           timestamp: new Date(Date.now() - i * 60000).toISOString(),
         });
       }
@@ -297,5 +299,220 @@ describe('failure-analyzer', () => {
       assert.equal(flags.find((f) => f.skillName === 'self-improver'), undefined,
         'self-improver must never be a rollback target, by explicit exclusion');
     });
+
+    // Ledger-driven pass (2026-08-23, correction 22): computeFailureRates() is skill-log-dir
+    // driven and structurally cannot see a maintenance job's failures — the block appended
+    // before `return flags;` reads the maintenance ledger directly instead.
+    describe('maintenance-job rollback (ledger-driven, 2026-08-23)', () => {
+      it('flags "git-revert" when a job fix regressed: consecutiveFailures >= 2 and lastAttemptAt is AFTER the fix ts', async () => {
+        const fixTs = new Date(Date.now() - 60 * 60 * 1000).toISOString(); // 1h ago
+        await appendAuditRecord({
+          ts: fixTs, draft: 'restore-drill-alert-fix', source_type: 'failure',
+          target_skill: 'restore-drill', target_kind: 'maintenance-job', action: 'applied-code-fix',
+          risk_flags: [], reason: 'ENOENT in restore-drill', commit_hash: 'job1234',
+        });
+        await updateJobState('restore-drill', (prev) => ({
+          ...prev,
+          consecutiveFailures: 3,
+          lastAttemptAt: new Date().toISOString(), // now — after the fix ts
+        }));
+
+        const flags = await checkForRollbacks();
+        const flag = flags.find((f) => f.skillName === 'restore-drill');
+        assert.ok(flag, 'expected a rollback flag for the regressed maintenance job');
+        assert.equal(flag!.kind, 'git-revert');
+        assert.equal(flag!.commitHash, 'job1234');
+        assert.equal(flag!.draftName, 'restore-drill-alert-fix');
+      });
+
+      it('does NOT flag when lastAttemptAt is BEFORE the fix ts (no attempt since the fix landed)', async () => {
+        const fixTs = new Date().toISOString(); // now
+        await appendAuditRecord({
+          ts: fixTs, draft: 'clobber-sentinel-alert-fix', source_type: 'failure',
+          target_skill: 'clobber-sentinel-early', target_kind: 'maintenance-job', action: 'applied-code-fix',
+          risk_flags: [], reason: 'x', commit_hash: 'job5678',
+        });
+        await updateJobState('clobber-sentinel-early', (prev) => ({
+          ...prev,
+          consecutiveFailures: 3,
+          lastAttemptAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(), // 1h ago — BEFORE fixTs
+        }));
+
+        const flags = await checkForRollbacks();
+        assert.equal(flags.find((f) => f.skillName === 'clobber-sentinel-early'), undefined);
+      });
+
+      it('does NOT flag when consecutiveFailures < 2 (a single fresh failure is not a regression signal)', async () => {
+        const fixTs = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+        await appendAuditRecord({
+          ts: fixTs, draft: 'redteam-recurring-alert-fix', source_type: 'failure',
+          target_skill: 'redteam-recurring-low', target_kind: 'maintenance-job', action: 'applied-code-fix',
+          risk_flags: [], reason: 'x', commit_hash: 'job9999',
+        });
+        await updateJobState('redteam-recurring-low', (prev) => ({
+          ...prev,
+          consecutiveFailures: 1,
+          lastAttemptAt: new Date().toISOString(),
+        }));
+
+        const flags = await checkForRollbacks();
+        assert.equal(flags.find((f) => f.skillName === 'redteam-recurring-low'), undefined);
+      });
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// censusProposals / tracebackCodeTarget (2026-08-23 alerts wave, §WP-J2b step 1) — pure,
+// no LLM call, no I/O, so these run with no PA_HOME fixture at all.
+// ---------------------------------------------------------------------------
+
+function makeFamily(overrides: Partial<CensusFamily> = {}): CensusFamily {
+  return {
+    family: 'test-family',
+    subjectSample: 'Skill failed: test-family',
+    sent: 5,
+    suppressed: 0,
+    other: 0,
+    firstSeen: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString(),
+    lastSeen: new Date().toISOString(),
+    ownerKind: 'skill',
+    owner: 'test-family',
+    distinctBodies: 1,
+    classification: 'deterministic-defect',
+    ownerStatus: { consecutiveFailures: 3, lastError: 'Traceback (most recent call last):\n  File "run.py", line 1, in <module>' },
+    ...overrides,
+  };
+}
+
+function makeCensus(families: CensusFamily[]): AlertCensus {
+  return {
+    generatedAt: new Date().toISOString(),
+    windowDays: 7,
+    since: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString(),
+    until: new Date().toISOString(),
+    totalSent: families.reduce((s, f) => s + f.sent, 0),
+    totalSuppressed: 0,
+    sentPerDay: {},
+    families,
+    maskedFailures: [],
+    topLine: 'test census',
+  };
+}
+
+function makeInput(overrides: Partial<CensusProposalInput> = {}): CensusProposalInput {
+  return {
+    skills: [{ name: 'daily-mail-brief', frontmatter: { cmd: 'python run_brief.py' } }],
+    maintenanceJobNames: ['restore-drill', 'clobber-sentinel'],
+    jobFileExists: () => true,
+    ...overrides,
+  };
+}
+
+describe('censusProposals (2026-08-23 alerts wave)', () => {
+  it('cmd-based skill owner -> one proposal with target_kind skill and census evidence', () => {
+    const census = makeCensus([makeFamily({ owner: 'daily-mail-brief', family: 'daily-mail-brief-defect' })]);
+    const results = censusProposals(census, makeInput());
+
+    assert.equal(results.length, 1);
+    assert.equal(results[0].proposal.name, 'daily-mail-brief-alert-fix');
+    assert.equal(results[0].proposal.target_skill, 'daily-mail-brief');
+    assert.equal(results[0].proposal.target_kind, 'skill');
+    assert.equal(results[0].evidence.length, 1);
+    assert.equal(results[0].evidence[0].worker, 'census');
+    assert.equal(results[0].evidence[0].skillName, 'daily-mail-brief');
+  });
+
+  it('non-cmd skill owner -> no proposal (a prompt fix cannot repair a deterministic defect)', () => {
+    const census = makeCensus([makeFamily({ owner: 'daily-mail-brief' })]);
+    const input = makeInput({ skills: [{ name: 'daily-mail-brief', frontmatter: {} }] });
+    assert.deepEqual(censusProposals(census, input), []);
+  });
+
+  it('unknown skill owner (not in skills list) -> no proposal', () => {
+    const census = makeCensus([makeFamily({ owner: 'never-registered-skill' })]);
+    assert.deepEqual(censusProposals(census, makeInput()), []);
+  });
+
+  it('maintenance-job owner with an existing job file -> target_kind maintenance-job, jobs-dir code_target', () => {
+    const census = makeCensus([makeFamily({
+      owner: 'restore-drill', family: 'restore-drill-defect', ownerKind: 'maintenance-job',
+      ownerStatus: { consecutiveFailures: 5, lastError: 'ENOENT: no such file' },
+    })]);
+    const results = censusProposals(census, makeInput());
+
+    assert.equal(results.length, 1);
+    assert.equal(results[0].proposal.target_kind, 'maintenance-job');
+    assert.equal(results[0].proposal.target_skill, 'restore-drill');
+    assert.equal(results[0].proposal.code_target, 'pa/src/lib/maintenance/jobs/restore-drill.ts');
+  });
+
+  it('maintenance-job whose file does not exist -> no proposal', () => {
+    const census = makeCensus([makeFamily({ owner: 'restore-drill', ownerKind: 'maintenance-job' })]);
+    const input = makeInput({ jobFileExists: () => false });
+    assert.deepEqual(censusProposals(census, input), []);
+  });
+
+  it('healthy owner now (consecutiveFailures 0) -> no proposal, even if classified deterministic-defect', () => {
+    const census = makeCensus([makeFamily({ owner: 'daily-mail-brief', ownerStatus: { consecutiveFailures: 0 } })]);
+    assert.deepEqual(censusProposals(census, makeInput()), []);
+  });
+
+  it('non-deterministic-defect classifications -> no proposal', () => {
+    for (const classification of ['human-gated', 'repeat-unchanged', 'transient', 'informational'] as const) {
+      const census = makeCensus([makeFamily({ owner: 'daily-mail-brief', classification })]);
+      assert.deepEqual(censusProposals(census, makeInput()), [], `classification=${classification} must not propose`);
+    }
+  });
+
+  it('two families for the same owner -> no duplicate proposal name (higher-sent family, listed first, wins)', () => {
+    const census = makeCensus([
+      makeFamily({ owner: 'daily-mail-brief', family: 'daily-mail-brief-defect-a', sent: 20 }),
+      makeFamily({ owner: 'daily-mail-brief', family: 'daily-mail-brief-defect-b', sent: 5 }),
+    ]);
+    const results = censusProposals(census, makeInput());
+
+    assert.equal(results.length, 1, 'never emit two proposals with the same name');
+    assert.equal(results[0].proposal.name, 'daily-mail-brief-alert-fix');
+    assert.match(results[0].proposal.reason, /daily-mail-brief-defect-a/, 'the first (higher-sent) family wins');
+  });
+
+  it('worker/system/unknown owner kinds -> no proposal', () => {
+    for (const ownerKind of ['worker', 'system', 'unknown'] as const) {
+      const census = makeCensus([makeFamily({ ownerKind, owner: ownerKind === 'unknown' ? undefined : 'x' })]);
+      assert.deepEqual(censusProposals(census, makeInput()), []);
+    }
+  });
+});
+
+describe('tracebackCodeTarget (2026-08-23 alerts wave)', () => {
+  it('extracts a repo-relative path from a File "..." traceback line under Personal Assistant/', () => {
+    const text = 'Traceback (most recent call last):\n  File "D:\\Personal Assistant\\projects\\daily-mail-brief\\scripts\\run_brief.py", line 42, in main\n    raise RuntimeError';
+    assert.equal(tracebackCodeTarget(text), 'projects/daily-mail-brief/scripts/run_brief.py');
+  });
+
+  it('takes the LAST frame that resolves under the repo when there are several', () => {
+    const text = [
+      'File "D:\\Personal Assistant\\pa\\scripts\\a.py", line 1, in <module>',
+      'File "D:\\Personal Assistant\\pa\\scripts\\b.py", line 2, in helper',
+    ].join('\n');
+    assert.equal(tracebackCodeTarget(text), 'pa/scripts/b.py');
+  });
+
+  it('skips a frame outside the repo and still returns the one that resolves under it', () => {
+    const text = [
+      'File "C:\\Python313\\lib\\subprocess.py", line 100, in run',
+      'File "D:\\Personal Assistant\\pa\\scripts\\backup_secrets.py", line 223, in main',
+    ].join('\n');
+    assert.equal(tracebackCodeTarget(text), 'pa/scripts/backup_secrets.py');
+  });
+
+  it('returns undefined when no frame resolves under the repo', () => {
+    const text = 'File "C:\\Python313\\lib\\subprocess.py", line 100, in run';
+    assert.equal(tracebackCodeTarget(text), undefined);
+  });
+
+  it('returns undefined for text with no traceback frame at all', () => {
+    assert.equal(tracebackCodeTarget('ENOENT: no such file or directory'), undefined);
   });
 });

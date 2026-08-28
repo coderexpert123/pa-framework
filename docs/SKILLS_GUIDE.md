@@ -25,7 +25,7 @@ cwd: ${PA_HOME}/skills/myskill # ~ expands (to the OS home dir); ${VAR} env-inte
                                # PA_HOME is overridden. ${PA_HOME} resolves correctly either way.
 secrets:                       # env vars to inject from secrets.env
   - TELEGRAM_BOT_TOKEN
-worker: gemini                # force a specific worker
+worker: codex                 # force a specific worker
 no_fallback: true             # don't failover (use with worker:)
 cmd: "python run.py"          # direct command — bypasses LLM
 timeout: 1800                 # seconds; default 3600
@@ -65,7 +65,7 @@ The body becomes a comment for human readers. The skill is identical to running 
 ```yaml
 ---
 cron: "0 9 * * *"
-worker: gemini
+worker: codex
 telegram_output:
   chat_id: '${TELEGRAM_CHAT_ID}'
   token_secret: TELEGRAM_BOT_TOKEN
@@ -75,7 +75,7 @@ Check the weather forecast for Bangalore for the next 7 days.
 Output a Markdown summary with a single recommendation: "good week for outdoor", "mixed", or "stay in".
 ```
 
-The worker (gemini) receives the body as its prompt. Its output is captured and routed to Telegram via the `telegram_output` envelope. No script involved.
+The worker (codex) receives the body as its prompt. Its output is captured and routed to Telegram via the `telegram_output` envelope. No script involved.
 
 ### Hybrid (subprocess + LLM)
 
@@ -85,7 +85,7 @@ cron: "0 9 1 * *"
 cwd: ${PA_HOME}/skills/expense-report
 secrets:
   - TELEGRAM_BOT_TOKEN
-worker: gemini
+worker: codex
 ---
 
 # Monthly expense report
@@ -154,11 +154,11 @@ telegram_output:
 ### Worker override + no_fallback
 
 ```yaml
-worker: gemini
+worker: codex
 no_fallback: true
 ```
 
-Use when only one worker can do the task (e.g., gemini for grounded search, claude for long-context reasoning). Without `no_fallback`, the framework will try other workers if gemini fails.
+Use when only one worker can do the task (e.g., claude for long-context reasoning). Without `no_fallback`, the framework will try other workers if it fails.
 
 ### Secrets injection
 
@@ -213,7 +213,7 @@ The script reads a static calendar JSON file, fires only if today matches a conf
 ```yaml
 ---
 cron: "0 8 * * *"
-worker: gemini
+worker: codex
 secrets:
   - PA_PROFILE_PATH
 ---
@@ -270,7 +270,10 @@ Within each step, unavailable workers (check failure, in cooldown) are skipped.
 node pa/dist/bin/pa.js run my-skill
 
 # Force a specific worker
-node pa/dist/bin/pa.js run my-skill --worker gemini
+node pa/dist/bin/pa.js run my-skill --worker codex
+
+# Inject per-run operator arguments into the skill prompt (LLM skills only)
+node pa/dist/bin/pa.js run my-skill --prompt-args "Focus on section 3 only"
 
 # Pass extra args (after --)
 node pa/dist/bin/pa.js run my-skill -- some additional context
@@ -279,3 +282,49 @@ node pa/dist/bin/pa.js run my-skill -- some additional context
 Logs land at `~/.pa/logs/my-skill/<timestamp>.json`. Use `pa logs my-skill` to view recent runs.
 
 For unit-test-style testing of skill-loading logic, see `pa/tests/skills.test.ts`.
+
+## The self-improvement loop
+
+The framework includes an autonomous self-improvement system that analyzes logs, proposes fixes, and applies changes through safety-gated validation.
+
+### What it does
+
+The self-improvement loop (`pa/src/self-improver.ts`) runs nightly and when triggered manually:
+
+1. **Analyzes conversation patterns** — reads `~/.pa/conversation-history.jsonl` to extract user feedback and decision patterns
+2. **Scans run logs** — runs `analyzer.ts`, `failure-analyzer.ts`, and `feedback-analyzer.ts` against `~/.pa/app.log.jsonl` to identify failures, anti-patterns, and improvement opportunities
+3. **Routes alert census** — the 7-day alert census feeds deterministic proposals (defect fixes, human-gated alerts, repeat-unchanged hygiene)
+4. **Drafts proposals** — `drafts.ts` consolidates findings into concrete `DraftProposal` objects with diffs and validation detail
+5. **Floor-gated application** — `validator.ts` checks each proposal against safety floors before applying:
+   - **Validation floor** — every change must pass its validation gate (broken fixes stay `pending`, never deploy)
+   - **Protected-skills floor** — changes to git-workflow skills (commit, push, push-public, investigate-flagged) require explicit approval
+6. **Commits fixes** — one pathspec commit per applied fix (roll back via `git revert` if needed)
+7. **Audit trail** — every terminal decision logged to `~/.pa/self-improver-audit.jsonl` with diff, validation, and run-stats
+8. **Evaluates impact** — `pa improvements [--since N]` recomputes before/after state from the audit trail
+
+### Safety floors
+
+The two safety floors are product features that ensure autonomous changes are safe and reversible:
+
+- **Validation floor** — changes that fail validation (compilation errors, test failures) are never applied. They remain `pending` for manual review.
+- **Protected-skills floor** — changes to critical workflow skills (commit, push, push-public, investigate-flagged) are flagged for approval rather than auto-applied.
+
+### Evaluation and rollback
+
+Run `pa improvements` to view the audit trail and assess impact. Each entry shows:
+
+- The proposal (diff, rationale, validation result)
+- Whether it was applied, rejected, or rolled back
+- Run-stats baseline for before/after comparison
+
+If a change causes issues, roll it back via `git revert <commit>` — the self-improver records the commit SHA in the audit trail.
+
+### Example skill
+
+The framework ships an example skill at `examples/skills/self-improver/skill.md` that demonstrates the loop's configuration and behavior. Copy it to `~/.pa/skills/` to adopt autonomous improvement into your deployment, or trigger it manually via:
+
+```bash
+pa run self-improver
+```
+
+The example skill runs at 22:20 UTC nightly and can also be triggered on-demand after skill changes or repeated failures.

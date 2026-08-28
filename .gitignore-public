@@ -35,6 +35,7 @@ pa/src/learn_agent.py
 pa/src/travel_butler.py
 pa/src/gmail_utils.py
 pa/src/telegram_notify.py
+pa/scripts/backup_fitness.py
 # Python tests for the excluded modules above — they import learn_agent/
 # telegram_notify, which don't exist in the public mirror (permanently-broken
 # tests there), and their fixtures/docstrings reference personal context.
@@ -42,22 +43,28 @@ pa/src/tests/
 pa/scripts/tests/test_telegram_notify_429.py
 pa/scripts/memory_consolidation.py
 pa/scripts/tests/test_memory_consolidation.py
+# Tests importing the private modules above — CI unittest-discover dies on them
+pa/scripts/tests/test_unconfirmed_facts.py
+pa/scripts/tests/test_start_google_telegram_reauth.py
 pa/scripts/migrate_profile_metadata.py
 pa/scripts/tests/test_migrate_profile_metadata.py
 pa/scripts/profile_repair.py
 pa/scripts/tests/test_profile_repair.py
-pa/scripts/run_restore_drill.py
-pa/scripts/tests/test_run_restore_drill.py
 pa/scripts/rotate_secrets.py
 pa/scripts/tests/test_rotate_secrets.py
-pa/scripts/redteam_injection.py
-pa/scripts/tests/test_redteam_injection.py
 pa/scripts/upload_apk.py
+# pa/scripts/run_restore_drill.py — INCLUDED (monthly backup integrity check)
+# pa/scripts/tests/test_run_restore_drill.py — INCLUDED
+# pa/scripts/redteam_injection.py — INCLUDED (monthly injection regression tests)
+# pa/scripts/tests/test_redteam_injection.py — INCLUDED
+# pa/scripts/run_eval.py — INCLUDED (self-improver eval gate)
 # pa/scripts/upload_plan.py — INCLUDED (refactored to env-driven via PA_PLANS_DRIVE_FOLDER_ID; see Cat E3)
 
 # Inside projects/telegram-bot/: exclude build/state/runtime artifacts + personal prompt
 projects/telegram-bot/dist/
 projects/telegram-bot/node_modules/
+# Private planning docs must never reach the public mirror (any project subtree)
+projects/*/plans/
 # Compiled .js artifacts that belong in dist/, not src/ (catches accidental tsc output in source dirs)
 projects/telegram-bot/src/*.js
 projects/telegram-bot/src/tests/*.js
@@ -92,6 +99,10 @@ projects/reminders/*
 !projects/reminders/add_reminder.py
 !projects/reminders/process_reminders.py
 !projects/reminders/tests/
+
+# Inside projects/google-oauth-redirect/: exclude the deployment-specific
+# bot-username config (names the bot; config.example.js stays tracked).
+projects/google-oauth-redirect/config.js
 
 # Universal noise excludes
 **/__pycache__/

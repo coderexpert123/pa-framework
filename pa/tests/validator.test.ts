@@ -19,7 +19,7 @@ async function createTempFailureMeta(dir: string, skillName: string, meta: RunMe
 
 function makeErrorMeta(overrides: Partial<RunMeta> = {}): RunMeta {
   return {
-    worker: 'gemini',
+    worker: 'codex',
     status: 'error',
     exitCode: -1,
     duration: 30000,
@@ -75,7 +75,7 @@ describe('isProtected (hard block — self-guard, 2026-07-11 full-autonomy regim
   });
 
   it('is protected for all git-workflow skills (2026-08-17 audit P1-1)', () => {
-    const gitWorkflowSkills = ['commit', 'push', 'push-public', 'commit-and-push', 'investigate-flagged', 'update-brain'];
+    const gitWorkflowSkills = ['commit', 'push', 'push-public', 'investigate-flagged', 'update-brain'];
     for (const skill of gitWorkflowSkills) {
       assert.equal(isProtected(makeProposal({ name: skill })), true, `${skill} should be protected`);
       assert.equal(isProtected(makeProposal({ name: `${skill}-fix`, target_skill: skill })), true, `${skill} target should be protected`);

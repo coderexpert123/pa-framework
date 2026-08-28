@@ -2,6 +2,9 @@ import type { RateLimitParseResult } from './rate-limits.js';
 import { DEFAULT_COOLDOWN_MINUTES } from './rate-limits.js';
 import { formatIST } from './ist.js';
 
+// Kept post-gemini-CLI-sunset (2026-08-28): agy (Antigravity) emits the same Google-API
+// quota error shapes; this is agy's live classifier.
+
 function sliceSnippet(stderr: string, idx: number, len = 500): string {
   const start = Math.max(0, idx - 40);
   const end = Math.min(stderr.length, idx + len);

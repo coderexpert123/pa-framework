@@ -39,6 +39,9 @@ export interface AuditRecord {
   draft: string;
   source_type: 'conversation' | 'failure' | 'feedback';
   target_skill?: string;
+  /** 'maintenance-job' when target_skill names a declared MaintenanceJob rather
+   *  than a skill (2026-08-23 alerts wave). Absent/undefined = skill, as before. */
+  target_kind?: 'skill' | 'maintenance-job';
   action: 'applied-fix' | 'approved-new-skill' | 'rejected_auto' | 'rejected_stale' | 'rolled-back' | 'validation-failed'
     // Autonomous CODE-fix capability (2026-07-11) — see
     // plans/2026-07-11-autonomous-code-fix-capability.md. code-fixer.ts's attemptCodeFix()
@@ -60,6 +63,10 @@ export interface AuditRecord {
     // Quiet-tree gate (2026-08-15): active reservations or recent non-churn path modifications
     // indicate concurrent work — defer to next nightly run.
     | 'code-fix-skipped-concurrent-activity'
+    // F5 rework (2026-08-23, plans/2026-08-23-code-fix-multi-per-night-SPEC.md): diff touches
+    // a file a fix applied earlier in the SAME nightly run already changed — reverted so every
+    // applied fix in a run stays independently `git revert`-able.
+    | 'code-fix-skipped-same-run-overlap'
     | 'reverted-protected-path'
     | 'reverted-test-weakening'
     | 'reverted-verification-failed'
