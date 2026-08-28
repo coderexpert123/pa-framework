@@ -4,7 +4,24 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+// D13 amendment (2026-08-23, WP-D): capture the real global fetch BEFORE any
+// test file's top-level code runs, so pa/src/lib/telegram-proxy.ts's
+// PA_NOTIFY_DISABLED kill switch can tell "the real fetch" apart from a test
+// double a test later installs on globalThis.fetch. Must be the first
+// statement in this preload — a test file that mocks globalThis.fetch at
+// import time still runs after this preload's module body finishes.
+(globalThis as unknown as { __PA_REAL_FETCH__?: typeof fetch }).__PA_REAL_FETCH__ = globalThis.fetch;
+
 process.env.PA_NOTIFY_DISABLED = '1';
+// The pa CLI tees an agy worker's output by exporting AGY_TEE_OUT to the worker
+// process (worker-exec.ts keys the tee path off it when present). When a test run is
+// HOSTED INSIDE such a worker — the push skill's gate runs via an agy dispatch — the
+// variable leaks into every spawned test and worker-exec returns the inherited path
+// instead of a per-contextId one, failing worker-exec-tee-path-result.test.ts with
+// 'teePath should be keyed by contextId' (false red at the push gate, 2026-08-24).
+// Scrub it before any module loads, like PA_HOME above.
+delete process.env.AGY_TEE_OUT;
+
 
 // Machine-wide worker admission control (AI-096) shares its slot pool across
 // the concurrently-running test-file processes (the blackboard path is baked
@@ -34,6 +51,10 @@ process.env.PA_MAX_CONCURRENT_WORKERS = process.env.PA_MAX_CONCURRENT_WORKERS ||
 // path at import time). A test that forgets to set one still cannot reach
 // production. Tests that set their own PA_HOME are unaffected; helpers.ts
 // cleanup() resets to this suite default instead of deleting the variable.
+//
+// pa/tests/test-env-guard-gate.test.ts (2026-08-23) now enforces, mechanically,
+// that every test file which can bypass this preload (a direct scoped run)
+// imports pa/tests/test-env-guard.ts first — see that file's own header.
 const suiteHome = mkdtempSync(join(tmpdir(), 'pa-suite-'));
 
 // Explicit, test-only signal consumed by pa/src/lib/log.ts: if a resolved log

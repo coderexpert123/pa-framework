@@ -5,12 +5,27 @@ import { readdir, unlink, rename, writeFile, readFile, stat, mkdir } from 'fs/pr
 import { join } from 'path';
 import { homedir } from 'os';
 import { acquireLock, releaseLock } from './lock.js';
-import { getUpdates, sendMessage, sendMessageWithId, pinChatMessage, unpinChatMessage, sendTyping, setMessageReaction, downloadFile, editMessageText, createForumTopic, deleteMessage, sendMessageWithKeyboard, answerCallbackQuery } from './telegram.js';
-import { loadState, saveState, loadTopicState, saveTopicState, addTurn, findHistoricalSessionTurns, findRecentTurnsByTopic, listTopicStateRefs } from './conversation.js';
+import { getUpdates, sendMessage, sendMessageWithId, pinChatMessage, unpinChatMessage, sendTyping, setMessageReaction, downloadFile, editMessageText, createForumTopic, deleteMessage, sendMessageWithKeyboard } from './telegram.js';
+import type { InlineKeyboardMarkup } from './telegram.js';
+import {
+  handleCallbackQuery,
+  handleMessageReaction,
+  buildConfirmKeyboard,
+  buildFailoverKeyboard,
+  buildControlCardKeyboard,
+  rememberConfirmMessage,
+  currentCardKeyboard,
+  clearCardKeyboard,
+  type CallbackDeps,
+} from './callbacks.js';
+import { sendReplyText } from './rich-message.js';
+import { loadState, saveState, loadTopicState, saveTopicState, addTurn, findHistoricalSessionTurns, findRecentTurnsByTopic, listTopicStateRefs, type JoinableTurn } from './conversation.js';
 import { buildPrompt, buildResumedPrompt, buildSkillStatus } from './context.js';
+import { stripAnsi } from './ansi.js';
 import {
   expirePendingAction,
   resolveConfirmation,
+  consumeConfirmation,
   resolvePendingDescription,
   buildWorkerResponse,
   buildWorkerErrorResponse,
@@ -60,6 +75,7 @@ import {
   handleHealthCommand,
   handleRefCommand,
   handleClaimsCommand,
+  handleReauthCommand,
   handleUpdateBrainCommand,
   COMMIT_PATTERN,
   COMMIT_AND_PUSH_PATTERN,
@@ -70,9 +86,12 @@ import {
   HEALTH_PATTERN,
   REF_PATTERN,
   CLAIMS_PATTERN,
+  REAUTH_PATTERN,
+  parseReauthCallback,
   type TunableCommand,
   type UpdateBrainResult,
 } from './logic.js';
+import { runRulesCritic } from './rules-critic.js';
 import {
   resolveTunable,
   resolveTunableArgs,
@@ -84,6 +103,8 @@ import {
   validateTunable,
   isKnownValue,
   extractTunableValues,
+  declaredValues,
+  getTunableSpec,
 } from '../../../pa/dist/src/lib/tunables.js';
 import { readObservedTunableValues } from '../../../pa/dist/src/lib/tunables-observed.js';
 import { getKeepAwakeStatus, toggleKeepAwake } from './keepawake.js';
@@ -106,14 +127,14 @@ import { computeBackoff, computePollOffset, LONG_POLL_TIMEOUT } from './poll.js'
 import { WatermarkTracker } from './watermark.js';
 import { appendDlq, flushDlq } from './dlq.js';
 import { deliveredKey, wasDelivered, markDelivered } from './delivered-store.js';
-import { addPendingDispatch, removePendingDispatch, updatePendingDispatch, pendingDispatchKey, listPendingDispatches } from './pending-dispatches.js';
+import { addPendingDispatch, removePendingDispatch, updatePendingDispatch, pendingDispatchKey, listPendingDispatches, type PendingDispatch } from './pending-dispatches.js';
 import { reapOrphanedDispatches } from './orphan-reaper.js';
-import { isTopicRecovering } from './recovery-gate.js';
+import { isTopicRecovering, waitForTopicRecovery } from './recovery-gate.js';
 import { isDegraded, startHealthProbe } from './health.js';
 import { parseStopSteer, stopTopicWorkers, markTopicStopped, isTopicStopped, consumeTopicStopped } from './worker-stop.js';
 import { registerQueuedUpdate, dequeueUpdate, drainQueuedEntries, addHeldEntry, absorbHeldEntries, type QueueEntry, type HeldItem } from './topic-queue.js';
 import { updateDashboard } from './dashboard.js';
-import type { ConversationState, SessionInfo, PAMeta, ModelStatusSnapshot, ModelStatusReasonCode } from './types.js';
+import type { ConversationState, SessionInfo, PAMeta, ModelStatusSnapshot, ModelStatusReasonCode, TelegramUpdate } from './types.js';
 import { loadTopicNames, updateTopicName, setTopicDescription, extractTopicEvent, loadBranches, addBranch, removeBranch, findBranchParent, getTopicName, type TopicNameMap, type BranchIndex } from './topic-names.js';
 import { appendKbNote } from './kb-notes.js';
 import { formatFailoverMessage, escapeMd } from './notify-format.js';
@@ -149,6 +170,7 @@ import { findSessionForRefId } from './ref-lookup.js';
 
 // Import pa modules
 import { loadSecrets } from '../../../pa/dist/src/secrets.js';
+import { markRepliedForThread } from '../../../pa/dist/src/lib/decisions.js';
 import { startProxyAutoRefresh } from '../../../pa/dist/src/lib/telegram-proxy.js';
 import { cleanupOrphanedWorkers } from '../../../pa/dist/src/worker-pids.js';
 import { blackboard, startLockRenewal } from '../../../pa/dist/src/blackboard.js';
@@ -276,7 +298,7 @@ async function replacePinnedStatusCard(
 ): Promise<{ delivered: boolean; pinned: boolean; messageId: number | null }> {
   const pinText = renderStatusCard({ snapshot, keepAwake });
   const oldPinId = state.pinned_status_message_id;
-  const pinMsgId = await sendMessageWithId(token, chatId, appendRefIdAndLog(pinText, { kind: 'pin', chatId, threadId }), threadId || undefined);
+  const pinMsgId = await sendMessageWithId(token, chatId, appendRefIdAndLog(pinText, { kind: 'pin', chatId, threadId }), threadId || undefined, buildControlCardKeyboard());
 
   syncModelStatusState(state, snapshot);
 
@@ -287,7 +309,12 @@ async function replacePinnedStatusCard(
   const pinned = await pinChatMessage(token, chatId, pinMsgId);
   if (pinned) {
     state.pinned_status_message_id = pinMsgId;
-    if (oldPinId && oldPinId !== pinMsgId) await unpinChatMessage(token, chatId, oldPinId);
+    if (oldPinId && oldPinId !== pinMsgId) {
+      // The superseded card can never be pressed again, so its recorded submenu is dead
+      // weight in cardKeyboardIndex — drop it alongside the unpin.
+      clearCardKeyboard(chatId, oldPinId);
+      await unpinChatMessage(token, chatId, oldPinId);
+    }
   }
 
   return { delivered: true, pinned, messageId: pinMsgId };
@@ -307,7 +334,13 @@ async function refreshPinnedStatusCardInPlace(
 
   const pinText = renderStatusCard({ snapshot, keepAwake });
   if (state.pinned_status_message_id) {
-    const pinOk = await editMessageText(token, chatId, state.pinned_status_message_id, appendRefIdAndLog(pinText, { kind: 'pin', chatId, threadId })).catch(() => false);
+    // bp-retry (2026-08-25): this sweep used to unconditionally rewrite the card's
+    // keyboard back to the top-level menu, silently stranding a user mid-navigation
+    // through a cc:agent/cc:model/cc:effort submenu on the same message id. If a
+    // submenu is currently displayed (recorded by callbacks.ts, fresh within its
+    // 2-minute window) keep showing it — only the card TEXT changes here either way.
+    const keyboard = currentCardKeyboard(chatId, state.pinned_status_message_id) ?? buildControlCardKeyboard();
+    const pinOk = await editMessageText(token, chatId, state.pinned_status_message_id, appendRefIdAndLog(pinText, { kind: 'pin', chatId, threadId }), keyboard).catch(() => false);
     if (pinOk) return;
   }
 
@@ -723,8 +756,8 @@ async function findNextAvailableWorker(
  *
  * Tunables are resolved against the worker THIS TOPIC WILL ACTUALLY DISPATCH TO
  * (session override first, then the topic's default worker) — the same choice
- * dispatchMessage makes — so `/effort high` right after `/model gemini` is
- * rejected by gemini's own declaration rather than being silently stored against
+ * dispatchMessage makes — so `/effort high` right after `/model gemini-3.7-flash-high` is
+ * rejected by agy's own declaration rather than being silently stored against
  * a worker that has no such flag.
  *
  * State is mutated in place; the caller's saveTopicState at the end of
@@ -887,7 +920,7 @@ export async function dispatchMessage(
   // AI-092: /stop and /steer kill the worker running right now, so EVERY
   // attempt below has to consult the marker — the between-phase checks alone
   // left the whole failover cascade uncovered (2026-08-02: a /stop killed
-  // gemini mid-chain and claude answered the cancelled message anyway).
+  // a worker mid-chain and claude answered the cancelled message anyway).
   // Handed to pa's executor as `isCancelled`, which stops the cascade and
   // suppresses the worker-exit page for the killed process.
   const stopKey = resource.replace(/^topic-/, '');
@@ -928,7 +961,7 @@ export async function dispatchMessage(
       const worker = config.workers.find((w) => w.name === activeSession.worker);
       if (worker) {
         const prompt = await buildResumedPrompt(userText, replyContext, pendingDesc, topicNames, { omitStatic: workerSupportsSystemPrompt(activeSession.worker) });
-        const result = await executeWorker(worker, prompt, { cwd: resolvedWorkdir.dir, env: secrets, extraArgs: buildDispatchExtraArgs(state, worker, buildResumeArgs(activeSession)), resource, agentName: activeSession.worker, contextId, isCancelled, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS });
+        const result = await executeWorker(worker, prompt, { cwd: resolvedWorkdir.dir, env: secrets, extraArgs: buildDispatchExtraArgs(state, worker, buildResumeArgs(activeSession)), resource, updateId, agentName: activeSession.worker, contextId, isCancelled, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS });
         if (result.success) {
           dispatchResult = { result, worker: activeSession.worker, session: activeSession };
         } else if (!isCancelled()) {
@@ -954,7 +987,7 @@ export async function dispatchMessage(
       if (preferredWorkerConfig) {
         const priorCtx = lastFailedSession ? { ...lastFailedSession, sessionPath: getPriorSessionPath(lastFailedSession.worker, lastFailedSession.sessionId, resolvedWorkdir.dir) } : undefined;
         const prompt = await buildPrompt(userText, state, topicNames, replyContext, pendingDesc, { omitStatic: workerSupportsSystemPrompt(preferredWorkerConfig.name), priorContext: priorCtx, workdir: resolvedWorkdir.tier === 'bot-cwd' ? undefined : { dir: resolvedWorkdir.dir, tier: resolvedWorkdir.tier } });
-        const prefResult = await executeWorker(preferredWorkerConfig, prompt, { cwd: resolvedWorkdir.dir, env: secrets, extraArgs: buildDispatchExtraArgs(state, preferredWorkerConfig), resource, agentName: state.preferred_worker, contextId, isCancelled, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS });
+        const prefResult = await executeWorker(preferredWorkerConfig, prompt, { cwd: resolvedWorkdir.dir, env: secrets, extraArgs: buildDispatchExtraArgs(state, preferredWorkerConfig), resource, updateId, agentName: state.preferred_worker, contextId, isCancelled, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS });
         if (prefResult.success) freshResult = { result: prefResult, worker: preferredWorkerConfig.name };
         else if (!isCancelled()) {
           const co = await tryClassifyAndNotify(state.preferred_worker, prefResult, prefResult.sessionId, preferredWorkerConfig, config, state, defaultWorker, onNotify);
@@ -975,7 +1008,7 @@ export async function dispatchMessage(
       if (defaultWorkerConfig) {
         const priorCtxDef = lastFailedSession ? { ...lastFailedSession, sessionPath: getPriorSessionPath(lastFailedSession.worker, lastFailedSession.sessionId, resolvedWorkdir.dir) } : undefined;
         const prompt = await buildPrompt(userText, state, topicNames, replyContext, pendingDesc, { omitStatic: workerSupportsSystemPrompt(defaultWorkerConfig.name), priorContext: priorCtxDef, workdir: resolvedWorkdir.tier === 'bot-cwd' ? undefined : { dir: resolvedWorkdir.dir, tier: resolvedWorkdir.tier } });
-        const defResult = await executeWorker(defaultWorkerConfig, prompt, { cwd: resolvedWorkdir.dir, env: secrets, extraArgs: buildDispatchExtraArgs(state, defaultWorkerConfig), resource, agentName: defaultWorker, contextId, isCancelled, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS });
+        const defResult = await executeWorker(defaultWorkerConfig, prompt, { cwd: resolvedWorkdir.dir, env: secrets, extraArgs: buildDispatchExtraArgs(state, defaultWorkerConfig), resource, updateId, agentName: defaultWorker, contextId, isCancelled, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS });
         if (defResult.success) freshResult = { result: defResult, worker: defaultWorkerConfig.name };
         else if (!isCancelled()) {
           const co = await tryClassifyAndNotify(defaultWorker, defResult, defResult.sessionId, defaultWorkerConfig, config, state, defaultWorker, onNotify);
@@ -1139,6 +1172,27 @@ function dispatchGitWorkflowSkill(skillName: string): string {
   return `🚀 Kicked off \`${skillName}\` — it reports back in the main "My PA" topic when done, not necessarily here.`;
 }
 
+/** Fire-and-forget request for a fresh Google OAuth link, delivered to THIS
+ *  chat/thread by the start script itself (AI-147: the script used to mint a
+ *  session and print a URL nobody received). Never routed to an LLM worker.
+ *  `runtimeEnv` (process.env merged with secrets.env) is a local of
+ *  processUpdate, not module scope — passed explicitly so this stays a
+ *  top-level function alongside dispatchGitWorkflowSkill (spec deviation,
+ *  see WP-G2 report: the draft closed over `runtimeEnv` from a scope this
+ *  function cannot see). */
+function spawnReauthLink(chatId: number, threadId: number | undefined, runtimeEnv: NodeJS.ProcessEnv, skill?: string): string {
+  const script = runtimeEnv.PA_OAUTH_START_SCRIPT || join(BOT_CWD, 'pa', 'scripts', 'start_google_telegram_reauth.py');
+  const redirectUri = runtimeEnv.GOOGLE_AUTH_REDIRECT_URI?.trim();
+  if (!redirectUri) return 'Cannot start reauth: GOOGLE_AUTH_REDIRECT_URI is not configured in ~/.pa/secrets.env.';
+  const args = [script, '--reuse-pending', '--redirect-uri', redirectUri,
+                '--chat-id', String(chatId), '--thread-id', String(threadId ?? 0)];
+  if (skill) args.push('--resume-skill', skill);
+  spawn(resolvePythonCommand(runtimeEnv), args, { cwd: BOT_CWD, detached: true, stdio: 'ignore', shell: false, windowsHide: true }).unref();
+  return skill
+    ? `🔐 Requesting a Google reauth link (will resume \`${skill}\` after success) — it arrives here shortly.`
+    : '🔐 Requesting a Google reauth link — it arrives here shortly.';
+}
+
 /**
  * Execute a pa CLI command synchronously and return trimmed stdout.
  * Used for read-only commands like /health, /ref, and /claims.
@@ -1151,7 +1205,8 @@ function execPaCommand(args: string[], maxChars: number = 1200): string {
       ['pa/dist/bin/pa.js', ...args],
       { cwd: BOT_CWD, windowsHide: true, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024, timeout: 30000 }
     ) as string;
-    const output = stdout.trim();
+    const stripped = stripAnsi(stdout);
+    const output = stripped.trim();
     if (output.length <= maxChars) return output;
     return output.slice(0, maxChars) + '…';
   } catch (err: any) {
@@ -1195,6 +1250,16 @@ function execPaRef(refId: string): string {
 // pa-host orphan-worker-reap maintenance job (runs every minute) doesn't kill
 // a worker the bot is still waiting to harvest a reply from.
 const ORPHAN_HARVEST_WINDOW_MS = 50 * 60 * 1000;
+
+/** How long a dispatch waits for a recovering topic before proceeding anyway
+ *  (default > the reaper's 45-min REAP_MAX_WAIT_MS so the reaper always wins the
+ *  race; a stale gate with no reaper must not wedge the topic forever). Read lazily
+ *  so tests can pin it via env per-case. 0 = proceed immediately.
+ *  (seamless-restart-recovery 2026-08-27) */
+function recoveryWaitMs(): number {
+  const v = Number(process.env.PA_RECOVERY_WAIT_MS);
+  return Number.isFinite(v) && v >= 0 ? v : 50 * 60 * 1000;
+}
 
 async function processUpdate(
   update: any,
@@ -1246,7 +1311,11 @@ async function processUpdate(
   let replyContext: string | undefined;
   const contextId = randomUUID();
 
-  setMessageReaction(token, chatId, messageId, '👍').catch(() => {});
+  // Synthetic updates (button/reaction-injected, spec §3.1): the message id here belongs
+  // to the card/notice that spawned the press, not to a user turn, and for the reaction
+  // path the ✅ receipt is already sent by handleMessageReaction — skip the 👍 ack.
+  // B5: Also skip for requeued synthetics — the user already saw the 👍 on first receipt.
+  if (!(update as any).__synthetic && (update as any).__requeueCount === undefined) setMessageReaction(token, chatId, messageId, '👍').catch(() => {});
 
   const resourceId = `topic-${chatId}_${threadId}`;
   const acquired = await blackboard.acquireLock(resourceId, 'telegram-bot', process.pid, 60000, contextId);
@@ -1417,12 +1486,18 @@ async function processUpdate(
     }
 
     if (userText) {
-      addTurn(topicState, { role: 'user', text: archivedUserText, timestamp, message_id: messageId, worker: topicState.preferred_worker || effectiveDefault, session_id: topicState.session?.session_id });
-      // AI-095 item 2: persist + archive the user turn AT RECEIPT. A crash during
-      // the (possibly minutes-long) dispatch must not erase the user's message from
-      // topic state / conversation-history.jsonl — 2026-07-03 lost two user turns
-      // this way. Watermark dedup makes the second save at the end idempotent.
-      await saveTopicState(topicState).catch((err) => logger.warn('conversation', 'early user-turn save failed', { error: String(err) }));
+      // B5: a requeued synthetic's user turn was already archived at first receipt
+      // (AI-095 item 2); re-adding would duplicate it in the rolling window.
+      if ((update as any).__requeueCount === undefined) {
+        const userTurn: JoinableTurn = { role: 'user', text: archivedUserText, timestamp, message_id: messageId, worker: topicState.preferred_worker || effectiveDefault, session_id: topicState.session?.session_id, update_id: update.update_id, via: (update as any).__synthetic };
+        addTurn(topicState, userTurn);
+        markRepliedForThread(chatId, threadId);
+        // AI-095 item 2: persist + archive the user turn AT RECEIPT. A crash during
+        // the (possibly minutes-long) dispatch must not erase the user's message from
+        // topic state / conversation-history.jsonl — 2026-07-03 lost two user turns
+        // this way. Watermark dedup makes the second save at the end idempotent.
+        await saveTopicState(topicState).catch((err) => logger.warn('conversation', 'early user-turn save failed', { error: String(err) }));
+      }
     }
 
     
@@ -1711,7 +1786,7 @@ async function processUpdate(
 
     // These spawn pa CLI commands synchronously and return trimmed output.
     if (!skipWorker && HEALTH_PATTERN.test(userText)) {
-      const healthResult = execPaCommand(['health'], 1200);
+      const healthResult = execPaCommand(['health', '--no-color'], 3500);
       response = appendRefIdAndLog(healthResult, { kind: 'system', chatId, threadId });
       skipWorker = true;
     }
@@ -1728,6 +1803,12 @@ async function processUpdate(
     if (!skipWorker && CLAIMS_PATTERN.test(userText)) {
       const claimsResult = execPaCommand(['claims'], 1200);
       response = appendRefIdAndLog(claimsResult, { kind: 'system', chatId, threadId });
+      skipWorker = true;
+    }
+
+    if (!skipWorker && REAUTH_PATTERN.test(userText)) {
+      const parsed = handleReauthCommand(userText);
+      response = appendRefIdAndLog(spawnReauthLink(chatId, threadId, runtimeEnv, parsed.skill), { kind: 'system', chatId, threadId });
       skipWorker = true;
     }
 
@@ -1913,11 +1994,16 @@ async function processUpdate(
       skipWorker = pdResult.skipWorker;
     }
 
+    // Consumed by a confirmed "yes" below (spec correction 3 / WP-B1 edit 5): clears
+    // pending_action so a second "yes" (typed, tapped, or 👍'd) inside the 5-minute TTL
+    // cannot re-run the same confirmed action.
+    let confirmedDescription: string | undefined;
     if (!skipWorker) {
       expirePendingAction(topicState);
       if (topicState.pending_action) {
         const resolved = resolveConfirmation(topicState, userText);
         response = resolved.response; skipWorker = resolved.skipWorker;
+        if (!skipWorker && topicState.pending_action) confirmedDescription = consumeConfirmation(topicState);
       }
     }
 
@@ -1930,13 +2016,38 @@ async function processUpdate(
     // (/reset, /model, etc.) that already resolved its own response above;
     // only intervene when the update was genuinely about to dispatch.
     if (!skipWorker && isTopicRecovering(topicKey)) {
-      response = '⏳ Still recovering the reply to your previous message after a restart — please resend this once you receive it.';
-      skipWorker = true;
+      // Queue-not-bounce (2026-08-27 seamless-restart-recovery spec): the topic is under
+      // orphan-recovery; WAIT for the reaper to clear it, then dispatch normally. The
+      // wait sits inside the already-acquired topic lock (AI-113 renewal keeps it fresh;
+      // reaper max 45 min « renewal cap 6 h). Typing pulse mirrors the dispatch keep-alive
+      // (DEGRADED-shed) but as a setTimeout chain — main.ts's setInterval count is pinned
+      // by pa/tests/timer-inventory.test.ts and must stay at 2.
+      let pulseTimer: NodeJS.Timeout | undefined;
+      const pulse = () => {
+        if (!isDegraded()) sendTyping(token, chatId, threadId).catch(() => {});
+        pulseTimer = setTimeout(pulse, 4000);
+        pulseTimer.unref?.();
+      };
+      pulse();
+      let cleared = false;
+      try {
+        cleared = await waitForTopicRecovery(topicKey, recoveryWaitMs());
+      } finally {
+        if (pulseTimer) clearTimeout(pulseTimer);
+      }
+      if (!cleared) {
+        logger.warn('recovery-gate', 'stale recovery gate — wait timed out, dispatching anyway', { chatId, threadId, updateId: update.update_id });
+      }
+      if (!isDegraded()) await sendTyping(token, chatId, threadId).catch(() => {});
     }
 
     let pendingKey: string | undefined;
     // AI-151: track the actual worker that handled this dispatch for accurate archival
     let assistantWorker: string = 'local';
+    // Hoisted out of the !skipWorker block (WP-B1 edit 7, spec §3.2): the reply-send
+    // block below needs to know whether the dispatch errored, to attach a
+    // buildFailoverKeyboard to the reply instead of the confirm keyboard.
+    let workerErrored = false;
     if (!skipWorker) {
       // AI-095: persist the in-flight dispatch so a crash mid-dispatch leaves a
       // recoverable record for the startup orphan reaper instead of a silent void.
@@ -1945,6 +2056,8 @@ async function processUpdate(
         updateId: update.update_id, chatId, threadId, messageId,
         userText: archivedUserText, startedAt: new Date().toISOString(),
         cwd: workdir.dir, session: topicState.session,
+        ...(voiceTranscribed ? { userTextSettled: true } : {}),
+        ...((update as any).__requeueCount !== undefined ? { requeueCount: (update as any).__requeueCount as number } : {}),
       }).catch((err) => logger.warn('dispatch', 'failed to persist pending dispatch', { error: String(err) }));
       // Hardened plan WP6 item 5: resolved here (not at receipt) so a slow
       // archive scan never delays the crash-recovery record above, and so
@@ -1959,37 +2072,84 @@ async function processUpdate(
       const onNotify = async (payload: FailoverNotifyPayload) => {
         latestFailoverPayload = payload;
         const msg = formatFailoverMessage(payload);
-        await sendMessage(token, chatId, appendRefIdAndLog(msg, { kind: 'failover', chatId, threadId }), messageId, threadId);
+        // Spec §3.2/WP-B1 edit 7: 🔁 Retry / ↔ Switch / ↩ Revert keyboard on the
+        // failover notice, attached at the send site (buildWorkerErrorResponse /
+        // formatFailoverMessage stay plain strings — spec correction 2).
+        await sendMessageWithKeyboard(
+          token,
+          chatId,
+          appendRefIdAndLog(msg, { kind: 'failover', chatId, threadId }),
+          buildFailoverKeyboard({ next: payload.to ?? undefined, previous: payload.from }) as InlineKeyboardMarkup,
+          messageId,
+          threadId
+        );
       };
 
-      let workerErrored = false;
       try {
-        const dr = await dispatchMessage(userText, replyContext, topicState.pending_action?.description, topicState, secrets, resourceId, effectiveDefault, topicNames, onNotify, update.update_id, workdir, contextId);
+        const dr = await dispatchMessage(userText, replyContext, confirmedDescription ?? topicState.pending_action?.description, topicState, secrets, resourceId, effectiveDefault, topicNames, onNotify, update.update_id, workdir, contextId);
         response = dr.response; topicState.session = dr.session;
         workerErrored = !!dr.workerError;
         // AI-151: capture the actual worker that handled this dispatch
         assistantWorker = dr.dispatchedWorker || topicState.session?.worker || topicState.preferred_worker || effectiveDefault;
-        const { response: processedResponse, skillToRun, restartBot: metaRestartBot, kbNote } = applyMetaActions(response, dr.meta, topicState);
-        response = processedResponse; restartBot = metaRestartBot;
-        if (skillToRun) {
-          spawn('pa', ['run', skillToRun, '--worker', topicState.preferred_worker || effectiveDefault], { cwd: BOT_CWD, detached: true, stdio: 'ignore', shell: true, windowsHide: true }).unref();
-        }
-        if (kbNote) {
-          // AI-101 Layer 2 — fire-and-forget: a KB-write hiccup must not block
-          // or fail the reply that carried the note.
-          appendKbNote(kbNote.domain, kbNote.note).catch(() => {});
-        }
-        if (dr.dispatchedWorker) await maybeUpdatePinnedStatusAfterDispatch(token, chatId, threadId, topicState, effectiveDefault, dr.dispatchedWorker, latestFailoverPayload, config);
+        // B9 rev 3 (a): HOIST stoppedKind consumption before applyMetaActions (V22)
+        const topicKey = `${chatId}_${threadId}`;
+        const stoppedKind = consumeTopicStopped(topicKey, update.update_id);
 
-        // Enrich pending dispatch with teePath for crash recovery.
-        // The teePath is deterministic from contextId (same formula
-        // used by worker-exec.ts). This is a best-effort enrichment:
-        // the worker-pids entry also carries it, but the entry may be
-        // cleaned up by the worker's own done() callback before
-        // the reaper reads it.
-        if (pendingKey && contextId) {
-          const inferredTeePath = join(paHome(), 'logs', 'worker-tee', `${contextId}.out`);
-          await updatePendingDispatch(pendingKey, { teePath: inferredTeePath, workerName: dr.dispatchedWorker }).catch(() => {});
+        // B9 rev 3 (b): Park decision BEFORE applyMetaActions (V22/V23)
+        const rqCount = (update as any).__requeueCount as number | undefined;
+        const v = Number(process.env.PA_REQUEUE_MAX);
+        const max = Number.isFinite(v) && v >= 0 ? v : 2; // PA_REQUEUE_* frozen in SPEC §2
+        const parkedNow = rqCount !== undefined && workerErrored && !stoppedKind
+          && rqCount < max && pendingKey !== undefined;
+        if (parkedNow) {
+          const b = Number(process.env.PA_REQUEUE_BACKOFF_MS);
+          const backoffMs = Number.isFinite(b) && b >= 0 ? b : 900_000;
+          (update as any).__ladderParked = true;
+          await updatePendingDispatch(pendingKey!, { requeueNotBefore: Date.now() + backoffMs }).catch(() => {});
+          logger.warn('requeue', 'requeued dispatch failed below cap — parked for retry',
+            { chatId, threadId, updateId: update.update_id, requeueCount: rqCount, retryInMs: backoffMs });
+          // V23: OUT-OF-BAND on purpose — riding the reply block would markDelivered the
+          // key and silently dedup-skip the retry's real reply (lock_busy-notice pattern).
+          await sendMessage(token, chatId,
+            appendRefIdAndLog('⏳ Hit a temporary snag — retrying your message automatically.',
+              { kind: 'requeue-deferred', chatId, threadId }),
+            messageId, threadId).catch(() => {});
+          response = '';
+        }
+
+        // B9 rev 3 (c): Skip post-dispatch work when parked
+        if (!parkedNow) {
+          const { response: processedResponse, skillToRun, restartBot: metaRestartBot, kbNote } = applyMetaActions(response, dr.meta, topicState);
+          response = processedResponse; restartBot = metaRestartBot;
+          if (skillToRun) {
+            spawn('pa', ['run', skillToRun, '--worker', topicState.preferred_worker || effectiveDefault], { cwd: BOT_CWD, detached: true, stdio: 'ignore', shell: true, windowsHide: true }).unref();
+          }
+          if (kbNote) {
+            // AI-101 Layer 2 — fire-and-forget: a KB-write hiccup must not block
+            // or fail the reply that carried the note.
+            appendKbNote(kbNote.domain, kbNote.note).catch(() => {});
+          }
+          if (dr.dispatchedWorker) await maybeUpdatePinnedStatusAfterDispatch(token, chatId, threadId, topicState, effectiveDefault, dr.dispatchedWorker, latestFailoverPayload, config);
+
+          // Enrich pending dispatch with teePath for crash recovery.
+          // The teePath is deterministic from contextId (same formula
+          // used by worker-exec.ts). This is a best-effort enrichment:
+          // the worker-pids entry also carries it, but the entry may be
+          // cleaned up by the worker's own done() callback before
+          // the reaper reads it.
+          if (pendingKey && contextId) {
+            const inferredTeePath = join(paHome(), 'logs', 'worker-tee', `${contextId}.out`);
+            await updatePendingDispatch(pendingKey, { teePath: inferredTeePath, workerName: dr.dispatchedWorker }).catch(() => {});
+          }
+
+          // StoppedKind handling (from rev 2, now inside !parkedNow)
+          if (stoppedKind && workerErrored) {
+            // A6: in-flight flush — when a stop/steer cancels a dispatch that
+            // already started (locked topic, but never reached dispatchMessage),
+            // the message's text becomes held context for the next dispatch.
+            addHeldEntry(topicKey, userText);
+            response = stoppedKind === 'stop' ? '⏹ Stopped.' : '';
+          }
         }
       } catch (dispatchErr) {
         logger.warn('dispatch', `dispatchMessage error: ${(dispatchErr as Error).message}`);
@@ -2015,26 +2175,34 @@ async function processUpdate(
             topicSpawnFailureCount.set(topicKey, 0); // reset after showing hint
           }
         }
-      } finally { clearInterval(typingInterval); }
 
-      // AI-092: a /stop or /steer killed this dispatch's worker. Swap the
-      // the resulting error for a clean confirmation (stop) or silence (steer —
-      // the steer prompt's own dispatch is queued right behind this one). If
-      // the worker actually finished before the kill landed, keep its real
-      // reply — the marker is consumed either way so it can't leak forward.
-      const stoppedKind = consumeTopicStopped(topicKey, update.update_id);
-      if (stoppedKind && workerErrored) {
-        // A6: in-flight flush — when a stop/steer cancels a dispatch that
-        // already started (locked topic, but never reached dispatchMessage),
-        // the message's text becomes held context for the next dispatch.
-        addHeldEntry(topicKey, userText);
-        response = stoppedKind === 'stop' ? '⏹ Stopped.' : '';
-      }
+        // B9 rev 3 (d): CATCH-PATH park
+        const rqCountCatch = (update as any).__requeueCount as number | undefined;
+        const vCatch = Number(process.env.PA_REQUEUE_MAX);
+        const maxCatch = Number.isFinite(vCatch) && vCatch >= 0 ? vCatch : 2;
+        const stoppedKindCatch = consumeTopicStopped(topicKey, update.update_id);
+        const parkedCatch = rqCountCatch !== undefined && workerErrored && !stoppedKindCatch
+          && rqCountCatch < maxCatch && pendingKey !== undefined;
+        if (parkedCatch) {
+          const bCatch = Number(process.env.PA_REQUEUE_BACKOFF_MS);
+          const backoffMsCatch = Number.isFinite(bCatch) && bCatch >= 0 ? bCatch : 900_000;
+          (update as any).__ladderParked = true;
+          await updatePendingDispatch(pendingKey!, { requeueNotBefore: Date.now() + backoffMsCatch }).catch(() => {});
+          logger.warn('requeue', 'requeued dispatch failed below cap (catch-path) — parked for retry',
+            { chatId, threadId, updateId: update.update_id, requeueCount: rqCountCatch, retryInMs: backoffMsCatch });
+          await sendMessage(token, chatId,
+            appendRefIdAndLog('⏳ Hit a temporary snag — retrying your message automatically.',
+              { kind: 'requeue-deferred', chatId, threadId }),
+            messageId, threadId).catch(() => {});
+          response = '';
+        }
+      } finally { clearInterval(typingInterval); }
     }
 
     if (response.trim()) {
       const refId = makeRefId();
       const textToSend = `${response.trim()}\n\n_Ref: ${refId}_`;
+      runRulesCritic({ text: response.trim(), chatId, threadId, refId });
       // Effectively-once guard: if a reply for this update was already delivered
       // in a prior run (crash/restart before the poll offset persisted), skip it
       // rather than re-send a duplicate. See delivered-store.ts.
@@ -2046,11 +2214,31 @@ async function processUpdate(
       if (dedupOn && await wasDelivered(idemKey)) {
         logger.warn('telegram', 'skipping reply for already-delivered update (dedup)', { updateId: update.update_id, chatId, threadId });
       } else {
-        const delivered = await sendMessage(token, chatId, textToSend, messageId, threadId);
-        if (delivered) {
+        // Spec §3.2/WP-B1 edits 6+7: attach a keyboard to the reply when either (a) this
+        // dispatch just (re)set pending_action and it has no anchor message_id yet — the
+        // ✅/❌ confirm keyboard, whose press is what populates that message_id for the
+        // 👍/👎 reaction path — or (b) the dispatch errored, in which case the failover
+        // 🔁 Retry / ↩ Revert keyboard takes priority over the confirm keyboard.
+        const wantsConfirm = !!topicState.pending_action && !topicState.pending_action.message_id;
+        const kb = workerErrored
+          ? buildFailoverKeyboard({ previous: assistantWorker })
+          : wantsConfirm
+          ? buildConfirmKeyboard()
+          : undefined;
+        const sent = await sendReplyText(token, chatId, textToSend, messageId, threadId, process.env, kb);
+        if (sent.delivered) {
           if (dedupOn) await markDelivered(idemKey);
           // AI-151: use the actual worker name, not hardcoded 'worker'
-          addTurn(topicState, { role: 'assistant', text: response.trim(), timestamp: new Date().toISOString(), worker: assistantWorker, refId });
+          const assistantTurn: JoinableTurn = { role: 'assistant', text: response.trim(), timestamp: new Date().toISOString(), worker: assistantWorker, refId, session_id: topicState.session?.session_id, update_id: update.update_id };
+          addTurn(topicState, assistantTurn);
+          // The 👍/👎 reaction-approval path (handleMessageReaction) matches on this
+          // field — a missed assignment here silently disables it with no other symptom.
+          if (wantsConfirm && sent.messageId && topicState.pending_action) {
+            topicState.pending_action.message_id = sent.messageId;
+            // bp-fix: MessageReactionUpdated carries no thread id, so remember which
+            // topic this confirm message belongs to for the reaction path to resolve.
+            rememberConfirmMessage(chatId, sent.messageId, threadId);
+          }
         } else {
           await appendDlq({ chatId, threadId, replyToMessageId: messageId, text: textToSend, timestamp: new Date().toISOString(), updateId: update.update_id, refId });
         }
@@ -2058,10 +2246,96 @@ async function processUpdate(
     }
     // Reply delivered, DLQ'd (itself persistent), or intentionally empty — the
     // in-flight record has served its purpose either way.
-    if (pendingKey) await removePendingDispatch(pendingKey).catch(() => {});
+    if (pendingKey && !(update as any).__ladderParked) await removePendingDispatch(pendingKey).catch(() => {});
     await saveTopicState(topicState);
     if (restartBot) writeFileSync(join(paHome(), 'telegram-bot.stop'), '');
   } finally { lockRenewal.stop(); await blackboard.releaseLock(resourceId, 'telegram-bot', contextId); }
+}
+
+// Synthetic-message injection queue (2026-08-24 buttons program,
+// plans/2026-08-24-buttons-program-SPEC.md §3.1). A button press that maps to a typed
+// command pushes a synthetic TelegramUpdate here; drainInjectedUpdates() is called once
+// per poll iteration, AFTER pollOffset/state.last_update_id are computed from the REAL
+// getUpdates() batch (risk R1 — injecting before that computation would let a synthetic
+// update_id, always far above any real one, poison the offset and silently confirm-away
+// real pending Telegram updates).
+const injectedUpdates: TelegramUpdate[] = [];
+function injectUpdate(u: TelegramUpdate): void {
+  injectedUpdates.push(u);
+}
+function drainInjectedUpdates(): TelegramUpdate[] {
+  return injectedUpdates.splice(0);
+}
+
+/** Seamless-restart-recovery (2026-08-27 spec): inject the original request of an
+ *  exhausted pending dispatch back into the poll loop as a synthetic update, so the
+ *  FULL normal path (prompt build, failover, pin update, redaction, delivered-store,
+ *  DLQ) handles it. REUSES the original update_id on purpose: delivered-store keys
+ *  align, and the offset is computed from the real batch only (see drain above), so a
+ *  re-used id can never confirm away real updates. Shape mirrors callbacks.ts's
+ *  buildSyntheticUpdate; built here (not there) so this file carries no compile
+ *  dependency on the callbacks via-union. `from` is inert on the dispatch path. */
+export function requeueSyntheticUpdate(record: PendingDispatch): void {
+  // Cast: WP-A owns the PendingDispatch.requeueCount field; this keeps main.ts
+  // compilable even if that edit lands after this one.
+  const requeueCount = (record as PendingDispatch & { requeueCount?: number }).requeueCount ?? 1;
+  injectUpdate({
+    update_id: record.updateId,
+    message: {
+      message_id: record.messageId,
+      from: { id: 0, first_name: 'PA recovery' },
+      chat: { id: record.chatId, type: record.threadId ? 'supergroup' : 'private' },
+      date: Math.floor(Date.now() / 1000),
+      text: record.userText,
+      ...(record.threadId ? { message_thread_id: record.threadId } : {}),
+    },
+    __synthetic: 'requeue',
+    __requeueCount: requeueCount,
+  } as TelegramUpdate);
+  logger.info('requeue', 'injected synthetic update for exhausted dispatch',
+    { updateId: record.updateId, chatId: record.chatId, threadId: record.threadId, requeueCount });
+}
+
+/** WP-C C2: the maintenance drain. Re-injects parked ladder records whose
+ *  requeueNotBefore has passed: increments requeueCount (persisted BEFORE the
+ *  injection — a crash in between leaves an un-parked capped-or-not record the
+ *  next reaper settles, never a silent loss), clears the park, and injects the
+ *  same synthetic as the original requeue. Returns the number injected. */
+export async function drainDueRequeues(): Promise<number> {
+  const records = await listPendingDispatches();
+  const v = Number(process.env.PA_REQUEUE_MAX);
+  const max = Number.isFinite(v) && v >= 0 ? v : 2; // PA_REQUEUE_* frozen in SPEC §2
+  let injected = 0;
+  for (const record of records) {
+    const parked = (record as PendingDispatch & { requeueNotBefore?: number }).requeueNotBefore;
+    const count = (record as PendingDispatch & { requeueCount?: number }).requeueCount ?? 0;
+    if (parked === undefined) continue;
+    // /stop during the backoff window cancels the deferred record (addendum round 2):
+    // a stop's marker updateId is newer than the record's, so isTopicStopped matches
+    // here. Checked BEFORE the due-check so a cancelled record never lingers to its
+    // due tick. isTopicStopped is already imported in main.ts (:132).
+    if (isTopicStopped(`${record.chatId}_${record.threadId}`, record.updateId)) {
+      await removePendingDispatch(
+        pendingDispatchKey(record.chatId, record.threadId, record.updateId)).catch(() => {});
+      logger.info('requeue', 'parked record cancelled by /stop — removed', { updateId: record.updateId });
+      continue;
+    }
+    if (Date.now() < parked) continue;
+    if (count >= max) {
+      // Unreachable by construction (suppression parks only below cap; the drain
+      // increments before injecting) — defensive only; the 24h TTL clears it.
+      logger.warn('requeue', 'parked record at cap with a due notBefore — no path claims it, TTL will clear', { updateId: record.updateId });
+      continue;
+    }
+    const next = count + 1;
+    await updatePendingDispatch(
+      pendingDispatchKey(record.chatId, record.threadId, record.updateId),
+      { requeueCount: next, requeueNotBefore: undefined },
+    ).catch(() => {});
+    requeueSyntheticUpdate({ ...record, requeueCount: next });
+    injected++;
+  }
+  return injected;
 }
 
 function getUpdateTopicKey(update: any): string {
@@ -2098,6 +2372,7 @@ export async function runPollLoop(
     sentinelPath,
     runModelSweep: runExpiredModelOverrideSweep,
     topicNames,
+    requeueDrain: drainDueRequeues,
   });
   // Read ONCE: a config.yaml read on every <=30s iteration is not free on this
   // disk. Changing config.maintenance for a bot job needs a bot restart.
@@ -2112,6 +2387,25 @@ export async function runPollLoop(
   // would silently strand prefetch on the local engine. Mirrors
   // processUpdate's runtimeEnv construction.
   const loopRuntimeEnv: NodeJS.ProcessEnv = { ...process.env, ...secrets };
+  // Buttons & interactivity program (2026-08-24, spec §3.1/WP-B1 edit 3): built once,
+  // above the poll loop, and reused by both the callback_query and message_reaction
+  // branches below.
+  const callbackDeps: CallbackDeps = {
+    token,
+    secrets,
+    runtimeEnv: loopRuntimeEnv,
+    botCwd: BOT_CWD,
+    injectUpdate,
+    spawnReauthLink,
+    loadTopicState,
+    listWorkerNames: async () => ((await loadConfig().catch(() => ({ workers: [] }))).workers ?? []).map((w: WorkerConfig) => w.name),
+    observedValues: async (w, s) => readObservedTunableValues((await loadConfig().catch(() => ({ workers: [] }))).workers?.find((x: WorkerConfig) => x.name === w), s),
+    declaredValues: async (w, s) => declaredValues(getTunableSpec((await loadConfig().catch(() => ({ workers: [] }))).workers?.find((x: WorkerConfig) => x.name === w), s)),
+    // bp-retry (2026-08-25): same cascade as getEffectiveDefaultWorker/handleTunableCommand
+    // (config.topic_defaults[topicKey], falling back to the first configured worker) — the
+    // picker's FINAL fallback so it never collapses to '' for a fresh/never-hydrated topic.
+    effectiveDefaultWorker: async (cid, tid) => getEffectiveDefaultWorker(await loadConfig().catch(() => ({})), topicKeyFor(cid, tid)),
+  };
   // Cold-start seeding (AI-100 Wave 2): dlq-flush, delivered-store-compact and
   // proxy-pool-refresh mirror the OLD setInterval-based timers, none of which
   // fired on their very first tick (setInterval always waits one full interval
@@ -2126,7 +2420,7 @@ export async function runPollLoop(
   // nextSweepAt/nextLogCheckAt, both seeded to 0 in the old code (due
   // immediately on the very first pass, every restart).
   const coldStartAt = Date.now();
-  for (const name of ['dlq-flush', 'delivered-store-compact', 'proxy-pool-refresh']) {
+  for (const name of ['dlq-flush', 'delivered-store-compact', 'proxy-pool-refresh', 'requeue-drain', 'dashboard-refresh']) {
     await updateJobState(name, (prev) => ({ ...prev, lastRunAt: new Date(coldStartAt).toISOString() })).catch(() => {});
   }
   // Throttle the KICK, not the pass-in-flight state — deliberately NOT a
@@ -2187,10 +2481,16 @@ export async function runPollLoop(
       if (updates.length > 0) {
         pollOffset = updates[updates.length - 1].update_id;
         state.last_update_id = pollOffset;
+      }
+      // Injected synthetic updates are drained AFTER the offset above is computed from
+      // the real batch only (§3.1, risk R1) — see drainInjectedUpdates()'s own comment.
+      const injected = drainInjectedUpdates();
+      const batch = injected.length > 0 ? [...injected, ...updates] : updates;
+      if (batch.length > 0) {
         // Side-map for steer context attachment in the enqueue block. Cleared each
         // batch to avoid cross-batch contamination.
         const steerContextsByUpdateId = new Map<number, { drainedEntries: QueueEntry[]; steerPrompt?: string; steerVoice?: { promise: Promise<VoiceResult>; descriptor: VoicePrefetchDescriptor } }>();
-        for (const update of updates) {
+        for (const update of batch) {
           // AI-092: /stop and /steer act on the topic's RUNNING worker, so they
           // must bypass per-topic serialization (queuing behind the in-flight
           // dispatch would defeat them). Handled here; /steer then re-enters
@@ -2343,117 +2643,22 @@ export async function runPollLoop(
             steerContextsByUpdateId.set(update.update_id, { ...steerContext, steerVoice });
           }
 
-          // WPE2: HITL callback_query handling for self-improver risk-flagged alerts
+          // Buttons & interactivity program (2026-08-24, plans/2026-08-24-buttons-program-SPEC.md
+          // §3.1, WP-B1 edit 3). Routes through callbacks.ts's handleCallbackQuery /
+          // handleMessageReaction — including the pm: HITL approve/reject/diff flow this
+          // block used to implement inline (verbatim behavioural move, spec correction 16).
           if (update.callback_query && allowedChatIds.has(update.callback_query.message?.chat?.id ?? 0)) {
             const cb = update.callback_query;
-            const cbChatId = cb.message?.chat.id ?? 0;
-            const cbThreadId = cb.message?.message_thread_id ?? 0;
-            const cbMessageId = cb.message?.message_id;
-            const cbUserId = cb.from?.id?.toString();
-
-            void (async () => {
-              try {
-                const operatorId = secrets['PA_OPERATOR_USER_ID'];
-                if (!operatorId) {
-                  await answerCallbackQuery(token, cb.id, 'Set PA_OPERATOR_USER_ID to enable HITL buttons', true);
-                  await sendMessage(token, cbChatId, appendRefIdAndLog('⚠️ Operator user ID not configured. Set PA_OPERATOR_USER_ID in secrets.env to enable HITL approval buttons.', { kind: 'callback', chatId: cbChatId, threadId: cbThreadId }), cbMessageId, cbThreadId);
-                  logger.info('callback', 'rejected - no operator ID', { refId: 'none', chatId: cbChatId, threadId: cbThreadId });
-                  return;
-                }
-
-                if (cbUserId !== operatorId) {
-                  await answerCallbackQuery(token, cb.id, 'Only the configured operator can approve changes', true);
-                  logger.info('callback', 'rejected - unauthorized user', { refId: 'none', chatId: cbChatId, threadId: cbThreadId, userId: cbUserId });
-                  return;
-                }
-
-                const callbackData = cb.data;
-                if (!callbackData) {
-                  await answerCallbackQuery(token, cb.id, 'Invalid callback data');
-                  return;
-                }
-
-                const match = callbackData.match(/^pm:([^:]+):(approve|reject|diff)$/);
-                if (!match) {
-                  await answerCallbackQuery(token, cb.id, 'Invalid callback format');
-                  return;
-                }
-
-                const auditId = match[1];
-                const action = match[2];
-
-                // Read audit records to find the target record
-                const { readAuditRecords, appendAuditRecord } = await import('../../../pa/dist/src/lib/improvement-audit.js');
-                const records = await readAuditRecords();
-                const targetRecord = records.find(r => r.ts === auditId || r.commit_hash === auditId);
-
-                if (!targetRecord) {
-                  await answerCallbackQuery(token, cb.id, 'Audit record not found', true);
-                  logger.info('callback', 'rejected - record not found', { refId: 'none', auditId, action, chatId: cbChatId, threadId: cbThreadId });
-                  return;
-                }
-
-                // Check 24h expiry
-                const recordAge = Date.now() - new Date(targetRecord.ts).getTime();
-                const EXPIRY_MS = 24 * 60 * 60 * 1000;
-                if (recordAge > EXPIRY_MS) {
-                  await answerCallbackQuery(token, cb.id, 'This approval button has expired (24h limit)', true);
-                  logger.info('callback', 'rejected - expired', { refId: 'none', auditId, action, chatId: cbChatId, threadId: cbThreadId, recordAge });
-                  return;
-                }
-
-                // Handle actions
-                const refId = makeRefId('cb');
-                logger.info('callback', 'received', { refId, auditId, action, chatId: cbChatId, threadId: cbThreadId });
-
-                if (action === 'approve') {
-                  const reviewRecord = {
-                    ts: new Date().toISOString(),
-                    draft: targetRecord.draft,
-                    source_type: 'conversation' as const,
-                    action: 'rollback-accepted' as const,
-                    risk_flags: targetRecord.risk_flags,
-                    reason: 'Approved via HITL button by operator',
-                    accepted_at: new Date().toISOString(),
-                    accepted_by: 'operator',
-                    commit_hash: targetRecord.commit_hash,
-                  };
-                  await appendAuditRecord(reviewRecord);
-                  await answerCallbackQuery(token, cb.id, '✅ Change approved');
-                  await sendMessage(token, cbChatId, appendRefIdAndLog(`✅ Approved change ${auditId} _Ref: ${refId}_`, { kind: 'callback', chatId: cbChatId, threadId: cbThreadId }), cbMessageId, cbThreadId);
-                } else if (action === 'reject') {
-                  const reviewRecord = {
-                    ts: new Date().toISOString(),
-                    draft: targetRecord.draft,
-                    source_type: 'conversation' as const,
-                    action: 'rollback-accepted' as const,
-                    risk_flags: targetRecord.risk_flags,
-                    reason: 'Rejected via HITL button by operator',
-                    accepted_at: new Date().toISOString(),
-                    accepted_by: 'operator',
-                    commit_hash: targetRecord.commit_hash,
-                  };
-                  await appendAuditRecord(reviewRecord);
-                  await answerCallbackQuery(token, cb.id, '❌ Change rejected');
-                  await sendMessage(token, cbChatId, appendRefIdAndLog(`❌ Rejected change ${auditId} _Ref: ${refId}_`, { kind: 'callback', chatId: cbChatId, threadId: cbThreadId }), cbMessageId, cbThreadId);
-                  // Notify pa-alerts about rejection
-                  const paAlertsChatId = secrets['PA_ALERTS_CHAT_ID'] ? parseInt(secrets['PA_ALERTS_CHAT_ID']) : null;
-                  if (paAlertsChatId && !isNaN(paAlertsChatId)) {
-                    await sendMessage(token, paAlertsChatId, `⚠️ Change ${auditId} was rejected by operator via HITL button.`);
-                  }
-                } else if (action === 'diff') {
-                  const diff = targetRecord.diff || 'No diff available';
-                  const chunks = diff.match(/[\s\S]{1,3000}/g) || ['No diff available'];
-                  const firstChunk = chunks[0];
-                  await answerCallbackQuery(token, cb.id, '📄 Showing diff');
-                  await sendMessage(token, cbChatId, appendRefIdAndLog(`📄 Diff for ${auditId}:\n\n${firstChunk}${chunks.length > 1 ? '\n\n...(truncated)' : ''} _Ref: ${refId}_`, { kind: 'callback', chatId: cbChatId, threadId: cbThreadId }), cbMessageId, cbThreadId);
-                }
-              } catch (err) {
-                logger.warn('callback', `error processing callback: ${(err as Error).message}`, { chatId: cbChatId, threadId: cbThreadId });
-                await answerCallbackQuery(token, cb.id, 'Error processing callback').catch(() => {});
-              }
-            })();
-            continue; // Don't process callback queries as messages
+            void handleCallbackQuery(cb, callbackDeps)
+              .then((outcome) => logger.info('callback', outcome, { chatId: cb.message?.chat.id, threadId: cb.message?.message_thread_id ?? 0 }))
+              .catch((err) => logger.warn('callback', `handler threw: ${(err as Error).message}`));
+            continue;
+          }
+          if (update.message_reaction && allowedChatIds.has(update.message_reaction.chat.id)) {
+            void handleMessageReaction(update.message_reaction, callbackDeps)
+              .then((outcome) => logger.info('reaction', outcome, { chatId: update.message_reaction!.chat.id }))
+              .catch((err) => logger.warn('reaction', `handler threw: ${(err as Error).message}`));
+            continue;
           }
 
           // AI-095 follow-up (deep-recheck 2026-07-08, Phase 1A): persist a
@@ -2507,6 +2712,8 @@ export async function runPollLoop(
             if (steerCtx) {
               queueEntry.steerContext = steerCtx;
             }
+            // B6: Hoist extractAudioAttachment for voiceFileId and reuse later.
+            const eAudio = hasAudio ? extractAudioAttachment(m) : undefined;
             await addPendingDispatch({
               updateId: update.update_id,
               chatId: eChatId,
@@ -2514,6 +2721,9 @@ export async function runPollLoop(
               messageId: m.message_id,
               userText,
               startedAt: new Date().toISOString(),
+              ...(eAudio ? { voiceFileId: eAudio.media.file_id } : {}),
+              ...((update as any).__requeueCount !== undefined
+                ? { requeueCount: (update as any).__requeueCount as number } : {}),
               // Deliberately no cwd/session — those aren't known until
               // topicState loads inside processUpdate. The dispatch-time
               // addPendingDispatch call (same key) overwrites this with the
@@ -2526,7 +2736,7 @@ export async function runPollLoop(
             // process.env alone would silently strand prefetch on the local
             // engine (loopRuntimeEnv is built once at poll-loop start).
             if (hasAudio && !skipVoice) {
-              const media = extractAudioAttachment(m);
+              const media = eAudio;
               if (media) {
                 const descriptor: VoicePrefetchDescriptor = {
                   kind: media.kind,
@@ -2541,7 +2751,26 @@ export async function runPollLoop(
                   voiceField = { promise: prefetch, descriptor };
                 }
                 if (voiceField) {
-                  queueEntry.voice = voiceField;
+                  const vf = voiceField;
+                  queueEntry.voice = vf;
+                  // Edit A (2026-08-27 voice-transcript-backfill spec): when the
+                  // arrival-time prefetch settles, merge the formatted text into
+                  // the enqueue-time placeholder record. updatePendingDispatch
+                  // merges (never clobbers cwd/session/teePath) and no-ops once
+                  // the record is removed (turn cleanup in the .finally() below,
+                  // or the reaper's finish()). Fires only post-settle, strictly
+                  // AFTER the awaited placeholder write above — the AI-095
+                  // placeholder-before-spawned-work order is untouched.
+                  const backfillKey = enqKey;
+                  vf.promise
+                    .then((vr) => {
+                      if (!backfillKey) return;
+                      return updatePendingDispatch(backfillKey, {
+                        userText: userTextFromVoiceResult(vr, vf.descriptor),
+                        userTextSettled: true,
+                      });
+                    })
+                    .catch((err) => logger.warn('dispatch', 'transcript backfill failed', { error: String(err) }));
                 }
               }
             }
@@ -2653,7 +2882,9 @@ export async function runPollLoop(
               // (upgraded) record at :1018, making this a safe no-op; anything
               // else that left the placeholder behind (including a cancelled
               // entry, which never reaches :1018) gets cleaned up here.
-              if (enqKey) await removePendingDispatch(enqKey).catch(() => {});
+              // B9: a ladder-parked record is the drain's to re-inject — removing it
+              // here would silently drop the user's request.
+              if (enqKey && !(update as any).__ladderParked) await removePendingDispatch(enqKey).catch(() => {});
             });
           topicPending.set(topicKey, p);
           inFlight.add(p);
@@ -2725,7 +2956,8 @@ async function main(): Promise<void> {
       await flushDlq(token).catch(() => {});
       // AI-095: recover replies from dispatches orphaned by a crashed prior instance.
       // May wait many minutes for an orphan to finish.
-      void reapOrphanedDispatches(token, { secrets }).catch((err) => logger.warn('reaper', 'reap failed', { error: String(err) }));
+      void reapOrphanedDispatches(token, { secrets, requeueUpdate: requeueSyntheticUpdate })
+        .catch((err) => logger.warn('reaper', 'reap failed', { error: String(err) }));
       await backfillTopicDescriptions(token, chatIds, topicNames).catch(() => {});
       await registerBotCommands(token).catch(() => {});
       await updateDashboard(token, chatIds[0]).catch(() => {});

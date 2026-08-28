@@ -19,7 +19,7 @@ async function createTempFailureMeta(dir: string, skillName: string, meta: RunMe
 
 function makeErrorMeta(overrides: Partial<RunMeta> = {}): RunMeta {
   return {
-    worker: 'gemini',
+    worker: 'codex',
     status: 'error',
     exitCode: -1,
     duration: 30000,

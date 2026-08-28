@@ -44,7 +44,8 @@ export const MODEL_SWITCH_PATTERN = /^\/models?(?:@\w+)?\s+(claude|zclaude|codex
 export const DEFAULT_SWITCH_PATTERN = /^\/default(?:@\w+)?(?:\s+(?:agent\s+)?(claude|zclaude|codex|agyc|agy))?$/i;
 export const CODE_PATTERN = /^\/code(?:@\w+)?(?:\s+(.+))?$/i;
 export const RESET_PATTERN = /^\/reset(?:@\w+)?$/i;
-export const NEW_PATTERN = /^\/new(?:@\w+)?(?:\s+(.+))?$/i;
+// [\s\S] (not .) so multi-line instructions (quoted ref + question) match — . never matches \n.
+export const NEW_PATTERN = /^\/new(?:@\w+)?(?:\s+([\s\S]+))?$/i;
 export const STATUS_PATTERN = /^\/status(?:@\w+)?$/i;
 export const KEEP_AWAKE_PATTERN = /^\/keepawake(?:@\w+)?$/i;
 export const SKILLS_PATTERN = /^\/skills(?:@\w+)?$/i;
@@ -53,6 +54,16 @@ export const HELP_PATTERN = /^\/help(?:@\w+)?$/i;
 export const HEALTH_PATTERN = /^\/health(?:@\w+)?$/i;
 export const REF_PATTERN = /^\/ref(?:@\w+)?\s+(\S+)\s*$/i;
 export const CLAIMS_PATTERN = /^\/claims(?:@\w+)?$/i;
+// Deterministic trigger for a Google OAuth reauth link. Local, never LLM-inferred:
+// the operator asks for this precisely when four skills are already blocked, and
+// the link has a 12 h fuse. `/reauth [skill]` optionally names the skill to resume.
+export const REAUTH_PATTERN = /^\/reauth(?:@\w+)?(?:\s+([a-z0-9][a-z0-9-]*))?\s*$/i;
+// Callback-data contract for the inline "Re-authorize Google" button carried by every
+// reauth notice (bot + Python sender share this shape): `reauth:google` or
+// `reauth:google:<skill>` where `<skill>` matches [a-z0-9-]{1,50}.
+// `reauth:google:` is 14 bytes, so 50 is the largest suffix that fits Telegram's
+// 64-byte `callback_data` limit.
+export const REAUTH_CALLBACK_PATTERN = /^reauth:(google)(?::([a-z0-9-]{1,50}))?$/;
 // [Voice message]/[Audio file]/[Video note] re-transcription (WP5 of the
 // hardened voice-transcription plan). Wiring (locate the replied media,
 // call voice.ts's findCachedAudio/transcribeVoiceMessage) is WP6's job in
@@ -89,7 +100,7 @@ export const UPDATE_BRAIN_PATTERN = /^\/update[-_]brain(?:@\w+)?(?:\s+([\s\S]+))
 // invoked by explicit human commands (/commit, /push, etc.) — never via PA_META
 // run_skill, because LLM inference about when to git-commit/push is too unreliable for
 // an operation that mutates the live tree.
-const PA_META_PROTECTED_SKILLS = new Set([
+export const PA_META_PROTECTED_SKILLS = new Set([
   'self-improver',
   'commit',
   'push',
@@ -165,9 +176,7 @@ export function buildModelStatusSnapshot(args: {
   defaultEffort?: string;
 }): ModelStatusSnapshot {
   let defaultWorker = args.defaultWorker;
-  if (defaultWorker === 'gemini') defaultWorker = 'agy';
   let currentWorker = args.currentWorker ?? defaultWorker;
-  if (currentWorker === 'gemini') currentWorker = 'agy';
 
   return {
     current_worker: currentWorker,
@@ -191,10 +200,8 @@ export function hydrateModelStatus(
     ? workersOrConfig
     : workersOrConfig?.workers;
   let normDefaultWorker = defaultWorker;
-  if (normDefaultWorker === 'gemini') normDefaultWorker = 'agy';
 
   let candidateWorker = state.model_status?.current_worker || state.preferred_worker || state.pinned_worker || normDefaultWorker;
-  if (candidateWorker === 'gemini') candidateWorker = 'agy';
   const knownWorkers = workers?.map((w) => w.name) ?? [];
   const currentWorker = (knownWorkers.length > 0 && !knownWorkers.includes(candidateWorker))
     ? normDefaultWorker
@@ -554,6 +561,29 @@ export function handleClaimsCommand(): { matched: boolean } {
   return { matched: true };
 }
 
+/**
+ * Handle the /reauth [skill] command. Extracts the optional resume-skill name.
+ * The actual link request is executed in main.ts via spawning
+ * pa/scripts/start_google_telegram_reauth.py.
+ */
+export function handleReauthCommand(userText: string): { matched: boolean; skill?: string } {
+  const m = REAUTH_PATTERN.exec(userText);
+  if (!m) return { matched: false };
+  return { matched: true, skill: m[1] };
+}
+
+/**
+ * Parses the `reauth:google[:skill]` inline-button callback_data. Pure — no I/O.
+ * The actual link request is executed in main.ts via spawnReauthLink, same as
+ * handleReauthCommand above.
+ */
+export function parseReauthCallback(data: string | undefined): { provider: 'google'; skill?: string } | null {
+  if (!data) return null;
+  const m = REAUTH_CALLBACK_PATTERN.exec(data);
+  if (!m) return null;
+  return { provider: 'google', skill: m[2] };
+}
+
 export function isPassThroughCommand(userText: string): boolean {
   return PASS_THROUGH_PATTERN.test(userText);
 }
@@ -741,6 +771,16 @@ export function resolveConfirmation(
   // Unrelated message — clear pending and let worker handle it
   state.pending_action = undefined;
   return { skipWorker: false, response: '' };
+}
+
+/** Reads the pending action's description and CLEARS it, so a second "yes" (typed,
+ *  tapped, or 👍'd) inside the 5-minute TTL cannot re-run the same confirmed action.
+ *  Implements what resolveConfirmation's own comment has claimed since it was written
+ *  (main.ts never did clear it — plans/2026-08-24-buttons-program-SPEC.md correction 3). */
+export function consumeConfirmation(state: ConversationState): string | undefined {
+  const desc = state.pending_action?.description;
+  state.pending_action = undefined;
+  return desc;
 }
 
 // AI-029 (hardened 2026-08-05, ekadashi-topic incident): resolves a pending
@@ -1510,72 +1550,77 @@ function isNoOutputSentinel(output: string): boolean {
 /**
  * Clean agent output for Telegram.
  */
-export function buildWorkerResponse(result: WorkerResult, worker: string): string {
-  if (result.success && result.output.trim()) {
-    let output = result.output.trim();
+export function formatWorkerReply(output: string, worker: string): string {
+  if (!output.trim()) return '';
+  let out = output.trim();
 
-    if (worker === 'agy') {
-      const thoughtRegex = /\[Thought: true\]([\s\S]*?)\[Thought: false\]/g;
-      const blocks: string[] = [];
-      let match;
-      while ((match = thoughtRegex.exec(output)) !== null) {
-        const content = match[1].trim();
-        if (content) blocks.push(content);
-      }
-      // If there are multiple thought blocks, use the last one (captures multi-step reasoning)
-      // If there's one thought block, prefer content after it (the actual response),
-      //   but fall back to thought block content if nothing substantive after
-      // Otherwise, strip orphaned tags and use remaining content
-      if (blocks.length > 1) {
-        output = blocks[blocks.length - 1];
-      } else if (blocks.length === 1) {
-        // Single thought block: check if there's non-whitespace content after it
-        const afterLastBlock = output.replace(/\[Thought: true\][\s\S]*?\[Thought: false\]/, '').trim();
-        // Check if afterLastBlock is substantive (not just planning headers, noise, or leftover tags)
-        const isSubstantiveAfter = afterLastBlock &&
-          !/^(\*\*[^*]+\*\*|Planning:|Strategy:|\[Thought)/.test(afterLastBlock) &&
-          afterLastBlock.length > 10; // Substantive responses are longer than headers/tags
-        if (isSubstantiveAfter) {
-          output = afterLastBlock;
-        } else {
-          output = blocks[0];
-        }
+  if (worker === 'agy') {
+    const thoughtRegex = /\[Thought: true\]([\s\S]*?)\[Thought: false\]/g;
+    const blocks: string[] = [];
+    let match;
+    while ((match = thoughtRegex.exec(out)) !== null) {
+      const content = match[1].trim();
+      if (content) blocks.push(content);
+    }
+    // If there are multiple thought blocks, use the last one (captures multi-step reasoning)
+    // If there's one thought block, prefer content after it (the actual response),
+    //   but fall back to thought block content if nothing substantive after
+    // Otherwise, strip orphaned tags and use remaining content
+    if (blocks.length > 1) {
+      out = blocks[blocks.length - 1];
+    } else if (blocks.length === 1) {
+      // Single thought block: check if there's non-whitespace content after it
+      const afterLastBlock = out.replace(/\[Thought: true\][\s\S]*?\[Thought: false\]/, '').trim();
+      // Check if afterLastBlock is substantive (not just planning headers, noise, or leftover tags)
+      const isSubstantiveAfter = afterLastBlock &&
+        !/^(\*\*[^*]+\*\*|Planning:|Strategy:|\[Thought)/.test(afterLastBlock) &&
+        afterLastBlock.length > 10; // Substantive responses are longer than headers/tags
+      if (isSubstantiveAfter) {
+        out = afterLastBlock;
       } else {
-        // No complete thought blocks: strip orphaned tags and use remaining content
-        output = output.replace(/\[Thought: (true|false)\]/g, '').trim();
+        out = blocks[0];
       }
     } else {
-      output = output.replace(/<thought>[\s\S]*?<\/thought>\s*/gi, '');
-      output = output.replace(/<\/?thought>/gi, '').trim();
+      // No complete thought blocks: strip orphaned tags and use remaining content
+      out = out.replace(/\[Thought: (true|false)\]/g, '').trim();
     }
+  } else {
+    out = out.replace(/<thought>[\s\S]*?<\/thought>\s*/gi, '');
+    out = out.replace(/<\/?thought>/gi, '').trim();
+  }
 
-    // Remove plain "I will/I'll/I've/I'm" planning statements (agy worker leak)
-    // Matches consecutive lines starting with these phrases at the start of output
-    output = output.replace(
-      /^(?:I will|I'll|I've|I'm)\s+[^\n]*\n+(?:(?:I will|I'll|I've|I'm)\s+[^\n]*\n+)*/,
-      ''
-    ).trim();
+  // Remove plain "I will/I'll/I've/I'm" planning statements (agy worker leak)
+  // Matches consecutive lines starting with these phrases at the start of output
+  out = out.replace(
+    /^(?:I will|I'll|I've|I'm)\s+[^\n]*\n+(?:(?:I will|I'll|I've|I'm)\s+[^\n]*\n+)*/,
+    ''
+  ).trim();
 
-    // Remove bold-prefixed planning statements (claude/zclaude format)
-    output = output.replace(
-      /^(\*\*[A-Z][^*\n]+\*\*\s+(?:I'(?:ve|m)|I will|I'll|My )[^\n]*\n+)+/,
-      ''
-    ).trim();
+  // Remove bold-prefixed planning statements (claude/zclaude format)
+  out = out.replace(
+    /^(\*\*[A-Z][^*\n]+\*\*\s+(?:I'(?:ve|m)|I will|I'll|My )[^\n]*\n+)+/,
+    ''
+  ).trim();
 
-    const noisePrefixes = [
-      /^(\*+(Planning|Strategy|Research|Thought|Process)\*+:?\s*)+/i,
-      /^(Planning\.\.\.|Strategy:|Research:|Thought:)\s*/i,
-    ];
+  const noisePrefixes = [
+    /^(\*+(Planning|Strategy|Research|Thought|Process)\*+:?\s*)+/i,
+    /^(Planning\.\.\.|Strategy:|Research:|Thought:)\s*/i,
+  ];
 
-    for (const pattern of noisePrefixes) {
-      output = output.replace(pattern, '').trim();
-    }
+  for (const pattern of noisePrefixes) {
+    out = out.replace(pattern, '').trim();
+  }
 
-    if (isNoOutputSentinel(output)) return '';
+  if (isNoOutputSentinel(out)) return '';
 
-    // Apply redaction as the last line of defense before returning
-    const cleaned = normalizeMarkdown(output);
-    return redactSecrets(cleaned) as string;
+  // Apply redaction as the last line of defense before returning
+  const cleaned = normalizeMarkdown(out);
+  return redactSecrets(cleaned) as string;
+}
+
+export function buildWorkerResponse(result: WorkerResult, worker: string): string {
+  if (result.success && result.output.trim()) {
+    return formatWorkerReply(result.output, worker);
   }
 
   if (!result.success) {
@@ -1622,34 +1667,12 @@ export function buildWorkerErrorResponse(args: {
  * Checks if an audit record carries risk flags that require operator approval
  * and returns the appropriate InlineKeyboardMarkup for HITL buttons.
  *
+ * Moved to pa/src/lib/hitl-keyboard.ts (2026-08-24 buttons program, P5) so pa's
+ * self-improver can attach the same keyboard without importing bot code — this is a
+ * re-export, not a reimplementation; output must stay byte-identical (verified by this
+ * file's own hitl-buttons.test.ts and pa/tests/hitl-keyboard.test.ts).
+ *
  * @param auditRecord - The audit record to check (from self-improver-audit.jsonl)
  * @returns InlineKeyboardMarkup if risk flags present, undefined otherwise
  */
-export function buildHITLKeyboard(auditRecord: { risk_flags?: string[]; ts?: string }): { inline_keyboard: any[][] } | undefined {
-  if (!auditRecord.risk_flags || auditRecord.risk_flags.length === 0) {
-    return undefined;
-  }
-
-  // Check for high-risk flags that require HITL approval
-  const highRiskFlags = ['critical-skill', 'declares-secrets'];
-  const hasHighRiskFlag = auditRecord.risk_flags.some(flag => highRiskFlags.includes(flag));
-
-  if (!hasHighRiskFlag) {
-    return undefined;
-  }
-
-  // Use timestamp as audit record ID for callback_data
-  const auditId = auditRecord.ts || 'unknown';
-
-  return {
-    inline_keyboard: [
-      [
-        { text: '✅ Approve', callback_data: `pm:${auditId}:approve` },
-        { text: '❌ Reject', callback_data: `pm:${auditId}:reject` },
-      ],
-      [
-        { text: '📄 Show diff', callback_data: `pm:${auditId}:diff` },
-      ],
-    ],
-  };
-}
+export { buildHITLKeyboard } from '../../../pa/dist/src/lib/hitl-keyboard.js';

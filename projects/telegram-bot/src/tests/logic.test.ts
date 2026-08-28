@@ -9,6 +9,7 @@ import {
   resolveConfirmation,
   resolvePendingDescription,
   buildWorkerResponse,
+  formatWorkerReply,
   AGENT_SWITCH_PATTERN,
   MODEL_SWITCH_PATTERN,
   handleModelSwitch,
@@ -2244,6 +2245,48 @@ describe('buildWorkerResponse: agy thought blocks', () => {
   });
 });
 
+describe('formatWorkerReply', () => {
+  it('is byte-identical to buildWorkerResponse for the same worker output', () => {
+    const cases = [
+      '**bold** text with ### header',
+      '[Thought: true]\nMulti-block answer\n[Thought: false]\n[Thought: true]\nFinal block\n[Thought: false]',
+      '<thought>planning</thought>\nReal answer',
+      '**Strategy** I will analyze this.\nActual content',
+    ];
+    for (const raw of cases) {
+      for (const worker of ['claude', 'agy', 'zclaude']) {
+        const formatted = formatWorkerReply(raw, worker);
+        const viaBuild = buildWorkerResponse({ success: true, output: raw }, worker);
+        assert.equal(formatted, viaBuild, `formatWorkerReply must match buildWorkerResponse for worker=${worker}`);
+      }
+    }
+  });
+
+  it('redacts secrets.env-shaped literals', () => {
+    const output = 'The API key is sk-TESTSECRET123456abcdefghijklmn and token is xoxb-1234567890abcdef';
+    const result = formatWorkerReply(output, 'claude');
+    assert.ok(!result.includes('sk-TESTSECRET123456abcdefghijklmn'), 'secret-like token must be redacted');
+    assert.ok(!result.includes('xoxb-1234567890abcdef'), 'Slack token must be redacted');
+  });
+
+  it('returns empty string for the NO_OUTPUT sentinel', () => {
+    const sentinel = 'Checking...NO_OUTPUT';
+    const result = formatWorkerReply(sentinel, 'agy');
+    assert.equal(result, '', 'NO_OUTPUT sentinel must return empty string');
+  });
+
+  it('returns empty string for empty input', () => {
+    assert.equal(formatWorkerReply('', 'claude'), '');
+    assert.equal(formatWorkerReply('   \n\t  ', 'claude'), '');
+  });
+
+  it('normalizes markdown: **bold** becomes *bold*', () => {
+    const input = '**Hello world**\nThis is **formatted** text.';
+    const result = formatWorkerReply(input, 'claude');
+    assert.equal(result, '*Hello world*\nThis is *formatted* text.');
+  });
+});
+
 describe('normalizeMarkdown: pre-escape stripping', () => {
   it('strips \\. to .', () => {
     assert.equal(normalizeMarkdown('version 1\\.0'), 'version 1.0');
@@ -2307,6 +2350,13 @@ describe('NEW_PATTERN', () => {
     const m = NEW_PATTERN.exec('/new');
     assert.equal(m?.[1], undefined);
   });
+  it('matches multi-line instruction (quoted ref + question)', () => {
+    assert.ok(NEW_PATTERN.test('/new \n> Ref: s-29c910953ae0\nwhat does this mean?'));
+  });
+  it('captures multi-line instruction verbatim', () => {
+    const m = NEW_PATTERN.exec('/new \n> Ref: s-29c910953ae0\nwhat does this mean?');
+    assert.equal(m?.[1], '> Ref: s-29c910953ae0\nwhat does this mean?');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2365,6 +2415,13 @@ describe('handleNewCommand', () => {
     const result = handleNewCommand(state, '/new summarise the project');
     assert.ok(result.matched);
     assert.equal(result.instruction, 'summarise the project');
+  });
+
+  it('extracts multi-line instruction (regression: used to fall through to the worker)', () => {
+    const state = makeState();
+    const result = handleNewCommand(state, '/new \n> Ref: s-daaa221fe2f0\ncan you debug this?');
+    assert.ok(result.matched);
+    assert.equal(result.instruction, '> Ref: s-daaa221fe2f0\ncan you debug this?');
   });
 
   it('preserves cwd_override after /new', () => {

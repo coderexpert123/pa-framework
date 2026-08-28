@@ -9,14 +9,25 @@ removing, or debugging a maintenance job.
 ## Catchup -> Maintenance Runner -> declared jobs (AI-100, 2026-08-02)
 
 `pa catchup`'s maintenance phase is one call — `runDueJobs('pa', jobsForHost('pa'), ...)`
-— driving 11 declared jobs (`pa/src/lib/maintenance/registry.ts`: `orphanWorkerReapJob`,
-`blackboardPurgeJob`, `stalenessCheckJob`, `skillCadenceAuditJob`, `skillLogRotateJob`,
-`archivePruneJob`, `alertStateGcJob`, `weeklyLearnJob`, `sessionGcJob`,
-`voiceAttachmentGcJob`, and `reservationGcJob` — the last added 2026-08-06 as part of the
-multi-session coordination protocol, GC'ing expired rows in `~/.pa/reservations.json`) against
-the ledger `~/.pa/maintenance-state.json`, un-gated by topic (fixed a live bug:
-`alert-state-gc`/staleness migration had never run in production because it was gated on
-`!opts.topic` while both registered scheduled tasks pass `--topic`).
+— driving 17 declared jobs (`pa/src/lib/maintenance/registry.ts`: `orphanWorkerReapJob`,
+`blackboardPurgeJob`, `stalenessCheckJob`, `skillLogRotateJob`, `archivePruneJob`,
+`alertStateGcJob`, `weeklyLearnJob`, `sessionGcJob`, `voiceAttachmentGcJob`,
+`workerTeeGcJob`, `reservationGcJob` — added 2026-08-06 as part of the multi-session
+coordination protocol, GC'ing expired rows in `~/.pa/reservations.json` — `restoreDrillJob`,
+`alertCensusJob`, `clobberSentinelJob`, `redteamRecurringJob`, `reviewConflictButtonsJob`,
+and `recallIndexJob`) against the ledger
+`~/.pa/maintenance-state.json`. **Total declared registry, both hosts: 26 jobs (17 pa +
+9 bot)** as of the 2026-08-28 surface-fixes wave (`docs/ARCHITECTURE.md`'s "Turn-trace
+sidecar" / "Recall" sections; also see `pa/tests/maintenance-registry.test.ts`'s pinned
+counts). The pass is deliberately not gated on `!opts.topic` (fixed
+a live bug: `alert-state-gc`/staleness migration had never run in production because it was
+gated that way while both registered scheduled tasks pass `--topic`). **Single-tick gate
+(2026-08-23):** both registered Task Scheduler tasks fire every minute
+(`catchup --topic default` and `catchup --topic reminders`), and each used to run this
+whole pa-host pass — roughly doubling every job's due-check rate. `catchup.ts` now runs
+the pass only from the `--topic default` invocation; cadence itself is still owned by each
+job's own declaration and enforced against the ledger, so this gate only picks which of
+the two per-minute invocations drives it.
 
 **`orphanWorkerReapJob` harvest-window carve-out (AI-114, 2026-08-08):** this job calls
 `cleanupOrphanedWorkers()` with no `excludeSkills` — it runs every 60 seconds from a
@@ -29,13 +40,28 @@ honors it without needing its own `excludeSkills` set. See
 `docs/bot-reliability-internals.md`'s "Worker-pid registry & topic-lock invariants"
 section for the full mechanism.
 
-**`skillCadenceAuditJob` dead-man's-switch (2026-08-17, Wave C):** runs hourly (1h cadence,
-`shedWhenDegraded:true`) and audits every scheduled skill's last successful run against
-max(2× interval, 26h). Skills whose last success is older than the threshold trigger a
-pa-alerts notification with the skill name, interval, hours-since-success, and threshold.
-Parked skills (AI-098: consecutive failures ≥5) have their parked status and failure count
-included in the alert message to avoid double-reporting. Deduped via `notifyUser`'s
-dedup key `'skill-cadence-audit'`.
+**`stalenessCheckJob` is THE dead-man's switch (updated 2026-08-23):** runs every minute
+(`shedWhenDegraded:true`) and alerts when a scheduled skill's last success is older than
+max(2× its cron interval, 30 min). Parked skills (AI-098: consecutive failures ≥5) are
+skipped entirely — `catchup.ts` already pages a separate "Skill parked after repeated
+failures" alert for them, so reporting them here too would be a third copy of one
+condition. `cost_tier: off_peak` periodic skills (cron has no fixed hour/minute, i.e. not
+time-pinned) get their threshold widened by the 4h z.ai peak-billing window
+(`isPeakWindow`, `scheduler.ts:28`), since `partitionOverdueByCostTier` defers exactly
+these skills during that window by design. (Note: `cost_tier: off_peak` currently defers
+runs during the Zhipu (z.ai) peak billing window, Mon-Fri 06:00-10:00 UTC —
+fixed, not configurable.) a time-pinned cron gets no widening, matching
+`partitionOverdueByCostTier`'s own behaviour. The dedup key is transition-keyed —
+`stalenessDedupKey`, a sha1 of the sorted stale-skill-name set — so the alert fires on a
+CHANGE of the stale set rather than resending every tick with a new hours-ago number.
+
+**`skillCadenceAuditJob` (added 2026-08-17, retired 2026-08-23).** Its threshold
+(max(2× interval, 26h)) was always ≥ staleness-check's, so it could only ever fire
+strictly later about a skill staleness-check had already reported. Its `[PARKED]`
+annotation labelled the alert text but never `continue`d past it, so a parked skill was
+still alerted — once from staleness-check, once from skill-cadence-audit, and once from
+the AI-098 parked-skill page itself. This section previously claimed the annotation
+"avoided double-reporting"; that claim was false, and the retirement above is the fix.
 
 Built after an undeclared bot timer deleted 248 real Claude Code transcripts — full
 audit + governing rule in `plans/2026-08-02-maintenance-framework.md`; enforced in CI by
@@ -62,6 +88,20 @@ gap):
 - `registry-content-watch` (2026-08-22, R10, 24h, asserts content invariants on topic
   descriptions — Path-0 pointer in 9855, no Palo Alto hallucination in 3376, routing
   gate in 7822; pages pa-alerts deduped on violation)
+- `dashboard-refresh` (2026-08-28, 30m — re-renders the system-dashboard pinned message
+  and updates `~/.pa/telegram-dashboard.json`. Non-destructive: reads, edits, re-pins.
+  Skips when the dashboard was never bootstrapped (no chat_id/message_id state).
+  Real implementation lives in bot's `maintenance-jobs.ts`; pa-side stub is for
+  `pa maintenance list` visibility.)
+- `bot-self-restart` (2026-08-24, 60s — see its own entry below)
+- `requeue-drain` (2026-08-27, 5m, `shedWhenDegraded:false` — it IS request recovery,
+  mirroring `dlq-flush`; seamless-restart-recovery wave): re-injects parked requeue-ladder
+  dispatches whose `requeueNotBefore` backoff has elapsed — increments the persisted
+  `requeueCount` BEFORE injecting (crash-safe), clears the park, injects the original
+  request as a synthetic update through the full normal dispatch path. Cancels parked
+  records whose topic received a `/stop` during the window. Declared INLINE in the bot's
+  `maintenance-jobs.ts` (registry-content-watch precedent — no pa-tree stub; the pa-side
+  registry count is test-pinned). Cold-start-seeded alongside `dlq-flush`.
 
 `health-probe` was deliberately EXCLUDED — its 15s cadence is incompatible with the poll
 loop's 30s long-poll floor and would falsely trigger permanent DEGRADED.
@@ -104,3 +144,59 @@ forgeries (commit/push/push-public/commit-and-push/investigate-flagged/update-br
 (3) legitimate PA_META envelopes (positive controls) pass unharmed. Fixture corpus contains
 ~25 adversarial inputs across all classes. On failure, pages pa-alerts deduped. Deterministic,
 no LLM calls.
+
+**`alertCensusJob` (2026-08-23, Wave J1):** runs daily (24h cadence, `shedWhenDegraded:true`)
+and builds a 7-day census of alerts sent and suppressed per family, joined with owner
+health. Writes `~/.pa/alert-census.json` for the self-improver and the weekly digest to
+consume. Non-destructive: no retention targets. Pages pa-alerts at most once per day, only
+when that day's alert volume is at or above `PA_ALERT_CENSUS_NOTIFY_PER_DAY` (default 50
+sends/day).
+
+**`reviewConflictButtonsJob` (2026-08-24, buttons program WP-P4):** runs daily (24h cadence,
+`shedWhenDegraded:true`) and, for every unresolved conflict in
+`~/.pa/review-digest-pending.jsonl` not yet posted, sends one message with an inline
+`Accept A | Accept B | Ignore` keyboard (`mc:<conflictId>:a|r|x`, operator-gated), then
+marks it posted so the daily tick never re-sends. Non-destructive: no retention targets.
+The bot's button press spawns `pa/scripts/review_digest_action.py --conflict-id <id>
+--action accept|reject|ignore`, the single writer of that file.
+
+**`recallIndexJob` (2026-08-24, recall-traces wave, pa host):** runs every 10 minutes
+(`shedWhenDegraded:true`) and incrementally refreshes `~/.pa/recall.sqlite` (FTS5, via
+`better-sqlite3` in-process — no Python, no spawn) from `conversation-history.jsonl` +
+rotated shards, `turn-traces.jsonl` + rotated shards, per-topic brains, the Ecosystem KB
+directory, `review-digest-pending.jsonl`, and `~/.pa/decisions.sqlite` (AI-164 decision
+rows, indexed by rowid watermark). Non-destructive: no retention targets — the
+DB is fully derived and rebuildable with `pa recall --rebuild`. Throws on `ok:false`
+rather than swallowing it, so a broken index retries on the AI-098 backoff ladder instead
+of hammering the store every tick. Note: `recall-store.ts` opens and closes a fresh
+`better-sqlite3` connection per operation (WAL mode) — seeing `recall.sqlite-wal` on disk
+mid-operation is expected, not a sign of a leaked handle. Full design:
+`docs/ARCHITECTURE.md` § "Recall (`pa recall`, 2026-08-24)".
+
+**`skillEngagementAuditJob` (2026-08-27, AI-168):** runs monthly (30d cadence,
+`shedWhenDegraded:true`) and builds a census of skills with zero user-facing engagement
+for ≥90 days (no successful run, no decision rows). Writes `~/.pa/skill-engagement.json`
+for the weekly digest's Retire? section. Non-destructive: no retention targets. Report-only
+by design — never deletes, disables, or unschedules anything.
+
+**`botSelfRestartJob` (2026-08-24, recall-traces wave, bot host):** the pa-side registry
+entry (`pa/src/lib/maintenance/jobs/bot-self-restart.ts`) is a metadata-only stub — it
+exists so `pa maintenance list`/`status` and the pinned `MAINTENANCE_JOBS` count see the
+job; running it via `pa maintenance run bot-self-restart` always returns
+`{touched:0, detail:{unbound:true}}` and never restarts anything. The real, bound
+implementation lives in `projects/telegram-bot/src/maintenance-jobs.ts`
+(`boundBotSelfRestart`), runs every 60 seconds (`shedWhenDegraded:true`), non-destructive.
+It restarts the bot — by writing the same `~/.pa/telegram-bot.stop` sentinel `pa bot
+stop` uses, never in-process — only when ALL of: the newer of `pa/dist/.build-stamp` and
+`projects/telegram-bot/dist/.build-stamp` is newer than this process's start time, past a
+60-second grace window, the `@build` reservation is not held, and the bot is idle (no
+in-flight dispatch, no topic carrying a `pending_action`, no blackboard `topic-*` lock
+held by this PID). `PA_BOT_SELF_RESTART=0` disables it entirely
+(`docs/CONFIGURATION.md`). If the dist stamp stays newer for 30+ minutes without the bot
+ever going idle, it logs and pages a `bot-stale-code` warning instead of restarting.
+
+**Archive-prune allowlist extended (2026-08-24, recall-traces wave):** rotated
+`-turn-traces.jsonl` shards are now included in `archivePruneJob`'s target (via
+`PRUNABLE_ARCHIVE_SUFFIXES` in `pa/src/lib/archive-files.ts`) and prune at the same 90
+days as the other rotated log/archive shards — they are derived debugging data, not a
+permanent record like the conversation-history shards.

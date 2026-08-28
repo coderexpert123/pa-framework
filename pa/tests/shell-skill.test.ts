@@ -45,13 +45,13 @@ describe('isNoOutputSentinel', () => {
     assert.equal(isNoOutputSentinel('\nNO_OUTPUT\n'), true);
   });
 
-  it('returns true when Gemini emits preamble before NO_OUTPUT (the real bug)', () => {
-    const geminiOutput = [
+  it('returns true when agy emits preamble before NO_OUTPUT (the real bug)', () => {
+    const agyOutput = [
       "Inspecting ~/.pa/rate-limit-unparseable.jsonl and summarizing entries from the last 65 minutes.",
       "I'm parsing the JSONL directly so I can return either the exact NO_OUTPUT sentinel or a report.",
       'NO_OUTPUT',
     ].join('\n');
-    assert.equal(isNoOutputSentinel(geminiOutput), true);
+    assert.equal(isNoOutputSentinel(agyOutput), true);
   });
 
   it('returns true when worker chatter is collapsed onto the same line as NO_OUTPUT', () => {
@@ -61,7 +61,7 @@ describe('isNoOutputSentinel', () => {
   });
 
   it('returns false for actual content', () => {
-    assert.equal(isNoOutputSentinel('Worker gemini hit rate limit: 429'), false);
+    assert.equal(isNoOutputSentinel('Worker agy hit rate limit: 429'), false);
   });
 
   it('returns false when NO_OUTPUT appears mid-output but not at the end', () => {

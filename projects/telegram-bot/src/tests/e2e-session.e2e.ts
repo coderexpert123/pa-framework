@@ -1,7 +1,7 @@
 /**
  * End-to-end session resumption tests.
  *
- * These tests spawn REAL Claude and Gemini CLI processes to verify the full
+ * These tests spawn REAL Claude-family (claude/zclaude) and agy CLI processes to verify the full
  * fresh → resume round-trip works. They make actual API calls and take ~30-60s.
  *
  * Run explicitly (not part of default npm test):

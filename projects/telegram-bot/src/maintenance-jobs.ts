@@ -3,6 +3,7 @@
  * See pa/src/lib/maintenance/types.ts for the MaintenanceJob contract this satisfies.
  */
 import { statSync, writeFileSync } from 'fs';
+import { readFile } from 'fs/promises';
 import { join } from 'path';
 import type { MaintenanceJob } from '../../../pa/dist/src/lib/maintenance/types.js';
 import { notifyUser } from '../../../pa/dist/src/lib/notify.js';
@@ -14,8 +15,15 @@ import { RUNTIME_ARCHIVE_MAX_BYTES } from '../../../pa/dist/src/lib/archive-file
 import {
   runScheduledPoolRefresh,
 } from '../../../pa/dist/src/lib/telegram-proxy.js';
+import { repoRootFromModule } from '../../../pa/dist/src/lib/git-root.js';
+import { readActive } from '../../../pa/dist/src/lib/reservations.js';
+import { blackboard } from '../../../pa/dist/src/blackboard.js';
 import type { TopicNameMap } from './topic-names.js';
 import { isSuspiciousDescription } from './grounding-check.js';
+import { listPendingDispatches } from './pending-dispatches.js';
+import { listTopicStateRefs } from './conversation.js';
+import { shouldSelfRestart, shouldWarnStaleCode } from './self-restart.js';
+import { refreshDashboardIfBootstrapped } from './dashboard.js';
 import {
   botLogRotationCheckJob,
   modelOverrideSweepJob,
@@ -24,7 +32,14 @@ import {
   dlqFlushJob,
   groundingCheckJob,
 } from '../../../pa/dist/src/lib/maintenance/jobs/index.js';
+import { botSelfRestartJob } from '../../../pa/dist/src/lib/maintenance/jobs/bot-self-restart.js';
 import { loadJobState, updateJobState } from '../../../pa/dist/src/lib/maintenance/state.js';
+
+// Module-level (not durable): the first pass where the dist stamp is newer
+// than this process but the bot has never gone idle long enough to restart.
+// A bot restart clears it implicitly (fresh process, fresh module state) —
+// that is the correct semantics, and it adds no timer (C13).
+let firstSeenNewerStampMs: number | null = null;
 
 // ─── Registry Content Watch Invariants ─────────────────────────────────────────────
 
@@ -107,6 +122,9 @@ export interface BotMaintenanceDeps {
   /** Live topic registry — same Map instance runPollLoop uses, so the job
    *  always sees current state with no extra load of its own (AI-101). */
   topicNames: TopicNameMap;
+  /** Injected (runModelSweep precedent — avoids a main.ts import cycle):
+   *  drain due parked requeues; returns the number re-injected. */
+  requeueDrain: () => Promise<number>;
 }
 
 /**
@@ -231,6 +249,10 @@ export function createBotMaintenanceJobs(deps: BotMaintenanceDeps): MaintenanceJ
     },
   };
 
+  // A static stub now exists in pa/src/lib/maintenance/jobs/registry-content-watch.ts
+  // (for `pa maintenance list`, which cannot run the bot's bound closure). The two must
+  // keep the same `name`, `everyMs`, `host`, `destructive` and `shedWhenDegraded` — asserted
+  // by pa/tests/maintenance-registry.test.ts and this file's own maintenance-jobs.test.ts.
   const boundRegistryContentWatch: MaintenanceJob = {
     name: 'registry-content-watch',
     description: 'Daily content invariants for topic descriptions — watches Path-0 pointer (whatsapp-drafts), no Palo Alto hallucination (pa-alerts), routing gate (ekadashi). Non-destructive — reads and alerts only.',
@@ -255,6 +277,117 @@ export function createBotMaintenanceJobs(deps: BotMaintenanceDeps): MaintenanceJ
     },
   };
 
+  const boundBotSelfRestart: MaintenanceJob = {
+    ...botSelfRestartJob,
+    async run(ctx) {
+      if (deps.sentinelPath === undefined) {
+        return { touched: 0, detail: { reason: 'no-sentinel' } };
+      }
+
+      const repoRoot = await repoRootFromModule(import.meta.url);
+      const stampPaths = [
+        join(repoRoot, 'pa', 'dist', '.build-stamp'),
+        join(repoRoot, 'projects', 'telegram-bot', 'dist', '.build-stamp'),
+      ];
+      let stampMtimeMs: number | null = null;
+      for (const p of stampPaths) {
+        try {
+          const m = statSync(p).mtimeMs;
+          if (stampMtimeMs === null || m > stampMtimeMs) stampMtimeMs = m;
+        } catch {
+          // stamp not present at this path — contributes nothing.
+        }
+      }
+
+      const procStartMs = Date.now() - Math.round(process.uptime() * 1000);
+      const buildLockHeld = (await readActive()).some((r) => r.paths.includes('@build'));
+      const inFlightWorkers = (await listPendingDispatches()).length;
+      const topicLocksHeld = (await blackboard.getActiveLocks()).filter(
+        (l) => l.pid === process.pid && l.resource.startsWith('topic-'),
+      ).length;
+
+      let pendingActions = 0;
+      for (const ref of await listTopicStateRefs()) {
+        try {
+          const raw = await readFile(ref.path, 'utf8');
+          const parsed = JSON.parse(raw) as { pending_action?: unknown };
+          if (parsed.pending_action) pendingActions++;
+        } catch {
+          // a parse failure counts as 0 for that file.
+        }
+      }
+
+      const disabled = process.env.PA_BOT_SELF_RESTART === '0';
+
+      const d = shouldSelfRestart({
+        procStartMs,
+        stampMtimeMs,
+        nowMs: ctx.now,
+        buildLockHeld,
+        inFlightWorkers,
+        pendingActions,
+        topicLocksHeld,
+        disabled,
+      });
+
+      if (d.stampIsNewer && !d.restart) {
+        if (firstSeenNewerStampMs === null) firstSeenNewerStampMs = ctx.now;
+      } else {
+        firstSeenNewerStampMs = null;
+      }
+
+      if (d.restart) {
+        logger.info('bot', 'self-restart: dist stamp is newer than this process and the bot is idle — writing stop sentinel', { stampMtimeMs, procStartMs });
+        await notifyUser(
+          'Bot self-restart',
+          `dist stamp (${stampMtimeMs !== null ? new Date(stampMtimeMs).toISOString() : 'unknown'}) is newer than this process's start (${new Date(procStartMs).toISOString()}) and the bot is idle. Writing the stop sentinel — Task Scheduler will relaunch it on the newer build.`,
+          { dedupKey: 'bot-self-restart', severity: 'info', escalate: false },
+        ).catch(() => {});
+        writeFileSync(deps.sentinelPath, String(ctx.now));
+        return { touched: 1, detail: { reason: d.reason, stampMtimeMs } };
+      }
+
+      if (shouldWarnStaleCode({ firstSeenNewerStampMs, nowMs: ctx.now })) {
+        logger.warn('bot', 'self-restart: dist stamp has been newer than this process for 30+ minutes but the bot has never gone idle', { stampMtimeMs, procStartMs, firstSeenNewerStampMs });
+        await notifyUser(
+          'Bot running stale code',
+          `dist stamp has been newer than this running process for 30+ minutes, but the bot has never gone idle long enough to self-restart (last reason: ${d.reason}). stampMtimeMs=${stampMtimeMs}, procStartMs=${procStartMs}.`,
+          { dedupKey: 'bot-stale-code', severity: 'warn', escalate: false },
+        ).catch(() => {});
+        return { touched: 0, detail: { reason: d.reason, stale: true } };
+      }
+
+      return { touched: 0, detail: { reason: d.reason } };
+    },
+  };
+
+  const boundRequeueDrain: MaintenanceJob = {
+    name: 'requeue-drain',
+    description: 'Re-inject parked requeue-ladder dispatches whose backoff has elapsed (seamless restart recovery, 2026-08-27). Request recovery, not housekeeping — never shed under DEGRADED, mirroring dlq-flush.',
+    host: 'bot',
+    everyMs: 5 * 60_000,
+    shedWhenDegraded: false,
+    destructive: false,
+    targets: [],
+    async run() {
+      return { touched: await deps.requeueDrain() };
+    },
+  };
+
+  const boundDashboardRefresh: MaintenanceJob = {
+    name: 'dashboard-refresh',
+    description: 'Re-render the system-dashboard pinned message and update ~/.pa/telegram-dashboard.json. Non-destructive — reads, edits, re-pins. Skips when the dashboard was never bootstrapped (no chat_id/message_id state).',
+    host: 'bot',
+    everyMs: 1_800_000, // 30 minutes
+    shedWhenDegraded: true,
+    destructive: false,
+    targets: [],
+    async run() {
+      await refreshDashboardIfBootstrapped(deps.token);
+      return { touched: 1 };
+    },
+  };
+
   return [
     boundBotLogRotationCheck,
     boundModelOverrideSweep,
@@ -262,6 +395,9 @@ export function createBotMaintenanceJobs(deps: BotMaintenanceDeps): MaintenanceJ
     boundProxyPoolRefresh,
     boundGroundingCheck,
     boundRegistryContentWatch,
+    boundDashboardRefresh,
+    boundRequeueDrain,
+    boundBotSelfRestart,
     boundDlqFlush,
   ];
 }

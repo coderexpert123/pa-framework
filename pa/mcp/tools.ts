@@ -3,7 +3,8 @@
  *
  * Read-only tools wrapping the pa CLI's existing commands — the same
  * spawn-the-CLI pattern as the bot's /health, /ref, /claims commands.
- * v1 surface: ref lookup, claims, maintenance status, costs, SLO report.
+ * v1 surface: ref lookup, claims, maintenance status, costs, SLO report,
+ * recall (full-text search over turns/traces/brains/KB).
  */
 
 import { execFile } from 'child_process';
@@ -97,4 +98,26 @@ export const pa_slo_report = {
   },
 };
 
-export const tools = [pa_ref_lookup, pa_claims, pa_maintenance_status, pa_costs, pa_slo_report];
+export const pa_recall = {
+  name: 'pa_recall',
+  description: 'Full-text search across archived conversation turns, worker run traces, per-topic brains, the Ecosystem KB and judgment-call decision rows. Use before assuming something was never discussed.',
+  inputSchema: {
+    type: 'object' as const,
+    properties: {
+      q: { type: 'string', description: 'Free-text query' },
+      thread: { type: 'number', description: 'Restrict to one Telegram thread id' },
+      source: { type: 'string', enum: ['conversation', 'trace', 'brain', 'kb', 'review', 'decisions'] },
+      limit: { type: 'number', description: 'Max hits (clamped to 50)' },
+    },
+    required: ['q'],
+  },
+  async handler(args: { q: string; thread?: number; source?: string; limit?: number }): Promise<string> {
+    const cliArgs = ['recall', args.q, '--json'];
+    if (args.thread !== undefined) cliArgs.push('--thread', String(args.thread));
+    if (args.source) cliArgs.push('--source', args.source);
+    if (args.limit !== undefined) cliArgs.push('--limit', String(args.limit));
+    return spawnPa(cliArgs);
+  },
+};
+
+export const tools = [pa_ref_lookup, pa_claims, pa_maintenance_status, pa_costs, pa_slo_report, pa_recall];

@@ -218,19 +218,20 @@ describe('syncPublicMirror', () => {
     assert.equal(stdout.trim(), '');
   });
 
-  it('RA-1: sends a deduped pa-alerts page when private tree is dirty', async () => {
-    // ESM exports are read-only, so we cannot mock notifyUser directly.
-    // Verify the implementation by checking that:
-    // 1. The sync correctly fails with ERR_DIRTY_PRIVATE
-    // 2. The implementation calls notifyUser with the right parameters (code review)
-    // The actual notification is verified by manual testing or by checking alert-state files.
+  it('RA-1 (superseded 2026-08-23): a dirty private tree is logged, not paged', async () => {
+    // The notifyUser call this test originally verified (by code review, since
+    // ESM exports are read-only and cannot be mocked directly) was removed
+    // 2026-08-23: a dirty private tree is an expected multi-session state, not
+    // a page — it fired on 5 of 7 days, 3 of those from manual commit-and-push
+    // runs whose own Step-4 wrap-up already reports it
+    // (plans/2026-08-23-alerts-week-review.md §5.4). public-sync.ts now emits a
+    // `log('warn', 'public-sync', …)` line instead of calling notifyUser.
+    // This test still verifies the ERR_DIRTY_PRIVATE return contract.
 
     await writeFile(join(privateDir, 'src/a.ts'), 'export const a = 999; // dirty\n', 'utf8');
     const result = await syncPublicMirror({ privateDir, publicDir });
 
     assert.equal(result.ok, false);
     assert.equal(result.code, ERR_DIRTY_PRIVATE);
-    // The notifyUser call is verified by code review of public-sync.ts:146-151
-    // which calls notifyUser with the correct subject, body, and dedup options.
   });
 });

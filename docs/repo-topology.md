@@ -30,6 +30,8 @@ as stale past blackboard's 10-minute heartbeat window. Prevents two different sk
 in-process state — from mutating the same working tree concurrently (e.g. a scheduled
 `push-public` colliding with a manual `/commit`).
 
+As of 2026-08-23 `pa public-sync` takes its own `skill-exclusive:git-public-workflow` lock so two direct invocations cannot interleave `checkout -f` / `clean -fdx` / tar-extraction against the derived `pa-public/` tree. The `push-public` skill still declares `exclusive_resource: git-workflow`, so the public mirror is still serialized behind private git work — splitting those two is [AI-148] and is not built.
+
 Lock-wait budget is half the skill's own `timeout` (`lockWaitBudgetMs` in run.ts), so a
 blocked run always keeps half its budget for the actual work no matter how long it
 waited; on timeout it returns a failed `CommandResult` routed through the normal

@@ -9,8 +9,18 @@ The reminders system manages due reminders stored in `~/.pa/reminders.json` and 
 ## Architecture
 
 1. **`add_reminder.py`**: Adds a new reminder with atomic write (`reminders.json.tmp` -> `os.replace`).
-2. **`process_reminders.py`**: Evaluates due items against current timestamp, delivers via `telegram_utils`, and atomically prunes delivered items.
+2. **`process_reminders.py`**: Evaluates due items against current timestamp, deletes them from `reminders.json` first, then delivers each one through the shared `pa/src/telegram_notify.py` sender (`send_text`). Every reminder now carries a ref-ID and a **Done / 1 h / Tomorrow** keyboard, and one failed send no longer blocks the rest of the batch.
 3. **Scheduler Integration**: Polled every minute via `pa catchup` or Task Scheduler (`PA-Catchup-Reminders` / cron `* * * * *`).
+
+## Buttons
+
+Each delivered reminder carries three inline buttons:
+
+- **Done** — acknowledges the reminder; nothing is re-created, since the due entry is already gone.
+- **1 h** — re-adds the same message one hour from now.
+- **Tomorrow** — re-adds the same message at 9 AM the next day.
+
+A tap re-creates the reminder through the unchanged `add_reminder.py` atomic writer above, so a snoozed reminder is just a new entry in `reminders.json`.
 
 ## CLI Usage
 
