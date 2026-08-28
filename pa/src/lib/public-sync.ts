@@ -11,14 +11,14 @@
 // longer has. Nothing in `privateDir` is ever written.
 //
 // All git/tar invocations use spawn() with an argv array (never shell:true)
-// so paths containing spaces (this repo's own "D:/Personal Assistant") are
-// passed through untouched, and windowsHide:true per the 2026-08-05 repo
+// so paths containing spaces are passed through untouched, and windowsHide:true
+// per the 2026-08-05 repo
 // rule so these subprocess calls don't flash a console window.
 
 import { spawn } from 'child_process';
 import { access, rm } from 'fs/promises';
 import { join } from 'path';
-import { notifyUser } from './notify.js';
+import { log } from './log.js';
 
 // Windows: PATH often puts git-bash's bundled GNU tar (MSYS) ahead of the
 // native bsdtar at System32\tar.exe (Windows 10 1803+). MSYS tar cannot
@@ -172,12 +172,13 @@ export async function syncPublicMirror(opts: SyncOptions): Promise<SyncResult> {
     return { ok: false, code: ERR_DIRTY_PRIVATE, ...empty, error: `git status failed in private repo: ${privateStatus.stderr.trim()}` };
   }
   if (privateStatus.stdout.trim() !== '') {
-    // RA-1: send a deduped pa-alerts page (once per day)
-    await notifyUser(
-      'pa public-sync blocked: private tree has uncommitted changes',
-      'The private working tree has uncommitted changes. Syncing now would publish a version that does not match what is actually committed.\n\nFix: Commit your pending work first (`/commit` or `pa claim`), then retry `pa public-sync`.',
-      { dedupKey: 'public-sync-dirty-tree', dedupWindowMs: 86400000, severity: 'warn' }
-    );
+    // A dirty private tree is an expected multi-session state, not a page
+    // (2026-08-23): it fired on 5 of 7 days, 3 of those from manual
+    // commit-and-push runs whose own Step-4 wrap-up already reports it
+    // (plans/2026-08-23-alerts-week-review.md §5.4). Log only.
+    log('warn', 'public-sync', 'blocked: private tree has uncommitted changes', {
+      status: privateStatus.stdout.trim().slice(0, 500),
+    });
     return { ok: false, code: ERR_DIRTY_PRIVATE, ...empty, error: `private repo is dirty:\n${privateStatus.stdout}` };
   }
 

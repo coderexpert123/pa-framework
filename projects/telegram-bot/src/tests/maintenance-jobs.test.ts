@@ -1,15 +1,42 @@
 import { describe, it, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, mkdir, writeFile } from 'fs/promises';
-import { existsSync } from 'fs';
+import { mkdtemp, rm, mkdir, writeFile, readdir } from 'fs/promises';
+import { existsSync, readFileSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createBotMaintenanceJobs, watchdogStaleJobs, checkRegistryContentInvariants, type BotMaintenanceDeps, type RegistryContentViolation } from '../maintenance-jobs.js';
+import type { RegistryContentRule } from '../registry-content-rules.js';
 import { validateRegistry } from '../../../../pa/dist/src/lib/maintenance/policy.js';
+import { registryContentWatchJob as registryContentWatchStub } from '../../../../pa/dist/src/lib/maintenance/jobs/registry-content-watch.js';
 import { RUNTIME_ARCHIVE_MAX_BYTES } from '../../../../pa/dist/src/lib/archive-files.js';
 import { flushLog } from '../../../../pa/dist/src/lib/log.js';
 import { loadJobState, updateJobState } from '../../../../pa/dist/src/lib/maintenance/state.js';
 import type { TopicNameMap } from '../topic-names.js';
+
+/**
+ * Config-shaped rule fixtures matching ~/.pa/registry-content-rules.json format.
+ * These test fixtures reflect the deployed rules (whatsapp-drafts, pa-alerts, ekadashi).
+ */
+const TEST_RULES: RegistryContentRule[] = [
+  {
+    topic_key: 'whatsapp-drafts',
+    thread_id: 9855,
+    require_contains: 'INSTRUCTIONS.md',
+    label: 'Path-0 pointer',
+  },
+  {
+    topic_key: 'pa-alerts',
+    thread_id: 3376,
+    forbid_contains: 'Palo Alto',
+    label: 'no hallucinated gloss',
+  },
+  {
+    topic_key: 'ekadashi',
+    thread_id: 7822,
+    require_contains: 'Sources.md',
+    label: 'deterministic routing gate',
+  },
+];
 
 let tempDir: string;
 let originalPaHome: string | undefined;
@@ -21,6 +48,7 @@ function stubDeps(overrides: Partial<BotMaintenanceDeps> = {}): BotMaintenanceDe
     sentinelPath: join(tempDir, 'telegram-bot.stop'),
     runModelSweep: async () => 0,
     topicNames: new Map(),
+    requeueDrain: async () => 0,
     ...overrides,
   };
 }
@@ -49,26 +77,34 @@ describe('createBotMaintenanceJobs', () => {
     assert.doesNotThrow(() => validateRegistry(createBotMaintenanceJobs(stubDeps())));
   });
 
-  it('declares exactly the 7 expected jobs, all host bot', () => {
+  it('declares exactly the 10 expected jobs, all host bot', () => {
     const jobs = createBotMaintenanceJobs(stubDeps());
-    assert.equal(jobs.length, 7);
+    assert.equal(jobs.length, 10);
     const names = jobs.map((j) => j.name).sort();
     assert.deepEqual(names, [
       'bot-log-rotation-check',
+      'bot-self-restart',
+      'dashboard-refresh',
       'delivered-store-compact',
       'dlq-flush',
       'grounding-check',
       'model-override-sweep',
       'proxy-pool-refresh',
       'registry-content-watch',
+      'requeue-drain',
     ]);
     for (const j of jobs) assert.equal(j.host, 'bot');
   });
 
-  it('orders bot-log-rotation-check first and dlq-flush last', () => {
+  it('orders bot-log-rotation-check first, dashboard-refresh after registry-content-watch, dlq-flush last', () => {
     const jobs = createBotMaintenanceJobs(stubDeps());
     assert.equal(jobs[0].name, 'bot-log-rotation-check');
     assert.equal(jobs[jobs.length - 1].name, 'dlq-flush');
+    assert.equal(jobs[jobs.length - 2].name, 'bot-self-restart');
+    assert.equal(jobs[jobs.length - 3].name, 'requeue-drain');
+    const registryIdx = jobs.findIndex((j) => j.name === 'registry-content-watch');
+    const dashboardIdx = jobs.findIndex((j) => j.name === 'dashboard-refresh');
+    assert.equal(dashboardIdx, registryIdx + 1, 'dashboard-refresh immediately follows registry-content-watch');
   });
 
   it('locks shedWhenDegraded per job', () => {
@@ -81,6 +117,8 @@ describe('createBotMaintenanceJobs', () => {
     assert.equal(byName.get('delivered-store-compact')!.shedWhenDegraded, true);
     assert.equal(byName.get('grounding-check')!.shedWhenDegraded, true);
     assert.equal(byName.get('registry-content-watch')!.shedWhenDegraded, true);
+    assert.equal(byName.get('dashboard-refresh')!.shedWhenDegraded, true);
+    assert.equal(byName.get('requeue-drain')!.shedWhenDegraded, false);
   });
 
   it('locks the destructive set and its targets resolve under paHome()', () => {
@@ -105,6 +143,8 @@ describe('createBotMaintenanceJobs', () => {
     assert.equal(byName.get('dlq-flush')!.everyMs, 300_000);
     assert.equal(byName.get('grounding-check')!.everyMs, 21_600_000);
     assert.equal(byName.get('registry-content-watch')!.everyMs, 86_400_000);
+    assert.equal(byName.get('dashboard-refresh')!.everyMs, 1_800_000);
+    assert.equal(byName.get('requeue-drain')!.everyMs, 300_000);
     const proxyEveryMs = byName.get('proxy-pool-refresh')!.everyMs;
     assert.equal(typeof proxyEveryMs, 'function');
     const resolved = (proxyEveryMs as () => number)();
@@ -126,6 +166,21 @@ describe('createBotMaintenanceJobs', () => {
     assert.equal(calls.length, 1);
     assert.equal(calls[0].token, deps.token);
     assert.deepEqual(calls[0].chatIds, deps.chatIds);
+  });
+
+  it('requeue-drain.run() invokes the injected drain and reports touched', async () => {
+    let calls = 0;
+    const deps = stubDeps({
+      requeueDrain: async () => {
+        calls++;
+        return 3;
+      },
+    });
+    const jobs = createBotMaintenanceJobs(deps);
+    const job = jobs.find((j) => j.name === 'requeue-drain')!;
+    const result = await job.run({ now: Date.now(), everyMs: 300_000 });
+    assert.equal(result.touched, 3);
+    assert.equal(calls, 1);
   });
 
   describe('bot-log-rotation-check', () => {
@@ -314,6 +369,39 @@ describe('createBotMaintenanceJobs', () => {
     });
   });
 
+  describe('bot-self-restart', () => {
+    it('bound job stays in parity with the frozen pa-side stub contract (name/host/everyMs/destructive/shedWhenDegraded)', () => {
+      // pa/src/lib/maintenance/jobs/bot-self-restart.ts (WP-D's stub) is
+      // frozen byte-for-byte in
+      // plans/2026-08-24-recall-traces-wave-SPEC.md §3.4 step 10. WP-D lands
+      // in a later batch than WP-G (§4 batch 1 vs batch 2), so at WP-G build
+      // time that module does not exist in pa/dist and cannot be imported
+      // here (unlike the registry-content-watch parity case above). These
+      // five literals are copied byte-for-byte from that frozen contract —
+      // see the INTEGRATOR note above botSelfRestartJobStub in
+      // ../maintenance-jobs.ts once WP-D's real stub lands.
+      const jobs = createBotMaintenanceJobs(stubDeps());
+      const bound = jobs.find((j) => j.name === 'bot-self-restart')!;
+      assert.equal(bound.name, 'bot-self-restart');
+      assert.equal(bound.host, 'bot');
+      assert.equal(bound.everyMs, 60_000);
+      assert.equal(bound.destructive, false);
+      assert.equal(bound.shedWhenDegraded, true);
+    });
+
+    it('run() with sentinelPath undefined returns touched:0 and writes nothing (early return before any I/O)', async () => {
+      const deps = stubDeps({ sentinelPath: undefined });
+      const jobs = createBotMaintenanceJobs(deps);
+      const job = jobs.find((j) => j.name === 'bot-self-restart')!;
+      const before = await readdir(tempDir);
+      const result = await job.run({ now: Date.now(), everyMs: 60_000 });
+      assert.equal(result.touched, 0);
+      assert.equal(result.detail?.reason, 'no-sentinel');
+      const after = await readdir(tempDir);
+      assert.deepEqual(after, before);
+    });
+  });
+
   describe('registry-content-watch', () => {
     function mapWith(entries: Array<{ chatId: string; threadId: number; name: string; description?: string }>): TopicNameMap {
       const map: TopicNameMap = new Map();
@@ -331,7 +419,7 @@ describe('createBotMaintenanceJobs', () => {
         { chatId: '-100', threadId: 3376, name: 'pa-alerts', description: 'PA system alerts and notifications' },
         { chatId: '-100', threadId: 7822, name: 'ekadashi', description: 'Ekadashi alerts — see Sources.md for schedule' },
       ]);
-      const violations = checkRegistryContentInvariants(topicNames);
+      const violations = checkRegistryContentInvariants(TEST_RULES, topicNames);
       assert.deepEqual(violations, []);
     });
 
@@ -339,7 +427,7 @@ describe('createBotMaintenanceJobs', () => {
       const topicNames = mapWith([
         { chatId: '-100', threadId: 9855, name: 'whatsapp-drafts', description: 'WhatsApp drafting topic' },
       ]);
-      const violations = checkRegistryContentInvariants(topicNames);
+      const violations = checkRegistryContentInvariants(TEST_RULES, topicNames);
       assert.equal(violations.length, 1);
       assert.equal(violations[0].topicKey, 'whatsapp-drafts');
       assert.equal(violations[0].invariantLabel, 'Path-0 pointer');
@@ -349,7 +437,7 @@ describe('createBotMaintenanceJobs', () => {
       const topicNames = mapWith([
         { chatId: '-100', threadId: 3376, name: 'pa-alerts', description: 'PA alerts — Palo Alto system notifications' },
       ]);
-      const violations = checkRegistryContentInvariants(topicNames);
+      const violations = checkRegistryContentInvariants(TEST_RULES, topicNames);
       assert.equal(violations.length, 1);
       assert.equal(violations[0].topicKey, 'pa-alerts');
       assert.equal(violations[0].invariantLabel, 'no hallucinated gloss');
@@ -359,7 +447,7 @@ describe('createBotMaintenanceJobs', () => {
       const topicNames = mapWith([
         { chatId: '-100', threadId: 7822, name: 'ekadashi', description: 'Ekadashi fasting alerts' },
       ]);
-      const violations = checkRegistryContentInvariants(topicNames);
+      const violations = checkRegistryContentInvariants(TEST_RULES, topicNames);
       assert.equal(violations.length, 1);
       assert.equal(violations[0].topicKey, 'ekadashi');
       assert.equal(violations[0].invariantLabel, 'deterministic routing gate');
@@ -371,7 +459,7 @@ describe('createBotMaintenanceJobs', () => {
         { chatId: '-100', threadId: 3376, name: 'pa-alerts', description: 'Contains Palo Alto' },
         { chatId: '-100', threadId: 7822, name: 'ekadashi', description: 'No Sources pointer' },
       ]);
-      const violations = checkRegistryContentInvariants(topicNames);
+      const violations = checkRegistryContentInvariants(TEST_RULES, topicNames);
       assert.equal(violations.length, 3);
       const labels = violations.map((v) => v.invariantLabel).sort();
       assert.deepEqual(labels, ['Path-0 pointer', 'deterministic routing gate', 'no hallucinated gloss']);
@@ -391,15 +479,28 @@ describe('createBotMaintenanceJobs', () => {
     });
 
     it('job integration: touched equals violation count', async () => {
-      const topicNames = mapWith([
-        { chatId: '-100', threadId: 9855, name: 'whatsapp-drafts', description: 'Missing pointer' },
-        { chatId: '-100', threadId: 3376, name: 'pa-alerts', description: 'Has Palo Alto text' },
-      ]);
-      const jobs = createBotMaintenanceJobs(stubDeps({ topicNames }));
-      const job = jobs.find((j) => j.name === 'registry-content-watch')!;
-      const result = await job.run({ now: Date.now(), everyMs: 86_400_000 });
-      assert.equal(result.touched, 2);
-      assert.equal((result.detail!.violations as RegistryContentViolation[]).length, 2);
+      // The job loads rules from $PA_HOME/registry-content-rules.json — write
+      // fixture rules matching the stub topics before running.
+      const rulesPath = join(process.env.PA_HOME!, 'registry-content-rules.json');
+      const prevRules = existsSync(rulesPath) ? readFileSync(rulesPath, 'utf-8') : undefined;
+      writeFileSync(rulesPath, JSON.stringify([
+        { topic_key: 'whatsapp-drafts', thread_id: 9855, require_contains: 'INSTRUCTIONS.md', label: 'Path-0 pointer' },
+        { topic_key: 'pa-alerts', thread_id: 3376, forbid_contains: 'Palo Alto', label: 'no hallucinated gloss' },
+      ]), 'utf-8');
+      try {
+        const topicNames = mapWith([
+          { chatId: '-100', threadId: 9855, name: 'whatsapp-drafts', description: 'Missing pointer' },
+          { chatId: '-100', threadId: 3376, name: 'pa-alerts', description: 'Has Palo Alto text' },
+        ]);
+        const jobs = createBotMaintenanceJobs(stubDeps({ topicNames }));
+        const job = jobs.find((j) => j.name === 'registry-content-watch')!;
+        const result = await job.run({ now: Date.now(), everyMs: 86_400_000 });
+        assert.equal(result.touched, 2);
+        assert.equal((result.detail!.violations as RegistryContentViolation[]).length, 2);
+      } finally {
+        if (prevRules !== undefined) writeFileSync(rulesPath, prevRules, 'utf-8');
+        else rmSync(rulesPath, { force: true });
+      }
     });
 
     it('job integration: alerts via notifyUser with correct dedup key', async () => {
@@ -415,8 +516,18 @@ describe('createBotMaintenanceJobs', () => {
       const topicNames = mapWith([
         { chatId: '-100', threadId: 1234, name: 'some-other-topic', description: 'Anything' },
       ]);
-      const violations = checkRegistryContentInvariants(topicNames);
+      const violations = checkRegistryContentInvariants(TEST_RULES, topicNames);
       assert.deepEqual(violations, []);
+    });
+
+    it('bound job stays in parity with the pa-side static stub (name/everyMs/host/destructive/shedWhenDegraded)', () => {
+      const jobs = createBotMaintenanceJobs(stubDeps());
+      const bound = jobs.find((j) => j.name === 'registry-content-watch')!;
+      assert.equal(bound.name, registryContentWatchStub.name);
+      assert.equal(bound.everyMs, registryContentWatchStub.everyMs);
+      assert.equal(bound.host, registryContentWatchStub.host);
+      assert.equal(bound.destructive, registryContentWatchStub.destructive);
+      assert.equal(bound.shedWhenDegraded, registryContentWatchStub.shedWhenDegraded);
     });
   });
 });

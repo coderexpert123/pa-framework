@@ -44,7 +44,7 @@ describe('appendUnparseableRateLimit', () => {
     const longRaw = 'x'.repeat(3000);
     await appendUnparseableRateLimit({
       timestamp: new Date().toISOString(),
-      worker: 'gemini',
+      worker: 'codex',
       raw: longRaw,
       reason: 'no-session-evidence',
     });

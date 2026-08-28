@@ -8,27 +8,16 @@
  * Never mutates anything — pure detection + notification only.
  */
 import { detectDrift, type DriftFinding } from '../../tree-drift.js';
-import { readActive, normalizePath } from '../../reservations.js';
+import { readActive } from '../../reservations.js';
 import { notifyUser } from '../../notify.js';
 import { log } from '../../log.js';
+import { repoRootFromModule } from '../../git-root.js';
+import { blackboard } from '../../../blackboard.js';
+import { exclusiveLockKey } from '../../../commands/run.js';
+import { randomBytes } from 'crypto';
 import type { MaintenanceJob } from '../types.js';
 
 const THIRTY_MINUTES = 30 * 60 * 1000;
-
-/** Checks if the current active reservations include @build or git-workflow locks. */
-async function isHeldByConflict(): Promise<boolean> {
-  const active = await readActive();
-
-  // Check for @build reservation
-  const hasBuildLock = active.some((r) => r.paths.some((p) => p === '@build'));
-
-  // Check for git-workflow exclusive_resource lock
-  const hasGitWorkflowLock = active.some((r) =>
-    r.paths.some((p) => p === 'exclusive_resource:git-workflow')
-  );
-
-  return hasBuildLock || hasGitWorkflowLock;
-}
 
 /** Builds a dedup key scoped to the drift finding's file path. */
 function dedupKeyForFile(filePath: string): string {
@@ -41,31 +30,50 @@ export interface ClobberSentinelDeps {
   readActiveFn?: () => Promise<Array<{ paths: string[] }>>;
   detectDriftFn?: (repoRoot: string) => Promise<DriftFinding[]>;
   notifyFn?: (subject: string, body: string, opts?: Record<string, unknown>) => Promise<{ sent: boolean; suppressed: boolean }>;
+  repoRootFn?: () => Promise<string>;
+  getActiveLocksFn?: () => Promise<Array<{ resource: string }>>;
 }
 
 export async function runClobberSentinel(deps: ClobberSentinelDeps = {}): Promise<{ touched: number; detail: Record<string, unknown> }> {
   const readActiveDep = deps.readActiveFn ?? readActive;
   const detectDriftDep = deps.detectDriftFn ?? detectDrift;
   const notifyDep = deps.notifyFn ?? notifyUser;
+  const repoRootDep = deps.repoRootFn ?? (() => repoRootFromModule(__filename));
+  const getActiveLocksDep = deps.getActiveLocksFn ?? (() => blackboard.getActiveLocks());
 
-  // Skip while @build or git-workflow locks are held — mid-commit reconcile is racy
+  // Skip while @build or a git-workflow blackboard lock is held — mid-commit reconcile is racy
   const active = await readActiveDep();
   const hasBuildLock = active.some((r) => r.paths.some((p) => p === '@build'));
-  const hasGitWorkflowLock = active.some((r) => r.paths.some((p) => p === 'exclusive_resource:git-workflow'));
-  if (hasBuildLock || hasGitWorkflowLock) {
-    log('info', 'maintenance', 'clobber-sentinel skipped: @build or git-workflow lock held');
+  const activeLocks = await getActiveLocksDep();
+  const heldKeys = new Set(activeLocks.map((l) => l.resource));
+  const hasGitLock = heldKeys.has(exclusiveLockKey('git-workflow'))
+                  || heldKeys.has(exclusiveLockKey('git-public-workflow'));
+  if (hasBuildLock || hasGitLock) {
+    log('info', 'maintenance', 'clobber-sentinel skipped: @build reservation or a git-workflow blackboard lock is held');
     return { touched: 0, detail: { skipped: 'lock-held' } };
   }
 
   const findings: DriftFinding[] = [];
   try {
-    const repoRoot = process.cwd(); // CWD is repo root when maintenance runs
+    const repoRoot = await repoRootDep();
     findings.push(...(await detectDriftDep(repoRoot)));
   } catch (err: any) {
-    log('warn', 'maintenance', 'clobber-sentinel detectDrift failed', {
+    // A tamper-detection control that reports green while doing nothing is
+    // worse than one that pages: clobber-sentinel was silently a no-op from
+    // 2026-08-17 (49 "detectDrift failed" warn lines in a single 17 h shard,
+    // plans/2026-08-23-alerts-wave-SPEC.md §5.2). Page + rethrow so the
+    // runner records `failed` and WP-B's failure-backoff ladder paces retries
+    // instead of the job quietly returning a green result every tick.
+    log('error', 'maintenance', 'clobber-sentinel detectDrift failed', {
       error: err?.message ?? String(err),
     });
-    return { touched: 0, detail: { error: 'detect-failed' } };
+    await notifyDep(
+      'clobber-sentinel cannot run',
+      `detectDrift threw: ${err?.message ?? String(err)}\n\n` +
+      `Tamper detection is DOWN — clobber-sentinel is not checking for reverted files until this is fixed.`,
+      { dedupKey: 'clobber-sentinel-detect-failed', severity: 'error' }
+    ).catch(() => {});
+    throw err;
   }
 
   if (findings.length === 0) {
@@ -113,7 +121,7 @@ export const clobberSentinelJob: MaintenanceJob = {
   },
 };
 
-/** Simple 6-char hex ref ID for alert messages. */
+/** 12-char hex ref ID for alert messages — matches the repo-wide `s-XXXXXXXXXXXX` convention. */
 function generateRefId(): string {
-  return Math.random().toString(16).slice(2, 8);
+  return randomBytes(6).toString('hex');
 }

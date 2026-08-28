@@ -14,6 +14,45 @@ import { promisify } from 'util';
 import { computeFingerprint } from '../src/drafts.js';
 import { appendAuditRecord } from '../src/lib/improvement-audit.js';
 import type { DraftMeta, DraftProposal, RunMeta } from '../src/types.js';
+import type { AlertCensus, CensusFamily } from '../src/lib/alert-census.js';
+
+// ---------------------------------------------------------------------------
+// Census fixtures (2026-08-23 alerts wave) — buildReport's census-derived sections and
+// gateAndApprove's maintenance-job route both consume these shapes.
+// ---------------------------------------------------------------------------
+
+function makeCensusFamily(overrides: Partial<CensusFamily> = {}): CensusFamily {
+  return {
+    family: 'test-family',
+    subjectSample: 'Skill failed: test-family',
+    sent: 5,
+    suppressed: 0,
+    other: 0,
+    firstSeen: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString(),
+    lastSeen: new Date().toISOString(),
+    ownerKind: 'skill',
+    owner: 'test-family',
+    distinctBodies: 1,
+    classification: 'informational',
+    ...overrides,
+  };
+}
+
+function makeCensus(overrides: Partial<AlertCensus> = {}): AlertCensus {
+  return {
+    generatedAt: new Date().toISOString(),
+    windowDays: 7,
+    since: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString(),
+    until: new Date().toISOString(),
+    totalSent: 42,
+    totalSuppressed: 3,
+    sentPerDay: {},
+    families: [],
+    maskedFailures: [],
+    topLine: '42 alerts / 1 families in 7d — top: test-family 5',
+    ...overrides,
+  };
+}
 
 // ---------------------------------------------------------------------------
 // git-workflow lock fake (2026-08-05) — local per this file's existing
@@ -212,6 +251,67 @@ describe('buildReport', () => {
     const report = buildReport([], [makeEntry()]);
     assert.match(report, /Analyzed the last 14 days\. 1 proposal\(s\) generated\./);
   });
+
+  it('prints the census headline even with zero proposals and zero rollbacks (2026-08-23) — the failure this exists to make impossible', () => {
+    const census = makeCensus({ topLine: '548 alerts / 22 families in 7d — top: restore-drill 180, staleness 111, bg-leak 88' });
+    const report = buildReport([], [], 0, 0, census);
+    assert.match(report, /548 alerts \/ 22 families in 7d/);
+  });
+
+  it('prints "Alert census unavailable: <err>" when the census failed to build (2026-08-23)', () => {
+    const report = buildReport([], [], 0, 0, undefined, 'ENOENT: no such file');
+    assert.match(report, /Alert census unavailable: ENOENT: no such file/);
+  });
+
+  it('prints "Alert census unavailable: not built" when neither census nor censusError is given (default args, 2026-08-23)', () => {
+    const report = buildReport([], []);
+    assert.match(report, /Alert census unavailable: not built/);
+  });
+
+  describe('census-derived report sections (2026-08-23 alerts wave)', () => {
+    it('renders Operator action needed for human-gated families (family/owner/age/error), omitted when there are none', () => {
+      const generatedAt = new Date().toISOString();
+      const oldFirstSeen = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString();
+      const census = makeCensus({
+        generatedAt,
+        families: [makeCensusFamily({
+          family: 'google-oauth', owner: 'daily-mail-brief', classification: 'human-gated',
+          firstSeen: oldFirstSeen,
+          ownerStatus: { lastError: 'invalid_grant: token expired', consecutiveFailures: 4 },
+        })],
+      });
+      const report = buildReport([], [], 0, 0, census);
+      assert.match(report, /\*Operator action needed \(1\)\*/);
+      assert.match(report, /google-oauth.*owner: daily-mail-brief.*5d old.*invalid_grant/);
+
+      const emptyReport = buildReport([], [], 0, 0, makeCensus({ families: [] }));
+      assert.doesNotMatch(emptyReport, /Operator action needed/);
+    });
+
+    it('renders Alert hygiene for repeat-unchanged families (family/sent/distinctBodies/suggestion), omitted when there are none', () => {
+      const census = makeCensus({
+        families: [makeCensusFamily({ family: 'bg-leak', classification: 'repeat-unchanged', sent: 88, distinctBodies: 2 })],
+      });
+      const report = buildReport([], [], 0, 0, census);
+      assert.match(report, /\*Alert hygiene \(1\)\*/);
+      assert.match(report, /bg-leak.*sent 88, 2 distinct bodies.*escalate \/ merge \/ mute/);
+
+      const emptyReport = buildReport([], [], 0, 0, makeCensus({ families: [] }));
+      assert.doesNotMatch(emptyReport, /Alert hygiene/);
+    });
+
+    it('renders Masked failures (skill/lastRunAt/marker), omitted when there are none', () => {
+      const census = makeCensus({
+        maskedFailures: [{ skill: 'daily-mail-brief', lastRunAt: '2026-08-20T12:00:00.000Z', marker: '[notify] attempting ... "severity":"error"' }],
+      });
+      const report = buildReport([], [], 0, 0, census);
+      assert.match(report, /\*Masked failures \(1\)\*/);
+      assert.match(report, /daily-mail-brief.*2026-08-20T12:00:00\.000Z.*severity.*error/);
+
+      const emptyReport = buildReport([], [], 0, 0, makeCensus({ maskedFailures: [] }));
+      assert.doesNotMatch(emptyReport, /Masked failures/);
+    });
+  });
 });
 
 describe('gateAndApprove', () => {
@@ -356,8 +456,8 @@ describe('gateAndApprove', () => {
         [{ proposal: makeProposal({ name: 'coding-dirs-update-fix', target_skill: 'coding-dirs-update' }), sourceType: 'failure' }],
         {
           readRecentFailuresFn: async () => [
-            { skillName: 'coding-dirs-update', error: 'boom A', timestamp: new Date().toISOString(), duration: 1000, worker: 'gemini' },
-            { skillName: 'unrelated-skill', error: 'boom B', timestamp: new Date().toISOString(), duration: 1000, worker: 'gemini' },
+            { skillName: 'coding-dirs-update', error: 'boom A', timestamp: new Date().toISOString(), duration: 1000, worker: 'codex' },
+            { skillName: 'unrelated-skill', error: 'boom B', timestamp: new Date().toISOString(), duration: 1000, worker: 'codex' },
           ],
           attemptCodeFixFn: async (_proposal, evidence) => { receivedEvidence = evidence; return { outcome: 'code-fix-skipped-worker-failed', reason: 'x' }; },
         }
@@ -367,7 +467,89 @@ describe('gateAndApprove', () => {
       assert.equal(receivedEvidence[0].error, 'boom A');
     });
 
-    it('enforces one code-fix attempt per gateAndApprove call (F5) — a second cmd-target proposal is skipped without calling attemptCodeFix again', async () => {
+    it('two cmd-target proposals with DIFFERENT targets each get their own attemptCodeFix call (F5 rework, 2026-08-23)', async () => {
+      await seedCmdTargetDraft();
+      await createTempSkill(dir, 'other-cmd-skill', '---\ncmd: "python other.py"\n---\nOther.');
+      await createTempDraft(dir, 'other-cmd-skill-fix', 'New prompt.', {
+        proposed_at: new Date().toISOString(), reason: 'other-cmd-skill failed twice.', source_turns: [],
+        status: 'pending', fingerprint: computeFingerprint('other-cmd-skill-fix', 'New prompt.'),
+        source_type: 'failure', target_skill: 'other-cmd-skill',
+      });
+
+      const calledFor: (string | undefined)[] = [];
+      const entries = await gateAndApprove(
+        [
+          { proposal: makeProposal({ name: 'coding-dirs-update-fix', target_skill: 'coding-dirs-update' }), sourceType: 'failure' },
+          { proposal: makeProposal({ name: 'other-cmd-skill-fix', target_skill: 'other-cmd-skill' }), sourceType: 'failure' },
+        ],
+        {
+          attemptCodeFixFn: async (proposal) => {
+            calledFor.push(proposal.target_skill);
+            return { outcome: 'code-fix-reverted', reason: `reverted ${proposal.target_skill}` };
+          },
+        }
+      );
+
+      assert.deepEqual(calledFor, ['coding-dirs-update', 'other-cmd-skill'], 'attemptCodeFix is called once per distinct target');
+      assert.equal(entries[0].outcome, 'code-fix-reverted');
+      assert.equal(entries[0].detail, 'reverted coding-dirs-update');
+      assert.equal(entries[1].outcome, 'code-fix-reverted');
+      assert.equal(entries[1].detail, 'reverted other-cmd-skill');
+    });
+
+    it('two proposals targeting the SAME skill: the second is skipped as target-already-attempted, not a second attemptCodeFix call (F5 rework, 2026-08-23)', async () => {
+      await seedCmdTargetDraft();
+      await createTempDraft(dir, 'coding-dirs-update-fix-2', 'Another prompt.', {
+        proposed_at: new Date().toISOString(), reason: 'coding-dirs-update failed again.', source_turns: [],
+        status: 'pending', fingerprint: computeFingerprint('coding-dirs-update-fix-2', 'Another prompt.'),
+        source_type: 'failure', target_skill: 'coding-dirs-update',
+      });
+
+      let callCount = 0;
+      const entries = await gateAndApprove(
+        [
+          { proposal: makeProposal({ name: 'coding-dirs-update-fix', target_skill: 'coding-dirs-update' }), sourceType: 'failure' },
+          { proposal: makeProposal({ name: 'coding-dirs-update-fix-2', target_skill: 'coding-dirs-update' }), sourceType: 'failure' },
+        ],
+        { attemptCodeFixFn: async () => { callCount++; return { outcome: 'code-fix-reverted', reason: 'reverted' }; } }
+      );
+
+      assert.equal(callCount, 1, 'a second proposal for an already-attempted target must not call attemptCodeFix again');
+      assert.equal(entries[0].outcome, 'code-fix-reverted');
+      assert.equal(entries[1].outcome, 'code-fix-skipped-target-already-attempted');
+    });
+
+    it('a per-run wall-clock budget stops further code-fix attempts once exceeded (F5 rework, 2026-08-23)', async () => {
+      await seedCmdTargetDraft();
+      await createTempSkill(dir, 'other-cmd-skill', '---\ncmd: "python other.py"\n---\nOther.');
+      await createTempDraft(dir, 'other-cmd-skill-fix', 'New prompt.', {
+        proposed_at: new Date().toISOString(), reason: 'other-cmd-skill failed twice.', source_turns: [],
+        status: 'pending', fingerprint: computeFingerprint('other-cmd-skill-fix', 'New prompt.'),
+        source_type: 'failure', target_skill: 'other-cmd-skill',
+      });
+
+      // nowFn advances 50 minutes each time an attemptCodeFix call actually runs (representing
+      // the real wall-clock time a fix consumes) — so the run's budget check sees the first
+      // attempt as within budget and the second as past it.
+      let clock = 0;
+      const entries = await gateAndApprove(
+        [
+          { proposal: makeProposal({ name: 'coding-dirs-update-fix', target_skill: 'coding-dirs-update' }), sourceType: 'failure' },
+          { proposal: makeProposal({ name: 'other-cmd-skill-fix', target_skill: 'other-cmd-skill' }), sourceType: 'failure' },
+        ],
+        {
+          nowFn: () => clock,
+          codeFixBudgetMs: 40 * 60_000,
+          attemptCodeFixFn: async () => { clock += 50 * 60_000; return { outcome: 'code-fix-reverted', reason: 'reverted' }; },
+        }
+      );
+
+      assert.equal(entries[0].outcome, 'code-fix-reverted', 'first attempt still runs — budget not yet spent');
+      assert.equal(entries[1].outcome, 'code-fix-skipped-budget-exhausted');
+      assert.match(entries[1].detail ?? '', /budget/);
+    });
+
+    it('a maxCodeFixes cap stops further code-fix attempts once reached (F5 rework, 2026-08-23)', async () => {
       await seedCmdTargetDraft();
       await createTempSkill(dir, 'other-cmd-skill', '---\ncmd: "python other.py"\n---\nOther.');
       await createTempDraft(dir, 'other-cmd-skill-fix', 'New prompt.', {
@@ -382,12 +564,163 @@ describe('gateAndApprove', () => {
           { proposal: makeProposal({ name: 'coding-dirs-update-fix', target_skill: 'coding-dirs-update' }), sourceType: 'failure' },
           { proposal: makeProposal({ name: 'other-cmd-skill-fix', target_skill: 'other-cmd-skill' }), sourceType: 'failure' },
         ],
-        { attemptCodeFixFn: async () => { callCount++; return { outcome: 'code-fix-reverted', reason: 'reverted' }; } }
+        {
+          maxCodeFixes: 1,
+          attemptCodeFixFn: async () => { callCount++; return { outcome: 'code-fix-reverted', reason: 'reverted' }; },
+        }
       );
 
-      assert.equal(callCount, 1, 'attemptCodeFix must be called at most once per nightly run');
+      assert.equal(callCount, 1, 'attemptCodeFix must be called at most maxCodeFixes times per run');
       assert.equal(entries[0].outcome, 'code-fix-reverted');
       assert.equal(entries[1].outcome, 'code-fix-skipped-limit-reached');
+      assert.match(entries[1].detail ?? '', /max 1 per run/);
+    });
+
+    it('threads sameRunAppliedFiles from an earlier applied fix into the next attemptCodeFix call (F5 rework, 2026-08-23)', async () => {
+      await seedCmdTargetDraft();
+      await createTempSkill(dir, 'other-cmd-skill', '---\ncmd: "python other.py"\n---\nOther.');
+      await createTempDraft(dir, 'other-cmd-skill-fix', 'New prompt.', {
+        proposed_at: new Date().toISOString(), reason: 'other-cmd-skill failed twice.', source_turns: [],
+        status: 'pending', fingerprint: computeFingerprint('other-cmd-skill-fix', 'New prompt.'),
+        source_type: 'failure', target_skill: 'other-cmd-skill',
+      });
+
+      const receivedOpts: Array<{ sameRunAppliedFiles?: string[] } | undefined> = [];
+      let callCount = 0;
+      await gateAndApprove(
+        [
+          { proposal: makeProposal({ name: 'coding-dirs-update-fix', target_skill: 'coding-dirs-update' }), sourceType: 'failure' },
+          { proposal: makeProposal({ name: 'other-cmd-skill-fix', target_skill: 'other-cmd-skill' }), sourceType: 'failure' },
+        ],
+        {
+          attemptCodeFixFn: async (_proposal, _evidence, opts) => {
+            receivedOpts.push(opts);
+            callCount++;
+            if (callCount === 1) {
+              return { outcome: 'applied-code-fix', reason: 'Applied and pushed (commit abc1234).', commitHash: 'abc1234', filesChanged: ['projects/x/a.py'] };
+            }
+            return { outcome: 'code-fix-reverted', reason: 'reverted' };
+          },
+        }
+      );
+
+      assert.deepEqual(receivedOpts[0]?.sameRunAppliedFiles, [], 'first call sees no earlier-applied files this run');
+      assert.deepEqual(receivedOpts[1]?.sameRunAppliedFiles, ['projects/x/a.py'], 'second call sees the files changed by the first applied fix');
+    });
+  });
+
+  describe('maintenance-job target routing (2026-08-23 alerts wave)', () => {
+    async function seedJobTargetDraft(): Promise<void> {
+      // No skill.md is ever created for 'restore-drill' — target_kind:'maintenance-job'
+      // proposals never route through loadSkill/isCmdBasedTarget, which both look a name up
+      // as a skill. The trigger draft itself still needs to exist (markDraftMeta reads it).
+      await createTempDraft(dir, 'restore-drill-alert-fix', 'inert (trigger record only)', {
+        proposed_at: new Date().toISOString(),
+        reason: 'restore-drill: 180 alerts in 7d — ENOENT: no such file',
+        source_turns: [],
+        status: 'pending',
+        fingerprint: computeFingerprint('restore-drill-alert-fix', 'inert'),
+        source_type: 'failure',
+        target_skill: 'restore-drill',
+      });
+    }
+
+    it('a target_kind:"maintenance-job" proposal reaches attemptCodeFixFn with the proposal intact and never reaches isCmdBasedTarget/loadSkill', async () => {
+      await seedJobTargetDraft();
+      let loadSkillWasCalledForJobName = false;
+      let receivedProposal: DraftProposal | undefined;
+
+      const entries = await gateAndApprove(
+        [{
+          proposal: makeProposal({
+            name: 'restore-drill-alert-fix', target_skill: 'restore-drill', target_kind: 'maintenance-job',
+            code_target: 'pa/src/lib/maintenance/jobs/restore-drill.ts',
+            reason: 'restore-drill: 180 alerts in 7d — ENOENT: no such file',
+          }),
+          sourceType: 'failure',
+          evidence: [{ skillName: 'restore-drill', error: 'ENOENT: no such file', timestamp: new Date().toISOString(), duration: 0, worker: 'census' }],
+        }],
+        {
+          // isCmdBasedTarget swallows a missing skill.md and returns false (validator.ts),
+          // so a regression that skipped the target_kind check would silently misroute this
+          // proposal to the prompt-fix branch instead of throwing — this probe on
+          // validateSkillFixFn (only reachable from that branch) is what catches it.
+          validateSkillFixFn: async () => { loadSkillWasCalledForJobName = true; return true; },
+          attemptCodeFixFn: async (proposal) => {
+            receivedProposal = proposal;
+            return { outcome: 'applied-code-fix', reason: 'Applied and pushed (commit job1234).', commitHash: 'job1234', filesChanged: ['pa/src/lib/maintenance/jobs/restore-drill.ts'] };
+          },
+        }
+      );
+
+      assert.equal(entries.length, 1);
+      assert.equal(entries[0].outcome, 'applied-code-fix');
+      assert.equal(loadSkillWasCalledForJobName, false, 'a maintenance-job target must never reach the prompt-fix validation path');
+      assert.equal(receivedProposal?.name, 'restore-drill-alert-fix');
+      assert.equal(receivedProposal?.target_kind, 'maintenance-job');
+      assert.equal(receivedProposal?.code_target, 'pa/src/lib/maintenance/jobs/restore-drill.ts');
+    });
+
+    it('the preset evidence travels with the proposal instead of calling readRecentFailuresFn', async () => {
+      await seedJobTargetDraft();
+      let readRecentFailuresCalled = false;
+      let receivedEvidence: any[] = [];
+      const presetEvidence = [{ skillName: 'restore-drill', error: 'ENOENT: no such file', timestamp: new Date().toISOString(), duration: 0, worker: 'census' }];
+
+      await gateAndApprove(
+        [{
+          proposal: makeProposal({ name: 'restore-drill-alert-fix', target_skill: 'restore-drill', target_kind: 'maintenance-job' }),
+          sourceType: 'failure',
+          evidence: presetEvidence,
+        }],
+        {
+          readRecentFailuresFn: async () => { readRecentFailuresCalled = true; return []; },
+          attemptCodeFixFn: async (_proposal, evidence) => { receivedEvidence = evidence; return { outcome: 'code-fix-reverted', reason: 'x' }; },
+        }
+      );
+
+      assert.equal(readRecentFailuresCalled, false, 'preset evidence must be used instead of calling readRecentFailuresFn');
+      assert.deepEqual(receivedEvidence, presetEvidence);
+    });
+
+    it('a maintenance-job proposal with NO preset evidence falls back to readRecentFailuresFn, filtered to the target (same as the cmd-based-skill route)', async () => {
+      await seedJobTargetDraft();
+      let receivedEvidence: any[] = [];
+
+      await gateAndApprove(
+        [{
+          proposal: makeProposal({ name: 'restore-drill-alert-fix', target_skill: 'restore-drill', target_kind: 'maintenance-job' }),
+          sourceType: 'failure',
+        }],
+        {
+          readRecentFailuresFn: async () => [
+            { skillName: 'restore-drill', error: 'ENOENT A', timestamp: new Date().toISOString(), duration: 1000, worker: 'codex' },
+            { skillName: 'unrelated-skill', error: 'boom B', timestamp: new Date().toISOString(), duration: 1000, worker: 'codex' },
+          ],
+          attemptCodeFixFn: async (_proposal, evidence) => { receivedEvidence = evidence; return { outcome: 'code-fix-skipped-worker-failed', reason: 'x' }; },
+        }
+      );
+
+      assert.equal(receivedEvidence.length, 1);
+      assert.equal(receivedEvidence[0].error, 'ENOENT A');
+    });
+
+    it('rejects the trigger draft (rejected_auto) exactly as the cmd-based-skill route does', async () => {
+      await seedJobTargetDraft();
+
+      await gateAndApprove(
+        [{
+          proposal: makeProposal({ name: 'restore-drill-alert-fix', target_skill: 'restore-drill', target_kind: 'maintenance-job' }),
+          sourceType: 'failure',
+          evidence: [],
+        }],
+        { attemptCodeFixFn: async () => ({ outcome: 'code-fix-reverted', reason: 'x' }) }
+      );
+
+      const meta: DraftMeta = JSON.parse(
+        await readFile(join(dir, 'skill-drafts', 'restore-drill-alert-fix', 'draft.meta.json'), 'utf8')
+      );
+      assert.equal(meta.status, 'rejected_auto', 'the prompt-fix draft itself is never deployed — code-fixer commits directly to the project');
     });
   });
 
@@ -395,7 +728,7 @@ describe('gateAndApprove', () => {
     it('appends an applied-fix record with the diff, backup_path, and baseline populated', async () => {
       await createTempSkill(dir, 'baseline-skill', 'Old prompt.');
       await createTempRunMeta(dir, 'baseline-skill', {
-        worker: 'gemini', status: 'error', exitCode: 1, duration: 1000, timestamp: new Date().toISOString(), error: 'boom',
+        worker: 'codex', status: 'error', exitCode: 1, duration: 1000, timestamp: new Date().toISOString(), error: 'boom',
       });
 
       const entries = await gateAndApprove(
@@ -637,12 +970,12 @@ describe('rollback', () => {
     // 3 errors, 1 success within the last 24h -> 75% failure rate, over the 50% threshold
     for (let i = 0; i < 3; i++) {
       await createTempRunMeta(dir, 'reminders', {
-        worker: 'gemini', status: 'error', exitCode: 1, duration: 1000,
+        worker: 'codex', status: 'error', exitCode: 1, duration: 1000,
         timestamp: new Date(Date.now() - i * 60000).toISOString(), error: 'boom',
       }, `err${i}`);
     }
     await createTempRunMeta(dir, 'reminders', {
-      worker: 'gemini', status: 'success', exitCode: 0, duration: 1000, timestamp: new Date().toISOString(),
+      worker: 'codex', status: 'success', exitCode: 0, duration: 1000, timestamp: new Date().toISOString(),
     }, 'ok');
 
     await createTempSkill(dir, 'reminders', 'Broken fixed version.');
@@ -682,6 +1015,66 @@ describe('rollback', () => {
     assert.deepEqual(lines, []);
     const records = await readAuditRecords(dir);
     assert.equal(records.length, 0);
+  });
+
+  it('acquires and releases the git-workflow lock with a per-call contextId and process.pid (C11)', async () => {
+    // Same fixture shape as 'appends a rolled-back audit record' above — this
+    // test only cares about the LOCK call shape (D3/D4), not the rollback
+    // outcome. No heartbeat/onLost migration here: C11 says rollback()'s hold
+    // is short by construction and has no timer to migrate onto
+    // startLockRenewal.
+    for (let i = 0; i < 3; i++) {
+      await createTempRunMeta(dir, 'reminders', {
+        worker: 'codex', status: 'error', exitCode: 1, duration: 1000,
+        timestamp: new Date(Date.now() - i * 60000).toISOString(), error: 'boom',
+      }, `err${i}`);
+    }
+    await createTempRunMeta(dir, 'reminders', {
+      worker: 'codex', status: 'success', exitCode: 0, duration: 1000, timestamp: new Date().toISOString(),
+    }, 'ok');
+    await createTempSkill(dir, 'reminders', 'Broken fixed version.');
+    await createTempDraft(dir, 'reminders-fix', 'Broken fixed version.', {
+      proposed_at: new Date().toISOString(),
+      reason: 'reminders kept failing.',
+      source_turns: [],
+      status: 'approved',
+      fingerprint: computeFingerprint('reminders-fix', 'x'),
+      source_type: 'failure',
+      target_skill: 'reminders',
+      approved_autonomously: true,
+      applied_in_place: true,
+      reviewed_at: new Date().toISOString(),
+      risk_flags: [],
+    });
+    await import('fs/promises').then(({ copyFile }) =>
+      copyFile(join(dir, 'skills', 'reminders', 'skill.md'), join(dir, 'skill-drafts', 'reminders-fix', 'target-backup.skill.md'))
+    );
+
+    const acquireCalls: Array<{ resource: string; agent: string; pid: number; timeoutMs?: number; contextId?: string }> = [];
+    const releaseCalls: Array<{ resource: string; agent: string; contextId?: string; opts?: { pid?: number } }> = [];
+    const bb: BlackboardLockClient = {
+      acquireLock: async (resource: string, agent: string, pid: number, timeoutMs?: number, contextId?: string) => {
+        acquireCalls.push({ resource, agent, pid, timeoutMs, contextId });
+        return true;
+      },
+      updateHeartbeat: async () => true,
+      releaseLock: async (resource: string, agent: string, contextId?: string, opts?: { pid?: number }) => {
+        releaseCalls.push({ resource, agent, contextId, opts });
+      },
+    };
+
+    await rollback({ blackboardFn: bb });
+
+    assert.equal(acquireCalls.length, 1);
+    assert.equal(acquireCalls[0].resource, exclusiveLockKey(GIT_WORKFLOW_RESOURCE));
+    assert.equal(typeof acquireCalls[0].contextId, 'string');
+    assert.ok(acquireCalls[0].contextId!.length > 0, 'expected a minted contextId');
+    assert.equal(acquireCalls[0].pid, process.pid);
+
+    assert.equal(releaseCalls.length, 1);
+    assert.equal(releaseCalls[0].resource, exclusiveLockKey(GIT_WORKFLOW_RESOURCE));
+    assert.equal(releaseCalls[0].contextId, acquireCalls[0].contextId, 'release must use the SAME contextId as acquire');
+    assert.deepEqual(releaseCalls[0].opts, { pid: process.pid });
   });
 });
 

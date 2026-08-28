@@ -86,10 +86,10 @@ const AGY: any = {
   },
 };
 
-/** gemini declares NO effort knob — the case that makes the store worker-scoped. */
-const GEMINI: any = {
-  name: 'gemini',
-  command: 'gemini',
+/** modelonly declares NO effort knob — the case that makes the store worker-scoped. */
+const MODEL_ONLY: any = {
+  name: 'modelonly',
+  command: 'modelonly',
   args: [],
   tunables: {
     model: { args: ['--model', '{value}'] },
@@ -127,7 +127,7 @@ const MAPPED: any = {
   },
 };
 
-const CONFIG = { workers: [AGY, GEMINI, CODEX, WITH_DEFAULT, MAPPED] };
+const CONFIG = { workers: [AGY, MODEL_ONLY, CODEX, WITH_DEFAULT, MAPPED] };
 
 function yesterdayIso(): string {
   return new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
@@ -365,8 +365,8 @@ describe('worker-scoped isolation', () => {
     setSessionTunable(state, 'agy', 'effort', 'high');
     setSessionTunable(state, 'agy', 'model', 'gemini-3.6-flash-high');
 
-    // /model gemini — gemini declares model only, and nothing was set for it.
-    assert.equal(buildDispatchExtraArgs(state, GEMINI), undefined);
+    // /model modelonly — modelonly declares model only, and nothing was set for it.
+    assert.equal(buildDispatchExtraArgs(state, MODEL_ONLY), undefined);
     // agy's settings are untouched and still apply when it comes back. Only the
     // model reaches the command line (CORRECTED 2026-07-22: this asserted both
     // flags, which agy's CLI rejects) — but BOTH values are still stored, so
@@ -388,8 +388,8 @@ describe('worker-scoped isolation', () => {
   });
 
   it('a value stored under a setting the worker does not declare is ignored', () => {
-    const state = makeState({ tunable_overrides: { gemini: { effort: 'high' } } });
-    assert.equal(buildDispatchExtraArgs(state, GEMINI), undefined);
+    const state = makeState({ tunable_overrides: { modelonly: { effort: 'high' } } });
+    assert.equal(buildDispatchExtraArgs(state, MODEL_ONLY), undefined);
   });
 });
 
@@ -444,13 +444,14 @@ const noObserved = async () => [] as string[];
 
 describe('handleTunableCommand', () => {
   it('rejects a setting the current worker does not declare, listing what it DOES support', async () => {
-    const state = makeState({ preferred_worker: 'gemini' });
+    const state = makeState({ preferred_worker: 'modelonly' });
     const reply = await handleTunableCommand(
       parseTunableCommand('/effort high')!, state, CONFIG, 'agy', noObserved);
 
     assert.match(reply, /no setting called 'effort'/);
     assert.match(reply, /supports: model/);
     assert.equal(state.tunable_overrides, undefined, 'nothing is stored for a rejected knob');
+    assert.equal(state.preferred_worker, 'modelonly', 'preferred_worker passes through unchanged');
   });
 
   it('rejects an unknown setting name outright', async () => {
@@ -579,10 +580,11 @@ describe('handleTunableCommand', () => {
   });
 
   it('bare command for an unsupported knob explains what the worker DOES support', async () => {
-    const state = makeState({ preferred_worker: 'gemini' });
+    const state = makeState({ preferred_worker: 'modelonly' });
     const reply = await handleTunableCommand(
       parseTunableCommand('/effort')!, state, CONFIG, 'agy', noObserved);
     assert.match(reply, /supports: model/);
+    assert.equal(state.preferred_worker, 'modelonly', 'preferred_worker passes through unchanged');
   });
 
   it('survives a failing observed-values read (help must never crash)', async () => {
@@ -669,8 +671,8 @@ describe('handleTunableCommand', () => {
 
 describe('tunable renderers', () => {
   it('renderTunableReport returns the validation error verbatim when unsupported', () => {
-    const validation = validateTunable(GEMINI, 'effort');
-    const out = renderTunableReport({ worker: 'gemini', label: 'effort', setting: 'effort', validation });
+    const validation = validateTunable(MODEL_ONLY, 'effort');
+    const out = renderTunableReport({ worker: 'modelonly', label: 'effort', setting: 'effort', validation });
     assert.equal(out, validation.error);
   });
 

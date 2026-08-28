@@ -148,6 +148,117 @@ describe('Blackboard lock re-entrance', () => {
       'legacy release must remove the entry'
     );
   });
+
+  it('no .tmp survives acquire/release', async () => {
+    const { blackboard } = await import('../src/blackboard.js');
+    const { readdir } = await import('fs/promises');
+    const resource = 'topic-no-tmp-leak';
+
+    await blackboard.acquireLock(resource, 'agent', process.pid, 5000);
+    await blackboard.releaseLock(resource, 'agent');
+
+    const files = await readdir(process.env.PA_HOME!);
+    assert.equal(
+      files.some((f) => f.endsWith('.tmp')),
+      false,
+      `expected no .tmp file to survive acquire/release, got: ${files.join(', ')}`
+    );
+  });
+});
+
+// D4: releaseLock(resource, agent, contextId?, opts?: { pid?: number }) — additive. acquireLock's
+// own re-entrance rule blocks a genuinely different PID from acquiring the SAME resource from
+// this one test process (see spawnDummyHolder precedent in run-exclusive-lock.test.ts), so these
+// two rows are seeded directly into blackboard.json rather than through the public API.
+describe('releaseLock pid scoping (D4, additive)', () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await createTempPaHome();
+  });
+
+  afterEach(async () => {
+    await cleanup(dir);
+  });
+
+  async function seedRows(rows: Array<{ resource: string; agent: string; pid: number; heartbeat?: string }>): Promise<void> {
+    const path = `${process.env.PA_HOME}/blackboard.json`;
+    let data: { active_locks: any[] };
+    try {
+      data = JSON.parse(await readFile(path, 'utf8'));
+    } catch {
+      data = { active_locks: [] };
+    }
+    const { writeFile } = await import('fs/promises');
+    data.active_locks.push(...rows.map((r) => ({ heartbeat: new Date().toISOString(), ...r })));
+    await writeFile(path, JSON.stringify(data, null, 2), 'utf8');
+  }
+
+  it('releaseLock with { pid } removes only the matching row', async () => {
+    const { blackboard } = await import('../src/blackboard.js');
+    const resource = 'topic-pid-scoped-release';
+    await seedRows([
+      { resource, agent: 'agent', pid: 111 },
+      { resource, agent: 'agent', pid: 222 },
+    ]);
+
+    await blackboard.releaseLock(resource, 'agent', undefined, { pid: 111 });
+
+    const data = JSON.parse(await readFile(`${process.env.PA_HOME}/blackboard.json`, 'utf8'));
+    const remaining = data.active_locks.filter((l: any) => l.resource === resource);
+    assert.equal(remaining.length, 1, 'expected exactly the non-matching-pid row to survive');
+    assert.equal(remaining[0].pid, 222);
+  });
+
+  it('releaseLock without { pid } is unchanged (legacy): removes every matching row regardless of pid', async () => {
+    const { blackboard } = await import('../src/blackboard.js');
+    const resource = 'topic-legacy-release-all-pids';
+    await seedRows([
+      { resource, agent: 'agent', pid: 111 },
+      { resource, agent: 'agent', pid: 222 },
+    ]);
+
+    await blackboard.releaseLock(resource, 'agent'); // no contextId, no opts — legacy behaviour
+
+    const data = JSON.parse(await readFile(`${process.env.PA_HOME}/blackboard.json`, 'utf8'));
+    assert.equal(
+      data.active_locks.filter((l: any) => l.resource === resource).length,
+      0,
+      'legacy release (no opts.pid) must remove every row for the resource+agent, regardless of pid'
+    );
+  });
+});
+
+describe('a torn blackboard.json (D7)', () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await createTempPaHome();
+  });
+
+  afterEach(async () => {
+    await cleanup(dir);
+  });
+
+  it('logs at error with a refId and resets to empty instead of throwing', async () => {
+    const { blackboard } = await import('../src/blackboard.js');
+    const { flushLog } = await import('../src/lib/log.js');
+    const { writeFile } = await import('fs/promises');
+    const path = `${process.env.PA_HOME}/blackboard.json`;
+
+    await writeFile(path, '{"active_locks":', 'utf8'); // truncated JSON
+
+    const locks = await blackboard.getActiveLocks();
+    assert.deepEqual(locks, [], 'a torn store must reset to empty, not throw');
+
+    await flushLog();
+    const raw = await readFile(`${process.env.PA_HOME}/app.log.jsonl`, 'utf8');
+    const lines = raw.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const entry = lines.find((l) => l.module === 'blackboard' && l.message === 'store unreadable — resetting to empty');
+    assert.ok(entry, `expected a blackboard error log line, got: ${JSON.stringify(lines)}`);
+    assert.equal(entry.level, 'error');
+    assert.match(entry.refId, /^s-[0-9a-f]{12}$/);
+  });
 });
 
 describe('startLockRenewal', () => {
@@ -364,5 +475,38 @@ describe('startLockRenewal', () => {
     assert.equal(maxConcurrent, 1, `ticks must never overlap, saw ${maxConcurrent} concurrent`);
 
     await blackboard.releaseLock(resource, 'holder');
+  });
+
+  it('renews through an injected client (C13), never touching the real singleton', async () => {
+    const { blackboard, startLockRenewal } = await import('../src/blackboard.js');
+    const resource = 'renew-test-injected-client';
+
+    let singletonCalls = 0;
+    const originalUpdateHeartbeat = blackboard.updateHeartbeat.bind(blackboard);
+    (blackboard as any).updateHeartbeat = async (...args: Parameters<typeof originalUpdateHeartbeat>) => {
+      singletonCalls++;
+      return originalUpdateHeartbeat(...args);
+    };
+
+    let clientCalls = 0;
+    const fakeClient = {
+      updateHeartbeat: async (_resource: string, _agent: string, _contextId?: string) => {
+        clientCalls++;
+        return true;
+      },
+    };
+
+    const renewal = startLockRenewal(resource, 'holder', undefined, {
+      intervalMs: 30, maxMs: 60_000, client: fakeClient,
+    });
+    try {
+      await new Promise((r) => setTimeout(r, 200));
+    } finally {
+      renewal.stop();
+      (blackboard as any).updateHeartbeat = originalUpdateHeartbeat;
+    }
+
+    assert.ok(clientCalls >= 1, `expected the injected client to receive at least one heartbeat tick, got ${clientCalls}`);
+    assert.equal(singletonCalls, 0, 'the real blackboard singleton must never be touched when a client is injected');
   });
 });

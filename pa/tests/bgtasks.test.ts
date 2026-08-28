@@ -75,7 +75,7 @@ describe('bgtasks: table output', () => {
 
   it('--json flag outputs JSON array', async () => {
     await writeBlackboard({
-      active_locks: [{ resource: 'skill-bar', agent: 'gemini', pid: 55555, heartbeat: new Date().toISOString() }],
+      active_locks: [{ resource: 'skill-bar', agent: 'codex', pid: 55555, heartbeat: new Date().toISOString() }],
     });
     await bgtasksCommand(['--json'], {
       getDescendantPids: async () => [{ pid: 99902, parentPid: 55555 }],

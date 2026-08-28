@@ -9,7 +9,8 @@ import { writeFile, unlink } from 'fs/promises';
 import { listSkills } from './skills.js';
 import { getLastSuccessfulRun, getFailureState } from './logger.js';
 import { paHome } from './paths.js';
-import type { Skill, RunMeta } from './types.js';
+import { repoRootFromModule } from './lib/git-root.js';
+import type { Skill, RunMeta, CostTierPeakWindowUtc } from './types.js';
 
 const execAsync = promisify(exec);
 
@@ -24,11 +25,23 @@ export interface OverdueSkill {
 // (non-time-pinned) skills marked cost_tier: off_peak defer during that window;
 // they catch up at the next evaluation inside the cheap window (19:30-11:30 IST).
 
-/** True while inside the z.ai peak billing window (Mon-Fri 06:00-10:00 UTC). */
-export function isPeakWindow(now: Date = new Date()): boolean {
+export const DEFAULT_PEAK_WINDOW_UTC: PeakWindowUtc = {
+  days: [1, 2, 3, 4, 5], // Mon-Fri
+  start_hour: 6,            // 06:00 UTC
+  end_hour: 10,              // 10:00 UTC
+};
+
+export interface PeakWindowUtc {
+  days: number[];
+  start_hour: number;
+  end_hour: number;
+}
+
+/** True while inside the z.ai peak billing window (Mon-Fri 06:00-10:00 UTC by default). */
+export function isPeakWindow(now: Date = new Date(), window: PeakWindowUtc = DEFAULT_PEAK_WINDOW_UTC): boolean {
   const d = now.getUTCDay();
   const h = now.getUTCHours();
-  return d >= 1 && d <= 5 && h >= 6 && h < 10;
+  return window.days.includes(d) && h >= window.start_hour && h < window.end_hour;
 }
 
 /** Log-once-per-day-per-skill deferral marker (catchup is a fresh process each
@@ -256,14 +269,15 @@ export function isTimePinnedCron(cron: string): boolean {
  * - From 00:00 UTC to 06:00 UTC (next day)
  *
  * @param now - Current date/time
+ * @param window - Peak window configuration (defaults to Mon-Fri 06:00-10:00 UTC)
  * @returns true if within off-peak window
  */
-function isOffPeakWindow(now: Date = new Date()): boolean {
+function isOffPeakWindow(now: Date = new Date(), window: PeakWindowUtc = DEFAULT_PEAK_WINDOW_UTC): boolean {
   // The billing truth: z.ai peak = Mon-Fri 06:00-10:00 UTC (11:30-15:30 IST).
   // Everything else — evenings, nights, weekends, AND 15:30-19:30 IST weekdays —
   // is off-peak. (The earlier 14:00/06:00 hour-only form misclassified
   // 15:30-19:30 IST as peak and ignored weekends.)
-  return !isPeakWindow(now);
+  return !isPeakWindow(now, window);
 }
 
 /**
@@ -285,7 +299,21 @@ export async function partitionOverdueByCostTier(
     deferred: [],
   };
 
-  const isInOffPeak = isOffPeakWindow(now);
+  // Load the configured peak window (if any) from config.yaml
+  let configuredWindow: CostTierPeakWindowUtc | undefined;
+  try {
+    const { loadConfig } = await import('./config.js');
+    const config = await loadConfig();
+    configuredWindow = config.cost_tier?.peak_window_utc;
+  } catch {
+    // Config missing or invalid — use default window
+  }
+
+  const window = configuredWindow
+    ? { days: configuredWindow.days ?? [1, 2, 3, 4, 5], start_hour: configuredWindow.start_hour ?? 6, end_hour: configuredWindow.end_hour ?? 10 }
+    : DEFAULT_PEAK_WINDOW_UTC;
+
+  const isInOffPeak = isOffPeakWindow(now, window);
 
   for (const entry of overdue) {
     const skill = entry.skill;
@@ -495,6 +523,18 @@ export async function syncSchedules(): Promise<void> {
   }
 }
 
+/** Pure, unit-tested (same pattern as resolveWindowsPaPath/resolvePosixPaPath).
+ *  The CurrentDirectory line is load-bearing: without it wscript inherits Task
+ *  Scheduler's cwd (C:\Windows\System32) and every cwd-relative path inside
+ *  `pa catchup` resolves there. The bot's launcher had this exact bug fixed in
+ *  303f439; the generator never got the fix (alerts-week-review §5.2). */
+export function buildLauncherVbs(paPathCmd: string, args: string, repoRoot: string): string {
+  const rootVbs = repoRoot.replace(/"/g, '""');
+  return `Set WshShell = CreateObject("WScript.Shell")\n` +
+    `WshShell.CurrentDirectory = "${rootVbs}"\n` +
+    `WshShell.Run "cmd /c ""${paPathCmd}"" ${args}", 0, True\n`;
+}
+
 async function syncSchedulesWindows(): Promise<boolean> {
   // Find pa executable path and sanitize for shell safety
   let whereStdout: string | null;
@@ -511,6 +551,7 @@ async function syncSchedulesWindows(): Promise<boolean> {
     return false;
   }
   const paPath = resolution.paPath;
+  const repoRoot = await repoRootFromModule(__filename);
 
   // Write VBScript launchers to ~/.pa/
   const createVbs = (name: string, args: string) => {
@@ -518,8 +559,7 @@ async function syncSchedulesWindows(): Promise<boolean> {
     const paPathCmd = paPath.replace(/"/g, '""');
     writeFileSync(
       vbsPath,
-      `Set WshShell = CreateObject("WScript.Shell")\n` +
-      `WshShell.Run "cmd /c ""${paPathCmd}"" ${args}", 0, True\n`,
+      buildLauncherVbs(paPathCmd, args, repoRoot),
       'utf8'
     );
     return vbsPath.replace(/'/g, "''");

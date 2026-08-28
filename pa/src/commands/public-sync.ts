@@ -1,6 +1,24 @@
 import path from 'path';
+import { randomUUID } from 'crypto';
 import { syncPublicMirror } from '../lib/public-sync.js';
 import { resolveRepoRoot } from '../lib/git-root.js';
+import { blackboard, startLockRenewal } from '../blackboard.js';
+import { exclusiveLockKey } from './run.js';
+
+const PUBLIC_SYNC_LOCK_AGENT = 'public-sync';
+
+// Default 300s (D5) — same rationale as GIT_LOCK_WAIT_MS in code-fixer.ts:
+// comfortably outlasts a typical sync without pretending to outwait a
+// concurrent /push. Overridable ONLY for tests (PA_PUBLIC_SYNC_LOCK_WAIT_MS) —
+// production always gets the 300_000ms default; no config knob for it.
+function publicSyncLockWaitMs(): number {
+  const raw = process.env.PA_PUBLIC_SYNC_LOCK_WAIT_MS;
+  if (raw) {
+    const n = parseInt(raw, 10);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return 300_000;
+}
 
 export async function publicSyncCommand(args: string[]): Promise<number> {
   let publicDir: string | undefined = process.env.PA_PUBLIC_DIR;
@@ -39,7 +57,34 @@ export async function publicSyncCommand(args: string[]): Promise<number> {
   // depends on repoRoot, which isn't known until after argument parsing.
   const resolvedPublicDir = publicDir || path.join(repoRoot, 'pa-public');
 
-  const result = await syncPublicMirror({ privateDir: repoRoot, publicDir: resolvedPublicDir, dryRun });
-  console.log(JSON.stringify(result, null, 2));
-  return result.code;
+  // D5 (2026-08-23): the public mirror gets its OWN blackboard resource
+  // (`git-public-workflow`), separate from `git-workflow` — serializes
+  // concurrent public-syncs against each other without adding public-sync to
+  // the private git-workflow lock family. Acquired here, in the CLI layer,
+  // NOT inside lib/public-sync.ts — syncPublicMirror stays lock-free so
+  // public-sync.test.ts can keep testing it directly. --dry-run is
+  // side-effect-free by construction and skips the lock entirely.
+  if (dryRun) {
+    const result = await syncPublicMirror({ privateDir: repoRoot, publicDir: resolvedPublicDir, dryRun });
+    console.log(JSON.stringify(result, null, 2));
+    return result.code;
+  }
+
+  const lockKey = exclusiveLockKey('git-public-workflow');
+  const contextId = randomUUID();
+  const lockAcquired = await blackboard.acquireLock(lockKey, PUBLIC_SYNC_LOCK_AGENT, process.pid, publicSyncLockWaitMs(), contextId);
+  if (!lockAcquired) {
+    console.log(JSON.stringify({ ok: false, code: 5, error: `another public-sync is holding ${lockKey}` }, null, 2));
+    return 5;
+  }
+
+  const renewal = startLockRenewal(lockKey, PUBLIC_SYNC_LOCK_AGENT, contextId);
+  try {
+    const result = await syncPublicMirror({ privateDir: repoRoot, publicDir: resolvedPublicDir, dryRun });
+    console.log(JSON.stringify(result, null, 2));
+    return result.code;
+  } finally {
+    renewal.stop();
+    await blackboard.releaseLock(lockKey, PUBLIC_SYNC_LOCK_AGENT, contextId, { pid: process.pid }).catch(() => {});
+  }
 }

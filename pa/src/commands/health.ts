@@ -311,13 +311,14 @@ async function checkRefIdLogging(): Promise<CheckResult> {
 
 // ---- Rendering ----
 
-function statusLabel(s: CheckStatus): string {
-  if (s === 'OK')   return '\x1b[32m[OK]  \x1b[0m';
-  if (s === 'WARN') return '\x1b[33m[WARN]\x1b[0m';
-  return                   '\x1b[31m[FAIL]\x1b[0m';
+function statusLabel(s: CheckStatus, useColor: boolean): string {
+  if (s === 'OK')   return useColor ? '\x1b[32m[OK]  \x1b[0m' : '[OK]  ';
+  if (s === 'WARN') return useColor ? '\x1b[33m[WARN]\x1b[0m' : '[WARN]';
+  return                   useColor ? '\x1b[31m[FAIL]\x1b[0m' : '[FAIL]';
 }
 
-export async function healthCommand(): Promise<void> {
+export async function healthCommand(args: string[] = []): Promise<void> {
+  const useColor = !args.includes('--no-color') && !process.env.NO_COLOR;
   const checks = await Promise.all([
     checkBotProcess(),
     checkBlackboard(),
@@ -336,17 +337,17 @@ export async function healthCommand(): Promise<void> {
   console.log('\nPA Health Check\n' + '─'.repeat(50));
   for (const check of checks) {
     const pad = ' '.repeat(nameWidth - check.name.length);
-    console.log(`  ${statusLabel(check.status)} ${check.name}${pad}  ${check.detail}`);
+    console.log(`  ${statusLabel(check.status, useColor)} ${check.name}${pad}  ${check.detail}`);
   }
   console.log('─'.repeat(50));
 
   const fails = checks.filter((c) => c.status === 'FAIL').length;
   const warns = checks.filter((c) => c.status === 'WARN').length;
   if (fails > 0) {
-    console.log(`\x1b[31m  ${fails} check(s) failed, ${warns} warning(s)\x1b[0m\n`);
+    console.log(useColor ? `\x1b[31m  ${fails} check(s) failed, ${warns} warning(s)\x1b[0m\n` : `  ${fails} check(s) failed, ${warns} warning(s)\n`);
   } else if (warns > 0) {
-    console.log(`\x1b[33m  ${warns} warning(s)\x1b[0m\n`);
+    console.log(useColor ? `\x1b[33m  ${warns} warning(s)\x1b[0m\n` : `  ${warns} warning(s)\n`);
   } else {
-    console.log(`\x1b[32m  All checks passed\x1b[0m\n`);
+    console.log(useColor ? `\x1b[32m  All checks passed\x1b[0m\n` : `  All checks passed\n`);
   }
 }

@@ -99,6 +99,7 @@ export async function loadSkill(name: string): Promise<Skill> {
     timeout: meta.timeout || DEFAULT_TIMEOUT,
     idle_timeout: meta.idle_timeout || DEFAULT_IDLE_TIMEOUT,
     trigger_description: meta.trigger_description,
+    description: meta.description,
     inject_triggers: !!meta.inject_triggers,
     worker: meta.worker,
     cmd: interpolate(meta.cmd),
