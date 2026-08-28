@@ -1,8 +1,18 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFile } from 'fs/promises';
+import { writeFile, readFile, readdir } from 'fs/promises';
 import { join } from 'path';
 import { createTempPaHome, cleanup } from './helpers.js';
+import { flushLog } from '../src/lib/log.js';
+
+async function readAppLogLines(paHomeDir: string): Promise<any[]> {
+  try {
+    const content = await readFile(join(paHomeDir, 'app.log.jsonl'), 'utf8');
+    return content.split('\n').filter((l) => l.trim().length > 0).map((l) => JSON.parse(l));
+  } catch {
+    return [];
+  }
+}
 
 describe('reservations', () => {
   let dir: string;
@@ -292,6 +302,110 @@ describe('reservations', () => {
       assert.equal(tmpTarget.match.test('maintenance-state.json'), false);
       assert.equal(tmpTarget.match.test('config.yaml'), false);
       assert.equal(tmpTarget.maxAgeMs, 3_600_000);
+    });
+  });
+
+  describe('reservation activity logging (D10)', () => {
+    it('claim() logs "claim granted" with a refId', async () => {
+      const { claim } = await import('../src/lib/reservations.js');
+      const result = await claim({ paths: ['pa/src/log-a.ts'], session: 's-log', note: 'log test' });
+      assert.equal(result.ok, true);
+      await flushLog();
+
+      const lines = await readAppLogLines(dir);
+      const entry = lines.find((l) => l.message === 'claim granted');
+      assert.ok(entry, 'expected a "claim granted" log line');
+      assert.equal(entry.level, 'info');
+      assert.equal(entry.module, 'reservations');
+      assert.match(entry.refId, /^s-[0-9a-f]{12}$/);
+      assert.equal(entry.id, result.reservation!.id);
+      assert.equal(entry.session, 's-log');
+      assert.equal(entry.forced, false);
+    });
+
+    it('claim() conflict logs "claim denied"', async () => {
+      const { claim } = await import('../src/lib/reservations.js');
+      const first = await claim({ paths: ['pa/src/log-b.ts'], session: 's-1', note: 'first' });
+      assert.equal(first.ok, true);
+      const second = await claim({ paths: ['pa/src/log-b.ts'], session: 's-2', note: 'second' });
+      assert.equal(second.ok, false);
+      await flushLog();
+
+      const lines = await readAppLogLines(dir);
+      const entry = lines.find((l) => l.message === 'claim denied');
+      assert.ok(entry, 'expected a "claim denied" log line');
+      assert.equal(entry.level, 'warn');
+      assert.equal(entry.session, 's-2');
+      assert.match(entry.refId, /^s-[0-9a-f]{12}$/);
+    });
+
+    it('release() logs "reservation released"', async () => {
+      const { claim, release } = await import('../src/lib/reservations.js');
+      const result = await claim({ paths: ['pa/src/log-c.ts'], session: 's-a', note: 'to release' });
+      assert.equal(result.ok, true);
+      const { released } = await release({ id: result.reservation!.id });
+      assert.equal(released, 1);
+      await flushLog();
+
+      const lines = await readAppLogLines(dir);
+      const entry = lines.find((l) => l.message === 'reservation released');
+      assert.ok(entry, 'expected a "reservation released" log line');
+      assert.equal(entry.level, 'info');
+      assert.equal(entry.releasedCount, 1);
+      assert.equal(entry.id, result.reservation!.id);
+    });
+
+    it('gcExpired() logs only when it removed something', async () => {
+      const { claim, gcExpired } = await import('../src/lib/reservations.js');
+      const now = Date.now();
+      await claim({ paths: ['pa/src/log-d.ts'], session: 's-a', note: 'stale', ttlMinutes: 1, now });
+      await flushLog();
+      let lines = await readAppLogLines(dir);
+      assert.equal(
+        lines.some((l) => l.message === 'reservations gc-expired'),
+        false,
+        'no gc-expired line should be logged before any expiry is actually removed'
+      );
+
+      const removed = await gcExpired(now + 2 * 60_000);
+      assert.equal(removed, 1);
+      await flushLog();
+      lines = await readAppLogLines(dir);
+      const entry = lines.find((l) => l.message === 'reservations gc-expired');
+      assert.ok(entry, 'expected a gc-expired log line once something was actually removed');
+      assert.equal(entry.removed, 1);
+      assert.match(entry.refId, /^s-[0-9a-f]{12}$/);
+
+      // A no-op GC pass (nothing left to expire) must not add a second line —
+      // otherwise a 5-minute job would flood the log even when nothing happens.
+      const removedAgain = await gcExpired(now + 3 * 60_000);
+      assert.equal(removedAgain, 0);
+      await flushLog();
+      lines = await readAppLogLines(dir);
+      assert.equal(lines.filter((l) => l.message === 'reservations gc-expired').length, 1);
+    });
+
+    it('mutate() leaves no .tmp on success', async () => {
+      const { claim } = await import('../src/lib/reservations.js');
+      await claim({ paths: ['pa/src/log-e.ts'], session: 's-a', note: 'tmp check' });
+
+      const files = await readdir(dir);
+      assert.equal(files.some((f) => f.endsWith('.tmp')), false, `expected no .tmp files, got ${JSON.stringify(files)}`);
+    });
+
+    it('a truncated reservations.json logs at error with a refId and resets to empty', async () => {
+      await writeFile(join(dir, 'reservations.json'), '{"reservations":', 'utf8');
+      const { readActive } = await import('../src/lib/reservations.js');
+      const active = await readActive();
+      assert.deepEqual(active, []);
+      await flushLog();
+
+      const lines = await readAppLogLines(dir);
+      const entry = lines.find((l) => l.message === 'store unreadable — resetting to empty');
+      assert.ok(entry, 'expected an error-level "store unreadable" log line');
+      assert.equal(entry.level, 'error');
+      assert.equal(entry.module, 'reservations');
+      assert.match(entry.refId, /^s-[0-9a-f]{12}$/);
     });
   });
 });

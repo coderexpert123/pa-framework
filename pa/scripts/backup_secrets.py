@@ -220,7 +220,24 @@ def main() -> int:
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     filename = f"pa-secrets-{ts}.pab"
 
-    service = _drive()
+    try:
+        service = _drive()
+    except RuntimeError as e:
+        # No existing handler around _drive() before this (2026-08-23,
+        # plans/2026-08-23-alerts-wave-SPEC.md WP-F correction 14) — an
+        # expired/revoked Google token crashed this weekly backup with a raw
+        # traceback instead of kicking a reauth link. WP-G's helper rate-limits
+        # itself to one Telegram send per 6h across all four Google-auth
+        # consumers, so a same-day failure storm still produces one link.
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from google_reauth_kick import kick_google_reauth
+            kick_google_reauth(resume_skill="secrets-backup", reason=str(e))
+        except Exception as kick_err:  # helper missing or failed — never mask the real error
+            print(f"[reauth-kick] could not start reauth: {kick_err}", file=sys.stderr)
+        print(f"Google auth failure — re-authenticate: "
+              f"python \"{Path.home() / '.pa' / 'reauth_google.py'}\"", file=sys.stderr)
+        sys.exit(1)
     root = _get_or_create_folder(service, DRIVE_ROOT_FOLDER)
     folder = _get_or_create_folder(service, DRIVE_SUB_FOLDER, root)
     pruned = _upload_and_rotate(service, folder, filename, blob)

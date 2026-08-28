@@ -416,3 +416,30 @@ export async function updateDashboard(token: string, fallbackChatId: number): Pr
     }
   }
 }
+
+/**
+ * Refresh the dashboard message if it was previously bootstrapped.
+ * Reads ~/.pa/telegram-dashboard.json and returns early when missing chat_id or message_id
+ * (the dashboard was never bootstrapped). Otherwise re-renders the content and updates the
+ * pinned message via editMessageText. Non-destructive: only reads, edits, and re-pins.
+ * Called by the dashboard-refresh maintenance job (every 30 minutes).
+ */
+export async function refreshDashboardIfBootstrapped(token: string): Promise<void> {
+  const state = await loadDashboardState();
+  if (!state.chat_id || !state.message_id) {
+    // Dashboard was never bootstrapped — skip silently
+    return;
+  }
+  const content = await getDashboardContent();
+  const success = await editMessageText(
+    token,
+    state.chat_id,
+    state.message_id,
+    appendRefIdAndLog(content, { kind: 'system', chatId: state.chat_id, threadId: state.thread_id })
+  );
+  if (!success) {
+    logger.warn('dashboard', `Failed to refresh dashboard message ${state.message_id} in chat ${state.chat_id}`);
+  } else {
+    logger.info('dashboard', `Refreshed dashboard message ${state.message_id} in chat ${state.chat_id}`);
+  }
+}

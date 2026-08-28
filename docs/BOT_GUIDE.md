@@ -165,7 +165,7 @@ The framework doesn't auto-create Telegram topics — you create them in your su
 | `pa-alerts` | Automated framework alerts: worker failures, rate-limit events, bg-process leaks, evaluator parse errors | `PA_ALERTS_CHAT_ID` + `PA_ALERTS_THREAD_ID` env vars |
 | `pa-support` | Manual debugging — pa CLI issues, scheduler problems, lock investigation, skill failures the user wants to discuss | `topic_defaults` map (route to claude/preferred worker) |
 | `daily-briefings` | Scheduled informational output — daily mail brief, weekly reports, calendar alerts | `TELEGRAM_DAILY_BRIEFING_THREAD_ID` env var |
-| `claude-support`, `zclaude-support`, `gemini-support`, `codex-support`, `agy-support` (one per worker) | Debugging a specific worker — prompt engineering, API issues, worker-specific weirdness | `topic_defaults` map (each routes to that worker by default) |
+| `claude-support`, `zclaude-support`, `codex-support`, `agy-support` (one per worker) | Debugging a specific worker — prompt engineering, API issues, worker-specific weirdness | `topic_defaults` map (each routes to that worker by default) |
 | `feature-changes` | Discussion about implementing changes to the framework / bot / skills | `topic_defaults` (route to claude or zclaude) |
 | `system-dashboard` | The pinned-message status card — bot creates + maintains this automatically | First message sent there triggers dashboard creation (`dashboard.ts`) |
 
@@ -214,7 +214,7 @@ In your Telegram supergroup (with topics enabled):
      "-100<group>_310": claude     # pa-support — use claude for framework debugging
      "-100<group>_298": claude     # claude-support — explicit claude
      "-100<group>_191": zclaude    # zclaude-support
-     "-100<group>_29": gemini      # daily-briefings — gemini for summaries
+     "-100<group>_29": agy         # daily-briefings — agy for summaries
      "-100<group>_2": zclaude      # feature-changes
    ```
 5. **Restart the bot**: `pa bot restart`.
@@ -242,7 +242,7 @@ The bot writes to this file when topics are renamed (via Telegram `forum_topic_e
 Every notable message in the system gets a 4-character ref ID with a single-letter prefix:
 
 - `c-XXXX` — Claude conversation message
-- `g-XXXX` — Gemini conversation message
+- `g-XXXX` — Gemini conversation message (legacy; the Gemini CLI worker was sunset 2026-08-08, AI-131)
 - `l-XXXX` — Log entry (structured log line in `~/.pa/app.log.jsonl`)
 - `z-XXXX` — zClaude message
 - `s-XXXX` — Skill output (alert body, briefing artifact, etc.)
@@ -366,7 +366,7 @@ To activate it:
 3. Edit `~/.pa/config.yaml`: add `--append-system-prompt-file` + absolute path to your claude/zclaude worker's `args`.
 4. Restart the bot.
 
-For gemini and codex workers, the bot's `context.ts` constructs an equivalent prompt at runtime (no static file needed).
+For agy and codex workers, the bot's `context.ts` constructs an equivalent prompt at runtime (no static file needed).
 
 ## Voice messages (speech to text)
 

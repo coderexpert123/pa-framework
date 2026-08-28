@@ -1,7 +1,7 @@
 import { randomBytes } from 'crypto';
 import { logger } from '../../../pa/dist/src/lib/log.js';
 
-export type RefKind = 'pin' | 'help' | 'branch' | 'lock_busy' | 'failover' | 'system' | 'recovered' | 'callback';
+export type RefKind = 'pin' | 'help' | 'branch' | 'lock_busy' | 'failover' | 'system' | 'recovered' | 'callback' | 'requeue-deferred';
 
 export function makeRefId(prefix: string = 's'): string {
   return `${prefix}-${randomBytes(6).toString('hex')}`;

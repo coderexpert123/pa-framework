@@ -14,11 +14,37 @@ import type {
   SkipReason,
 } from './types.js';
 
+// Typed off notifyUser's own third parameter (rather than a hand-copied opts shape)
+// so this can never drift from NotifyOpts again — plans/2026-08-24-buttons-program-SPEC.md
+// WP-P2 edit 2. Widened 2026-08-24 to carry `replyMarkup` for the "▶ Run now" button.
 type NotifyFn = (
   subject: string,
   body: string,
-  opts?: { dedupKey?: string; dedupWindowMs?: number; severity?: 'info' | 'warn' | 'error' },
+  opts?: Parameters<typeof notifyUser>[2],
 ) => Promise<{ sent: boolean; suppressed: boolean }>;
+
+// 64-byte callback_data budget: `sk:job:` is 7 bytes, leaving 57; capped at 40 to
+// match spec §3.2's `<job≤40>` field cap with room to spare. Kept in sync BY HAND
+// with pa/src/commands/catchup.ts's identical RUN_NOW_NAME_PATTERN — this is a
+// maintenance lib that catchup.ts already imports (`runDueJobs`), so importing the
+// other direction here would be circular. Maintenance jobs have no protected-set
+// concept (unlike skills), so no name is ever blocked beyond the shape check.
+const RUN_NOW_JOB_NAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,39}$/;
+
+/** Retry pacing after a FAILED maintenance run, indexed by consecutiveFailures-1
+ *  (last value repeats). Mirrors the skill-side AI-098 ladder
+ *  (scheduler.ts:142) with one extra rung, so a permanently broken job retries
+ *  DAILY instead of every tick: restore-drill failed 11,228 times and sent 180
+ *  alerts in 7 days because decideJob treats lastRunAt === null as "always due"
+ *  and the failure branch never recorded an attempt
+ *  (plans/2026-08-23-alerts-week-review.md §5.2). This ladder can only DELAY a
+ *  run — the everyMs/lastRunAt rule still applies after it clears. */
+export const MAINTENANCE_FAILURE_BACKOFF_MS = [0, 30 * 60_000, 2 * 3_600_000, 8 * 3_600_000, 24 * 3_600_000];
+
+export function failureBackoffMs(consecutiveFailures: number): number {
+  if (consecutiveFailures <= 0) return 0;
+  return MAINTENANCE_FAILURE_BACKOFF_MS[Math.min(consecutiveFailures - 1, MAINTENANCE_FAILURE_BACKOFF_MS.length - 1)];
+}
 
 /** PURE decision function — no I/O, unit-tested directly. */
 export function decideJob(args: {
@@ -30,13 +56,22 @@ export function decideJob(args: {
   shedWhenDegraded: boolean;
   inFlight: boolean;
   force: boolean;
+  lastAttemptAtMs?: number | null;
+  consecutiveFailures?: number;
 }): { action: 'run' } | { action: 'skip'; skipReason: SkipReason } {
-  const { everyMs, lastRunAtMs, nowMs, enabled, degraded, shedWhenDegraded, inFlight, force } = args;
+  const {
+    everyMs, lastRunAtMs, nowMs, enabled, degraded, shedWhenDegraded, inFlight, force,
+    lastAttemptAtMs = null, consecutiveFailures = 0,
+  } = args;
 
   if (inFlight) return { action: 'skip', skipReason: 'in-flight' };
   if (force) return { action: 'run' };
   if (!enabled) return { action: 'skip', skipReason: 'disabled' };
   if (degraded && shedWhenDegraded) return { action: 'skip', skipReason: 'degraded' };
+  if (consecutiveFailures > 0 && lastAttemptAtMs !== null
+      && nowMs - lastAttemptAtMs < failureBackoffMs(consecutiveFailures)) {
+    return { action: 'skip', skipReason: 'failure-backoff' };
+  }
   if (lastRunAtMs === null) return { action: 'run' };
   if (nowMs - lastRunAtMs >= everyMs) return { action: 'run' };
   return { action: 'skip', skipReason: 'not-due' };
@@ -74,8 +109,12 @@ export interface RunDueJobsOptions {
   notify?: NotifyFn;
 }
 
+// Floored at 15 min: for a 60s job (model-override-sweep) the old bare 3x was
+// 3 minutes, and the bot's degraded-mode detector flaps every 30-90s,
+// producing 85 "Maintenance job suppressed" pages in a week
+// (plans/2026-08-23-alerts-week-review.md §5.2).
 function skippedTooLongThreshold(everyMs: number): number {
-  return 3 * everyMs;
+  return Math.max(3 * everyMs, 15 * 60_000);
 }
 
 async function maybePageSkippedTooLong(
@@ -155,6 +194,7 @@ export async function runDueJobs(
 
     const state = ledger.jobs[job.name];
     const lastRunAtMs = state?.lastRunAt ? new Date(state.lastRunAt).getTime() : null;
+    const lastAttemptAtMs = state?.lastAttemptAt ? new Date(state.lastAttemptAt).getTime() : null;
 
     // The inFlight check and the IN_FLIGHT claim below must happen with no
     // `await` between them — otherwise a concurrent runDueJobs() call for the
@@ -170,6 +210,8 @@ export async function runDueJobs(
       shedWhenDegraded: job.shedWhenDegraded,
       inFlight,
       force: opts.force ?? false,
+      lastAttemptAtMs,
+      consecutiveFailures: state?.consecutiveFailures ?? 0,
     });
     if (decision.action === 'run') {
       IN_FLIGHT.add(job.name);
@@ -229,6 +271,7 @@ export async function runDueJobs(
       await updateJobState(job.name, (prev) => ({
         ...prev,
         lastRunAt: nowIso,
+        lastAttemptAt: nowIso,
         lastOutcome: 'ran' as JobOutcome,
         lastTouched: result.touched,
         consecutiveFailures: 0,
@@ -260,6 +303,7 @@ export async function runDueJobs(
       const errorMessage = err?.message ?? String(err);
       const persisted = await updateJobState(job.name, (prev) => ({
         ...prev,
+        lastAttemptAt: new Date(now).toISOString(),
         lastOutcome: 'failed' as JobOutcome,
         lastError: errorMessage,
         consecutiveFailures: prev.consecutiveFailures + 1,
@@ -275,6 +319,9 @@ export async function runDueJobs(
       await notify(`Maintenance job failed: ${job.name}`, errorMessage, {
         dedupKey: `maintenance-failed-${job.name}`,
         severity: 'error',
+        replyMarkup: RUN_NOW_JOB_NAME_PATTERN.test(job.name)
+          ? { inline_keyboard: [[{ text: '▶ Run now', callback_data: `sk:job:${job.name}` }]] }
+          : undefined,
       }).catch(() => {});
 
       records.push({

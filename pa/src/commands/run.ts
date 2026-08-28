@@ -1,3 +1,4 @@
+import { randomUUID, randomBytes } from 'crypto';
 import { loadSkill, listSkills } from '../skills.js';
 import { loadSecrets } from '../secrets.js';
 import { runWithFailover, executeWorker } from '../workers.js';
@@ -8,10 +9,8 @@ import { addWorkerPid, removeWorkerPid } from '../worker-pids.js';
 import { killProcessTree } from '../process-tree.js';
 import { log } from '../lib/log.js';
 import { notifyUser } from '../lib/notify.js';
-import { blackboard } from '../blackboard.js';
+import { blackboard, startLockRenewal } from '../blackboard.js';
 import type { RunMeta, CommandResult, TelegramOutput, RunOptions } from '../types.js';
-
-const LOCK_HEARTBEAT_MS = 60_000;
 
 /**
  * Lock key for a skill's `exclusive_resource`. Shared by acquire/heartbeat/release
@@ -35,10 +34,17 @@ export function lockWaitBudgetMs(skillTimeoutSec: number | undefined): number {
   return Math.max(2_000, Math.floor(skillTimeoutMs * 0.5));
 }
 
+/** Builds the per-run operator-arguments block appended to the skill prompt
+ *  (AI-148 D-c — the prompt-injection path `-- <extraArgs>` cannot provide,
+ *  since those flow to the worker CLI, not the prompt; run.ts:577-580). */
+export function buildOperatorArgsBlock(promptArgs: string): string {
+  return `\n\n## Operator arguments (this run)\n${promptArgs}\nTreat these as if the operator typed them alongside the skill trigger; they scope and constrain this run only.`;
+}
+
 /**
  * Returns true if the skill output should be suppressed (not sent to Telegram).
  * Checks whether the last non-empty line is exactly "NO_OUTPUT" — this handles workers
- * like Gemini that may emit reasoning/preamble text before the sentinel.
+ * like agy that may emit reasoning/preamble text before the sentinel.
  */
 export function isNoOutputSentinel(output: string): boolean {
   const trimmed = output.trim();
@@ -146,6 +152,28 @@ function recordDeliveryFailure(
 }
 
 /**
+ * Subject/severity/dedupKey for a skill-failure alert, discriminating on
+ * `worker === 'lock'` — the sentinel runCommand passes when the
+ * exclusive_resource wait timed out (run.ts:399, see runSkillBody). Lock
+ * contention is expected multi-session behaviour, not a page: it read to the
+ * operator as "Skill failed: commit" three times in one week
+ * (plans/2026-08-23-alerts-week-review.md §5.5). Extracted as a pure,
+ * directly-testable function (2026-08-23).
+ */
+export function lockSkipAlertFields(
+  worker: string,
+  skillName: string,
+): { subject: string; severity: 'info' | 'warn' | 'error'; dedupKey: string; topicDedupKey: string } {
+  const isLockSkip = worker === 'lock';
+  return {
+    subject: isLockSkip ? `Skill skipped (lock busy): ${skillName}` : `Skill failed: ${skillName}`,
+    severity: isLockSkip ? 'info' : 'error',
+    dedupKey: isLockSkip ? `skill-lock-busy-${skillName}` : `skill-failed-${skillName}`,
+    topicDedupKey: isLockSkip ? `skill-lock-busy-topic-${skillName}` : `skill-fail-topic-${skillName}`,
+  };
+}
+
+/**
  * Post-execution handler: deliver output, log result, print output, detect and run
  * trigger skills. Extracted to avoid duplicating this logic across the
  * preferred-worker and failover paths.
@@ -184,7 +212,7 @@ async function handleSkillResult(
   // Suppression check: the NO_OUTPUT sentinel (last non-empty line) means "I ran
   // and decided there is nothing to send" — a success that delivers nothing on
   // purpose. Checking the last line rather than the whole output handles workers
-  // like Gemini that prefix reasoning/preamble before the sentinel.
+  // like agy that prefix reasoning/preamble before the sentinel.
   //
   // Everything else that declares telegram_output exists to DELIVER. Until
   // 2026-07-21 this call DISCARDED sendToTelegram's return value, so a send
@@ -254,12 +282,18 @@ async function handleSkillResult(
     console.log(`[FAIL] ${skillName} failed via ${worker} (${(duration / 1000).toFixed(1)}s)`);
     if (result.error) console.log(`Error: ${result.error.slice(0, 500)}`);
 
+    // The pa-alerts page is already suppressed for a lock skip via
+    // alreadyAlertedPaSupport, but the telegram_output page below is not — see
+    // lockSkipAlertFields for why this distinction exists.
+    const { subject: failSubject, severity: failSeverity, dedupKey: paDedupKey, topicDedupKey } =
+      lockSkipAlertFields(worker, skillName);
+
     // Alert pa-alerts on skill failure (unless already alerted by runWithFailover exhaustion)
     if (!result.alreadyAlertedPaSupport) {
       notifyUser(
-        `Skill failed: ${skillName}`,
+        failSubject,
         `Skill: ${skillName}\nWorker: ${worker}\nDuration: ${(duration / 1000).toFixed(1)}s\nError: ${(result.error ?? '').slice(0, 500)}`,
-        { dedupKey: `skill-failed-${skillName}`, severity: 'error' },
+        { dedupKey: paDedupKey, severity: failSeverity },
       ).catch(() => {});
     }
 
@@ -274,12 +308,12 @@ async function handleSkillResult(
       const token = secrets[telegramOutput.token_secret];
       if (token) {
         notifyUser(
-          `Skill failed: ${skillName}`,
+          failSubject,
           `Worker: ${worker}\nError: ${(result.error ?? 'unknown error').slice(0, 300)}`,
           {
-            dedupKey: `skill-fail-topic-${skillName}`,
+            dedupKey: topicDedupKey,
             topic: { chat_id: telegramOutput.chat_id, thread_id: telegramOutput.thread_id },
-            severity: 'error',
+            severity: failSeverity,
           },
         ).catch(() => {});
       }
@@ -323,6 +357,7 @@ export async function runCommand(
   extraArgs: string[] = [],
   depth = 0,
   preferredWorker?: string,
+  promptArgs?: string,
 ): Promise<CommandResult> {
   if (!skillName) {
     throw new Error('Usage: pa run <skill-name>');
@@ -348,6 +383,14 @@ export async function runCommand(
         `If the briefing content matches any of these triggers, output EXACTLY \`[pa run <skill-name>]\` on its own line after the briefing.\n\n` +
         otherTriggers.join('\n');
     }
+  }
+
+  // AI-148 D-c: inject per-run operator arguments into the prompt
+  if (promptArgs !== undefined && promptArgs.trim() !== '') {
+    if (skill.frontmatter.cmd) {
+      throw new Error('--prompt-args applies to LLM-worker skills only; cmd skills take their arguments after --');
+    }
+    finalPrompt = finalPrompt + buildOperatorArgsBlock(promptArgs);
   }
 
   // Load all secrets. For cmd: shell skills, filter to only declared secrets (security hardening).
@@ -384,12 +427,19 @@ export async function runCommand(
   const exclusiveResource = skill.frontmatter.exclusive_resource;
   const lockKey = exclusiveResource ? exclusiveLockKey(exclusiveResource) : undefined;
   let lockHeld = false;
-  let lockHeartbeat: ReturnType<typeof setInterval> | undefined;
+  let lockContextId: string | undefined;
+  let lockRenewal: { stop: () => void } | undefined;
+  // Set by startLockRenewal's onLost (D2/D3/D4, 2026-08-23): a purged row mid-run means
+  // another process may be mutating the shared tree concurrently — the run's own result is
+  // downgraded to a failure once runSkillBody() resolves, rather than trusting a "success"
+  // that raced an unknown concurrent mutation.
+  let lockLost: 'expired' | 'purged' | undefined;
 
   if (lockKey && exclusiveResource) {
     const waitStart = Date.now();
     const lockWaitMs = lockWaitBudgetMs(skill.frontmatter.timeout);
-    lockHeld = await blackboard.acquireLock(lockKey, skillName, process.pid, lockWaitMs);
+    lockContextId = randomUUID();
+    lockHeld = await blackboard.acquireLock(lockKey, skillName, process.pid, lockWaitMs, lockContextId);
     if (!lockHeld) {
       const waitedS = Math.round((Date.now() - waitStart) / 1000);
       const lockResult: CommandResult = {
@@ -407,18 +457,38 @@ export async function runCommand(
     // is alive (see blackboard.ts), and push/push-public/investigate-flagged
     // can all legitimately run well past that. Without this, a second run
     // would steal the lock mid-work. Mirrors catchup.ts's own heartbeat.
-    lockHeartbeat = setInterval(() => {
-      void blackboard.updateHeartbeat(lockKey, skillName).catch(() => {});
-    }, LOCK_HEARTBEAT_MS);
-    lockHeartbeat.unref?.();
+    // startLockRenewal (2026-08-23) additionally detects a PURGED row via
+    // onLost — the old hand-rolled setInterval renewed blindly and never
+    // noticed a purge, so a concurrent commit could land undetected.
+    lockRenewal = startLockRenewal(lockKey, skillName, lockContextId, {
+      onLost: (reason) => {
+        lockLost = reason;
+        const refId = `s-${randomBytes(6).toString('hex')}`;
+        log('error', 'run', `Lock lost mid-run for skill ${skillName}`, { skill: skillName, lockKey, reason, refId });
+        void notifyUser(
+          'Skill failed (lock lost)',
+          `Skill: ${skillName}\nLock: ${lockKey}\nReason: ${reason}\n\n_Ref: ${refId}_`,
+          { dedupKey: `skill-lock-lost:${skillName}`, severity: 'error' },
+        ).catch(() => {});
+      },
+    });
   }
 
   try {
-    return await runSkillBody();
+    const result = await runSkillBody();
+    if (lockLost && lockKey) {
+      return {
+        ...result,
+        success: false,
+        alreadyAlertedPaSupport: true,
+        error: `Lock lost (${lockLost}) mid-run — ${lockKey} was purged while this run held it; another process may have committed concurrently. Treat this run's tree mutations as unverified.`,
+      };
+    }
+    return result;
   } finally {
-    if (lockHeartbeat) clearInterval(lockHeartbeat);
+    if (lockRenewal) lockRenewal.stop();
     if (lockHeld && lockKey) {
-      await blackboard.releaseLock(lockKey, skillName).catch(() => {});
+      await blackboard.releaseLock(lockKey, skillName, lockContextId, { pid: process.pid }).catch(() => {});
     }
   }
 

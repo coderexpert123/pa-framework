@@ -123,7 +123,9 @@ async function alertAccountExhausted(worker: string, result: RateLimitParseResul
 
 /**
  * Worker-aware rate-limit classifier. Dispatches to per-worker sub-classifiers
- * that live in rate-limits-{gemini,codex,claude}.ts.
+ * that live in rate-limits-{google,codex,claude}.ts (rate-limits-google.ts is the file
+ * rate-limits-gemini.ts; name kept for git-history continuity — it classifies the
+ * Google-API error family agy emits).
  *
  * Returns null when there is no evidence of a rate limit — the caller should
  * treat the failure as a regular (non-rate-limit) error and stop, not failover.
@@ -177,7 +179,7 @@ export async function classifyRateLimit(
     return result;
   }
 
-  if (worker === 'gemini' || worker === 'agy') {
+  if (worker === 'agy') {
     // Google API 429 / RESOURCE_EXHAUSTED in stderr. Returns null for non-rate-limit stderr.
     const { classifyGeminiError } = await import('./rate-limits-gemini.js');
     const result = classifyGeminiError(stderr) ?? null;

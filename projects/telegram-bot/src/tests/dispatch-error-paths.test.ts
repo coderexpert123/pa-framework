@@ -190,8 +190,8 @@ describe('dispatchMessage non-rate-limit failover cascade', () => {
     // The original session is dropped rather than kept, matching the pre-existing
     // behavior of a rate-limit-triggered cascade exhaustion (this code path is now
     // shared by both failure kinds).
-    // Uses zclaude+claude (not gemini/agy): those two resolve sessionId straight from
-    // CommandResult with no fallback, whereas gemini/agy fall back to scanning the
+    // Uses zclaude+claude (not agy): those two resolve sessionId straight from
+    // CommandResult with no fallback, whereas agy falls back to scanning the
     // real local session directory on disk even after a failure, which would leak an
     // unrelated real session id into this assertion.
     await writeConfig(testDir, [

@@ -38,6 +38,13 @@ export const ALLOWED_ROOTS: PolicyRoot[] = [
       'policy of its own; PA marks threads archived (never deletes rows) at ' +
       'GC_RETENTION_MS (30d) — audit 2026-08-02.',
   },
+  {
+    resolve: () => resolvePath(process.env.PA_TEST_TMP_DIR || (platform() === 'win32' ? 'C:/wt/tmp' : '/nonexistent-pa-test-tmp')),
+    evidence:
+      'Shared test scratch root for concurrent CLI sessions (PA_TEST_TMP_DIR override; C:/wt/tmp default on win32). ' +
+      'Deliberately OUTSIDE PA_HOME: test harnesses point TEMP here to spare the HDD checkout (2026-08-15); ' +
+      'its leak artifacts have no other retention owner (2026-08-28).',
+  },
 ];
 
 /**

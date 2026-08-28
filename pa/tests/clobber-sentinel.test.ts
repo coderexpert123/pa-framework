@@ -30,43 +30,93 @@ describe('clobber-sentinel job', () => {
   it('skips when @build reservation is held', async () => {
     const result = await runClobberSentinel({
       readActiveFn: async () => [{ paths: ['@build'] }],
+      getActiveLocksFn: async () => [],
       detectDriftFn: async () => { throw new Error('must not be called'); },
     });
     assert.equal(result.touched, 0);
     assert.deepEqual(result.detail, { skipped: 'lock-held' });
   });
 
-  it('skips when git-workflow exclusive_resource lock is held', async () => {
+  it('skips when a skill-exclusive:git-workflow blackboard lock is held', async () => {
     const result = await runClobberSentinel({
-      readActiveFn: async () => [{ paths: ['exclusive_resource:git-workflow'] }],
+      readActiveFn: async () => [],
+      getActiveLocksFn: async () => [{ resource: 'skill-exclusive:git-workflow' }],
       detectDriftFn: async () => { throw new Error('must not be called'); },
     });
     assert.equal(result.touched, 0);
     assert.deepEqual(result.detail, { skipped: 'lock-held' });
+  });
+
+  it('skips when a skill-exclusive:git-public-workflow blackboard lock is held', async () => {
+    const result = await runClobberSentinel({
+      readActiveFn: async () => [],
+      getActiveLocksFn: async () => [{ resource: 'skill-exclusive:git-public-workflow' }],
+      detectDriftFn: async () => { throw new Error('must not be called'); },
+    });
+    assert.equal(result.touched, 0);
+    assert.deepEqual(result.detail, { skipped: 'lock-held' });
+  });
+
+  it('REGRESSION (2026-08-23): the old fabricated reservations shape no longer causes a skip — clobber-sentinel checked the WRONG store (reservations.json) for a blackboard-only key from the day it shipped until this fix, so its documented "skip while a commit is in flight" never once fired', async () => {
+    let detectDriftCalled = false;
+    const result = await runClobberSentinel({
+      readActiveFn: async () => [{ paths: ['exclusive_resource:git-workflow'] }],
+      getActiveLocksFn: async () => [],
+      detectDriftFn: async () => { detectDriftCalled = true; return []; },
+    });
+    assert.equal(detectDriftCalled, true, 'detectDriftFn must be called — the fabricated reservations-shaped input must fall through, not skip');
+    assert.deepEqual(result.detail, { findings: 0 });
   });
 
   it('proceeds when no conflicting locks are held', async () => {
     const result = await runClobberSentinel({
       readActiveFn: async () => [],
+      getActiveLocksFn: async () => [],
       detectDriftFn: async () => [],
     });
     assert.equal(result.touched, 0);
     assert.deepEqual(result.detail, { findings: 0 });
   });
 
-  it('returns error detail when detectDrift fails', async () => {
+  it('rejects and pages when detectDrift fails — a tamper-detection control that reports green while broken is worse than one that pages', async () => {
+    const notifyCalls: Array<{ subject: string; body: string; opts?: Record<string, unknown> }> = [];
+    await assert.rejects(
+      () => runClobberSentinel({
+        readActiveFn: async () => [],
+        getActiveLocksFn: async () => [],
+        detectDriftFn: async () => { throw new Error('git status failed'); },
+        notifyFn: async (subject, body, opts) => {
+          notifyCalls.push({ subject, body, opts });
+          return { sent: true, suppressed: false };
+        },
+      }),
+      /git status failed/
+    );
+    assert.equal(notifyCalls.length, 1);
+    assert.equal(notifyCalls[0].opts?.dedupKey, 'clobber-sentinel-detect-failed');
+    assert.equal(notifyCalls[0].opts?.severity, 'error');
+  });
+
+  it('passes repoRootFn\'s resolved value into detectDriftFn', async () => {
+    let capturedRepoRoot: string | undefined;
     const result = await runClobberSentinel({
       readActiveFn: async () => [],
-      detectDriftFn: async () => { throw new Error('git status failed'); },
+      getActiveLocksFn: async () => [],
+      repoRootFn: async () => '/fake/repo/root',
+      detectDriftFn: async (repoRoot) => {
+        capturedRepoRoot = repoRoot;
+        return [];
+      },
     });
+    assert.equal(capturedRepoRoot, '/fake/repo/root');
     assert.equal(result.touched, 0);
-    assert.deepEqual(result.detail, { error: 'detect-failed' });
   });
 
   it('notifies per-file when drift findings exist', async () => {
     const notifyCalls: Array<{ subject: string; body: string; opts?: Record<string, unknown> }> = [];
     const result = await runClobberSentinel({
       readActiveFn: async () => [],
+      getActiveLocksFn: async () => [],
       detectDriftFn: async () => [finding('pa/src/foo.ts'), finding('pa/src/bar.ts')],
       notifyFn: async (subject, body, opts) => {
         notifyCalls.push({ subject, body, opts });
@@ -95,6 +145,7 @@ describe('clobber-sentinel job', () => {
     let callCount = 0;
     const result = await runClobberSentinel({
       readActiveFn: async () => [],
+      getActiveLocksFn: async () => [],
       detectDriftFn: async () => [finding('pa/src/a.ts'), finding('pa/src/b.ts'), finding('pa/src/c.ts')],
       notifyFn: async () => {
         callCount++;
@@ -111,6 +162,7 @@ describe('clobber-sentinel job', () => {
     let capturedKey: string | undefined;
     await runClobberSentinel({
       readActiveFn: async () => [],
+      getActiveLocksFn: async () => [],
       detectDriftFn: async () => [finding('projects/telegram-bot/src/main.ts')],
       notifyFn: async (_subject, _body, opts) => {
         capturedKey = opts?.dedupKey as string;
@@ -118,5 +170,22 @@ describe('clobber-sentinel job', () => {
       },
     });
     assert.equal(capturedKey, 'clobber-sentinel:projects/telegram-bot/src/main.ts');
+  });
+
+  it('refId in a clobber message is 12 hex chars', async () => {
+    const notifyCalls: Array<{ subject: string; body: string; opts?: Record<string, unknown> }> = [];
+    await runClobberSentinel({
+      readActiveFn: async () => [],
+      getActiveLocksFn: async () => [],
+      detectDriftFn: async () => [finding('pa/src/foo.ts')],
+      notifyFn: async (subject, body, opts) => {
+        notifyCalls.push({ subject, body, opts });
+        return { sent: true, suppressed: false };
+      },
+    });
+    assert.equal(notifyCalls.length, 1);
+    const match = notifyCalls[0].body.match(/_Ref: s-([0-9a-f]+)_/);
+    assert.ok(match, 'body should contain a _Ref: s-<hex>_ line');
+    assert.equal(match![1].length, 12, `ref-ID should be 12 hex chars, got "${match![1]}" (${match![1].length})`);
   });
 });
