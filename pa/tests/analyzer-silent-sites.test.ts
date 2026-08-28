@@ -1,8 +1,10 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFile, mkdir } from 'fs/promises';
+import { writeFile, mkdir, readFile } from 'fs/promises';
 import { join } from 'path';
 import { createTempPaHome, createTempConfig, cleanup } from './helpers.js';
+import { flushLog } from '../src/lib/log.js';
+import { loadAnalyzerState } from '../src/lib/skill-candidates.js';
 
 let tempDir: string;
 
@@ -37,6 +39,24 @@ describe('analyzer terminal failure alert', () => {
     // Should not throw — the failure is handled internally and alert is fired
     const proposals = await analyzeConversationPatterns(14);
     assert.ok(Array.isArray(proposals));
+
+    // R6: a parse failure (here, the whole LLM call failing) must leave the
+    // watermark unmoved — never silently lose the turns it never keyed.
+    const state = await loadAnalyzerState();
+    assert.equal(state.covers_through, null);
+
+    // The existing notifyUser('Analyzer terminal failure', …) must still fire
+    // on the Pass-1 failure branch. PA_NOTIFY_DISABLED=1 (test preload) means
+    // no real send happens, but notify.ts still logs its 'attempting' phase
+    // before checking that flag — that log line is the observable proof the
+    // call happened, since notify.ts is excluded from this wave (C25/§6.1).
+    await flushLog();
+    const appLog = await readFile(join(tempDir, 'app.log.jsonl'), 'utf8');
+    const lines = appLog.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const attempted = lines.some(
+      (l) => l.module === 'notify' && l.message === 'attempting' && l.subject === 'Analyzer terminal failure',
+    );
+    assert.ok(attempted, 'expected a notify "attempting" log line for the Analyzer terminal failure alert');
   });
 });
 

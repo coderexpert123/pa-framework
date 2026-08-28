@@ -4,7 +4,148 @@
 # `pa init` scaffolds a minimal default; this template shows ALL fields.
 
 workers:
-  # === zclaude (priority 1 — your highest-preferred worker) ===
+  # === claude (priority 1 — your highest-preferred worker) ===
+  - name: claude
+    command: claude
+    # Windows: command: C:/Users/<you>/AppData/Roaming/npm/claude.cmd
+    # POSIX:   command: claude   (if in PATH) or ~/.local/bin/claude
+    args:
+      - "-p"
+      - "--dangerously-skip-permissions"
+      - "--output-format"
+      - "stream-json"
+      - "--input-format"
+      - "stream-json"
+      - "--verbose"
+    input_mode: stdin-json
+    output_format: stream-json
+    check: claude --version
+    rate_limit_patterns:
+      - "rate limit"
+      - "token limit"
+      - "quota exceeded"
+      - "Usage limit"
+      - "over your limit"
+      - "hit your limit"
+    priority: 1
+    state_dir: "~/.claude/projects"
+    state_pattern: "*.jsonl"
+    # secret_allowlist: []  # Uncomment and list secrets this worker may access
+    tunables:
+      model:
+        args: ["--model", "{value}"]
+        description: "Model name passed to the CLI (e.g. opusplan, opus, sonnet)."
+      effort:
+        args: ["--effort", "{value}"]
+        values: [low, medium, high, xhigh, max]
+        description: "Effort level for the session (Claude Code 2.x --effort)."
+
+  # === codex (priority 2) ===
+  - name: codex
+    command: codex
+    # Windows (Node-based, path varies by npm setup):
+    # command: node C:/Users/<you>/AppData/Roaming/npm/node_modules/@openai/codex/bin/codex.js
+    # POSIX:   command: codex   (or: node ~/.npm-global/lib/node_modules/@openai/codex/bin/codex.js)
+    args:
+      - "exec"
+      - "--dangerously-bypass-approvals-and-sandbox"
+      - "--color"
+      - "never"
+      - "--json"
+      - "-"
+    input_mode: stdin-text
+    output_format: stream-json
+    check: codex --version
+    check_timeout: 15
+    rate_limit_patterns:
+      - "hit your usage limit"
+      - "rate limit"
+      - "quota exceeded"
+      - "429"
+    priority: 2
+    state_dir: "~/.codex"
+    state_pattern: "state_5.sqlite"   # SQLite; same caveat as agy — heartbeat, not transcript, drives stuck-detection
+    # secret_allowlist: []  # Uncomment and list secrets this worker may access
+    # codex has no --effort flag; reasoning effort is a -c config override —
+    # which is exactly why "args" is a template array and not flag+value.
+    tunables:
+      model:
+        args: ["--model", "{value}"]
+        description: "Model the agent should use."
+      effort:
+        args: ["-c", "model_reasoning_effort={value}"]
+        values: [minimal, low, medium, high]
+        description: "Reasoning effort, via codex's -c config override."
+
+  # === agy (priority 3 — Antigravity CLI) ===
+  # Antigravity CLI (agy) — setup-required; the dispatcher skips it if not installed.
+  # Plain-text worker: it has no --output-format flag, so pa never sees
+  # stream-json events from it. Consequence: pa cannot capture a native session
+  # id for agy (worker-exec only reads session ids off stream-json events), so
+  # conversation continuity must come from prompt-injected history, not from
+  # resuming a native session.
+  - name: agy
+    command: agy
+    # Tip: point command at a small wrapper script if your CLI needs env vars
+    # set (e.g. GCP project vars, token refresh) or arg-quoting fixes (see
+    # docs/WORKERS_GUIDE.md). worker-exec spawns this command verbatim — no
+    # name-based rewriting.
+    args:
+      - "--dangerously-skip-permissions"
+      # Required: agy's print mode self-kills at 5m0s by default, which is far
+      # below any real synthesis run. 65m sits just ABOVE pa's own
+      # DEFAULT_TIMEOUT (3600s) so pa's max-timeout is always the layer that
+      # fires — pa logs an attributable "exceeded max timeout" and feeds failure
+      # backoff, whereas an agy-side kill surfaces only as an opaque non-zero
+      # exit. If a skill sets `timeout:` above 3600, raise this too.
+      - "--print-timeout"
+      - "65m"
+      # {prompt} is NOT inlined on the command line: worker-exec.ts (arg mode)
+      # writes the prompt to a temp file and substitutes '@<path>', which agy
+      # resolves client-side. So prompt size is not capped by the shell.
+      - "-p"
+      - "{prompt}"
+    input_mode: arg           # prompt passed as a CLI arg, not over stdin
+    output_format: plain-text # agy has no --output-format flag; do not claim stream-json
+    check: agy --version
+    check_timeout: 10
+    rate_limit_patterns:
+      - "RESOURCE_EXHAUSTED"
+      - "429"
+    priority: 3
+    state_dir: "~/.gemini/antigravity-cli/conversations"
+    # Each conversation is a SQLite database in WAL mode, hence the sibling
+    # <id>.db-shm / <id>.db-wal files ('*.db' matches on suffix, so those are
+    # excluded). pa's state reader is line-oriented JSON and cannot parse
+    # SQLite — it reports "unknown" instead of guessing, so agy stuck-detection
+    # relies on the process-tree heartbeat rather than transcript inspection.
+    state_pattern: "*.db"
+    # secret_allowlist: []  # Uncomment and list secrets this worker may access
+    # THE `supersedes:` CASE, AND ITS RETIREMENT. On agy v1.1.5 (every line
+    # below is a real invocation from 2026-07-22) model and effort were NOT
+    # independent knobs, so the model tunable declared `supersedes: [effort]`:
+    #   --model gemini-3.6-flash                  -> ERROR: invalid model selection ... --effort ""
+    #   --model gemini-3.6-flash --effort high    -> OK
+    #   --model gemini-3.6-flash-high             -> OK   (the suffix IS the effort)
+    #   --model claude-sonnet-4-6 --effort high   -> ERROR: --effort is not supported
+    #   --effort high  (no model)                 -> OK
+    # agy v1.1.13 (live-verified 2026-08-15, AI-155) changed the last row: a
+    # bare --effort with no model is now ALSO rejected instantly, so the effort
+    # knob is gone entirely and `supersedes:` has nothing to suppress here.
+    # The mechanism itself is unchanged and still the right tool whenever two
+    # of a worker's knobs are mutually exclusive — see the general note on
+    # `supersedes:` near the top of this file.
+    tunables:
+      model:
+        args: ["--model", "{value}"]
+        # Declared here (unusually for a model knob) precisely because the
+        # effort suffix makes the vocabulary worth showing. Still a hint: an
+        # unlisted id passes through, so a model that ships tomorrow works.
+        values: ["gemini-3.7-flash-high", "gemini-3.7-flash-medium", "gemini-3.7-flash-low", "gemini-3.6-flash-high", "gemini-3.6-flash-medium", "gemini-3.6-flash-low", "gemini-3.5-flash-high", "gemini-3.5-flash-medium", "gemini-3.5-flash-low", "gemini-3.1-pro-high", "gemini-3.1-pro-low", "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium"]
+        description: "Model for this CLI session (run `agy models` for the current list — from PowerShell/cmd, not Git Bash, where it hangs). Effort is embedded in the gemini names; a base name with no -high/-medium/-low suffix is rejected. There is deliberately NO effort knob on v1.1.13+ (a bare --effort is rejected — AI-155)."
+
+  # === zclaude (priority 4 — example Claude-compatible wrapper CLI) ===
+  # zclaude — example Claude-compatible wrapper CLI; setup-required.
   - name: zclaude
     command: zclaude          # PATH-resolved binary, or absolute path
     # Windows: command: C:/Users/you/.local/bin/zclaude.bat
@@ -29,7 +170,7 @@ workers:
       - "over your limit"
       - "hit your limit"
       - "429"
-    priority: 1
+    priority: 4
     state_dir: "~/.claude/projects"   # for session-mode rate-limit detection
     state_pattern: "*.jsonl"
     # === secret_allowlist (optional, defense-in-depth) ===
@@ -84,145 +225,6 @@ workers:
         values: [low, medium, high, xhigh, max]
         description: "Effort level for the session (Claude Code 2.x --effort)."
 
-  # === codex (priority 4) ===
-  - name: codex
-    command: codex
-    # Windows (Node-based, path varies by npm setup):
-    # command: node C:/Users/<you>/AppData/Roaming/npm/node_modules/@openai/codex/bin/codex.js
-    # POSIX:   command: codex   (or: node ~/.npm-global/lib/node_modules/@openai/codex/bin/codex.js)
-    args:
-      - "exec"
-      - "--dangerously-bypass-approvals-and-sandbox"
-      - "--color"
-      - "never"
-      - "--json"
-      - "-"
-    input_mode: stdin-text
-    output_format: stream-json
-    check: codex --version
-    check_timeout: 15
-    rate_limit_patterns:
-      - "hit your usage limit"
-      - "rate limit"
-      - "quota exceeded"
-      - "429"
-    priority: 4
-    state_dir: "~/.codex"
-    state_pattern: "state_5.sqlite"   # SQLite; same caveat as agy — heartbeat, not transcript, drives stuck-detection
-    # secret_allowlist: []  # Uncomment and list secrets this worker may access
-    # codex has no --effort flag; reasoning effort is a -c config override —
-    # which is exactly why "args" is a template array and not flag+value.
-    tunables:
-      model:
-        args: ["--model", "{value}"]
-        description: "Model the agent should use."
-      effort:
-        args: ["-c", "model_reasoning_effort={value}"]
-        values: [minimal, low, medium, high]
-        description: "Reasoning effort, via codex's -c config override."
-
-  # === claude (priority 5 — last resort) ===
-  - name: claude
-    command: claude
-    # Windows: command: C:/Users/<you>/AppData/Roaming/npm/claude.cmd
-    # POSIX:   command: claude   (if in PATH) or ~/.local/bin/claude
-    args:
-      - "-p"
-      - "--dangerously-skip-permissions"
-      - "--output-format"
-      - "stream-json"
-      - "--input-format"
-      - "stream-json"
-      - "--verbose"
-    input_mode: stdin-json
-    output_format: stream-json
-    check: claude --version
-    rate_limit_patterns:
-      - "rate limit"
-      - "token limit"
-      - "quota exceeded"
-      - "Usage limit"
-      - "over your limit"
-      - "hit your limit"
-    priority: 5
-    state_dir: "~/.claude/projects"
-    state_pattern: "*.jsonl"
-    # secret_allowlist: []  # Uncomment and list secrets this worker may access
-    tunables:
-      model:
-        args: ["--model", "{value}"]
-        description: "Model name passed to the CLI (e.g. opusplan, opus, sonnet)."
-      effort:
-        args: ["--effort", "{value}"]
-        values: [low, medium, high, xhigh, max]
-        description: "Effort level for the session (Claude Code 2.x --effort)."
-
-  # === agy (priority 2 — Antigravity CLI) ===
-  # Plain-text worker: it has no --output-format flag, so pa never sees
-  # stream-json events from it. Consequence: pa cannot capture a native session
-  # id for agy (worker-exec only reads session ids off stream-json events), so
-  # conversation continuity must come from prompt-injected history, not from
-  # resuming a native session.
-  - name: agy
-    command: agy
-    # Tip: point command at a small wrapper script if your CLI needs env vars
-    # set (e.g. GCP project vars, token refresh) or arg-quoting fixes (see
-    # docs/WORKERS_GUIDE.md). worker-exec spawns this command verbatim — no
-    # name-based rewriting.
-    args:
-      - "--dangerously-skip-permissions"
-      # Required: agy's print mode self-kills at 5m0s by default, which is far
-      # below any real synthesis run. 65m sits just ABOVE pa's own
-      # DEFAULT_TIMEOUT (3600s) so pa's max-timeout is always the layer that
-      # fires — pa logs an attributable "exceeded max timeout" and feeds failure
-      # backoff, whereas an agy-side kill surfaces only as an opaque non-zero
-      # exit. If a skill sets `timeout:` above 3600, raise this too.
-      - "--print-timeout"
-      - "65m"
-      # {prompt} is NOT inlined on the command line: worker-exec.ts (arg mode)
-      # writes the prompt to a temp file and substitutes '@<path>', which agy
-      # resolves client-side. So prompt size is not capped by the shell.
-      - "-p"
-      - "{prompt}"
-    input_mode: arg           # prompt passed as a CLI arg, not over stdin
-    output_format: plain-text # agy has no --output-format flag; do not claim stream-json
-    check: agy --version
-    check_timeout: 10
-    rate_limit_patterns:
-      - "RESOURCE_EXHAUSTED"
-      - "429"
-    priority: 2
-    state_dir: "~/.gemini/antigravity-cli/conversations"
-    # Each conversation is a SQLite database in WAL mode, hence the sibling
-    # <id>.db-shm / <id>.db-wal files ('*.db' matches on suffix, so those are
-    # excluded). pa's state reader is line-oriented JSON and cannot parse
-    # SQLite — it reports "unknown" instead of guessing, so agy stuck-detection
-    # relies on the process-tree heartbeat rather than transcript inspection.
-    state_pattern: "*.db"
-    # secret_allowlist: []  # Uncomment and list secrets this worker may access
-    # THE `supersedes:` CASE, AND ITS RETIREMENT. On agy v1.1.5 (every line
-    # below is a real invocation from 2026-07-22) model and effort were NOT
-    # independent knobs, so the model tunable declared `supersedes: [effort]`:
-    #   --model gemini-3.6-flash                  -> ERROR: invalid model selection ... --effort ""
-    #   --model gemini-3.6-flash --effort high    -> OK
-    #   --model gemini-3.6-flash-high             -> OK   (the suffix IS the effort)
-    #   --model claude-sonnet-4-6 --effort high   -> ERROR: --effort is not supported
-    #   --effort high  (no model)                 -> OK
-    # agy v1.1.13 (live-verified 2026-08-15, AI-155) changed the last row: a
-    # bare --effort with no model is now ALSO rejected instantly, so the effort
-    # knob is gone entirely and `supersedes:` has nothing to suppress here.
-    # The mechanism itself is unchanged and still the right tool whenever two
-    # of a worker's knobs are mutually exclusive — see the general note on
-    # `supersedes:` near the top of this file.
-    tunables:
-      model:
-        args: ["--model", "{value}"]
-        # Declared here (unusually for a model knob) precisely because the
-        # effort suffix makes the vocabulary worth showing. Still a hint: an
-        # unlisted id passes through, so a model that ships tomorrow works.
-        values: ["gemini-3.7-flash-high", "gemini-3.7-flash-medium", "gemini-3.7-flash-low", "gemini-3.6-flash-high", "gemini-3.6-flash-medium", "gemini-3.6-flash-low", "gemini-3.5-flash-high", "gemini-3.5-flash-medium", "gemini-3.5-flash-low", "gemini-3.1-pro-high", "gemini-3.1-pro-low", "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium"]
-        description: "Model for this CLI session (run `agy models` for the current list — from PowerShell/cmd, not Git Bash, where it hangs). Effort is embedded in the gemini names; a base name with no -high/-medium/-low suffix is rejected. There is deliberately NO effort knob on v1.1.13+ (a bare --effort is rejected — AI-155)."
-
 # === evaluator (optional) ===
 # When a worker appears stuck (no output for idle_timeout seconds), the
 # orchestrator consults this LLM to decide: extend timeout, kill, or
@@ -235,12 +237,12 @@ evaluator:
 # Maps Telegram (chat_id, thread_id) pairs to a preferred worker.
 # Useful when you want different topics to default to different LLMs
 # (e.g., a "coding" topic always uses claude, a "research" topic always
-# uses gemini). The bot's /model command can override per-topic; this
+# uses agy). The bot's /model command can override per-topic; this
 # is the initial default.
 topic_defaults:
   # "1000000001_0": zclaude            # private chat with this user_id, topic 0 → zclaude
   # "-1001234567890_310": claude       # supergroup thread 310 → claude
-  # "-1001234567890_29": gemini
+  # "-1001234567890_29": agy
 
 # === bg_tasks (background-leak detection) ===
 bg_tasks:
@@ -257,12 +259,36 @@ bg_tasks:
 
 # === usage (optional) ===
 # Track token usage and set budget alerts. The `pa costs` command reports
-# usage rollups by worker, model, and skill. When budget_monthly_usd is set,
-# alerts fire at 50/80/100% of the monthly budget (once per threshold per month).
+# usage rollups by worker, model, and skill. The budget_monthly_usd field is
+# parsed but budget alerting is not implemented yet — reserved for future budget alerts.
 # Cost estimation requires a price table to be configured — without prices,
-# tokens are tracked but costs remain null, and budget alerts are inert.
+# tokens are tracked but costs remain null.
 # usage:
-#   budget_monthly_usd: 100   # optional monthly USD budget; alerts fire at 50/80/100%
+#   budget_monthly_usd: 100   # optional monthly USD budget; alerting not implemented yet
+
+# === model_pricing (optional) ===
+# Price overrides for `pa costs` dollar estimates (per-million-token USD).
+# Worker-level fallbacks (agy, zclaude) price records that carry no model field.
+# Input/output/cache_read are per million tokens. Thinking bills at output rate.
+# Cache_read defaults to 0 when omitted. Values are list prices verified 2026-08-27.
+# model_pricing:
+#   agy:                    { input: 0.75, output: 3.75, cache_read: 0.075 }  # = gemini-3.7-flash
+#   zclaude:                { input: 1.40, output: 4.40, cache_read: 0.26 }   # = glm-5.3
+#   claude-opus-4-6:        { input: 5,    output: 25,   cache_read: 0.50 }
+#   claude-sonnet-4-6:      { input: 3,    output: 15,   cache_read: 0.30 }
+#   claude-sonnet-5:        { input: 2,    output: 10,   cache_read: 0.20 }
+#   claude-haiku-4-5:       { input: 1,    output: 5,    cache_read: 0.10 }
+#   gemini-3.7-flash:       { input: 0.75, output: 3.75, cache_read: 0.075 }
+#   gemini-3.6-flash:       { input: 0.75, output: 3.75, cache_read: 0.075 }
+#   gemini-3.5-flash:       { input: 1.50, output: 9.00, cache_read: 0.15 }
+#   gemini-3.5-flash-lite:  { input: 0.30, output: 2.50, cache_read: 0.03 }
+#   gemini-2.5-flash:       { input: 0.30, output: 2.50, cache_read: 0.03 }
+#   gemini-2.5-flash-lite:  { input: 0.10, output: 0.40, cache_read: 0.01 }
+#   glm-5.3:                { input: 1.40, output: 4.40, cache_read: 0.26 }
+#   glm-5.2:                { input: 1.40, output: 4.40, cache_read: 0.26 }
+#   glm-5.1:                { input: 1.40, output: 4.40, cache_read: 0.26 }
+#   glm-5:                  { input: 1.00, output: 3.20, cache_read: 0.20 }
+#   glm-4.7:                { input: 0.60, output: 2.20, cache_read: 0.11 }
 
 # === quota-aware failover (optional) ===
 # Opt-in flag to enable health-score-based worker ordering. When ON:

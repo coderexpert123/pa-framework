@@ -440,10 +440,10 @@ describe('recordRateLimit + getWorkerCooldown', () => {
 
   it('recordRateLimit with duration=0 is a no-op (no state file entry)', async () => {
     await resetState();
-    await recordRateLimit('gemini', 0, 'transient', 'unknown');
-    const entry = await getWorkerCooldown('gemini');
+    await recordRateLimit('agy', 0, 'transient', 'unknown');
+    const entry = await getWorkerCooldown('agy');
     assert.equal(entry, null);
-    assert.equal(await isWorkerCoolingDown('gemini'), false);
+    assert.equal(await isWorkerCoolingDown('agy'), false);
   });
 
   it('getCooldownStatus returns all entries with classification', async () => {
@@ -534,18 +534,18 @@ describe('readClaudeSessionErrors', () => {
 // ---------------------------------------------------------------------------
 
 describe('classifyRateLimit dispatcher', () => {
-  it('dispatches to gemini classifier', async () => {
+  it('dispatches to agy classifier', async () => {
     const stderr = '"code": 429, "reason": "MODEL_CAPACITY_EXHAUSTED"';
-    const result = await classifyRateLimit('gemini', '', stderr);
+    const result = await classifyRateLimit('agy', '', stderr);
     assert.ok(result);
     assert.equal(result!.classification, 'server-overload');
     assert.equal(result!.source, 'gemini-stderr');
   });
 
-  it('gemini: returns null when stderr has no 429 / RESOURCE_EXHAUSTED marker', async () => {
+  it('agy: returns null when stderr has no 429 / RESOURCE_EXHAUSTED marker', async () => {
     // No 429 in stderr → classifier returns null → not a rate limit
-    const result = await classifyRateLimit('gemini', '', 'plain network timeout');
-    assert.equal(result, null, 'gemini with no 429 marker must return null');
+    const result = await classifyRateLimit('agy', '', 'plain network timeout');
+    assert.equal(result, null, 'agy with no 429 marker must return null');
   });
 
   it('dispatches to claude/zclaude with session file lookup', async () => {
@@ -773,9 +773,9 @@ describe('Zhipu terminal account-balance fault', () => {
   });
 
   it('a genuine transient 429 still gets the existing short cooldown', async () => {
-    // gemini per-minute quota — a real, self-healing rate limit.
+    // agy per-minute quota — a real, self-healing rate limit.
     const result = await classifyRateLimit(
-      'gemini',
+      'agy',
       '',
       'status: 429 "quotaMetric": "generativelanguage.googleapis.com/generate_content_requests_PerMinutePerProject"',
     );
@@ -825,7 +825,7 @@ describe('Zhipu terminal account-balance fault', () => {
 
     // 429 framing present, but on a DIFFERENT line from the balance phrase.
     const distant = [
-      'API Error: Request rejected (429) — gemini hit a per-minute quota earlier today.',
+      'API Error: Request rejected (429) — agy hit a per-minute quota earlier today.',
       'Separately, a teammate asked what "Insufficient balance or no resource package" means.',
     ].join('\n');
     assert.equal(classifyZhipuAccountExhausted(distant), null, 'cross-line coincidence must not classify');

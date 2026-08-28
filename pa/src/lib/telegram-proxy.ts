@@ -29,6 +29,24 @@ import { loadSecrets } from '../secrets.js';
 import { paHome } from '../paths.js';
 import { log } from './log.js';
 
+// D13 amendment (2026-08-23, WP-D): the module's own `fetch` reference at
+// import time — captured BEFORE any test can install a mock — so the
+// PA_NOTIFY_DISABLED kill switch can tell "the real global fetch" apart from
+// "a test double a test installed on globalThis.fetch". See realFetch().
+const REAL_FETCH_AT_IMPORT: typeof fetch = globalThis.fetch;
+
+/**
+ * The real (non-test-double) fetch reference. Prefers
+ * globalThis.__PA_REAL_FETCH__ — set by the test preloads
+ * (tests/test-env-setup.ts in both packages) as their very first statement,
+ * before any test file's top-level code can install a mock — falling back to
+ * this module's own import-time snapshot for non-preloaded contexts (e.g. a
+ * direct `node --test` run with no preload, or production).
+ */
+function realFetch(): typeof fetch {
+  return (globalThis as unknown as { __PA_REAL_FETCH__?: typeof fetch }).__PA_REAL_FETCH__ ?? REAL_FETCH_AT_IMPORT;
+}
+
 const TELEGRAM_HOST = 'api.telegram.org';
 const PROBE_TIMEOUT_MS = 8_000;
 const COOLDOWN_MS = 60_000;
@@ -473,9 +491,42 @@ let refreshToken: string | null = null; // set by startProxyAutoRefresh; enables
  * and caller aborts/timeouts surface to the caller (preserving effectively-once).
  * Drop-in for global fetch() at Telegram call sites.
  */
+// PA_NOTIFY_DISABLED must be a real kill switch, not a proxy-bypass: until
+// 2026-08-23 this branch called real `fetch`, so the ~21 `telegramFetch` call
+// sites in the two `telegram.ts` modules could send for real whenever PA_HOME
+// leaked to the real `~/.pa` (two production incidents, 2026-08-17/18).
+let suppressedCount = 0;
+
+/** Test hook: number of telegramFetch calls suppressed by PA_NOTIFY_DISABLED. */
+export function telegramFetchSuppressedCount(): number {
+  return suppressedCount;
+}
+
+/** Test hook: reset the suppressed-call counter. */
+export function resetTelegramFetchSuppressedCount(): void {
+  suppressedCount = 0;
+}
+
 export async function telegramFetch(input: string, init?: RequestInit): Promise<Response> {
-  // Test mode: never hit the network through real proxies.
-  if (process.env.PA_NOTIFY_DISABLED === '1') return fetch(input, init);
+  // Test mode: the kill switch blocks the REAL fetch; a mocked fetch is by
+  // definition not the network, so it is not suppressed — a test that
+  // installed a fetch double on globalThis.fetch needs to observe the call
+  // (2026-08-23 D13 amendment: the original unconditional synthetic-response
+  // form broke every existing test that mocks globalThis.fetch and asserts
+  // on the call, e.g. pa/tests/telegram.test.ts's sendToTelegram suite).
+  if (process.env.PA_NOTIFY_DISABLED === '1') {
+    const current = globalThis.fetch;
+    if (current !== realFetch()) {
+      return current(input, init);
+    }
+    // fetch IS the real one — never let it reach the network. A synthetic
+    // 200 keeps every caller's success path exercised without any real fetch.
+    suppressedCount++;
+    return new Response(JSON.stringify({ ok: true, result: {} }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  }
 
   // 1. DIRECT route (preferred) — tried whenever healthy, or when it's time to
   //    re-probe after a prior failure.

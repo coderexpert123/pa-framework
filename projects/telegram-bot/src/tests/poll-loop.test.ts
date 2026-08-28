@@ -3,13 +3,13 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, readFile, writeFile, stat, utimes } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { runPollLoop, extractReplyContext, generateDescriptionSuggestion, isValidDescriptionOutput, parseDescriptionLLMOutput, postDescriptionSuggestion } from '../main.js';
+import { runPollLoop, extractReplyContext, generateDescriptionSuggestion, isValidDescriptionOutput, parseDescriptionLLMOutput, postDescriptionSuggestion, requeueSyntheticUpdate } from '../main.js';
 import { loadBranches, type BranchIndex } from '../topic-names.js';
 import { _setDegradedForTest } from '../health.js';
 import type { ConversationState } from '../types.js';
 import { rmRetry } from './rm-retry.js';
 import { listPendingDispatches, pendingDispatchKey, _resetPendingDispatchesForTest } from '../pending-dispatches.js';
-import { markTopicRecovering, _resetRecoveryGateForTest } from '../recovery-gate.js';
+import { markTopicRecovering, clearTopicRecovering, _resetRecoveryGateForTest } from '../recovery-gate.js';
 import { _clearQueueForTest } from '../topic-queue.js';
 import { blackboard } from '../../../../pa/dist/src/blackboard.js';
 
@@ -2732,11 +2732,64 @@ describe('runPollLoop: recovery gate', { concurrency: 1 }, () => {
     return sentTexts;
   }
 
-  it('a plain worker message to a topic marked recovering gets the deferral response and never reaches a full pending-dispatch record', async () => {
+  it('a plain worker message to a topic marked recovering WAITS for the clear, then dispatches (queue-not-bounce)', async () => {
+    process.env.PA_RECOVERY_WAIT_MS = '5000';
     markTopicRecovering('123_0');
-    const sent = await runOneUpdate('hello there');
-    assert.ok(sent.some(t => t.includes('Still recovering')), `expected a deferral notice, got: ${JSON.stringify(sent)}`);
-    assert.deepEqual(await listPendingDispatches(), [], 'the enqueue-time placeholder must be cleaned up, and no full record ever written');
+    const clearTimer = setTimeout(() => clearTopicRecovering('123_0'), 50);
+    try {
+      const sent = await runOneUpdate('hello there');
+      assert.ok(!sent.some(t => t.includes('Still recovering')), `the deferral notice is gone (2026-08-27 seamless-restart-recovery); got: ${JSON.stringify(sent)}`);
+      assert.ok(sent.length > 0, 'the worker reply must be sent after the clear');
+      assert.deepEqual(await listPendingDispatches(), [], 'the dispatch lifecycle must complete normally');
+    } finally {
+      clearTimeout(clearTimer);
+      delete process.env.PA_RECOVERY_WAIT_MS;
+    }
+  });
+
+  it('a stale recovery gate (never cleared) times out and dispatches anyway', async () => {
+    process.env.PA_RECOVERY_WAIT_MS = '50';
+    markTopicRecovering('123_0');
+    try {
+      const sent = await runOneUpdate('hello there');
+      assert.ok(!sent.some(t => t.includes('Still recovering')), `no deferral text; got: ${JSON.stringify(sent)}`);
+      assert.ok(sent.length > 0, 'the dispatch must proceed past the stale gate');
+    } finally {
+      delete process.env.PA_RECOVERY_WAIT_MS;
+    }
+  });
+
+  it('requeueSyntheticUpdate injects a shape-complete synthetic that dispatches through the normal path exactly once', async () => {
+    requeueSyntheticUpdate({ updateId: 7, chatId: 123, threadId: 0, messageId: 321, userText: 'do the thing', startedAt: new Date().toISOString(), requeueCount: 1 });
+    const controller = new AbortController();
+    const state = makeState(123, -1);
+    const sentTexts: string[] = [];
+    let getUpdatesCallCount = 0;
+    (globalThis as Record<string, unknown>).fetch = async (url: string, opts?: { body?: string }) => {
+      if ((url as string).includes('getUpdates')) {
+        getUpdatesCallCount++;
+        if (getUpdatesCallCount === 1) {
+          // EMPTY real batch — only the injected synthetic may be processed.
+          return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: [] }), json: async () => ({ ok: true, result: [] }) };
+        }
+        controller.abort();
+        return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: [] }), json: async () => ({ ok: true, result: [] }) };
+      }
+      if ((url as string).includes('sendMessage') && opts?.body) {
+        sentTexts.push(JSON.parse(opts.body).text ?? '');
+      }
+      return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: { message_id: 999 } }), json: async () => ({ ok: true, result: { message_id: 999 } }) };
+    };
+    await runPollLoop('token', [123], state, {}, controller.signal, fastSleep);
+    assert.ok(sentTexts.length > 0, 'the requeued request must dispatch and reply');
+    // V1 guard: the user turn was archived at first receipt — the synthetic must
+    // not duplicate it in the rolling window.
+    const saved = JSON.parse(await readFile(join(process.env.PA_HOME!, 'telegram-bot-state-123_0.json'), 'utf8')) as { turns: Array<{ role: string; message_id?: number }> };
+    assert.equal(saved.turns.filter((t) => t.role === 'user' && t.message_id === 321).length, 1, 'exactly one user turn for the original message');
+    assert.deepEqual(await listPendingDispatches(), [], 'the requeued record must complete its lifecycle');
+    // Buttons-program invariant (R1/R4): a synthetic update_id must never reach
+    // the offset — with an empty real batch it stays at the seeded value.
+    assert.equal(state.last_update_id, -1, 'synthetic update_id never advances last_update_id');
   });
 
   it('a skip-worker command to a topic marked recovering still executes its own logic, not the deferral', async () => {
@@ -2957,7 +3010,7 @@ describe('generateDescriptionSuggestion', () => {
 
 describe('isValidDescriptionOutput', () => {
   it('accepts a normal description', () => {
-    assert.equal(isValidDescriptionOutput('Debugging the Gemini worker, Gemini-specific issues, and failover routing considerations.'), true);
+    assert.equal(isValidDescriptionOutput('Debugging the codex worker, codex-specific issues, and failover routing considerations.'), true);
   });
 
   it('accepts a short description', () => {

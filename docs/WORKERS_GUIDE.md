@@ -21,7 +21,7 @@ A "worker" is an external CLI process that the framework spawns to handle an LLM
 |---|---|---|---|---|
 | `zclaude` | `stdin-json` | `stream-json` | Session-mode | Claude wrapper with extra features |
 | `claude` | `stdin-json` | `stream-json` | Session-mode | Anthropic's Claude Code CLI |
-| `gemini` | `stdin-text` | `stream-json` | Text-pattern (RESOURCE_EXHAUSTED, 429) | Google Gemini CLI |
+| `agy` | `arg` | `plain-text` | Google-API stderr classifier (RESOURCE_EXHAUSTED, 429) | Antigravity CLI — setup-required |
 | `codex` | `stdin-text` | `stream-json` | Text-pattern (`hit your usage limit`) | OpenAI Codex CLI |
 
 ## Wrapper scripts
@@ -32,23 +32,23 @@ A worker's `command:` field is spawned verbatim — `worker-exec.ts` does no nam
 - **Token refresh** — some CLIs need a credential refreshed before each invocation.
 - **Arg-quoting fixes** — a CLI that mishandles how `worker-exec.ts` passes arguments through `shell:true`.
 
-Minimal example, `gemini-wrapper.cmd` (Windows):
+Minimal example, `mycli-wrapper.cmd` (Windows):
 
 ```bat
 @echo off
-set GOOGLE_CLOUD_PROJECT=your-project-id
-gemini %*
+set YOUR_VAR=your-value
+mycli %*
 ```
 
-Minimal example, `gemini-wrapper.sh` (POSIX):
+Minimal example, `mycli-wrapper.sh` (POSIX):
 
 ```sh
 #!/bin/sh
-export GOOGLE_CLOUD_PROJECT=your-project-id
-exec gemini "$@"
+export YOUR_VAR=your-value
+exec mycli "$@"
 ```
 
-Point the worker's `command:` at the wrapper's absolute path in `config.yaml`, e.g. `command: C:/Users/you/gemini-wrapper.cmd` or `command: ~/.local/bin/gemini-wrapper.sh`. Since `worker-exec.ts` spawns `command:` verbatim, this works for any worker without any framework changes.
+Point the worker's `command:` at the wrapper's absolute path in `config.yaml`, e.g. `command: C:/Users/you/mycli-wrapper.cmd` or `command: ~/.local/bin/mycli-wrapper.sh`. Since `worker-exec.ts` spawns `command:` verbatim, this works for any worker without any framework changes.
 
 ## Adding a new worker — walkthrough (Ollama example)
 
@@ -193,12 +193,10 @@ Each worker maintains its own session-state directory:
 | Worker | Location | Format |
 |---|---|---|
 | claude, zclaude | `~/.claude/projects/<cwd-slug>/<session>.jsonl` | NDJSON |
-| gemini | `~/.gemini/tmp/<project-slug>/chats/session-*.json` | Single JSON |
+| agy | `~/.gemini/antigravity-cli/conversations` | SQLite (*.db, WAL) |
 | codex | `~/.codex/state_5.sqlite` | SQLite (use `sqlite3` to inspect) |
 
 The `<cwd-slug>` for Claude is the cwd with `:`, `\`, `/`, spaces replaced with `-`. E.g., `D:\My Project` → `D--My-Project`.
-
-The `<project-slug>` for Gemini is the cwd lowercased with spaces → hyphens. E.g., `D:/My Project` → `my-project`.
 
 ### Step 3: Manual worker spawn
 
@@ -255,7 +253,12 @@ The pa CLI can run as a local MCP server, exposing read-only tools to LLM client
 | `pa_claims` | List active path reservations + recently modified files (multi-session coordination) |
 | `pa_maintenance_status` | Show maintenance ledger (last run, outcome, consecutive failures/skips) |
 | `pa_costs` | Usage/cost rollup by worker, model, and skill |
-| `pa_slo_report` | SLO error budget report for bot-reply-delivery, daily-mail-brief, catchup-heartbeat, ekadashi-alerts |
+| `pa_slo_report` | SLO error budget report for bot-reply-delivery, daily-mail-brief, catchup-heartbeat (add your own services via `~/.pa/slo.yaml`) |
+| `pa_recall` | Full-text search over archived conversation turns, worker run traces, per-topic brains, the Ecosystem KB, pending review-digest conflicts, and decision rows (2026-08-24/27). `q` required; `thread`/`source`/`limit` optional (`limit` clamped to 50). |
+
+### Searching past context
+
+`pa recall "<query>" [--thread <id>] [--source conversation|trace|brain|kb|review|decisions] [--role user|assistant] [--since <YYYY-MM-DD>] [--until <YYYY-MM-DD>] [--limit <n>] [--json] [--reindex] [--rebuild]` searches everything a worker or the bot might otherwise re-ask about: past turns from any topic, past worker runs and their tool calls/commands/files/errors, topic brains, the Ecosystem KB, and past judgment calls (decision rows, 2026-08-27). Precedent check before proposing: `pa recall "<intent>" --source decisions --json` returns past decisions with rationale and user reaction. `--reindex`/`--rebuild` alone (no query) run the incremental or full index pass and print a summary. Backed by `pa/src/lib/recall-store.ts` (FTS5 via `better-sqlite3`, in-process — no spawn); kept fresh every 10 minutes by the `recall-index` maintenance job (`docs/maintenance-jobs.md`). Full design: `docs/ARCHITECTURE.md` § "Recall (`pa recall`, 2026-08-24)".
 
 ### Starting the server
 
@@ -284,7 +287,7 @@ claude mcp add pa-mcp --stdio pa mcp serve
   "mcpServers": {
     "pa-mcp": {
       "command": "node",
-      "args": ["D:/Personal Assistant/pa/mcp/server.mjs"]
+      "args": ["<repo-root>/pa/mcp/server.mjs"]
     }
   }
 }
@@ -297,7 +300,7 @@ mcp:
     pa-mcp:
       command: node
       args:
-        - D:/Personal Assistant/pa/mcp/server.mjs
+        - <repo-root>/pa/mcp/server.mjs
 ```
 
 The manifest file at `~/.pa/mcp.json` contains the full tool definitions for reference.

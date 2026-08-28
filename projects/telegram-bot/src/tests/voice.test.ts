@@ -39,6 +39,7 @@ const {
   voiceErrorMessage,
   transcribeVoiceMessage,
   VOICE_TYPING_INTERVAL_MS,
+  isBarePlaceholderUserText,
 } = await import('../voice.js');
 type TelegramVoice = import('../voice.js').TelegramVoice;
 type TelegramAudioLike = import('../voice.js').TelegramAudioLike;
@@ -455,6 +456,32 @@ describe('formatFailedTranscriptUserText', () => {
   it('appends a sanitized caption when given', () => {
     const text = formatFailedTranscriptUserText('audio', 'no-engine', { caption: 'hi "there"' });
     assert.ok(text.includes('caption: "hi \'there\'"'));
+  });
+});
+
+describe('isBarePlaceholderUserText', () => {
+  it('matches the three bare placeholder labels, with or without a raw trailing caption', () => {
+    assert.ok(isBarePlaceholderUserText('[Voice message]'));
+    assert.ok(isBarePlaceholderUserText('[Audio file]'));
+    assert.ok(isBarePlaceholderUserText('[Video note]'));
+    assert.ok(isBarePlaceholderUserText('[Voice message] call mom'));
+  });
+
+  it('rejects failure markers, folded-caption transcripts, attachment hints, and plain text', () => {
+    assert.ok(!isBarePlaceholderUserText(formatFailedTranscriptUserText('voice', 'timeout')));
+    assert.ok(!isBarePlaceholderUserText('[Voice message, caption: "call mom"] hello there'));
+    assert.ok(!isBarePlaceholderUserText('[An audio file was attached as a document and was not transcribed. Re-send it as a voice note or audio message to have it transcribed.]'));
+    assert.ok(!isBarePlaceholderUserText('plain text'));
+    assert.ok(!isBarePlaceholderUserText(''));
+  });
+
+  it('documents + drift-guards the marker pairing: bare-label SUCCESS transcripts match, so callers must check userTextSettled', () => {
+    assert.ok(isBarePlaceholderUserText(formatTranscriptUserText('hello there')), 'bare-label success transcript matches (the collision that motivates the marker)');
+    const kinds: AudioAttachmentKind[] = ['voice', 'audio', 'video_note'];
+    for (const kind of kinds) {
+      assert.ok(isBarePlaceholderUserText(formatTranscriptUserText('x', { kind })), `${kind} bare-label stays in sync with KIND_LABEL`);
+      assert.ok(!isBarePlaceholderUserText(formatFailedTranscriptUserText(kind, 'timeout')), `${kind} failure marker does not match`);
+    }
   });
 });
 

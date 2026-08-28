@@ -23,6 +23,7 @@ The framework ships scripts that depend on Google OAuth at `~/.pa/google_auth.py
    - User Type: **External**
    - Publishing status: **Testing** is fine for personal use (no review needed).
    - Add yourself as a Test User in the consent screen settings.
+   - **Note (inferred, not verified in the GCP console):** a Testing-status consent screen appears to issue refresh tokens that Google invalidates after about 7 days of inactivity. This pattern held across every re-auth gap observed between 2026-06-29 and 2026-08-22. For unattended automation, publish the consent screen to **Production**, or expect to re-authorize roughly weekly via the Telegram/mobile flow below.
 4. **APIs & Services → Credentials → Create Credentials → OAuth Client ID**:
    - Application type: **Desktop app**
    - Name: anything (e.g., `pa-framework-personal`)
@@ -114,8 +115,11 @@ Copy-Item examples/oauth/telegram_oauth_resume_hook.example.py $HOME/.pa/oauth_r
    - the deployed redirect URI
    - destination chat/thread
    - an opaque `resume_action` JSON object
-2. The script generates the Google consent URL and stores pending auth state in
-   `~/.pa/google-telegram-auth.json`.
+2. The script generates the Google consent URL, stores pending auth state in
+   `~/.pa/google-telegram-auth.json` (valid for 12 hours), and sends the link
+   to that chat/thread as a plain-text Telegram message. It never uses
+   Markdown parsing, since a consent URL's underscores and parentheses would
+   otherwise be mangled.
 3. After the user authorizes, Google redirects to the static bridge page.
 4. The bridge page renders a full Telegram command:
 

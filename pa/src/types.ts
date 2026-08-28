@@ -200,12 +200,23 @@ export interface PaConfig {
   maintenance?: Record<string, MaintenanceConfig>;
   transcription?: TranscriptionConfig;
   usage?: UsageConfig;
+  cost_tier?: CostTierConfig;  // optional cost-tier window configuration
   quota_aware_failover?: boolean;  // opt-in flag for health-score-based worker ordering (default false)
   worker_pin?: string;  // persisted override for 'pa worker pin <name>'
 }
 
 export interface UsageConfig {
-  budget_monthly_usd?: number;  // optional monthly budget in USD; when set, triggers alerts at 50/80/100% usage
+  budget_monthly_usd?: number;  // optional monthly budget in USD; parsed but alerting is not implemented yet — reserved for future budget alerts
+}
+
+export interface CostTierPeakWindowUtc {
+  days?: number[];      // 0-6 (0=Sunday) — days of week treated as peak; default [1,2,3,4,5]
+  start_hour?: number;  // 0-23 UTC — start of peak window; default 6
+  end_hour?: number;    // 0-23 UTC — end of peak window; default 10 (must be > start_hour for v1)
+}
+
+export interface CostTierConfig {
+  peak_window_utc?: CostTierPeakWindowUtc;  // optional peak window override; default Mon-Fri 06:00-10:00 UTC
 }
 
 export interface WorkerHealthState {
@@ -284,6 +295,7 @@ export interface SkillFrontmatter {
   timeout?: number;       // max total seconds (default DEFAULT_TIMEOUT)
   idle_timeout?: number;  // max seconds of silence before kill (default DEFAULT_IDLE_TIMEOUT)
   trigger_description?: string;  // LLM-readable description of when to fire this skill from a brief
+  description?: string;         // Human-readable one-liner shown in /skills and pa surfaces
   inject_triggers?: boolean;     // if true, inject all other skills' trigger_descriptions into this skill's prompt
   worker?: string;               // preferred worker for this skill (e.g. "claude", "agy", "zclaude")
   no_fallback?: boolean;         // when true, don't failover to other workers on failure
@@ -328,6 +340,12 @@ export interface DraftProposal {
   prompt: string;
   target_skill?: string; // set by failure-analyzer.ts/feedback-analyzer.ts for fix/reinforce proposals — the existing skill this proposal targets. Proposal-authoring metadata, NOT part of SkillFrontmatter (never written into a deployed skill.md).
   code_target?: string;  // set by failure-analyzer.ts (2026-07-11) when its evidence names a specific source file likely causing the failure — a relative repo path (e.g. "projects/daily-mail-brief/scripts/run_brief.py"), validated in analyzer.ts's parseProposalResponse. A hint for code-fixer.ts's attemptCodeFix(), not authoritative on its own — the coding worker still explores the project itself.
+  // 2026-08-23 (alert-census wave, plans/2026-08-23-alerts-wave-SPEC.md): what `target_skill`
+  // names. Default/undefined = 'skill' (a ~/.pa/skills entry). 'maintenance-job' = a declared
+  // maintenance job (pa/src/lib/maintenance/registry.ts) whose name is in `target_skill` and
+  // whose source file is in `code_target` — routed straight to code-fixer.ts (no skill.md exists
+  // to prompt-fix), verified by the pa build+suite, rolled back on the job's ledger failures.
+  target_kind?: 'skill' | 'maintenance-job';
 }
 
 export interface RunMeta {
@@ -345,7 +363,7 @@ export interface CommandResult {
   output: string;
   error?: string;
   exitCode: number | null;
-  sessionId?: string; // CLI session ID (Claude: from NDJSON stream; Gemini: undefined, discovered from disk)
+  sessionId?: string; // CLI session ID (Claude: from NDJSON stream; agy: undefined, discovered from disk)
   evaluatorSummary?: string; // user-facing summary from LLM evaluator (set on both kill and done verdicts)
   alreadyAlertedPaSupport?: boolean; // true when runWithFailover already emitted exhaustion/wall alert
   rateLimitTelemetry?: {
@@ -356,4 +374,9 @@ export interface CommandResult {
   /** Path to the tee file capturing this dispatch's stdout (for crash
    * recovery). Undefined when no tee was set up. */
   teePath?: string;
+  /** Per-execution uuid minted by executeWorker. Joins this run to its line in
+   * ~/.pa/turn-traces.jsonl and to the archive row the bot writes for the turn
+   * (2026-08-24, plans/2026-08-24-recall-traces-wave-SPEC.md). Present on every
+   * executeWorker return, including failures. */
+  runId?: string;
 }

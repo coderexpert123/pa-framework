@@ -2,6 +2,8 @@
 
 Several Claude Code sessions, plus the Telegram bot's worker dispatches, run against this ONE working tree concurrently — this tree is the live installation (`pa` runs from `pa/dist` built here, the bot from its own `dist` here, skills and Task Scheduler entries point here). Sessions share a tree, not worktrees, because a worktree is invisible to the running system until merged back. (Added 2026-08-05 after a concurrent-edit collision on `pa/src/code-fixer.ts` — full incident and design: `plans/2026-08-05-concurrent-session-safety.md`.)
 
+Enforcement audit and the findings behind the 2026-08-23 changes: `plans/2026-08-23-coordination-audit.md`. This file is THE surface for this protocol — if a coordination rule lives only in a global config file or an agent definition, it belongs here too.
+
 ## Rule 1: Look Before You Leap
 
 **Before starting work that will touch more than one file or run longer than ~10 minutes, run `pa claims`.**
@@ -25,6 +27,7 @@ pa claim pa/src/code-fixer.ts pa/tests/code-fixer.test.ts --session <label> --no
 - Reservations expire on their own (45 min default, `--ttl <minutes>`, max 240)
 - Renew with `pa claim --renew <id>` if the work outlives it
 - Release with `pa release <id>` the moment you are done; do not hold one across idle time
+- A Claude Code `PreToolUse` hook warns (never blocks) when you edit a path under any active reservation, once per reservation per session: `pa/scripts/hooks/reservation-guard.py`, registered PROJECT-scoped in this repo's own tracked `.claude/settings.json` — so it applies to sessions in this project and its worktrees, and never fires while you work in another repo. It adds to your personal `~/.claude/settings.json` hooks rather than replacing them. It names the holder; if the reservation is yours, continue. It binds interactive sessions and subagents in the Claude Code family only — the bot's own workers get the same information injected into their prompt instead (Rule 2 has no reach into agy/codex, which is why C1b exists).
 
 ## Rule 3: Reservations Are Advisory
 
@@ -34,25 +37,44 @@ Mandatory locking's dominant real-world failure is the abandoned lock, not the c
 - `--force` proceeds anyway and is logged with a ref-ID
 - Use `--force` only after actually reconciling with the other session's intent, never to silence the warning
 
-## Rule 4: Build Under @build Lock
+## Rule 4: Builds and Tests Serialize on @build — Automatically
 
 ```
 npm run build
 npm test
 ```
 
-Both run under `pa claim @build --wait 900 --ttl 30`, released immediately afterwards.
+Both acquire the `@build` reservation themselves and release it when they finish. You do not
+claim it, and you must not: a hand-claim under your own session label collides with the one
+the npm script takes, and your build then polls for 15 minutes and gives up.
 
 - Concurrent builds tear each other's `pa/dist` output (the bot loads it live)
 - D:'s 5400rpm HDD starves other D: I/O under one concurrent build
+- **`@build` covers test runs, not just builds** — a `npm test` run reads `dist/` the whole time, so a concurrent build tears it out from under a running suite
 - `@build` is a logical resource, not a path (the `@` prefix can never collide with a filename)
-- Enforced in the `push` skill's Step 2; `commit` runs no build, so it doesn't need it
+- A `waiting for @build (held by "…")` line is the lock working. The run continues by itself once the holder releases; do not cancel it
+- **It fails open.** If the wait passes 15 minutes the run proceeds *without* the lock and says so, rather than failing for a reason unrelated to the code. A stale reservation therefore degrades serialization; it never bricks the machine's builds
+- **It is a no-op** when `PA_BUILD_LOCK=0`, when a parent already holds it (`PA_BUILD_LOCK_HELD`), when `~/.pa` does not exist, or when `pa/dist` has not been built yet — so CI, a fresh clone, and the very first build never claim anything
+- Set `PA_BUILD_LOCK=0` for **scoped** test runs inside an orchestrated wave, where several builders would otherwise serialize behind one another. Never set it for a full-suite or pre-push gate
+- Implementation: `pa/src/lib/build-lock.ts`, used by `pa/scripts/build.mjs`, `pa/scripts/run-tests.mjs`, the bot's copies of both, and `pa/src/code-fixer.ts`'s verification gate. It is the only implementation — do not add a second
+- In PowerShell, a hand-typed `pa claim '@build' …` still needs the quotes: an unquoted leading `@` is parsed as a splat of a nonexistent variable
 
 ## Rule 5: Never Run Raw Git Commands
 
 Never run raw `git commit` / `git push` / `git-public …` yourself (concurrency is one reason; see Public/private repo topology in root CLAUDE.md for the other).
 
 The `commit`/`push`/`push-public`/`investigate-flagged`/`update-brain` family serializes through the `git-workflow` blackboard lock. A raw git invocation sits entirely outside that lock and can collide on `.git/index.lock` — a failure mode with documented silent work-loss behaviour in concurrent-agent setups.
+
+**Rule 5 is convention, exactly as unenforced at the git level as Rule 3's reservations.** Nothing blocks a raw `git commit`; the pre-push PII guard is a different, unrelated mechanism (content scanning, not workflow routing). A git `pre-commit` hook that refuses paths under a foreign active reservation is C1 in the audit and is not built.
+
+### Rule 5a: The wave exception
+
+A builder, verifier or deep-planner subagent inside an orchestrated wave commits its OWN scoped work with a pathspec commit — `git add <paths>` then `git commit -m "..." -- <paths>` — and that is the sanctioned, deliberate exception. It is safe only because the orchestrator holds the tree-level discipline for the wave: disjoint file ownership per package, one branch per package, and a single integrator running the full gates. Two constraints make it safe and both are load-bearing:
+
+- **`git commit -- <pathspec>` does not stage untracked files.** `git add` the new paths first, then commit with the same pathspec.
+- **A pathspec does not protect WITHIN a file.** If your target file already carries uncommitted changes at dispatch, `git add <path>` stages that whole diff and your commit bundles a stranger's unlanded work — a later revert of your commit then destroys theirs. Run `git diff HEAD -- <file>` before your FIRST edit to any file; non-empty means stop and surface it.
+
+Outside a wave — an interactive session doing an ad-hoc commit — Rule 5 applies unchanged.
 
 ## Rule 6: Check For Clobbers
 
@@ -74,6 +96,39 @@ For a large, self-contained, multi-file refactor that will not need to exercise 
 
 ## Rule 8: Long-Running Skills Hold the Tree
 
-- `update-brain` fires nightly at 21:30 IST and git-commits any pending working-tree changes
-- `self-improver`'s code-fixer can hold the `git-workflow` lock 30+ minutes
-- Neither is a bug. Don't leave work uncommitted across 21:30 IST expecting it to stay uncommitted.
+- `update-brain` fires nightly at 21:30 IST and commits pending `CLAUDE.md` / `inventory/` changes — since 2026-08-23 it DEFERS that sweep for any managed path under an active foreign reservation or modified in the last 15 minutes, and names the deferred paths in its Telegram report. Reserve `CLAUDE.md` (`pa claim CLAUDE.md …`) if you are mid-edit across 21:30 IST; it will not be swept.
+- `self-improver`'s code-fixer can hold the `git-workflow` lock 30+ minutes. Every long holder (`pa run` skills, `pa catchup`, code-fixer) renews through `startLockRenewal()`; if its row is purged out from under it (a >10-minute sleep or I/O stall) the run FAILS loudly — alert families `Skill failed (lock lost)` / `Catchup aborted (lock lost)`, and code-fixer hard-reverts — instead of continuing as a silent second writer.
+- Neither is a bug. A held lock or reservation is honoured; an unheld, recently-untouched file is fair game for the nightly sweep.
+
+## Rule 9: Never Destroy What You Do Not Own
+
+No session, skill, worker or subagent may run `git stash`, `git checkout -- <path>`, `git reset`, `git clean`, or `git worktree remove` against a file it does not own. These rewrite other sessions' uncommitted work irreversibly and outside every lock in this system.
+
+On 2026-08-23 a skill's LLM worker ran `git stash push -m temp-stash-backlog BACKLOG.md` to make a size gate pass, popping it four minutes later. During that window three sessions' edits to that file were invisible on disk and one was about to write it. Nothing in the skill's own text forbade it, and Rule 5 does not bind a worker's improvisation.
+
+If a gate needs a clean tree, run the gate against a fresh checkout of the committed head — `git worktree add --detach C:/wt/gate-<name> HEAD` — never by mutating the shared tree. The `push` gate does this by construction since 2026-08-23 (Wave C): its skill runs the whole gate in `C:/wt/gate-push`, a detached checkout of HEAD. A gate that fails because of another session's WIP is reported as such, never stashed away.
+
+## Rule 10: Test Runs Are Isolated, Serialized, and Off D:
+
+These rules governed this repo from global machine notes only until 2026-08-23. They are repo-operational, not machine trivia.
+
+- **One test process on this machine at a time.** Gates run in the FOREGROUND, serialized. Never launch a suite in the background and move on — on 2026-08-15 a background 35-file run alongside two other agents' runs starved the machine to a hard hang.
+- **Agent test runs belong on C:, never on D:.** `git worktree add --detach C:/wt/<name> <sha>` gives a same-repo, zero-contention checkout in seconds (git objects stay in the D: `.git`). `git worktree remove` when done — but if you junctioned `node_modules` into the worktree, delete the junctions FIRST (`cmd /c rmdir C:\wt\<name>\pa\node_modules`, same for the bot): `git worktree remove --force` follows a junction and empties the LIVE `node_modules` on D: (2026-08-23: both packages' modules were wiped for ~90 s and one `pa catchup` tick died; restored with `npm ci`). Prefer `npm ci` in the worktree (~35 s) over junctions; a `git worktree add` interrupted mid-checkout leaves a `locked: initializing` entry that only `git worktree remove -f -f <path>` clears.
+- **Verify the worktree's base before trusting any gate.** A harness-created worktree can be cut from a stale ref: `git merge-base main <branch>` must equal current `main`, or the gate is measuring a different tree than you think.
+- **Point TEMP at C: for every test run:** `TMP=C:/wt/tmp TEMP=C:/wt/tmp npm test -- <file>`. The user TEMP directory lives on D:, so temp sqlite files fsync against the saturated HDD; a trivial test "hung" for 30+ minutes on 2026-08-15 and passed in 22 seconds with TEMP on C:. `pa/scripts/run-tests.mjs` and the bot's copy do this automatically when `PA_TEST_TMP_DIR` or `C:/wt/tmp` exists.
+- **Run a scoped test through the package's own `npm test`:** `npm test -- <file.test.js>` (added 2026-08-23; matches on basename, still preloads the safety file, still excludes quarantined files, exits 1 if nothing matched). **Never hand-construct a `node --test` invocation** — it skips the `--import test-env-setup.js` preload, so `PA_HOME` resolves to the real `~/.pa` from the file's first line. That leak sent 3 real Telegram alerts to production on 2026-08-17.
+- A slow run under contention is reported as "unverified, I/O-starved" — never as evidence either way.
+- `npm test` now takes `@build` itself (Rule 4), so a scoped run inside an orchestrated wave should set `PA_BUILD_LOCK=0` to avoid six builders serializing behind each other; the integrator's full-suite runs must NOT set it.
+
+## Rule 11: Talk Before You Force
+
+`pa claim --force` is the last step, not the first. When a reservation blocks work that genuinely cannot wait, message the holding session directly and agree on who yields. That ad-hoc session-to-session channel is a real, used part of this protocol — on 2026-08-23 it was how two sessions resolved a live conflict correctly — and it was undocumented until now.
+
+Five forced claims landed in the week of 2026-08-16, four of them on `@build`. A force with no conversation behind it is how two agents silently overwrite each other. Every claim, denial, force, release and expiry is now logged to `app.log.jsonl` under module `reservations`; `pa claims --stats` summarizes the last 7 days and the weekly ops digest carries a one-line rollup.
+
+## See also
+
+- `plans/2026-08-23-coordination-audit.md` — the enforcement audit behind Rules 4, 5a, 9, 10 and 11, with the per-surface enforced/advisory/prose matrix.
+- `plans/2026-08-05-concurrent-session-safety.md` — the original design and the rationale for advisory-over-mandatory locking.
+- `docs/repo-topology.md` — public/private repo boundaries, the PII guard, and the `exclusive_resource` lock's place in them.
+- Global machine notes (`~/.claude/CLAUDE.md`) still carry machine-specific hardware detail (D: I/O diagnosis, PowerShell quoting, Windows path escaping). Everything in them that governs *this repo's* coordination is now restated above; if you find a coordination rule that exists only there, move it here.

@@ -143,7 +143,7 @@ describe('worker-pids', () => {
       await writeFile(
         join(pidsDir, '999993.json'),
         JSON.stringify({
-          pid: 999993, spawnedBy: 999999, worker: 'gemini', skill: 'test',
+          pid: 999993, spawnedBy: 999999, worker: 'codex', skill: 'test',
           startedAt: new Date().toISOString(), descendants: [orphan.pid],
         }),
         'utf8'

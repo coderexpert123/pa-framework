@@ -1,4 +1,5 @@
 import { mkdtemp, mkdir, writeFile, rm } from 'fs/promises';
+import { mkdtempSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { stringify as yamlStringify } from 'yaml';
@@ -68,8 +69,29 @@ export async function cleanup(dir: string): Promise<void> {
   // back to the REAL ~/.pa, and any late fire-and-forget log (worker-exec's
   // exit alert, the bg-task orphan sweep, a killed worker's late 'close'
   // event) wrote synthetic records into the production forensic log.
-  if (process.env.PA_TEST_LOG_HOME) process.env.PA_HOME = process.env.PA_TEST_LOG_HOME;
-  else delete process.env.PA_HOME;
+  //
+  // 2026-08-17: this happened for real when a test file was run WITHOUT the
+  // `--import test-env-setup.js` preload (a direct `node --test
+  // dist/tests/x.test.js`, exactly the scoped-run form this repo's own
+  // guidance recommends). With no preload, PA_TEST_LOG_HOME was never set, so
+  // this branch fell to `delete process.env.PA_HOME` and every fire-and-forget
+  // write after that point resolved paHome() to the REAL ~/.pa. 3 real
+  // Telegram alerts reached chat/thread 3376 (`worker-under-test`, `test`,
+  // `kill-tree-worker`; archive/2026-08-18-134211-app.log.jsonl:12647,12764,
+  // 14202) and 64 `telegram`-module rows plus 40 of 63 429 rows carried the
+  // `-1001234567` fixture chat id from pa/tests/telegram.test.ts:76 (review
+  // plans/2026-08-23-alerts-week-review.md §5.3). Fix: never delete PA_HOME —
+  // mint a fresh temp home via mkdtempSync when no preload ran, so an unset
+  // PA_TEST_LOG_HOME can no longer make paHome() fall back to the real ~/.pa.
+  if (!process.env.PA_TEST_LOG_HOME) {
+    // No preload ran (a direct `node --test dist/tests/x.test.js`). Mint a home
+    // rather than unsetting: an unset PA_HOME makes paHome() resolve to the REAL
+    // ~/.pa for every late fire-and-forget write.
+    const fallback = mkdtempSync(join(tmpdir(), 'pa-test-home-'));
+    process.env.PA_TEST_LOG_HOME = fallback;
+  }
+  process.env.PA_HOME = process.env.PA_TEST_LOG_HOME;
+  process.env.PA_NOTIFY_DISABLED = process.env.PA_NOTIFY_DISABLED ?? '1';
   delete process.env.PA_BOT_PID;
   try {
     await rm(dir, { recursive: true, force: true });
