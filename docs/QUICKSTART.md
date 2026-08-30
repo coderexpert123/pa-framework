@@ -12,7 +12,6 @@
 - **systemd** on Linux (for `/keepawake` and the recommended bot supervisor). Not required if you use a non-systemd distro, but those features will be unavailable.
 - **At least one LLM CLI** in your PATH:
   - [Claude Code](https://github.com/anthropics/claude-code) (`claude`)
-  - [Gemini CLI](https://github.com/google-gemini/gemini-cli) (`gemini`)
   - [OpenAI Codex](https://github.com/openai/codex) (`codex`)
   - Or a Claude alternative like zClaude.
 - **Optional**: a Telegram bot (created via [@BotFather](https://t.me/BotFather)) + the chat ID where you want it to operate. See `docs/BOT_GUIDE.md`.
@@ -43,11 +42,12 @@ node pa/dist/bin/pa.js init
 
 This scaffolds:
 
-- `~/.pa/config.yaml` — worker definitions (5 default workers; you'll customize paths)
+- `~/.pa/config.yaml` — worker definitions (4 default workers — claude, codex, agy, zclaude; you'll customize paths and priorities)
 - `~/.pa/secrets.env` — empty env-var file
 - `~/.pa/skills/`, `~/.pa/logs/`, `~/.pa/skill-drafts/` — runtime directories
 - `~/.pa/codex-skill-translations.json` — codex `/skill` → `$skill` translation patterns
 - `~/.pa/brain-files.json` — opt-in config for the `update-brain` sample skill
+- `~/.pa/topic-brains/EXEMPT.json` — empty exemption registry for per-topic brain enrollment
 
 It prints a "Next steps" block at the end with specific docs to read.
 
@@ -198,6 +198,19 @@ bash projects/telegram-bot/run-bot.sh &
 ```
 For persistent deployment register as a systemd service (Linux, template: `examples/systemd/pa-telegram-bot.service`) or launchd agent (macOS, template: `examples/launchd/com.pa-framework.telegram-bot.plist`) — see `docs/BOT_GUIDE.md §"Option B / Option C"`.
 
+### Optional: customize the standing rules
+
+By default, the bot's rules ship inline in every prompt. Enable the file to customize them per deployment (claude/zclaude only — agy/codex always use the inline block).
+
+To activate:
+
+1. **Copy the template** — `cp examples/bot-instructions.example.md projects/telegram-bot/bot-instructions.md`
+2. **Customize for your setup** — edit the file to match your identity, paths, and integrations
+3. **Enable the flag** — edit `~/.pa/config.yaml`: add `--append-system-prompt-file` + the absolute path to `projects/telegram-bot/bot-instructions.md` to the `args` array for the `claude` and `zclaude` workers
+4. **Restart the bot** — `node pa/dist/bin/pa.js bot restart`
+
+See `docs/BOT_GUIDE.md §"bot-instructions.md (static system prompt)"` for full details.
+
 Send your bot a message in Telegram — it responds via your highest-priority available worker. Use `/help` to see the bot's slash commands (defined in `projects/telegram-bot/src/commands.ts`).
 
 To stop gracefully: `node pa/dist/bin/pa.js bot stop` (sets a sentinel file the bot polls).
@@ -235,6 +248,54 @@ To set up your own deployment (your own private repo seeded with the framework, 
 
 - **Pattern A — Simple fork** (recommended for most users): one private repo containing the framework + your personal additions.
 - **Pattern B — Dual-`.git`** (advanced): two `.git` directories in one working tree, for contributors who push substrate fixes back to the public framework.
+
+## 13. Your assistant has a brain
+
+The framework ships with a brain system — knowledge stores and nightly maintenance loops that keep your assistant grounded in how your projects actually work.
+
+### What ships
+
+- **`~/.pa/brain-files.json`** — config that enrolls project CLAUDE.md files for nightly sweeps (opt-in; empty by default)
+- **`~/.pa/topic-brains/`** — per-topic knowledge store where each Telegram conversation's distilled facts live (one BRAIN.md per topic, plus an INDEX.md registry)
+- **Two example skills** — `update-brain` (sweeps enrolled project brains) and `topic-brain-distill` (nightly per-topic memory consolidation); copy them into `~/.pa/skills/` to adopt (see below)
+
+### The knowledge loop
+
+Each night, the `topic-brain-distill` skill processes every active Telegram topic:
+
+1. **Distill** recent turns → extract facts, decisions, and pointers
+2. **Write** to `~/.pa/topic-brains/{chatId}_{threadId}/BRAIN.md` (stamped with covers-through date)
+3. **Inject pointers** into the next prompt — the bot routes to topic-specific knowledge automatically
+
+For project-level knowledge, `update-brain` sweeps all enrolled `CLAUDE.md` files nightly, keeping architecture decisions, gotchas, and conventions fresh in the agent's context.
+
+### The behavior loop
+
+The `self-improver` example skill analyzes run logs, failures, and the alert census — proposing and applying fixes with a validation floor and rollback-able commits. See [`docs/SKILLS_GUIDE.md`](SKILLS_GUIDE.md) for the full loop description.
+
+### Self-modularization
+
+Give your projects their own brains:
+
+1. **Add a project** — give it a `README.md` and copy `examples/brain/CLAUDE.template.md` as its `CLAUDE.md`
+2. **Enroll it** — add the project to `~/.pa/brain-files.json` (the template's header shows the format)
+3. **Add a skill** — `update-brain` picks it up automatically on the next nightly run
+
+### Adopt the example skills
+
+```powershell
+# PowerShell
+Copy-Item -Recurse examples/skills/update-brain ~/.pa/skills/
+Copy-Item -Recurse examples/skills/topic-brain-distill ~/.pa/skills/
+Copy-Item -Recurse examples/skills/self-improver ~/.pa/skills/
+
+# Bash / POSIX
+cp -r examples/skills/update-brain ~/.pa/skills/
+cp -r examples/skills/topic-brain-distill ~/.pa/skills/
+cp -r examples/skills/self-improver ~/.pa/skills/
+```
+
+Verify: `node pa/dist/bin/pa.js list` shows all three with their nightly crons.
 
 ## Next steps
 

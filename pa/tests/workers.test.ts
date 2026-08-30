@@ -1,3 +1,4 @@
+import './test-env-guard.js';
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFile, mkdir } from 'fs/promises';
@@ -46,6 +47,36 @@ async function writeScript(name: string, code: string): Promise<string> {
   const path = join(scriptDir, name);
   await writeFile(path, code, 'utf8');
   return path;
+}
+
+// Module-scope (not describe-local) so both `describe('runWithFailover —
+// suppressExitAlert on intermediate hops')` and `describe('executeWorker —
+// cancelled exit alert')` can observe the real "Worker exited with code"
+// notify.attempting forensic log line without mocking notifyUser (ESM
+// read-only — see pa/tests/public-sync.test.ts:221 for the same constraint).
+// The exit page is fire-and-forget off the child's close handler, so both
+// callers poll rather than read once.
+async function exitAlertSubjects(): Promise<string[]> {
+  await flushLog();
+  const logPath = join(tempDir, 'app.log.jsonl');
+  if (!existsSync(logPath)) return [];
+  const { readFile } = await import('fs/promises');
+  const raw = await readFile(logPath, 'utf8');
+  return raw.split('\n').filter(Boolean)
+    .map((l) => { try { return JSON.parse(l) as Record<string, unknown>; } catch { return null; } })
+    .filter((e): e is Record<string, unknown> => !!e && e['module'] === 'notify' && e['message'] === 'attempting'
+      && typeof e['subject'] === 'string' && (e['subject'] as string).startsWith('Worker exited with code'))
+    .map((e) => e['subject'] as string);
+}
+
+async function waitForExitAlerts(expected: number, timeoutMs: number): Promise<string[]> {
+  const deadline = Date.now() + timeoutMs;
+  let subjects = await exitAlertSubjects();
+  while (subjects.length < expected && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 50));
+    subjects = await exitAlertSubjects();
+  }
+  return subjects;
 }
 
 describe('checkWorker', () => {
@@ -869,6 +900,81 @@ describe('runWithFailover', () => {
   });
 });
 
+// 2026-08-23 (alerts wave, correction #9): an intermediate failover hop's
+// non-zero exit used to page "Worker exited with code 1: <worker>" even when
+// a later worker went on to answer. hasEligibleCandidateAfter() suppresses
+// the exit page on any hop where a real next candidate still exists;
+// verified here via the real notify.attempting forensic log line (ESM
+// read-only makes mocking notifyUser itself impossible — same constraint as
+// pa/tests/public-sync.test.ts:221), never via a hop-index test (a naive
+// `i === workers.length - 1` would wrongly suppress a hop that is in fact
+// terminal once excludeWorkers/cooldown/manual_only are accounted for).
+describe('runWithFailover — suppressExitAlert on intermediate hops', () => {
+  it('hop 1 exit page is suppressed when hop 2 exists and succeeds', async () => {
+    const failScript = await writeScript('suppress-hop1-fail.js', 'process.stderr.write("boom"); process.exit(1);');
+    const okScript = await writeScript('suppress-hop2-ok.js', 'process.stdout.write("from hop2");');
+    await createTempSecrets(tempDir, '');
+    await createTempConfig(tempDir, [
+      { name: 'hop1', command: 'node', args: [failScript], check: 'echo ok', priority: 1, rate_limit_patterns: [] },
+      { name: 'hop2', command: 'node', args: [okScript], check: 'echo ok', priority: 2, rate_limit_patterns: [] },
+    ]);
+    const { result, worker } = await runWithFailover('unused', { timeout: 10, resource: 'topic-suppress-1' });
+    assert.equal(result.success, true);
+    assert.equal(worker, 'hop2');
+    // Hop 1's failure must not have paged — poll the same window a genuine
+    // page would need, then confirm it never arrived.
+    assert.deepEqual(await waitForExitAlerts(1, 3000), []);
+  });
+
+  it('hop 1 exit page still fires when hop 2 is excluded (no eligible candidate remains)', async () => {
+    const failScript = await writeScript('suppress-hop1-excl-fail.js', 'process.stderr.write("boom"); process.exit(1);');
+    const okScript = await writeScript('suppress-hop2-excl-ok.js', 'process.stdout.write("should not run");');
+    await createTempSecrets(tempDir, '');
+    await createTempConfig(tempDir, [
+      { name: 'hop1', command: 'node', args: [failScript], check: 'echo ok', priority: 1, rate_limit_patterns: [] },
+      { name: 'hop2', command: 'node', args: [okScript], check: 'echo ok', priority: 2, rate_limit_patterns: [] },
+    ]);
+    const { result, worker } = await runWithFailover('unused', {
+      timeout: 10,
+      resource: 'topic-suppress-2',
+      excludeWorkers: new Set(['hop2']),
+    });
+    assert.equal(result.success, false);
+    assert.equal(worker, 'hop1');
+    assert.deepEqual(await waitForExitAlerts(1, 5000), ['Worker exited with code 1: hop1']);
+  });
+
+  it('hop 1 exit page still fires under noFallback even though a later candidate is configured', async () => {
+    const failScript = await writeScript('suppress-hop1-nofallback-fail.js', 'process.stderr.write("boom"); process.exit(1);');
+    const okScript = await writeScript('suppress-hop2-nofallback-ok.js', 'process.stdout.write("should not run");');
+    await createTempSecrets(tempDir, '');
+    await createTempConfig(tempDir, [
+      { name: 'hop1', command: 'node', args: [failScript], check: 'echo ok', priority: 1, rate_limit_patterns: [] },
+      { name: 'hop2', command: 'node', args: [okScript], check: 'echo ok', priority: 2, rate_limit_patterns: [] },
+    ]);
+    const { result, worker } = await runWithFailover('unused', {
+      timeout: 10,
+      resource: 'topic-suppress-3',
+      noFallback: true,
+    });
+    assert.equal(result.success, false);
+    assert.equal(worker, 'hop1');
+    assert.deepEqual(await waitForExitAlerts(1, 5000), ['Worker exited with code 1: hop1']);
+  });
+
+  it('the last candidate in the chain always pages on failure', async () => {
+    const failScript = await writeScript('suppress-lasthop-fail.js', 'process.stderr.write("boom"); process.exit(1);');
+    await createTempSecrets(tempDir, '');
+    await createTempConfig(tempDir, [
+      { name: 'onlyhop', command: 'node', args: [failScript], check: 'echo ok', priority: 1, rate_limit_patterns: [] },
+    ]);
+    const { result, worker } = await runWithFailover('unused', { timeout: 10, resource: 'topic-suppress-4' });
+    assert.equal(result.success, false);
+    assert.equal(worker, 'onlyhop');
+    assert.deepEqual(await waitForExitAlerts(1, 5000), ['Worker exited with code 1: onlyhop']);
+  });
+});
+
 // AI-092 gap closed 2026-08-02: a /stop landing mid-chain used to read as an
 // ordinary worker failure, so the cascade answered the cancelled request with
 // the next worker. See the isCancelled block in runWithFailover.
@@ -959,32 +1065,10 @@ describe('runWithFailover — caller cancellation', () => {
 });
 
 describe('executeWorker — cancelled exit alert', () => {
-  // The exit page is fire-and-forget off the child's close handler, so both
-  // tests poll rather than read once: the negative case waits out the same
-  // window the positive case needs before asserting silence.
-  async function exitAlertSubjects(): Promise<string[]> {
-    await flushLog();
-    const logPath = join(tempDir, 'app.log.jsonl');
-    if (!existsSync(logPath)) return [];
-    const { readFile } = await import('fs/promises');
-    const raw = await readFile(logPath, 'utf8');
-    return raw.split('\n').filter(Boolean)
-      .map((l) => { try { return JSON.parse(l) as Record<string, unknown>; } catch { return null; } })
-      .filter((e): e is Record<string, unknown> => !!e && e['module'] === 'notify' && e['message'] === 'attempting'
-        && typeof e['subject'] === 'string' && (e['subject'] as string).startsWith('Worker exited with code'))
-      .map((e) => e['subject'] as string);
-  }
-
-  async function waitForExitAlerts(expected: number, timeoutMs: number): Promise<string[]> {
-    const deadline = Date.now() + timeoutMs;
-    let subjects = await exitAlertSubjects();
-    while (subjects.length < expected && Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 50));
-      subjects = await exitAlertSubjects();
-    }
-    return subjects;
-  }
-
+  // exitAlertSubjects/waitForExitAlerts are module-scope now (2026-08-23) —
+  // shared with describe('runWithFailover — suppressExitAlert on
+  // intermediate hops') above. The negative case here still waits out the
+  // same window the positive case needs before asserting silence.
   it('suppresses the pa-alerts exit page when the caller cancelled the run', async () => {
     const script = await writeScript('exit-cancelled.js', 'process.stderr.write("killed"); process.exit(1);');
     await createTempSecrets(tempDir, '');

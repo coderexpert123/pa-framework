@@ -1,8 +1,9 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, readFile, writeFile, mkdir } from 'fs/promises';
-import { join } from 'path';
+import { join, dirname } from 'path';
 import { tmpdir } from 'os';
+import lockfile from 'proper-lockfile';
 import { applyKbNote, appendKbNote, kbSourcesPath } from '../kb-notes.js';
 
 // ---------------------------------------------------------------------------
@@ -160,5 +161,64 @@ describe('appendKbNote', () => {
     process.env.PA_KB_SOURCES_PATH = tempDir; // a directory, not a file
     const ok = await appendKbNote('Domain', 'note');
     assert.equal(ok, false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// appendKbNote concurrency + lock behaviour (WP-E, D20, 2026-08-23) — V4-F6
+// ---------------------------------------------------------------------------
+
+describe('appendKbNote concurrency and locking', () => {
+  let tempDir: string;
+  let sourcesPath: string;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'tgbot-kb-notes-concurrency-'));
+    sourcesPath = join(tempDir, 'notes', 'Sources.md');
+    process.env.PA_KB_SOURCES_PATH = sourcesPath;
+  });
+
+  afterEach(async () => {
+    delete process.env.PA_KB_SOURCES_PATH;
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it('two concurrent appendKbNote calls for different domains both survive', async () => {
+    const [okA, okB] = await Promise.all([
+      appendKbNote('Domain A', 'note from A'),
+      appendKbNote('Domain B', 'note from B'),
+    ]);
+    assert.equal(okA, true);
+    assert.equal(okB, true);
+
+    const content = await readFile(sourcesPath, 'utf8');
+    assert.match(content, /## Domain A/);
+    assert.match(content, /- \*\*Recent\*\*: note from A/);
+    assert.match(content, /## Domain B/);
+    assert.match(content, /- \*\*Recent\*\*: note from B/);
+  });
+
+  it('appendKbNote returns false and writes nothing when the lock cannot be taken', async () => {
+    await mkdir(dirname(sourcesPath), { recursive: true });
+    await writeFile(
+      sourcesPath,
+      '# Sources\n\n## Existing\n\n<!-- LIVING SECTION -->\n\n*Last updated: 2026-01-01*\n\n- **Recent**: keep me\n\n---\n',
+      'utf8',
+    );
+
+    // Pre-lock the file from the test itself so appendKbNote's own lock
+    // attempt (safeLockOptions('kb-notes', { retries: 5 })) exhausts its
+    // retries and fails.
+    const release = await lockfile.lock(sourcesPath, { retries: 0, realpath: false });
+    try {
+      const ok = await appendKbNote('New Domain', 'should not land');
+      assert.equal(ok, false);
+
+      const content = await readFile(sourcesPath, 'utf8');
+      assert.match(content, /- \*\*Recent\*\*: keep me/, 'original content must be untouched');
+      assert.ok(!content.includes('should not land'), 'nothing must be written when the lock cannot be taken');
+    } finally {
+      await release();
+    }
   });
 });

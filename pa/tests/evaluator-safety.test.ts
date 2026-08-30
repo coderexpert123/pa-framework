@@ -29,7 +29,7 @@ describe('evaluateWorkerState safety', () => {
 
   before(async () => {
     dir = await createTempPaHome();
-    // Config with evaluator.worker = 'claude', stuckWorkerName will be 'gemini'
+    // Config with evaluator.worker = 'claude', stuckWorkerName will be 'codex'
     await createTempConfig(dir, [WORKER], { evaluator: { worker: 'claude', timeout: 30 } });
     // State dir with a dummy state file for readStateTail
     stateDir = join(dir, 'state');
@@ -44,7 +44,7 @@ describe('evaluateWorkerState safety', () => {
   it('returns extend verdict when evaluator returns non-JSON', async () => {
     const { evaluateWorkerState } = await import('../src/worker-evaluator.js');
     const result = await evaluateWorkerState(
-      stateDir, '*.jsonl', 'gemini', {},
+      stateDir, '*.jsonl', 'codex', {},
       makeExecutor('This is markdown text, not JSON at all.'),
     );
     assert.ok(result !== null, 'should return a verdict, not null');
@@ -55,7 +55,7 @@ describe('evaluateWorkerState safety', () => {
   it('returns extend verdict when evaluator returns invalid verdict value', async () => {
     const { evaluateWorkerState } = await import('../src/worker-evaluator.js');
     const result = await evaluateWorkerState(
-      stateDir, '*.jsonl', 'gemini', {},
+      stateDir, '*.jsonl', 'codex', {},
       makeExecutor('{"verdict":"pause","summary":"thinking","reason":"not done yet"}'),
     );
     assert.ok(result !== null, 'should return a verdict, not null');
@@ -66,7 +66,7 @@ describe('evaluateWorkerState safety', () => {
   it('returns parsed verdict when evaluator returns valid JSON with kill', async () => {
     const { evaluateWorkerState } = await import('../src/worker-evaluator.js');
     const result = await evaluateWorkerState(
-      stateDir, '*.jsonl', 'gemini', {},
+      stateDir, '*.jsonl', 'codex', {},
       makeExecutor('{"verdict":"kill","summary":"agent is looping","reason":"repeating same tool calls"}'),
     );
     assert.ok(result !== null, 'should return a verdict');
@@ -78,7 +78,7 @@ describe('evaluateWorkerState safety', () => {
   it('returns parsed verdict when evaluator returns valid JSON with extend', async () => {
     const { evaluateWorkerState } = await import('../src/worker-evaluator.js');
     const result = await evaluateWorkerState(
-      stateDir, '*.jsonl', 'gemini', {},
+      stateDir, '*.jsonl', 'codex', {},
       makeExecutor('{"verdict":"extend","summary":"reading files","reason":"making progress on task"}'),
     );
     assert.ok(result !== null, 'should return a verdict');
@@ -89,7 +89,7 @@ describe('evaluateWorkerState safety', () => {
   it('returns null when executor indicates failure', async () => {
     const { evaluateWorkerState } = await import('../src/worker-evaluator.js');
     const result = await evaluateWorkerState(
-      stateDir, '*.jsonl', 'gemini', {},
+      stateDir, '*.jsonl', 'codex', {},
       makeExecutor('', false),
     );
     assert.equal(result, null, 'failed executor should return null');
@@ -97,7 +97,7 @@ describe('evaluateWorkerState safety', () => {
 
   it('returns null when no executor provided', async () => {
     const { evaluateWorkerState } = await import('../src/worker-evaluator.js');
-    const result = await evaluateWorkerState(stateDir, '*.jsonl', 'gemini', {});
+    const result = await evaluateWorkerState(stateDir, '*.jsonl', 'codex', {});
     assert.equal(result, null, 'no executor should return null');
   });
 
@@ -114,7 +114,7 @@ describe('evaluateWorkerState safety', () => {
   it('handles JSON wrapped in markdown code fences', async () => {
     const { evaluateWorkerState } = await import('../src/worker-evaluator.js');
     const result = await evaluateWorkerState(
-      stateDir, '*.jsonl', 'gemini', {},
+      stateDir, '*.jsonl', 'codex', {},
       makeExecutor('```json\n{"verdict":"kill","summary":"stuck","reason":"looping"}\n```'),
     );
     assert.ok(result !== null);
@@ -124,7 +124,7 @@ describe('evaluateWorkerState safety', () => {
   it('returns parsed verdict when evaluator returns valid JSON with done', async () => {
     const { evaluateWorkerState } = await import('../src/worker-evaluator.js');
     const result = await evaluateWorkerState(
-      stateDir, '*.jsonl', 'gemini', {},
+      stateDir, '*.jsonl', 'codex', {},
       makeExecutor('{"verdict":"done","summary":"agent completed the task","reason":"final response produced, waiting for input"}'),
     );
     assert.ok(result !== null, 'should return a verdict');

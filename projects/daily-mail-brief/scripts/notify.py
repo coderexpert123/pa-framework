@@ -20,6 +20,11 @@ import shutil
 import subprocess
 import sys
 
+# `pa notify` boots a Node CLI off the D: HDD; under I/O contention it exceeded
+# a 10s timeout twice (2026-08-21, 2026-08-24), silently dropping the very alert
+# that reports a brief failure. Bound it generously and retry once on timeout.
+NOTIFY_TIMEOUT_S = float(os.environ.get("DAILY_MAIL_BRIEF_NOTIFY_TIMEOUT", "60"))
+
 
 def _resolve_pa_bin() -> str:
     """Resolve the `pa` binary path."""
@@ -54,20 +59,34 @@ def send(subject: str, body: str, dedup_key: str) -> None:
                     "--body-stdin",
                     "--dedup-key", dedup_key]
 
-    try:
-        subprocess.run(
-            argv,
-            input=body.encode("utf-8"),
-            timeout=10,
-            check=False,  # don't raise on non-zero exit
-        )
-    except FileNotFoundError:
-        print(f"[notify.py] failed: pa binary not found at '{pa_bin}'", file=sys.stderr)
-    except subprocess.TimeoutExpired:
-        print("[notify.py] failed: timeout (10s)", file=sys.stderr)
-    except subprocess.CalledProcessError as e:
-        print(f"[notify.py] failed: exit {e.returncode}", file=sys.stderr)
-    except OSError as e:
-        print(f"[notify.py] failed: OS error: {e}", file=sys.stderr)
-    except Exception as e:
-        print(f"[notify.py] failed: {e}", file=sys.stderr)
+    # One retry on timeout only: a slow pa boot is the recorded failure mode,
+    # while a missing binary or OS error cannot succeed on a second attempt.
+    for attempt in (1, 2):
+        try:
+            subprocess.run(
+                argv,
+                input=body.encode("utf-8"),
+                timeout=NOTIFY_TIMEOUT_S,
+                check=False,  # don't raise on non-zero exit
+            )
+            return
+        except subprocess.TimeoutExpired:
+            if attempt == 1:
+                print(
+                    f"[notify.py] timeout ({NOTIFY_TIMEOUT_S:g}s) — retrying once",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"[notify.py] failed: timeout ({NOTIFY_TIMEOUT_S:g}s)", file=sys.stderr)
+        except FileNotFoundError:
+            print(f"[notify.py] failed: pa binary not found at '{pa_bin}'", file=sys.stderr)
+            return
+        except subprocess.CalledProcessError as e:
+            print(f"[notify.py] failed: exit {e.returncode}", file=sys.stderr)
+            return
+        except OSError as e:
+            print(f"[notify.py] failed: OS error: {e}", file=sys.stderr)
+            return
+        except Exception as e:
+            print(f"[notify.py] failed: {e}", file=sys.stderr)
+            return

@@ -14,6 +14,7 @@
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { parse } from 'yaml';
+import { decisionStatsBySkill } from './decisions.js';
 
 export interface SLOServiceDefinition {
   name: string;
@@ -44,6 +45,24 @@ export interface SLOReport {
   missingData: string[];
 }
 
+export interface SkillOutcomeRow {
+  skill: string;
+  total: number;
+  approved: number;
+  rejected: number;
+  replied: number;
+  pending: number;
+  other_reaction: number;
+  actedOnRate: number | null; // null ⇔ total === 0
+}
+
+export interface SkillOutcomeReport {
+  generatedAt: string;
+  windowDays: 30;
+  skills: SkillOutcomeRow[];
+  inWindow: number;
+}
+
 const SERVICE_DEFINITIONS: SLOServiceDefinition[] = [
   {
     name: 'bot-reply-delivery',
@@ -68,14 +87,6 @@ const SERVICE_DEFINITIONS: SLOServiceDefinition[] = [
     period: 'month',
     eventSources: ['app-log'],
     description: 'Catchup heartbeat gaps (events = gaps >30min)',
-  },
-  {
-    name: 'ekadashi-alerts',
-    target: 100.0,
-    targetHuman: 'zero-miss',
-    period: 'month',
-    eventSources: ['ekadashi-watchdog'],
-    description: 'Ekadashi alert delivery (watchdog miss detections)',
   },
 ];
 
@@ -369,6 +380,11 @@ export function generateMonthlyReport(
 
     const budget = computeErrorBudget(service, events, monthStart, monthEnd);
     budget.missingData = missingData;
+    // C3 fix: services with missing data sources have status='unknown'
+    // A service with all sources present and no events has status='ok'
+    if (missingData.length > 0) {
+      budget.status = 'unknown';
+    }
 
     reports.push({
       service: service.name,
@@ -422,6 +438,107 @@ export function formatReportTable(reports: SLOReport[]): string {
       lines.push(`WARNING: ${report.service} missing data sources: ${report.missingData.join(', ')}`);
     }
   }
+
+  return lines.join('\n');
+}
+
+/**
+ * Generate skill outcome report from decisions.sqlite.
+ *
+ * Returns null when the DB is absent or empty (no decisions ever recorded).
+ * Universe = all-time distinct skills; a skill with no rows in the window
+ * gets actedOnRate: null.
+ */
+export function generateSkillOutcomes(nowMs?: number): SkillOutcomeReport | null {
+  const now = nowMs ?? Date.now();
+
+  // Get all-time distinct skills (universe)
+  const universeStats = decisionStatsBySkill('1970-01-01T00:00:00.000Z');
+  if (!universeStats || universeStats.size === 0) {
+    return null; // No decisions ever recorded
+  }
+
+  // Get trailing 30d window stats
+  const windowStart = new Date(now - 30 * 24 * 60 * 60 * 1000).toISOString();
+  const windowEnd = new Date(now).toISOString();
+  const windowStats = decisionStatsBySkill(windowStart, windowEnd);
+
+  const skills: SkillOutcomeRow[] = [];
+  const universe = Array.from(universeStats.keys()).sort();
+  let inWindow = 0;
+
+  for (const skill of universe) {
+    const stats = windowStats?.get(skill);
+    if (stats && stats.total > 0) {
+      inWindow++;
+      const actedOnRate = (stats.approved + stats.replied) / stats.total;
+      skills.push({
+        skill,
+        total: stats.total,
+        approved: stats.approved,
+        rejected: stats.rejected,
+        replied: stats.replied,
+        pending: stats.pending,
+        other_reaction: stats.other_reaction,
+        actedOnRate,
+      });
+    } else {
+      // Skill exists in universe but has no rows in window
+      skills.push({
+        skill,
+        total: 0,
+        approved: 0,
+        rejected: 0,
+        replied: 0,
+        pending: 0,
+        other_reaction: 0,
+        actedOnRate: null,
+      });
+    }
+  }
+
+  return {
+    generatedAt: new Date(now).toISOString(),
+    windowDays: 30,
+    skills,
+    inWindow,
+  };
+}
+
+/**
+ * Format skill outcomes table for text output.
+ */
+export function formatSkillOutcomesTable(report: SkillOutcomeReport): string {
+  const lines: string[] = [];
+
+  lines.push('');
+  lines.push('Per-skill outcome SLOs (acted_on = approved+replied, trailing 30d)');
+  lines.push('-'.repeat(120));
+  lines.push(sprintf('%-18s %6s %10s %6s %6s %6s %8s', 'skill', 'rows', 'acted_on', '👍', '👎', 'replied', 'pending'));
+  lines.push('-'.repeat(120));
+
+  for (const row of report.skills) {
+    if (row.total === 0) {
+      lines.push(sprintf('%-18s %6d %10s', row.skill, row.total, 'no decision data'));
+    } else {
+      const rate = row.actedOnRate !== null ? Math.round(row.actedOnRate * 100) + '%' : 'n/a';
+      lines.push(sprintf(
+        '%-18s %6d %10s %6d %6d %6d %8d',
+        row.skill,
+        row.total,
+        rate,
+        row.approved,
+        row.rejected,
+        row.replied,
+        row.pending
+      ));
+    }
+  }
+
+  lines.push('-'.repeat(120));
+  const totalSkills = report.skills.length;
+  const withRows = report.inWindow;
+  lines.push(`(${totalSkills} skills with decision rows all-time; ${withRows} with rows in window)`);
 
   return lines.join('\n');
 }

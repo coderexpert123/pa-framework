@@ -1,7 +1,8 @@
 import { appendFile, readFile, unlink, writeFile, rename, mkdir } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
-import { sendMessage } from './telegram.js';
+import { sendMessage, sendMessageWithId } from './telegram.js';
+import { buildDlqReplayKeyboard } from './callbacks.js';
 import { deliveredKey, wasDelivered, markDelivered } from './delivered-store.js';
 import { log } from '../../../pa/dist/src/lib/log.js';
 import { loadSecrets } from '../../../pa/dist/src/secrets.js';
@@ -17,7 +18,7 @@ function quarantineAlertDir(): string {
   return join(process.env.PA_HOME ?? join(homedir(), '.pa'), 'quarantine-alerts');
 }
 
-async function sendQuarantineAlert(entry: DlqEntry): Promise<void> {
+async function sendQuarantineAlert(entry: DlqEntry, index: number): Promise<void> {
   try {
     const secrets = await loadSecrets();
     // env-first, secrets fallback — the standalone-scripts convention
@@ -43,9 +44,9 @@ async function sendQuarantineAlert(entry: DlqEntry): Promise<void> {
 
     const preview = entry.text.slice(0, 80);
     const subject = `DLQ entry quarantined after ${QUARANTINE_THRESHOLD} failed attempts`;
-    const body = `Ref: ${entry.refId || '(none)'}\nPreview: ${preview}${entry.text.length > 80 ? '...' : ''}\n\nThis entry will not be retried. Use "pa dlq list" to see all quarantined entries and "pa dlq replay <index>" to retry manually.\n\nRunbook: runbooks/dlq-poison.md`;
+    const body = `Ref: ${entry.refId || '(none)'}\nDLQ index: ${index}\nPreview: ${preview}${entry.text.length > 80 ? '...' : ''}\n\nThis entry will not be retried. Use "pa dlq list" to see all quarantined entries and "pa dlq replay <index>" to retry manually.\n\nRunbook: runbooks/dlq-poison.md`;
 
-    await sendMessage(token, Number(alertsChatId), body, undefined, alertsThreadId || undefined);
+    await sendMessageWithId(token, Number(alertsChatId), body, alertsThreadId || undefined, buildDlqReplayKeyboard(index, false));
 
     // Mark alert as sent
     await writeFile(alertFile, JSON.stringify({ timestamp: new Date().toISOString() }), 'utf8');
@@ -176,10 +177,14 @@ async function flushDlqInner(token: string): Promise<{ delivered: number; remain
       // Increment attempts counter
       const attempts = (entry.attempts || 0) + 1;
       if (attempts >= QUARANTINE_THRESHOLD) {
-        // Quarantine the entry and alert once
+        // Quarantine the entry and alert once. `remaining` (in this same order)
+        // is what gets persisted to the DLQ file below, and `pa dlq replay <idx>`
+        // indexes into that same persisted array — so the position this entry
+        // is about to occupy IS the index the alert's keyboard must carry.
         const quarantinedEntry: DlqEntry = { ...entry, attempts, quarantined: true };
+        const index = remaining.length;
         remaining.push(quarantinedEntry);
-        await sendQuarantineAlert(quarantinedEntry);
+        await sendQuarantineAlert(quarantinedEntry, index);
       } else {
         remaining.push({ ...entry, attempts });
       }

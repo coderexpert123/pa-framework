@@ -93,17 +93,39 @@ function networkFailure(err: unknown): SendResult {
  *  (no parse_mode in payload). Pass `'MarkdownV2'` to route through
  *  `sanitizeMdV2` (the body is escaped before the italic `_Ref: <id>_`
  *  trailer is appended raw). Defaults to legacy `'Markdown'`.
+ *
+ * Ref handling: a fresh `s-` ref is minted and appended UNLESS the text
+ * already ends with a caller-stamped `_Ref: <prefix>-<hex>_` trailer — that
+ * id is reused verbatim (extracted before sanitization, re-appended raw), so
+ * a message never carries two refs and its delivery log row keys under the
+ * caller's id.
  */
 export async function sendToTelegram(
   text: string,
   config: TelegramOutput,
   token: string,
   parseMode?: string | false,
+  /** Inline keyboard attached to the LAST chunk only (one keyboard per message;
+   *  the press must land where the reader finishes). Carried into the plain-text
+   *  fallback because that path mutates the same `body` (2026-08-24 buttons program, P3). */
+  replyMarkup?: Record<string, unknown>,
 ): Promise<SendResult> {
-  const refId = `s-${randomBytes(6).toString('hex')}`;
-
   // Apply redaction as the last line of defense
-  const redactedText = redactSecrets(text) as string;
+  const redactedText = String(redactSecrets(text) ?? '');
+
+  // Ref reuse (2026-08-26): callers may stamp their own ref trailer — catchup's
+  // lock-lost alert mints and logs its refId in the body BEFORE notifyUser
+  // runs, and this send used to append a SECOND trailer, so the delivered
+  // message carried two refs while the delivery row keyed under an id nobody
+  // quoted. A TRAILING `_Ref: <prefix>-<hex>_` on the redacted text is now
+  // extracted before sanitization and reused: the message carries exactly one
+  // ref, and every log row below (send, 429 retries, failures, aborts) keys
+  // under the caller's id, so `pa ref` resolves origin AND delivery. A
+  // mid-text `_Ref:` occurrence is NOT a trailer — quoted refs stay quoted.
+  const trimmedInput = redactedText.trim();
+  const stampedRef = /_Ref: ([a-z]+)-([0-9a-f]{4,16})_\s*$/.exec(trimmedInput);
+  const refId = stampedRef ? `${stampedRef[1]}-${stampedRef[2]}` : `s-${randomBytes(6).toString('hex')}`;
+  const bodyCore = stampedRef ? trimmedInput.slice(0, stampedRef.index).trimEnd() : trimmedInput;
 
   // Preflight guards — both of these produce a guaranteed Telegram 400, so we
   // refuse to issue the HTTP call at all and report the reason to the caller.
@@ -115,7 +137,7 @@ export async function sendToTelegram(
     });
     return { ok: false, reason: 'no-chat-id' };
   }
-  if (!redactedText || !redactedText.trim()) {
+  if (!bodyCore) {
     console.error('[pa/telegram] sendToTelegram aborted: message text is empty');
     log('error', 'telegram', 'send aborted — empty text', {
       refId,
@@ -128,13 +150,14 @@ export async function sendToTelegram(
   // For MarkdownV2 callers, sanitize the body so identifiers (node_modules,
   // snake_case), Windows paths, parens, etc. don't trigger parse failures.
   // The italic `_Ref: <id>_` trailer is appended AFTER sanitize so its markers
-  // survive raw and render as italic. Body that happens to literally contain
-  // `_Ref: ...` will have its underscores escaped (`\_Ref: ...\_`) which means
-  // the fallback regex on line ~75 won't match the body occurrence — only the
-  // appended trailer. That's the desired behavior.
+  // survive raw and render as italic. A trailing caller-stamped ref was
+  // already extracted above (bodyCore), so sanitize never touches the trailer
+  // that gets re-appended; a MID-BODY `_Ref: ...` occurrence still has its
+  // underscores escaped (`\_Ref: ...\_`), so the fallback regex below matches
+  // only the appended trailer. That's the desired behavior.
   // The `-` inside the refId (e.g. `s-9b43`) MUST be escaped under MdV2 even
   // inside the italic span — Telegram rejects raw `-` everywhere outside code.
-  const safeBody = parseMode === 'MarkdownV2' ? sanitizeMdV2(normalizeMarkdown(redactedText.trim())) : redactedText.trim();
+  const safeBody = parseMode === 'MarkdownV2' ? sanitizeMdV2(normalizeMarkdown(bodyCore)) : bodyCore;
   const refTrailer = parseMode === 'MarkdownV2' ? `_Ref: ${refId.replace('-', '\\-')}_` : `_Ref: ${refId}_`;
   const textWithRef = `${safeBody}\n\n${refTrailer}`;
   const chunks = splitMessage(textWithRef);
@@ -152,6 +175,9 @@ export async function sendToTelegram(
     };
     if (config.thread_id !== undefined && config.thread_id !== 0) {
       body.message_thread_id = config.thread_id;
+    }
+    if (replyMarkup !== undefined && chunkIndex === chunks.length - 1) {
+      body.reply_markup = replyMarkup;
     }
 
     let attempt = 0;

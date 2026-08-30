@@ -42,6 +42,25 @@ export interface PendingDispatch {
   /** The worker that was actually dispatched (for native-resume args and
    * recovery UX when the dispatch has no session). Set at dispatch time. */
   workerName?: string;
+  /** True once userText reflects the settled transcription result (success
+   * transcript or failure marker) rather than the enqueue-time placeholder.
+   * Set by the enqueue-block backfill and by the dispatch-time record when
+   * voiceTranscribed (main.ts, 2026-08-27 backfill spec). The orphan reaper
+   * and the rs: callback guard read it to tell a lost transcript from a
+   * recovered one. */
+  userTextSettled?: boolean;
+  /** Times this dispatch was auto-requeued through the synthetic path (reaper
+   *  exhaustion, voice revive, or the maintenance drain). Absent = 0. Cap:
+   *  PA_REQUEUE_MAX (default 2) — read via the frozen env-literal (SPEC §2). */
+  requeueCount?: number;
+  /** Epoch ms. Set when a requeued synthetic's dispatch fails below the cap
+   *  (main.ts suppression); the maintenance drain re-injects once due. Present
+   *  ⇒ the startup reaper skips the record entirely ('parked'). */
+  requeueNotBefore?: number;
+  /** Telegram file_id of the enqueue-time voice/audio/video_note attachment
+   *  (name is historical — covers all three kinds). Enables the reaper's
+   *  re-download + re-transcription revive path. Written at enqueue only. */
+  voiceFileId?: string;
 }
 
 function storePath(): string {

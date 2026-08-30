@@ -275,3 +275,17 @@ describe('AI-098 integration: backoff never throttles a skill below its own sche
     );
   });
 });
+
+describe('WP-B: catchup gates pa-host maintenance to a single topic (2026-08-23)', () => {
+  it('does not run pa-host maintenance for topic:reminders, but does for topic:default', async () => {
+    const statePath = join(dir, 'maintenance-state.json');
+
+    await catchupCommand({ topic: 'reminders' });
+    const afterReminders = await readFile(statePath, 'utf8').catch(() => null);
+    assert.equal(afterReminders, null, 'topic:reminders must not create the maintenance ledger');
+
+    await catchupCommand({ topic: 'default' });
+    const afterDefault = await readFile(statePath, 'utf8').catch(() => null);
+    assert.ok(afterDefault, 'topic:default must run pa-host maintenance and create the ledger');
+  });
+});

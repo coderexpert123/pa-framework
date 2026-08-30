@@ -1,6 +1,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, readFile, writeFile, access } from 'fs/promises';
+import { mkdtempSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { acquireLock, releaseLock } from '../lock.js';
@@ -17,7 +18,11 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  delete process.env.PA_HOME;
+  // D15 (2026-08-23): reset, never delete. `delete process.env.PA_HOME` is
+  // the exact pattern that sent 3 real Telegram alerts on 2026-08-18 — a late
+  // fire-and-forget write after the delete resolved paHome() to the REAL
+  // ~/.pa. Byte-for-byte the shape of pa/tests/helpers.ts:85-93.
+  process.env.PA_HOME = process.env.PA_TEST_LOG_HOME ?? mkdtempSync(join(tmpdir(), 'tgbot-lock-fallback-'));
   await rm(tempDir, { recursive: true, force: true });
 });
 
@@ -145,5 +150,22 @@ describe('lock round-trip', () => {
 
     const second = await acquireLock();
     assert.equal(second, true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// test-isolation regression (D15, WP-D, AI-156, 2026-08-23)
+// ---------------------------------------------------------------------------
+
+describe('afterEach PA_HOME handling', () => {
+  it('leaves PA_HOME set, never unset', async () => {
+    // Drive one full beforeEach/afterEach cycle via a real test-like sequence,
+    // then assert this suite's OWN afterEach (which already ran once for
+    // whichever test executed immediately before this one) never deleted
+    // PA_HOME. `delete process.env.PA_HOME` is the exact pattern that sent 3
+    // real Telegram alerts on 2026-08-18 (a late fire-and-forget write after
+    // the delete resolved paHome() to the REAL ~/.pa).
+    assert.notEqual(process.env.PA_HOME, undefined, 'PA_HOME must remain set between tests');
+    assert.notEqual(process.env.PA_HOME, '', 'PA_HOME must not be reset to an empty string');
   });
 });

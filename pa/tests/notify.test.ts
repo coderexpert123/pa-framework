@@ -1,9 +1,12 @@
+import './test-env-guard.js';
+
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFile, readFile, mkdir, readdir } from 'fs/promises';
 import { join } from 'path';
 import { createHash } from 'crypto';
 import { createTempPaHome, createTempSecrets, cleanup } from './helpers.js';
+import type { DigestDayFile } from '../src/lib/notify.js';
 
 let tempDir: string;
 
@@ -350,18 +353,24 @@ describe('notifyUser — route resolution and confirmed delivery', () => {
     assert.equal(await dedupFileExists('rejected-key'), false, 'a rejected alert must stay un-deduped');
   });
 
-  it('reports a timed-out send honestly and writes NO dedup state', async () => {
+  it('reports a timed-out send honestly and writes only the short timeout mute, never an escalated window', async () => {
     await createTempSecrets(tempDir, 'TELEGRAM_BOT_TOKEN=tok\nPA_ALERTS_CHAT_ID=-100777\n');
     process.env.PA_NOTIFY_TIMEOUT_MS = '20';
     setupFetchMock(['hang']);
-    const { notifyUser } = await import('../src/lib/notify.js');
+    const { notifyUser, TIMEOUT_DEDUP_MS } = await import('../src/lib/notify.js');
 
     const result = await notifyUser('Test', 'body', { dedupKey: 'timeout-key' });
 
     assert.equal(result.sent, false);
     assert.equal(result.suppressed, false);
     assert.equal(result.reason, 'timeout-unknown-outcome', 'the race does not cancel the send — outcome is unknown, not failed');
-    assert.equal(await dedupFileExists('timeout-key'), false);
+    // 2026-08-23 (alerts wave, WP-D): a timeout used to write NO dedup state, so a
+    // chronically-timing-out alert re-fired on every per-minute tick (the 429 loop of
+    // plans/2026-08-23-alerts-week-review.md §5.4). It now writes a SHORT mute only —
+    // TIMEOUT_DEDUP_MS, count not advanced — never the confirmed-send escalated window.
+    const record = await readDedupFile('timeout-key');
+    assert.equal(record.windowMs, TIMEOUT_DEDUP_MS, 'timeout writes the short mute, not a confirmed-send window');
+    assert.equal(record.count ?? 0, 0, 'a timeout is not a confirmed send — escalation count must not advance');
   });
 
   it('suppresses the second alert once the first is confirmed delivered', async () => {
@@ -390,6 +399,179 @@ describe('notifyUser — route resolution and confirmed delivery', () => {
     assert.equal(result.reason, 'disabled');
     assert.equal(calls.length, 0);
     assert.equal(await dedupFileExists('disabled-route-key'), false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Escalating dedup + timeout short-dedup (2026-08-23 alerts wave, WP-D).
+//
+// A permanently failing condition used to page every flat dedup window
+// forever (restore-drill: 180 sends in 7.5 days). An UNCHANGED body now
+// doubles its stored window on each confirmed send, capped at
+// ESCALATION_CAP_MS (24h); a CHANGED body resets to count 1 / the base
+// window. A send that TIMES OUT (unknown outcome) writes a short
+// TIMEOUT_DEDUP_MS mute instead — the 429 loop of review §5.4 was a
+// timed-out send re-firing on every per-minute catchup tick because dedup
+// was written only on confirmed success.
+// ---------------------------------------------------------------------------
+
+describe('notifyUser — escalating dedup', () => {
+  let savedEnv: Record<string, string | undefined>;
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    savedEnv = {};
+    for (const key of ROUTE_ENV_KEYS) {
+      savedEnv[key] = process.env[key];
+      delete process.env[key];
+    }
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    for (const key of ROUTE_ENV_KEYS) {
+      if (savedEnv[key] !== undefined) process.env[key] = savedEnv[key];
+      else delete process.env[key];
+    }
+    globalThis.fetch = originalFetch;
+  });
+
+  it('doubles the stored window on each confirmed send of an unchanged body, capped at 24h', async () => {
+    await createTempSecrets(tempDir, 'TELEGRAM_BOT_TOKEN=tok\nPA_ALERTS_CHAT_ID=-100777\n');
+    const { notifyUser } = await import('../src/lib/notify.js');
+
+    // count 1..7 -> 1h, 2h, 4h, 8h, 16h, 24h, 24h (capped)
+    const expectedWindows = [3_600_000, 7_200_000, 14_400_000, 28_800_000, 57_600_000, 86_400_000, 86_400_000];
+    for (const windowMs of expectedWindows) {
+      setupFetchMock([{ ok: true }]);
+      // breaker: false — this loop performs 7 confirmed sends for one key in one day;
+      // the 2026-08-30 breaker would cap it at 3.
+      await notifyUser('Test', 'same body', { dedupKey: 'escalate-key', breaker: false });
+      const record = await readDedupFile('escalate-key');
+      assert.equal(record.windowMs, windowMs);
+      // Push the just-written record's timestamp into the past so the NEXT
+      // call lands past its (now-escalated) window and attempts a send
+      // instead of being dedup-suppressed.
+      await writeFile(dedupPath('escalate-key'), JSON.stringify({ ...record, timestamp: new Date(Date.now() - windowMs - 1000).toISOString() }), 'utf8');
+    }
+  });
+
+  it('resets count and window to the base when the body changes', async () => {
+    await createTempSecrets(tempDir, 'TELEGRAM_BOT_TOKEN=tok\nPA_ALERTS_CHAT_ID=-100777\n');
+    const { notifyUser } = await import('../src/lib/notify.js');
+
+    setupFetchMock([{ ok: true }]);
+    await notifyUser('Test', 'body A', { dedupKey: 'change-key' });
+    let record = await readDedupFile('change-key');
+    assert.equal(record.count, 1);
+    assert.equal(record.windowMs, 3_600_000);
+
+    // Escalate once more with the SAME body so count/window move off base.
+    await writeFile(dedupPath('change-key'), JSON.stringify({ ...record, timestamp: new Date(Date.now() - record.windowMs - 1000).toISOString() }), 'utf8');
+    setupFetchMock([{ ok: true }]);
+    await notifyUser('Test', 'body A', { dedupKey: 'change-key' });
+    record = await readDedupFile('change-key');
+    assert.equal(record.count, 2);
+    assert.equal(record.windowMs, 7_200_000);
+
+    // Push past the window again and send a DIFFERENT body — count/window
+    // must reset to base, not continue escalating.
+    await writeFile(dedupPath('change-key'), JSON.stringify({ ...record, timestamp: new Date(Date.now() - record.windowMs - 1000).toISOString() }), 'utf8');
+    setupFetchMock([{ ok: true }]);
+    await notifyUser('Test', 'body B — different', { dedupKey: 'change-key' });
+    record = await readDedupFile('change-key');
+    assert.equal(record.count, 1, 'a changed body resets count to 1');
+    assert.equal(record.windowMs, 3_600_000, 'a changed body resets the window to the caller base');
+  });
+
+  it('escalate: false keeps count and window flat across repeated confirmed sends', async () => {
+    await createTempSecrets(tempDir, 'TELEGRAM_BOT_TOKEN=tok\nPA_ALERTS_CHAT_ID=-100777\n');
+    const { notifyUser } = await import('../src/lib/notify.js');
+
+    for (let i = 0; i < 3; i++) {
+      setupFetchMock([{ ok: true }]);
+      await notifyUser('Test', 'same body', { dedupKey: 'noescalate-key', dedupWindowMs: 60_000, escalate: false });
+      const record = await readDedupFile('noescalate-key');
+      assert.equal(record.count, 1);
+      assert.equal(record.windowMs, 60_000);
+      await writeFile(dedupPath('noescalate-key'), JSON.stringify({ ...record, timestamp: new Date(Date.now() - 61_000).toISOString() }), 'utf8');
+    }
+  });
+
+  it('treats a legacy record (no count/bodyHash) as same-body and escalates from 1', async () => {
+    await createTempSecrets(tempDir, 'TELEGRAM_BOT_TOKEN=tok\nPA_ALERTS_CHAT_ID=-100777\n');
+    // Legacy shape: {timestamp, key} only — written by writeDedupFile — 2h old,
+    // past the 1h default window so the next call is not dedup-suppressed.
+    await writeDedupFile('legacy-key', new Date(Date.now() - 2 * 3_600_000).toISOString());
+    setupFetchMock([{ ok: true }]);
+    const { notifyUser } = await import('../src/lib/notify.js');
+
+    await notifyUser('Test', 'body', { dedupKey: 'legacy-key' });
+    const record = await readDedupFile('legacy-key');
+    assert.equal(record.count, 1);
+    assert.equal(record.windowMs, 3_600_000);
+    assert.equal(typeof record.bodyHash, 'string');
+  });
+
+  it('gcAlertState respects an escalated window, not the flat 24h default, at deletion time', async () => {
+    const { gcAlertState } = await import('../src/lib/notify.js');
+    await mkdir(join(tempDir, 'alert-state'), { recursive: true });
+
+    // Escalated to 8h (count 4): timestamp 9h ago -> past its own window -> deleted.
+    await writeFile(dedupPath('escalated-expired'), JSON.stringify({
+      timestamp: new Date(Date.now() - 9 * 3_600_000).toISOString(), key: 'escalated-expired', windowMs: 8 * 3_600_000, count: 4, bodyHash: 'abc',
+    }), 'utf8');
+    // Escalated to 24h (count 6): timestamp 9h ago -> still within its window -> kept.
+    await writeFile(dedupPath('escalated-alive'), JSON.stringify({
+      timestamp: new Date(Date.now() - 9 * 3_600_000).toISOString(), key: 'escalated-alive', windowMs: 24 * 3_600_000, count: 6, bodyHash: 'def',
+    }), 'utf8');
+
+    await gcAlertState();
+
+    const expiredExists = await readFile(dedupPath('escalated-expired'), 'utf8').then(() => true).catch(() => false);
+    const aliveExists = await readFile(dedupPath('escalated-alive'), 'utf8').then(() => true).catch(() => false);
+    assert.equal(expiredExists, false, 'a record whose escalated window has passed must be GC-ed');
+    assert.equal(aliveExists, true, 'a record whose escalated window has not passed must survive');
+  });
+});
+
+describe('notifyUser — timeout short-dedup', () => {
+  let savedEnv: Record<string, string | undefined>;
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    savedEnv = {};
+    for (const key of ROUTE_ENV_KEYS) {
+      savedEnv[key] = process.env[key];
+      delete process.env[key];
+    }
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    for (const key of ROUTE_ENV_KEYS) {
+      if (savedEnv[key] !== undefined) process.env[key] = savedEnv[key];
+      else delete process.env[key];
+    }
+    globalThis.fetch = originalFetch;
+  });
+
+  it('writes a short TIMEOUT_DEDUP_MS mute (count unchanged) and suppresses the immediate retry', async () => {
+    await createTempSecrets(tempDir, 'TELEGRAM_BOT_TOKEN=tok\nPA_ALERTS_CHAT_ID=-100777\n');
+    process.env.PA_NOTIFY_TIMEOUT_MS = '20';
+    setupFetchMock(['hang']);
+    const { notifyUser, TIMEOUT_DEDUP_MS } = await import('../src/lib/notify.js');
+
+    const first = await notifyUser('Test', 'body', { dedupKey: 'timeout-dedup-key' });
+    assert.equal(first.reason, 'timeout-unknown-outcome');
+
+    const record = await readDedupFile('timeout-dedup-key');
+    assert.equal(record.windowMs, TIMEOUT_DEDUP_MS);
+    assert.equal(record.count, 0, 'a timeout is not a confirmed send — count must not advance');
+
+    const second = await notifyUser('Test', 'body', { dedupKey: 'timeout-dedup-key' });
+    assert.equal(second.suppressed, true);
+    assert.equal(second.reason, 'dedup-suppressed');
   });
 });
 
@@ -654,5 +836,332 @@ describe('notifyUser — runbook field', () => {
       runbook: 'runbooks/test.md',
       severity: 'warn',
     });
+  });
+});
+
+describe('notifyUser — circuit breaker', () => {
+  const ROUTE_ENV_KEYS = ['PA_NOTIFY_DISABLED', 'PA_NOTIFY_TIMEOUT_MS', 'TELEGRAM_BOT_TOKEN', 'PA_ALERTS_CHAT_ID', 'PA_ALERTS_THREAD_ID'];
+  let savedEnv: Record<string, string | undefined>;
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    savedEnv = {};
+    for (const key of ROUTE_ENV_KEYS) {
+      savedEnv[key] = process.env[key];
+      delete process.env[key];
+    }
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    for (const key of ROUTE_ENV_KEYS) {
+      if (savedEnv[key] !== undefined) process.env[key] = savedEnv[key];
+      else delete process.env[key];
+    }
+    globalThis.fetch = originalFetch;
+  });
+
+  function setupFetchMock(responses: Array<{ ok: boolean }>) {
+    let callCount = 0;
+    (globalThis as any).fetch = async () => {
+      const response = responses[Math.min(callCount, responses.length - 1)];
+      callCount++;
+      return response;
+    };
+  }
+
+  function todayKey(): string {
+    const d = new Date();
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${dd}`;
+  }
+
+  function yesterdayKey(): string {
+    const d = new Date(Date.now() - 24 * 3600_000);
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${dd}`;
+  }
+
+  it('caps a family at BREAKER_DEFAULT_CAP delivered per local day; the cap+1 call is breaker-open and lands in the digest', async () => {
+    await createTempSecrets(tempDir, 'TELEGRAM_BOT_TOKEN=tok\nPA_ALERTS_CHAT_ID=-100777\n');
+    const { notifyUser, BREAKER_DEFAULT_CAP } = await import('../src/lib/notify.js');
+
+    setupFetchMock([{ ok: true }]);
+    for (let i = 0; i < BREAKER_DEFAULT_CAP + 1; i++) {
+      const result = await notifyUser('Test', `body ${i}`, { dedupKey: 'cap-key' });
+      if (i < BREAKER_DEFAULT_CAP) {
+        assert.equal(result.sent, true);
+        assert.equal(result.suppressed, false);
+      } else {
+        assert.equal(result.sent, false);
+        assert.equal(result.suppressed, true);
+        assert.equal(result.reason, 'breaker-open');
+      }
+      // Push past the dedup window so the next call isn't dedup-suppressed
+      const record = await readDedupFile('cap-key');
+      await writeFile(dedupPath('cap-key'), JSON.stringify({ ...record, timestamp: new Date(Date.now() - 3600_1000).toISOString() }), 'utf8');
+    }
+
+    // Digest file should exist with one entry
+    const digestPath = join(tempDir, 'alert-digest', `${todayKey()}.json`);
+    const digest = JSON.parse(await readFile(digestPath, 'utf8'));
+    assert.ok(digest.families['cap-key']);
+    assert.equal(digest.families['cap-key'].count, 1);
+  });
+
+  it('breaker-open writes NO dedup state (send-only invariant)', async () => {
+    await createTempSecrets(tempDir, 'TELEGRAM_BOT_TOKEN=tok\nPA_ALERTS_CHAT_ID=-100777\n');
+    const { notifyUser, BREAKER_DEFAULT_CAP } = await import('../src/lib/notify.js');
+
+    // First 3 sends succeed
+    setupFetchMock([{ ok: true }, { ok: true }, { ok: true }]);
+    for (let i = 0; i < BREAKER_DEFAULT_CAP; i++) {
+      await notifyUser('Test', `body ${i}`, { dedupKey: 'no-state-key' });
+      const record = await readDedupFile('no-state-key');
+      await writeFile(dedupPath('no-state-key'), JSON.stringify({ ...record, timestamp: new Date(Date.now() - 3600_1000).toISOString() }), 'utf8');
+    }
+
+    // 4th call trips breaker
+    setupFetchMock([{ ok: true }]);
+    const afterTrip = await notifyUser('Test', 'body 4', { dedupKey: 'no-state-key' });
+    assert.equal(afterTrip.reason, 'breaker-open');
+
+    // Dedup state is UNCHANGED from after 3rd send
+    const record = await readDedupFile('no-state-key');
+    assert.equal(record.deliveredToday, BREAKER_DEFAULT_CAP);
+    assert.equal(record.day, todayKey());
+  });
+
+  it('breaker: false bypasses the cap', async () => {
+    await createTempSecrets(tempDir, 'TELEGRAM_BOT_TOKEN=tok\nPA_ALERTS_CHAT_ID=-100777\n');
+    const { notifyUser, BREAKER_DEFAULT_CAP } = await import('../src/lib/notify.js');
+
+    setupFetchMock([{ ok: true }]);
+    for (let i = 0; i < BREAKER_DEFAULT_CAP + 2; i++) {
+      const result = await notifyUser('Test', `body ${i}`, { dedupKey: 'bypass-key', breaker: false });
+      assert.equal(result.sent, true);
+      const record = await readDedupFile('bypass-key');
+      await writeFile(dedupPath('bypass-key'), JSON.stringify({ ...record, timestamp: new Date(Date.now() - 3600_1000).toISOString() }), 'utf8');
+    }
+  });
+
+  it('deliveredToday resets on a new local day', async () => {
+    await createTempSecrets(tempDir, 'TELEGRAM_BOT_TOKEN=tok\nPA_ALERTS_CHAT_ID=-100777\n');
+    const { notifyUser, BREAKER_DEFAULT_CAP } = await import('../src/lib/notify.js');
+
+    // Pre-write a record with yesterday's key at cap (fresh temp PA_HOME per
+    // test — create alert-state before writing into it)
+    await mkdir(join(tempDir, 'alert-state'), { recursive: true });
+    await writeFile(dedupPath('reset-key'), JSON.stringify({
+      timestamp: new Date(Date.now() - 48 * 3600_000).toISOString(),
+      key: 'reset-key',
+      windowMs: 3600_000,
+      count: BREAKER_DEFAULT_CAP,
+      bodyHash: 'abc123',
+      day: yesterdayKey(),
+      deliveredToday: BREAKER_DEFAULT_CAP,
+    }), 'utf8');
+
+    // One send should succeed (new day reset count to 0, then +1)
+    setupFetchMock([{ ok: true }]);
+    const result = await notifyUser('Test', 'body', { dedupKey: 'reset-key' });
+    assert.equal(result.sent, true);
+
+    const record = await readDedupFile('reset-key');
+    assert.equal(record.day, todayKey());
+    assert.equal(record.deliveredToday, 1);
+  });
+
+  it('a legacy record with no day/deliveredToday fields starts counting from 0', async () => {
+    await createTempSecrets(tempDir, 'TELEGRAM_BOT_TOKEN=tok\nPA_ALERTS_CHAT_ID=-100777\n');
+    const { notifyUser } = await import('../src/lib/notify.js');
+
+    // Legacy record: no day/deliveredToday, expired timestamp
+    await mkdir(join(tempDir, 'alert-state'), { recursive: true });
+    await writeFile(dedupPath('legacy-no-breaker'), JSON.stringify({
+      timestamp: new Date(Date.now() - 2 * 3600_000).toISOString(),
+      key: 'legacy-no-breaker',
+      windowMs: 3600_000,
+      count: 1,
+      bodyHash: 'abc123',
+    }), 'utf8');
+
+    setupFetchMock([{ ok: true }]);
+    const result = await notifyUser('Test', 'body', { dedupKey: 'legacy-no-breaker' });
+    assert.equal(result.sent, true, 'should NOT be breaker-open');
+
+    const record = await readDedupFile('legacy-no-breaker');
+    assert.equal(record.deliveredToday, 1);
+    assert.equal(record.day, todayKey());
+  });
+
+  it('calls without dedupKey never hit the breaker', async () => {
+    await createTempSecrets(tempDir, 'TELEGRAM_BOT_TOKEN=tok\nPA_ALERTS_CHAT_ID=-100777\n');
+    const { notifyUser } = await import('../src/lib/notify.js');
+
+    setupFetchMock([{ ok: true }, { ok: true }, { ok: true }, { ok: true }, { ok: true }]);
+    for (let i = 0; i < 5; i++) {
+      const result = await notifyUser('Test', `body ${i}`);
+      assert.equal(result.sent, true);
+    }
+  });
+
+  it('a timeout does not advance deliveredToday (unknown outcome is not a delivery)', async () => {
+    process.env.PA_NOTIFY_TIMEOUT_MS = '20';
+    await createTempSecrets(tempDir, 'TELEGRAM_BOT_TOKEN=tok\nPA_ALERTS_CHAT_ID=-100777\n');
+    const { notifyUser, BREAKER_DEFAULT_CAP } = await import('../src/lib/notify.js');
+
+    // Pre-write a record at cap-1, expired
+    await mkdir(join(tempDir, 'alert-state'), { recursive: true });
+    await writeFile(dedupPath('timeout-key'), JSON.stringify({
+      timestamp: new Date(Date.now() - 3600_000).toISOString(),
+      key: 'timeout-key',
+      windowMs: 3600_000,
+      count: 1,
+      bodyHash: 'abc123',
+      day: todayKey(),
+      deliveredToday: BREAKER_DEFAULT_CAP - 1,
+    }), 'utf8');
+
+    // Mock a hang
+    (globalThis as any).fetch = async () => {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      return { ok: true };
+    };
+
+    const result = await notifyUser('Test', 'body', { dedupKey: 'timeout-key' });
+    assert.equal(result.reason, 'timeout-unknown-outcome');
+
+    const record = await readDedupFile('timeout-key');
+    assert.equal(record.deliveredToday, BREAKER_DEFAULT_CAP - 1, 'should NOT advance');
+  });
+
+  it('repeated breaker-opens increment the digest entry and update lastAt', async () => {
+    await createTempSecrets(tempDir, 'TELEGRAM_BOT_TOKEN=tok\nPA_ALERTS_CHAT_ID=-100777\n');
+    const { notifyUser, BREAKER_DEFAULT_CAP } = await import('../src/lib/notify.js');
+
+    // First cap+1 sends to trip
+    setupFetchMock([{ ok: true }, { ok: true }, { ok: true }]);
+    for (let i = 0; i < BREAKER_DEFAULT_CAP; i++) {
+      await notifyUser('Test', `body ${i}`, { dedupKey: 'repeat-key' });
+      const record = await readDedupFile('repeat-key');
+      await writeFile(dedupPath('repeat-key'), JSON.stringify({ ...record, timestamp: new Date(Date.now() - 3600_1000).toISOString() }), 'utf8');
+    }
+    setupFetchMock([{ ok: true }]);
+    await notifyUser('Test', 'body trip', { dedupKey: 'repeat-key' });
+
+    // Two more suppressed calls
+    for (let i = 0; i < 2; i++) {
+      setupFetchMock([{ ok: true }]);
+      await notifyUser('Test', `body after ${i}`, { dedupKey: 'repeat-key' });
+    }
+
+    const digestPath = join(tempDir, 'alert-digest', `${todayKey()}.json`);
+    const digest = JSON.parse(await readFile(digestPath, 'utf8'));
+    assert.equal(digest.families['repeat-key'].count, 3);
+    assert.ok(digest.families['repeat-key'].lastAt > digest.families['repeat-key'].firstAt);
+  });
+
+  it('breaker suppression works under PA_NOTIFY_DISABLED=1 (placement before the disabled guard)', async () => {
+    process.env.PA_NOTIFY_DISABLED = '1';
+    await createTempSecrets(tempDir, 'TELEGRAM_BOT_TOKEN=tok\nPA_ALERTS_CHAT_ID=-100777\n');
+    const { notifyUser, BREAKER_DEFAULT_CAP } = await import('../src/lib/notify.js');
+
+    // Pre-write a tripped record
+    await mkdir(join(tempDir, 'alert-state'), { recursive: true });
+    await writeFile(dedupPath('disabled-key'), JSON.stringify({
+      timestamp: new Date(Date.now() - 3600_000).toISOString(),
+      key: 'disabled-key',
+      windowMs: 3600_000,
+      count: 1,
+      bodyHash: 'abc123',
+      day: todayKey(),
+      deliveredToday: BREAKER_DEFAULT_CAP,
+    }), 'utf8');
+
+    const result = await notifyUser('Test', 'body', { dedupKey: 'disabled-key' });
+    assert.equal(result.suppressed, true);
+    assert.equal(result.reason, 'breaker-open');
+
+    const digestPath = join(tempDir, 'alert-digest', `${todayKey()}.json`);
+    const digest = JSON.parse(await readFile(digestPath, 'utf8'));
+    assert.ok(digest.families['disabled-key']);
+  });
+});
+
+describe('digest flush helpers', () => {
+  function todayKey(): string {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+
+  function yesterdayKey(): string {
+    const d = new Date(Date.now() - 24 * 3600_000);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+
+  function dayBeforeKey(): string {
+    const d = new Date(Date.now() - 2 * 24 * 3600_000);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+
+  async function writeDigestFile(date: string, families: Record<string, { count: number; subject: string; firstAt: string; lastAt: string }>, flushedAt?: string): Promise<void> {
+    const dir = join(tempDir, 'alert-digest');
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, `${date}.json`), JSON.stringify({ date, families, flushedAt }), 'utf8');
+  }
+
+  it('collectUnflushedDigests returns strictly-before-today, non-empty, unflushed files, oldest first', async () => {
+    const { collectUnflushedDigests } = await import('../src/lib/notify.js');
+
+    // Each exclusion condition gets its OWN date file — same-date writes
+    // overwrite each other and would defeat the scenario.
+    const dayKey = (offsetDays: number): string => {
+      const d = new Date(Date.now() - offsetDays * 24 * 3600_000);
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    };
+    await writeDigestFile(dayKey(4), { familyFlushed: { count: 1, subject: 'F', firstAt: '2024-01-01T00:00:00.000Z', lastAt: '2024-01-01T01:00:00.000Z' } }, '2024-01-01T02:00:00.000Z'); // flushed -> excluded
+    await writeDigestFile(dayKey(3), {}); // empty families -> excluded
+    await writeDigestFile(dayBeforeKey(), { family2: { count: 1, subject: 'Test2', firstAt: '2024-01-01T00:00:00.000Z', lastAt: '2024-01-01T01:00:00.000Z' } }); // oldest KEPT
+    await writeDigestFile(yesterdayKey(), { family1: { count: 2, subject: 'Test', firstAt: '2024-01-01T00:00:00.000Z', lastAt: '2024-01-01T01:00:00.000Z' } }); // KEPT
+    await writeDigestFile(todayKey(), { family3: { count: 1, subject: 'Test3', firstAt: '2024-01-01T00:00:00.000Z', lastAt: '2024-01-01T01:00:00.000Z' } }); // today -> excluded
+    await mkdir(join(tempDir, 'alert-digest'), { recursive: true });
+    await writeFile(join(tempDir, 'alert-digest', 'corrupt.json'), '{invalid json', 'utf8');
+
+    const files = await collectUnflushedDigests(Date.now());
+    assert.equal(files.length, 2);
+    assert.equal(files[0].date, dayBeforeKey());
+    assert.equal(files[1].date, yesterdayKey());
+  });
+
+  it('formatDigestMessage produces one line per family with the pinned format', async () => {
+    const { formatDigestMessage } = await import('../src/lib/notify.js');
+
+    const files: DigestDayFile[] = [
+      { date: '2024-01-01', path: '/x/2024-01-01.json', families: { family1: { count: 2, subject: 'Test', firstAt: '2024-01-01T00:00:00.000Z', lastAt: '2024-01-01T01:00:00.000Z' } } },
+      { date: '2024-01-02', path: '/x/2024-01-02.json', families: { family2: { count: 1, subject: 'Test2', firstAt: '2024-01-02T00:00:00.000Z', lastAt: '2024-01-02T01:00:00.000Z' } } },
+    ];
+    const { subject, body } = formatDigestMessage(files);
+    assert.equal(subject, 'Alert digest 2024-01-01, 2024-01-02');
+    assert.ok(body.includes('family1 ×2 (first 2024-01-01T00:00:00.000Z, last 2024-01-01T01:00:00.000Z)'));
+    assert.ok(body.includes('family2 ×1 (first 2024-01-02T00:00:00.000Z, last 2024-01-02T01:00:00.000Z)'));
+  });
+
+  it('markDigestFlushed writes flushedAt and round-trips through collectUnflushedDigests', async () => {
+    const { collectUnflushedDigests, markDigestFlushed } = await import('../src/lib/notify.js');
+
+    await writeDigestFile(yesterdayKey(), { family1: { count: 1, subject: 'Test', firstAt: '2024-01-01T00:00:00.000Z', lastAt: '2024-01-01T01:00:00.000Z' } });
+
+    const before = await collectUnflushedDigests(Date.now());
+    assert.equal(before.length, 1);
+
+    await markDigestFlushed(before[0], Date.now());
+
+    const after = await collectUnflushedDigests(Date.now());
+    assert.equal(after.length, 0);
   });
 });

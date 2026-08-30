@@ -54,7 +54,7 @@ export function resetUsageParseFailures(): void {
  * Returns undefined if no usage data is found in the event.
  *
  * Supports:
- * - agy (Gemini CLI): event.usage or event.result?.usage
+ * - agy (Antigravity CLI; Gemini-model usage events): event.usage or event.result?.usage
  * - claude/zclaude: event.usage or event.message?.usage
  * - codex: event.usage (if available)
  */
