@@ -12,6 +12,8 @@ import {
   getDescendantPids,
   getCommandLines,
   areProcessesAlive,
+  getChildPids,
+  hasChildProcesses,
 } from '../src/process-tree.js';
 import type { ExecFn } from '../src/process-tree.js';
 
@@ -163,5 +165,101 @@ describe('areProcessesAlive', () => {
     const result = await areProcessesAlive([], mockFn);
     assert.equal(result.size, 0);
     assert.equal(called, false);
+  });
+});
+
+// ── getChildPids / hasChildProcesses (snapshot refactor) ─────────────────────
+
+describe('getChildPids', () => {
+  it('returns children from snapshot', async () => {
+    // Tree: 100 → 200, 201
+    const rows: Array<[number, number]> = [
+      [1, 0], [100, 1], [200, 100], [201, 100], [999, 1],
+    ];
+    const result = await getChildPids(100, mockExec(descendantOutput(rows)));
+    assert.deepEqual(result.sort((a, b) => a - b), [200, 201]);
+  });
+
+  it('returns empty array when pid has no children', async () => {
+    const rows: Array<[number, number]> = [[1, 0], [100, 1], [200, 1]];
+    const result = await getChildPids(999, mockExec(descendantOutput(rows)));
+    assert.deepEqual(result, []);
+  });
+
+  it('bypasses cache when custom execFn is injected', async () => {
+    const rows: Array<[number, number]> = [[100, 1], [200, 100]];
+    let callCount = 0;
+    const countingExec: ExecFn = async (_cmd) => {
+      callCount++;
+      return { stdout: descendantOutput(rows), stderr: '' };
+    };
+
+    // Two calls with injected execFn should make TWO exec calls (cache bypassed)
+    await getChildPids(100, countingExec);
+    await getChildPids(100, countingExec);
+    assert.equal(callCount, 2, 'injected execFn bypasses cache');
+  });
+});
+
+describe('hasChildProcesses', () => {
+  it('returns true when direct children exist (isShell=false)', async () => {
+    // Tree: 100 → 200
+    const rows: Array<[number, number]> = [[1, 0], [100, 1], [200, 100]];
+    const result = await hasChildProcesses(100, false, mockExec(descendantOutput(rows)));
+    assert.equal(result, true);
+  });
+
+  it('returns false when no children exist', async () => {
+    const rows: Array<[number, number]> = [[1, 0], [100, 1]];
+    const result = await hasChildProcesses(100, false, mockExec(descendantOutput(rows)));
+    assert.equal(result, false);
+  });
+
+  it('with isShell=true: returns true when grandchildren exist (wrapper→child→grandchild)', async () => {
+    // Tree: wrapper(100) → child(200) → grandchild(300)
+    const rows: Array<[number, number]> = [
+      [1, 0], [100, 1], [200, 100], [300, 200],
+    ];
+
+    let callCount = 0;
+    const countingExec: ExecFn = async (_cmd) => {
+      callCount++;
+      return { stdout: descendantOutput(rows), stderr: '' };
+    };
+
+    const result = await hasChildProcesses(100, true, countingExec);
+    assert.equal(result, true, 'should detect grandchildren');
+    assert.equal(callCount, 1, 'should issue exactly ONE exec call for three-level check');
+  });
+
+  it('with isShell=true: returns false when grandchildren do not exist (wrapper→child only)', async () => {
+    // Tree: wrapper(100) → child(200) [no grandchildren]
+    const rows: Array<[number, number]> = [
+      [1, 0], [100, 1], [200, 100],
+    ];
+
+    let callCount = 0;
+    const countingExec: ExecFn = async (_cmd) => {
+      callCount++;
+      return { stdout: descendantOutput(rows), stderr: '' };
+    };
+
+    const result = await hasChildProcesses(100, true, countingExec);
+    assert.equal(result, false, 'should return false when no grandchildren');
+    assert.equal(callCount, 1, 'should issue exactly ONE exec call even when result is false');
+  });
+
+  it('bypasses cache when custom execFn is injected', async () => {
+    const rows: Array<[number, number]> = [[100, 1], [200, 100]];
+    let callCount = 0;
+    const countingExec: ExecFn = async (_cmd) => {
+      callCount++;
+      return { stdout: descendantOutput(rows), stderr: '' };
+    };
+
+    // Two calls with injected execFn should make TWO exec calls (cache bypassed)
+    await hasChildProcesses(100, false, countingExec);
+    await hasChildProcesses(100, false, countingExec);
+    assert.equal(callCount, 2, 'injected execFn bypasses cache');
   });
 });

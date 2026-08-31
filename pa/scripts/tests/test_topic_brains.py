@@ -1004,6 +1004,59 @@ class TestAtomicWrites(unittest.TestCase):
             self.assertEqual(f.read(), new_content)
 
 
+class TestWriteTopicShim(unittest.TestCase):
+    """Test write_topic_shim's coordination-protocol bullet (WP-G, 2026-08-23)."""
+
+    def setUp(self):
+        """Set up temp directory."""
+        import tempfile
+        self.test_dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        """Clean up."""
+        import shutil
+        if os.path.exists(self.test_dir):
+            shutil.rmtree(self.test_dir)
+
+    def test_write_topic_shim_emits_shared_tree_line(self):
+        """write_topic_shim's CLAUDE.md carries the Shared tree coordination bullet (§7.4)."""
+        topic_dir = os.path.join(self.test_dir, 'topic')
+        os.makedirs(topic_dir, exist_ok=True)
+        repo_root = 'D:/repo'
+
+        result = topic_brains.write_topic_shim(
+            topic_dir,
+            'D:/repo/topic-brains/x/BRAIN.md',
+            'test-topic',
+            repo_root,
+        )
+        self.assertTrue(result)
+
+        shim_path = os.path.join(topic_dir, 'CLAUDE.md')
+        with open(shim_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        repo_root_normalized = repo_root.replace('\\', '/')
+        expected_line = (
+            f"- Shared tree: {repo_root_normalized}/ is written by other sessions and skills "
+            "while you work. Before editing a tracked file there run `pa claims`; claim "
+            "multi-file work with `pa claim <paths> --session <label> --note \"<what you are "
+            "doing>\"`; never run git commit/push/stash/checkout/reset/clean yourself; do not "
+            "claim `@build` yourself — `npm run build`/`npm test` take and release it "
+            "automatically, and a \"waiting for @build\" line means another session is "
+            "building, not stuck. Full rules: "
+            f"{repo_root_normalized}/docs/multi-session-protocol.md"
+        )
+        self.assertIn(expected_line, content)
+        self.assertNotIn("pa claim '@build'", content)
+
+        # Must sit between the Central brain line and the Scratch line (§7.4 placement).
+        central_idx = content.index('- Central brain:')
+        shared_idx = content.index('- Shared tree:')
+        scratch_idx = content.index('- Scratch:')
+        self.assertTrue(central_idx < shared_idx < scratch_idx)
+
+
 class TestPAAHomeResolution(unittest.TestCase):
     """Test PA_HOME resolution matches memory_consolidation.py conventions."""
 
@@ -1029,7 +1082,7 @@ class TestCliAndStampForms(unittest.TestCase):
     """CLI argv normalization and stamp timezone form.
 
     Both findings surfaced in integration Gates D/D2 on 2026-08-21: argparse
-    rejected `--stamp -100..._7822` (leading-dash value parsed as a flag), and
+    rejected `--stamp -100..._4242` (leading-dash value parsed as a flag), and
     consolidated stamps carried IST wall-clock values under a +00:00 suffix.
     """
 

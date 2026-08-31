@@ -8,7 +8,7 @@ import time
 import traceback
 from datetime import datetime, timedelta, timezone
 
-from runtime_state import clear_failure_marker, load_last_window_end, write_failure_marker
+from runtime_state import clear_failure_marker, load_last_window_end, write_failure_marker, append_window_misses
 
 # Force UTF-8 output on Windows
 if sys.stdout.encoding != 'utf-8':
@@ -83,6 +83,40 @@ def format_window_label(window_start: datetime, window_end: datetime) -> str:
     return f"{start_ist.strftime('%d %b %Y %H:%M')} – {end_ist.strftime('%d %b %Y %H:%M')} IST"
 
 
+def detect_missed_windows(last_processed: datetime | None, window_start: datetime) -> list[dict]:
+    """Detect missed slot ends between last_processed and window_start (strict).
+
+    Every scheduled slot-end t (13:30 & 23:30 UTC) with last_processed < t < window_start
+    is a missed window. Returns list of entries with timestamp and window label.
+
+    If last_processed is None, returns [] (no baseline — honest, no fabricated history).
+    """
+    if last_processed is None:
+        return []
+
+    missed = []
+    # Iterate day by day from last_processed's day to window_start's day
+    current_day = last_processed.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_day = window_start.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    while current_day <= end_day:
+        for h, m in DAILY_SLOTS_UTC:
+            slot_end = current_day.replace(hour=h, minute=m, second=0, microsecond=0)
+            # Only count if slot_end is strictly between last_processed and window_start
+            if last_processed < slot_end < window_start:
+                # Find the slot start (previous slot before this one)
+                slot_start = get_prev_slot_before(slot_end)
+                entry = {
+                    "timestamp": slot_end.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "window": format_window_label(slot_start, slot_end),
+                }
+                missed.append(entry)
+        # Move to next day
+        current_day += timedelta(days=1)
+
+    return missed
+
+
 def write_emails_json(payload: dict) -> None:
     emails_path = os.path.join(PROJECT_ROOT, "emails.json")
     try:
@@ -134,6 +168,16 @@ def fetch_headers():
     last_processed = load_last_window_end()
     window_start, window_end, already_processed = resolve_window(now, last_processed, args.force)
     window_label = format_window_label(window_start, window_end)
+
+    # Detect and record missed windows (SLO feed)
+    if last_processed is not None and not already_processed:
+        try:
+            missed_windows = detect_missed_windows(last_processed, window_start)
+            if missed_windows:
+                append_window_misses(missed_windows)
+                print(f"[INFO] Recorded {len(missed_windows)} missed window(s)", file=sys.stderr)
+        except Exception as e:
+            print(f"[WARN] SLO misses write failed: {e}", file=sys.stderr)
 
     if already_processed:
         result = {

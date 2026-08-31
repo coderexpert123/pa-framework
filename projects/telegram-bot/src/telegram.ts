@@ -53,9 +53,95 @@ async function parseRetryAfter(res: Response, errorText: string): Promise<number
   return undefined;
 }
 
+/**
+ * True when a 400 error means the message we tried to reply to no longer
+ * exists (e.g. deleted after being sent, as with /auth's delete-then-reply
+ * flow — a reply targeting a since-deleted message dead-letters otherwise).
+ * Telegram's wording varies by API version, so match loosely rather than on
+ * one exact string.
+ */
+function isReplyTargetGoneError(status: number, errorText: string): boolean {
+  if (status !== 400) return false;
+  const lower = errorText.toLowerCase();
+  return lower.includes('message to be replied') || (lower.includes('reply') && lower.includes('not found'));
+}
+
+/**
+ * POST a sendMessage body with the existing 429/5xx retry-with-backoff
+ * behavior, shared by sendMessage's initial attempt and its corrective
+ * retries (MarkdownV2 fallback, reply-target fallback — see sendMessage).
+ * A non-retryable status (e.g. 400) is returned as-is for the caller to
+ * inspect; its body is read at most once here (only on the 429/5xx branch),
+ * so callers must read `res`'s body themselves for any other status.
+ */
+async function postSendMessageWithRetries(
+  token: string,
+  body: Record<string, unknown>,
+  logLabel: string
+): Promise<{ res: Response | undefined; timedOut: boolean }> {
+  let res: Response | undefined;
+  let timedOut = false;
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) await new Promise<void>((r) => setTimeout(r, 1000 * attempt));
+    try {
+      res = await telegramFetch(`${BASE}/bot${token}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(30_000),
+      });
+
+      if (res.ok) break;
+
+      if (res.status === 429 || res.status >= 500) {
+        const errorText = await safeResponseText(res);
+        if (attempt < 2) {
+          logger.warn('telegram', `[${logLabel}] HTTP ${res.status}, retrying (${attempt + 1}/3)`, { error: errorText });
+          // AI-149: honor retry_after on 429, with cap at 60s + 1s margin
+          if (res.status === 429) {
+            const retryAfter = await parseRetryAfter(res, errorText);
+            if (retryAfter !== undefined) {
+              const delayMs = Math.min(retryAfter + 1, 61) * 1000; // cap at 60s + 1s margin
+              logger.warn('telegram', `[${logLabel}] 429 rate limit, waiting ${retryAfter}s (capped at 60s) before retry`, { retryAfter });
+              await new Promise<void>((r) => setTimeout(r, delayMs));
+              continue;
+            }
+          }
+          // For 5xx or unparsable 429, use immediate retry (existing behavior)
+          continue;
+        }
+        console.error(`[${logLabel}] HTTP ${res.status} error after 3 attempts: ${errorText}`);
+        break;
+      }
+
+      // Non-retryable status (e.g. 400) — stop here, caller reads the body.
+      break;
+    } catch (err) {
+      const name = (err as any)?.name;
+      if (name === 'TimeoutError' || name === 'AbortError') {
+        logger.warn('telegram', `[${logLabel}] timeout — not retrying to avoid duplicate delivery`, { attempt: attempt + 1 });
+        timedOut = true;
+        break;
+      }
+      if (attempt < 2) {
+        console.warn(`[${logLabel}] network error, retrying (${attempt + 1}/3): ${(err as Error).message}`);
+      } else {
+        console.error(`[${logLabel}] network error after 3 attempts:`, err);
+      }
+    }
+  }
+
+  return { res, timedOut };
+}
+
+// Sticky server-side: Telegram remembers the last list passed, so the FULL list
+// must go on every call. Dropping message_reaction here silently disables the
+// reaction-approval path (AI-159, plans/2026-08-24-buttons-program-SPEC.md P1).
+export const ALLOWED_UPDATES = ['message', 'callback_query', 'message_reaction'] as const;
 
 export async function getUpdates(token: string, offset: number, timeout: number = 0, signal?: AbortSignal): Promise<TelegramUpdate[]> {
-  const url = `${BASE}/bot${token}/getUpdates?offset=${offset}&timeout=${timeout}`;
+  const url = `${BASE}/bot${token}/getUpdates?offset=${offset}&timeout=${timeout}&allowed_updates=${encodeURIComponent(JSON.stringify(ALLOWED_UPDATES))}`;
   const res = await telegramFetch(url, signal ? { signal } : undefined);
   if (!res.ok) throw new Error(`getUpdates failed: ${res.status} ${await safeResponseText(res)}`);
   const data = await res.json() as { ok: boolean; result: TelegramUpdate[] };
@@ -214,147 +300,70 @@ export async function sendMessage(
       parse_mode: 'MarkdownV2',
     };
     if (threadId !== undefined && threadId !== null && threadId !== 0) body.message_thread_id = threadId;
+    let hasReplyTarget = false;
     if (replyToMessageId) {
       body.reply_to_message_id = replyToMessageId;
+      hasReplyTarget = true;
       replyToMessageId = undefined; // Only reply on the first chunk
     }
 
     let res: Response | undefined;
     let timedOut = false;
-    let parseErrorHappened = false;
+    let parseModeStripped = false;
+    let replyTargetStripped = false;
 
-    for (let attempt = 0; attempt < 3; attempt++) {
-      if (attempt > 0) await new Promise<void>((r) => setTimeout(r, 1000 * attempt));
-      try {
-        res = await telegramFetch(`${BASE}/bot${token}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-          signal: AbortSignal.timeout(30_000),
-        });
+    // At most 3 phases per chunk: the initial attempt, plus at most one
+    // corrective retry for each of the two known causes (MarkdownV2 parse
+    // failure, reply-target message deleted — e.g. /auth's delete-then-reply
+    // flow). Each corrective retry flips exactly one of the two `*Stripped`
+    // flags from false to true and re-entry is gated on that flag still
+    // being false, so the loop always terminates within 3 iterations no
+    // matter which cause Telegram reports first.
+    for (let phase = 0; phase < 3; phase++) {
+      const label = phase === 0 ? 'sendMessage' : 'sendMessage fallback';
+      const attempt = await postSendMessageWithRetries(token, body, label);
+      res = attempt.res;
+      timedOut = attempt.timedOut;
 
-        if (res.ok) {
-          break;
-        }
+      if (!res || res.ok) break;
 
-        const errorText = await safeResponseText(res);
-        if (res.status === 429 || res.status >= 500) {
-          if (attempt < 2) {
-            logger.warn('telegram', `[sendMessage] HTTP ${res.status}, retrying (${attempt + 1}/3)`, { error: errorText });
-            // AI-149: honor retry_after on 429, with cap at 60s + 1s margin
-            if (res.status === 429) {
-              const retryAfter = await parseRetryAfter(res, errorText);
-              if (retryAfter !== undefined) {
-                const delayMs = Math.min(retryAfter + 1, 61) * 1000; // cap at 60s + 1s margin
-                logger.warn('telegram', `[sendMessage] 429 rate limit, waiting ${retryAfter}s (capped at 60s) before retry`, { retryAfter });
-                await new Promise<void>((r) => setTimeout(r, delayMs));
-                continue;
-              }
-            }
-            // For 5xx or unparsable 429, use immediate retry (existing behavior)
-            continue;
-          } else {
-            console.error(`[sendMessage] HTTP ${res.status} error after 3 attempts: ${errorText}`);
-            break;
-          }
-        }
-
-        if (res.status === 400 && errorText.includes('parse')) {
-          parseErrorHappened = true;
-          break;
-        }
-
-        console.error(`sendMessage failed: ${res.status} ${errorText}`);
-        break;
-      } catch (err) {
-        const name = (err as any)?.name;
-        if (name === 'TimeoutError' || name === 'AbortError') {
-          logger.warn('telegram', 'sendMessage timeout — not retrying to avoid duplicate delivery', { attempt: attempt + 1 });
-          timedOut = true;
-          break;
-        }
-        if (attempt < 2) {
-          console.warn(`[sendMessage] network error, retrying (${attempt + 1}/3): ${(err as Error).message}`);
-        } else {
-          console.error('[sendMessage] network error after 3 attempts:', err);
-        }
-      }
-    }
-
-    if (!res) {
-      if (!timedOut) allDelivered = false;
-      continue;
-    }
-
-    // Fallback: if Markdown parse fails, retry as plain text
-    if (!res.ok || parseErrorHappened) {
       const errorText = await safeResponseText(res);
-      if (parseErrorHappened || errorText.includes('parse')) {
+
+      // Fallback: if Markdown parse fails, retry as plain text.
+      if (!parseModeStripped && res.status === 400 && errorText.includes('parse')) {
         logger.warn('telegram', 'MarkdownV2 parse failed — falling back to plain text', {
           error: errorText,
           chunkPreview: chunk.slice(0, 200),
         });
         delete body.parse_mode;
         body.text = chunk.replace(/((?:\n\n)?)_Ref: ([a-z]+-[0-9a-f]{4,})_$/, '$1Ref: $2');
-
-        let fallbackRes: Response | undefined;
-        let fallbackTimedOut = false;
-
-        for (let attempt = 0; attempt < 3; attempt++) {
-          if (attempt > 0) await new Promise<void>((r) => setTimeout(r, 1000 * attempt));
-          try {
-            fallbackRes = await telegramFetch(`${BASE}/bot${token}/sendMessage`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(body),
-              signal: AbortSignal.timeout(30_000),
-            });
-            if (fallbackRes.ok) {
-              res = fallbackRes;
-              break;
-            }
-
-            const fbErrText = await safeResponseText(fallbackRes);
-            if ((fallbackRes.status === 429 || fallbackRes.status >= 500) && attempt < 2) {
-              logger.warn('telegram', `[sendMessage fallback] HTTP ${fallbackRes.status}, retrying (${attempt + 1}/3)`, { error: fbErrText });
-              // AI-149: honor retry_after on 429, with cap at 60s + 1s margin
-              if (fallbackRes.status === 429) {
-                const retryAfter = await parseRetryAfter(fallbackRes, fbErrText);
-                if (retryAfter !== undefined) {
-                  const delayMs = Math.min(retryAfter + 1, 61) * 1000; // cap at 60s + 1s margin
-                  logger.warn('telegram', `[sendMessage fallback] 429 rate limit, waiting ${retryAfter}s (capped at 60s) before retry`, { retryAfter });
-                  await new Promise<void>((r) => setTimeout(r, delayMs));
-                  continue;
-                }
-              }
-              // For 5xx or unparsable 429, use immediate retry (existing behavior)
-              continue;
-            }
-            console.error(`sendMessage failed: ${fallbackRes.status} ${fbErrText}`);
-            res = fallbackRes;
-            break;
-          } catch (err) {
-            const name = (err as any)?.name;
-            if (name === 'TimeoutError' || name === 'AbortError') {
-              logger.warn('telegram', 'sendMessage plain-text fallback timeout — not retrying to avoid duplicate delivery', {});
-              fallbackTimedOut = true;
-              break;
-            }
-            if (attempt < 2) {
-              console.warn(`[sendMessage fallback] network error, retrying (${attempt + 1}/3): ${(err as Error).message}`);
-            } else {
-              console.error('[sendMessage] plain-text fallback network error after 3 attempts:', err);
-            }
-          }
-        }
-
-        if ((!fallbackRes || !fallbackRes.ok) && !fallbackTimedOut) {
-          allDelivered = false;
-        }
-      } else {
-        if (!timedOut) allDelivered = false;
+        parseModeStripped = true;
+        continue;
       }
+
+      // Fallback: if the reply target message no longer exists (e.g. deleted
+      // right after send, as with /auth's delete-then-reply flow), retry
+      // once without reply_to_message_id instead of dead-lettering the send.
+      if (hasReplyTarget && !replyTargetStripped && isReplyTargetGoneError(res.status, errorText)) {
+        logger.warn('telegram', 'reply target message no longer exists — retrying without reply_to_message_id', {
+          chatId,
+          threadId,
+          error: errorText,
+        });
+        delete body.reply_to_message_id;
+        replyTargetStripped = true;
+        continue;
+      }
+
+      console.error(`sendMessage failed: ${res.status} ${errorText}`);
+      break;
     }
+
+    if (!res) {
+      if (!timedOut) allDelivered = false;
+      continue;
+    }
+    if (!res.ok && !timedOut) allDelivered = false;
   }
 
   return allDelivered;
@@ -363,12 +372,19 @@ export async function sendMessage(
 /**
  * Like sendMessage but returns the message_id of the sent message (first chunk only).
  * Used when the caller needs to pin the message afterwards.
+ *
+ * NO MarkdownV2 -> plain-text fallback (unlike `sendMessage` / `sendMessageWithKeyboard`):
+ * a parse-mode 400 here just fails. A new caller sending user- or worker-generated text
+ * (not a fixed, known-safe template) must go through `sendMessage` or
+ * `sendMessageWithKeyboard` instead, or port the fallback here first (bp-fix 2026-08-24 —
+ * this exact gap cost two work packages a day earlier).
  */
 export async function sendMessageWithId(
   token: string,
   chatId: number,
   text: string,
-  threadId?: number
+  threadId?: number,
+  replyMarkup?: InlineKeyboardMarkup
 ): Promise<number | null> {
   const body: Record<string, unknown> = {
     chat_id: chatId,
@@ -376,6 +392,7 @@ export async function sendMessageWithId(
     parse_mode: 'MarkdownV2',
   };
   if (threadId !== undefined && threadId !== null && threadId !== 0) body.message_thread_id = threadId;
+  if (replyMarkup !== undefined) body.reply_markup = replyMarkup;
 
   try {
     const res = await telegramFetch(`${BASE}/bot${token}/sendMessage`, {
@@ -400,14 +417,26 @@ export async function editMessageText(
   token: string,
   chatId: number,
   messageId: number,
-  text: string
+  text: string,
+  replyMarkup?: InlineKeyboardMarkup,
+  opts?: { rawMarkdown?: boolean }
 ): Promise<boolean> {
-  const body = {
+  // Telegram DROPS the keyboard when `reply_markup` is omitted from an edit —
+  // passing `undefined` here is how a card refresh removes its buttons, and every
+  // refresh of a message that must KEEP its buttons has to pass them again
+  // (plans/2026-08-24-buttons-program-SPEC.md P1d / §8 R3). The plain-text retry
+  // below reuses this same `body` object, so the keyboard survives the fallback.
+  //
+  // Rationale for rawMarkdown: round-tripped cb.message.text from a callback query
+  // is already MarkdownV2 source; re-sanitizing double-escapes entities (\* → \\*)
+  // and visibly corrupts the message.
+  const body: Record<string, unknown> = {
     chat_id: chatId,
     message_id: messageId,
-    text: sanitizeMdV2(text.trim()),
+    text: opts?.rawMarkdown ? text.trim() : sanitizeMdV2(text.trim()),
     parse_mode: 'MarkdownV2',
   };
+  if (replyMarkup !== undefined) body.reply_markup = replyMarkup;
 
   try {
     const res = await telegramFetch(`${BASE}/bot${token}/editMessageText`, {
@@ -431,12 +460,15 @@ export async function editMessageText(
           body: JSON.stringify(body),
           signal: AbortSignal.timeout(30_000),
         });
-        return res2.ok;
+        if (!res2.ok) return false;
+        const result = await res2.json() as { ok: boolean };
+        return result.ok;
       }
       console.error(`editMessageText failed: ${res.status} ${errorText}`);
       return false;
     }
-    return true;
+    const result = await res.json() as { ok: boolean };
+    return result.ok;
   } catch (err) {
     console.error('editMessageText network error:', err);
     return false;
@@ -648,7 +680,11 @@ export async function deleteMessage(token: string, chatId: number, messageId: nu
  */
 export interface InlineKeyboardButton {
   text: string;
-  callback_data: string;
+  callback_data?: string;
+  url?: string;
+  copy_text?: { text: string };
+  /** Bot API 9.4 button styles. Unknown values are ignored by older clients. */
+  style?: 'primary' | 'success' | 'danger';
 }
 
 export interface InlineKeyboardRow {
@@ -670,45 +706,131 @@ export async function sendMessageWithKeyboard(
   keyboard: InlineKeyboardMarkup,
   replyToMessageId?: number,
   threadId?: number
-): Promise<boolean> {
+): Promise<number | null> {
+  // 2026-08-24 (buttons program, P1f): the keyboard goes on the LAST chunk only
+  // (Telegram allows one keyboard per message; the press must land on the message
+  // the reader finishes on), and the return value is the FIRST chunk's message_id
+  // (null on any failure) — mirroring sendMessageWithId — so a caller can anchor
+  // `pending_action.message_id` / a later editMessageReplyMarkup on it.
   const trimmed = text.trim();
-  if (!trimmed) return true;
+  if (!trimmed) return null;
 
   const chunks = splitMessage(trimmed);
-  let allDelivered = true;
+  let firstMessageId: number | null = null;
+  let anyFailed = false;
 
-  for (const chunk of chunks) {
+  for (let i = 0; i < chunks.length; i++) {
     const body: Record<string, unknown> = {
       chat_id: chatId,
-      text: sanitizeMdV2(chunk),
+      text: sanitizeMdV2(chunks[i]),
       parse_mode: 'MarkdownV2',
-      reply_markup: keyboard,
     };
+    if (i === chunks.length - 1) body.reply_markup = keyboard;
     if (threadId !== undefined && threadId !== null && threadId !== 0) body.message_thread_id = threadId;
+    let hasReplyTarget = false;
     if (replyToMessageId) {
       body.reply_to_message_id = replyToMessageId;
+      hasReplyTarget = true;
       replyToMessageId = undefined; // Only reply on the first chunk
     }
 
-    try {
-      const res = await telegramFetch(`${BASE}/bot${token}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(30_000),
-      });
-      if (!res.ok) {
+    let parseModeStripped = false;
+    let replyTargetStripped = false;
+    let succeeded = false;
+
+    // At most 3 attempts per chunk: the initial send, plus at most one
+    // corrective retry for each of the two known causes (MarkdownV2 parse
+    // failure, reply-target message deleted). Same termination argument as
+    // sendMessage: each retry flips one `*Stripped` flag false->true and
+    // re-entry is gated on that flag, so this always terminates within 3
+    // attempts regardless of which cause Telegram reports first.
+    for (let phase = 0; phase < 3; phase++) {
+      try {
+        const res = await telegramFetch(`${BASE}/bot${token}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(30_000),
+        });
+
+        if (res.ok) {
+          const data = await res.json().catch(() => null) as { ok?: boolean; result?: { message_id: number } } | null;
+          if (i === 0) firstMessageId = data?.ok ? (data.result?.message_id ?? null) : null;
+          succeeded = true;
+          break;
+        }
+
         const errorText = await safeResponseText(res);
+
+        // If Markdown fails, retry as plain text (same as sendMessage/editMessageText),
+        // keeping reply_markup (already set on the last chunk's body) intact.
+        if (!parseModeStripped && res.status === 400 && errorText.includes('parse')) {
+          delete (body as any).parse_mode;
+          // Same ref-marker de-italicisation as sendMessage's fallback: without MdV2
+          // the surrounding underscores would render literally.
+          body.text = chunks[i].replace(/((?:\n\n)?)_Ref: ([a-z]+-[0-9a-f]{4,})_$/, '$1Ref: $2');
+          parseModeStripped = true;
+          continue;
+        }
+
+        // If the reply target message no longer exists (e.g. deleted right
+        // after send, as with /auth's delete-then-reply flow), retry once
+        // without reply_to_message_id instead of dead-lettering the send.
+        if (hasReplyTarget && !replyTargetStripped && isReplyTargetGoneError(res.status, errorText)) {
+          logger.warn('telegram', 'reply target message no longer exists — retrying without reply_to_message_id', {
+            chatId,
+            threadId,
+            error: errorText,
+          });
+          delete body.reply_to_message_id;
+          replyTargetStripped = true;
+          continue;
+        }
+
         console.error(`sendMessageWithKeyboard failed: ${res.status} ${errorText}`);
-        allDelivered = false;
+        break;
+      } catch (err) {
+        console.error('sendMessageWithKeyboard network error:', err);
+        break;
       }
-    } catch (err) {
-      console.error('sendMessageWithKeyboard network error:', err);
-      allDelivered = false;
     }
+
+    if (!succeeded) anyFailed = true;
   }
 
-  return allDelivered;
+  return anyFailed ? null : firstMessageId;
+}
+
+/**
+ * Replace (or remove, when `replyMarkup` is undefined) the inline keyboard of an
+ * existing message without touching its text — the post-press "disable the button"
+ * step every handler performs (design rule 2). `message is not modified` counts as
+ * success; never throws.
+ */
+export async function editMessageReplyMarkup(
+  token: string,
+  chatId: number,
+  messageId: number,
+  replyMarkup?: InlineKeyboardMarkup
+): Promise<boolean> {
+  const body: Record<string, unknown> = { chat_id: chatId, message_id: messageId };
+  if (replyMarkup !== undefined) body.reply_markup = replyMarkup;
+  try {
+    const res = await telegramFetch(`${BASE}/bot${token}/editMessageReplyMarkup`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (res.ok) return true;
+    const errorText = await safeResponseText(res);
+    if (errorText.includes('message is not modified')) return true;
+    console.error(`editMessageReplyMarkup failed: ${res.status} ${errorText}`);
+    return false;
+  } catch (err) {
+    console.error('editMessageReplyMarkup network error:', err);
+    return false;
+  }
 }
 
 /**

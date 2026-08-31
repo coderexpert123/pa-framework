@@ -20,15 +20,20 @@
  * the honest death notice.
  */
 import { readFile, stat } from 'fs/promises';
-import { sendMessage, sendTyping, editMessageText } from './telegram.js';
+import { sendMessage, sendMessageWithKeyboard, sendTyping, editMessageText, type InlineKeyboardMarkup } from './telegram.js';
+import { sendReplyText } from './rich-message.js';
 import { getPriorSessionPath, buildResumeArgs } from './session.js';
-import { parseMetadata, buildModelStatusSnapshot, renderStatusCard, resolveWorkerLlm, selectWorkerTunables } from './logic.js';
+import { parseMetadata, buildModelStatusSnapshot, renderStatusCard, resolveWorkerLlm, selectWorkerTunables, formatWorkerReply } from './logic.js';
 import type { ModelStatusReasonCode } from './types.js';
 import { loadTopicState, saveTopicState, addTurn } from './conversation.js';
 import { deliveredKey, wasDelivered, markDelivered } from './delivered-store.js';
-import { listPendingDispatches, removePendingDispatch, pendingDispatchKey, type PendingDispatch } from './pending-dispatches.js';
+import { listPendingDispatches, removePendingDispatch, pendingDispatchKey, updatePendingDispatch, type PendingDispatch } from './pending-dispatches.js';
+import { putResend } from './resend-store.js';
+import { isBarePlaceholderUserText, transcribeVoiceMessage, formatTranscriptUserText, extensionForAttachment, voiceAttachmentPath } from './voice.js';
+import { buildResendKeyboard } from './callbacks.js';
 import { makeRefId } from './ref-id.js';
 import { markTopicRecovering, clearTopicRecovering } from './recovery-gate.js';
+import { isTopicStopped } from './worker-stop.js';
 import { listWorkerPids, isProcessAlive } from '../../../pa/dist/src/worker-pids.js';
 import { getDescendantPids } from '../../../pa/dist/src/process-tree.js';
 import { executeWorker } from '../../../pa/dist/src/worker-exec.js';
@@ -51,6 +56,20 @@ const REDISPATCH_HARVEST_MS = 50 * 60 * 1000;
 // ---------------------------------------------------------------------------
 // Pure transcript parsing
 // ---------------------------------------------------------------------------
+
+/**
+ * Recover {kind, caption} from a placeholder userText ("[Voice message] raw caption")
+ *  — the label set mirrors isBarePlaceholderUserText's regex (voice.ts). Null when the
+ *  text is not a bare placeholder.
+ */
+export function placeholderKindAndCaption(userText: string):
+    { kind: 'voice' | 'audio' | 'video_note'; caption?: string } | null {
+  const m = /^\[(Voice message|Audio file|Video note)\](?: (.*))?$/.exec(userText);
+  if (!m) return null;
+  const kind = m[1] === 'Voice message' ? 'voice' : m[1] === 'Audio file' ? 'audio' : 'video_note';
+  const caption = m[2]?.trim();
+  return { kind, ...(caption ? { caption } : {}) };
+}
 
 /**
  * Extract the final assistant text from a claude-family session transcript
@@ -135,7 +154,7 @@ export function extractTeeResult(raw: string): string | null {
 // ---------------------------------------------------------------------------
 
 export interface ReaperDeps {
-  send: (record: PendingDispatch, text: string) => Promise<boolean>;
+  send: (record: PendingDispatch, text: string, replyMarkup?: InlineKeyboardMarkup) => Promise<boolean>;
   readTranscript: (record: PendingDispatch) => Promise<{ content: string; mtimeMs: number } | null>;
   isTopicWorkerAlive: (record: PendingDispatch) => Promise<boolean>;
   now: () => number;
@@ -163,6 +182,15 @@ export interface ReaperDeps {
    * worker died without producing a result. Returns the raw output
    * or null. Injected for testing; default calls the real function. */
   redispatchWithResume?: (record: PendingDispatch) => Promise<string | null>;
+  /** Injects the original request back through the normal dispatch pipeline
+   *  (main.ts's synthetic-update requeue). Record arrives with requeueCount already
+   *  incremented. */
+  requeueUpdate?: (record: PendingDispatch) => void;
+  /** Revive an untranscribed voice/audio/video_note placeholder: re-download via
+   *  voiceFileId and re-transcribe through voice.ts's existing pipeline. Returns
+   *  the formatted transcript text, or null on any failure (caller falls to the
+   *  neutral notice). Injected for testing; default impl in makeDefaultDeps. */
+  reviveVoiceNote?: (record: PendingDispatch) => Promise<string | null>;
 }
 
 function defaultReadTranscript(record: PendingDispatch): Promise<{ content: string; mtimeMs: number } | null> {
@@ -238,9 +266,12 @@ export async function findTeePathByRegistry(record: PendingDispatch): Promise<st
 
 export function makeDefaultDeps(token: string, secrets?: Record<string, string>): ReaperDeps {
   return {
-    send: async (record, text) => {
+    send: async (record, text, replyMarkup) => {
       const refId = makeRefId();
-      const delivered = await sendMessage(token, record.chatId, `${text}\n\n_Ref: ${refId}_`, record.messageId, record.threadId);
+      const fullText = `${text}\n\n_Ref: ${refId}_`;
+      const delivered = replyMarkup !== undefined
+        ? (await sendMessageWithKeyboard(token, record.chatId, fullText, replyMarkup, record.messageId, record.threadId)) !== null
+        : (await sendReplyText(token, record.chatId, fullText, record.messageId, record.threadId, process.env)).delivered;
       if (delivered) {
         logger.info('bot', 'system message sent', { refId, kind: 'recovered', chatId: record.chatId, threadId: record.threadId, textPreview: text.slice(0, 200) });
         // Restore conversational continuity. The ASSISTANT turn is always
@@ -327,7 +358,7 @@ export function makeDefaultDeps(token: string, secrets?: Record<string, string>)
           currentWorker,
           currentLlm,
           reasonCode: (opts?.reasonCode ?? 'recovery') as any,
-          reasonText: 'Bot restarted mid-request — recovering reply',
+          reasonText: 'Resuming your request…',
         });
         topicState.model_status = snapshot;
         if (topicState.pinned_status_message_id) {
@@ -342,14 +373,44 @@ export function makeDefaultDeps(token: string, secrets?: Record<string, string>)
       }
     },
     redispatchWithResume: (record) => redispatchWithResume(record, token, secrets ?? Object.fromEntries(Object.entries(process.env).filter(([k,v]) => v !== undefined)) as Record<string, string>),
+    reviveVoiceNote: (record) => reviveVoiceNote(record, token, secrets ?? {}),
   };
+}
+
+async function reviveVoiceNote(record: PendingDispatch, token: string, secrets: Record<string, string>): Promise<string | null> {
+  const kc = placeholderKindAndCaption(record.userText);
+  if (!kc || !record.voiceFileId) return null;
+  // Command-caption guard: if caption starts with '/', do NOT revive
+  if (kc.caption && kc.caption.startsWith('/')) return null;
+
+  const media = {
+    file_id: record.voiceFileId,
+    file_unique_id: `recovered-${record.updateId}`,
+    duration: 0,
+  };
+
+  try {
+    const vr = await transcribeVoiceMessage(token, record.chatId, media, {
+      repoRoot: record.cwd || process.env.PA_BOT_CWD || process.cwd(),
+      env: { ...process.env, ...secrets },
+      transcription: (await loadConfig().catch(() => ({ transcription: {} } as any))).transcription,
+      threadId: record.threadId,
+    }, kc.kind);
+
+    if (vr.ok && vr.text) {
+      return formatTranscriptUserText(vr.text, { truncated: vr.truncated, caption: kc.caption, kind: kc.kind, speakers: vr.speakers });
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Per-record evaluation (single step, no sleeping — the loop lives outside)
 // ---------------------------------------------------------------------------
 
-export type ReapOutcome = 'already-delivered' | 'recovered' | 'dead' | 'waiting';
+export type ReapOutcome = 'already-delivered' | 'recovered' | 'dead' | 'waiting' | 'requeued' | 'parked';
 
 function preview(text: string): string {
   const t = text.replace(/\s+/g, ' ').trim();
@@ -357,7 +418,11 @@ function preview(text: string): string {
 }
 
 function deathNotice(record: PendingDispatch): string {
-  return `⚠️ The bot restarted while processing your message and the reply could not be recovered. Please resend:\n«${preview(record.userText)}»`;
+  return `⚠️ This request couldn't be completed — tap Resend, or send it again:\n«${preview(record.userText)}»`;
+}
+
+function untranscribedNotice(_record: PendingDispatch): string {
+  return '⚠️ That voice note couldn\'t be processed — please send it again.';
 }
 
 async function finish(record: PendingDispatch, outcome: 'recovered' | 'dead'): Promise<void> {
@@ -428,6 +493,16 @@ export async function evaluatePendingDispatch(
   deps: ReaperDeps,
   deadlineMs: number,
 ): Promise<ReapOutcome> {
+  // WP-C C2: a parked ladder record (requeueNotBefore set by main.ts's failure
+  // suppression) belongs to the maintenance drain, not the reaper. Skipping it
+  // entirely — not 'waiting' — lets the topic's gate clear this round so the
+  // drain's re-injected synthetic is never wedged behind the recovery gate.
+  if (record.requeueNotBefore !== undefined) {
+    logger.info('reaper', 'skipping parked ladder record (drain owns it)',
+      { updateId: record.updateId, requeueNotBefore: record.requeueNotBefore });
+    return 'parked';
+  }
+
   // Step 0: Already delivered?
   const key = deliveredKey(record.chatId, record.threadId, record.updateId);
   if (await wasDelivered(key)) {
@@ -452,8 +527,13 @@ export async function evaluatePendingDispatch(
       // Deliver the harvested reply.
       const { cleaned } = parseMetadata(sourceResult);
       const body = cleaned.trim() || sourceResult.trim();
-      const sent = await deps.send(record,
-        `♻️ *Recovered reply* (the bot restarted mid-request; the worker finished on its own):\n\n${body}`);
+      const worker = record.workerName ?? record.session?.worker ?? 'agy';
+      const formatted = formatWorkerReply(body, worker);
+      if (formatted === '') {
+        // Worker produced no output — treat as null source
+        return 'waiting';
+      }
+      const sent = await deps.send(record, formatted);
       if (sent) {
         await deps.captureSession?.(record, sourceResult);
         await deps.updatePinnedCard?.(record, { reasonCode: 'recovery-worker-alive' });
@@ -492,15 +572,20 @@ export async function evaluatePendingDispatch(
     if (extracted) {
       const { cleaned } = parseMetadata(extracted);
       const body = cleaned.trim() || extracted.trim();
-      const sent = await deps.send(record,
-        `♻️ *Recovered reply* (the bot restarted mid-request; the worker finished on its own):\n\n${body}`);
-      if (sent) {
-        await deps.captureSession?.(record, extracted);
-        await deps.updatePinnedCard?.(record, { reasonCode: 'recovery-tee' });
-        await finish(record, 'recovered');
-        return 'recovered';
+      const worker = record.workerName ?? record.session?.worker ?? 'agy';
+      const formatted = formatWorkerReply(body, worker);
+      if (formatted === '') {
+        // Fall through to transcript check
+      } else {
+        const sent = await deps.send(record, formatted);
+        if (sent) {
+          await deps.captureSession?.(record, extracted);
+          await deps.updatePinnedCard?.(record, { reasonCode: 'recovery-tee' });
+          await finish(record, 'recovered');
+          return 'recovered';
+        }
+        return 'waiting';
       }
-      return 'waiting';
     }
     // Tee file exists but has no extractable result — fall through to transcript check
   }
@@ -516,15 +601,20 @@ export async function evaluatePendingDispatch(
       if (final && (quiescent || expired)) {
         const { cleaned } = parseMetadata(final.text);
         const body = cleaned.trim() || final.text.trim();
-        const sent = await deps.send(record,
-          `♻️ *Recovered reply* (the bot restarted mid-request; the worker finished on its own):\n\n${body}`);
-        if (sent) {
-          await deps.captureSession?.(record, final.text);
-          await deps.updatePinnedCard?.(record, { reasonCode: 'recovery-transcript' });
-          await finish(record, 'recovered');
-          return 'recovered';
+        const worker = record.workerName ?? record.session?.worker ?? 'agy';
+        const formatted = formatWorkerReply(body, worker);
+        if (formatted === '') {
+          // Fall through to redispatch
+        } else {
+          const sent = await deps.send(record, formatted);
+          if (sent) {
+            await deps.captureSession?.(record, final.text);
+            await deps.updatePinnedCard?.(record, { reasonCode: 'recovery-transcript' });
+            await finish(record, 'recovered');
+            return 'recovered';
+          }
+          return 'waiting';
         }
-        return 'waiting';
       }
       if (!expired) return 'waiting';
     }
@@ -539,19 +629,26 @@ export async function evaluatePendingDispatch(
     if (result !== null && result !== undefined) {
       const { cleaned } = parseMetadata(result);
       const body = cleaned.trim() || result.trim();
-      const sent = await deps.send(record,
-        `♻️ *Recovered reply* (the bot restarted; the original worker died without producing a result — re-dispatched with conversation resume):\n\n${body}`);
-      if (sent) {
-        await deps.captureSession?.(record, result);
-        await deps.updatePinnedCard?.(record, { reasonCode: 'recovery-resume' });
-        await finish(record, 'recovered');
-        return 'recovered';
+      const worker = record.workerName ?? record.session?.worker ?? 'agy';
+      const formatted = formatWorkerReply(body, worker);
+      if (formatted === '') {
+        // Fall through to death notice
+        resumeAttemptedAndFailed = true;
+      } else {
+        const sent = await deps.send(record, formatted);
+        if (sent) {
+          await deps.captureSession?.(record, result);
+          await deps.updatePinnedCard?.(record, { reasonCode: 'recovery-resume' });
+          await finish(record, 'recovered');
+          return 'recovered';
+        }
+        return 'waiting'; // send failed — retry next poll
       }
-      return 'waiting'; // send failed — retry next poll
+    } else {
+      // Re-dispatch returned null (execution failed or no worker config) — mark
+      // as attempted-and-failed so we fall through to death notice below.
+      resumeAttemptedAndFailed = true;
     }
-    // Re-dispatch returned null (execution failed or no worker config) — mark
-    // as attempted-and-failed so we fall through to death notice below.
-    resumeAttemptedAndFailed = true;
   }
 
   // Step 4: Death notice (true last resort)
@@ -559,7 +656,66 @@ export async function evaluatePendingDispatch(
   // non-recoverable (not in CLAUDE_FAMILY), OR all recovery sources have been
   // exhausted (worker dead + no tee + no transcript + resume failed/skipped).
   if (expired || !session || !recoverable || resumeAttemptedAndFailed) {
-    const sent = await deps.send(record, deathNotice(record)).catch(() => false);
+    // Voice placeholder branch: try revive before giving up (A10 part b)
+    if (isBarePlaceholderUserText(record.userText) && record.userTextSettled !== true) {
+      const kc = placeholderKindAndCaption(record.userText);
+      const v = Number(process.env.PA_REQUEUE_MAX);
+      const max = Number.isFinite(v) && v >= 0 ? v : 2; // PA_REQUEUE_* frozen in SPEC §2
+      const stopped = isTopicStopped(`${record.chatId}_${record.threadId}`, record.updateId);
+
+      // Voice revive attempt
+      if (kc && kc.caption && !kc.caption.startsWith('/') && record.voiceFileId && deps.reviveVoiceNote && (record.requeueCount ?? 0) < max && !stopped) {
+        const transcript = await deps.reviveVoiceNote(record);
+        if (transcript !== null) {
+          // Revive succeeded: requeue with transcript
+          const next = (record.requeueCount ?? 0) + 1;
+          await updatePendingDispatch(
+            pendingDispatchKey(record.chatId, record.threadId, record.updateId),
+            { requeueCount: next, userText: transcript, userTextSettled: true },
+          ).catch(() => {});
+          logger.info('reaper', 'voice placeholder revived with transcript',
+            { updateId: record.updateId, chatId: record.chatId, threadId: record.threadId });
+          deps.requeueUpdate?.({ ...record, userText: transcript, userTextSettled: true, requeueCount: next });
+          return 'requeued';
+        }
+      }
+      // Revive failed or not possible: send neutral untranscribed notice
+      const sent = await deps.send(record, untranscribedNotice(record)).catch(() => false);
+      if (!sent) return 'waiting';
+      await finish(record, 'dead');
+      return 'dead';
+    }
+
+    // Auto-requeue ladder (A4 part b)
+    const v = Number(process.env.PA_REQUEUE_MAX);
+    const max = Number.isFinite(v) && v >= 0 ? v : 2; // PA_REQUEUE_* frozen in SPEC §2
+    const stopped = isTopicStopped(`${record.chatId}_${record.threadId}`, record.updateId);
+    if (deps.requeueUpdate && !stopped
+        && !isBarePlaceholderUserText(record.userText)
+        && (record.requeueCount ?? 0) < max) {
+      const next = (record.requeueCount ?? 0) + 1;
+      await updatePendingDispatch(
+        pendingDispatchKey(record.chatId, record.threadId, record.updateId),
+        { requeueCount: next },
+      ).catch(() => {});
+      logger.info('reaper', `pending dispatch requeued (attempt ${next})`,
+        { updateId: record.updateId, chatId: record.chatId, threadId: record.threadId });
+      deps.requeueUpdate({ ...record, requeueCount: next });
+      return 'requeued';
+    }
+
+    // No requeue possible: send death notice with resend keyboard
+    await putResend({
+      chatId: record.chatId,
+      threadId: record.threadId,
+      updateId: record.updateId,
+      messageId: record.messageId,
+      userText: record.userText,
+      userTextSettled: record.userTextSettled,
+      storedAt: new Date().toISOString(),
+    }).catch(() => {});
+    const keyboard = buildResendKeyboard(record.chatId, record.threadId, record.updateId);
+    const sent = await deps.send(record, deathNotice(record), keyboard).catch(() => false);
     if (!sent) return 'waiting';
     await finish(record, 'dead');
     return 'dead';
@@ -591,9 +747,12 @@ function recordTopicKey(record: PendingDispatch): string {
  */
 export async function reapOrphanedDispatches(
   token: string,
-  opts: { deps?: ReaperDeps; maxWaitMs?: number; pollMs?: number; sleep?: (ms: number) => Promise<void>; secrets?: Record<string, string> } = {},
+  opts: { deps?: ReaperDeps; maxWaitMs?: number; pollMs?: number; sleep?: (ms: number) => Promise<void>; secrets?: Record<string, string>; requeueUpdate?: (record: PendingDispatch) => void; reviveVoiceNote?: (record: PendingDispatch) => Promise<string | null> } = {},
 ): Promise<void> {
-  const deps = opts.deps ?? makeDefaultDeps(token, opts.secrets ?? {});
+  const deps = opts.deps
+    ?? { ...makeDefaultDeps(token, opts.secrets ?? {}),
+         ...(opts.requeueUpdate ? { requeueUpdate: opts.requeueUpdate } : {}),
+         ...(opts.reviveVoiceNote ? { reviveVoiceNote: opts.reviveVoiceNote } : {}) };
   const maxWaitMs = opts.maxWaitMs ?? REAP_MAX_WAIT_MS;
   const pollMs = opts.pollMs ?? REAP_POLL_MS;
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));

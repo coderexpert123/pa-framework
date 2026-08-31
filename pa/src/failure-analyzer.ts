@@ -5,10 +5,12 @@ import { readLogs } from './logger.js';
 import { listSkills } from './skills.js';
 import { listDrafts, isDuplicate, computeFingerprint, uniqueDraftName } from './drafts.js';
 import { readAuditRecords } from './lib/improvement-audit.js';
+import { readLedger } from './lib/maintenance/state.js';
 import { runWithFailover } from './workers.js';
 import { parseProposalResponse } from './analyzer.js';
 import { notifyUser } from './lib/notify.js';
 import type { DraftProposal, DraftMeta, RunMeta } from './types.js';
+import type { AlertCensus } from './lib/alert-census.js';
 
 export interface FailureRecord {
   skillName: string;
@@ -191,6 +193,116 @@ export async function analyzeFailurePatterns(
   return unique;
 }
 
+// ---------------------------------------------------------------------------
+// Alert-census -> deterministic proposal mapping (2026-08-23 alerts wave,
+// plans/2026-08-23-alerts-wave-SPEC.md §WP-J2b step 1). No LLM call, no I/O:
+// every input the mapping needs (the census, the skill list, the maintenance
+// job names, and a file-existence predicate) is passed in by the caller, so
+// this stays a pure function and is unit-tested directly.
+// ---------------------------------------------------------------------------
+
+export interface CensusProposalInput {
+  /** From listSkills(); only name + frontmatter.cmd are read. */
+  skills: Array<{ name: string; frontmatter: { cmd?: string } }>;
+  /** MAINTENANCE_JOBS names, pa host only. */
+  maintenanceJobNames: string[];
+  /** Predicate for "does pa/src/lib/maintenance/jobs/<name>.ts exist" — injected
+   *  so this stays pure; the caller passes an existsSync-backed closure. */
+  jobFileExists: (relPath: string) => boolean;
+}
+
+/** Extracts the LAST `File "<path>", line N` traceback frame whose path
+ *  resolves under this repo (i.e. contains a `Personal Assistant/` segment),
+ *  normalised to forward slashes and repo-relative. undefined when no frame
+ *  in `text` resolves under the repo. */
+export function tracebackCodeTarget(text: string): string | undefined {
+  const FILE_LINE_RE = /File "([^"]+)", line \d+/g;
+  const marker = 'Personal Assistant/';
+  let match: RegExpExecArray | null;
+  let result: string | undefined;
+  while ((match = FILE_LINE_RE.exec(text)) !== null) {
+    const normalized = match[1].replace(/\\/g, '/');
+    const idx = normalized.indexOf(marker);
+    if (idx === -1) continue; // does not resolve under the repo — skip, keep scanning
+    result = normalized.slice(idx + marker.length);
+  }
+  return result;
+}
+
+/**
+ * Deterministic census -> DraftProposal mapping (spec §WP-J1 step 1g classification feeds
+ * this directly: only 'deterministic-defect' families are considered here). Evidence travels
+ * WITH each proposal (decision (i) — gateAndApprove's own evidence lookup returns [] for a
+ * maintenance job, since computeFailureRates()/readRecentFailures() are skill-log-directory-
+ * driven and a declared job has no such directory).
+ */
+export function censusProposals(
+  census: AlertCensus,
+  input: CensusProposalInput,
+): Array<{ proposal: DraftProposal; evidence: FailureRecord[] }> {
+  const results: Array<{ proposal: DraftProposal; evidence: FailureRecord[] }> = [];
+  const seenNames = new Set<string>();
+
+  // families is already sorted by sent desc (alert-census.ts) — preserved here, so the
+  // higher-volume family for a given owner wins the name-collision skip below.
+  for (const family of census.families) {
+    if (family.classification !== 'deterministic-defect') continue;
+    if (family.suppressedBy) continue; // known-fixed (fix-record/green-signal overlay) — do not re-propose; regressed families carry no suppressedBy and stay eligible (PLAN §5)
+    if ((family.ownerStatus?.consecutiveFailures ?? 0) === 0) continue; // healthy now — skip
+
+    const owner = family.owner;
+    if (!owner) continue; // worker/system/unknown families carry no attributable owner name
+
+    let targetKind: 'skill' | 'maintenance-job';
+    let codeTarget: string | undefined;
+
+    if (family.ownerKind === 'skill') {
+      const skill = input.skills.find((s) => s.name === owner);
+      // Not cmd-based, or unknown skill: a prompt fix cannot repair a deterministic defect in
+      // a script, and this loop does not author prompt fixes — no proposal either way.
+      if (!skill || !skill.frontmatter.cmd) continue;
+      targetKind = 'skill';
+      codeTarget = tracebackCodeTarget(family.ownerStatus?.lastError ?? family.bodySample ?? '');
+    } else if (family.ownerKind === 'maintenance-job') {
+      if (!input.maintenanceJobNames.includes(owner)) continue;
+      const jobPath = `pa/src/lib/maintenance/jobs/${owner}.ts`;
+      if (!input.jobFileExists(jobPath)) continue; // job names match filenames for all current
+      // jobs; this predicate guards the exception rather than assuming it can never happen.
+      targetKind = 'maintenance-job';
+      codeTarget = jobPath;
+    } else {
+      continue; // 'worker' / 'system' / 'unknown' — no proposal
+    }
+
+    const name = `${owner}-alert-fix`;
+    if (seenNames.has(name)) continue; // never emit two proposals with the same name
+
+    const errorText = (family.ownerStatus?.lastError ?? family.bodySample ?? '').slice(0, 200);
+    const proposal: DraftProposal = {
+      name,
+      reason: `${family.family}: ${family.sent} alerts in ${census.windowDays}d — ${errorText}`,
+      source_message_ids: [],
+      frontmatter: {},
+      prompt: '(code fix; see reason)',
+      target_skill: owner,
+      target_kind: targetKind,
+      ...(codeTarget ? { code_target: codeTarget } : {}),
+    };
+    const evidence: FailureRecord[] = [{
+      skillName: owner,
+      error: (family.ownerStatus?.lastError ?? family.bodySample ?? family.family).slice(0, 2000),
+      timestamp: family.lastSeen,
+      duration: 0,
+      worker: 'census',
+    }];
+
+    seenNames.add(name);
+    results.push({ proposal, evidence });
+  }
+
+  return results;
+}
+
 export interface RollbackFlag {
   kind: 'restore' | 'delete' | 'git-revert';
   skillName: string;   // for 'restore': the target skill to restore; for 'delete': the skill to delete; for 'git-revert': the skill whose code fix gets reverted
@@ -314,6 +426,24 @@ export async function checkForRollbacks(): Promise<RollbackFlag[]> {
     ) {
       flags.push({ kind: 'delete', skillName, draftName: skillName });
     }
+  }
+
+  // Maintenance-job code fixes (2026-08-23). computeFailureRates() reads
+  // ~/.pa/logs/<skill>/, and a declared MaintenanceJob has no such directory —
+  // so the loop above is structurally blind to them. The ledger is the only
+  // instrument that can see a job regress.
+  const ledger = await readLedger();
+  const flagged = new Set(flags.map((f) => f.skillName));
+  for (const r of await readAuditRecords()) {
+    if (r.action !== 'applied-code-fix' || r.target_kind !== 'maintenance-job') continue;
+    if (!r.commit_hash || !r.target_skill || flagged.has(r.target_skill)) continue;
+    if (new Date(r.ts) < new Date(Date.now() - ROLLBACK_LOOKBACK_DAYS * 86_400_000)) continue;
+    const st = ledger.jobs[r.target_skill];
+    if (!st || (st.consecutiveFailures ?? 0) < 2) continue;
+    const attemptMs = st.lastAttemptAt ? new Date(st.lastAttemptAt).getTime() : NaN;
+    if (!Number.isFinite(attemptMs) || attemptMs <= new Date(r.ts).getTime()) continue;
+    flags.push({ kind: 'git-revert', skillName: r.target_skill, draftName: r.draft, commitHash: r.commit_hash });
+    flagged.add(r.target_skill);
   }
 
   return flags;

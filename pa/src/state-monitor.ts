@@ -344,7 +344,7 @@ export async function analyzeAgentState(
       try { entries.push(JSON.parse(line)); } catch {}
     }
 
-    // Support for single JSON session file (Gemini format)
+    // Support for single JSON session file (Gemini/Google-family format; kept for any Google-family CLI incl. agy legacy stores — agy's current store is SQLite, handled by the binary path below)
     if (entries.length === 0 || (entries.length === 1 && Array.isArray(entries[0]?.messages))) {
       try {
         const full = entries.length === 1 ? entries[0] : JSON.parse(content);

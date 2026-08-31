@@ -18,6 +18,7 @@ import { healthCommand } from '../src/commands/health.js';
 import { notifyCommand } from '../src/commands/notify-cmd.js';
 import { bgtasksCommand } from '../src/commands/bgtasks.js';
 import { refCommand } from '../src/commands/ref.js';
+import { recallCommand } from '../src/commands/recall.js';
 import { improvementsCommand, acceptRollbackCommand } from '../src/commands/improvements.js';
 import { costsCommand } from '../src/commands/costs.js';
 import { maintenanceCommand } from '../src/commands/maintenance.js';
@@ -27,6 +28,8 @@ import { reconcileCommand } from '../src/commands/reconcile.js';
 import { dlqCommand } from '../src/commands/dlq.js';
 import { chainRunCommand, chainListCommand } from '../src/commands/chain.js';
 import { sloReportCommand } from '../src/commands/slo.js';
+import { rulesCommand } from '../src/commands/rules.js';
+import { fixCommand } from '../src/commands/fix.js';
 
 async function mcpServeCommand(): Promise<void> {
   // @ts-ignore - .mjs module without declaration file
@@ -35,6 +38,10 @@ async function mcpServeCommand(): Promise<void> {
 }
 
 async function mcpManifestCommand(): Promise<void> {
+  const { repoRootFromModule } = await import('../src/lib/git-root.js');
+  const repoRoot = await repoRootFromModule(__filename);
+  const mcpServerPath = repoRoot.replace(/\\/g, '/') + '/pa/mcp/server.mjs';
+
   const manifest = {
     name: 'pa-cli-mcp-server',
     version: '1.0.0',
@@ -60,6 +67,10 @@ async function mcpManifestCommand(): Promise<void> {
         name: 'pa_slo_report',
         description: 'Generate SLO error budget report. Shows service-level objectives, error budget consumed/remaining, and event breakdowns.',
       },
+      {
+        name: 'pa_recall',
+        description: 'Full-text search across archived conversation turns, worker run traces, per-topic brains, the Ecosystem KB and judgment-call decision rows. Use before assuming something was never discussed.',
+      },
     ],
     transport: 'stdio',
     command: 'pa mcp serve',
@@ -82,7 +93,7 @@ async function mcpManifestCommand(): Promise<void> {
   console.log('  "mcpServers": {');
   console.log('    "pa-mcp": {');
   console.log('      "command": "node",');
-  console.log('      "args": ["D:/Personal Assistant/pa/mcp/server.mjs"]');
+  console.log(`      "args": ["${mcpServerPath}"]`);
   console.log('    }');
   console.log('  }');
   console.log('}');
@@ -94,7 +105,7 @@ async function mcpManifestCommand(): Promise<void> {
   console.log('    pa-mcp:');
   console.log('      command: node');
   console.log('      args:');
-  console.log('        - D:/Personal Assistant/pa/mcp/server.mjs');
+  console.log(`        - ${mcpServerPath}`);
   console.log('```\n');
 }
 
@@ -119,10 +130,13 @@ Usage:
   pa drafts [--pending|--rejected|--approved]  List skill drafts
   pa approve <name> [--edit]  Approve a draft and install as active skill
   pa reject <name>            Reject a skill draft
+  pa fix <family> [--note "..."]  Record a shipped fix in the fix ledger (stops the family re-alerting)
+  pa fix --list                 List fix-ledger records (oldest first)
   pa health                   Show system health status
   pa notify --subject <s> (--body <b> | --body-file <path> | --body-stdin) [--dedup-key <k>] [--topic-thread <id>] [--severity info|warn|error]
   pa bgtasks [--json] [--kill <pid>]  List or kill background descendant processes
   pa ref <refId>              Look up what message produced a Ref ID (e.g. 'pa ref c-a59a')
+  pa recall "<q>" [--thread N] [--json]   Full-text search over turns, traces, brains, KB
   pa improvements [--since N] Eval self-improver's applied/rolled-back changes (default 30d)
   pa improvements accept <commit_hash> [--reason "..."]  Record a human decision to KEEP a commit whose rollback failed
   pa maintenance list         List declared maintenance jobs + resolved target paths
@@ -132,14 +146,15 @@ Usage:
   pa claim <path...> --session <label> --note "<text>" [--ttl <minutes>] [--force] [--wait <seconds>]
                                Reserve path(s)/@logical-resource for multi-session coordination
   pa claim --renew <id> [--ttl <minutes>]  Extend an existing reservation
-  pa release <id>             Release a reservation by id
-  pa claims                   Show active reservations + recently modified paths (mtime layer)
+  pa release <id> [--session <label>] [--force]  Release a reservation by id (ownership-checked when --session is given)
+  pa claims [--stats [--days N] [--json]]  Show active reservations + recently modified paths, or a reservation-activity rollup
   pa reconcile [--check] [--restore <path>] [--merge <path>]  Detect/restore/diagnose files reverted to an ancestor of HEAD
   pa dlq list                 List Dead Letter Queue entries (age, attempts, quarantined, preview)
   pa dlq replay <index|all>   Clear quarantined flag and reset attempts (retry on next flush)
   pa dlq discard <index|all>  Remove entries from DLQ
-  pa costs [--week|--month] [--skill <name>]  Show usage/cost rollup by worker, model, and skill
-  pa slo report [--month <YYYY-MM>]  Generate SLO error budget report
+  pa costs [--day|--week|--month] [--skill <name>] [--json]  Show usage/cost rollup by worker, model, and skill
+  pa slo report [--month <YYYY-MM>] [--json]  Generate SLO error budget report
+  pa rules list [--active] | show <id> | supersede <id> --reason "…" | accept <id> | weekly [--json]  Feedback-rules store (AI-165)
   pa mcp serve                Start the MCP stdio server (for Claude/Codex/agy integration)
   pa mcp manifest             Print MCP manifest + registration instructions
   pa chain run <name>         Execute a sequential workflow chain
@@ -161,11 +176,20 @@ async function main(): Promise<void> {
         const skillName = args[1];
         const dashIdx = args.indexOf('--');
         const workerIdx = args.indexOf('--worker');
+        const promptArgsIdx = args.indexOf('--prompt-args');
         // Only accept --worker if it appears before -- (or there's no --)
         const preferredWorker = (workerIdx !== -1 && (dashIdx === -1 || workerIdx < dashIdx))
           ? args[workerIdx + 1] : undefined;
+        // Only accept --prompt-args if it appears before -- (or there's no --)
+        const promptArgs = (promptArgsIdx !== -1 && (dashIdx === -1 || promptArgsIdx < dashIdx))
+          ? args[promptArgsIdx + 1] : undefined;
+        if (promptArgs === undefined && promptArgsIdx !== -1) {
+          console.error('Usage: pa run <skill> [--prompt-args "<text>"] [--worker <name>] [-- <extra-args>]');
+          process.exitCode = 2;
+          break;
+        }
         const extraArgs = dashIdx !== -1 ? args.slice(dashIdx + 1) : [];
-        await runCommand(skillName, extraArgs, 0, preferredWorker);
+        await runCommand(skillName, extraArgs, 0, preferredWorker, promptArgs);
         break;
       }
 
@@ -254,8 +278,12 @@ async function main(): Promise<void> {
         await rejectCommand(args[1]);
         break;
 
+      case 'fix':
+        await fixCommand(args.slice(1));
+        break;
+
       case 'health':
-        await healthCommand();
+        await healthCommand(args.slice(1));
         break;
 
       case 'notify':
@@ -301,7 +329,11 @@ async function main(): Promise<void> {
         break;
 
       case 'claims':
-        process.exitCode = await claimsCommand();
+        process.exitCode = await claimsCommand(args.slice(1));
+        break;
+
+      case 'recall':
+        process.exitCode = await recallCommand(args.slice(1));
         break;
 
       case 'reconcile':
@@ -333,10 +365,14 @@ async function main(): Promise<void> {
         if (sub === 'report') {
           await sloReportCommand(args.slice(2));
         } else {
-          console.log('Usage: pa slo report [--month <YYYY-MM>]');
+          console.log('Usage: pa slo report [--month <YYYY-MM>] [--json]');
         }
         break;
       }
+
+      case 'rules':
+        process.exitCode = await rulesCommand(args.slice(1));
+        break;
 
       case 'mcp': {
         const sub = args[1];

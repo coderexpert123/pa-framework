@@ -8,6 +8,17 @@ import { homedir } from 'os';
 import type { ConversationState, ConversationTurn } from './types.js';
 import { rotateFileIfNeeded } from './archive-files.js';
 
+/** Archive join fields the rolling in-memory window does not need to know about.
+ *  Declared HERE, not on ConversationTurn, because projects/telegram-bot/src/types.ts
+ *  is owned by a concurrent wave (2026-08-24 constraint) — a widened alias is purely
+ *  additive and collides with nothing. archiveNewTurns serialises the whole turn
+ *  object (conversation.ts:173), so any field present on the turn reaches the
+ *  archive row with no writer change. `run_id` is declared but is NOT populated by
+ *  the bot today: the bot-origin join key is (thread_id, update_id), which the trace
+ *  sidecar already carries — see the SPEC's C24. */
+export interface TurnJoinFields { update_id?: number; run_id?: string }
+export type JoinableTurn = ConversationTurn & TurnJoinFields;
+
 const MAX_TURNS = 20;
 const MAX_HISTORY_CHARS = 8000;
 
@@ -88,6 +99,21 @@ async function saveWatermarks(wm: Record<string, ArchiveWatermark>): Promise<voi
   const tmp = getWatermarkPath() + '.tmp';
   await fs.writeFile(tmp, JSON.stringify(wm), 'utf8');
   await fs.rename(tmp, getWatermarkPath());
+}
+
+/**
+ * atomic (2026-08-23): a kill mid-write left a truncated file that `loadState`
+ * silently reset to `defaultState`, losing the rolling 20-turn window and any
+ * `cwd_override`/`preferred_worker` state with no signal. Mirrors this file's
+ * own `saveWatermarks` idiom above (tmp sibling + rename) rather than
+ * importing pa/dist's atomic-write.ts — this file has no pa/dist import
+ * today, and adding one for a two-line helper would change the bot's module
+ * load order.
+ */
+async function writeFileAtomicLocal(path: string, data: string): Promise<void> {
+  const tmp = path + '.tmp';
+  await fs.writeFile(tmp, data, 'utf8');
+  await fs.rename(tmp, path);
 }
 
 async function archiveNewTurns(turns: ConversationTurn[], threadId?: number): Promise<void> {
@@ -221,7 +247,7 @@ export async function saveState(state: ConversationState): Promise<void> {
     totalChars -= dropped.text.length;
   }
 
-  await fs.writeFile(getStatePath(), JSON.stringify({ ...state, turns }, null, 2), 'utf8');
+  await writeFileAtomicLocal(getStatePath(), JSON.stringify({ ...state, turns }, null, 2));
 }
 
 export async function loadTopicState(chatId: number, threadId: number): Promise<ConversationState> {
@@ -252,7 +278,7 @@ export async function saveTopicState(state: ConversationState): Promise<void> {
     totalChars -= dropped.text.length;
   }
 
-  await fs.writeFile(getTopicPath(state.chat_id, state.thread_id), JSON.stringify({ ...state, turns }, null, 2), 'utf8');
+  await writeFileAtomicLocal(getTopicPath(state.chat_id, state.thread_id), JSON.stringify({ ...state, turns }, null, 2));
 }
 
 export async function listTopicStateRefs(): Promise<TopicStateRef[]> {

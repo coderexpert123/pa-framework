@@ -3,9 +3,10 @@
  * See pa/src/lib/maintenance/types.ts for the MaintenanceJob contract this satisfies.
  */
 import { statSync, writeFileSync } from 'fs';
+import { readFile } from 'fs/promises';
 import { join } from 'path';
 import type { MaintenanceJob } from '../../../pa/dist/src/lib/maintenance/types.js';
-import { notifyUser } from '../../../pa/dist/src/lib/notify.js';
+import { notifyUser, collectUnflushedDigests, formatDigestMessage, markDigestFlushed } from '../../../pa/dist/src/lib/notify.js';
 import { flushDlq } from './dlq.js';
 import { compactDelivered } from './delivered-store.js';
 import { paHome } from '../../../pa/dist/src/paths.js';
@@ -14,8 +15,19 @@ import { RUNTIME_ARCHIVE_MAX_BYTES } from '../../../pa/dist/src/lib/archive-file
 import {
   runScheduledPoolRefresh,
 } from '../../../pa/dist/src/lib/telegram-proxy.js';
+import { repoRootFromModule } from '../../../pa/dist/src/lib/git-root.js';
+import { readActive } from '../../../pa/dist/src/lib/reservations.js';
+import { blackboard } from '../../../pa/dist/src/blackboard.js';
+import { warnOnce } from './lib/warn-once.js';
+import { loadRegistryContentRules, type RegistryContentRule } from './registry-content-rules.js';
 import type { TopicNameMap } from './topic-names.js';
 import { isSuspiciousDescription } from './grounding-check.js';
+import { listPendingDispatches } from './pending-dispatches.js';
+import { listTopicStateRefs } from './conversation.js';
+import { shouldSelfRestart, shouldWarnStaleCode, formatRestartBlockers, formatDurationCompact } from './self-restart.js';
+import { refreshDashboardIfBootstrapped } from './dashboard.js';
+import { writeFileAtomic } from '../../../pa/dist/src/lib/atomic-write.js';
+import { PENDING_ACTION_TTL_MS } from './logic.js';
 import {
   botLogRotationCheckJob,
   modelOverrideSweepJob,
@@ -24,7 +36,15 @@ import {
   dlqFlushJob,
   groundingCheckJob,
 } from '../../../pa/dist/src/lib/maintenance/jobs/index.js';
+import { botSelfRestartJob } from '../../../pa/dist/src/lib/maintenance/jobs/bot-self-restart.js';
+import { alertDigestJob } from '../../../pa/dist/src/lib/maintenance/jobs/alert-digest.js';
 import { loadJobState, updateJobState } from '../../../pa/dist/src/lib/maintenance/state.js';
+
+// Module-level (not durable): the first pass where the dist stamp is newer
+// than this process but the bot has never gone idle long enough to restart.
+// A bot restart clears it implicitly (fresh process, fresh module state) —
+// that is the correct semantics, and it adds no timer (C13).
+let firstSeenNewerStampMs: number | null = null;
 
 // ─── Registry Content Watch Invariants ─────────────────────────────────────────────
 
@@ -33,27 +53,6 @@ import { loadJobState, updateJobState } from '../../../pa/dist/src/lib/maintenan
  * Each invariant asserts a required condition for a specific topic's description.
  * Future migrations add lines in one place (this array) — extensible.
  */
-const REGISTRY_CONTENT_INVARIANTS = [
-  {
-    topicKey: 'whatsapp-drafts',
-    threadId: 9855,
-    test: (desc: string | undefined) => desc?.includes('INSTRUCTIONS.md') ?? false,
-    label: 'Path-0 pointer',
-  },
-  {
-    topicKey: 'pa-alerts',
-    threadId: 3376,
-    test: (desc: string | undefined) => !desc?.includes('Palo Alto'),
-    label: 'no hallucinated gloss',
-  },
-  {
-    topicKey: 'ekadashi',
-    threadId: 7822,
-    test: (desc: string | undefined) => desc?.includes('Sources.md') ?? false,
-    label: 'deterministic routing gate',
-  },
-] as const;
-
 export interface RegistryContentViolation {
   topicKey: string;
   threadId: number;
@@ -64,20 +63,37 @@ export interface RegistryContentViolation {
 /**
  * Pure check function for registry content invariants.
  * Returns a list of violations (empty if all pass). Exported for tests.
+ *
+ * @param rules - Declarative rules loaded from registry-content-rules.json
+ * @param topicNames - Current topic registry
  */
-export function checkRegistryContentInvariants(topicNames: TopicNameMap): RegistryContentViolation[] {
+export function checkRegistryContentInvariants(
+  rules: RegistryContentRule[],
+  topicNames: TopicNameMap
+): RegistryContentViolation[] {
   const violations: RegistryContentViolation[] = [];
-  for (const inv of REGISTRY_CONTENT_INVARIANTS) {
+  for (const rule of rules) {
     let found = false;
     for (const [chatId, threads] of topicNames.entries()) {
-      const entry = threads.get(inv.threadId);
-      if (entry && entry.name === inv.topicKey) {
+      const entry = threads.get(rule.thread_id);
+      if (entry && entry.name === rule.topic_key) {
         found = true;
-        if (!inv.test(entry.description)) {
+        const desc = entry.description || '';
+
+        // Evaluate declarative predicates
+        let passes = true;
+        if (rule.require_contains && !desc.includes(rule.require_contains)) {
+          passes = false;
+        }
+        if (rule.forbid_contains && desc.includes(rule.forbid_contains)) {
+          passes = false;
+        }
+
+        if (!passes) {
           violations.push({
-            topicKey: inv.topicKey,
-            threadId: inv.threadId,
-            invariantLabel: inv.label,
+            topicKey: rule.topic_key,
+            threadId: rule.thread_id,
+            invariantLabel: rule.label,
             description: entry.description,
           });
         }
@@ -107,6 +123,14 @@ export interface BotMaintenanceDeps {
   /** Live topic registry — same Map instance runPollLoop uses, so the job
    *  always sees current state with no extra load of its own (AI-101). */
   topicNames: TopicNameMap;
+  /** Injected (runModelSweep precedent — avoids a main.ts import cycle):
+   *  drain due parked requeues; returns the number re-injected. */
+  requeueDrain: () => Promise<number>;
+  /**
+   * Registry content rules loaded from ~/.pa/registry-content-rules.json.
+   * Injected for testability (default: loadRegistryContentRules()).
+   */
+  rules?: RegistryContentRule[];
 }
 
 /**
@@ -152,6 +176,61 @@ export async function watchdogStaleJobs(jobs: MaintenanceJob[]): Promise<void> {
       logger.warn('maintenance-watchdog', `watchdog check failed for job ${job.name}`, { error: String(err) });
     }
   }
+}
+
+/**
+ * Zombie-confirmations fix (2026-08-30 SPEC): sweep expired pending_action
+ * records from topic-state files, then return how many FRESH ones remain.
+ * One pass per file: read, sweep if expired, count if fresh — so the caller's
+ * count always sees post-sweep state. Malformed/missing proposed_at counts as
+ * expired (conservative toward restarting — deliberate divergence from
+ * expirePendingAction's NaN-keeps behavior, SPEC §1.6). Parse/read failures
+ * keep the job's existing counts-as-0 behavior and never write. The mtime
+ * guard (SPEC §1.5) prevents reverting a concurrent saveTopicState (which
+ * writes new turns too) that lands between our read and write.
+ */
+export interface PendingActionSweepResult {
+  /** Fresh (within-TTL) pending_action records remaining after the sweep. */
+  fresh: number;
+  /** Age of the OLDEST fresh record in ms; null when fresh === 0. Feeds the
+   *  stale-code watchdog's blocker text (2026-08-30 SPEC). */
+  oldestFreshAgeMs: number | null;
+}
+
+export async function sweepExpiredPendingActions(nowMs: number): Promise<PendingActionSweepResult> {
+  let fresh = 0;
+  let oldestFreshAgeMs: number | null = null;
+  for (const ref of await listTopicStateRefs()) {
+    try {
+      const mtimeBeforeMs = statSync(ref.path).mtimeMs;
+      const parsed = JSON.parse(await readFile(ref.path, 'utf8')) as {
+        pending_action?: { proposed_at?: unknown };
+      };
+      const pa = parsed.pending_action;
+      if (!pa) continue;
+      const t = typeof pa.proposed_at === 'string' ? new Date(pa.proposed_at).getTime() : NaN;
+      if (Number.isFinite(t) && nowMs - t < PENDING_ACTION_TTL_MS) {
+        fresh++;
+        const ageMs = nowMs - t;
+        if (oldestFreshAgeMs === null || ageMs > oldestFreshAgeMs) oldestFreshAgeMs = ageMs;
+        continue; // fresh — NEVER touch
+      }
+      if (statSync(ref.path).mtimeMs !== mtimeBeforeMs) {
+        // Concurrent writer landed mid-sweep; leave it for the next tick.
+        logger.info('bot', 'self-restart sweep: skipped, file changed mid-sweep', { path: ref.path });
+        continue;
+      }
+      delete parsed.pending_action;
+      await writeFileAtomic(ref.path, JSON.stringify(parsed, null, 2));
+      logger.info('bot', 'self-restart sweep: cleared expired pending_action', {
+        path: ref.path,
+        proposed_at: typeof pa.proposed_at === 'string' ? pa.proposed_at : null,
+      });
+    } catch {
+      // unreadable/unparseable file: counts as 0, never written (existing gather behavior).
+    }
+  }
+  return { fresh, oldestFreshAgeMs };
 }
 
 export function createBotMaintenanceJobs(deps: BotMaintenanceDeps): MaintenanceJob[] {
@@ -231,16 +310,21 @@ export function createBotMaintenanceJobs(deps: BotMaintenanceDeps): MaintenanceJ
     },
   };
 
+  // A static stub now exists in pa/src/lib/maintenance/jobs/registry-content-watch.ts
+  // (for `pa maintenance list`, which cannot run the bot's bound closure). The two must
+  // keep the same `name`, `everyMs`, `host`, `destructive` and `shedWhenDegraded` — asserted
+  // by pa/tests/maintenance-registry.test.ts and this file's own maintenance-jobs.test.ts.
   const boundRegistryContentWatch: MaintenanceJob = {
     name: 'registry-content-watch',
-    description: 'Daily content invariants for topic descriptions — watches Path-0 pointer (whatsapp-drafts), no Palo Alto hallucination (pa-alerts), routing gate (ekadashi). Non-destructive — reads and alerts only.',
+    description: 'Daily content invariants for topic descriptions, per rules in ~/.pa/registry-content-rules.json (default: none). Non-destructive — reads and alerts only.',
     host: 'bot',
     everyMs: 86_400_000, // daily
     shedWhenDegraded: true,
     destructive: false,
     targets: [], // non-destructive — reads and alerts only
     async run() {
-      const violations = checkRegistryContentInvariants(deps.topicNames);
+      const rules = deps.rules || loadRegistryContentRules();
+      const violations = checkRegistryContentInvariants(rules, deps.topicNames);
       if (violations.length > 0) {
         const body = violations
           .map((v) => `${v.topicKey} (${v.threadId}): failed invariant "${v.invariantLabel}" — description: "${v.description?.slice(0, 120) ?? '(empty)'}"`)
@@ -255,6 +339,152 @@ export function createBotMaintenanceJobs(deps: BotMaintenanceDeps): MaintenanceJ
     },
   };
 
+  const boundBotSelfRestart: MaintenanceJob = {
+    ...botSelfRestartJob,
+    async run(ctx) {
+      if (deps.sentinelPath === undefined) {
+        return { touched: 0, detail: { reason: 'no-sentinel' } };
+      }
+
+      const repoRoot = await repoRootFromModule(import.meta.url);
+      const stampPaths = [
+        join(repoRoot, 'pa', 'dist', '.build-stamp'),
+        join(repoRoot, 'projects', 'telegram-bot', 'dist', '.build-stamp'),
+      ];
+      let stampMtimeMs: number | null = null;
+      for (const p of stampPaths) {
+        try {
+          const m = statSync(p).mtimeMs;
+          if (stampMtimeMs === null || m > stampMtimeMs) stampMtimeMs = m;
+        } catch {
+          // stamp not present at this path — contributes nothing.
+        }
+      }
+
+      const procStartMs = Date.now() - Math.round(process.uptime() * 1000);
+      const buildLockHeld = (await readActive()).some((r) => r.paths.includes('@build'));
+      const inFlightWorkers = (await listPendingDispatches()).length;
+      const topicLocksHeld = (await blackboard.getActiveLocks()).filter(
+        (l) => l.pid === process.pid && l.resource.startsWith('topic-'),
+      ).length;
+
+      // TTL-aware (2026-08-30 SPEC): sweep expired pending_action records first,
+      // then count what is fresh — a zombie can no longer pin the restart gate
+      // at 'busy' forever.
+      const { fresh: pendingActions, oldestFreshAgeMs: oldestPendingActionAgeMs } =
+        await sweepExpiredPendingActions(ctx.now);
+
+      const disabled = process.env.PA_BOT_SELF_RESTART === '0';
+
+      const d = shouldSelfRestart({
+        procStartMs,
+        stampMtimeMs,
+        nowMs: ctx.now,
+        buildLockHeld,
+        inFlightWorkers,
+        pendingActions,
+        topicLocksHeld,
+        disabled,
+      });
+
+      if (d.stampIsNewer && !d.restart) {
+        if (firstSeenNewerStampMs === null) firstSeenNewerStampMs = ctx.now;
+      } else {
+        firstSeenNewerStampMs = null;
+      }
+
+      if (d.restart) {
+        logger.info('bot', 'self-restart: dist stamp is newer than this process and the bot is idle — writing stop sentinel', { stampMtimeMs, procStartMs });
+        await notifyUser(
+          'Bot self-restart',
+          `dist stamp (${stampMtimeMs !== null ? new Date(stampMtimeMs).toISOString() : 'unknown'}) is newer than this process's start (${new Date(procStartMs).toISOString()}) and the bot is idle. Writing the stop sentinel — Task Scheduler will relaunch it on the newer build.`,
+          { dedupKey: 'bot-self-restart', severity: 'info', escalate: false },
+        ).catch(() => {});
+        writeFileSync(deps.sentinelPath, String(ctx.now));
+        return { touched: 1, detail: { reason: d.reason, stampMtimeMs } };
+      }
+
+      if (shouldWarnStaleCode({ firstSeenNewerStampMs, nowMs: ctx.now })) {
+        const staleMs = firstSeenNewerStampMs !== null ? ctx.now - firstSeenNewerStampMs : 0;
+        const blockers = formatRestartBlockers({
+          procStartMs,
+          stampMtimeMs,
+          nowMs: ctx.now,
+          buildLockHeld,
+          inFlightWorkers,
+          pendingActions,
+          topicLocksHeld,
+          oldestPendingActionAgeMs,
+        });
+        logger.warn('bot', 'self-restart: dist stamp has been newer than this process for 30+ minutes but the bot has never gone idle long enough to self-restart', { stampMtimeMs, procStartMs, firstSeenNewerStampMs, staleMs, blockers });
+        await notifyUser(
+          'Bot running stale code',
+          `dist stamp has been newer than this running process for ${formatDurationCompact(staleMs)}, but the bot has never gone idle long enough to self-restart. Still blocked by: ${blockers || 'nothing observable'}. (last reason: ${d.reason}). stampMtimeMs=${stampMtimeMs}, procStartMs=${procStartMs}.`,
+          { dedupKey: 'bot-stale-code', severity: 'warn' },
+        ).catch(() => {});
+        return { touched: 0, detail: { reason: d.reason, stale: true, blockers } };
+      }
+
+      return { touched: 0, detail: { reason: d.reason } };
+    },
+  };
+
+  // Parity with the pa-side stub (pa/src/lib/maintenance/jobs/alert-digest.ts)
+  // is asserted by maintenance-jobs.test.ts. Cheap job runs BEFORE dlq-flush
+  // (jobs array order is load-bearing — see the comment above
+  // createBotMaintenanceJobs).
+  const boundAlertDigest: MaintenanceJob = {
+    ...alertDigestJob,
+    async run(ctx) {
+      const files = await collectUnflushedDigests(ctx.now);
+      if (files.length === 0) return { touched: 0 };
+      const dates = files.map((f) => f.date).join(',');
+      const { subject, body } = formatDigestMessage(files);
+      const r = await notifyUser(subject, body, {
+        dedupKey: `alert-digest-${dates}`,
+        severity: 'info',
+        breaker: false,
+      }).catch(() => ({ sent: false, suppressed: false }));
+      // Mark flushed ONLY on sent || suppressed (SPEC §1.14): suppressed
+      // proves an earlier attempt with the same per-date key delivered;
+      // anything else (disabled/token/chat/send-failed/timeout) retries on
+      // the next daily run instead of silently losing the digest.
+      if (r.sent || r.suppressed) {
+        for (const f of files) {
+          await markDigestFlushed(f, ctx.now).catch(() => {});
+        }
+      }
+      return { touched: r.sent ? files.length : 0, detail: { dates: files.map((f) => f.date), sent: r.sent } };
+    },
+  };
+
+  const boundRequeueDrain: MaintenanceJob = {
+    name: 'requeue-drain',
+    description: 'Re-inject parked requeue-ladder dispatches whose backoff has elapsed (seamless restart recovery, 2026-08-27). Request recovery, not housekeeping — never shed under DEGRADED, mirroring dlq-flush.',
+    host: 'bot',
+    everyMs: 5 * 60_000,
+    shedWhenDegraded: false,
+    destructive: false,
+    targets: [],
+    async run() {
+      return { touched: await deps.requeueDrain() };
+    },
+  };
+
+  const boundDashboardRefresh: MaintenanceJob = {
+    name: 'dashboard-refresh',
+    description: 'Re-render the system-dashboard pinned message and update ~/.pa/telegram-dashboard.json. Non-destructive — reads, edits, re-pins. Skips when the dashboard was never bootstrapped (no chat_id/message_id state).',
+    host: 'bot',
+    everyMs: 1_800_000, // 30 minutes
+    shedWhenDegraded: true,
+    destructive: false,
+    targets: [],
+    async run() {
+      await refreshDashboardIfBootstrapped(deps.token);
+      return { touched: 1 };
+    },
+  };
+
   return [
     boundBotLogRotationCheck,
     boundModelOverrideSweep,
@@ -262,6 +492,10 @@ export function createBotMaintenanceJobs(deps: BotMaintenanceDeps): MaintenanceJ
     boundProxyPoolRefresh,
     boundGroundingCheck,
     boundRegistryContentWatch,
+    boundDashboardRefresh,
+    boundRequeueDrain,
+    boundBotSelfRestart,
+    boundAlertDigest,
     boundDlqFlush,
   ];
 }

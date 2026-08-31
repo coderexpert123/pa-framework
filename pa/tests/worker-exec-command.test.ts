@@ -1,3 +1,5 @@
+import './test-env-guard.js';
+
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFile, mkdir, chmod } from 'fs/promises';
@@ -56,20 +58,20 @@ async function writeStub(baseName: string, marker: string): Promise<string> {
 describe('worker-exec command contract (no name-based rewriting)', () => {
   it('spawns worker.command verbatim for a gemini-named worker pointed at a gemini.cmd stub', async () => {
     // Regression guard: worker-exec.ts used to rewrite any worker named
-    // "gemini" whose command was "gemini" or ended in "gemini.cmd" to the
-    // machine-specific D:/gemini-shim/gemini.cmd, ignoring the configured
+    // "stubcli" whose command was "stubcli" or ended in "stubcli.cmd" to the
+    // machine-specific D:/gemini-shim/stubcli.cmd, ignoring the configured
     // command entirely. That made the scaffolded default config unusable
     // on every machine except the original maintainer's.
-    const stubPath = await writeStub('gemini', 'MARKER_GEMINI_CONTRACT');
+    const stubPath = await writeStub('stubcli', 'MARKER_STUBCLI_CONTRACT');
     const worker = makeWorker({
-      name: 'gemini',
+      name: 'stubcli',
       command: stubPath,
       args: [],
       input_mode: 'arg',
     });
 
     const result = await executeWorker(worker, 'test prompt', { timeout: 10 });
-    assert.ok(result.output.includes('MARKER_GEMINI_CONTRACT'),
+    assert.ok(result.output.includes('MARKER_STUBCLI_CONTRACT'),
       `Expected stub output, got: ${JSON.stringify(result)}`);
   });
 

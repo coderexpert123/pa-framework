@@ -76,8 +76,8 @@ const codex = worker('codex', {
   effort: { args: ['-c', 'model_reasoning_effort={value}'], values: ['minimal', 'low', 'medium', 'high'] },
 });
 
-/** gemini-shaped: model only. The bot uses this to explain why /effort is unavailable. */
-const gemini = worker('gemini', { model: { args: ['--model', '{value}'] } });
+/** agy-shaped: model only. The bot uses this to explain why /effort is unavailable. */
+const modelOnly = worker('agy', { model: { args: ['--model', '{value}'] } });
 
 /** no tunables block at all — must behave exactly as before the feature existed. */
 const plain = worker('plain');
@@ -243,7 +243,7 @@ describe('parseTunables', () => {
 describe('supports + describe', () => {
   it('lists declared settings in declaration order', () => {
     assert.deepEqual(listTunables(agy), ['model', 'effort']);
-    assert.deepEqual(listTunables(gemini), ['model']);
+    assert.deepEqual(listTunables(modelOnly), ['model']);
     assert.deepEqual(listTunables(plain), []);
     assert.deepEqual(listTunables(undefined), []);
   });
@@ -251,7 +251,7 @@ describe('supports + describe', () => {
   it('answers supports(W, S) case-insensitively', () => {
     assert.equal(supportsTunable(agy, 'effort'), true);
     assert.equal(supportsTunable(agy, ' EFFORT '), true);
-    assert.equal(supportsTunable(gemini, 'effort'), false);
+    assert.equal(supportsTunable(modelOnly, 'effort'), false);
     assert.equal(supportsTunable(plain, 'model'), false);
     assert.equal(supportsTunable(undefined, 'model'), false);
   });
@@ -272,7 +272,7 @@ describe('supports + describe', () => {
   });
 
   it('describeTunable returns undefined for an unsupported setting', () => {
-    assert.equal(describeTunable(gemini, 'effort'), undefined);
+    assert.equal(describeTunable(modelOnly, 'effort'), undefined);
     assert.equal(describeTunable(plain, 'model'), undefined);
   });
 
@@ -295,7 +295,7 @@ describe('validateTunable', () => {
   });
 
   it('rejects a setting the worker does not declare and says what it DOES support', () => {
-    const v = validateTunable(gemini, 'effort');
+    const v = validateTunable(modelOnly, 'effort');
     assert.equal(v.ok, false);
     assert.match(v.error!, /no setting called 'effort'/);
     assert.match(v.error!, /supports: model/);
@@ -361,7 +361,7 @@ describe('resolveTunables cascade', () => {
   });
 
   it('ignores overrides naming a setting this worker does not declare', () => {
-    const r = resolveTunables(gemini, { effort: 'high', model: 'gemini-2.5-pro' });
+    const r = resolveTunables(modelOnly, { effort: 'high', model: 'gemini-2.5-pro' });
     assert.deepEqual(r.map((x) => x.setting), ['model']);
     assert.deepEqual(buildTunableArgs(r), ['--model', 'gemini-2.5-pro']);
   });
@@ -600,9 +600,9 @@ describe('worker-scoped tunable store', () => {
     store = setWorkerTunable(store, 'codex', 'model', 'gpt-5.4');
 
     assert.deepEqual(selectWorkerTunables(store, 'agy'), { effort: 'high' });
-    assert.deepEqual(selectWorkerTunables(store, 'gemini'), {});
-    // after /model gemini, gemini resolves nothing even though agy's entry survives
-    assert.deepEqual(resolveTunableArgs(gemini, selectWorkerTunables(store, 'gemini')), []);
+    assert.deepEqual(selectWorkerTunables(store, 'deadworker'), {});
+    // after /model deadworker, deadworker resolves nothing even though agy's entry survives
+    assert.deepEqual(resolveTunableArgs(modelOnly, selectWorkerTunables(store, 'deadworker')), []);
     assert.deepEqual(resolveTunableArgs(agy, selectWorkerTunables(store, 'agy')), ['--effort', 'high']);
   });
 
@@ -713,7 +713,7 @@ describe('observed tunable values', () => {
   it('returns [] on an empty logs directory and for an unsupported setting', async () => {
     assert.deepEqual(await readObservedTunableValues(agy, 'model', { dir: logs, now: NOW }), []);
     await writeMeta('s1', '20260722-101010-aaaaaa.meta', { worker: 'agy', status: 'success', exitCode: 0, duration: 1, timestamp: '', extraArgs: ['--effort', 'high'] });
-    assert.deepEqual(await readObservedTunableValues(gemini, 'effort', { dir: logs, now: NOW }), []);
+    assert.deepEqual(await readObservedTunableValues(modelOnly, 'effort', { dir: logs, now: NOW }), []);
   });
 
   it('extracts distinct values across skills, newest run first', async () => {

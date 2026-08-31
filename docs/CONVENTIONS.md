@@ -106,6 +106,8 @@ CLAUDE.md" community guidance assumes — a line budget is the wrong unit here.
 | Router/index file (a file that replaced a monolith with pointers) | — | 4,000 chars | it stopped being a router; re-split |
 | Evergreen audience-facing guide (the 9 evergreen `UPPERCASE.md` guides under `docs/`) | — | 24,000 chars | separate class from operational-detail docs |
 | Append-only archive file (`backlog/archive-*.md`, `backlog/not-valid.md`) — looked up by ID, never read front to back | — | no hard ceiling | see note below |
+| Completed-item lookup index (`backlog/completed-index.md`) — one row per archived item, grows monotonically with shipped work, never auto-loaded | 16,000 chars | 20,000 chars | raise this row rather than splitting; splitting breaks its "every item exactly once, in one place" contract |
+| Open-program body file (`backlog/programs-*.md`) — bodies lifted out of `BACKLOG.md`, looked up by ID | — | no hard ceiling | same class as the archives |
 
 **Note on the auto-managed inventory row**: this class exists because its size is bounded
 by *how many source files a glob pattern matches*, not by narrative verbosity — splitting
@@ -195,7 +197,7 @@ These never live at the root and are caught by `.gitignore`:
 | `/*turns*.{json,jsonl,txt}` | conversation analyses | `<project>/data/exports/` or scratch |
 | `/analyze_*.py`, `/check_*.py`, `/find_*.py` | ad-hoc scripts | `scratch/` or `<project>/scripts/` |
 | `/fetch_*.py`, `/search_*.py`, `/extract_*.py` | ad-hoc fetchers | `scratch/` or `<project>/scripts/` |
-| `/Action Items.md`, `/Preferences.md`, etc. | Ecosystem KB files | `<KB-root>/Ecosystem KB/` (outside the repo) |
+| `/notes-actions.md`, `/notes-preferences.md`, etc. | External knowledge-base files | `<your-kb-root>/` (outside the repo) |
 | `/message_to_user.md`, `/output.json`, `/output.md`, `/skill_proposals.json`, `/error_log.txt`, `/oracle_output.txt`, `**/glm-[0-9]*` | LLM worker "going agentic" — writes its response (or its error) to a file at cwd instead of returning text; `glm-*` is zclaude naming the file after its own model (glm-4.7, glm-5.2[1m]), in whatever subdir its cwd was | delete; not a real output path for any script (confirmed via full-repo grep) |
 
 The last row keeps growing because the failure mode keeps resurfacing under new filenames — `/output.md` and `/error_log.txt` were added on 2026-07-21, `/oracle_output.txt` on 2026-08-08 (the `oracle` skill's step 1 script prints raw profile+briefing data to stdout by design for its worker to synthesize per step 6 — the worker dumped that raw stdout to a file instead of returning the synthesized text), and `**/glm-[0-9]*` on 2026-08-13 (zclaude's model-named dumps, root AND subdirs — the first instance of the class that is a glob, not a fixed filename, because the name tracks whatever model zclaude runs). When you find a new one, add it to `.gitignore`, `.gitignore-public`, this table, and the private brain's hygiene section in the same edit. A partial update is how the pattern list falls behind reality.

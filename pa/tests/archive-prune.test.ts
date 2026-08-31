@@ -87,6 +87,14 @@ describe('pruneArchive', () => {
     assert.equal((await readdir(archiveDir)).length, 2);
   });
 
+  it('deletes an old turn-traces.jsonl shard but keeps a conversation-history shard of the same age', async () => {
+    await makeArchive('2026-01-01-000000-turn-traces.jsonl', 100, 200); // old, prunable (AI-161)
+    await makeArchive('2026-01-01-000000-conversation-history.jsonl', 100, 200); // old, PERMANENT
+    const removed = await pruneArchive({ maxAgeDays: 90, maxTotalBytes: 999_999_999 });
+    assert.equal(removed, 1);
+    assert.deepEqual(await readdir(archiveDir), ['2026-01-01-000000-conversation-history.jsonl']);
+  });
+
   it('fails safe: unknown-named files are kept forever', async () => {
     await makeArchive('mystery-export.bin', 100, 400);
     const removed = await pruneArchive({ maxAgeDays: 90, maxTotalBytes: 10 });

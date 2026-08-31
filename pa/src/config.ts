@@ -380,6 +380,67 @@ export function parseUsage(raw: any): UsageConfig | undefined {
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/** Parse the optional top-level `cost_tier:` block. WARN-AND-SKIP. */
+export function parseCostTier(raw: any): import('./types.js').CostTierConfig | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    console.warn("[config] ~/.pa/config.yaml: 'cost_tier' must be a mapping with 'peak_window_utc'; ignoring");
+    return undefined;
+  }
+
+  const out: import('./types.js').CostTierConfig = {};
+
+  if (raw.peak_window_utc !== undefined && raw.peak_window_utc !== null) {
+    const pw = raw.peak_window_utc;
+    if (typeof pw !== 'object' || Array.isArray(pw)) {
+      console.warn("[config] cost_tier.peak_window_utc must be a mapping; ignoring");
+      return undefined;
+    }
+
+    // Validate days array (if present)
+    if (pw.days !== undefined) {
+      if (!Array.isArray(pw.days) || pw.days.some((d: any) => typeof d !== 'number' || d < 0 || d > 6)) {
+        console.warn("[config] cost_tier.peak_window_utc.days must be an array of integers 0-6 (Sunday-Saturday); using default");
+        return undefined;
+      }
+    }
+
+    // Validate start_hour (if present)
+    if (pw.start_hour !== undefined) {
+      const sh = Number(pw.start_hour);
+      if (!Number.isInteger(sh) || sh < 0 || sh > 23) {
+        console.warn("[config] cost_tier.peak_window_utc.start_hour must be an integer 0-23; using default");
+        return undefined;
+      }
+    }
+
+    // Validate end_hour (if present)
+    if (pw.end_hour !== undefined) {
+      const eh = Number(pw.end_hour);
+      if (!Number.isInteger(eh) || eh < 0 || eh > 23) {
+        console.warn("[config] cost_tier.peak_window_utc.end_hour must be an integer 0-23; using default");
+        return undefined;
+      }
+    }
+
+    // Validate non-wrapping (start_hour < end_hour for v1)
+    const start = pw.start_hour !== undefined ? Number(pw.start_hour) : 6;
+    const end = pw.end_hour !== undefined ? Number(pw.end_hour) : 10;
+    if (start >= end) {
+      console.warn("[config] cost_tier.peak_window_utc requires start_hour < end_hour (non-wrapping windows); using default");
+      return undefined;
+    }
+
+    out.peak_window_utc = {
+      days: pw.days !== undefined ? pw.days : [1, 2, 3, 4, 5],
+      start_hour: start,
+      end_hour: end,
+    };
+  }
+
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 export async function loadConfig(): Promise<PaConfig> {
   const path = configPath();
   let raw: string;
@@ -479,6 +540,7 @@ export async function loadConfig(): Promise<PaConfig> {
       maintenance: parseMaintenance(parsed.maintenance),
       transcription: parseTranscription(parsed.transcription),
       usage: parseUsage(parsed.usage),
+      cost_tier: parseCostTier(parsed.cost_tier),
       quota_aware_failover: typeof parsed.quota_aware_failover === 'boolean' ? parsed.quota_aware_failover : false,
       worker_pin: typeof parsed.worker_pin === 'string' ? parsed.worker_pin.trim() : undefined,
     };

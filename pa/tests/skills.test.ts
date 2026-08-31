@@ -24,6 +24,7 @@ describe('loadSkill', () => {
       'idle_timeout: 30',
       'on_missed: all',
       'trigger_description: "Fire on monday"',
+      'description: "Sends daily reminders"',
       'inject_triggers: true',
       'secrets:',
       '  - API_KEY',
@@ -38,6 +39,7 @@ describe('loadSkill', () => {
     assert.equal(skill.frontmatter.idle_timeout, 30);
     assert.equal(skill.frontmatter.on_missed, 'all');
     assert.equal(skill.frontmatter.trigger_description, 'Fire on monday');
+    assert.equal(skill.frontmatter.description, 'Sends daily reminders');
     assert.equal(skill.frontmatter.inject_triggers, true);
     assert.deepEqual(skill.frontmatter.secrets, ['API_KEY']);
     assert.equal(skill.prompt, 'Do the thing.');
@@ -51,13 +53,13 @@ describe('loadSkill', () => {
 
   it('parses worker_args array from frontmatter (2026-07-12)', async () => {
     await createTempSkill(tempDir, 'wa-skill',
-      '---\nworker: gemini\nworker_args:\n  - "--include-directories"\n  - "C:/Users/x/.pa,D:/notes"\n---\nP.');
+      '---\nworker: agy\nworker_args:\n  - "--include-directories"\n  - "C:/Users/x/.pa,D:/notes"\n---\nP.');
     const skill = await loadSkill('wa-skill');
     assert.deepEqual(skill.frontmatter.worker_args, ['--include-directories', 'C:/Users/x/.pa,D:/notes']);
   });
 
   it('worker_args is undefined when absent', async () => {
-    await createTempSkill(tempDir, 'no-wa-skill', '---\nworker: gemini\n---\nP.');
+    await createTempSkill(tempDir, 'no-wa-skill', '---\nworker: agy\n---\nP.');
     const skill = await loadSkill('no-wa-skill');
     assert.equal(skill.frontmatter.worker_args, undefined);
   });
@@ -155,9 +157,9 @@ describe('loadSkill', () => {
   });
 
   it('parses worker field', async () => {
-    await createTempSkill(tempDir, 'worker-skill', '---\nworker: gemini\n---\nDo things.');
+    await createTempSkill(tempDir, 'worker-skill', '---\nworker: agy\n---\nDo things.');
     const skill = await loadSkill('worker-skill');
-    assert.equal(skill.frontmatter.worker, 'gemini');
+    assert.equal(skill.frontmatter.worker, 'agy');
   });
 
   it('leaves telegram_output undefined when not set', async () => {
