@@ -10,8 +10,8 @@ describe('MAINTENANCE_JOBS registry', () => {
     assert.doesNotThrow(() => validateRegistry([...MAINTENANCE_JOBS]));
   });
 
-  it('declares exactly 29 jobs (19 pa + 10 bot) with the expected names', () => {
-    assert.equal(MAINTENANCE_JOBS.length, 29);
+  it('declares exactly 30 jobs (20 pa + 10 bot) with the expected names', () => {
+    assert.equal(MAINTENANCE_JOBS.length, 30);
     const names = MAINTENANCE_JOBS.map((j) => j.name).sort();
     assert.deepEqual(names, [
       'alert-census',
@@ -41,13 +41,14 @@ describe('MAINTENANCE_JOBS registry', () => {
       'skill-log-rotate',
       'staleness-check',
       'voice-attachment-gc',
+      'watch-jobs-runner',
       'weekly-learn',
       'worker-tee-gc',
     ]);
   });
 
-  it('splits jobs correctly by host (19 pa, 10 bot)', () => {
-    assert.equal(jobsForHost('pa').length, 19);
+  it('splits jobs correctly by host (20 pa, 10 bot)', () => {
+    assert.equal(jobsForHost('pa').length, 20);
     assert.equal(jobsForHost('bot').length, 10);
     const botNames = jobsForHost('bot').map((j) => j.name).sort();
     assert.deepEqual(botNames, [
@@ -151,6 +152,19 @@ describe('MAINTENANCE_JOBS registry', () => {
     assert.equal(job!.shedWhenDegraded, true);
   });
 
+  it('watch-jobs-runner is declared for host pa, 60s cadence, one row-level target, never shed', () => {
+    const job = findJob('watch-jobs-runner');
+    assert.ok(job, 'watch-jobs-runner should exist');
+    assert.equal(job!.host, 'pa');
+    assert.equal(resolveEvery(job!), 60_000);
+    assert.equal(job!.destructive, true);
+    assert.equal(job!.shedWhenDegraded, false);
+    assert.equal(job!.targets.length, 1);
+    assert.ok(job!.targets[0].match.test('watch-jobs.json'));
+    assert.equal(job!.targets[0].match.test('watch-jobs.json.bak'), false);
+    assert.ok(job!.targets[0].note, 'row-level expiry must be declared in the target note');
+  });
+
   it('locks the declared destructive set across both hosts', () => {
     const destructive = MAINTENANCE_JOBS.filter((j) => j.destructive).map((j) => j.name).sort();
     assert.deepEqual(destructive, [
@@ -164,6 +178,7 @@ describe('MAINTENANCE_JOBS registry', () => {
       'shared-tmp-sweep',
       'skill-log-rotate',
       'voice-attachment-gc',
+      'watch-jobs-runner',
       'worker-tee-gc',
     ]);
   });

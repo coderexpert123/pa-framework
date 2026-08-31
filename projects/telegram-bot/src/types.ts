@@ -166,12 +166,17 @@ export interface BranchAncestry {
 }
 
 export interface PAMetaAction {
-  type: 'retry_with_worker' | 'run_skill' | 'confirm_required' | 'restart_bot' | 'kb_note' | string;
+  type: 'retry_with_worker' | 'run_skill' | 'confirm_required' | 'restart_bot' | 'kb_note' | 'watch_job' | string;
   worker?: string;   // ignored by dispatch — system picks next worker by config priority
   skill?: string;    // for run_skill: skill name to trigger
   reason?: string;   // human-readable explanation (optional)
   domain?: string;   // for kb_note: Sources.md domain section to update (e.g. "Ekadashi / fasting calendar")
   note?: string;     // for kb_note: the dated one-line "Recent" note to record (AI-101 Layer 2 — same-turn write path)
+  // AI-170 watch_job (SPEC §2.8). snake_case on the wire; logic.ts maps since_iso -> sinceIso.
+  description?: string;
+  check?: { type?: string; path?: string; pattern?: string; since_iso?: string; pid?: number };
+  deadline_minutes?: number;
+  interval_seconds?: number;
 }
 
 export interface PAMeta {

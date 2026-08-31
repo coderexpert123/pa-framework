@@ -18,32 +18,31 @@ action envelope for cross-skill triggering.
 
 - **`bot-instructions.md`**: static system-prompt content appended to all claude/zclaude
   spawns via `--append-system-prompt-file` — **`agy`/`codex` NEVER receive this file**
-  (AI-101: `agy` is the priority-1 default worker, so a rule added only here is invisible
-  to most live traffic). Non-claude-family workers get a thinner inline block from
+  (AI-101: `agy` is the priority-1 default, so rules added only here are invisible to most
+  traffic). Non-claude-family workers get a thinner inline block from
   `context.ts`'s `capabilities` string instead (`buildPrompt`, `omitStatic:false`).
   **Any standing rule that must reach every worker has to be added to BOTH places** — not
   structurally enforced, check both by hand. **Convention (2026-08-24)**: every new
   prompt-triangle bullet (`context.ts` capabilities ↔ `bot-instructions.md` ↔
   `examples/bot-instructions.example.md`) ships its verbatim-sync test in
-  `context.test.ts` in the SAME commit — No-LaTeX once shipped mismatched wording,
-  caught only by a deep-recheck.
+  `context.test.ts` in the SAME commit — No-LaTeX once shipped a mismatch caught
+  only by deep-recheck.
 - **Per-file detail**: `inventory/telegram-bot.md` (routed from `FILE_INVENTORY.md`) is the full
-  index — poll loop `main.ts`; topic state `conversation.ts`; output cleaning + worker-stickiness
-  `logic.ts`; prompt builder `context.ts`; `telegram.ts` (API + chunking + reactions); DLQ
-  `dlq.ts`; delivered-key dedup `delivered-store.ts`; OAuth `oauth.ts`; sentinel `sentinel.ts`;
-  callbacks `callbacks.ts`; see the inventory for the rest.
+  index (poll loop `main.ts`, topic state `conversation.ts`, output cleaning `logic.ts`, prompt
+  `context.ts`, API `telegram.ts`, DLQ `dlq.ts`, dedup `delivered-store.ts`, OAuth `oauth.ts`,
+  sentinel `sentinel.ts`, callbacks `callbacks.ts`; rest in the inventory).
 - **Graceful shutdown**: `pa bot stop` writes `~/.pa/telegram-bot.stop` (sentinel).
 - **Agent & Model switching**: `/agent zclaude`, `/agent claude`, `/agent codex`,
   `/agent agy`, `/agent agyc` sets `preferred_worker` (session-scoped, expires at IST
-  midnight; legacy `/model <agent>` still works, with a tip).
+  midnight; legacy `/model <agent>` still works).
 - **Dispatch failover shape**: resumed-session, preferred-worker, and default-worker attempts
   are each a single try advancing only on rate-limit classification; total failure falls
   through to the full `runWithFailover` cascade with prior-context injection. Resumed-session
   timeouts surface as errors, not silent model switches.
 - **Uniform tunables & Option B descriptors** (`logic.ts`, `main.ts`): `/model`/`/effort` are
   CLI-agnostic session-scoped settings (`TUNABLE_COMMAND_SETTINGS` maps to each CLI's real name);
-  `/default` alone promotes session config to topic defaults, `/default <setting> <value>` sets one.
-  Pinned cards: `agent (model) [effort]`. Switches + midnight expiry update the card in-place.
+  `/default` alone promotes session config to topic defaults; `<setting> <value>` sets one.
+  Switches + midnight expiry update the pinned card (`agent (model) [effort]`) in-place.
   Resolution: session → topic default → worker default → CLI built-in. Per-CLI translation:
   config.yaml `tunables.<name>.args` (`{value}` substituted); `supersedes:` = exclusive knobs.
   Clear tokens: `clear`/`reset`/`default`/`unset`/`-`.
@@ -109,12 +108,14 @@ action envelope for cross-skill triggering.
   note downloads, transcribes, and feeds the identical text pipeline. Bot: `voice.ts`
   (never throws), `voice-worker-client.ts` (optional worker IPC). Python:
   `pa/scripts/transcribe_voice.py` (cloud-first), `voice_worker.py` (self-idle; known
-  self-healing start-race gap). Config: `transcription:` = deployment policy,
+  start-race gap, self-healing). Config: `transcription:` = deployment policy,
   `PA_VOICE_*` = env tuning (do not merge). Job `voice-attachment-gc`
   (30d retention, `~/.pa/attachments/`). **Since 2026-08-15, transcription happens at
   ARRIVAL** (`voice-prefetch.ts` + poll-loop enqueue) — the transcript becomes the queue
   entry's text, so voice follows /stop//steer flush semantics like text; see
-  `docs/bot-reliability-internals.md`'s AI-092 section.
+  `docs/bot-reliability-internals.md`'s AI-092 section. **Smart `/retranscribe` (2026-08-31)**:
+  durable audio index (`audio-index.ts` → `~/.pa/attachments/<chatId>/audio-index.json`,
+  25 entries) — `/retranscribe` without reply, newest failed note first.
 - **Archive join fields (2026-08-24)**: assistant rows carry `session_id`+`update_id`, user rows
   carry `update_id` (`main.ts:1457`/`:2126`) via a `JoinableTurn` alias in `conversation.ts` (bot
   `types.ts` was owned by a concurrent wave that day). Trace join key for a bot turn:

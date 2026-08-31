@@ -336,6 +336,12 @@ const noopSleep = async () => {};
 // exception is the dedicated ordering test further down, which supplies its own recording stub.
 const withBuildLockFn: typeof withBuildLock = (_label, fn) => fn();
 
+// Git-optional gate test double (2026-08-31, plans/2026-08-31-git-optional-SPEC.md §4
+// spec amendment 2026-08-31-A): all existing tests were written before the guard existed
+// and assume the code-fix lane runs. The test double restores the pre-guard execution path
+// those tests were written against. A dedicated test below pins the blocking behavior.
+const gitGuardFn = async () => ({ allowed: true, reason: 'test double' } as const);
+
 describe('attemptCodeFix', () => {
   it('ignores pa/data/profile* runtime drift when checking the tree (churn is filtered from recent-activity check)', async () => {
     await createTempSkill(dir, 'daily-mail-brief', '---\ncwd: "D:/fake-repo/projects/daily-mail-brief"\ncmd: "python scripts/run_brief.py"\n---\n\nBody.');
@@ -353,7 +359,7 @@ describe('attemptCodeFix', () => {
 
     const recentActivityFn = async () => [];
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, withBuildLockFn });
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, withBuildLockFn, gitGuardFn });
 
     // Worker ran but made no changes (status --porcelain is called a 2nd time post-worker; our
     // handler returns the same drift-only output both times) — proves the drift didn't count as
@@ -373,7 +379,7 @@ describe('attemptCodeFix', () => {
 
     const recentActivityFn = async () => [];
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: failRunner, blackboardFn: bb, recentActivityFn, withBuildLockFn });
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: failRunner, blackboardFn: bb, recentActivityFn, withBuildLockFn, gitGuardFn });
 
     assert.equal(result.outcome, 'code-fix-skipped-worker-failed');
     assert.equal(calls.some((c) => c.command.startsWith('git reset --hard')), false);
@@ -394,7 +400,7 @@ describe('attemptCodeFix', () => {
 
     const recentActivityFn = async () => [];
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, withBuildLockFn });
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, withBuildLockFn, gitGuardFn });
 
     assert.equal(result.outcome, 'code-fix-skipped-no-changes');
     assert.equal(statusCalls, 2); // once for quiet-tree gate, once after the worker ran
@@ -422,7 +428,7 @@ describe('attemptCodeFix', () => {
 
     const recentActivityFn = async () => [];
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, withBuildLockFn });
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, withBuildLockFn, gitGuardFn });
 
     assert.equal(result.outcome, 'code-fix-reverted');
     assert.match(result.reason, /protected/i);
@@ -462,7 +468,7 @@ describe('attemptCodeFix', () => {
 
     const recentActivityFn = async () => [];
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, withBuildLockFn });
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, withBuildLockFn, gitGuardFn });
 
     assert.equal(result.outcome, 'code-fix-reverted');
     assert.match(result.reason, /test/i);
@@ -502,7 +508,7 @@ describe('attemptCodeFix', () => {
     const recentActivityFn = async () => [];
     const readActiveFn = async () => [];
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn });
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn, gitGuardFn });
 
     assert.equal(result.outcome, 'applied-code-fix');
   });
@@ -537,7 +543,7 @@ describe('attemptCodeFix', () => {
     const recentActivityFn = async () => [];
     const readActiveFn = async () => [];
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn });
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn, gitGuardFn });
 
     assert.equal(result.outcome, 'code-fix-reverted');
     // After 2026-08-15: scoped revert uses `git checkout <sha> -- <path>`
@@ -588,7 +594,7 @@ describe('attemptCodeFix', () => {
     const recentActivityFn = async () => [];
     const readActiveFn = async () => [];
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn });
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn, gitGuardFn });
     assert.equal(result.outcome, 'applied-code-fix');
   });
 
@@ -628,7 +634,7 @@ describe('attemptCodeFix', () => {
     const recentActivityFn = async () => [];
     const readActiveFn = async () => [];
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn });
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn, gitGuardFn });
     assert.equal(result.outcome, 'code-fix-reverted');
     // After 2026-08-15: scoped revert uses `git checkout <sha> -- <path>`
     assert.ok(calls.some((c) => c.command.startsWith('git checkout') && c.command.includes('abc1111')));
@@ -670,7 +676,7 @@ describe('attemptCodeFix', () => {
     const recentActivityFn = async () => [];
     const readActiveFn = async () => [];
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn });
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn, gitGuardFn });
 
     assert.equal(result.outcome, 'applied-code-fix');
     assert.equal(result.commitHash, 'abc9999');
@@ -721,7 +727,7 @@ describe('attemptCodeFix', () => {
     const recentActivityFn = async () => [];
     const readActiveFn = async () => [];
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn });
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn, gitGuardFn });
 
     assert.equal(result.outcome, 'applied-code-fix');
     assert.deepEqual(result.filesChanged, ['projects/daily-mail-brief/scripts/run_brief.py']);
@@ -768,7 +774,7 @@ describe('attemptCodeFix', () => {
     const recentActivityFn = async () => [];
     const readActiveFn = async () => [];
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, recentActivityFn, readActiveFn, withBuildLockFn });
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, recentActivityFn, readActiveFn, withBuildLockFn, gitGuardFn });
 
     assert.equal(result.outcome, 'code-fix-reverted');
     const cmds = calls.map((c) => c.command);
@@ -820,7 +826,7 @@ describe('attemptCodeFix', () => {
     const readActiveFn = async () => [];
     const result = await attemptCodeFix(
       makeProposal({ target_skill: 'daily-mail-brief' }), evidence,
-      { execFn: exec, runner: okRunner, botRestartFn, checkBotProcessFn, sleepFn: noopSleep, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn },
+      { execFn: exec, runner: okRunner, botRestartFn, checkBotProcessFn, sleepFn: noopSleep, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn, gitGuardFn },
     );
 
     assert.equal(result.outcome, 'applied-code-fix');
@@ -857,7 +863,7 @@ describe('attemptCodeFix', () => {
 
     const result = await attemptCodeFix(
       makeProposal(), evidence,
-      { execFn: exec, runner: okRunner, botRestartFn: noopBotRestart, checkBotProcessFn: unhealthyBot, sleepFn: noopSleep, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn },
+      { execFn: exec, runner: okRunner, botRestartFn: noopBotRestart, checkBotProcessFn: unhealthyBot, sleepFn: noopSleep, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn, gitGuardFn },
     );
 
     assert.equal(result.outcome, 'code-fix-reverted');
@@ -890,7 +896,7 @@ describe('attemptCodeFix', () => {
       { id: 'r-other-123', paths: ['projects/other-thing'], session: 'waveA-wp1', note: 'unrelated work', claimedAt: '2026-08-17T12:00:00.000Z', expiresAt: '2026-08-17T13:00:00.000Z' },
     ];
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn });
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn, gitGuardFn });
 
     assert.equal(result.outcome, 'code-fix-skipped-concurrent-activity');
     assert.match(result.reason, /Active reservations/);
@@ -931,7 +937,7 @@ describe('attemptCodeFix', () => {
     const recentActivityFn = async () => [];
     const readActiveFn = async () => [];
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn });
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn, gitGuardFn });
 
     assert.equal(result.outcome, 'code-fix-skipped-staged-mismatch');
     assert.match(result.reason, /Staged set mismatch/);
@@ -967,7 +973,7 @@ describe('attemptCodeFix', () => {
     const readActiveFn = async () => [];
 
     const result = await attemptCodeFix(makeProposal(), evidence, {
-      execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn,
+      execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn, gitGuardFn,
       sameRunAppliedFiles: ['projects/daily-mail-brief/scripts/run_brief.py'],
     });
 
@@ -1013,7 +1019,7 @@ describe('attemptCodeFix', () => {
 
     // Empty array: same shape the orchestrator sends for the FIRST fix of a run.
     const result = await attemptCodeFix(makeProposal(), evidence, {
-      execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn,
+      execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn, gitGuardFn,
       sameRunAppliedFiles: [],
     });
 
@@ -1021,6 +1027,41 @@ describe('attemptCodeFix', () => {
     assert.deepEqual(result.filesChanged, ['projects/daily-mail-brief/scripts/run_brief.py']);
     // Every other test in this suite omits sameRunAppliedFiles entirely and already proves
     // the undefined case applies cleanly (e.g. the happy-path test above).
+  });
+
+  // ---------------------------------------------------------------------------
+  // Git-optional gate (2026-08-31, plans/2026-08-31-git-optional-SPEC.md §4
+  // spec amendment 2026-08-31-A)
+  // ---------------------------------------------------------------------------
+
+  it('skips (git-disabled) when the guard returns allowed: false — code-fix lane not attempted', async () => {
+    await createTempSkill(dir, 'daily-mail-brief', '---\ncwd: "D:/fake-repo/projects/daily-mail-brief"\ncmd: "python scripts/run_brief.py"\n---\n\nBody.');
+    const calls: ExecCall[] = [];
+    const exec = makeExec([
+      ...baseHandlers(),
+      { match: 'git status --porcelain', stdout: ' M pa/src/some-file.ts\n' },
+      { match: 'git rev-parse HEAD', stdout: 'abc1111\n' },
+      { match: 'git diff --numstat', stdout: '' },
+    ], calls);
+    const { bb } = makeLockFake(calls);
+
+    const recentActivityFn = async () => [];
+
+    // Guard returns not allowed: the entire code-fix lane must skip.
+    const blockingGuardFn = async () => ({ allowed: false, reason: 'git_workflow.enabled is false' } as const);
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, withBuildLockFn, gitGuardFn: blockingGuardFn });
+
+    assert.equal(result.outcome, 'code-fix-skipped-git-disabled');
+    assert.match(result.reason, /Git not allowed/);
+    assert.match(result.reason, /git_workflow.enabled is false/);
+    // Guard blocked before any git commands: no calls made (the quiet-tree
+    // check runs after the guard in the production code).
+    assert.equal(calls.length, 0);
+
+    const raw = await readFile(join(dir, 'self-improver-audit.jsonl'), 'utf8');
+    const record = JSON.parse(raw.trim());
+    assert.equal(record.action, 'code-fix-skipped-git-disabled');
+    assert.match(record.reason, /git_workflow.enabled is false/);
   });
 });
 
@@ -1057,7 +1098,7 @@ describe('WP-J2a: scoped verification gate matrix', () => {
     const recentActivityFn = async () => [];
     const readActiveFn = async () => [];
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn });
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn, gitGuardFn });
 
     assert.equal(result.outcome, 'applied-code-fix');
     assert.ok(calls.some((c) => c.command.startsWith(`${resolvePythonForTest()} -m py_compile`)));
@@ -1094,7 +1135,7 @@ describe('WP-J2a: scoped verification gate matrix', () => {
     const recentActivityFn = async () => [];
     const readActiveFn = async () => [];
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn });
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn, gitGuardFn });
 
     assert.equal(result.outcome, 'applied-code-fix');
     assert.ok(calls.some((c) => c.command === 'npm run build'));
@@ -1139,7 +1180,7 @@ describe('WP-J2a: scoped verification gate matrix', () => {
     const recentActivityFn = async () => [];
     const readActiveFn = async () => [];
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn });
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn, gitGuardFn });
 
     assert.equal(result.outcome, 'applied-code-fix');
     assert.ok(calls.some((c) => c.command === 'npm run build'));
@@ -1182,7 +1223,7 @@ describe('WP-J2a: scoped verification gate matrix', () => {
 
     const result = await attemptCodeFix(
       makeProposal({ target_skill: 'daily-mail-brief' }), evidence,
-      { execFn: exec, runner: okRunner, botRestartFn, checkBotProcessFn, sleepFn: noopSleep, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn },
+      { execFn: exec, runner: okRunner, botRestartFn, checkBotProcessFn, sleepFn: noopSleep, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn, gitGuardFn },
     );
 
     assert.equal(result.outcome, 'applied-code-fix');
@@ -1261,7 +1302,7 @@ describe('WP-J2a: maintenance-job targets', () => {
     const recentActivityFn = async () => [];
     const readActiveFn = async () => [];
 
-    const result = await attemptCodeFix(jobProposal, jobEvidence, { execFn: exec, runner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn });
+    const result = await attemptCodeFix(jobProposal, jobEvidence, { execFn: exec, runner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn, gitGuardFn });
 
     assert.equal(result.outcome, 'applied-code-fix');
     assert.match(capturedBrief, /Declared maintenance job: restore-drill/);
@@ -1282,7 +1323,7 @@ describe('WP-J2a: maintenance-job targets', () => {
     const runner = async (...args: any[]) => { workerCalled = true; return okRunner(); };
     const exec = makeExec([...baseHandlers()]);
 
-    const result = await attemptCodeFix(badProposal, evidence, { execFn: exec, runner, withBuildLockFn });
+    const result = await attemptCodeFix(badProposal, evidence, { execFn: exec, runner, withBuildLockFn, gitGuardFn });
 
     assert.equal(result.outcome, 'code-fix-skipped-no-target');
     assert.match(result.reason, /not under pa\/src\/lib\/maintenance\/jobs\//);
@@ -1340,6 +1381,7 @@ describe('attemptCodeFix — verification gate holds @build (W-C8)', () => {
     const result = await attemptCodeFix(makeProposal(), evidence, {
       execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn,
       withBuildLockFn: recordingWithBuildLockFn,
+      gitGuardFn,
     });
 
     assert.equal(result.outcome, 'applied-code-fix');
@@ -1380,7 +1422,7 @@ describe('attemptCodeFix — git-workflow lock', () => {
     const recentActivityFn = async () => [];
     const readActiveFn = async () => [];
 
-    await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn });
+    await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn, gitGuardFn });
 
     assert.equal(state.acquireCalls.length, 1);
     assert.equal(state.acquireCalls[0].resource, exclusiveLockKey(GIT_WORKFLOW_RESOURCE));
@@ -1401,7 +1443,7 @@ describe('attemptCodeFix — git-workflow lock', () => {
     let workerCalled = false;
     const runner = async (...args: any[]) => { workerCalled = true; return okRunner(); };
 
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner, blackboardFn: bb, withBuildLockFn });
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner, blackboardFn: bb, withBuildLockFn, gitGuardFn });
 
     assert.equal(result.outcome, 'code-fix-skipped-git-lock-busy');
     assert.equal(workerCalled, false);
@@ -1542,7 +1584,7 @@ describe('attemptCodeFix — git-workflow lock', () => {
       const { exec, runner, calls, recentActivityFn, readActiveFn } = buildBranchFixture(branch);
       const { bb, state } = makeLockFake(calls);
 
-      const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn });
+      const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn, gitGuardFn });
 
       assert.equal(result.outcome, EXPECTED_OUTCOMES[branch]);
       assert.equal(state.acquireCalls.length, 1);
@@ -1570,7 +1612,7 @@ describe('attemptCodeFix — git-workflow lock', () => {
     const readActiveFn = async () => [];
 
     await assert.rejects(
-      () => attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn }),
+      () => attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, recentActivityFn, readActiveFn, withBuildLockFn, gitGuardFn }),
       /unexpected git failure/
     );
 
@@ -1597,7 +1639,7 @@ describe('attemptCodeFix — git-workflow lock', () => {
 
     const result = await attemptCodeFix(
       makeProposal(), evidence,
-      { execFn: exec, runner: slowRunner, blackboardFn: bb, lockHeartbeatMs: 20, recentActivityFn, readActiveFn, withBuildLockFn },
+      { execFn: exec, runner: slowRunner, blackboardFn: bb, lockHeartbeatMs: 20, recentActivityFn, readActiveFn, withBuildLockFn, gitGuardFn },
     );
 
     assert.equal(result.outcome, 'code-fix-skipped-no-changes');
@@ -1618,7 +1660,7 @@ describe('attemptCodeFix — git-workflow lock', () => {
 
     const recentActivityFn = async () => ['projects/other-thing/scratch.py'];
     const readActiveFn = async () => [];
-    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, recentActivityFn, readActiveFn, withBuildLockFn });
+    const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, recentActivityFn, readActiveFn, withBuildLockFn, gitGuardFn });
 
     assert.equal(result.outcome, 'code-fix-skipped-concurrent-activity');
   });
@@ -1666,7 +1708,7 @@ describe('attemptCodeFix — git-workflow lock', () => {
     const readActiveFn = async () => [];
 
     const result = await attemptCodeFix(makeProposal(), evidence, {
-      execFn: exec, runner: slowRunner, blackboardFn: bb, lockHeartbeatMs: 20, recentActivityFn, readActiveFn, withBuildLockFn,
+      execFn: exec, runner: slowRunner, blackboardFn: bb, lockHeartbeatMs: 20, recentActivityFn, readActiveFn, withBuildLockFn, gitGuardFn,
     });
 
     assert.equal(result.outcome, 'code-fix-skipped-concurrent-activity');
@@ -1727,7 +1769,7 @@ describe('attemptCodeFix — git-workflow lock', () => {
         // recentActivityFn intentionally OMITTED so attemptCodeFix falls back
         // to the real `recentActivity` import (opts.recentActivityFn ?? recentActivity),
         // which resolves the repo root from process.cwd() and shells out to real git.
-        const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, readActiveFn, withBuildLockFn });
+        const result = await attemptCodeFix(makeProposal(), evidence, { execFn: exec, runner: okRunner, blackboardFn: bb, readActiveFn, withBuildLockFn, gitGuardFn });
 
         assert.equal(result.outcome, 'code-fix-skipped-concurrent-activity');
         assert.match(result.reason, /Recent non-churn modifications/);

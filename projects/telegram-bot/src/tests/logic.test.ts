@@ -1826,6 +1826,139 @@ describe('applyMetaActions', () => {
     assert.equal(restartBot, true);
   });
 
+  // --- watch_job (AI-170: shape-validated extraction; store write is main.ts's job) ---
+
+  it('watchJob is null by default', () => {
+    const state = makeState();
+    const { watchJob } = applyMetaActions('Hello.', null, state);
+    assert.equal(watchJob, null);
+  });
+
+  it('valid file_exists action extracts a WatchInput and leaves response unchanged', () => {
+    const state = makeState();
+    const { watchJob, response } = applyMetaActions(
+      'Started the download.',
+      meta([{ type: 'watch_job', description: 'JetBrains download finishes', check: { type: 'file_exists', path: '/downloads/jb.zip' } }]),
+      state
+    );
+    assert.deepEqual(watchJob, {
+      description: 'JetBrains download finishes',
+      check: { type: 'file_exists', path: '/downloads/jb.zip', pattern: undefined, sinceIso: undefined, pid: undefined },
+      intervalSeconds: undefined,
+      deadlineMinutes: undefined,
+      source: { kind: 'pa_meta', chatId: String(state.chat_id), threadId: state.thread_id, refId: null },
+    });
+    assert.equal(response, 'Started the download.', 'happy path must not alter the visible response text — main.ts owns that text');
+  });
+
+  it('since_iso is mapped to sinceIso', () => {
+    const state = makeState();
+    const { watchJob } = applyMetaActions(
+      'Watching for changes.',
+      meta([{ type: 'watch_job', description: 'file changes', check: { type: 'file_newer_than', path: '/data/report.csv', since_iso: '2026-08-31T00:00:00.000Z' } }]),
+      state
+    );
+    assert.ok(watchJob, 'watchJob should be set');
+    assert.equal(watchJob!.check.sinceIso, '2026-08-31T00:00:00.000Z');
+    assert.equal((watchJob!.check as { since_iso?: string }).since_iso, undefined, 'the wire snake_case key must not survive onto the WatchInput');
+  });
+
+  it('invalid check type is rejected — watchJob null, rejection line appended', () => {
+    const state = makeState();
+    const { watchJob, response } = applyMetaActions(
+      'Done.',
+      meta([{ type: 'watch_job', description: 'bogus watch', check: { type: 'delete_everything' } }]),
+      state
+    );
+    assert.equal(watchJob, null);
+    assert.ok(response.endsWith('_(watch_job rejected: unknown check type: delete_everything (allowed: file_exists, file_gone, file_newer_than, file_contains, process_gone))_'));
+  });
+
+  it('relative path is rejected with check.path must be absolute', () => {
+    const state = makeState();
+    const { watchJob, response } = applyMetaActions(
+      'Done.',
+      meta([{ type: 'watch_job', description: 'relative path watch', check: { type: 'file_exists', path: 'downloads/jb.zip' } }]),
+      state
+    );
+    assert.equal(watchJob, null);
+    assert.ok(response.includes('check.path must be absolute'));
+  });
+
+  it('an uncompilable regex is rejected, reason quoted in the response', () => {
+    const state = makeState();
+    const { watchJob, response } = applyMetaActions(
+      'Done.',
+      meta([{ type: 'watch_job', description: 'bad regex watch', check: { type: 'file_contains', path: '/logs/app.log', pattern: '(unclosed' } }]),
+      state
+    );
+    assert.equal(watchJob, null);
+    assert.ok(response.includes('check.pattern is not a valid regular expression:'));
+  });
+
+  it('a 201-char description is rejected', () => {
+    const state = makeState();
+    const { watchJob, response } = applyMetaActions(
+      'Done.',
+      meta([{ type: 'watch_job', description: 'x'.repeat(201), check: { type: 'process_gone', pid: 123 } }]),
+      state
+    );
+    assert.equal(watchJob, null);
+    assert.ok(response.endsWith('_(watch_job rejected: description exceeds 200 characters)_'));
+  });
+
+  it('interval_seconds outside 60-3600 is rejected', () => {
+    const state = makeState();
+    const { watchJob, response } = applyMetaActions(
+      'Done.',
+      meta([{ type: 'watch_job', description: 'too-frequent watch', check: { type: 'process_gone', pid: 123 }, interval_seconds: 10 }]),
+      state
+    );
+    assert.equal(watchJob, null);
+    assert.ok(response.endsWith('_(watch_job rejected: interval_seconds must be between 60 and 3600)_'));
+  });
+
+  it('watch_job coexists with run_skill', () => {
+    const state = makeState();
+    const { watchJob, skillToRun } = applyMetaActions(
+      'Done.',
+      meta([
+        { type: 'watch_job', description: 'coexistence watch', check: { type: 'process_gone', pid: 123 } },
+        { type: 'run_skill', skill: 'fitness-sync' },
+      ]),
+      state
+    );
+    assert.ok(watchJob, 'watchJob should be set');
+    assert.equal(watchJob!.description, 'coexistence watch');
+    assert.equal(skillToRun, 'fitness-sync');
+  });
+
+  it('watch_job coexists with restart_bot', () => {
+    const state = makeState();
+    const { watchJob, restartBot } = applyMetaActions(
+      'Done.',
+      meta([
+        { type: 'watch_job', description: 'coexistence watch', check: { type: 'process_gone', pid: 123 } },
+        { type: 'restart_bot' },
+      ]),
+      state
+    );
+    assert.ok(watchJob, 'watchJob should be set');
+    assert.equal(watchJob!.description, 'coexistence watch');
+    assert.equal(restartBot, true);
+  });
+
+  it('a watch_job rejection does not arm pending_action', () => {
+    const state = makeState();
+    const { response } = applyMetaActions(
+      'Done.',
+      meta([{ type: 'watch_job', description: 'bogus watch', check: { type: 'delete_everything' } }]),
+      state
+    );
+    assert.ok(response.endsWith('_(watch_job rejected: unknown check type: delete_everything (allowed: file_exists, file_gone, file_newer_than, file_contains, process_gone))_'));
+    assert.equal(state.pending_action, undefined, 'the appended rejection line must not become the CONFIRMATION_PATTERN anchor');
+  });
+
   // --- git-workflow skills authorization (2026-08-17 audit P1-2) ---
 
   it('rejects PA_META run_skill for protected git-workflow skills', () => {

@@ -194,14 +194,18 @@ function spawnTests(testFiles, distDir) {
 
 /** Files allowlisted to contribute zero tests (legitimately-empty placeholders). */
 const DARK_FILE_ALLOWLIST = new Set([
-  // KNOWN-DARK (2026-08-28 deep-recheck): under the installed Node 22.14 test
-  // runner, every integration-class bot test file passes as an empty shell with
-  // ZERO suites registered (node:test runner bug; pure-sync describes register
-  // fine). Splitting cannot fix it (each dark describe is dark SOLO); the fix
-  // is the Node 22.14 → 22.23 upgrade (OPERATOR ACTION, alongside the GitHub
-  // billing fix) — after upgrading, REMOVE these entries; all five files'
-  // tests must then run. The bot's entire poll-loop/integration layer has been
-  // silently skipped by every local gate on this machine. Do not add new files.
+  // KNOWN-DARK (2026-08-28 deep-recheck; re-verified 2026-08-31): these
+  // integration-class bot test files pass as empty shells with ZERO suites
+  // registered (node:test runner bug; pure-sync describes register fine).
+  // Splitting cannot fix it (each dark describe is dark SOLO). The 2026-08-28
+  // hypothesis that Node 22.14→22.23 would fix it is DISPROVEN: on 22.23.2
+  // (upgraded 2026-08-31) all five files STILL register zero tests (verified
+  // per-file with --test direct invocation) while pa's previously-dark
+  // workers.test.js runs its 89 tests fine — so the trigger is structural to
+  // these files (async-describe/timer shape), not the Node version. Root-cause
+  // fix is a follow-up (BACKLOG); these entries STAY until the files' tests
+  // actually run. The bot's poll-loop/integration layer is silently skipped by
+  // local gates — treat bot "green" accordingly. Do not add new files.
   'dist/tests/poll-loop.test.js',
   'dist/tests/integration.test.js',
   'dist/tests/poll-loop-integration-extra.test.js',

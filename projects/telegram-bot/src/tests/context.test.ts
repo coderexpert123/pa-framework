@@ -464,6 +464,47 @@ describe('@build reservation bullet (W-C6 §7.3)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// watch_job standing-rule bullet (AI-170, plans/2026-08-31-ai170-async-watch-SPEC.md §2.9)
+// ---------------------------------------------------------------------------
+// Same byte-identical-across-three-files sync pattern as the Shared working tree
+// and @build anchors above: examples/bot-instructions.example.md is the CI-enforced
+// half; the local bot-instructions.md half stays skip-guarded (untracked).
+
+const WATCH_JOB_BULLET = '- Never promise to report back later: you are a one-shot process with no timer, so "I\'ll let you know when it finishes" never fires. If the result will land in a file or a process you can name, emit a `watch_job` PA_META action and say the watch is registered; otherwise tell the user the exact command or file that will show them the answer.';
+
+describe('watch_job standing-rule bullet (AI-170)', () => {
+  it('matches examples/bot-instructions.example.md verbatim', async () => {
+    const exampleContent = await readFile(BOT_INSTRUCTIONS_EXAMPLE_PATH, 'utf8');
+    assert.ok(exampleContent.includes(WATCH_JOB_BULLET),
+      'examples/bot-instructions.example.md must contain the watch_job bullet verbatim');
+
+    const inlinePrompt = await buildPrompt('hello', makeState(), undefined, undefined, undefined, { omitStatic: false });
+    assert.ok(inlinePrompt.includes(WATCH_JOB_BULLET),
+      'context.ts inline capabilities block must contain the SAME watch_job bullet verbatim — keep both in sync');
+  });
+
+  it('matches bot-instructions.md verbatim (local, skip-guarded)', { skip: !BOT_INSTRUCTIONS_EXISTS && 'bot-instructions.md not present locally (public-clone default — see examples/bot-instructions.example.md)' }, async () => {
+    const botInstructionsContent = await readFile(BOT_INSTRUCTIONS_PATH, 'utf8');
+    assert.ok(botInstructionsContent.includes(WATCH_JOB_BULLET),
+      'bot-instructions.md must contain the watch_job bullet verbatim');
+
+    const inlinePrompt = await buildPrompt('hello', makeState(), undefined, undefined, undefined, { omitStatic: false });
+    assert.ok(inlinePrompt.includes(WATCH_JOB_BULLET),
+      'context.ts inline capabilities block must contain the SAME watch_job bullet verbatim — keep both in sync');
+  });
+
+  it('is absent in omitStatic (lean) mode', async () => {
+    const result = await buildPrompt('hello', makeState(), undefined, undefined, undefined, { omitStatic: true });
+    assert.ok(!result.includes(WATCH_JOB_BULLET), 'watch_job bullet must be absent in lean mode');
+  });
+
+  it('is absent in execution mode (pendingAction set)', async () => {
+    const result = await buildPrompt('yes', makeState(), undefined, undefined, 'send email to John', { omitStatic: false });
+    assert.ok(!result.includes(WATCH_JOB_BULLET), 'watch_job bullet must be absent in execution mode');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // buildPrompt — topic description injection
 // ---------------------------------------------------------------------------
 

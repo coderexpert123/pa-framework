@@ -30,6 +30,8 @@ import {
 import type { WorkerConfig } from '../../../pa/dist/src/types.js';
 import { BOT_COMMANDS } from './commands.js';
 import { redactSecrets } from '../../../pa/dist/src/lib/redact.js';
+import { validateWatchInput } from '../../../pa/dist/src/lib/watch-jobs.js';
+import type { WatchInput } from '../../../pa/dist/src/lib/watch-jobs.js';
 
 export interface WorkerResult {
   success: boolean;
@@ -1393,10 +1395,11 @@ export function applyMetaActions(
   response: string,
   meta: PAMeta | null,
   state: ConversationState
-): { response: string; skillToRun: string | null; restartBot: boolean; kbNote: { domain: string; note: string } | null } {
+): { response: string; skillToRun: string | null; restartBot: boolean; kbNote: { domain: string; note: string } | null; watchJob: WatchInput | null } {
   let out = response;
   let restartBot = false;
   let kbNote: { domain: string; note: string } | null = null;
+  let watchJob: WatchInput | null = null;
 
   if (meta?.actions.some((a) => a.type === 'restart_bot')) {
     restartBot = true;
@@ -1415,6 +1418,39 @@ export function applyMetaActions(
       kbNote = { domain, note };
     } else {
       console.warn(`[pa-meta] kb_note rejected — domain/note missing or too long (domain=${domain?.length ?? 0} chars, note=${note?.length ?? 0} chars)`);
+    }
+  }
+
+  // AI-170: a worker that starts something finishing later registers a watch instead of
+  // promising to "report back". Shape validation happens here (pure, no I/O) against pa's
+  // single validateWatchInput; the store write and the visible outcome line happen in main.ts,
+  // which is the only place the minted id exists (SPEC §1 C12).
+  const watchAction = meta?.actions.find((a) => a.type === 'watch_job');
+  if (watchAction) {
+    const candidate: WatchInput = {
+      description: (watchAction.description ?? '').trim(),
+      check: {
+        type: watchAction.check?.type ?? '',
+        path: watchAction.check?.path,
+        pattern: watchAction.check?.pattern,
+        sinceIso: watchAction.check?.since_iso,
+        pid: watchAction.check?.pid,
+      },
+      intervalSeconds: watchAction.interval_seconds,
+      deadlineMinutes: watchAction.deadline_minutes,
+      source: {
+        kind: 'pa_meta',
+        chatId: String(state.chat_id),
+        threadId: state.thread_id,
+        refId: null,
+      },
+    };
+    const check = validateWatchInput(candidate);
+    if (check.ok) {
+      watchJob = candidate;
+    } else {
+      console.warn(`[pa-meta] watch_job rejected — ${check.error}`);
+      out += `\n\n_(watch_job rejected: ${check.error})_`;
     }
   }
 
@@ -1451,19 +1487,19 @@ export function applyMetaActions(
       const skillName = runSkillAction.skill;
       if (!/^[a-zA-Z0-9_-]+$/.test(skillName)) {
         console.warn(`[pa-meta] run_skill rejected — invalid skill name: ${skillName}`);
-        return { response: out, skillToRun: null, restartBot, kbNote };
+        return { response: out, skillToRun: null, restartBot, kbNote, watchJob };
       }
       if (PA_META_PROTECTED_SKILLS.has(skillName)) {
         console.warn(`[pa-meta] run_skill rejected — protected skill: ${skillName}`);
         out += `\n\n_(Skill trigger blocked: ${skillName} requires an explicit command.)_`;
-        return { response: out, skillToRun: null, restartBot, kbNote };
+        return { response: out, skillToRun: null, restartBot, kbNote, watchJob };
       }
       out += `\n\n_(Triggering skill: ${skillName})_`;
-      return { response: out, skillToRun: skillName, restartBot, kbNote };
+      return { response: out, skillToRun: skillName, restartBot, kbNote, watchJob };
     }
   }
 
-  return { response: out, skillToRun: null, restartBot, kbNote };
+  return { response: out, skillToRun: null, restartBot, kbNote, watchJob };
 }
 
 /**
