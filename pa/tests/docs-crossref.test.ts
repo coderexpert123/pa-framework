@@ -13,6 +13,13 @@ function readIfExists(path: string): string | null {
   return existsSync(path) ? readFileSync(path, 'utf8') : null;
 }
 
+// Budgets measure content, not encoding: public Windows CI checks out CRLF
+// (PR #34 run 33436146842 measured bot CLAUDE.md at 12,073 vs 11,923 LF).
+// Single shared helper so every size-budget check below normalizes the same way.
+function budgetLength(content: string): number {
+  return content.replace(/\r\n/g, '\n').length;
+}
+
 /** All `#{1,6} heading text` lines, full (including the `#` markers). */
 function headingLines(content: string): string[] {
   return content
@@ -85,19 +92,19 @@ function extractRefs(filePath: string, content: string): Ref[] {
   return refs;
 }
 
-// `docs/` (and examples/secrets.env.example) are gitignored in the PRIVATE repo
-// by design (CLAUDE.md: "the private repo's .gitignore intentionally ignores
-// /README.md, /LICENSE, /docs/, and /examples/" -- public-mirror-only paths).
-// A fresh CI checkout of the private repo therefore never has docs/ at all,
-// even though it exists on every real dev machine's working tree. This is not
-// a flake: it reproduced identically on all 3 CI platforms the first time
-// this file's tests ran (2026-08-04) because nothing had ever depended on
-// reading docs/ content at test time before. Skip gracefully when the
-// directory is genuinely absent rather than fail -- the public mirror (where
-// docs/ IS tracked) is where this checker's real verification happens; a
-// private-repo-only checkout has nothing valid to check.
+// `docs/` and `examples/` are TRACKED in the private repo -- `git ls-files`
+// confirms it (verified 2026-08-31, AI-170 SPEC C11; only
+// projects/telegram-bot/bot-instructions.md is actually gitignored,
+// .gitignore:266). The claim this comment used to make -- that docs/+examples/
+// were gitignored by design -- was false. A fresh CI checkout can still
+// genuinely lack docs/ for some other reason: it reproduced identically on
+// all 3 CI platforms the first time this file's tests ran (2026-08-04), root
+// cause not gitignore. Skip gracefully when the directory is genuinely absent
+// rather than fail -- the public mirror (where docs/ IS also tracked) is
+// where this checker's real verification happens; a checkout missing docs/
+// has nothing valid to check.
 const DOCS_MISSING_REASON =
-  'docs/ is not present in this checkout (gitignored in the private repo -- see file header comment)';
+  'docs/ is not present in this checkout (see file header comment -- not a gitignore, see AI-170 SPEC C11)';
 
 describe('docs cross-reference checker', () => {
   it('every docs/<file>.md reference (anchor or quoted heading) resolves', (t) => {
@@ -215,9 +222,10 @@ describe('docs cross-reference checker', () => {
   it('root CLAUDE.md stays within its size budget (soft 40k, hard 48k chars)', () => {
     const claudeMd = readIfExists(join(REPO_ROOT, 'CLAUDE.md'));
     if (claudeMd === null) return; // absent in the public mirror
+    const len = budgetLength(claudeMd);
     assert.ok(
-      claudeMd.length <= 48000,
-      `CLAUDE.md is ${claudeMd.length} chars, over the 48,000-char hard budget -- run /shorten-brain`
+      len <= 48000,
+      `CLAUDE.md is ${len} chars, over the 48,000-char hard budget -- run /shorten-brain`
     );
   });
 
@@ -231,8 +239,9 @@ describe('docs cross-reference checker', () => {
       const claudeMdPath = join(PROJECTS_DIR, entry.name, 'CLAUDE.md');
       const content = readIfExists(claudeMdPath);
       if (content === null) continue;
-      if (content.length > 12000) {
-        failures.push(`${claudeMdPath} is ${content.length} chars, over the 12,000-char budget`);
+      const len = budgetLength(content);
+      if (len > 12000) {
+        failures.push(`${claudeMdPath} is ${len} chars, over the 12,000-char budget`);
       }
     }
     assert.deepEqual(failures, [], failures.join('\n'));
@@ -247,8 +256,9 @@ describe('docs cross-reference checker', () => {
       // extracted operational-detail files are lowercase-hyphen (repo-topology.md).
       const isEvergreenGuide = /^[A-Z][A-Z0-9_]*\.md$/.test(f);
       const budget = isEvergreenGuide ? 24000 : 16000;
-      if (content.length > budget) {
-        failures.push(`docs/${f} is ${content.length} chars, over its ${budget.toLocaleString()}-char budget`);
+      const len = budgetLength(content);
+      if (len > budget) {
+        failures.push(`docs/${f} is ${len} chars, over its ${budget.toLocaleString()}-char budget`);
       }
     }
     assert.deepEqual(failures, [], failures.join('\n'));
@@ -257,9 +267,10 @@ describe('docs cross-reference checker', () => {
   it('the FILE_INVENTORY.md router stays within its 4k budget', () => {
     const content = readIfExists(join(REPO_ROOT, 'FILE_INVENTORY.md'));
     if (content === null) return; // absent in the public mirror
+    const len = budgetLength(content);
     assert.ok(
-      content.length <= 4000,
-      `FILE_INVENTORY.md is ${content.length} chars, over the 4,000-char router budget -- it has stopped being a router, re-split`
+      len <= 4000,
+      `FILE_INVENTORY.md is ${len} chars, over the 4,000-char router budget -- it has stopped being a router, re-split`
     );
   });
 
@@ -280,8 +291,9 @@ describe('docs cross-reference checker', () => {
       // The durable fix is the split pa-lib.md's own header names (maintenance/
       // out); 20k is headroom toward that, not permission to grow unbounded.
       const budget = isAutoManaged ? 20000 : 16000;
-      if (content.length > budget) {
-        failures.push(`inventory/${f} is ${content.length} chars, over its ${budget.toLocaleString()}-char budget`);
+      const len = budgetLength(content);
+      if (len > budget) {
+        failures.push(`inventory/${f} is ${len} chars, over its ${budget.toLocaleString()}-char budget`);
       }
     }
     assert.deepEqual(failures, [], failures.join('\n'));
@@ -299,18 +311,20 @@ describe('docs cross-reference checker', () => {
     // ceiling is the wrong instrument -- raise this row rather than splitting.
     const content = readIfExists(join(REPO_ROOT, 'backlog', 'completed-index.md'));
     if (content === null) return; // absent in the public mirror and pre-Phase-4 checkouts
+    const len = budgetLength(content);
     assert.ok(
-      content.length <= 20000,
-      `backlog/completed-index.md is ${content.length} chars, over the 20,000-char budget -- it's a lookup table, not an archive, and should stay scannable`
+      len <= 20000,
+      `backlog/completed-index.md is ${len} chars, over the 20,000-char budget -- it's a lookup table, not an archive, and should stay scannable`
     );
   });
 
   it('root BACKLOG.md stays within its size budget (12k chars)', () => {
     const content = readIfExists(join(REPO_ROOT, 'BACKLOG.md'));
     if (content === null) return; // absent in the public mirror
+    const len = budgetLength(content);
     assert.ok(
-      content.length <= 12000,
-      `BACKLOG.md is ${content.length} chars, over its 12,000-char budget -- move more DONE items to backlog/`
+      len <= 12000,
+      `BACKLOG.md is ${len} chars, over its 12,000-char budget -- move more DONE items to backlog/`
     );
   });
 });

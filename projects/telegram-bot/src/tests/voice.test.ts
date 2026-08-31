@@ -253,6 +253,26 @@ describe('findCachedAudio', () => {
     const found = await findCachedAudio(-999999, 'whatever');
     assert.equal(found, undefined);
   });
+
+  it('ignores a chat-level audio-index.json so it cannot steal a dated slot (31-dir bound)', async () => {
+    const SLOT_CHAT = -1007777;
+    const chatDir = join(tempDir, 'attachments', String(SLOT_CHAT));
+    await mkdir(chatDir, { recursive: true });
+    await writeFile(join(chatDir, 'audio-index.json'), '{"version":1,"entries":[]}', 'utf-8');
+
+    // Create 31 date directories
+    for (let i = 1; i <= 31; i++) {
+      const dateDir = join(chatDir, `2026-08-${String(i).padStart(2, '0')}`);
+      await mkdir(dateDir, { recursive: true });
+    }
+
+    // Put audio only in the oldest dir (2026-08-01)
+    const oldestDir = join(chatDir, '2026-08-01');
+    await writeFile(join(oldestDir, 'slotcheck-1.oga'), 'fake audio');
+
+    const found = await findCachedAudio(SLOT_CHAT, 'slotcheck-1');
+    assert.equal(found, join(oldestDir, 'slotcheck-1.oga'));
+  });
 });
 
 describe('configuredCloudProviders / persistentModeApplies', () => {
@@ -550,6 +570,12 @@ describe('voiceErrorMessage', () => {
         const msg = voiceErrorMessage({ ok: false, reason, message, audioPath: '/tmp/a.oga' });
         assert.ok(!msg.includes('/retranscribe'), `unexpected hint for ${reason}`);
       }
+    });
+
+    it('exact wording: " Send `/retranscribe` to try again." — no reply requirement', () => {
+      const msg = voiceErrorMessage({ ok: false, reason: 'timeout', message: 'x', audioPath: '/tmp/a.oga' });
+      assert.ok(msg.endsWith(' Send `/retranscribe` to try again.'), msg);
+      assert.ok(!msg.includes('Reply with'), msg);
     });
   });
 });

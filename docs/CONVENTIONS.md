@@ -18,7 +18,6 @@ These conventions prevent the working tree from accumulating loose junk. They ap
 ├── BACKLOG.md             ← private (gitignored)
 ├── backlog/               ← private brain sub-files, split out of BACKLOG.md for size (2026-08-07)
 ├── MEMORY.md              ← optional private memory index (gitignored, auto-managed when used)
-├── DEBUGGING.md           ← private (gitignored)
 ├── AGENTS.md, GEMINI.md   ← private compatibility aliases; prefer filesystem links to CLAUDE.md
 ├── .gitignore             ← shared
 ├── .gitignore-public      ← private (whitelist for public repo)

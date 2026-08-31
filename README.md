@@ -23,35 +23,9 @@ Then follow [`docs/QUICKSTART.md`](docs/QUICKSTART.md) — the one canonical set
 
 ## 🌟 Key Features
 
-### 🔀 Multi-Worker LLM Dispatcher
-- **Cascading Failover**: Dispatches tasks across Antigravity (`agy`), Claude Code (`claude`/`zclaude`), and OpenAI Codex (`codex`).
-- **Rate-Limit Awareness**: Intercepts HTTP 429 and `RESOURCE_EXHAUSTED` responses in real-time, automatically failing over to the next worker in the cascade.
-- **Dynamic Tunables**: Adjust model family and reasoning effort (`/model`, `/effort`) dynamically per chat topic without restarting.
+**Multi-worker dispatcher** — cascading failover across Antigravity/Claude/OpenAI Codex/zClaude with rate-limit awareness. **Voice transcription** — cloud (Groq/Deepgram/OpenAI) or fully offline Whisper. **WhatsApp drafter** — voice/text dictation to polished messages with `wa.me` links. **Reminders** — natural-language parsing with timezone-aware scheduling. **Daily mail brief** — Gmail triage → AI executive summary. **Per-topic brains** — nightly memory consolidation per Telegram conversation. **Project brains** — `CLAUDE.md` sweeps keep architecture fresh. **Self-improver** — autonomous analysis loop proposes and validates fixes. **Weekly digest** — executive summary of metrics, failures, and costs. **Ops watchdogs** — worker capability, rate-limit retrospective, human-gated blocker alerts. **pa status** — one-screen overview of health, git, skills, claims, DLQ, maintenance.
 
-### 🎙️ Voice Notes & Audio Transcription
-- **Cloud & Offline Engines**: Transcribes voice messages via Groq (Whisper large-v3), OpenAI Whisper, Deepgram, or fully offline via local CPU Whisper.
-- **Hands-Free Operation**: Dictate thoughts, reminders, or messages directly in Telegram voice notes.
-
-### 💬 Voice-to-WhatsApp Drafter (`projects/whatsapp-drafts/`)
-- **Dictate & Send**: Convert unstructured voice memos or text requests into clean, formatted WhatsApp messages.
-- **Contact Alias Resolution**: Resolve aliases (`mom`, `john`) from `data/contacts.json` and generate one-tap `wa.me` links.
-
-### ⏰ Natural Language Reminders (`projects/reminders/`)
-- **Timezone-Aware Scheduling**: Parse natural reminder times and store them in atomic JSON state (`~/.pa/reminders.json`).
-- **Automated Delivery**: Minute-cadence scheduler polling with automatic Telegram alerts and delivery receipts.
-
-### 📬 Daily Email Briefing (`projects/daily-mail-brief/`)
-- **Inbox Triage**: Authenticate via Google OAuth, fetch unseen emails, and categorize priority senders, newsletters, and receipts.
-- **AI Executive Summary**: Generates concise morning/evening digests sent directly to your Telegram topic.
-
-### 🧠 Knowledge & Self-Improvement Loops
-- **Per-Topic Memory**: Nightly distill of each Telegram conversation into its own brain (`topic-brain-distill` skill), with automatic pointer injection.
-- **Project Brains**: Enroll your projects' `CLAUDE.md` files for nightly sweeps (`update-brain` skill), keeping architecture and decisions fresh.
-- **Self-Improvement Loop**: Analyzes logs, failures, and alert census to propose and apply fixes with validation floors (`self-improver` skill).
-- See [`docs/QUICKSTART.md §13`](docs/QUICKSTART.md#13-your-assistant-has-a-brain) for the full brain system.
-
-### 📊 Weekly Operations Digest (`pa/scripts/weekly_digest.py`)
-- **System Telemetry**: Aggregates skill run metrics, failure rates, worker cost rollups, and memory consolidation audits into an executive weekly briefing.
+Full inventory with per-feature guides: [`docs/FEATURES.md`](docs/FEATURES.md).
 
 ---
 
@@ -97,7 +71,7 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for complete technical archit
 - **`projects/daily-mail-brief/`** — Gmail triage → LLM summary → Telegram executive briefing.
 - **`projects/google-oauth-redirect/`** — Static bridge page for Telegram and mobile Google OAuth recovery.
 - **`.env.example`** & **`config.example.yaml`** — Root-level turnkey configuration templates for environment and workers.
-- **`examples/`** — Sample skills, OAuth helpers, and topic structures.
+- **`examples/`** — Sample skills, OAuth helpers, and topic structures + ops watchdogs, injection redteam, brain audit.
 - **`docs/`** — Detailed guides: quickstart, configuration, skills development, workers, and deployment.
 
 ---

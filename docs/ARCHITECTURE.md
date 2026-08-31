@@ -88,6 +88,7 @@ Action types:
 - **`retry_with_worker{reason}`** — worker declares it can't complete; orchestrator routes to the next-priority worker.
 - **`run_skill{skill}`** — trigger another skill automatically after this one finishes.
 - **`confirm_required`** — used by the bot in place of "Reply *yes* to confirm" text; the bot tracks pending confirmations per-topic.
+- **`watch_job{description,check,deadline_minutes,interval_seconds}`** — register an async watch (AI-170). `check` is `{type, path?, pattern?, since_iso?, pid?}`; `type` is one of `file_exists`, `file_gone`, `file_newer_than`, `file_contains`, `process_gone`. Read-only observations only — no shell, no network, no writes. `logic.ts` validates the shape, `main.ts` writes, and the reply always states the registered id or the rejection reason.
 
 The bot strips the envelope before delivering text to the user. In execution mode (`Pending Confirmation` set), the bot suppresses any `[PA_META]` the model emits.
 
@@ -207,6 +208,17 @@ Applied changes gain an `eval` field in their audit record:
 ```
 
 This enables post-factum review via `pa improvements --show <draft>`.
+
+## Async watch jobs (AI-170, 2026-08-31)
+
+Store `~/.pa/watch-jobs.json` (lockfile + atomic write, same family as `reservations.json`);
+engine the single declared `watch-jobs-runner` job (pa host, 60 s). `pa/src/lib/watch-jobs.ts`
+holds the ONE validator (`validateWatchInput`), the store and the tick engine — every
+registration path routes through it. Two paths: the `watch_job` PA_META action and
+`pa watch add`. Bounds: 25 active, 10 checks/tick, 60 s-1 h intervals, 7-day max deadline,
+256 KB tail reads. Terminal states `reported`/`expired`/`check-failed`/`cancelled`; all but
+`cancelled` report to the registering chat/thread, redacted and `_Ref:`-stamped, and the send
+precedes the status write. Spec: `plans/2026-08-31-ai170-async-watch-SPEC.md`.
 
 ## Blackboard & locking
 

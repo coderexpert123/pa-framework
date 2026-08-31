@@ -48,6 +48,11 @@ class TestTopicBrains(unittest.TestCase):
         import shutil
         if 'PA_HOME' in os.environ:
             del os.environ['PA_HOME']
+        # Clean up cap env vars
+        if 'PA_TOPIC_BRAINS_MAX_TASKS' in os.environ:
+            del os.environ['PA_TOPIC_BRAINS_MAX_TASKS']
+        if 'PA_TOPIC_BRAINS_MAX_SEEDS' in os.environ:
+            del os.environ['PA_TOPIC_BRAINS_MAX_SEEDS']
         if os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
 
@@ -183,9 +188,9 @@ class TestTopicBrains(unittest.TestCase):
         self.assertEqual(skipped_reasons['-1001111111111_100'], 'thread-id-collision')
         self.assertEqual(skipped_reasons['-1002222222222_100'], 'thread-id-collision')
 
-    def test_plan_caps_300_turn_truncation(self):
-        """Test slice truncation to 300 turns."""
-        # Create 400 turns
+    def test_plan_no_truncation(self):
+        """Test NO truncation: all turns preserved, even with 400+ turns."""
+        # Create 400 turns for one topic
         turns = []
         for i in range(400):
             turns.append({
@@ -201,17 +206,21 @@ class TestTopicBrains(unittest.TestCase):
         ret = topic_brains.plan(self.pa_home)
         self.assertEqual(ret, 0)
 
-        # Check slice file
+        # Check slice file contains ALL 400 turns
         slice_path = os.path.join(self.pa_home, 'topic-brains', '.slices', '-1001234567890_100.jsonl')
         with open(slice_path, 'r') as f:
             slice_turns = [json.loads(line) for line in f]
 
-        # Should have at most 300 turns
-        self.assertLessEqual(len(slice_turns), 300)
+        # Should have exactly 400 turns (no truncation)
+        self.assertEqual(len(slice_turns), 400)
 
-    def test_plan_caps_8_task_limit(self):
-        """Test 8 task per run cap."""
-        # Create 10 topics with turns
+        # Verify order is preserved (newest last)
+        self.assertEqual(slice_turns[0]['message_id'], 0)
+        self.assertEqual(slice_turns[-1]['message_id'], 399)
+
+    def test_plan_default_no_task_cap(self):
+        """Test default behavior: no task cap when env not set."""
+        # Create 10 topics with turns (old cap would have limited to 8)
         for i in range(10):
             thread_id = 100 + i
             turns = [
@@ -232,23 +241,28 @@ class TestTopicBrains(unittest.TestCase):
         with open(workplan_path, 'r') as f:
             workplan = json.load(f)
 
-        # Should have at most 8 tasks
-        self.assertLessEqual(len(workplan['tasks']), 8)
-        # Remaining 2 should be deferred
-        self.assertGreaterEqual(len(workplan['skipped']), 2)
+        # With default unlimited cap, all 10 should become tasks
+        self.assertEqual(len(workplan['tasks']), 10)
+        # No deferred-cap skips
+        deferred = [s for s in workplan['skipped'] if s.get('reason') == 'deferred-cap']
+        self.assertEqual(len(deferred), 0)
 
-    def test_plan_caps_3_seed_limit(self):
-        """Test 3 seed per run cap."""
-        # Create 5 seed candidates (no existing brains)
-        turns = [
-            {'role': 'user', 'text': 'test', 'timestamp': '2026-08-21T10:00:00.000Z', 'thread_id': 100, 'message_id': 1}
-        ]
-
+    def test_plan_default_no_seed_cap(self):
+        """Test default behavior: no seed cap when env not set."""
+        # Create 5 seed candidates (no existing brains) - old cap would have limited to 3
+        turns = []
         for i in range(5):
             thread_id = 100 + i
+            turns.append({
+                'role': 'user',
+                'text': f'test {i}',
+                'timestamp': '2026-08-21T10:00:00.000Z',
+                'thread_id': thread_id,
+                'message_id': 1
+            })
             self.write_topic_state(-1001234567890, thread_id)
 
-        self.write_archive_turns(turns * 5)
+        self.write_archive_turns(turns)
 
         ret = topic_brains.plan(self.pa_home)
         self.assertEqual(ret, 0)
@@ -257,9 +271,198 @@ class TestTopicBrains(unittest.TestCase):
         with open(workplan_path, 'r') as f:
             workplan = json.load(f)
 
-        # Should have at most 3 seeds
+        # With default unlimited cap, all 5 seeds should become tasks
         seed_tasks = [t for t in workplan['tasks'] if t['kind'] == 'seed']
-        self.assertLessEqual(len(seed_tasks), 3)
+        self.assertEqual(len(seed_tasks), 5)
+
+    def test_plan_env_max_tasks_cap(self):
+        """Test PA_TOPIC_BRAINS_MAX_TASKS env override applies task cap."""
+        # Create 10 topics with turns
+        all_turns = []
+        for i in range(10):
+            thread_id = 100 + i
+            all_turns.append({
+                'role': 'user',
+                'text': f'test {i}',
+                'timestamp': '2026-08-21T10:00:00.000Z',
+                'thread_id': thread_id,
+                'message_id': 1
+            })
+            self.write_topic_state(-1001234567890, thread_id)
+
+        self.write_archive_turns(all_turns)
+
+        # Set env cap to 3 tasks
+        os.environ['PA_TOPIC_BRAINS_MAX_TASKS'] = '3'
+
+        ret = topic_brains.plan(self.pa_home)
+        self.assertEqual(ret, 0)
+
+        workplan_path = os.path.join(self.pa_home, 'topic-brains', '.workplan.json')
+        with open(workplan_path, 'r') as f:
+            workplan = json.load(f)
+
+        # Should have exactly 3 tasks
+        self.assertEqual(len(workplan['tasks']), 3)
+        # Should have 7 deferred-cap skips
+        deferred = [s for s in workplan['skipped'] if s.get('reason') == 'deferred-cap']
+        self.assertEqual(len(deferred), 7)
+
+    def test_plan_env_max_seeds_cap(self):
+        """Test PA_TOPIC_BRAINS_MAX_SEEDS env override applies seed cap."""
+        # Create 5 seed candidates (no existing brains)
+        turns = []
+        for i in range(5):
+            thread_id = 100 + i
+            turns.append({
+                'role': 'user',
+                'text': 'test',
+                'timestamp': '2026-08-21T10:00:00.000Z',
+                'thread_id': thread_id,
+                'message_id': 1
+            })
+            self.write_topic_state(-1001234567890, thread_id)
+
+        self.write_archive_turns(turns)
+
+        # Set env cap to 2 seeds
+        os.environ['PA_TOPIC_BRAINS_MAX_SEEDS'] = '2'
+
+        ret = topic_brains.plan(self.pa_home)
+        self.assertEqual(ret, 0)
+
+        workplan_path = os.path.join(self.pa_home, 'topic-brains', '.workplan.json')
+        with open(workplan_path, 'r') as f:
+            workplan = json.load(f)
+
+        # Should have exactly 2 seed tasks
+        seed_tasks = [t for t in workplan['tasks'] if t['kind'] == 'seed']
+        self.assertEqual(len(seed_tasks), 2)
+        # Should have 3 deferred-cap skips
+        deferred = [s for s in workplan['skipped'] if s.get('reason') == 'deferred-cap']
+        self.assertEqual(len(deferred), 3)
+
+    def test_plan_env_invalid_value_warns_and_defaults_unlimited(self):
+        """Test invalid cap value prints warning and defaults to unlimited."""
+        # Create 10 topics with turns
+        all_turns = []
+        for i in range(10):
+            thread_id = 100 + i
+            all_turns.append({
+                'role': 'user',
+                'text': f'test {i}',
+                'timestamp': '2026-08-21T10:00:00.000Z',
+                'thread_id': thread_id,
+                'message_id': 1
+            })
+            self.write_topic_state(-1001234567890, thread_id)
+
+        self.write_archive_turns(all_turns)
+
+        # Set invalid env value
+        os.environ['PA_TOPIC_BRAINS_MAX_TASKS'] = 'banana'
+
+        # Capture stderr
+        import io
+        from contextlib import redirect_stderr
+
+        stderr_capture = io.StringIO()
+        with redirect_stderr(stderr_capture):
+            ret = topic_brains.plan(self.pa_home)
+
+        self.assertEqual(ret, 0)
+
+        # Should have warning in stderr
+        stderr_output = stderr_capture.getvalue()
+        self.assertIn('Unparsable PA_TOPIC_BRAINS_MAX_TASKS', stderr_output)
+        self.assertIn('banana', stderr_output)
+        self.assertIn('unlimited', stderr_output)
+
+        # All topics should become tasks (unlimited behavior)
+        workplan_path = os.path.join(self.pa_home, 'topic-brains', '.workplan.json')
+        with open(workplan_path, 'r') as f:
+            workplan = json.load(f)
+
+        self.assertEqual(len(workplan['tasks']), 10)
+        deferred = [s for s in workplan['skipped'] if s.get('reason') == 'deferred-cap']
+        self.assertEqual(len(deferred), 0)
+
+    def test_plan_parts_large_slice_split(self):
+        """Test large slices split into ordered parts at ~100KB boundaries."""
+        # Create enough turns to force >1 part (assuming ~250 bytes per turn)
+        # ~400-500 turns should create ~100KB data
+        turns = []
+        for i in range(450):
+            turns.append({
+                'role': 'user',
+                'text': f'Large turn message number {i} with some padding ' * 5,
+                'timestamp': f'2026-08-21T{i:02d}:00:00.000Z',
+                'thread_id': 100,
+                'message_id': i
+            })
+        self.write_archive_turns(turns)
+        self.write_topic_state(-1001234567890, 100)
+
+        ret = topic_brains.plan(self.pa_home)
+        self.assertEqual(ret, 0)
+
+        workplan_path = os.path.join(self.pa_home, 'topic-brains', '.workplan.json')
+        with open(workplan_path, 'r') as f:
+            workplan = json.load(f)
+
+        # Should have created a task with parts
+        self.assertEqual(len(workplan['tasks']), 1)
+        task = workplan['tasks'][0]
+
+        # Should have parts > 1
+        self.assertGreater(task['parts'], 1)
+        self.assertEqual(len(task['slicePaths']), task['parts'])
+
+        # Verify parts are ordered and disjoint
+        all_turns = []
+        for part_path in task['slicePaths']:
+            with open(part_path, 'r') as f:
+                part_turns = [json.loads(line) for line in f]
+                self.assertGreater(len(part_turns), 0, "Part should not be empty")
+                all_turns.extend(part_turns)
+
+        # All turns preserved, in order
+        self.assertEqual(len(all_turns), 450)
+        self.assertEqual(all_turns[0]['message_id'], 0)
+        self.assertEqual(all_turns[-1]['message_id'], 449)
+
+    def test_plan_spool_hygiene(self):
+        """Test that .spool-* files are cleaned up after plan()."""
+        # Create 3 topics: 2 will be selected, 1 will be skipped (collision)
+        turns = []
+        for i in range(3):
+            thread_id = 100 + i
+            turns.append({
+                'role': 'user',
+                'text': f'test {i}',
+                'timestamp': '2026-08-21T10:00:00.000Z',
+                'thread_id': thread_id,
+                'message_id': 1
+            })
+            self.write_topic_state(-1001234567890, thread_id)
+
+        self.write_archive_turns(turns)
+
+        # Create collision for thread_id 102 (same thread_id, different chat)
+        self.write_topic_state(-1009999999999, 102)
+
+        ret = topic_brains.plan(self.pa_home)
+        self.assertEqual(ret, 0)
+
+        # Verify no .spool-* files remain
+        slices_dir = os.path.join(self.pa_home, 'topic-brains', '.slices')
+        spool_files = [f for f in os.listdir(slices_dir) if f.startswith('.spool-')]
+        self.assertEqual(len(spool_files), 0, "All spool files should be cleaned up")
+
+        # Verify slice files exist for selected tasks only (not for collision)
+        slice_files = [f for f in os.listdir(slices_dir) if f.endswith('.jsonl') and not f.startswith('.')]
+        # Should have 2 slice files (threads 100 and 101), not 3 (thread 102 was collision)
+        self.assertEqual(len(slice_files), 2)
 
     def test_plan_corrupt_topic_state_skipped(self):
         """Test corrupt topic-state files are skipped."""

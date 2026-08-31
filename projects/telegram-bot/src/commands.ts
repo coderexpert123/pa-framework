@@ -30,7 +30,7 @@ export const BOT_COMMANDS: BotCommand[] = [
   { command: 'keepawake', description: 'Toggle machine keep-awake mode' },
   { command: 'stop', description: 'Kill the worker currently running in this topic' },
   { command: 'steer', description: 'Kill the running worker and resume with folded context (/steer [prompt])' },
-  { command: 'retranscribe', description: 'Re-transcribe the voice/audio/video note you replied to (optional engine override)' },
+  { command: 'retranscribe', description: 'Re-transcribe a recent voice/audio/video note — last one in this topic, or reply to pick one (optional engine override)' },
   { command: 'commit', description: 'Commit pending work locally — fast, no push, no test gate, no CI wait' },
   { command: 'push', description: 'Push already-committed local work to origin/main after a full local test gate, wait for CI' },
   { command: 'push_public', description: 'Sync currently-eligible framework changes to the public mirror via a guarded auto-merge PR' },

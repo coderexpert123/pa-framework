@@ -93,7 +93,7 @@ export async function checkBotProcess(): Promise<CheckResult> {
   return { name: 'bot-process', status: 'OK', detail: `PID ${pid} alive` };
 }
 
-async function checkBlackboard(): Promise<CheckResult> {
+export async function checkBlackboard(): Promise<CheckResult> {
   const bbPath = join(paHome(), 'blackboard.json');
   try {
     const content = await readFile(bbPath, 'utf8');
@@ -121,7 +121,7 @@ async function checkBlackboard(): Promise<CheckResult> {
   }
 }
 
-async function checkConversationLog(): Promise<CheckResult> {
+export async function checkConversationLog(): Promise<CheckResult> {
   const logPath = join(paHome(), 'conversation-history.jsonl');
   const size = await fileSize(logPath);
   if (size === null) {
@@ -133,7 +133,7 @@ async function checkConversationLog(): Promise<CheckResult> {
   return { name: 'conversation-log', status: 'OK', detail: label };
 }
 
-async function checkBotLog(): Promise<CheckResult> {
+export async function checkBotLog(): Promise<CheckResult> {
   const logPath = join(paHome(), 'logs', 'telegram-bot.log');
   const size = await fileSize(logPath);
   if (size === null) return { name: 'bot-log', status: 'WARN', detail: 'no log file yet — bot hasn\'t started or hasn\'t logged. Try: `pa bot restart`.' };
@@ -143,7 +143,7 @@ async function checkBotLog(): Promise<CheckResult> {
   return { name: 'bot-log', status: 'OK', detail: label };
 }
 
-async function checkAppLog(): Promise<CheckResult> {
+export async function checkAppLog(): Promise<CheckResult> {
   const logPath = join(paHome(), 'app.log.jsonl');
   const size = await fileSize(logPath);
   if (size === null) return { name: 'app-log', status: 'WARN', detail: 'no structured log yet — normal on a fresh install' };
@@ -153,7 +153,7 @@ async function checkAppLog(): Promise<CheckResult> {
   return { name: 'app-log', status: 'OK', detail: label };
 }
 
-async function checkWorkers(): Promise<CheckResult> {
+export async function checkWorkers(): Promise<CheckResult> {
   let config;
   try {
     config = await loadConfig();
@@ -195,7 +195,7 @@ async function checkWorkers(): Promise<CheckResult> {
   return { name: 'workers', status: 'OK', detail: `all ${results.length} available` };
 }
 
-async function checkSkills(): Promise<CheckResult> {
+export async function checkSkills(): Promise<CheckResult> {
   try {
     const skills = await listSkills();
     return { name: 'skills', status: 'OK', detail: `${skills.length} skills parsed` };
@@ -233,7 +233,7 @@ export async function checkSecrets(): Promise<CheckResult> {
   }
 }
 
-async function checkLastCatchup(): Promise<CheckResult> {
+export async function checkLastCatchup(): Promise<CheckResult> {
   const logsPath = join(paHome(), 'logs');
   try {
     const entries = await readdir(logsPath, { withFileTypes: true });
@@ -261,7 +261,7 @@ async function checkLastCatchup(): Promise<CheckResult> {
   }
 }
 
-async function checkDiskLogs(): Promise<CheckResult> {
+export async function checkDiskLogs(): Promise<CheckResult> {
   const logsPath = join(paHome(), 'logs');
   try {
     let totalBytes = 0;
@@ -283,7 +283,7 @@ async function checkDiskLogs(): Promise<CheckResult> {
   }
 }
 
-async function checkRefIdLogging(): Promise<CheckResult> {
+export async function checkRefIdLogging(): Promise<CheckResult> {
   const logPath = join(paHome(), 'app.log.jsonl');
   try {
     const content = await readFile(logPath, 'utf8');
