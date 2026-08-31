@@ -31,6 +31,34 @@ IST = timezone(timedelta(hours=5, minutes=30))
 DORMANT_MS = 30 * 24 * 3600
 
 
+def _parse_optional_int_cap(value: Optional[str], name: str) -> Optional[int]:
+    """Parse an optional cap env var.
+
+    Args:
+        value: Env var value (may be None or empty)
+        name: Env var name for warning messages
+
+    Returns:
+        None for unlimited (absent, empty, '0', or negative), positive int for cap.
+        Unparsable values → print warning to stderr and return None (unlimited).
+    """
+    if not value:
+        return None
+
+    value = value.strip()
+    if not value:
+        return None
+
+    try:
+        cap = int(value)
+        if cap <= 0:
+            return None
+        return cap
+    except ValueError:
+        print(f"Warning: Unparsable {name} value '{value}', treating as unlimited", file=sys.stderr)
+        return None
+
+
 def resolve_pa_home() -> str:
     """Resolve PA_HOME with same precedence as memory_consolidation.py."""
     return os.environ.get('PA_HOME', os.path.expanduser('~/.pa'))
@@ -210,33 +238,6 @@ def count_new_turns(turns: List[Dict], covers_through: Optional[str]) -> int:
         return len(turns)
 
 
-def truncate_slice(turns: List[Dict], max_turns: int = 300, max_bytes: int = 150000) -> List[Dict]:
-    """Truncate turns to max_turns, dropping oldest if exceeding max_bytes.
-
-    Returns:
-        List of turns (newest last), truncated to fit constraints.
-    """
-    if len(turns) <= max_turns:
-        # Check byte cap
-        total_bytes = sum(len(json.dumps(t)) for t in turns)
-        if total_bytes <= max_bytes:
-            return turns
-
-    # Take last max_turns, then trim from oldest if still over byte cap
-    truncated = turns[-max_turns:] if len(turns) > max_turns else turns[:]
-
-    total_bytes = 0
-    result = []
-    for turn in reversed(truncated):  # Start from newest
-        turn_bytes = len(json.dumps(turn))
-        if total_bytes + turn_bytes > max_bytes and result:
-            break
-        result.insert(0, turn)  # Keep newest-first order
-        total_bytes += turn_bytes
-
-    return result
-
-
 def plan(pa_home: str) -> int:
     """Generate workplan and slice files.
 
@@ -246,6 +247,10 @@ def plan(pa_home: str) -> int:
     os.makedirs(paths['topic_brains_dir'], exist_ok=True)
     os.makedirs(paths['slices_dir'], exist_ok=True)
     os.makedirs(paths['staged_dir'], exist_ok=True)
+
+    # Read scheduling caps (opt-in budget guards, default unlimited since 2026-08-31)
+    max_tasks = _parse_optional_int_cap(os.environ.get('PA_TOPIC_BRAINS_MAX_TASKS'), 'PA_TOPIC_BRAINS_MAX_TASKS')
+    max_seeds = _parse_optional_int_cap(os.environ.get('PA_TOPIC_BRAINS_MAX_SEEDS'), 'PA_TOPIC_BRAINS_MAX_SEEDS')
 
     # Enumerate topics
     topics = enumerate_topic_states(pa_home)
@@ -277,18 +282,35 @@ def plan(pa_home: str) -> int:
         brain_path = os.path.join(paths['topic_brains_dir'], topic_key, 'BRAIN.md')
         stamp_cache[topic_key] = parse_brain_stamp(brain_path)
 
-    # Single archive pass with per-thread bounded state (spec §3.5)
-    # Returns: {threadId: (exact_new_turns, deque(maxlen=300), newest_turn_ts)}
-    def stream_with_bounds(archive_path: str) -> Dict[int, Tuple[int, deque, Optional[str]]]:
-        """Stream archive once, tracking exact counts and newest turn per thread.
+    # Build cutoff map from stamp cache (thread_id -> cutoff datetime or None)
+    # Used for delta-mode filtering: only turns newer than cutoff are "new"
+    cutoff_map: Dict[int, Optional[str]] = {}
+    for _, chat_id, thread_id, _ in topics:
+        topic_key = f"{chat_id}_{thread_id}"
+        _, covers, _ = stamp_cache.get(topic_key, (None, None, None))
+        cutoff_map[thread_id] = covers  # 'none' or None or ISO timestamp
 
-        Returns:
-            Dict mapping threadId to (newTurns, deque of newest 300, newestTurnTs).
+    # Single archive pass with cutoff-aware disk spooling (no truncation, RAM bounded by design)
+    # Spools to .slices/.spool-<threadId>.jsonl, returns {threadId: (new_turns, newest_turn_ts)}
+    def spool_archive_with_cutoff(archive_path: str) -> Dict[int, Tuple[int, Optional[str]]]:
+        """Stream archive once, spooling new turns per thread to disk.
+
+        Hard-exempt threads are NOT spooled (they'll be skipped anyway).
+        Returns mapping from threadId to (newTurns, newestTurnTs).
         """
-        thread_state: Dict[int, Tuple[int, deque, Optional[str]]] = {}
+        thread_state: Dict[int, Tuple[int, Optional[str]]] = {}
+        spool_dir = paths['slices_dir']
 
         if not os.path.exists(archive_path):
             return thread_state
+
+        # Build set of thread_ids that might be selected (non-hard-exempt)
+        # Hard-exempt keys are known before the stream, so we skip spooling them entirely
+        eligible_thread_ids: Set[int] = set()
+        for _, chat_id, thread_id, _ in topics:
+            topic_key = f"{chat_id}_{thread_id}"
+            if topic_key not in hard_exempt_keys and thread_id not in collisions:
+                eligible_thread_ids.add(thread_id)
 
         try:
             with open(archive_path, 'r', encoding='utf-8') as f:
@@ -302,22 +324,50 @@ def plan(pa_home: str) -> int:
                         if not thread_id:
                             continue
 
-                        if thread_id not in thread_state:
-                            thread_state[thread_id] = (0, deque(maxlen=300), None)
-
-                        new_turns, turns_deque, newest_ts = thread_state[thread_id]
-                        new_turns += 1
-                        turns_deque.append(turn)
-
-                        # Track newest timestamp
+                        # Always track newest timestamp for ALL threads (dormant rule needs it)
+                        # Do this first, before cutoff check, so dormant rule works even for exempt threads
                         try:
                             turn_ts = datetime.fromisoformat(turn['timestamp'].replace('Z', '+00:00'))
+                            newest_ts = thread_state.get(thread_id, (0, None))[1]
                             if newest_ts is None or turn_ts > datetime.fromisoformat(newest_ts.replace('Z', '+00:00')):
                                 newest_ts = turn['timestamp']
                         except (ValueError, KeyError):
-                            pass  # Unparsable timestamp counted but doesn't become newest
+                            pass  # Unparsable timestamp: don't update newest
 
-                        thread_state[thread_id] = (new_turns, turns_deque, newest_ts)
+                        # Initialize state if first time seeing this thread
+                        if thread_id not in thread_state:
+                            thread_state[thread_id] = (0, newest_ts)
+
+                        # Skip spooling for hard-exempt or collision threads
+                        if thread_id not in eligible_thread_ids:
+                            # Still update newest_ts in thread_state for dormant check
+                            thread_state[thread_id] = (0, newest_ts)
+                            continue
+
+                        # Cutoff filter: only spool turns newer than the stamp's covers timestamp
+                        cutoff = cutoff_map.get(thread_id)
+                        if cutoff and cutoff != 'none':
+                            try:
+                                cutoff_dt = datetime.fromisoformat(cutoff.replace('Z', '+00:00'))
+                                if turn_ts <= cutoff_dt:
+                                    # Turn is older than cutoff: skip spooling, count as "not new"
+                                    thread_state[thread_id] = (thread_state[thread_id][0], newest_ts)
+                                    continue
+                            except ValueError:
+                                pass  # Invalid cutoff: treat as no cutoff (spool the turn)
+
+                        # Append to spool file
+                        new_turns = thread_state[thread_id][0] + 1
+                        thread_state[thread_id] = (new_turns, newest_ts)
+
+                        spool_path = os.path.join(spool_dir, f'.spool-{thread_id}.jsonl')
+                        try:
+                            with open(spool_path, 'a', encoding='utf-8') as f:
+                                f.write(line + '\n')
+                        except IOError as e:
+                            print(f"Warning: Cannot write spool file for thread {thread_id}: {e}", file=sys.stderr)
+                            return thread_state  # Abort on spool failure
+
                     except json.JSONDecodeError:
                         print(f"Warning: Skipping unparseable line {line_num} in archive", file=sys.stderr)
                         continue
@@ -326,7 +376,7 @@ def plan(pa_home: str) -> int:
 
         return thread_state
 
-    thread_bounds = stream_with_bounds(paths['conversation_history'])
+    thread_bounds = spool_archive_with_cutoff(paths['conversation_history'])
 
     # Build candidates
     candidates = []
@@ -370,32 +420,13 @@ def plan(pa_home: str) -> int:
         staged_path = os.path.join(paths['staged_dir'], f'{topic_key}.md')
         has_staged = os.path.exists(staged_path)
 
-        # Get bounded state for this thread
+        # Get spool state for this thread (newTurns, newestTurnTs)
+        # Cutoff filtering already applied during spooling
         new_turns = 0
-        turns_deque = deque(maxlen=300)
         newest_turn_ts = None
 
         if thread_id in thread_bounds:
-            new_turns, turns_deque, newest_turn_ts = thread_bounds[thread_id]
-
-        # Filter deque by covers timestamp (delta mode)
-        # After filtering, recount new_turns (spec §3.5)
-        if covers and covers != 'none':
-            try:
-                cutoff = datetime.fromisoformat(covers.replace('Z', '+00:00'))
-                filtered_deque = deque(maxlen=300)
-                for turn in turns_deque:
-                    try:
-                        turn_ts = datetime.fromisoformat(turn['timestamp'].replace('Z', '+00:00'))
-                        if turn_ts > cutoff:
-                            filtered_deque.append(turn)
-                    except (ValueError, KeyError):
-                        filtered_deque.append(turn)  # Unparsable counts as new
-                turns_deque = filtered_deque
-                # Recount after filtering (spec §3.5)
-                new_turns = len(turns_deque)
-            except ValueError:
-                pass  # Invalid covers: use full deque
+            new_turns, newest_turn_ts = thread_bounds[thread_id]
 
         # Dormant rule: skip if newest turn is older than 30 days (spec §3.2)
         if topic_key in exempt_registry and exempt_registry[topic_key] == 'dormant':
@@ -443,6 +474,11 @@ def plan(pa_home: str) -> int:
             except OSError:
                 pass
 
+        # Spool path for this thread (if it has new turns)
+        spool_path = None
+        if new_turns > 0 or has_staged:
+            spool_path = os.path.join(paths['slices_dir'], f'.spool-{thread_id}.jsonl')
+
         candidate = {
             'topicKey': topic_key,
             'chatId': chat_id,
@@ -455,7 +491,7 @@ def plan(pa_home: str) -> int:
             'coversThrough': covers,
             'newTurns': new_turns,
             'skip': False,
-            'turnsDeque': turns_deque,  # For slice writing (only if selected)
+            'spoolPath': spool_path,  # For slice promotion (only if selected)
         }
 
         if has_staged:
@@ -463,7 +499,8 @@ def plan(pa_home: str) -> int:
 
         candidates.append(candidate)
 
-    # Apply caps: sort by newTurns desc, take ≤8 tasks (≤3 seeds)
+    # Apply caps: opt-in budget guards (env-configurable, default unlimited since 2026-08-31)
+    # Sort by newTurns desc to prioritize active topics; caps only apply when set via env
     candidates.sort(key=lambda c: c.get('newTurns', 0), reverse=True)
 
     tasks = []
@@ -479,27 +516,107 @@ def plan(pa_home: str) -> int:
             skipped.append(skip_entry)
             continue
 
-        if task_count >= 8:
+        # Task cap (optional)
+        if max_tasks is not None and task_count >= max_tasks:
             skipped.append({'topicKey': c['topicKey'], 'reason': 'deferred-cap'})
             continue
 
+        # Seed cap (optional)
         if c['kind'] == 'seed':
-            if seed_count >= 3:
+            if max_seeds is not None and seed_count >= max_seeds:
                 skipped.append({'topicKey': c['topicKey'], 'reason': 'deferred-cap'})
                 continue
             seed_count += 1
 
-        # Write slice ONLY for selected tasks (spec §3.5)
-        slice_path = os.path.join(paths['slices_dir'], f'{c["topicKey"]}.jsonl')
-        turns_deque = c.get('turnsDeque', deque(maxlen=300))
+        # Promote spool to slice(s) with parts (Task A item 3)
+        # Hardcoded constant: ~100KB per part, break on line boundaries only
+        PART_SIZE_BYTES = 100000
 
-        try:
-            with open(slice_path, 'w', encoding='utf-8') as f:
-                for turn in turns_deque:
-                    f.write(json.dumps(turn) + '\n')
-        except IOError as e:
-            print(f"Error: Cannot write slice file: {e}", file=sys.stderr)
-            return 1
+        spool_path = c.get('spoolPath')
+        slice_paths = []
+        parts = 0
+
+        if spool_path and os.path.exists(spool_path):
+            # Read spool and split into parts if needed
+            try:
+                current_part = []
+                current_bytes = 0
+                part_index = 1
+
+                with open(spool_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+
+                        current_part.append(line)
+                        current_bytes += len(line.encode('utf-8'))
+
+                        # Start new part if approaching size limit (only on line boundary)
+                        if current_bytes >= PART_SIZE_BYTES and current_part:
+                            # Write current part
+                            part_filename = f'{c["topicKey"]}.part{part_index:02d}.jsonl'
+                            part_path = os.path.join(paths['slices_dir'], part_filename)
+                            try:
+                                with open(part_path, 'w', encoding='utf-8') as part_file:
+                                    for turn_line in current_part:
+                                        part_file.write(turn_line + '\n')
+                                slice_paths.append(part_path)
+                                parts += 1
+                            except IOError as e:
+                                print(f"Error: Cannot write part file: {e}", file=sys.stderr)
+                                return 1
+
+                            # Start new part
+                            current_part = []
+                            current_bytes = 0
+                            part_index += 1
+
+                # Write final part if non-empty
+                if current_part:
+                    if parts == 0:
+                        # Single file (no parts needed)
+                        slice_path = os.path.join(paths['slices_dir'], f'{c["topicKey"]}.jsonl')
+                        try:
+                            with open(slice_path, 'w', encoding='utf-8') as f:
+                                for turn_line in current_part:
+                                    f.write(turn_line + '\n')
+                        except IOError as e:
+                            print(f"Error: Cannot write slice file: {e}", file=sys.stderr)
+                            return 1
+                    elif parts > 0:
+                        # Final part of a multi-part set
+                        part_filename = f'{c["topicKey"]}.part{part_index:02d}.jsonl'
+                        part_path = os.path.join(paths['slices_dir'], part_filename)
+                        try:
+                            with open(part_path, 'w', encoding='utf-8') as part_file:
+                                for turn_line in current_part:
+                                    part_file.write(turn_line + '\n')
+                            slice_paths.append(part_path)
+                            parts += 1
+                            slice_path = slice_paths[0]  # Point at first part
+                        except IOError as e:
+                            print(f"Error: Cannot write part file: {e}", file=sys.stderr)
+                            return 1
+
+                # Delete spool after promotion
+                try:
+                    os.remove(spool_path)
+                except OSError as e:
+                    print(f"Warning: Cannot delete spool file: {e}", file=sys.stderr)
+
+            except IOError as e:
+                print(f"Error: Cannot read spool file: {e}", file=sys.stderr)
+                return 1
+        else:
+            # No spool (no new turns) - create empty slice for completeness
+            slice_path = os.path.join(paths['slices_dir'], f'{c["topicKey"]}.jsonl')
+            try:
+                with open(slice_path, 'w', encoding='utf-8') as f:
+                    pass  # Empty file
+            except IOError as e:
+                print(f"Error: Cannot create empty slice file: {e}", file=sys.stderr)
+                return 1
 
         task_entry = {
             'topicKey': c['topicKey'],
@@ -511,7 +628,9 @@ def plan(pa_home: str) -> int:
             'brainPath': c['brainPath'],
             'brainExists': c['brainExists'],
             'coversThrough': c['coversThrough'],
-            'slicePath': slice_path,
+            'slicePath': slice_path,  # Points at part01 (or single file)
+            'slicePaths': slice_paths,  # Ordered list of all part files
+            'parts': parts,  # Number of parts
             'newTurns': c['newTurns'],
         }
 
@@ -569,6 +688,19 @@ def plan(pa_home: str) -> int:
             'mergedAt': merged_at,
             'branchSummary': summary,
         })
+
+    # Cleanup remaining .spool-* files (skipped topics, collision/exempt threads)
+    # Selected tasks already had their spools promoted to slice files
+    try:
+        for filename in os.listdir(paths['slices_dir']):
+            if filename.startswith('.spool-') and filename.endswith('.jsonl'):
+                spool_file = os.path.join(paths['slices_dir'], filename)
+                try:
+                    os.remove(spool_file)
+                except OSError as e:
+                    print(f"Warning: Cannot delete spool file {filename}: {e}", file=sys.stderr)
+    except OSError:
+        pass  # Slices dir may not exist yet
 
     # Write workplan
     workplan = {

@@ -9,15 +9,14 @@ removing, or debugging a maintenance job.
 ## Catchup -> Maintenance Runner -> declared jobs (AI-100, 2026-08-02)
 
 `pa catchup`'s maintenance phase is one call — `runDueJobs('pa', jobsForHost('pa'), ...)`
-— driving 18 declared jobs (`pa/src/lib/maintenance/registry.ts`: `orphanWorkerReapJob`,
+— driving 20 declared jobs (`pa/src/lib/maintenance/registry.ts`: `orphanWorkerReapJob`,
 `blackboardPurgeJob`, `stalenessCheckJob`, `skillLogRotateJob`, `archivePruneJob`,
 `alertStateGcJob`, `weeklyLearnJob`, `sessionGcJob`, `voiceAttachmentGcJob`,
 `workerTeeGcJob`, `reservationGcJob` — added 2026-08-06 as part of the multi-session
 coordination protocol, GC'ing expired rows in `~/.pa/reservations.json` — `restoreDrillJob`,
 `alertCensusJob`, `clobberSentinelJob`, `redteamRecurringJob`, `reviewConflictButtonsJob`,
-`recallIndexJob`, and `sharedTmpSweepJob`) against the ledger
-`~/.pa/maintenance-state.json`. **Total declared registry, both hosts: 28 jobs (19 pa +
-9 bot)** as of the 2026-08-28 wave-4 tractable (`docs/ARCHITECTURE.md`'s "Turn-trace
+`recallIndexJob`, and `sharedTmpSweepJob`, `skillEngagementAuditJob` and `watchJobsRunnerJob`) against the ledger
+`~/.pa/maintenance-state.json`. **Total declared registry, both hosts: 30 jobs (20 pa + 10 bot)** as of the 2026-08-28 wave-4 tractable (`docs/ARCHITECTURE.md`'s "Turn-trace
 sidecar" / "Recall" sections; also see `pa/tests/maintenance-registry.test.ts`'s pinned
 counts). The pass is deliberately not gated on `!opts.topic` (fixed
 a live bug: `alert-state-gc`/staleness migration had never run in production because it was
@@ -56,12 +55,10 @@ configurable via `cost_tier.peak_window_utc` in config.yaml.) a time-pinned cron
 CHANGE of the stale set rather than resending every tick with a new hours-ago number.
 
 **`skillCadenceAuditJob` (added 2026-08-17, retired 2026-08-23).** Its threshold
-(max(2× interval, 26h)) was always ≥ staleness-check's, so it could only ever fire
-strictly later about a skill staleness-check had already reported. Its `[PARKED]`
-annotation labelled the alert text but never `continue`d past it, so a parked skill was
-still alerted — once from staleness-check, once from skill-cadence-audit, and once from
-the AI-098 parked-skill page itself. This section previously claimed the annotation
-"avoided double-reporting"; that claim was false, and the retirement above is the fix.
+(max(2× interval, 26h)) was always ≥ staleness-check's, so it could only fire strictly
+later about a skill staleness-check had already reported, and its `[PARKED]` annotation
+labelled the alert text without ever `continue`ing past it — a parked skill was paged
+three times. The old "avoided double-reporting" claim here was false; retirement is the fix.
 
 Built after an undeclared bot timer deleted 248 real Claude Code transcripts — full
 audit + governing rule in `plans/2026-08-02-maintenance-framework.md`; enforced in CI by
@@ -210,3 +207,11 @@ ever going idle, it logs and pages a `bot-stale-code` warning instead of restart
 `PRUNABLE_ARCHIVE_SUFFIXES` in `pa/src/lib/archive-files.ts`) and prune at the same 90
 days as the other rotated log/archive shards — they are derived debugging data, not a
 permanent record like the conversation-history shards.
+
+**`watchJobsRunnerJob` (AI-170, 2026-08-31):** 60 s, pa host — the ONE runner for every async
+watch (never a job per watch, never a bare timer). Read-only checks only (`file_exists`/
+`file_gone`/`file_newer_than`/`file_contains`/`process_gone`) because an LLM registers these:
+no shell, no network, no writes. 10 per tick, 25 active. Every terminal state but a cancel
+SENDS, and the send precedes the status write. `shedWhenDegraded: false`; row-level target on
+`~/.pa/watch-jobs.json`, pruned 14 d after `terminalAt`. Mechanics:
+`plans/2026-08-31-ai170-async-watch-SPEC.md`.

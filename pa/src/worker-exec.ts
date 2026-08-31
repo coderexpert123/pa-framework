@@ -540,7 +540,9 @@ export async function executeWorker(
 
           // Check 2: process tree — if children exist, definitely alive
           // (For shell:true, we look for grandchildren, as the direct child is the worker itself)
-          if (child.pid && await hasChildProcesses(child.pid, true)) {
+          // fresh:true — this is a kill/extend DECISION: a ≤300ms-stale cached snapshot can
+          // list a just-exited child as present and wrongly extend instead of killing (2026-08-31).
+          if (child.pid && await hasChildProcesses(child.pid, true, undefined, true)) {
             process.stdout.write(`\r  [check] ${worker.name}: subprocess still running, extending...    `);
             resetIdleTimer();
             return;
@@ -640,8 +642,8 @@ export async function executeWorker(
               });
             }
 
-            // Check 1: process tree (idle-timer reset)
-            const hasChildren = await hasChildProcesses(child.pid!, true);
+            // Check 1: process tree (idle-timer reset) — fresh read: kill/extend decision (2026-08-31)
+            const hasChildren = await hasChildProcesses(child.pid!, true, undefined, true);
             if (hasChildren) {
               resetIdleTimer('subprocess running');
               return;

@@ -233,7 +233,10 @@ export async function findCachedAudio(chatId: number, fileUniqueId: string): Pro
     return undefined;
   }
 
-  const sorted = dateDirs.sort().reverse().slice(0, 31);
+  // Chat-level non-date entries (audio-index.json, 2026-08-31 retranscribe-smart)
+  // must not consume one of the 31 dated slots — 'a…' sorts after 'YYYY-MM-DD'
+  // and .reverse() would put it first.
+  const sorted = dateDirs.filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d)).sort().reverse().slice(0, 31);
 
   for (const dateDir of sorted) {
     const datePath = join(root, dateDir);
@@ -313,7 +316,7 @@ export function reasonForErrorCode(code: string | undefined): VoiceFailureReason
 const TRUNCATION_SUFFIX =
   '\n\n[Note: this transcript was cut off at the length limit. If you said more, please continue in a follow-up message.]';
 
-const KIND_LABEL: Record<AudioAttachmentKind, string> = {
+export const KIND_LABEL: Record<AudioAttachmentKind, string> = {
   voice: 'Voice message',
   audio: 'Audio file',
   video_note: 'Video note',
@@ -425,7 +428,7 @@ const EMPTY_TRANSCRIPT_MESSAGE = `🎙 I couldn't make out any speech in that vo
 // timeout, and empty-transcript are all "try the same audio again" failures.
 // no-engine/cloud-auth/ffmpeg-missing need a config change first, and
 // too-long/too-large/download-failed have no cached audio worth retrying.
-const RETRANSCRIBE_HINT = ' Reply with `/retranscribe` to try again.';
+const RETRANSCRIBE_HINT = ' Send `/retranscribe` to try again.';
 
 export function voiceErrorMessage(result: Extract<VoiceResult, { ok: false }>): string {
   const hint = result.audioPath ? RETRANSCRIBE_HINT : '';

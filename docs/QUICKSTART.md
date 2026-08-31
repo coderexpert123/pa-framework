@@ -4,6 +4,8 @@
 
 > **Before you start**: read [`docs/CONVENTIONS.md`](CONVENTIONS.md) for the file-placement rules so personal data doesn't accidentally land in a tracked location. For deployment patterns (simple fork vs dual-`.git`), see [`docs/DEPLOYMENT.md`](DEPLOYMENT.md).
 
+New here? [`docs/FEATURES.md`](FEATURES.md) is the one-screen inventory of everything the framework does, each row linked to the section of this guide that shows it working.
+
 ## 1. Prerequisites
 
 - **Node.js 22+** (the framework uses ES modules with Node native test runner).
@@ -249,6 +251,15 @@ To set up your own deployment (your own private repo seeded with the framework, 
 - **Pattern A — Simple fork** (recommended for most users): one private repo containing the framework + your personal additions.
 - **Pattern B — Dual-`.git`** (advanced): two `.git` directories in one working tree, for contributors who push substrate fixes back to the public framework.
 
+### Run-only vs GitHub user (the git switch)
+
+The framework defaults to **run-only**: no skill ever commits, pushes, or reverts on your behalf. `pa init` writes this into `~/.pa/config.yaml`:
+
+    git_workflow:
+      enabled: false
+
+If you keep your deployment in a git repo (Pattern A/B above) and want snapshot commits and the autonomous code-fix lane, flip it to `true` — that is the only switch. Skills probe it with `pa git-guard` (exit 0 = allowed); `update-brain` then makes its snapshot commits and the `self-improver` example enables its code-fix lane. See [`docs/CONFIGURATION.md`](CONFIGURATION.md) § `GitWorkflowConfig`.
+
 ## 13. Your assistant has a brain
 
 The framework ships with a brain system — knowledge stores and nightly maintenance loops that keep your assistant grounded in how your projects actually work.
@@ -296,6 +307,10 @@ cp -r examples/skills/self-improver ~/.pa/skills/
 ```
 
 Verify: `node pa/dist/bin/pa.js list` shows all three with their nightly crons.
+
+Both `update-brain` and `self-improver` are git-optional: with the run-only default (`git_workflow.enabled: false`, see §12) they run file-only — no snapshot commits, no autonomous code-fix commits. Flip the switch before adopting them if you want the git behavior.
+
+Five more example skills ship in `examples/skills/` — three ops watchdogs (worker-capability-watch, rate-limit-retrospective, human-gated-blocker-watch), the injection-redteam regression test, and brain-recheck (brain audit). One-liners and links: [`docs/FEATURES.md`](FEATURES.md).
 
 ## Next steps
 

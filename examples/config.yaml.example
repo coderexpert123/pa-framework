@@ -303,6 +303,13 @@ bg_tasks:
 # first in all dispatches regardless of health. Set via CLI, edit manually to clear.
 # worker_pin: "claude"
 
+# === git workflow (persona switch) ===
+# pa ships run-only by default: no skill commits, pushes, or reverts on your
+# behalf. Flip to true (inside a git work tree) to enable snapshot commits and
+# the self-improver example's code-fix lane. Probe: pa git-guard
+git_workflow:
+  enabled: false
+
 # === transcription (optional) ===
 # Controls how Telegram VOICE NOTES become text. If you never send voice notes,
 # ignore this whole block — everything else works exactly as before.

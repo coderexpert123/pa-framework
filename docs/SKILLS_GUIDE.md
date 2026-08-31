@@ -11,6 +11,24 @@ A skill is a Markdown file at `~/.pa/skills/<name>/skill.md` with two parts:
 
 The skill's directory (`~/.pa/skills/<name>/`) can hold additional files (scripts, state JSON, fixtures). Set `cwd` to this dir for self-contained skills.
 
+## Shipped example skills
+
+Eleven example skills ship in `examples/skills/`:
+
+- **reminders** — Natural-language reminders with timezone-aware scheduling.
+- **daily-digest** — End-of-day summary of bot activity and skill runs.
+- **daily-mail-brief** — Gmail triage → AI executive briefing.
+- **update-brain** — Nightly sweeps of enrolled `CLAUDE.md` files.
+- **topic-brain-distill** — Per-topic memory consolidation.
+- **self-improver** — Autonomous analysis and fix proposal loop.
+- **worker-capability-watch** — Ops watchdog: pages when worker CLIs disappear.
+- **rate-limit-retrospective** — Ops watchdog: summarizes rate-limit patterns.
+- **human-gated-blocker-watch** — Ops watchdog: escalates human-gated faults.
+- **injection-redteam** — Regression test: validates prompt-injection defenses.
+- **brain-recheck** — Brain audit: scans `CLAUDE.md` for outdated claims.
+
+Full inventory with per-feature guides: [`docs/FEATURES.md`](FEATURES.md).
+
 ## Frontmatter schema
 
 See [`docs/ARCHITECTURE.md`](ARCHITECTURE.md#skill-yaml-frontmatter-schema) for the full field list. Key fields:
@@ -241,6 +259,8 @@ Before modifying any tracked file:
 ```
 
 Lets you `git revert HEAD` if the skill goes wrong.
+
+**Guard it**: wrap the snapshot in `pa git-guard "$root"` (exit 0 = allowed). Run-only deployments — the `pa init` default, `git_workflow.enabled: false` — must skip the snapshot and run file-only; the guard alone decides (config opt-in AND inside a git work tree), never the skill's own judgment.
 
 ## Skill chaining
 

@@ -383,10 +383,10 @@ describe('process-tree helpers: single-query invariant', () => {
         // Simulate a 3-level tree: workerPid=100, child=101, grandchild=102
         return {
           stdout: JSON.stringify([
-            { ProcessId: 100, ParentProcessId: 0 },
-            { ProcessId: 101, ParentProcessId: 100 },
-            { ProcessId: 102, ParentProcessId: 101 },
-            { ProcessId: 103, ParentProcessId: 102 },
+            { ProcessId: 100, ParentProcessId: 0, CommandLine: 'worker' },
+            { ProcessId: 101, ParentProcessId: 100, CommandLine: 'child' },
+            { ProcessId: 102, ParentProcessId: 101, CommandLine: 'grandchild1' },
+            { ProcessId: 103, ParentProcessId: 102, CommandLine: 'grandchild2' },
           ]),
           stderr: '',
         };
@@ -406,11 +406,11 @@ describe('process-tree helpers: single-query invariant', () => {
       if (process.platform === 'win32') {
         return {
           stdout: JSON.stringify([
-            { ProcessId: 1, ParentProcessId: 0 },
-            { ProcessId: 2, ParentProcessId: 1 },   // direct child
-            { ProcessId: 3, ParentProcessId: 2 },   // grandchild
-            { ProcessId: 4, ParentProcessId: 3 },   // great-grandchild
-            { ProcessId: 5, ParentProcessId: 999 }, // unrelated
+            { ProcessId: 1, ParentProcessId: 0, CommandLine: 'init' },
+            { ProcessId: 2, ParentProcessId: 1, CommandLine: 'child' },   // direct child
+            { ProcessId: 3, ParentProcessId: 2, CommandLine: 'grandchild' },   // grandchild
+            { ProcessId: 4, ParentProcessId: 3, CommandLine: 'greatgrandchild' },   // great-grandchild
+            { ProcessId: 5, ParentProcessId: 999, CommandLine: 'unrelated' }, // unrelated
           ]),
           stderr: '',
         };

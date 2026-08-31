@@ -5,7 +5,13 @@ import { promisify } from 'util';
 const execAsync = promisify(exec);
 
 // Hidden exec wrapper for Windows — prevents console window flash on every spawn
-const execHidden = (cmd: string) => execAsync(cmd, { windowsHide: true });
+const execHidden = (cmd: string) => execAsync(cmd, { windowsHide: true, timeout: 15_000, killSignal: 'SIGKILL' });
+// timeout (2026-08-31): a saturated WMI makes Get-CimInstance hang forever, and
+// exec's default timeout is NONE — stuck snapshot queries then accumulate one
+// wedged powershell per pa process and hold WMI hostage machine-wide (third
+// storm variant, 19:30 IST: 120 zombie shells, WMI dead, both lock-heartbeat
+// timers stalled). 15s hard cap → stuck child killed, empty snapshot returned,
+// next heartbeat retries; degradation instead of deadlock.
 
 export type ExecFn = (cmd: string) => Promise<{ stdout: string; stderr: string }>;
 
@@ -13,15 +19,22 @@ const BATCH_SIZE = 50;
 
 // Snapshot cache to avoid per-PID OS queries on hot paths (heartbeat, idle checks)
 const SNAPSHOT_TTL_MS = 300;
-let _cachedSnapshot: Map<number, number[]> | null = null;
+interface ProcessRecord {
+  parentPid: number;
+  cmdline: string;
+}
+let _cachedSnapshot: Map<number, ProcessRecord> | null = null;
 let _snapshotExpiresAt = 0;
 
 /**
- * Get a process-tree snapshot in ONE OS query. Returns a parent→children adjacency map.
+ * Get a process-tree snapshot in ONE OS query. Returns a map of PID→{parentPid,cmdline}.
  * Results are cached for 300ms to make consecutive heartbeats/idle checks essentially free.
  * When a custom execFn is injected (tests), bypass the cache to preserve call-count semantics.
+ * `fresh: true` forces a new query AND refreshes the cache — for DECISION points
+ * (kill/extend, idle-kill) where a ≤300ms-stale read can see a just-exited child
+ * as still present and wrongly extend instead of killing (2026-08-31).
  */
-async function getProcessSnapshot(execFn?: ExecFn): Promise<Map<number, number[]>> {
+async function getProcessSnapshot(execFn?: ExecFn, fresh = false): Promise<Map<number, ProcessRecord>> {
   const now = Date.now();
 
   // If injected execFn, bypass cache entirely (tests need exact call counts)
@@ -30,55 +43,70 @@ async function getProcessSnapshot(execFn?: ExecFn): Promise<Map<number, number[]
   }
 
   // Check cache for default path
-  if (_cachedSnapshot && now < _snapshotExpiresAt) {
+  if (!fresh && _cachedSnapshot && now < _snapshotExpiresAt) {
     return _cachedSnapshot;
   }
 
-  // Cache miss or expired — fetch and cache
+  // Cache miss, expired, or fresh — fetch and cache
   const snapshot = await buildSnapshotFromQuery(execAsync);
   _cachedSnapshot = snapshot;
   _snapshotExpiresAt = now + SNAPSHOT_TTL_MS;
   return snapshot;
 }
 
-async function buildSnapshotFromQuery(execFn: ExecFn): Promise<Map<number, number[]>> {
+async function buildSnapshotFromQuery(execFn: ExecFn): Promise<Map<number, ProcessRecord>> {
   try {
-    let pairs: Array<{ pid: number; parentPid: number }>;
+    let records: Map<number, ProcessRecord>;
 
     if (platform() === 'win32') {
       const { stdout } = await execFn(
-        `powershell -NoProfile -Command "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress"`
+        `powershell -NoProfile -Command "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress"`
       );
       const raw = stdout.trim();
       if (!raw) return new Map();
       const data = JSON.parse(raw);
       const arr = Array.isArray(data) ? data : [data];
-      pairs = arr
-        .filter((p: any) => typeof p.ProcessId === 'number')
-        .map((p: any) => ({ pid: p.ProcessId as number, parentPid: p.ParentProcessId as number }));
+      records = new Map();
+      for (const p of arr) {
+        if (typeof p.ProcessId === 'number') {
+          records.set(p.ProcessId, {
+            parentPid: p.ParentProcessId as number,
+            cmdline: p.CommandLine ?? '',
+          });
+        }
+      }
     } else {
       const { stdout } = await execFn('ps -eo pid=,ppid= --no-headers 2>/dev/null || ps -eo pid,ppid');
-      pairs = stdout.trim().split('\n')
-        .filter(l => l.trim())
-        .map(l => {
-          const [p, pp] = l.trim().split(/\s+/).map(Number);
-          return { pid: p, parentPid: pp };
-        })
-        .filter(p => !isNaN(p.pid) && !isNaN(p.parentPid));
+      records = new Map();
+      for (const line of stdout.trim().split('\n')) {
+        if (!line.trim()) continue;
+        const [pidStr, ppidStr] = line.trim().split(/\s+/);
+        const pid = parseInt(pidStr, 10);
+        const ppid = parseInt(ppidStr, 10);
+        if (!isNaN(pid) && !isNaN(ppid)) {
+          records.set(pid, { parentPid: ppid, cmdline: '' });
+        }
+      }
     }
 
-    // Build parent→children adjacency map
-    const childMap = new Map<number, number[]>();
-    for (const { pid, parentPid } of pairs) {
-      if (!childMap.has(parentPid)) childMap.set(parentPid, []);
-      childMap.get(parentPid)!.push(pid);
-    }
-
-    return childMap;
+    return records;
   } catch (err: any) {
     if (err.code === 'ENOENT') warnProcessTreeUnavailable(platform() === 'win32' ? 'powershell' : 'ps', 'getProcessSnapshot');
     return new Map();
   }
+}
+
+/**
+ * Build parent→children adjacency map from the snapshot cache.
+ * Used by getDescendantPids, getChildPids, hasChildProcesses.
+ */
+function buildAdjacencyMap(snapshot: Map<number, ProcessRecord>): Map<number, number[]> {
+  const childMap = new Map<number, number[]>();
+  for (const [pid, record] of snapshot) {
+    if (!childMap.has(record.parentPid)) childMap.set(record.parentPid, []);
+    childMap.get(record.parentPid)!.push(pid);
+  }
+  return childMap;
 }
 
 // Emit at most one warning per process lifetime when process-listing tools are absent
@@ -95,12 +123,14 @@ function warnProcessTreeUnavailable(tool: string, fn: string): void {
 
 export async function getChildPids(pid: number, execFn?: ExecFn): Promise<number[]> {
   const snapshot = await getProcessSnapshot(execFn);
-  return snapshot.get(pid) ?? [];
+  const adjacency = buildAdjacencyMap(snapshot);
+  return adjacency.get(pid) ?? [];
 }
 
-export async function hasChildProcesses(pid: number, isShell: boolean = false, execFn?: ExecFn): Promise<boolean> {
-  const snapshot = await getProcessSnapshot(execFn);
-  const children = snapshot.get(pid) ?? [];
+export async function hasChildProcesses(pid: number, isShell: boolean = false, execFn?: ExecFn, fresh = false): Promise<boolean> {
+  const snapshot = await getProcessSnapshot(execFn, fresh);
+  const adjacency = buildAdjacencyMap(snapshot);
+  const children = adjacency.get(pid) ?? [];
 
   if (children.length === 0) return false;
 
@@ -108,7 +138,7 @@ export async function hasChildProcesses(pid: number, isShell: boolean = false, e
     // If we are spawning via a shell, the direct child is the worker agent.
     // We only count it as "having active children" if the agent itself has children (e.g. running a tool).
     for (const childPid of children) {
-      const grandchildren = snapshot.get(childPid) ?? [];
+      const grandchildren = adjacency.get(childPid) ?? [];
       if (grandchildren.length > 0) return true;
     }
     return false;
@@ -126,6 +156,7 @@ export async function getDescendantPids(
   execFn: ExecFn = execHidden
 ): Promise<Array<{ pid: number; parentPid: number }>> {
   const snapshot = await getProcessSnapshot(execFn);
+  const adjacency = buildAdjacencyMap(snapshot);
 
   // BFS from workerPid — collect all descendants
   const result: Array<{ pid: number; parentPid: number }> = [];
@@ -134,7 +165,7 @@ export async function getDescendantPids(
 
   while (queue.length > 0) {
     const { pid: current } = queue.shift()!;
-    for (const childPid of snapshot.get(current) ?? []) {
+    for (const childPid of adjacency.get(current) ?? []) {
       if (!visited.has(childPid)) {
         visited.add(childPid);
         result.push({ pid: childPid, parentPid: current });
@@ -147,7 +178,10 @@ export async function getDescendantPids(
 }
 
 /**
- * Fetch command-lines for a list of PIDs. Batched at 50 PIDs per OS call.
+ * Fetch command-lines for a list of PIDs.
+ * - win32: filters from cached snapshot (one OS query per 300ms refresh)
+ * - POSIX: uses ps (no CommandLine available in snapshot)
+ * - Injected execFn: bypasses cache and queries directly (preserves test call-count semantics)
  */
 export async function getCommandLines(
   pids: number[],
@@ -155,6 +189,34 @@ export async function getCommandLines(
 ): Promise<Map<number, string>> {
   const result = new Map<number, string>();
   if (pids.length === 0) return result;
+
+  // Injected execFn: bypass cache (tests need exact call counts)
+  if (execFn !== execHidden) {
+    return getCommandLinesDirect(pids, execFn);
+  }
+
+  if (platform() === 'win32') {
+    // Use cached snapshot — filter for requested PIDs
+    const snapshot = await getProcessSnapshot();
+    for (const pid of pids) {
+      const record = snapshot.get(pid);
+      result.set(pid, record?.cmdline ?? '');
+    }
+    return result;
+  }
+
+  // POSIX: use ps (no CommandLine in snapshot)
+  return getCommandLinesDirect(pids, execFn);
+}
+
+/**
+ * Direct query path (bypasses cache). Used by injected execFn (tests) and POSIX.
+ */
+async function getCommandLinesDirect(
+  pids: number[],
+  execFn: ExecFn
+): Promise<Map<number, string>> {
+  const result = new Map<number, string>();
 
   for (let i = 0; i < pids.length; i += BATCH_SIZE) {
     const batch = pids.slice(i, i + BATCH_SIZE);
@@ -193,8 +255,12 @@ export async function getCommandLines(
 
 /**
  * Check which PIDs from a list are still alive.
- * POSIX: uses process.kill(pid, 0) — no subprocess spawn.
- * Windows: batched Get-Process call (≤50 PIDs per call).
+ * - POSIX: uses process.kill(pid, 0) — no subprocess spawn.
+ * - win32: checks cached snapshot (pid enumerated ≤300ms ago = alive; absent = dead).
+ * - Injected execFn: bypasses cache and queries directly (preserves test call-count semantics).
+ *
+ * NOTE: killProcessTree does NOT use this function (it taskkills directly).
+ * Any caller using areProcessesAlive for kill decisions should consider the 300ms staleness acceptable.
  */
 export async function areProcessesAlive(
   pids: number[],
@@ -202,6 +268,11 @@ export async function areProcessesAlive(
 ): Promise<Map<number, boolean>> {
   const result = new Map<number, boolean>();
   if (pids.length === 0) return result;
+
+  // Injected execFn: bypass cache (tests need exact call counts)
+  if (execFn !== execHidden && platform() === 'win32') {
+    return areProcessesAliveDirect(pids, execFn);
+  }
 
   if (platform() !== 'win32') {
     // POSIX: process.kill(pid, 0) is free — no spawn
@@ -216,7 +287,23 @@ export async function areProcessesAlive(
     return result;
   }
 
-  // Windows: batched Get-Process with -ErrorAction SilentlyContinue
+  // win32: use cached snapshot — presence check
+  const snapshot = await getProcessSnapshot();
+  for (const pid of pids) {
+    result.set(pid, snapshot.has(pid));
+  }
+  return result;
+}
+
+/**
+ * Direct query path for win32 (bypasses cache). Used by injected execFn (tests).
+ */
+async function areProcessesAliveDirect(
+  pids: number[],
+  execFn: ExecFn
+): Promise<Map<number, boolean>> {
+  const result = new Map<number, boolean>();
+
   for (let i = 0; i < pids.length; i += BATCH_SIZE) {
     const batch = pids.slice(i, i + BATCH_SIZE);
     try {

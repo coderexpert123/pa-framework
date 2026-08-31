@@ -181,6 +181,13 @@ maintenance:
 #   glm-5:                  { input: 1.00, output: 3.20, cache_read: 0.20 }
 #   glm-4.7:                { input: 0.60, output: 2.20, cache_read: 0.11 }
 
+# === git workflow (persona switch) ===
+# pa ships run-only by default: no skill commits, pushes, or reverts on your
+# behalf. Flip to true (inside a git work tree) to enable snapshot commits and
+# the self-improver example's code-fix lane. Probe: pa git-guard
+git_workflow:
+  enabled: false
+
 # === Voice Message Transcription ===
 transcription:
   engine_preference: auto

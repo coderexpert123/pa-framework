@@ -31,4 +31,4 @@ another skill/script write to it):
 See `examples/skills/daily-mail-brief/skill.md` for a more advanced example
 with telegram_output routing and LLM worker delegation. See
 `examples/skills/update-brain/skill.md` for the full feature set
-(worker override + no_fallback + atomic writes + git integration).
+(worker override + no_fallback + atomic writes + guarded git snapshots).

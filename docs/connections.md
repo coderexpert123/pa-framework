@@ -26,7 +26,7 @@ That cadence amplifies retries — dedupe by occurrence before diagnosing raw fa
 **Multi-instance task naming**: `scheduledTaskName()` suffixes the Task Scheduler/crontab entry name only when the RESOLVED `PA_HOME` path differs from the default `~/.pa` — do not regress to a fixed name; a disposable test clone once silently overwrote this deployment's real scheduled tasks.
 
 ### Catchup → Maintenance Runner → Declared Jobs (AI-100)
-`pa catchup`'s maintenance phase (`runDueJobs`) drives all declared jobs (25 total: 17 `pa`-host via `registry.ts`, 8 bot-host via `maintenance-jobs.ts`) against `~/.pa/maintenance-state.json`. Built after an undeclared timer deleted 248 transcripts (CI-enforced: `timer-inventory.test.ts`). Catalog: `docs/maintenance-jobs.md`. Every `pa`-host job resolves repo root via `repoRootFromModule(__filename)` (never `process.cwd()` — Task Scheduler cwd is `C:\Windows\System32`). Failed runs record `lastAttemptAt` and back off 0/30m/2h/8h/24h; `pa maintenance run <job>` bypasses.
+`pa catchup`'s maintenance phase (`runDueJobs`) drives all declared jobs (30 total: 20 `pa`-host via `registry.ts`, 10 bot-host via `maintenance-jobs.ts`) against `~/.pa/maintenance-state.json`. Built after an undeclared timer deleted 248 transcripts (CI-enforced: `timer-inventory.test.ts`). Catalog: `docs/maintenance-jobs.md`. Every `pa`-host job resolves repo root via `repoRootFromModule(__filename)` (never `process.cwd()` — Task Scheduler cwd is `C:\Windows\System32`). Failed runs record `lastAttemptAt` and back off 0/30m/2h/8h/24h; `pa maintenance run <job>` bypasses.
 
 ### update-brain Nightly Sweep
 The `update-brain` skill git-commits ANY pending working-tree/staged changes as `pre-update snapshot` / `commit pending brain-file changes` before refreshing (swept a 48-file staged change mid-session 2026-07-27). Never promise "staged, uncommitted until you approve" across 21:30 IST — it commits locally only.
@@ -35,7 +35,7 @@ The `update-brain` skill git-commits ANY pending working-tree/staged changes as 
 PA-Telegram-Bot task ensures the bot is always running (1m repeat).
 
 ### Skills → Triggers
-LLM output can trigger other skills via PA_META run_skill action.
+LLM output can trigger other skills via PA_META run_skill action. PA_META `watch_job` (AI-170) writes `~/.pa/watch-jobs.json`; the 60s `watch-jobs-runner` job reports back into the registering topic. Also `pa watch add`.
 
 ### Chains → Skills
 `pa chain run <name>` executes sequential chains from `~/.pa/chains/*.yaml` (steps: skill, args, retry, on_failure; report: telegram/stdout). Each step spawns `pa run <skill>` as a subprocess, inheriting git-workflow lock discipline. Validation is strict: unknown/invalid/missing fields are rejected on load.

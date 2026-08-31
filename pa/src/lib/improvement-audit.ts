@@ -67,6 +67,10 @@ export interface AuditRecord {
     // a file a fix applied earlier in the SAME nightly run already changed — reverted so every
     // applied fix in a run stays independently `git revert`-able.
     | 'code-fix-skipped-same-run-overlap'
+    // Git-optional gate (2026-08-31, plans/2026-08-31-git-optional-SPEC.md):
+    // git_workflow disabled in config (or not inside a git work tree) — the
+    // code-fix lane was never attempted.
+    | 'code-fix-skipped-git-disabled'
     | 'reverted-protected-path'
     | 'reverted-test-weakening'
     | 'reverted-verification-failed'

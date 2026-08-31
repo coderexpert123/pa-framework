@@ -5,7 +5,7 @@ import type { ReportEntry } from '../src/self-improver.js';
 import { GIT_WORKFLOW_RESOURCE, GIT_LOCK_WAIT_MS } from '../src/code-fixer.js';
 import type { BlackboardLockClient } from '../src/code-fixer.js';
 import { exclusiveLockKey } from '../src/commands/run.js';
-import { createTempPaHome, createTempSkill, createTempDraft, createTempSecrets, cleanup } from './helpers.js';
+import { createTempPaHome, createTempSkill, createTempDraft, createTempSecrets, createTempConfig, cleanup } from './helpers.js';
 import { readFile, mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -955,11 +955,21 @@ describe('gateAndApprove', () => {
   });
 });
 
+// Git-optional gate test double (2026-08-31, plans/2026-08-31-git-optional-SPEC.md §4
+// spec amendment 2026-08-31-A): all existing rollback tests were written before the guard
+// existed and assume the git-revert branch executes. The test double restores the pre-guard
+// execution path those tests were written against. A dedicated test below pins the blocking
+// behavior.
+const gitGuardFn = async () => ({ allowed: true, reason: 'test double' } as const);
+
 describe('rollback', () => {
   let dir: string;
 
   beforeEach(async () => {
     dir = await createTempPaHome();
+    // Git-optional guard (2026-08-31): the guard reads config.yaml, which must exist.
+    // Omitting the git_workflow block defaults to "allowed" (legacy behavior).
+    await createTempConfig(dir, []);
   });
 
   afterEach(async () => {
@@ -1063,7 +1073,7 @@ describe('rollback', () => {
       },
     };
 
-    await rollback({ blackboardFn: bb });
+    await rollback({ blackboardFn: bb, gitGuardFn });
 
     assert.equal(acquireCalls.length, 1);
     assert.equal(acquireCalls[0].resource, exclusiveLockKey(GIT_WORKFLOW_RESOURCE));
@@ -1236,6 +1246,9 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
 
   beforeEach(async () => {
     dir = await createTempPaHome();
+    // Git-optional guard (2026-08-31): the guard reads config.yaml, which must exist.
+    // Omitting the git_workflow block defaults to "allowed" (legacy behavior).
+    await createTempConfig(dir, []);
   });
 
   afterEach(async () => {
@@ -1274,6 +1287,7 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
         return { stdout: cmd.includes('rev-parse') ? 'def5678\n' : '', stderr: '' };
       },
       blackboardFn: bb,
+      gitGuardFn,
     });
 
     // `-n` (staged, not committed) since 2026-07-21 so the pa/data/profile* churn can be
@@ -1309,6 +1323,7 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
         return { stdout: '', stderr: '' };
       },
       blackboardFn: bb,
+      gitGuardFn,
     });
 
     assert.equal(lines.length, 1);
@@ -1336,6 +1351,7 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
       checkForRollbacksFn: async () => [gitRevertFlag()],
       execFn: async (cmd: string) => ({ stdout: cmd.includes('rev-parse') ? 'def5678\n' : '', stderr: '' }),
       blackboardFn: bb,
+      gitGuardFn,
     });
 
     assert.match(lines[0], /bot restart|rebuild/i);
@@ -1395,6 +1411,7 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
         return { stdout: '', stderr: '' };
       },
       blackboardFn: bb,
+      gitGuardFn,
     });
 
     // Should proceed with the revert
@@ -1422,6 +1439,7 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
         return { stdout: '', stderr: '' };
       },
       blackboardFn: bb,
+      gitGuardFn,
     });
 
     assert.match(lines[0], /Rollback FAILED/);
@@ -1468,6 +1486,7 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
         return { stdout: '', stderr: '' };
       },
       blackboardFn: bb,
+      gitGuardFn,
     });
 
     assert.equal(state.acquireCalls.length, 1);
@@ -1494,6 +1513,7 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
         return { stdout: '', stderr: '' };
       },
       blackboardFn: bb,
+      gitGuardFn,
     });
 
     assert.equal(state.releaseCalls, 1);
@@ -1515,6 +1535,7 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
       checkForRollbacksFn: async () => [gitRevertFlag()],
       execFn: async (cmd: string) => { execCalled = true; return { stdout: '', stderr: '' }; },
       blackboardFn: bb,
+      gitGuardFn,
     });
 
     assert.equal(execCalled, false, 'must not touch git at all when the lock is busy');
@@ -1531,11 +1552,44 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
     const lines = await rollback({
       checkForRollbacksFn: async () => [],
       blackboardFn: bb,
+      gitGuardFn,
     });
 
     assert.deepEqual(lines, []);
     assert.equal(state.acquireCalls.length, 0);
     assert.equal(state.releaseCalls, 0);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Git-optional gate (2026-08-31, plans/2026-08-31-git-optional-SPEC.md §4
+  // spec amendment 2026-08-31-A)
+  // ---------------------------------------------------------------------------
+
+  it('throws into rollback-failed handling when the guard returns allowed: false — manual revert required', async () => {
+    await seedDraft();
+    const { bb } = makeLockFake();
+    let execCalled = false;
+
+    const lines = await rollback({
+      checkForRollbacksFn: async () => [gitRevertFlag()],
+      execFn: async (cmd: string) => {
+        execCalled = true;
+        return { stdout: cmd.includes('rev-parse') ? 'def5678\n' : '', stderr: '' };
+      },
+      blackboardFn: bb,
+      gitGuardFn: async () => ({ allowed: false, reason: 'git_workflow.enabled is false' } as const),
+    });
+
+    // Guard blocked before git was touched: no exec calls.
+    assert.equal(execCalled, false);
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /Rollback FAILED/);
+    assert.match(lines[0], /git workflow not allowed.*git_workflow\.enabled is false.*manual revert.*abc1234/);
+
+    const records = await readAuditRecords(dir);
+    const failedRecord = records.find((r) => r.action === 'rollback-failed');
+    assert.ok(failedRecord, 'expected a rollback-failed audit record');
+    assert.match(failedRecord.reason, /git workflow not allowed.*git_workflow\.enabled is false/);
   });
 });
 
@@ -1562,6 +1616,9 @@ describe('rollback: git-revert survives (and preserves) nightly pa/data/profile 
   beforeEach(async () => {
     paHome = await createTempPaHome();
     repo = await mkdtemp(join(tmpdir(), 'pa-revert-repo-'));
+    // Git-optional guard (2026-08-31): the guard reads config.yaml, which must exist.
+    // Omitting the git_workflow block defaults to "allowed" (legacy behavior).
+    await createTempConfig(paHome, []);
 
     await git('git init -q');
     await git('git config user.email pa-test@example.com');
@@ -1744,6 +1801,7 @@ describe('P2-19: rollback-failed notification (self-improver rollback path)', ()
       },
       blackboardFn: bb,
       notifyUserFn: mockNotify,
+      gitGuardFn,
     });
 
     assert.equal(lines.length, 1);
@@ -1778,6 +1836,7 @@ describe('P2-19: rollback-failed notification (self-improver rollback path)', ()
       },
       blackboardFn: bb,
       notifyUserFn: mockNotify,
+      gitGuardFn,
     });
 
     // Audit record should still be written

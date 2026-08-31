@@ -180,6 +180,14 @@ bg_tasks:
 # Persisted override for 'pa worker pin <name>' — set via CLI command.
 # worker_pin: "claude"
 
+# === git workflow (persona switch) ===
+# pa ships run-only by default: no skill commits, pushes, or reverts on your
+# behalf. update-brain then runs file-only and the self-improver example skips
+# its code-fix lane. Flip to true (inside a git work tree) to enable snapshot
+# commits and autonomous code fixes. Skills probe with: pa git-guard
+git_workflow:
+  enabled: false
+
 # === transcription (optional) ===
 # Controls how Telegram VOICE NOTES become text. If you never send voice notes,
 # ignore this whole block — everything else works exactly as before.
