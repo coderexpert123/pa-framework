@@ -422,4 +422,78 @@ describe('runPollLoop: voice notes', { concurrency: 1 }, () => {
     assert.ok(userTurn, 'a user turn should have been archived');
     assert.ok(userTurn.text.includes('cut off at the length limit'), 'the archived turn should carry the truncation notice');
   });
+
+  // -------------------------------------------------------------------
+  // Case 11: backfill — a settled success transcript merges into the enqueue-time placeholder before the dispatch-time overwrite (WP-A A-T1)
+  // -------------------------------------------------------------------
+
+  it('case 11: backfill — a settled success transcript merges into the enqueue-time placeholder before the dispatch-time overwrite', async () => {
+    const scriptPath = await writePythonStub(tempDir, 'success_stub.py', SUCCESS_STUB);
+    process.env.PA_VOICE_TRANSCRIBE_SCRIPT = scriptPath;
+    await writeEchoWorkerConfig(tempDir);
+    const controller = new AbortController();
+    const state = makeState(123, -1);
+    const update = voiceUpdate(12, { messageId: 12 });
+    const calls = setupVoiceFetchMock({ batches: [[update], []], controller });
+
+    const loopDone = runPollLoop('token', [123], state, {}, controller.signal, fastSleep);
+    let sawBackfill = false;
+    for (let i = 0; i < 2000 && !sawBackfill; i++) {
+      const rec = (await listPendingDispatches()).find((r) => r.updateId === 12);
+      if (rec && rec.userText === '[Voice message] hello there' && rec.cwd === undefined && rec.userTextSettled === true) {
+        sawBackfill = true;
+      } else {
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    }
+    await loopDone;
+
+    assert.ok(sawBackfill, 'the settled transcript must merge into the placeholder (cwd undefined proves it is the backfill merge, not the dispatch-time record)');
+    assert.deepEqual(await listPendingDispatches(), []);
+  });
+
+  // -------------------------------------------------------------------
+  // Case 12: backfill — a settled failure writes the failure-marker text into the placeholder record (WP-A A-T2)
+  // -------------------------------------------------------------------
+
+  it('case 12: backfill — a settled failure writes the failure-marker text into the placeholder record', async () => {
+    process.env.PA_VOICE_TRANSCRIBE_SCRIPT = join(tempDir, 'does-not-exist.py');
+    const controller = new AbortController();
+    const state = makeState(123, -1);
+    const update = voiceUpdate(13, { messageId: 13 });
+    const calls = setupVoiceFetchMock({ batches: [[update], []], controller });
+
+    const loopDone = runPollLoop('token', [123], state, {}, controller.signal, fastSleep);
+    let saw = false;
+    for (let i = 0; i < 2000 && !saw; i++) {
+      const rec = (await listPendingDispatches()).find((r) => r.updateId === 13);
+      if (rec && rec.userText.startsWith('[Voice message — transcription failed') && rec.userTextSettled === true && rec.cwd === undefined) {
+        saw = true;
+      } else {
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    }
+    await loopDone;
+
+    assert.ok(saw, 'the failure-marker text must be written into the placeholder record with userTextSettled=true');
+    assert.deepEqual(await listPendingDispatches(), []);
+  });
+
+  // -------------------------------------------------------------------
+  // Case 13: backfill never resurrects a removed record — store stays empty after the run settles (WP-A A-T3)
+  // -------------------------------------------------------------------
+
+  it('case 13: backfill never resurrects a removed record — store stays empty after the run settles', async () => {
+    process.env.PA_VOICE_TRANSCRIBE_SCRIPT = join(tempDir, 'does-not-exist.py');
+    const controller = new AbortController();
+    const state = makeState(123, -1);
+    const update = voiceUpdate(14, { messageId: 14 });
+    const calls = setupVoiceFetchMock({ batches: [[update], []], controller });
+
+    await runPollLoop('token', [123], state, {}, controller.signal, fastSleep);
+
+    assert.deepEqual(await listPendingDispatches(), [], 'store must be empty after the run settles');
+    await new Promise((r) => setTimeout(r, 200));
+    assert.deepEqual(await listPendingDispatches(), [], 'a late backfill cannot recreate a removed record');
+  });
 });

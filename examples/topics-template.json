@@ -23,7 +23,7 @@
       "name": "daily-briefings",
       "description": "Scheduled informational output — daily mail brief, weekly reports, calendar alerts.",
       "special_role": "briefings",
-      "default_worker": "gemini"
+      "default_worker": "claude"
     },
     {
       "name": "claude-support",
@@ -36,12 +36,6 @@
       "description": "Debugging the zclaude worker — zclaude-specific issues and worker failover scenarios.",
       "special_role": "none",
       "default_worker": "zclaude"
-    },
-    {
-      "name": "gemini-support",
-      "description": "Debugging the gemini worker — gemini-cli quirks, RESOURCE_EXHAUSTED, grounded search issues.",
-      "special_role": "none",
-      "default_worker": "gemini"
     },
     {
       "name": "codex-support",

@@ -4,8 +4,9 @@ import { paHome } from '../paths.js';
 import type { UsageRecord } from '../lib/usage-ledger.js';
 
 interface CostFilters {
-  period: 'all' | 'week' | 'month';
+  period: 'all' | 'day' | 'week' | 'month';
   skill?: string;
+  json?: boolean;
 }
 
 interface RollupRow {
@@ -18,6 +19,7 @@ interface RollupRow {
   tokensThinking: number;
   tokensCacheRead: number;
   totalTokens: number;
+  estCostUsd: number | null;
 }
 
 /**
@@ -53,7 +55,9 @@ function filterRecords(records: UsageRecord[], filters: CostFilters): UsageRecor
   const now = new Date();
   let cutoffDate: Date | undefined;
 
-  if (filters.period === 'week') {
+  if (filters.period === 'day') {
+    cutoffDate = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  } else if (filters.period === 'week') {
     cutoffDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
   } else if (filters.period === 'month') {
     cutoffDate = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -96,6 +100,7 @@ function aggregateRecords(records: UsageRecord[]): RollupRow[] {
         tokensThinking: 0,
         tokensCacheRead: 0,
         totalTokens: 0,
+        estCostUsd: null,
       };
       grouped.set(key, row);
     }
@@ -125,8 +130,9 @@ function formatRow(row: RollupRow): string {
   const thinkTokens = formatNumber(row.tokensThinking).padStart(10);
   const cacheTokens = formatNumber(row.tokensCacheRead).padStart(10);
   const total = formatNumber(row.totalTokens).padStart(12);
+  const estCost = row.estCostUsd === null ? '-'.padStart(8) : `$${row.estCostUsd.toFixed(4)}`.padStart(8);
 
-  return `${worker} ${model} ${skill} ${runs} ${inTokens} ${outTokens} ${thinkTokens} ${cacheTokens} ${total}`;
+  return `${worker} ${model} ${skill} ${runs} ${inTokens} ${outTokens} ${thinkTokens} ${cacheTokens} ${total} ${estCost}`;
 }
 
 /**
@@ -139,14 +145,14 @@ function formatNumber(n: number): string {
 /**
  * Print the costs report as a table.
  */
-function printReport(rows: RollupRow[], filters: CostFilters): void {
-  if (rows.length === 0) {
+function printReport(rows: RollupRow[], filters: CostFilters, unpricedKeys: Set<string>): void {
+  if (rows.length === 0 && !filters.json) {
     console.log(`No usage records found for the specified period (${filters.period}${filters.skill ? ` skill: ${filters.skill}` : ''}).`);
     return;
   }
 
-  const header = `${'Worker'.padEnd(12)} ${'Model'.padEnd(20)} ${'Skill/Resource'.padEnd(25)} ${'Runs'.padStart(6)} ${'In'.padStart(10)} ${'Out'.padStart(10)} ${'Thinking'.padStart(10)} ${'Cache'.padStart(10)} ${'Total'.padStart(12)}`;
-  const separator = '-'.repeat(120);
+  const header = `${'Worker'.padEnd(12)} ${'Model'.padEnd(20)} ${'Skill/Resource'.padEnd(25)} ${'Runs'.padStart(6)} ${'In'.padStart(10)} ${'Out'.padStart(10)} ${'Thinking'.padStart(10)} ${'Cache'.padStart(10)} ${'Total'.padStart(12)} ${'Est.$'.padStart(8)}`;
+  const separator = '-'.repeat(129);
 
   console.log(separator);
   console.log(header);
@@ -165,9 +171,15 @@ function printReport(rows: RollupRow[], filters: CostFilters): void {
   const totalThinking = rows.reduce((sum, r) => sum + r.tokensThinking, 0);
   const totalCache = rows.reduce((sum, r) => sum + r.tokensCacheRead, 0);
   const grandTotal = totalIn + totalOut + totalThinking + totalCache;
+  const totalCost = rows.reduce((sum, r) => sum + (r.estCostUsd ?? 0), 0);
 
-  console.log(`${'TOTAL'.padEnd(12)} ${''.padEnd(20)} ${''.padEnd(25)} ${String(totalRuns).padStart(6)} ${formatNumber(totalIn).padStart(10)} ${formatNumber(totalOut).padStart(10)} ${formatNumber(totalThinking).padStart(10)} ${formatNumber(totalCache).padStart(10)} ${formatNumber(grandTotal).padStart(12)}`);
+  const totalCostStr = totalCost === 0 ? '-'.padStart(8) : `$${totalCost.toFixed(4)}`.padStart(8);
+  console.log(`${'TOTAL'.padEnd(12)} ${''.padEnd(20)} ${''.padEnd(25)} ${String(totalRuns).padStart(6)} ${formatNumber(totalIn).padStart(10)} ${formatNumber(totalOut).padStart(10)} ${formatNumber(totalThinking).padStart(10)} ${formatNumber(totalCache).padStart(10)} ${formatNumber(grandTotal).padStart(12)} ${totalCostStr}`);
   console.log(separator);
+
+  // Print footer
+  const unpricedList = unpricedKeys.size > 0 ? Array.from(unpricedKeys).sort().join(', ') : 'none';
+  console.log(`Estimates: built-in list prices (verified 2026-08-27) + model_pricing overrides. Unpriced: ${unpricedList}.`);
 }
 
 export async function costsCommand(args: string[]): Promise<void> {
@@ -176,10 +188,14 @@ export async function costsCommand(args: string[]): Promise<void> {
   // Parse arguments
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
-    if (arg === '--week') {
+    if (arg === '--day') {
+      filters.period = 'day';
+    } else if (arg === '--week') {
       filters.period = 'week';
     } else if (arg === '--month') {
       filters.period = 'month';
+    } else if (arg === '--json') {
+      filters.json = true;
     } else if (arg === '--skill' && i + 1 < args.length) {
       filters.skill = args[++i];
     }
@@ -188,5 +204,64 @@ export async function costsCommand(args: string[]): Promise<void> {
   const records = await readUsageLedger();
   const filtered = filterRecords(records, filters);
   const aggregated = aggregateRecords(filtered);
-  printReport(aggregated, filters);
+
+  // Load pricing and estimate costs
+  const { loadModelPricing, priceKeyFor, estimateRecordCostUsd } = await import('../lib/model-pricing.js');
+  const pricing = await loadModelPricing();
+  const unpricedKeys = new Set<string>();
+
+  for (const row of aggregated) {
+    // Price per-record then sum (same key per row so row-level math is identical)
+    let rowCost = 0;
+    for (const record of filtered) {
+      const key = priceKeyFor(record.worker, record.model);
+      if (record.worker === row.worker &&
+          (record.model || '') === (row.model || '') &&
+          record.resource === row.skill) {
+        const cost = estimateRecordCostUsd(record, pricing);
+        if (cost === null) {
+          unpricedKeys.add(key);
+        } else {
+          rowCost += cost;
+        }
+      }
+    }
+    row.estCostUsd = rowCost > 0 ? Math.round(rowCost * 1_000_000) / 1_000_000 : null;
+  }
+
+  // Calculate totals
+  const totals = {
+    runs: aggregated.reduce((sum, r) => sum + r.runs, 0),
+    tokensIn: aggregated.reduce((sum, r) => sum + r.tokensIn, 0),
+    tokensOut: aggregated.reduce((sum, r) => sum + r.tokensOut, 0),
+    tokensThinking: aggregated.reduce((sum, r) => sum + r.tokensThinking, 0),
+    tokensCacheRead: aggregated.reduce((sum, r) => sum + r.tokensCacheRead, 0),
+    totalTokens: aggregated.reduce((sum, r) => sum + r.totalTokens, 0),
+    estCostUsd: aggregated.reduce((sum, r) => sum + (r.estCostUsd ?? 0), 0),
+  };
+
+  if (filters.json) {
+    const jsonOutput = {
+      period: filters.period,
+      generatedAt: new Date().toISOString(),
+      skillFilter: filters.skill ?? null,
+      rows: aggregated.map(row => ({
+        worker: row.worker,
+        model: row.model ?? null,
+        skill: row.skill ?? null,
+        runs: row.runs,
+        tokensIn: row.tokensIn,
+        tokensOut: row.tokensOut,
+        tokensThinking: row.tokensThinking,
+        tokensCacheRead: row.tokensCacheRead,
+        totalTokens: row.totalTokens,
+        estCostUsd: row.estCostUsd,
+      })),
+      totals,
+      unpricedKeys: Array.from(unpricedKeys).sort(),
+    };
+    console.log(JSON.stringify(jsonOutput, null, 2));
+  } else {
+    printReport(aggregated, filters, unpricedKeys);
+  }
 }

@@ -21,7 +21,7 @@ export const archivePruneJob: MaintenanceJob = {
       maxAgeMs: DEFAULT_ARCHIVE_RETENTION.maxAgeDays * DAY,
       action: 'delete',
       ownership: 'pa-owned',
-      evidence: "PA's own rotated archive shards (~/.pa/archive/); PA is the sole writer (audit 2026-08-02). PRUNABLE_ARCHIVE_SUFFIXES is an explicit ALLOWLIST — rotated conversation-history shards are PERMANENT and excluded from both the age loop and the byte cap.",
+      evidence: "PA's own rotated archive shards (~/.pa/archive/); PA is the sole writer (audit 2026-08-02). PRUNABLE_ARCHIVE_SUFFIXES is an explicit ALLOWLIST — rotated conversation-history shards are PERMANENT and excluded from both the age loop and the byte cap. Includes rotated turn-traces.jsonl shards from 2026-08-24 (deterministic per-run trace sidecar, AI-161) — derived debugging data, prunable at 90 days.",
       note: 'Also applies a 500MB oldest-first byte-cap backstop over prunable files only; the preview shows the age-based candidates only.',
     },
   ],

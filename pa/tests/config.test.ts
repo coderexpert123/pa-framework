@@ -94,9 +94,9 @@ describe('loadConfig', () => {
   it('parses evaluator config when present', async () => {
     await createTempConfig(tempDir, [
       { name: 'w1', command: 'echo', args: ['x'], check: 'echo ok' },
-    ], { evaluator: { worker: 'gemini', timeout: 30 } });
+    ], { evaluator: { worker: 'codex', timeout: 30 } });
     const config = await loadConfig();
-    assert.deepEqual(config.evaluator, { worker: 'gemini', timeout: 30 });
+    assert.deepEqual(config.evaluator, { worker: 'codex', timeout: 30 });
   });
 
   it('evaluator is undefined when not in config', async () => {

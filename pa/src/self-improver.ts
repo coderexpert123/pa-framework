@@ -24,8 +24,10 @@
  *    actual report buried at the end. self-improver's skill.md deliberately has no
  *    `telegram_output` for this reason; only this explicit notifyUser() call sends anything.
  */
+import { randomUUID } from 'crypto';
 import { analyzeConversationPatterns } from './analyzer.js';
-import { analyzeFailurePatterns, checkForRollbacks, readRecentFailures } from './failure-analyzer.js';
+import { analyzeFailurePatterns, checkForRollbacks, readRecentFailures, censusProposals } from './failure-analyzer.js';
+import type { FailureRecord } from './failure-analyzer.js';
 import { attemptCodeFix, CHURN_PATHSPEC_ARGS, isChurnPath, parsePorcelainPaths, popChurn, stashChurn, GIT_WORKFLOW_RESOURCE, GIT_LOCK_WAIT_MS } from './code-fixer.js';
 import type { BlackboardLockClient } from './code-fixer.js';
 import { analyzeFeedbackPatterns } from './feedback-analyzer.js';
@@ -34,16 +36,22 @@ import { promisify } from 'util';
 import { saveDraft, markDraftMeta, approveDraft, loadDraft, listDrafts, cleanRejected, updateDraftPrompt } from './drafts.js';
 import { skillsDir, draftsDir } from './paths.js';
 import { isProtected, isCriticalChange, hasRealSideEffects, isCmdBasedTarget, validateNewSkill, validateSkillFix, applyFix, regenerateProposal } from './validator.js';
-import { loadSkill } from './skills.js';
+import { loadSkill, listSkills } from './skills.js';
 import { blackboard } from './blackboard.js';
 import { exclusiveLockKey } from './commands/run.js';
 import { appendAuditRecord, readAuditRecords, skillRunStats, toAuditBaseline, unifiedDiff } from './lib/improvement-audit.js';
 import type { AuditValidation } from './lib/improvement-audit.js';
 import { runEvalGate, formatEvalDetail } from './lib/eval-gate.js';
 import { notifyUser, resolveNotifyTopic } from './lib/notify.js';
+import { buildHITLKeyboard, buildDraftKeyboard } from './lib/hitl-keyboard.js';
 import { createPostmortemStub } from './lib/postmortem.js';
 import type { PostmortemInput, PostmortemMetadata } from './lib/postmortem.js';
+import { buildAlertCensus } from './lib/alert-census.js';
+import type { AlertCensus } from './lib/alert-census.js';
+import { jobsForHost } from './lib/maintenance/registry.js';
+import { repoRootFromModule } from './lib/git-root.js';
 import { rm, copyFile } from 'fs/promises';
+import { existsSync } from 'fs';
 import { join } from 'path';
 import type { DraftProposal, DraftMeta } from './types.js';
 
@@ -237,6 +245,12 @@ export interface ReportEntry {
   targetSkill?: string;  // for fix/reinforce proposals: which existing skill this touches or would touch
   detail?: string;
   riskFlags?: string[];  // 'critical-skill' | 'declares-secrets' — informational only, never blocks
+  /** The `ts` of the audit record THIS entry produced (pa/src/lib/improvement-audit.js
+   *  AuditRecord.ts) — set only for outcomes that wrote one with a matching, known ts
+   *  (WP-P1, 2026-08-24). Absent, never guessed: `buildHITLKeyboard`'s `pm:<ts>:<action>`
+   *  callback must key on the record that actually exists, or a press just answers
+   *  "Audit record not found". */
+  ts?: string;
 }
 
 // Injectable for tests — the git-revert kind shells out to real git otherwise.
@@ -371,7 +385,12 @@ export async function rollback(deps: RollbackDeps = {}): Promise<string[]> {
 
   const bb = blackboardFn ?? blackboard;
   const lockKey = exclusiveLockKey(GIT_WORKFLOW_RESOURCE);
-  const lockAcquired = await bb.acquireLock(lockKey, ROLLBACK_LOCK_AGENT, process.pid, GIT_LOCK_WAIT_MS);
+  // C11 (2026-08-23): contextId + pid threaded through, matching the other
+  // three git-workflow-lock sites (D3/D4). No heartbeat/onLost migration
+  // here — this hold is short by construction (checkForRollbacksFn() returns
+  // early in the common case) and has no timer to migrate onto startLockRenewal.
+  const contextId = randomUUID();
+  const lockAcquired = await bb.acquireLock(lockKey, ROLLBACK_LOCK_AGENT, process.pid, GIT_LOCK_WAIT_MS, contextId);
   if (!lockAcquired) {
     // Deliberately NO appendAuditRecord here: a 'rollback-failed' record trips `pa
     // improvements`' FAILED ROLLBACKS banner, which only clears via a human `pa improvements
@@ -382,7 +401,7 @@ export async function rollback(deps: RollbackDeps = {}): Promise<string[]> {
   try {
     return await runRollbacks();
   } finally {
-    await bb.releaseLock(lockKey, ROLLBACK_LOCK_AGENT).catch(() => {});
+    await bb.releaseLock(lockKey, ROLLBACK_LOCK_AGENT, contextId, { pid: process.pid }).catch(() => {});
   }
 
   async function runRollbacks(): Promise<string[]> {
@@ -501,11 +520,19 @@ export async function rollback(deps: RollbackDeps = {}): Promise<string[]> {
 }
 
 interface GeneratedProposals {
-  toGate: Array<{ proposal: DraftProposal; sourceType: 'conversation' | 'failure' | 'feedback' }>;
+  toGate: Array<{ proposal: DraftProposal; sourceType: 'conversation' | 'failure' | 'feedback'; evidence?: FailureRecord[] }>;
   skipped: ReportEntry[]; // thrash-control skips (Phase D) — never even saved as a draft
 }
 
-async function generateProposals(): Promise<GeneratedProposals> {
+/**
+ * `census`, when provided, feeds `censusProposals` (deterministic, no LLM) into the same
+ * tagged/toGate pipeline as the three LLM-driven analyzers below — thrash control
+ * (hasPendingDraftForTarget / wasRecentlyChanged / saveDraft) applies to census proposals
+ * unchanged (decision (g), plans/2026-08-23-alerts-wave-SPEC.md §3). Census proposals are
+ * tagged sourceType 'failure' (decision (h) — they ARE failure evidence; a new sourceType
+ * union member would ripple into types.ts/drafts.ts/improvement-audit.ts for no gain).
+ */
+async function generateProposals(census?: AlertCensus): Promise<GeneratedProposals> {
   const [conversationProposals, failureProposals, feedbackProposals] = await Promise.all([
     analyzeConversationPatterns(ANALYSIS_DAYS),
     analyzeFailurePatterns(ANALYSIS_DAYS),
@@ -518,16 +545,35 @@ async function generateProposals(): Promise<GeneratedProposals> {
   // proposals need this filter.
   const excludesSelf = (p: DraftProposal) => p.name !== SELF_NAME && p.target_skill !== SELF_NAME;
 
-  const tagged: Array<{ proposal: DraftProposal; sourceType: 'conversation' | 'failure' | 'feedback' }> = [
+  const tagged: GeneratedProposals['toGate'] = [
     ...conversationProposals.map((proposal) => ({ proposal, sourceType: 'conversation' as const })),
     ...failureProposals.filter(excludesSelf).map((proposal) => ({ proposal, sourceType: 'failure' as const })),
     ...feedbackProposals.filter(excludesSelf).map((proposal) => ({ proposal, sourceType: 'feedback' as const })),
   ];
 
+  if (census) {
+    // repoRootFromModule(__filename), NOT import.meta.url: pa/ compiles to CommonJS
+    // (tsconfig module Node16, no "type":"module") — a literal `import.meta` in emitted
+    // output makes Node auto-detect the file as ESM and the whole CLI dies at startup
+    // ("exports is not defined", live incident 2026-08-23, pa/src/lib/git-root.ts:56-61).
+    // Every other repoRootFromModule call site in this tree (scheduler.ts, the three
+    // maintenance job files) already uses __filename for the same reason.
+    const repoRoot = await repoRootFromModule(__filename);
+    const censusPairs = censusProposals(census, {
+      skills: await listSkills(),
+      maintenanceJobNames: jobsForHost('pa').map((j) => j.name),
+      jobFileExists: (p) => existsSync(join(repoRoot, p)),
+    });
+    for (const { proposal, evidence } of censusPairs) {
+      if (!excludesSelf(proposal)) continue;
+      tagged.push({ proposal, sourceType: 'failure' as const, evidence });
+    }
+  }
+
   const toGate: GeneratedProposals['toGate'] = [];
   const skipped: ReportEntry[] = [];
 
-  for (const { proposal, sourceType } of tagged) {
+  for (const { proposal, sourceType, evidence } of tagged) {
     const base = { name: proposal.name, sourceType, reason: proposal.reason, targetSkill: proposal.target_skill };
 
     // Thrash control (Phase D) only applies to fix/reinforce proposals — a brand-new skill
@@ -544,10 +590,26 @@ async function generateProposals(): Promise<GeneratedProposals> {
     }
 
     await saveDraft(proposal, sourceType);
-    toGate.push({ proposal, sourceType });
+    toGate.push({ proposal, sourceType, evidence });
   }
 
   return { toGate, skipped };
+}
+
+// Per-run bounds for autonomous code fixes (2026-08-23 F5 rework — the global
+// one-fix-per-night cap is gone, see plans/2026-08-23-code-fix-multi-per-night-SPEC.md).
+// PA_SELF_IMPROVER_CODE_FIX_BUDGET_MS: wall-clock budget for code-fix attempts in one run
+// (default 40 min, comfortably inside the 60-min skill timeout given observed 12-20 min/fix).
+export function readCodeFixBudgetMs(): number {
+  return Number(process.env.PA_SELF_IMPROVER_CODE_FIX_BUDGET_MS) || 40 * 60_000;
+}
+
+// PA_SELF_IMPROVER_MAX_CODE_FIXES: optional hard cap on code-fix attempts per run.
+// Unset/0/non-finite = unlimited (the per-target + disjoint-files + budget bounds carry the
+// safety property now, so there's no default count ceiling).
+export function readMaxCodeFixes(): number {
+  const n = Number(process.env.PA_SELF_IMPROVER_MAX_CODE_FIXES);
+  return Number.isFinite(n) && n > 0 ? n : Infinity;
 }
 
 // Injectable so gateAndApprove is unit-testable without spawning real LLM workers (the
@@ -567,6 +629,12 @@ export interface GateDeps {
   // `regenerateProposalFn &&` check short-circuits on undefined.
   regenerateProposalFn?: typeof regenerateProposal;
   updateDraftPromptFn?: typeof updateDraftPrompt;
+  /** Test-only clock injection for the per-run code-fix wall-clock budget below. */
+  nowFn?: () => number;
+  /** Per-run wall-clock budget for autonomous code fixes; default readCodeFixBudgetMs(). */
+  codeFixBudgetMs?: number;
+  /** Hard cap on code-fix attempts per run; default readMaxCodeFixes() (unlimited unless set). */
+  maxCodeFixes?: number;
 }
 
 // 1 initial validation attempt + 1 retry-with-judge-feedback before parking as
@@ -576,7 +644,7 @@ export interface GateDeps {
 const MAX_VALIDATION_ATTEMPTS = 2;
 
 export async function gateAndApprove(
-  tagged: Array<{ proposal: DraftProposal; sourceType: 'conversation' | 'failure' | 'feedback' }>,
+  tagged: Array<{ proposal: DraftProposal; sourceType: 'conversation' | 'failure' | 'feedback'; evidence?: FailureRecord[] }>,
   deps: GateDeps = {}
 ): Promise<ReportEntry[]> {
   const {
@@ -588,14 +656,93 @@ export async function gateAndApprove(
     readRecentFailuresFn = readRecentFailures,
     regenerateProposalFn,
     updateDraftPromptFn = updateDraftPrompt,
+    nowFn = Date.now,
+    codeFixBudgetMs = readCodeFixBudgetMs(),
+    maxCodeFixes = readMaxCodeFixes(),
   } = deps;
 
   const entries: ReportEntry[] = [];
-  // F5: one code-fix attempt per nightly run, globally — bounds blast radius and keeps
-  // rollback attribution + evals to a single variable per night.
-  let codeFixAttempted = false;
+  // F5 rework (2026-08-23, plans/2026-08-23-code-fix-multi-per-night-SPEC.md): the global
+  // one-fix-per-night cap is gone. Blast radius + rollback attribution are now bounded by,
+  // per run: one attempt per target skill (attemptedTargets), disjoint files across every
+  // applied fix so each stays independently git-revertable (sameRunAppliedFiles, enforced by
+  // code-fixer's same-run-overlap guard), and a wall-clock budget (runStartedAt/codeFixBudgetMs)
+  // so a fix is never started that the skill timeout could kill mid-verification. An optional
+  // hard count cap (maxCodeFixes, default unlimited) is kept as a belt-and-suspenders knob.
+  const runStartedAt = nowFn();
+  const attemptedTargets = new Set<string>();
+  const sameRunAppliedFiles: string[] = [];
+  let codeFixAttempts = 0;
 
-  for (const { proposal, sourceType } of tagged) {
+  // Shared body for BOTH cmd-based-skill targets and maintenance-job targets (2026-08-23,
+  // §WP-J2b step 3c) — the two branches below differ only in how they decided to get here
+  // (isCmdBasedTarget vs. proposal.target_kind === 'maintenance-job'); once here, routing to
+  // the autonomous code-fixer is identical, evidence included: `presetEvidence` carries the
+  // census's own synthesized FailureRecord when this proposal came from censusProposals
+  // (decision (i) — gateAndApprove's readRecentFailuresFn lookup returns [] for a maintenance
+  // job, since it is keyed on a skill log directory a declared job doesn't have), and falls
+  // back to the pre-existing readRecentFailuresFn lookup otherwise.
+  const runCodeFixRoute = async (
+    proposal: DraftProposal,
+    sourceType: 'conversation' | 'failure' | 'feedback',
+    riskFlags: string[],
+    presetEvidence: FailureRecord[] | undefined,
+  ): Promise<void> => {
+    const base = { name: proposal.name, sourceType, reason: proposal.reason, targetSkill: proposal.target_skill };
+    const targetSkill = proposal.target_skill!;
+
+    // A cmd-based skill's real behavior lives in its script, not its prompt (and a
+    // maintenance-job target has no skill.md at all) — so instead of parking a no-op prompt
+    // fix, route the failure evidence to the autonomous code-fixer. The prompt-fix DRAFT
+    // itself is never deployed either way: it's marked rejected_auto and serves as the
+    // trigger record; the actual fix (if any) lands as a git commit. attemptCodeFix appends
+    // its own audit records for every outcome (applied, reverted, every skip reason) — the
+    // rejected_auto record below covers only the draft's fate.
+    await markDraftMeta(proposal.name, { status: 'rejected_auto' });
+    await appendAuditRecord({
+      ts: new Date().toISOString(), draft: proposal.name, source_type: sourceType,
+      target_skill: proposal.target_skill, action: 'rejected_auto', risk_flags: riskFlags,
+      reason: proposal.reason,
+    });
+
+    if (attemptedTargets.has(targetSkill)) {
+      entries.push({ ...base, outcome: 'code-fix-skipped-target-already-attempted', riskFlags });
+      return;
+    }
+    if (codeFixAttempts >= maxCodeFixes) {
+      entries.push({ ...base, outcome: 'code-fix-skipped-limit-reached', riskFlags, detail: `max ${maxCodeFixes} per run (PA_SELF_IMPROVER_MAX_CODE_FIXES)` });
+      return;
+    }
+    if (nowFn() - runStartedAt > codeFixBudgetMs) {
+      entries.push({ ...base, outcome: 'code-fix-skipped-budget-exhausted', riskFlags, detail: `elapsed ${Math.round((nowFn() - runStartedAt) / 60000)}m ≥ budget ${Math.round(codeFixBudgetMs / 60000)}m (PA_SELF_IMPROVER_CODE_FIX_BUDGET_MS)` });
+      return;
+    }
+
+    attemptedTargets.add(targetSkill);
+    codeFixAttempts++;
+
+    const evidence = presetEvidence ?? (await readRecentFailuresFn(ANALYSIS_DAYS))
+      .filter((f) => f.skillName === targetSkill);
+    const result = await attemptCodeFixFn(proposal, evidence, { sameRunAppliedFiles: [...sameRunAppliedFiles] });
+    if (result.outcome === 'applied-code-fix' && result.filesChanged) {
+      sameRunAppliedFiles.push(...result.filesChanged);
+    }
+    // WP-P1 (2026-08-24): attemptCodeFixFn's own audit record's `ts` is generated inside
+    // code-fixer.ts and is not returned on CodeFixResult, so the exact ts of the record THIS
+    // entry produced is looked up back out of the audit trail by commit_hash — the same
+    // pattern rollback()'s git-revert branch already uses above. Left undefined (not
+    // invented) when there is no commit hash to key on, so a HITL send for this entry is
+    // skipped rather than risking a `pm:` id that can't be found later.
+    let auditTs: string | undefined;
+    if (result.outcome === 'applied-code-fix' && result.commitHash) {
+      const record = (await readAuditRecords()).find(
+        (r) => r.action === 'applied-code-fix' && r.commit_hash === result.commitHash);
+      auditTs = record?.ts;
+    }
+    entries.push({ ...base, outcome: result.outcome, riskFlags, detail: result.reason, ts: auditTs });
+  };
+
+  for (const { proposal, sourceType, evidence: presetEvidence } of tagged) {
     const base = { name: proposal.name, sourceType, reason: proposal.reason, targetSkill: proposal.target_skill };
 
     // The ONLY remaining hard block — self-guard against the loop ever touching itself.
@@ -626,9 +773,14 @@ export async function gateAndApprove(
       if (valid) {
         if (attempts > 1) await updateDraftPromptFn(current.name, current.frontmatter, current.prompt);
         await approveDraftFn(current.name, { approved_autonomously: true, risk_flags: riskFlags });
-        entries.push({ ...base, outcome: 'approved-new-skill', riskFlags, ...(attempts > 1 ? { detail: `validated on retry ${attempts}` } : {}) });
+        // WP-P1 (2026-08-24): captured once and reused on both the report entry and the
+        // audit record so a later `pm:<ts>:approve` press keys on the SAME record this
+        // entry produced (§WP-P1 step 1 — "auditTs is the ts of the audit record this
+        // entry produced").
+        const auditTs = new Date().toISOString();
+        entries.push({ ...base, outcome: 'approved-new-skill', riskFlags, ts: auditTs, ...(attempts > 1 ? { detail: `validated on retry ${attempts}` } : {}) });
         await appendAuditRecord({
-          ts: new Date().toISOString(), draft: proposal.name, source_type: sourceType,
+          ts: auditTs, draft: proposal.name, source_type: sourceType,
           action: 'approved-new-skill', risk_flags: riskFlags, reason: proposal.reason,
           validation: detail, diff: current.prompt.slice(0, 4000),
         });
@@ -640,31 +792,13 @@ export async function gateAndApprove(
           validation: detail, diff: current.prompt.slice(0, 4000),
         });
       }
+    } else if (proposal.target_kind === 'maintenance-job') {
+      // A census proposal naming a declared maintenance job (2026-08-23) — no skill.md exists
+      // to prompt-fix, so this never calls isCmdBasedTarget or loadSkill; it routes straight
+      // to the same code-fix closure the cmd-based-skill branch below uses.
+      await runCodeFixRoute(proposal, sourceType, riskFlags, presetEvidence);
     } else if (await isCmdBasedTarget(proposal.target_skill)) {
-      // A cmd-based skill's real behavior lives in its script, not its prompt — so instead of
-      // parking a no-op prompt fix (the pre-2026-07-11 'auto-rejected-cmd-target' behavior),
-      // route the failure evidence to the autonomous code-fixer. The prompt-fix DRAFT itself
-      // is never deployed either way: it's marked rejected_auto and serves as the trigger
-      // record; the actual fix (if any) lands as a git commit in the target project.
-      // attemptCodeFix appends its own audit records for every outcome (applied, reverted,
-      // every skip reason) — the rejected_auto record below covers only the draft's fate.
-      await markDraftMeta(proposal.name, { status: 'rejected_auto' });
-      await appendAuditRecord({
-        ts: new Date().toISOString(), draft: proposal.name, source_type: sourceType,
-        target_skill: proposal.target_skill, action: 'rejected_auto', risk_flags: riskFlags,
-        reason: proposal.reason,
-      });
-
-      if (codeFixAttempted) {
-        entries.push({ ...base, outcome: 'code-fix-skipped-limit-reached', riskFlags });
-        continue;
-      }
-      codeFixAttempted = true;
-
-      const evidence = (await readRecentFailuresFn(ANALYSIS_DAYS))
-        .filter((f) => f.skillName === proposal.target_skill);
-      const result = await attemptCodeFixFn(proposal, evidence);
-      entries.push({ ...base, outcome: result.outcome, riskFlags, detail: result.reason });
+      await runCodeFixRoute(proposal, sourceType, riskFlags, presetEvidence);
     } else {
       // Capture the OLD prompt BEFORE applyFixFn overwrites target_skill's skill.md, so the
       // audit diff shows what actually changed — after applyFixFn, loadSkill would return
@@ -715,14 +849,18 @@ export async function gateAndApprove(
         }
 
         await applyFixFn(current, riskFlags);
+        // WP-P1 (2026-08-24): captured once and reused on both the report entry and the
+        // audit record — see the identical note on the approved-new-skill path above.
+        const auditTs = new Date().toISOString();
         entries.push({
           ...base,
           outcome: 'applied-fix',
           riskFlags,
+          ts: auditTs,
           detail: `overwrote \`${proposal.target_skill}\` (backup: \`${proposal.name}/target-backup.skill.md\`)${attempts > 1 ? ` — validated on retry ${attempts}` : ''}`,
         });
         await appendAuditRecord({
-          ts: new Date().toISOString(), draft: proposal.name, source_type: sourceType,
+          ts: auditTs, draft: proposal.name, source_type: sourceType,
           target_skill: proposal.target_skill, action: 'applied-fix', risk_flags: riskFlags,
           reason: proposal.reason, validation: detail, diff: unifiedDiff(oldPrompt, current.prompt),
           backup_path: join(draftsDir(), proposal.name, 'target-backup.skill.md'),
@@ -752,7 +890,14 @@ function riskFlagSuffix(e: ReportEntry): string {
   return e.riskFlags && e.riskFlags.length > 0 ? ` [risk: ${e.riskFlags.join(', ')}]` : '';
 }
 
-export function buildReport(rollbackLines: string[], entries: ReportEntry[], staleCount: number = 0, purgedCount: number = 0): string {
+export function buildReport(
+  rollbackLines: string[],
+  entries: ReportEntry[],
+  staleCount: number = 0,
+  purgedCount: number = 0,
+  census?: AlertCensus,
+  censusError?: string,
+): string {
   const applied = entries.filter((e) => e.outcome === 'approved-new-skill' || e.outcome === 'applied-fix' || e.outcome === 'applied-code-fix');
   const pending = entries.filter((e) => e.outcome === 'validation-failed-pending');
   const autoRejected = entries.filter((e) => e.outcome === 'auto-rejected-cmd-target');
@@ -763,12 +908,62 @@ export function buildReport(rollbackLines: string[], entries: ReportEntry[], sta
 
   const lines: string[] = [];
   lines.push(`Analyzed the last ${ANALYSIS_DAYS} days. ${entries.length} proposal(s) generated.`);
+  // ALWAYS printed, even with zero proposals — "0 proposals — nothing to report" while ~110
+  // alerts/day fired is exactly the failure this line exists to make impossible (2026-08-23,
+  // plans/2026-08-23-alerts-week-review.md §4).
+  lines.push(census ? census.topLine : `Alert census unavailable: ${censusError ?? 'not built'}`);
   lines.push('');
 
   if (rollbackLines.length > 0) {
     lines.push(`*Rollbacks (${rollbackLines.length})*`);
     lines.push(...rollbackLines);
     lines.push('');
+  }
+
+  if (census) {
+    const humanGated = census.families.filter((f) => f.classification === 'human-gated' && !f.suppressedBy);
+    const repeatUnchanged = census.families.filter((f) => f.classification === 'repeat-unchanged' && !f.suppressedBy);
+    // Reference point for "age since firstSeen" is the census's own generatedAt (not
+    // Date.now()) so buildReport stays a pure function of its inputs, unit-testable without a
+    // clock dependency.
+    const nowMs = Date.parse(census.generatedAt);
+
+    if (humanGated.length > 0) {
+      lines.push(`*Operator action needed (${humanGated.length})*`);
+      for (const f of humanGated) {
+        const ageDays = Math.max(0, Math.round((nowMs - Date.parse(f.firstSeen)) / 86_400_000));
+        const err = (f.ownerStatus?.lastError ?? f.bodySample ?? '').slice(0, 200);
+        lines.push(`- \`${f.family}\` (owner: ${f.owner ?? 'unknown'}) — ${ageDays}d old, last error: ${err}${f.regressedAfterFix ? ` ⚠ recurred after fix ${f.fixedAt}` : ''}`);
+      }
+      lines.push('');
+    }
+
+    if (repeatUnchanged.length > 0) {
+      lines.push(`*Alert hygiene (${repeatUnchanged.length})*`);
+      for (const f of repeatUnchanged) {
+        lines.push(`- \`${f.family}\` — sent ${f.sent}, ${f.distinctBodies} distinct bod${f.distinctBodies === 1 ? 'y' : 'ies'} — escalate / merge / mute${f.regressedAfterFix ? ` ⚠ recurred after fix ${f.fixedAt}` : ''}`);
+      }
+      lines.push('');
+    }
+
+    // One trace line so suppressed families are visibly accounted for, not
+    // silently gone (2026-08-29). Regressions are NOT suppressed and resurface
+    // with a ⚠ marker on their own line.
+    const suppressedFamilies = census.families.filter((f) => f.suppressedBy);
+    if (suppressedFamilies.length > 0) {
+      const byFixRecord = suppressedFamilies.filter((f) => f.suppressedBy === 'fix-record').length;
+      const byGreen = suppressedFamilies.length - byFixRecord;
+      lines.push(`Known-fixed suppressed: ${suppressedFamilies.length} (${byFixRecord} fix-record, ${byGreen} green-signal; recurrences resurface)`);
+      lines.push('');
+    }
+
+    if (census.maskedFailures.length > 0) {
+      lines.push(`*Masked failures (${census.maskedFailures.length})*`);
+      for (const m of census.maskedFailures) {
+        lines.push(`- \`${m.skill}\` (last run ${m.lastRunAt}): ${m.marker}`);
+      }
+      lines.push('');
+    }
   }
 
   if (staleCount > 0) {
@@ -860,14 +1055,123 @@ export function buildReport(rollbackLines: string[], entries: ReportEntry[], sta
   return lines.join('\n');
 }
 
+// --- HITL keyboard sends (WP-P1, 2026-08-24, plans/2026-08-24-buttons-program-SPEC.md §WP-P1) ---
+//
+// Two ADDITIONAL per-item sends appended after the one nightly report notifyUser above (spec
+// correction 14) — the report itself never changes. Both loops in the spec are combined here
+// into one pure selector (`selectHitlMessages`) plus one send loop in main(), sharing a single
+// 10-message-per-run budget ("Cap at 10 messages per run" — spec §WP-P1 step 3 states the cap
+// under the shared "both loops" bullet, not per loop).
+const HIGH_RISK_FLAGS = new Set(['critical-skill', 'declares-secrets']);
+
+/** entries eligible for the risk-flagged-applied-change keyboard: APPLIED outcomes carrying a
+ *  high-risk flag AND a known audit-record ts (spec correction 14 step 1 — an entry with no ts
+ *  is skipped, never sent with an invented id). */
+function isRiskFlaggedApplied(e: ReportEntry): boolean {
+  return (
+    (e.outcome === 'applied-fix' || e.outcome === 'approved-new-skill' || e.outcome === 'applied-code-fix') &&
+    !!e.ts &&
+    !!e.riskFlags?.some((f) => HIGH_RISK_FLAGS.has(f))
+  );
+}
+
+// SPEC CORRECTION (not in the FIXED spec's corrections list — found while implementing WP-P1):
+// §WP-P1 step 2 says `outcome === 'validation-failed'`, but ReportEntry's real outcome union
+// (this file, above) has no such value — the actual value written by gateAndApprove for a
+// draft parked by failed validation is 'validation-failed-pending' (used consistently at every
+// call site, e.g. the `pending` filter in buildReport just above). 'validation-failed' would
+// fail to typecheck (TS2367, no overlap) and noEmitOnError would fail the build. Implemented
+// against the real value; flagged here for the spec to be corrected upstream.
+function isPendingDraft(e: ReportEntry): boolean {
+  return e.outcome === 'validation-failed-pending' && buildDraftKeyboard(e.name) !== undefined;
+}
+
+export interface HitlMessage {
+  kind: 'risk-flagged' | 'pending-draft';
+  entry: ReportEntry;
+}
+
+export interface HitlSelection {
+  messages: HitlMessage[];
+  /** How many qualified before the cap was applied — used to log an honest "N more eligible"
+   *  line rather than silently dropping them. */
+  totalEligible: number;
+}
+
+export const HITL_MESSAGE_CAP = 10;
+
+/** Pure. Risk-flagged applied changes are selected before pending drafts (matching the spec's
+ *  step 1-then-step-2 ordering), then both are capped together at HITL_MESSAGE_CAP. */
+export function selectHitlMessages(entries: ReportEntry[]): HitlSelection {
+  const riskFlagged = entries.filter(isRiskFlaggedApplied);
+  const pendingDrafts = entries.filter(isPendingDraft);
+  const all: HitlMessage[] = [
+    ...riskFlagged.map((entry) => ({ kind: 'risk-flagged' as const, entry })),
+    ...pendingDrafts.map((entry) => ({ kind: 'pending-draft' as const, entry })),
+  ];
+  return { messages: all.slice(0, HITL_MESSAGE_CAP), totalEligible: all.length };
+}
+
+/** Sends the per-item HITL keyboard messages selected by selectHitlMessages. Each send is
+ *  independently wrapped so one failure logs and continues — this must never abort or throw,
+ *  since it runs after the nightly report has already been sent (spec step 3). */
+async function sendHitlMessages(entries: ReportEntry[]): Promise<void> {
+  const selection = selectHitlMessages(entries);
+  if (selection.totalEligible > selection.messages.length) {
+    console.log(`[self-improver] HITL send cap reached: ${selection.totalEligible} eligible, sending ${selection.messages.length} (cap ${HITL_MESSAGE_CAP})`);
+  }
+
+  for (const msg of selection.messages) {
+    const e = msg.entry;
+    try {
+      if (msg.kind === 'risk-flagged') {
+        const body = `Target: ${e.targetSkill ?? e.name}\nRisk flags: ${(e.riskFlags ?? []).join(', ')}\nReason: ${e.reason}`;
+        await notifyUser(`Risk-flagged change applied: ${e.name}`, body, {
+          topic: await getReportTopic(),
+          severity: 'warn',
+          dedupKey: `hitl-applied-${e.ts}`,
+          dedupWindowMs: 24 * 3_600_000,
+          escalate: false,
+          // NotifyOpts.replyMarkup is `Record<string, unknown>` (pre-work P4, FROZEN) —
+          // HitlKeyboard has no index signature, so a named-type value needs the
+          // double-cast escape hatch here even though it satisfies the shape at runtime.
+          replyMarkup: buildHITLKeyboard({ risk_flags: e.riskFlags, ts: e.ts }) as unknown as Record<string, unknown> | undefined,
+        });
+      } else {
+        const body = `Reason: ${e.reason}\n\nTyped fallback: \`pa approve ${e.name}\` / \`pa reject ${e.name}\``;
+        await notifyUser(`Draft pending review: ${e.name}`, body, {
+          topic: await getReportTopic(),
+          dedupKey: `hitl-draft-${e.name}`,
+          dedupWindowMs: 7 * 86_400_000,
+          escalate: false,
+          replyMarkup: buildDraftKeyboard(e.name) as unknown as Record<string, unknown> | undefined,
+        });
+      }
+    } catch (err: any) {
+      console.error(`[self-improver] HITL send failed for ${msg.kind} '${e.name}': ${err?.stack || err}`);
+    }
+  }
+}
+
 async function main() {
   const rollbackLines = await rollback();
   const staleCount = await sweepStaleDrafts();
   const purgedCount = await cleanRejected();
-  const { toGate, skipped } = await generateProposals();
+  // In-process build (2026-08-23) — keeps this loop independent of the alert-census
+  // maintenance job's own schedule; that job's ~/.pa/alert-census.json is for the weekly
+  // digest, not for this. Never let a census build failure abort the whole nightly run.
+  let censusError: string | undefined;
+  // 7 days, NOT ANALYSIS_DAYS: the alert-census maintenance job and weekly_digest.py's
+  // "Alerts (7d)" section use a 7-day window; a 14-day copy here would let the same family
+  // classify differently in the nightly report vs the digest (wave verifier, 2026-08-23).
+  const census = await buildAlertCensus({ days: 7 }).catch((err) => {
+    censusError = String(err?.message ?? err);
+    return undefined;
+  });
+  const { toGate, skipped } = await generateProposals(census);
   const gateEntries = await gateAndApprove(toGate, { regenerateProposalFn: regenerateProposal });
   const entries = [...skipped, ...gateEntries];
-  const report = buildReport(rollbackLines, entries, staleCount, purgedCount);
+  const report = buildReport(rollbackLines, entries, staleCount, purgedCount, census, censusError);
 
   // Local visibility only (captured in this run's own .log file) — NOT what gets delivered
   // to Telegram. See the file header for why: the skill has no telegram_output, precisely so
@@ -882,6 +1186,11 @@ async function main() {
   if (!result.sent) {
     console.error(`[self-improver] Report notification was not sent (suppressed=${result.suppressed}) — see local log above for the report content.`);
   }
+
+  // WP-P1 (2026-08-24): per-item HITL keyboard sends, additional to the report above (spec
+  // correction 14) — never allowed to abort the nightly run (each send is individually
+  // try/caught inside sendHitlMessages).
+  await sendHitlMessages(entries);
 }
 
 // Guard so importing this module (e.g. from a test file, to unit-test buildReport/ReportEntry)

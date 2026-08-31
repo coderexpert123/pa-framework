@@ -5,6 +5,8 @@
  * Tests that sendToTelegram applies redaction to message text.
  */
 
+import './test-env-guard.js';
+
 import { describe, it, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, writeFileSync, rmSync, existsSync } from 'fs';

@@ -1,6 +1,9 @@
-import { readFile, writeFile, mkdir } from 'fs/promises';
+import { readFile, mkdir, writeFile } from 'fs/promises';
 import { dirname } from 'path';
+import lockfile from 'proper-lockfile';
 import { formatIST } from '../../../pa/dist/src/ist.js';
+import { safeLockOptions } from '../../../pa/dist/src/lib/safe-lock.js';
+import { writeFileAtomic } from '../../../pa/dist/src/lib/atomic-write.js';
 
 /**
  * AI-101 Layer 2: same-turn write path into the Ecosystem KB's Sources.md
@@ -83,6 +86,16 @@ function escapeRegExp(s: string): string {
 /**
  * Validate + persist a kb_note action. Never throws — logs and returns false
  * on any failure (a KB-write hiccup must not break the reply that carried it).
+ *
+ * D20 (2026-08-23): the read-modify-write is now guarded by a proper-lockfile
+ * mutex plus an atomic tmp+rename write, closing the RMW race where two
+ * same-turn kb_note actions from different topics could interleave and the
+ * second writer's plain writeFile silently clobbered the first's note (same
+ * defect class already fixed for rate-limits.ts under AI-045). proper-lockfile
+ * needs an existing target to lock, so when the file is absent the default
+ * skeleton is written first (atomically), then the lock/read/transform/write
+ * sequence runs as normal. A lock that cannot be taken returns false — this
+ * feature stays best-effort by contract.
  */
 export async function appendKbNote(domain: string, note: string): Promise<boolean> {
   const path = kbSourcesPath();
@@ -91,15 +104,38 @@ export async function appendKbNote(domain: string, note: string): Promise<boolea
 
   try {
     await mkdir(dirname(path), { recursive: true });
-    let existing = '';
+
+    // proper-lockfile needs an existing target to lock — create the default
+    // skeleton first when the file is absent, then lock/read/write. This
+    // precondition step runs BEFORE the lock (unavoidable — you cannot lock a
+    // file that doesn't exist yet), so it must be non-destructive: an
+    // exclusive `wx` create either wins (file was truly absent) or fails with
+    // EEXIST (someone else's skeleton — or, if this precondition step raced
+    // against a full concurrent write cycle, someone else's already-written
+    // note — is already there). A plain unconditional write here would
+    // silently clobber a concurrent caller's already-completed, lock-protected
+    // note write with a blank skeleton; `wx` cannot, because it never
+    // overwrites.
     try {
-      existing = await readFile(path, 'utf8');
+      await readFile(path, 'utf8');
     } catch {
-      existing = '# Sources\n\nCross-topic system-of-record index.\n\n---\n';
+      try {
+        await writeFile(path, '# Sources\n\nCross-topic system-of-record index.\n\n---\n', { flag: 'wx' });
+      } catch (err: any) {
+        if (err.code !== 'EEXIST') throw err;
+      }
     }
-    const { content } = applyKbNote(existing, domain, note, new Date());
-    await writeFile(path, content, 'utf8');
-    return true;
+
+    let release: (() => Promise<void>) | undefined;
+    try {
+      release = await lockfile.lock(path, safeLockOptions('kb-notes', { retries: 5 }));
+      const existing = await readFile(path, 'utf8');
+      const { content } = applyKbNote(existing, domain, note, new Date());
+      await writeFileAtomic(path, content);
+      return true;
+    } finally {
+      if (release) await release();
+    }
   } catch {
     return false;
   }

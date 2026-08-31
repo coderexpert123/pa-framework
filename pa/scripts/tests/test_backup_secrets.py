@@ -10,6 +10,7 @@ import sys
 import tarfile
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import backup_secrets as bs  # noqa: E402
@@ -116,6 +117,61 @@ class TestManifestAndPack(unittest.TestCase):
                 recovered[m.name] = tar.extractfile(m).read()
         self.assertEqual(recovered["pa/secrets.env"], (home / "secrets.env").read_bytes())
         self.assertEqual(recovered["pa/google-token.json"], (home / "google-token.json").read_bytes())
+
+
+class TestReauthKickOnDriveFailure(unittest.TestCase):
+    """backup_secrets.py had NO existing handler around _drive() before this
+    (correction 14 of plans/2026-08-23-alerts-wave-SPEC.md) — main() must wrap
+    it, kick a reauth link via the WP-G helper, and still exit 1 without
+    masking the real error. The helper module doesn't exist at collection time
+    in every environment (WP-G's own file) so it's stubbed via sys.modules,
+    matching the try/except-Exception import at the call site."""
+
+    def setUp(self):
+        import tempfile
+        self._orig_kick_module = sys.modules.get("google_reauth_kick")
+        self.stub_module = type(sys)("google_reauth_kick")
+        self.stub_module.kick_google_reauth = MagicMock()
+        sys.modules["google_reauth_kick"] = self.stub_module
+
+        self.tmp = tempfile.mkdtemp()
+        self._orig_home = os.environ.get("PA_HOME")
+        self._orig_pass = os.environ.get("PA_BACKUP_PASSPHRASE")
+        os.environ["PA_HOME"] = str(Path(self.tmp) / "pa-home")
+        Path(os.environ["PA_HOME"]).mkdir()
+        # build_manifest() must find a real secrets.env or build_blob() raises
+        # BEFORE reaching _drive() — content is irrelevant, only existence.
+        (Path(os.environ["PA_HOME"]) / "secrets.env").write_text(
+            "PA_BACKUP_PASSPHRASE=correct-horse-battery-staple-1234", encoding="utf-8"
+        )
+        # Set directly (bypasses _secret()'s module-level _SECRETS_CACHE, which
+        # is populated lazily and would otherwise leak across test run order).
+        os.environ["PA_BACKUP_PASSPHRASE"] = "correct-horse-battery-staple-1234"
+
+    def tearDown(self):
+        import shutil
+        if self._orig_kick_module is not None:
+            sys.modules["google_reauth_kick"] = self._orig_kick_module
+        else:
+            sys.modules.pop("google_reauth_kick", None)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        for var, val in [("PA_HOME", self._orig_home), ("PA_BACKUP_PASSPHRASE", self._orig_pass)]:
+            if val is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = val
+
+    def test_drive_failure_kicks_reauth_and_exits_1(self):
+        with patch.object(
+            bs, "_drive", side_effect=RuntimeError("Google token is missing or invalid.")
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                bs.main()
+
+        self.assertEqual(ctx.exception.code, 1)
+        self.stub_module.kick_google_reauth.assert_called_once()
+        _, kwargs = self.stub_module.kick_google_reauth.call_args
+        self.assertEqual(kwargs.get("resume_skill"), "secrets-backup")
 
 
 if __name__ == "__main__":

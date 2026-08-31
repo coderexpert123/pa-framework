@@ -1,10 +1,12 @@
+import './test-env-guard.js';
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'fs/promises';
-import { tmpdir } from 'os';
+import { mkdtemp, readFile, rm, stat } from 'fs/promises';
+import { tmpdir, homedir } from 'os';
 import { join } from 'path';
 import { splitMessage, sendToTelegram } from '../src/telegram.js';
 import { flushLog } from '../src/lib/log.js';
+import { cleanup } from './helpers.js';
 import type { TelegramOutput } from '../src/types.js';
 
 type FetchResponse = { ok: boolean; status?: number; bodyText?: string };
@@ -152,6 +154,57 @@ describe('sendToTelegram', () => {
 });
 
 // ---------------------------------------------------------------------------
+// sendToTelegram — caller-stamped trailing ref reuse (2026-08-26)
+// ---------------------------------------------------------------------------
+
+describe('sendToTelegram — trailing ref reuse', () => {
+  const cfg: TelegramOutput = { chat_id: '-1001234567', token_secret: 'T' };
+
+  it('reuses a trailing _Ref_ trailer instead of appending a second one', async () => {
+    const calls = setupFetchMock([{ ok: true }]);
+    await sendToTelegram(
+      'Catchup aborted (lock lost)\n\nLock: catchup:topic:default\n\n_Ref: s-4272d68d3c58_',
+      cfg,
+      'tok',
+    );
+    const body = JSON.parse(calls[0].init!.body as string);
+    assert.equal((body.text.match(/_Ref: /g) ?? []).length, 1, 'exactly one ref trailer');
+    assert.match(body.text, /\n\n_Ref: s-4272d68d3c58_$/, 'caller ref preserved verbatim');
+  });
+
+  it('MarkdownV2: reuses caller ref — body sanitized, trailer raw with escaped dash', async () => {
+    const calls = setupFetchMock([{ ok: true }]);
+    await sendToTelegram('node_modules/path (parens)\n\n_Ref: c-0abc123def456_', cfg, 'tok', 'MarkdownV2');
+    const body = JSON.parse(calls[0].init!.body as string);
+    assert.equal(body.parse_mode, 'MarkdownV2');
+    assert.ok(body.text.includes('node\\_modules/path \\(parens\\)'), 'body sanitized');
+    assert.equal((body.text.match(/_Ref: /g) ?? []).length, 1, 'exactly one ref trailer');
+    assert.match(body.text, /\n\n_Ref: c\\-0abc123def456_$/, 'reused trailer, dash escaped');
+  });
+
+  it('MarkdownV2 plain-text fallback: strips markers from the reused trailer too', async () => {
+    const calls = setupFetchMock([
+      { ok: false, status: 400, bodyText: "can't parse entities" },
+      { ok: true },
+    ]);
+    await sendToTelegram('alert body\n\n_Ref: s-4272d68d3c58_', cfg, 'tok', 'MarkdownV2');
+    assert.equal(calls.length, 2, 'fallback retried');
+    const fallback = JSON.parse(calls[1].init!.body as string);
+    assert.equal(fallback.parse_mode, undefined, 'parse_mode omitted on retry');
+    assert.ok(!fallback.text.includes('_Ref:'), 'italic markers stripped');
+    assert.match(fallback.text, /alert body\n\nRef: s-4272d68d3c58$/, 'reused ref kept (markers stripped)');
+  });
+
+  it('a MID-TEXT _Ref_ occurrence is not a trailer — fresh ref still appended', async () => {
+    const calls = setupFetchMock([{ ok: true }]);
+    await sendToTelegram('Quoting earlier:\n\n_Ref: s-aaa111bbb222_ said so\n\nnew content', cfg, 'tok');
+    const body = JSON.parse(calls[0].init!.body as string);
+    assert.equal((body.text.match(/_Ref: /g) ?? []).length, 2, 'quoted ref kept + fresh trailer');
+    assert.match(body.text, /\n\n_Ref: s-[0-9a-f]{12}_$/, 'fresh trailer minted at the end');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // sendToTelegram — observable outcome (SendResult, 2026-07-21 alerting fix)
 // ---------------------------------------------------------------------------
 
@@ -286,6 +339,15 @@ describe('sendToTelegram — app.log textPreview', () => {
     assert.ok(entry, 'skill message sent entry must exist');
     assert.ok(typeof entry.textPreview === 'string', 'textPreview field must be present');
     assert.ok(entry.textPreview.includes('hello world from skill'));
+  });
+
+  it('ref reuse: delivery row keys under the caller-stamped refId', async () => {
+    setupFetchMock([{ ok: true }]);
+    await sendToTelegram('alert body\n\n_Ref: s-abc123def456_', cfg, 'tok');
+    const entries = await readLogEntries();
+    const entry = entries.find((e) => e.message === 'skill message sent');
+    assert.ok(entry, 'skill message sent entry must exist');
+    assert.equal(entry.refId, 's-abc123def456', 'delivery logged under the reused ref, not a fresh one');
   });
 
   it('plain-text fallback: includes textPreview in fallback log entry', async () => {
@@ -432,5 +494,35 @@ describe('sendToTelegram — 429 rate-limit handling', () => {
     // Third call (after 429) should still have parse_mode undefined (plain text)
     const body3 = JSON.parse(calls[2].init!.body as string);
     assert.equal(body3.parse_mode, undefined, 'should retry plain-text form on 429');
+  });
+});
+
+describe('test isolation (helpers.cleanup)', () => {
+  it('never falls back to the real ~/.pa when PA_TEST_LOG_HOME is unset (WP-H, 2026-08-23)', async () => {
+    const savedHome = process.env.PA_HOME;
+    const savedTestLogHome = process.env.PA_TEST_LOG_HOME;
+    const savedNotifyDisabled = process.env.PA_NOTIFY_DISABLED;
+    const probeDir = await mkdtemp(join(tmpdir(), 'pa-test-cleanup-probe-'));
+    try {
+      delete process.env.PA_TEST_LOG_HOME;
+      await cleanup(probeDir);
+
+      assert.ok(process.env.PA_HOME, 'PA_HOME must remain a non-empty string after cleanup()');
+      assert.notEqual(
+        process.env.PA_HOME,
+        join(homedir(), '.pa'),
+        'PA_HOME must not resolve to the real ~/.pa'
+      );
+      const st = await stat(process.env.PA_HOME as string);
+      assert.ok(st.isDirectory(), 'the minted fallback PA_HOME must actually exist as a directory');
+    } finally {
+      if (savedHome === undefined) delete process.env.PA_HOME;
+      else process.env.PA_HOME = savedHome;
+      if (savedTestLogHome === undefined) delete process.env.PA_TEST_LOG_HOME;
+      else process.env.PA_TEST_LOG_HOME = savedTestLogHome;
+      if (savedNotifyDisabled === undefined) delete process.env.PA_NOTIFY_DISABLED;
+      else process.env.PA_NOTIFY_DISABLED = savedNotifyDisabled;
+      await rm(probeDir, { recursive: true, force: true });
+    }
   });
 });

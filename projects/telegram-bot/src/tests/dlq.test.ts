@@ -353,6 +353,37 @@ describe('quarantine', () => {
     assert.ok(alertFiles, 'quarantine alert dedup file should be created');
   });
 
+  it('quarantine alert carries a dq:replay keyboard and the DLQ index in its body (WP-B3)', async () => {
+    let alertBody: string | undefined;
+    (globalThis as Record<string, unknown>).fetch = async (_url: unknown, init: { body?: string } | undefined) => {
+      const body = init?.body ?? '';
+      const isAlert = typeof body === 'string' && (body.includes('"chat_id":123') || body.includes('"chat_id":"123"'));
+      if (isAlert) alertBody = body;
+      return isAlert
+        ? { ok: true, status: 200, text: async () => '{"ok":true}', json: async () => ({ ok: true }) }
+        : { ok: false, status: 400, text: async () => 'Bad Request', json: async () => ({ ok: false }) };
+    };
+    const entry = makeEntry({ chatId: -100888, text: 'alert index test', updateId: 9, refId: 's-idxtest' });
+    await appendDlq(entry);
+
+    process.env.PA_ALERTS_CHAT_ID = '123';
+    process.env.TELEGRAM_BOT_TOKEN = 'test-token';
+
+    const alertDir = join(tempDir, 'quarantine-alerts');
+    await mkdir(alertDir, { recursive: true });
+
+    // This is the only entry in the DLQ, so it quarantines at index 0.
+    for (let i = 0; i < QUARANTINE_THRESHOLD; i++) {
+      await flushDlq('token');
+    }
+
+    assert.ok(alertBody, 'quarantine alert should have been sent');
+    const parsed = JSON.parse(alertBody!);
+    assert.ok(String(parsed.text).includes('DLQ index: 0'), 'alert body should name the DLQ index');
+    assert.ok(parsed.reply_markup, 'alert should carry a reply_markup');
+    assert.ok(JSON.stringify(parsed.reply_markup).includes('dq:replay:0'), 'keyboard should carry dq:replay:<index>');
+  });
+
   it('quarantined entries persist beyond TTL for operator action', async () => {
     const veryOldTimestamp = new Date(Date.now() - DLQ_MAX_AGE_MS - 100000).toISOString();
     const oldQuarantinedEntry = makeEntry({ text: 'old quarantined', timestamp: veryOldTimestamp, updateId: 5, attempts: 5, quarantined: true });

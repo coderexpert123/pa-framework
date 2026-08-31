@@ -2,7 +2,7 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createTempPaHome, createTempSkill, cleanup } from './helpers.js';
 import { writeLog } from '../src/logger.js';
-import { getOverdueSkills, partitionOverdueByCostTier } from '../src/scheduler.js';
+import { getOverdueSkills, partitionOverdueByCostTier, buildLauncherVbs } from '../src/scheduler.js';
 import type { RunMeta } from '../src/types.js';
 
 let tempDir: string;
@@ -329,5 +329,36 @@ describe('partitionOverdueByCostTier', () => {
     const partition = await partitionOverdueByCostTier(overdue, peakHour);
     assert.equal(partition.runnable.length, 1, 'skill without cost_tier should default to anytime');
     assert.equal(partition.deferred.length, 0, 'should not be deferred');
+  });
+});
+
+describe('buildLauncherVbs', () => {
+  const paPathCmd = 'C:\\Program Files\\pa\\pa.cmd';
+  const args = 'catchup --topic default';
+
+  it('sets CurrentDirectory to the repo root, appearing before the Run line', () => {
+    const vbs = buildLauncherVbs(paPathCmd, args, 'D:\\Personal Assistant');
+    const currentDirLine = 'WshShell.CurrentDirectory = "D:\\Personal Assistant"';
+    assert.ok(vbs.includes(currentDirLine), 'must set CurrentDirectory to the repo root');
+
+    const currentDirIndex = vbs.indexOf(currentDirLine);
+    const runIndex = vbs.indexOf('WshShell.Run');
+    assert.ok(currentDirIndex >= 0, 'CurrentDirectory line must be present');
+    assert.ok(runIndex >= 0, 'Run line must be present');
+    assert.ok(currentDirIndex < runIndex, 'CurrentDirectory line must appear before the Run line');
+  });
+
+  it('doubles an embedded double-quote in repoRoot', () => {
+    const vbs = buildLauncherVbs(paPathCmd, args, 'D:\\Weird"Path');
+    assert.ok(
+      vbs.includes('WshShell.CurrentDirectory = "D:\\Weird""Path"'),
+      'embedded quote in repoRoot must be doubled per VBScript string-literal escaping'
+    );
+  });
+
+  it('the WshShell.Run line is byte-identical to the pre-fix format for the same paPathCmd/args (regression pin)', () => {
+    const vbs = buildLauncherVbs(paPathCmd, args, 'D:\\Personal Assistant');
+    const runLine = `WshShell.Run "cmd /c ""${paPathCmd}"" ${args}", 0, True\n`;
+    assert.ok(vbs.includes(runLine), 'Run line must not change shape when CurrentDirectory was added');
   });
 });

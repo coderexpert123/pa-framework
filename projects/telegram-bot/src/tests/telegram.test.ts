@@ -1,6 +1,15 @@
+// Guard against the same real-Telegram/real-log leak test-env-setup.ts fixes
+// for the preloaded suite path, but for a direct `node --test x.test.js` run
+// (no --import preload) of THIS file alone: sendTyping's failure path logs
+// { chatId: 123, threadId: 456 } via pa's logger (telegram.ts:545), whose
+// paHome() is resolved fresh on every call — an unset PA_HOME there writes
+// straight into the real ~/.pa/app.log.jsonl. Shared guard (2026-08-23,
+// D16/WP-D) replaces this file's former inlined ad-hoc copy.
+import './test-env-guard.js';
+
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { splitMessage, sanitizeMdV2, getUpdates, sendMessage, sendMessageWithId, pinChatMessage, unpinChatMessage, sendTyping, SEND_TYPING_TIMEOUT_MS } from '../telegram.js';
+import { splitMessage, sanitizeMdV2, getUpdates, sendMessage, sendMessageWithId, pinChatMessage, unpinChatMessage, sendTyping, editMessageText, SEND_TYPING_TIMEOUT_MS } from '../telegram.js';
 
 const MAX = 4000;
 
@@ -903,6 +912,59 @@ describe('sendMessage', () => {
     assert.ok(fallbackBody.text.includes('Ref: s-a1b2c3d4e5f6'), '12-hex ref ID preserved in fallback text');
     assert.ok(!fallbackBody.text.includes('_Ref:'), 'italic markers stripped in fallback');
   });
+
+  // -------------------------------------------------------------------------
+  // Reply-target-gone fallback (bp-replyfix): a reply whose target message
+  // was deleted (e.g. /auth's delete-then-reply flow) must not dead-letter.
+  // -------------------------------------------------------------------------
+
+  it('retries without reply_to_message_id when Telegram reports the reply target is gone', async () => {
+    const calls = setupFetchMock([
+      { ok: false, status: 400, bodyText: 'Bad Request: message to be replied not found' },
+      { ok: true, bodyJson: { ok: true } },
+    ]);
+    const result = await sendMessage('token', 123, 'hello', 99);
+    assert.equal(calls.length, 2, 'should retry after reply-target-gone failure');
+    const firstBody = JSON.parse(calls[0].init!.body as string);
+    const retryBody = JSON.parse(calls[1].init!.body as string);
+    assert.equal(firstBody.reply_to_message_id, 99, 'initial attempt still targets the reply');
+    assert.equal(retryBody.reply_to_message_id, undefined, 'retry must omit reply_to_message_id');
+    assert.equal(retryBody.text, 'hello', 'retry keeps the original text');
+    assert.equal(retryBody.parse_mode, 'MarkdownV2', 'retry does not touch parse_mode (unrelated cause)');
+    assert.equal(result, true, 'reports success once the retry lands');
+  });
+
+  it('does not retry on an unrelated 400 even when a reply target was set', async () => {
+    const calls = setupFetchMock([
+      { ok: false, status: 400, bodyText: 'Bad Request: chat not found' },
+    ]);
+    const result = await sendMessage('token', 123, 'hello', 99);
+    assert.equal(calls.length, 1, 'no retry for an unrelated error');
+    assert.equal(result, false, 'reports failure exactly as before this fix');
+  });
+
+  it('terminates after one retry per cause when parse and reply-target errors both occur, without looping', async () => {
+    const calls = setupFetchMock([
+      { ok: false, status: 400, bodyText: "can't parse entities" },
+      { ok: false, status: 400, bodyText: 'Bad Request: message to be replied not found' },
+      { ok: false, status: 400, bodyText: 'Bad Request: message to be replied not found' },
+    ]);
+    const result = await sendMessage('token', 123, 'hello *world', 99);
+    assert.equal(calls.length, 3, 'exactly 2 corrective retries — one per cause — then it stops');
+    const finalBody = JSON.parse(calls[2].init!.body as string);
+    assert.equal(finalBody.parse_mode, undefined, 'final body has no parse_mode');
+    assert.equal(finalBody.reply_to_message_id, undefined, 'final body has no reply_to_message_id');
+    assert.equal(result, false, 'still-failing final attempt reports failure, not a false success');
+  });
+
+  it('a successful first send still passes reply_to_message_id (no unconditional stripping)', async () => {
+    const calls = setupFetchMock([{ ok: true, bodyJson: { ok: true } }]);
+    const result = await sendMessage('token', 123, 'hello', 99);
+    assert.equal(calls.length, 1);
+    const body = JSON.parse(calls[0].init!.body as string);
+    assert.equal(body.reply_to_message_id, 99);
+    assert.equal(result, true);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1075,6 +1137,94 @@ describe('unpinChatMessage', () => {
   it('does not throw on API failure', async () => {
     setupFetchMock([{ ok: false, bodyText: 'Bad Request' }]);
     await assert.doesNotReject(() => unpinChatMessage('token', 123, 456));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// editMessageText — fetch mocked
+// ---------------------------------------------------------------------------
+
+describe('editMessageText', () => {
+  it('calls editMessageText endpoint with chat_id, message_id, and text', async () => {
+    const calls = setupFetchMock([{ ok: true, bodyJson: { ok: true, result: true } }]);
+    const result = await editMessageText('token', 123, 456, 'hello');
+    assert.ok(calls[0].url.includes('/editMessageText'));
+    const body = JSON.parse(calls[0].init!.body as string);
+    assert.equal(body.chat_id, 123);
+    assert.equal(body.message_id, 456);
+    assert.equal(body.text, 'hello');
+    assert.equal(result, true);
+  });
+
+  it('includes parse_mode MarkdownV2 by default', async () => {
+    const calls = setupFetchMock([{ ok: true, bodyJson: { ok: true, result: true } }]);
+    await editMessageText('token', 123, 456, 'hello');
+    const body = JSON.parse(calls[0].init!.body as string);
+    assert.equal(body.parse_mode, 'MarkdownV2');
+  });
+
+  it('sanitizes text with sanitizeMdV2 when rawMarkdown is not set', async () => {
+    const calls = setupFetchMock([{ ok: true, bodyJson: { ok: true, result: true } }]);
+    await editMessageText('token', 123, 456, 'hello (world)');
+    const body = JSON.parse(calls[0].init!.body as string);
+    assert.equal(body.text, 'hello \\(world\\)', 'parens must be escaped');
+  });
+
+  it('with rawMarkdown=true, passes text un-sanitized to the request body', async () => {
+    const calls = setupFetchMock([{ ok: true, bodyJson: { ok: true, result: true } }]);
+    // Text with special chars that would normally be escaped
+    const text = '*bold* _italic_ (parens) `code`';
+    await editMessageText('token', 123, 456, text, undefined, { rawMarkdown: true });
+    const body = JSON.parse(calls[0].init!.body as string);
+    assert.equal(body.text, text, 'text must pass through unchanged');
+  });
+
+  it('with rawMarkdown=true, still uses parse_mode MarkdownV2', async () => {
+    const calls = setupFetchMock([{ ok: true, bodyJson: { ok: true, result: true } }]);
+    await editMessageText('token', 123, 456, 'test', undefined, { rawMarkdown: true });
+    const body = JSON.parse(calls[0].init!.body as string);
+    assert.equal(body.parse_mode, 'MarkdownV2');
+  });
+
+  it('with rawMarkdown=false or undefined, sanitizes as before', async () => {
+    const calls = setupFetchMock([{ ok: true, bodyJson: { ok: true, result: true } }]);
+    await editMessageText('token', 123, 456, 'test (value)', undefined, { rawMarkdown: false });
+    const body = JSON.parse(calls[0].init!.body as string);
+    assert.equal(body.text, 'test \\(value\\)', 'must be sanitized');
+  });
+
+  it('includes reply_markup in body when provided', async () => {
+    const keyboard = { inline_keyboard: [[{ text: 'Button', callback_data: 'btn' }]] };
+    const calls = setupFetchMock([{ ok: true, bodyJson: { ok: true, result: true } }]);
+    await editMessageText('token', 123, 456, 'hello', keyboard);
+    const body = JSON.parse(calls[0].init!.body as string);
+    assert.deepEqual(body.reply_markup, keyboard);
+  });
+
+  it('omits reply_markup when undefined (strips keyboard)', async () => {
+    const calls = setupFetchMock([{ ok: true, bodyJson: { ok: true, result: true } }]);
+    await editMessageText('token', 123, 456, 'hello', undefined);
+    const body = JSON.parse(calls[0].init!.body as string);
+    assert.equal(body.reply_markup, undefined);
+  });
+
+  it('returns false when API returns ok: false', async () => {
+    setupFetchMock([{ ok: true, bodyJson: { ok: false, description: 'Bad request' } }]);
+    const result = await editMessageText('token', 123, 456, 'hello');
+    assert.equal(result, false);
+  });
+
+  it('returns false on HTTP error', async () => {
+    setupFetchMock([{ ok: false, status: 400, bodyText: 'Bad Request' }]);
+    const result = await editMessageText('token', 123, 456, 'hello');
+    assert.equal(result, false);
+  });
+
+  it('trims whitespace from text before processing', async () => {
+    const calls = setupFetchMock([{ ok: true, bodyJson: { ok: true, result: true } }]);
+    await editMessageText('token', 123, 456, '  hello  ');
+    const body = JSON.parse(calls[0].init!.body as string);
+    assert.equal(body.text, 'hello', 'whitespace must be trimmed');
   });
 });
 

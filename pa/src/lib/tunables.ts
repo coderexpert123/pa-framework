@@ -18,7 +18,7 @@
  *   4. cli     — nothing is passed at all; the CLI applies its own default
  *
  * TUNABLES ARE WORKER-SCOPED, NOT TOPIC-SCOPED-FLAT. "effort=high" is
- * meaningless the moment the user runs /model gemini, because gemini declares
+ * meaningless the moment the user runs /model gemini-3.7-flash, because gemini-3.7-flash declares
  * no effort flag. State is therefore keyed worker -> setting -> value
  * (TunableStore), and resolution only ever walks the settings the CURRENT
  * worker declares — so switching worker can never carry another worker's knobs

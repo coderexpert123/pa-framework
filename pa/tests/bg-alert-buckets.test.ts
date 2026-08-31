@@ -1,3 +1,5 @@
+import './test-env-guard.js';
+
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { collectBgAlerts } from '../src/workers.js';

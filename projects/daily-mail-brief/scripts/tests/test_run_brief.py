@@ -1,6 +1,7 @@
-"""Unit tests for run_brief.py: call_gemini error formatting and state-advancement logic."""
+"""Unit tests for run_brief.py: call_llm error formatting and state-advancement logic."""
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -33,57 +34,149 @@ class RunBriefTestCase(unittest.TestCase):
     def state_path(self):
         return os.path.join(self.pa_home, "daily-mail-brief-state.json")
 
+class TestBuildAgyCommand(unittest.TestCase):
+    """build_agy_command is a PURE command builder — unit-testable without a
+    subprocess (2026-08-23, WP-F step 2b)."""
 
-class TestCallGeminiErrorFormat(unittest.TestCase):
-    """call_gemini must surface both stderr and stdout on non-zero exit."""
+    def setUp(self):
+        self._orig_cmd = run_brief.AGY_CMD
+        self._orig_model = run_brief.AGY_MODEL
+        self._orig_timeout = run_brief.AGY_PRINT_TIMEOUT
 
-    def _make_result(self, returncode, stderr, stdout):
-        return SimpleNamespace(returncode=returncode, stderr=stderr, stdout=stdout)
+    def tearDown(self):
+        run_brief.AGY_CMD = self._orig_cmd
+        run_brief.AGY_MODEL = self._orig_model
+        run_brief.AGY_PRINT_TIMEOUT = self._orig_timeout
+
+    def test_flag_pairs_in_order_and_prompt_is_at_file_reference(self):
+        run_brief.AGY_CMD = "D:/gemini-shim/agy.cmd"
+        run_brief.AGY_MODEL = "gemini-3.7-flash-high"
+        run_brief.AGY_PRINT_TIMEOUT = "10m"
+        cmd = run_brief.build_agy_command("C:/wt/tmp/pa-prompt-abc123.txt")
+        self.assertEqual(cmd, [
+            "cmd", "/c", "D:/gemini-shim/agy.cmd",
+            "--dangerously-skip-permissions",
+            "--model", "gemini-3.7-flash-high",
+            "--print-timeout", "10m",
+            "--output-format", "text",
+            "-p", "@C:/wt/tmp/pa-prompt-abc123.txt",
+        ])
+
+    def test_prompt_is_never_inlined(self):
+        """The prompt text itself must never appear as its own argv element —
+        only the @-file reference (worker-exec.ts:231 precedent, correction 28
+        of plans/2026-08-23-alerts-wave-SPEC.md)."""
+        cmd = run_brief.build_agy_command("some/prompt/path.txt")
+        self.assertEqual(cmd[-1], "@some/prompt/path.txt")
+        self.assertTrue(cmd[-1].startswith("@"))
+
+    def test_model_and_timeout_come_from_module_globals(self):
+        """AGY_MODEL/AGY_PRINT_TIMEOUT are populated from DAILY_MAIL_BRIEF_MODEL/
+        DAILY_MAIL_BRIEF_PRINT_TIMEOUT at import time (see TestProviderIdentifiers
+        AreEnvDriven for the same pattern used elsewhere in this file) — verified
+        here via the module globals build_agy_command actually reads."""
+        run_brief.AGY_MODEL = "custom-model"
+        run_brief.AGY_PRINT_TIMEOUT = "5m"
+        cmd = run_brief.build_agy_command("p.txt")
+        self.assertIn("custom-model", cmd)
+        self.assertIn("5m", cmd)
+
+
+class TestDurationToSeconds(unittest.TestCase):
+    """_duration_to_seconds parses the --print-timeout duration syntax ('10m')
+    so the Python-level subprocess bound can be sized from it."""
+
+    def test_parses_s_m_h_and_bare_numbers(self):
+        self.assertEqual(run_brief._duration_to_seconds("45s", 1), 45)
+        self.assertEqual(run_brief._duration_to_seconds("10m", 1), 600)
+        self.assertEqual(run_brief._duration_to_seconds("1h", 1), 3600)
+        self.assertEqual(run_brief._duration_to_seconds("90", 1), 90)
+        self.assertEqual(run_brief._duration_to_seconds("2.5m", 1), 150)
+
+    def test_whitespace_and_case_tolerated(self):
+        self.assertEqual(run_brief._duration_to_seconds(" 10M ", 1), 600)
+
+    def test_unparseable_or_empty_falls_back(self):
+        for bad in ("", "abc", "10x", "-5m", None):
+            self.assertEqual(run_brief._duration_to_seconds(bad, 600), 600)
+
+
+class TestCallLlmBoundedTimeout(unittest.TestCase):
+    """The agy subprocess inside call_llm must be bounded at the Python level.
+
+    --print-timeout is only advisory to the CLI: a call that hangs at
+    auth/network before the print wait, or a CLI that overruns its own bound,
+    would otherwise block run_brief forever — the run goes dark with no
+    failure marker, no alert, and no retry. The bound is the 'bounded
+    timeouts' half of the agy-routing fix for the recurring auth-failure /
+    timeout evidence (2026-08-21..24)."""
 
     @patch("run_brief.subprocess.run")
-    def test_stderr_only_when_stdout_empty(self, mock_run):
-        mock_run.return_value = self._make_result(1, "some error", "")
+    def test_subprocess_call_receives_bounded_timeout(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout="ok")
+        run_brief.call_llm("ping")
+        kwargs = mock_run.call_args.kwargs
+        self.assertIn("timeout", kwargs, "subprocess.run must be given a timeout")
+        self.assertGreater(kwargs["timeout"], 0)
+
+    @patch("run_brief.subprocess.run")
+    def test_bound_is_looser_than_cli_own_print_timeout(self, mock_run):
+        """The Python bound must exceed the CLI's own --print-timeout by a
+        comfortable margin so agy's internal timeout normally fires first and
+        its diagnostic stderr (auth text, quota text) reaches the retry loop
+        instead of being cut off mid-flight by the outer bound."""
+        mock_run.return_value = MagicMock(returncode=0, stdout="ok")
+        run_brief.call_llm("ping")
+        timeout = mock_run.call_args.kwargs["timeout"]
+        print_timeout_s = run_brief._duration_to_seconds(run_brief.AGY_PRINT_TIMEOUT, 600.0)
+        self.assertGreaterEqual(timeout, print_timeout_s + 60)
+
+    @patch(
+        "run_brief.subprocess.run",
+        side_effect=subprocess.TimeoutExpired(cmd=["cmd", "/c", "agy"], timeout=720),
+    )
+    def test_timeout_surfaces_as_transient_runtime_error(self, mock_run):
+        """TimeoutExpired must become a RuntimeError the retry loop already
+        knows how to handle — transient (retried once), never auth-classified
+        (an auth fail-fast on a timeout would strand a healthy credential)."""
         with self.assertRaises(RuntimeError) as ctx:
-            run_brief.call_gemini("prompt")
+            run_brief.call_llm("ping")
         msg = str(ctx.exception)
-        self.assertIn("some error", msg)
-        self.assertNotIn("stdout:", msg)
-
-    @patch("run_brief.subprocess.run")
-    def test_stderr_and_stdout_when_stdout_nonempty(self, mock_run):
-        mock_run.return_value = self._make_result(1, "startup noise", "actual api error")
-        with self.assertRaises(RuntimeError) as ctx:
-            run_brief.call_gemini("prompt")
-        msg = str(ctx.exception)
-        self.assertIn("startup noise", msg)
-        self.assertIn("stdout:", msg)
-        self.assertIn("actual api error", msg)
-
-    @patch("run_brief.subprocess.run")
-    def test_whitespace_only_stdout_not_included(self, mock_run):
-        mock_run.return_value = self._make_result(1, "err", "   \n  ")
-        with self.assertRaises(RuntimeError) as ctx:
-            run_brief.call_gemini("prompt")
-        self.assertNotIn("stdout:", str(ctx.exception))
-
-    @patch("run_brief.subprocess.run")
-    def test_success_returns_stripped_output(self, mock_run):
-        mock_run.return_value = self._make_result(0, "", "  hello world  ")
-        result = run_brief.call_gemini("prompt")
-        self.assertEqual(result, "hello world")
-
-    @patch("run_brief.subprocess.run")
-    def test_noise_marker_stripped(self, mock_run):
-        mock_run.return_value = self._make_result(
-            0, "", "real output\nCreated execution plan for SessionEnd: foo"
+        self.assertIn("timed out", msg)
+        self.assertFalse(
+            run_brief.is_llm_auth_failure(msg),
+            "a timeout must stay transient, not fail fast as llm-auth",
         )
-        result = run_brief.call_gemini("prompt")
-        self.assertEqual(result, "real output")
+
+    @patch(
+        "run_brief.subprocess.run",
+        side_effect=subprocess.TimeoutExpired(cmd=["cmd", "/c", "agy"], timeout=720),
+    )
+    def test_temp_prompt_file_removed_on_timeout(self, mock_run):
+        """The @-file temp prompt must still be cleaned up when the subprocess
+        times out (the finally block covers the raise path)."""
+        created = {}
+        real_ntf = run_brief.tempfile.NamedTemporaryFile
+
+        def tracking_ntf(*args, **kwargs):
+            f = real_ntf(*args, **kwargs)
+            created["path"] = f.name
+            return f
+
+        with patch("run_brief.tempfile.NamedTemporaryFile", side_effect=tracking_ntf):
+            with self.assertRaises(RuntimeError):
+                run_brief.call_llm("ping")
+
+        self.assertIn("path", created, "prompt temp file was created")
+        self.assertFalse(
+            os.path.exists(created["path"]),
+            "prompt temp file must be removed when the agy call times out",
+        )
 
 
-# The exact stderr the Gemini CLI emitted on every scheduled run 2026-08-19..21
-# (license invalidated): non-transient, yet the retry loop burned both attempts
-# on every run and alerted as if a catchup retry could fix it.
+# The exact stderr agy emitted on a license-invalidation run 2026-08-19..21:
+# non-transient, yet the retry loop burned both attempts on every run and alerted
+# as if a catchup retry could fix it.
 RECORDED_GEMINI_AUTH_ERROR = (
     "Gemini exited 1: Warning: 256-color support not detected. Using a terminal "
     "with at least 256-color support is recommended for a better visual experience.\n"
@@ -93,18 +186,19 @@ RECORDED_GEMINI_AUTH_ERROR = (
 )
 
 
-class TestIsGeminiAuthFailure(unittest.TestCase):
-    """Auth/license failures must be recognizable so the retry loop can fail fast."""
+class TestIsLlmAuthFailure(unittest.TestCase):
+    """Auth/license/quota failures must be recognizable so the retry loop can
+    fail fast for the LLM CLI (agy)."""
 
     def test_recorded_license_error_detected(self):
-        self.assertTrue(run_brief.is_gemini_auth_failure(RECORDED_GEMINI_AUTH_ERROR))
+        self.assertTrue(run_brief.is_llm_auth_failure(RECORDED_GEMINI_AUTH_ERROR))
 
     def test_oauth_rejections_detected(self):
         for text in (
             "Gemini exited 1: Error authenticating: _GaxiosError: invalid_grant",
             "Gemini exited 1: UNAUTHENTICATED: Request had invalid credentials",
         ):
-            self.assertTrue(run_brief.is_gemini_auth_failure(text), text)
+            self.assertTrue(run_brief.is_llm_auth_failure(text), text)
 
     def test_transient_errors_not_classified_auth(self):
         for text in (
@@ -112,17 +206,38 @@ class TestIsGeminiAuthFailure(unittest.TestCase):
             "Gemini exited 1: quota exceeded, retry later",
             "Gemini exited 1: internal server error",
         ):
-            self.assertFalse(run_brief.is_gemini_auth_failure(text), text)
+            self.assertFalse(run_brief.is_llm_auth_failure(text), text)
 
-    def test_dedup_key_for_gemini_auth_status(self):
+    def test_dedup_key_for_llm_auth_status(self):
         self.assertEqual(
             run_brief._dedup_key_for_status("gemini-auth"), "daily-mail-brief-gemini-auth"
         )
 
+    # 2026-08-23 (WP-F step 5): the four cases the spec pins explicitly for the
+    # renamed is_llm_auth_failure, including agy's own quota signature.
+    def test_valid_license_phrase_detected(self):
+        self.assertTrue(
+            run_brief.is_llm_auth_failure("You do not have a valid license of this product.")
+        )
 
-class TestGeminiAuthFailureFailsFast(RunBriefTestCase):
+    def test_invalid_grant_detected(self):
+        self.assertTrue(run_brief.is_llm_auth_failure("OAuth error: invalid_grant"))
+
+    def test_agy_quota_signature_detected_case_insensitively(self):
+        for text in (
+            "Individual quota reached",
+            "individual quota reached — try again later",
+            "INDIVIDUAL QUOTA REACHED",
+        ):
+            self.assertTrue(run_brief.is_llm_auth_failure(text), text)
+
+    def test_generic_rate_limit_not_classified_auth(self):
+        self.assertFalse(run_brief.is_llm_auth_failure("429 Too Many Requests"))
+
+
+class TestLlmAuthFailureFailsFast(RunBriefTestCase):
     """A non-transient auth/license failure must skip the pointless second
-    attempt, write a distinct 'gemini-auth' marker, and alert with actionable
+    attempt, write a distinct 'llm-auth' marker, and alert with actionable
     guidance instead of 'next catchup will retry'."""
 
     def _make_fetch_data(self, listed=2):
@@ -151,17 +266,17 @@ class TestGeminiAuthFailureFailsFast(RunBriefTestCase):
     @patch("run_brief._notify_failure")
     @patch("run_brief.load_portfolio_context", return_value="")
     @patch("run_brief.run_py")
-    @patch("run_brief.call_gemini")
-    def test_no_second_attempt_and_no_sleep(self, mock_gemini, mock_run_py, _portfolio, _notify):
+    @patch("run_brief.call_llm")
+    def test_no_second_attempt_and_no_sleep(self, mock_llm, mock_run_py, _portfolio, _notify):
         mock_run_py.side_effect = self._patch_run_py(self._make_fetch_data())
-        mock_gemini.side_effect = RuntimeError(RECORDED_GEMINI_AUTH_ERROR)
+        mock_llm.side_effect = RuntimeError(RECORDED_GEMINI_AUTH_ERROR)
 
         with patch("run_brief.time.sleep") as mock_sleep:
             with self.assertRaises(SystemExit):
                 run_brief.main()
 
         self.assertEqual(
-            mock_gemini.call_count, 1,
+            mock_llm.call_count, 1,
             "Auth/license failure is non-transient — must not be retried",
         )
         mock_sleep.assert_not_called()
@@ -169,10 +284,10 @@ class TestGeminiAuthFailureFailsFast(RunBriefTestCase):
     @patch("run_brief._notify_failure")
     @patch("run_brief.load_portfolio_context", return_value="")
     @patch("run_brief.run_py")
-    @patch("run_brief.call_gemini")
-    def test_gemini_auth_marker_written(self, mock_gemini, mock_run_py, _portfolio, _notify):
+    @patch("run_brief.call_llm")
+    def test_llm_auth_marker_written(self, mock_llm, mock_run_py, _portfolio, _notify):
         mock_run_py.side_effect = self._patch_run_py(self._make_fetch_data())
-        mock_gemini.side_effect = RuntimeError(RECORDED_GEMINI_AUTH_ERROR)
+        mock_llm.side_effect = RuntimeError(RECORDED_GEMINI_AUTH_ERROR)
 
         with patch("run_brief.time.sleep"):
             with self.assertRaises(SystemExit):
@@ -182,28 +297,28 @@ class TestGeminiAuthFailureFailsFast(RunBriefTestCase):
         self.assertTrue(os.path.exists(marker_path), "Failure marker must be written")
         with open(marker_path, encoding="utf-8") as f:
             content = json.load(f)
-        self.assertEqual(content.get("status"), "gemini-auth")
+        self.assertEqual(content.get("status"), "llm-auth")
         self.assertIn("valid license", content.get("reason", ""))
 
     @patch("run_brief._notify_failure")
     @patch("run_brief.load_portfolio_context", return_value="")
     @patch("run_brief.run_py")
-    @patch("run_brief.call_gemini")
+    @patch("run_brief.call_llm")
     def test_notify_body_is_actionable_not_retry_promise(
-        self, mock_gemini, mock_run_py, _portfolio, mock_notify
+        self, mock_llm, mock_run_py, _portfolio, mock_notify
     ):
         mock_run_py.side_effect = self._patch_run_py(self._make_fetch_data())
-        mock_gemini.side_effect = RuntimeError(RECORDED_GEMINI_AUTH_ERROR)
+        mock_llm.side_effect = RuntimeError(RECORDED_GEMINI_AUTH_ERROR)
 
         with patch("run_brief.time.sleep"):
             with self.assertRaises(SystemExit):
                 run_brief.main()
 
         mock_notify.assert_called_once()
-        self.assertEqual(mock_notify.call_args.args[0], "gemini-auth")
+        self.assertEqual(mock_notify.call_args.args[0], "llm-auth")
         body = mock_notify.call_args.args[1]
         self.assertIn("not transient", body)
-        self.assertIn("GEMINI_CMD", body)
+        self.assertIn("AGY_CMD", body)
         self.assertNotIn(
             "next catchup will retry", body,
             "Auth failure alert must not promise a retry that cannot succeed",
@@ -212,26 +327,26 @@ class TestGeminiAuthFailureFailsFast(RunBriefTestCase):
     @patch("run_brief._notify_failure")
     @patch("run_brief.load_portfolio_context", return_value="")
     @patch("run_brief.run_py")
-    @patch("run_brief.call_gemini")
+    @patch("run_brief.call_llm")
     def test_transient_failure_still_retries_twice(
-        self, mock_gemini, mock_run_py, _portfolio, mock_notify
+        self, mock_llm, mock_run_py, _portfolio, mock_notify
     ):
         """The fail-fast path must not eat the existing transient retry: generic
-        errors still get both attempts and the plain 'gemini' status."""
+        errors still get both attempts and the plain 'llm' status."""
         mock_run_py.side_effect = self._patch_run_py(self._make_fetch_data())
-        mock_gemini.side_effect = RuntimeError("Gemini exited 1: Connection reset by peer")
+        mock_llm.side_effect = RuntimeError("Gemini exited 1: Connection reset by peer")
 
         with patch("run_brief.time.sleep"):
             with self.assertRaises(SystemExit):
                 run_brief.main()
 
-        self.assertEqual(mock_gemini.call_count, 2, "Transient failures keep the retry")
+        self.assertEqual(mock_llm.call_count, 2, "Transient failures keep the retry")
         mock_notify.assert_called_once()
-        self.assertEqual(mock_notify.call_args.args[0], "gemini")
+        self.assertEqual(mock_notify.call_args.args[0], "llm")
 
 
 class TestStateAdvancementLogic(RunBriefTestCase):
-    """State must be written only after Gemini succeeds, not at fetch time."""
+    """State must be written only after the LLM call succeeds, not at fetch time."""
 
     def _make_fetch_data(self, window_end_utc="2026-05-17T13:30:00+00:00", listed=2):
         return {
@@ -246,8 +361,8 @@ class TestStateAdvancementLogic(RunBriefTestCase):
             ],
         }
 
-    def _patch_run_py(self, fetch_data, gemini_side_effect=None, gemini_return="ok"):
-        """Helper: patch run_py to return fake fetch output; patch call_gemini."""
+    def _patch_run_py(self, fetch_data, llm_side_effect=None, llm_return="ok"):
+        """Helper: patch run_py to return fake fetch output; patch call_llm."""
         fetch_result = MagicMock()
         fetch_result.returncode = 0
         fetch_result.stdout = json.dumps(fetch_data)
@@ -266,12 +381,12 @@ class TestStateAdvancementLogic(RunBriefTestCase):
 
     @patch("run_brief.load_portfolio_context", return_value="")
     @patch("run_brief.run_py")
-    @patch("run_brief.call_gemini")
-    def test_state_written_after_gemini_success(self, mock_gemini, mock_run_py, _mock_portfolio_context):
-        """When Gemini succeeds, PA_HOME state gets window_end_utc from fetch output."""
+    @patch("run_brief.call_llm")
+    def test_state_written_after_llm_success(self, mock_llm, mock_run_py, _mock_portfolio_context):
+        """When the LLM call succeeds, PA_HOME state gets window_end_utc from fetch output."""
         fetch_data = self._make_fetch_data()
         mock_run_py.side_effect = self._patch_run_py(fetch_data)
-        mock_gemini.return_value = (
+        mock_llm.return_value = (
             "===BRIEFING_START===\n[pa assert] emails.json listed=2\n\nbrief\n===BRIEFING_END===\n"
             "===ANALYSIS_START===\nanalysis\n===ANALYSIS_END==="
         )
@@ -286,7 +401,7 @@ class TestStateAdvancementLogic(RunBriefTestCase):
             pass
 
         state_path = self.state_path()
-        self.assertTrue(os.path.exists(state_path), "State must be written after Gemini success")
+        self.assertTrue(os.path.exists(state_path), "State must be written after LLM success")
         with open(state_path, encoding="utf-8") as f:
             state = json.load(f)
         self.assertEqual(state["last_window_end_utc"], "2026-05-17T13:30:00+00:00")
@@ -294,12 +409,12 @@ class TestStateAdvancementLogic(RunBriefTestCase):
     @patch("run_brief._notify_failure")
     @patch("run_brief.load_portfolio_context", return_value="")
     @patch("run_brief.run_py")
-    @patch("run_brief.call_gemini")
-    def test_state_not_written_when_gemini_fails(self, mock_gemini, mock_run_py, _mock_portfolio_context, _mock_notify):
-        """When Gemini fails both attempts, state must NOT be written."""
+    @patch("run_brief.call_llm")
+    def test_state_not_written_when_llm_fails(self, mock_llm, mock_run_py, _mock_portfolio_context, _mock_notify):
+        """When the LLM call fails both attempts, state must NOT be written."""
         fetch_data = self._make_fetch_data()
         mock_run_py.side_effect = self._patch_run_py(fetch_data)
-        mock_gemini.side_effect = RuntimeError("Gemini exited 1: auth error")
+        mock_llm.side_effect = RuntimeError("agy exited 1: auth error")
 
         with patch("run_brief.time.sleep"):
             try:
@@ -307,17 +422,17 @@ class TestStateAdvancementLogic(RunBriefTestCase):
             except SystemExit:
                 pass
 
-        self.assertFalse(os.path.exists(self.state_path()), "State must NOT be written when Gemini fails")
+        self.assertFalse(os.path.exists(self.state_path()), "State must NOT be written when LLM fails")
 
     @patch("run_brief._notify_failure")
     @patch("run_brief.load_portfolio_context", return_value="")
     @patch("run_brief.run_py")
-    @patch("run_brief.call_gemini")
-    def test_fetch_failed_written_on_gemini_failure(self, mock_gemini, mock_run_py, _mock_portfolio_context, _mock_notify):
-        """On Gemini failure, the PA_HOME failure marker must be written."""
+    @patch("run_brief.call_llm")
+    def test_fetch_failed_written_on_llm_failure(self, mock_llm, mock_run_py, _mock_portfolio_context, _mock_notify):
+        """On LLM failure, the PA_HOME failure marker must be written."""
         fetch_data = self._make_fetch_data()
         mock_run_py.side_effect = self._patch_run_py(fetch_data)
-        mock_gemini.side_effect = RuntimeError("Gemini exited 1: auth error")
+        mock_llm.side_effect = RuntimeError("agy exited 1: auth error")
 
         fetch_failed_path = os.path.join(self.pa_home, "daily-mail-brief-fetch-failed.json")
         content = None
@@ -331,30 +446,29 @@ class TestStateAdvancementLogic(RunBriefTestCase):
         if exists:
             with open(fetch_failed_path, encoding="utf-8") as f:
                 content = json.load(f)
-        self.assertTrue(exists, "Failure marker must be written on Gemini failure")
+        self.assertTrue(exists, "Failure marker must be written on LLM failure")
         self.assertIsNotNone(content, "Failure marker must be valid JSON")
-        self.assertEqual(content.get("status"), "gemini")
+        self.assertEqual(content.get("status"), "llm")
 
     def test_dedup_key_for_status(self):
         """Dedup keys stay lockstep with fetch_headers.py so an 'auth' failure
         collapses across both callers instead of double-notifying."""
         self.assertEqual(run_brief._dedup_key_for_status("auth"), "daily-mail-brief-auth")
-        self.assertEqual(run_brief._dedup_key_for_status("gemini"), "daily-mail-brief-gemini")
 
     @patch("run_brief._notify_failure")
     @patch("run_brief.load_portfolio_context", return_value="")
     @patch("run_brief.run_py")
-    @patch("run_brief.call_gemini")
-    def test_gemini_failure_notifies_and_skips_briefings_send(
-        self, mock_gemini, mock_run_py, _mock_portfolio_context, mock_notify
+    @patch("run_brief.call_llm")
+    def test_llm_failure_notifies_and_skips_briefings_send(
+        self, mock_llm, mock_run_py, _mock_portfolio_context, mock_notify
     ):
-        """A Gemini failure must alert via the deduped notify path with status
-        'gemini' and must NOT send_telegram.py into the user-facing briefings
+        """An LLM failure must alert via the deduped notify path with status
+        'llm' and must NOT send_telegram.py into the user-facing briefings
         topic — the unthrottled direct send flooded thread 29 with 26 identical
         failure notices during one overnight auth blip (2026-07-12)."""
         fetch_data = self._make_fetch_data()
         mock_run_py.side_effect = self._patch_run_py(fetch_data)
-        mock_gemini.side_effect = RuntimeError("Gemini exited 42: auth cancelled")
+        mock_llm.side_effect = RuntimeError("agy exited 42: auth cancelled")
 
         with patch("run_brief.time.sleep"):
             try:
@@ -363,23 +477,23 @@ class TestStateAdvancementLogic(RunBriefTestCase):
                 pass
 
         mock_notify.assert_called_once()
-        self.assertEqual(mock_notify.call_args.args[0], "gemini")
+        self.assertEqual(mock_notify.call_args.args[0], "llm")
         send_calls = [c for c in mock_run_py.call_args_list
                       if c.args and "send_telegram" in str(c.args[0])]
-        self.assertEqual(send_calls, [], "Gemini-failure path must not send_telegram.py to the briefings topic")
+        self.assertEqual(send_calls, [], "LLM-failure path must not send_telegram.py to the briefings topic")
 
     @patch("run_brief.load_portfolio_context", return_value="")
     @patch("run_brief.detect_portfolio_statement_emails", return_value=[])
     @patch("run_brief.run_py")
-    @patch("run_brief.call_gemini")
-    def test_retry_succeeds_on_second_attempt(self, mock_gemini, mock_run_py, _mock_detect, _mock_portfolio_context):
-        """State is advanced when first Gemini attempt fails but second succeeds."""
+    @patch("run_brief.call_llm")
+    def test_retry_succeeds_on_second_attempt(self, mock_llm, mock_run_py, _mock_detect, _mock_portfolio_context):
+        """State is advanced when first LLM attempt fails but second succeeds."""
         fetch_data = self._make_fetch_data()
         mock_run_py.side_effect = self._patch_run_py(fetch_data)
 
         call_count = {"n": 0}
 
-        def gemini_fail_then_succeed(prompt):
+        def llm_fail_then_succeed(prompt):
             call_count["n"] += 1
             if call_count["n"] == 1:
                 raise RuntimeError("transient error")
@@ -388,7 +502,7 @@ class TestStateAdvancementLogic(RunBriefTestCase):
                 "===ANALYSIS_START===\nanalysis\n===ANALYSIS_END==="
             )
 
-        mock_gemini.side_effect = gemini_fail_then_succeed
+        mock_llm.side_effect = llm_fail_then_succeed
 
         emails_path = os.path.join(self.project_root, "emails.json")
         with open(emails_path, "w", encoding="utf-8") as f:
@@ -400,15 +514,15 @@ class TestStateAdvancementLogic(RunBriefTestCase):
             except SystemExit:
                 pass
 
-        self.assertEqual(call_count["n"], 2, "Gemini must be called exactly twice for brief retry")
+        self.assertEqual(call_count["n"], 2, "LLM must be called exactly twice for brief retry")
         self.assertTrue(os.path.exists(self.state_path()), "State must exist after retry success")
 
     @patch("run_brief.load_portfolio_context", return_value="")
     @patch("run_brief.detect_portfolio_statement_emails", return_value=[])
     @patch("run_brief.run_py")
-    @patch("run_brief.call_gemini")
+    @patch("run_brief.call_llm")
     def test_retry_uses_stricter_marker_prompt_after_unmarked_response(
-        self, mock_gemini, mock_run_py, _mock_detect, _mock_portfolio_context
+        self, mock_llm, mock_run_py, _mock_detect, _mock_portfolio_context
     ):
         """Retry must explicitly require both marker pairs even when a section is empty."""
         fetch_data = self._make_fetch_data()
@@ -416,7 +530,7 @@ class TestStateAdvancementLogic(RunBriefTestCase):
 
         prompts = []
 
-        def gemini_requires_retry_instruction(prompt):
+        def llm_requires_retry_instruction(prompt):
             prompts.append(prompt)
             if len(prompts) == 1:
                 return "Here is the summary without markers."
@@ -427,7 +541,7 @@ class TestStateAdvancementLogic(RunBriefTestCase):
                 )
             return "Still no markers."
 
-        mock_gemini.side_effect = gemini_requires_retry_instruction
+        mock_llm.side_effect = llm_requires_retry_instruction
 
         emails_path = os.path.join(self.project_root, "emails.json")
         with open(emails_path, "w", encoding="utf-8") as f:
@@ -439,17 +553,17 @@ class TestStateAdvancementLogic(RunBriefTestCase):
             except SystemExit:
                 pass
 
-        self.assertEqual(len(prompts), 2, "Gemini must be called twice after an unmarked response")
+        self.assertEqual(len(prompts), 2, "LLM must be called twice after an unmarked response")
         self.assertIn("even if one or both sections are empty", prompts[1])
         self.assertTrue(os.path.exists(self.state_path()), "State must exist after marker-enforced retry success")
 
     @patch("run_brief.load_portfolio_context", return_value="")
     @patch("run_brief.run_py")
-    @patch("run_brief.call_gemini")
-    def test_state_not_written_when_telegram_send_fails(self, mock_gemini, mock_run_py, _mock_portfolio_context):
+    @patch("run_brief.call_llm")
+    def test_state_not_written_when_telegram_send_fails(self, mock_llm, mock_run_py, _mock_portfolio_context):
         """Primary delivery failure must not advance state."""
         fetch_data = self._make_fetch_data()
-        mock_gemini.return_value = (
+        mock_llm.return_value = (
             "===BRIEFING_START===\n[pa assert] emails.json listed=2\n\nbrief\n===BRIEFING_END===\n"
             "===ANALYSIS_START===\nanalysis\n===ANALYSIS_END==="
         )
@@ -475,8 +589,8 @@ class TestStateAdvancementLogic(RunBriefTestCase):
         self.assertFalse(os.path.exists(self.state_path()), "State must not advance when Telegram delivery fails")
 
     @patch("run_brief.run_py")
-    @patch("run_brief.call_gemini")
-    def test_zero_email_window_advances_state_without_gemini(self, mock_gemini, mock_run_py):
+    @patch("run_brief.call_llm")
+    def test_zero_email_window_advances_state_without_llm(self, mock_llm, mock_run_py):
         """A zero-email slot should still be marked processed."""
         fetch_data = {
             "status": "ok",
@@ -490,12 +604,12 @@ class TestStateAdvancementLogic(RunBriefTestCase):
 
         run_brief.main()
 
-        mock_gemini.assert_not_called()
+        mock_llm.assert_not_called()
         self.assertTrue(os.path.exists(self.state_path()), "Zero-email slots must advance state")
 
     @patch("run_brief.run_py")
-    @patch("run_brief.call_gemini")
-    def test_already_processed_window_short_circuits(self, mock_gemini, mock_run_py):
+    @patch("run_brief.call_llm")
+    def test_already_processed_window_short_circuits(self, mock_llm, mock_run_py):
         """Already-processed slots should exit without side effects."""
         fetch_data = {
             "status": "already_processed",
@@ -509,7 +623,7 @@ class TestStateAdvancementLogic(RunBriefTestCase):
 
         run_brief.main()
 
-        mock_gemini.assert_not_called()
+        mock_llm.assert_not_called()
         self.assertFalse(os.path.exists(self.state_path()), "Already-processed windows must not rewrite state")
 
 
@@ -539,7 +653,7 @@ class TestMarkerParsing(unittest.TestCase):
 
 
 class TestDetectPortfolioStatementEmails(unittest.TestCase):
-    """detect_portfolio_statement_emails must classify via Gemini and parse robustly."""
+    """detect_portfolio_statement_emails must classify via LLM and parse robustly."""
 
     PORTFOLIO_EMAIL = {
         "id": "abc123",
@@ -575,95 +689,95 @@ class TestDetectPortfolioStatementEmails(unittest.TestCase):
         "snippet": "Please find attached your contract note for trades executed today.",
     }
 
-    @patch("run_brief.call_gemini")
-    def test_portfolio_statement_triggers(self, mock_gemini):
-        mock_gemini.return_value = '["abc123"]'
+    @patch("run_brief.call_llm")
+    def test_portfolio_statement_triggers(self, mock_llm):
+        mock_llm.return_value = '["abc123"]'
         result = run_brief.detect_portfolio_statement_emails([self.PORTFOLIO_EMAIL])
         self.assertEqual(result, ["abc123"])
 
-    @patch("run_brief.call_gemini")
-    def test_market_news_does_not_trigger(self, mock_gemini):
-        mock_gemini.return_value = "[]"
+    @patch("run_brief.call_llm")
+    def test_market_news_does_not_trigger(self, mock_llm):
+        mock_llm.return_value = "[]"
         result = run_brief.detect_portfolio_statement_emails([self.NEWS_EMAIL])
         self.assertEqual(result, [])
 
-    @patch("run_brief.call_gemini")
-    def test_gemini_failure_returns_empty(self, mock_gemini):
-        mock_gemini.side_effect = RuntimeError("auth cancelled")
+    @patch("run_brief.call_llm")
+    def test_llm_failure_returns_empty(self, mock_llm):
+        mock_llm.side_effect = RuntimeError("auth cancelled")
         result = run_brief.detect_portfolio_statement_emails([self.PORTFOLIO_EMAIL])
         self.assertEqual(result, [])
 
-    @patch("run_brief.call_gemini")
-    def test_json_embedded_in_text_parsed_correctly(self, mock_gemini):
-        # Gemini often wraps JSON in prose
-        mock_gemini.return_value = 'The emails that qualify are: ["abc123"]\nThat is the only one.'
+    @patch("run_brief.call_llm")
+    def test_json_embedded_in_text_parsed_correctly(self, mock_llm):
+        # LLM often wraps JSON in prose
+        mock_llm.return_value = 'The emails that qualify are: ["abc123"]\nThat is the only one.'
         result = run_brief.detect_portfolio_statement_emails([self.PORTFOLIO_EMAIL])
         self.assertEqual(result, ["abc123"])
 
-    @patch("run_brief.call_gemini")
-    def test_empty_email_list_skips_gemini(self, mock_gemini):
+    @patch("run_brief.call_llm")
+    def test_empty_email_list_skips_llm(self, mock_llm):
         result = run_brief.detect_portfolio_statement_emails([])
-        mock_gemini.assert_not_called()
+        mock_llm.assert_not_called()
         self.assertEqual(result, [])
 
-    @patch("run_brief.call_gemini")
-    def test_detect_triggers_fires_portfolio_reports_when_statement_found(self, mock_gemini):
-        mock_gemini.return_value = '["abc123"]'
+    @patch("run_brief.call_llm")
+    def test_detect_triggers_fires_portfolio_reports_when_statement_found(self, mock_llm):
+        mock_llm.return_value = '["abc123"]'
         result = run_brief.detect_triggers([self.PORTFOLIO_EMAIL])
         self.assertIn("portfolio-reports", result)
 
-    @patch("run_brief.call_gemini")
-    def test_detect_triggers_empty_when_only_news_emails(self, mock_gemini):
-        mock_gemini.return_value = "[]"
+    @patch("run_brief.call_llm")
+    def test_detect_triggers_empty_when_only_news_emails(self, mock_llm):
+        mock_llm.return_value = "[]"
         result = run_brief.detect_triggers([self.NEWS_EMAIL])
         self.assertEqual(result, [])
 
-    @patch("run_brief.call_gemini")
-    def test_detect_triggers_empty_on_gemini_failure(self, mock_gemini):
-        mock_gemini.side_effect = RuntimeError("timeout")
+    @patch("run_brief.call_llm")
+    def test_detect_triggers_empty_on_llm_failure(self, mock_llm):
+        mock_llm.side_effect = RuntimeError("timeout")
         result = run_brief.detect_triggers([self.PORTFOLIO_EMAIL])
         self.assertEqual(result, [])
 
-    @patch("run_brief.call_gemini")
-    def test_gemini_returns_non_list_json_is_safe(self, mock_gemini):
-        # Gemini returns valid JSON that's not a list — must not crash
-        mock_gemini.return_value = '{"ids": ["abc123"]}'
+    @patch("run_brief.call_llm")
+    def test_llm_returns_non_list_json_is_safe(self, mock_llm):
+        # LLM returns valid JSON that's not a list — must not crash
+        mock_llm.return_value = '{"ids": ["abc123"]}'
         result = run_brief.detect_portfolio_statement_emails([self.PORTFOLIO_EMAIL])
         self.assertEqual(result, [])
 
-    @patch("run_brief.call_gemini")
-    def test_email_missing_id_field_does_not_crash(self, mock_gemini):
+    @patch("run_brief.call_llm")
+    def test_email_missing_id_field_does_not_crash(self, mock_llm):
         # If an email dict is missing "id", must return [] gracefully, not raise
         bad_email = {"from": "x@y.com", "subject": "Statement", "snippet": ""}
         result = run_brief.detect_portfolio_statement_emails([bad_email])
         self.assertEqual(result, [])
-        mock_gemini.assert_not_called()  # should fail before reaching call_gemini
+        mock_llm.assert_not_called()  # should fail before reaching call_llm
 
-    @patch("run_brief.call_gemini")
-    def test_tracked_provider_statement_triggers(self, mock_gemini):
-        mock_gemini.return_value = '["statement001"]'
+    @patch("run_brief.call_llm")
+    def test_tracked_provider_statement_triggers(self, mock_llm):
+        mock_llm.return_value = '["statement001"]'
         result = run_brief.detect_portfolio_statement_emails([self.STATEMENT_EMAIL])
         self.assertEqual(result, ["statement001"])
 
-    @patch("run_brief.call_gemini")
-    def test_bank_alert_does_not_trigger(self, mock_gemini):
+    @patch("run_brief.call_llm")
+    def test_bank_alert_does_not_trigger(self, mock_llm):
         # Routine bank transactional alerts must not be flagged as portfolio statements
         # (this was the primary source of near-daily false triggers before the prompt fix)
-        mock_gemini.return_value = "[]"
+        mock_llm.return_value = "[]"
         result = run_brief.detect_portfolio_statement_emails([self.BANK_ALERT_EMAIL])
         self.assertEqual(result, [])
 
-    @patch("run_brief.call_gemini")
-    def test_other_broker_contract_note_does_not_trigger(self, mock_gemini):
+    @patch("run_brief.call_llm")
+    def test_other_broker_contract_note_does_not_trigger(self, mock_llm):
         # Other-broker statements must not fire the ad-hoc trigger — only the
         # configured BRIEF_STATEMENT_PROVIDER should
-        mock_gemini.return_value = "[]"
+        mock_llm.return_value = "[]"
         result = run_brief.detect_portfolio_statement_emails([self.OTHER_BROKER_CONTRACT_NOTE_EMAIL])
         self.assertEqual(result, [])
 
-    @patch("run_brief.call_gemini")
-    def test_detect_triggers_logs_matched_sender_and_subject(self, mock_gemini):
-        mock_gemini.return_value = '["statement001"]'
+    @patch("run_brief.call_llm")
+    def test_detect_triggers_logs_matched_sender_and_subject(self, mock_llm):
+        mock_llm.return_value = '["statement001"]'
         stderr = StringIO()
         with redirect_stderr(stderr):
             run_brief.detect_triggers([self.STATEMENT_EMAIL])
@@ -671,11 +785,11 @@ class TestDetectPortfolioStatementEmails(unittest.TestCase):
         self.assertIn("MONTHLY REPORT- TESTOWNER CLIENT", logged)
         self.assertIn("Sam Advisor", logged)
 
-    @patch("run_brief.call_gemini")
-    def test_detect_triggers_mixed_batch_only_tracked_provider_triggers(self, mock_gemini):
+    @patch("run_brief.call_llm")
+    def test_detect_triggers_mixed_batch_only_tracked_provider_triggers(self, mock_llm):
         # A batch containing both a genuine tracked-provider statement and noise
         # (bank alert, market news) should trigger only on the tracked match.
-        mock_gemini.return_value = '["statement001"]'
+        mock_llm.return_value = '["statement001"]'
         result = run_brief.detect_triggers(
             [self.STATEMENT_EMAIL, self.BANK_ALERT_EMAIL, self.NEWS_EMAIL]
         )
@@ -717,6 +831,118 @@ class TestPreflightFailurePath(RunBriefTestCase):
         send_calls = [c for c in mock_run_py.call_args_list
                       if c.args and "send_telegram" in str(c.args[0])]
         self.assertEqual(send_calls, [], "Preflight failure must not send_telegram.py to the briefings topic")
+
+    @patch("run_brief._notify_failure")
+    @patch("run_brief.write_failure_marker")
+    @patch("run_brief.read_failure_marker")
+    @patch("run_brief.run_py")
+    def test_main_exits_2_on_preflight_failure(
+        self, mock_run_py, mock_read_marker, mock_write_marker, mock_notify
+    ):
+        """A bare `return` here previously made a preflight failure look like
+        `status: success` to the scheduler — latestSuccess kept advancing and
+        the 2026-08-19..21 four-day outage went undetected (review §2.2). exit
+        code 2 matches preflight.py's own sys.exit(2) (2026-08-23, WP-F step 3)."""
+        preflight_fail = MagicMock(returncode=1, stderr="token expired")
+
+        def fake_run_py(script, *args, check=True):
+            if "preflight" in script:
+                return preflight_fail
+            return MagicMock(returncode=0)
+
+        mock_run_py.side_effect = fake_run_py
+        mock_read_marker.return_value = {"status": "auth", "reason": "token expired"}
+
+        with self.assertRaises(SystemExit) as ctx:
+            run_brief.main()
+
+        self.assertEqual(ctx.exception.code, 2)
+
+
+class TestFailureExitsAreSelfDescribing(RunBriefTestCase):
+    """Every failure exit must leave a stderr diagnostic.
+
+    The skill runner records only this script's stderr as the run's error
+    (pa/src/commands/run.ts: `error: error.trim() || undefined`) and the
+    failure analyzer falls back to 'unknown error' when that field is empty.
+    Six recorded runs (2026-08-23..24) exited 2 with empty stderr — the
+    preflight-failure branch prints nothing, so when `pa notify` succeeds
+    silently each run became an unclassifiable 'unknown error' row in the
+    failure evidence. Same defect class one branch over: the
+    malformed-briefing fail_llm() call has no print of its own either. A
+    failure exit that says nothing is unactionable and unanalyzable."""
+
+    def _make_fetch_data(self, listed=2):
+        return {
+            "window": "23 Aug 2026 05:00 – 23 Aug 2026 19:00 IST",
+            "window_end_utc": "2026-08-23T13:30:00+00:00",
+            "listed_count": listed,
+            "total_count": listed,
+            "emails": [
+                {"id": f"e{i}", "from": "a@b.com", "subject": "subj",
+                 "gmail_category": "unknown", "in_inbox": True, "is_unread": True, "snippet": ""}
+                for i in range(listed)
+            ],
+        }
+
+    def _patch_run_py(self, fetch_data=None):
+        """fetch_data=None makes preflight fail (the recorded exit-2 runs);
+        otherwise preflight/fetch/send all succeed."""
+        fetch_result = MagicMock(returncode=0, stdout=json.dumps(fetch_data) if fetch_data else "")
+
+        def fake_run_py(script, *args, check=True):
+            if "preflight" in script:
+                if fetch_data is None:
+                    return MagicMock(returncode=1, stderr="token expired")
+                return MagicMock(returncode=0)
+            if "fetch_headers" in script:
+                return fetch_result
+            return MagicMock(returncode=0)
+
+        return fake_run_py
+
+    @patch("run_brief._notify_failure")
+    @patch("run_brief.run_py")
+    def test_preflight_failure_exit_writes_stderr_diagnostic(self, mock_run_py, mock_notify):
+        """Reproduces the recorded 'unknown error' rows: exit 2 with empty
+        stderr (notify succeeded silently) leaves meta.error empty, so the
+        failure is recorded as unclassifiable."""
+        mock_run_py.side_effect = self._patch_run_py(fetch_data=None)
+
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                run_brief.main()
+
+        self.assertEqual(ctx.exception.code, 2)
+        logged = stderr.getvalue()
+        self.assertTrue(logged.strip(), "exit-2 must leave a stderr diagnostic, not exit silently")
+        self.assertIn("auth", logged)
+        self.assertIn("token expired", logged)
+
+    @patch("run_brief._notify_failure")
+    @patch("run_brief.load_portfolio_context", return_value="")
+    @patch("run_brief.run_py")
+    @patch("run_brief.call_llm")
+    def test_malformed_briefing_failure_writes_stderr_diagnostic(
+        self, mock_llm, mock_run_py, _portfolio, mock_notify
+    ):
+        """fail_llm reached from the malformed-briefing branch (whose caller
+        prints nothing): the funnel itself must say why on stderr."""
+        mock_run_py.side_effect = self._patch_run_py(fetch_data=self._make_fetch_data())
+        mock_llm.return_value = (
+            "===BRIEFING_START===\nbriefing without the assert header\n===BRIEFING_END==="
+        )
+
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                run_brief.main()
+
+        self.assertEqual(ctx.exception.code, 1)
+        logged = stderr.getvalue()
+        self.assertTrue(logged.strip(), "fail_llm must leave a stderr diagnostic")
+        self.assertIn("Malformed briefing content", logged)
 
 
 class TestLoadPortfolioContext(unittest.TestCase):
@@ -869,11 +1095,11 @@ class TestProviderIdentifiersAreEnvDriven(unittest.TestCase):
             setattr(run_brief, name, value)
 
     def _classifier_prompt(self):
-        with patch("run_brief.call_gemini", return_value="[]") as mock_gemini:
+        with patch("run_brief.call_llm", return_value="[]") as mock_llm:
             run_brief.detect_portfolio_statement_emails(
                 [{"id": "x", "from": "a@b.test", "subject": "s", "snippet": "n"}]
             )
-        return mock_gemini.call_args.args[0]
+        return mock_llm.call_args.args[0]
 
     def test_classifier_prompt_uses_configured_provider(self):
         prompt = self._classifier_prompt()
@@ -908,6 +1134,268 @@ class TestProviderIdentifiersAreEnvDriven(unittest.TestCase):
     def test_build_prompt_embeds_the_grounding_rule(self):
         prompt = run_brief.build_prompt("some window", 3, "emails here")
         self.assertIn(run_brief.build_grounding_rule(), prompt)
+
+
+class TestParseDecisionRows(unittest.TestCase):
+    """parse_decision_rows must extract decision JSON from the DECISIONS marker block."""
+
+    def test_wellformed_two_row_block_returns_two_dicts(self):
+        response = (
+            "===BRIEFING_START===\nbrief\n===BRIEFING_END===\n"
+            "===DECISIONS_START===\n"
+            '{"request_excerpt":"Sender1 - Subj1","decision":"included","rationale":"Borderline case","alternatives":["excluded: too old"]}\n'
+            '{"request_excerpt":"Sender2 - Subj2","decision":"excluded","rationale":"Clearly promotional","alternatives":[]}\n'
+            "===DECISIONS_END==="
+        )
+        rows = run_brief.parse_decision_rows(response)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["decision"], "included")
+        self.assertEqual(rows[1]["decision"], "excluded")
+
+    def test_malformed_middle_line_skipped_with_warn(self):
+        response = (
+            "===BRIEFING_START===\nbrief\n===BRIEFING_END===\n"
+            "===DECISIONS_START===\n"
+            '{"request_excerpt":"Sender1 - Subj1","decision":"included","rationale":"OK","alternatives":[]}\n'
+            "not valid json here\n"
+            '{"request_excerpt":"Sender2 - Subj2","decision":"excluded","rationale":"OK","alternatives":[]}\n'
+            "===DECISIONS_END==="
+        )
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            rows = run_brief.parse_decision_rows(response)
+        self.assertEqual(len(rows), 2)
+        logged = stderr.getvalue()
+        self.assertIn("Malformed decision line", logged)
+
+    def test_more_than_ten_lines_capped_at_ten(self):
+        lines = [
+            f'{{"request_excerpt":"S{i}","decision":"included","rationale":"OK","alternatives":[]}}'
+            for i in range(15)
+        ]
+        response = (
+            "===BRIEFING_START===\nbrief\n===BRIEFING_END===\n"
+            "===DECISIONS_START===\n"
+            + "\n".join(lines) +
+            "\n===DECISIONS_END==="
+        )
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            rows = run_brief.parse_decision_rows(response)
+        self.assertEqual(len(rows), 10)
+        logged = stderr.getvalue()
+        self.assertIn("capping at 10", logged)
+
+    def test_missing_markers_returns_empty_list(self):
+        response = "===BRIEFING_START===\nbrief\n===BRIEFING_END==="
+        rows = run_brief.parse_decision_rows(response)
+        self.assertEqual(rows, [])
+
+    def test_empty_block_returns_empty_list(self):
+        response = (
+            "===BRIEFING_START===\nbrief\n===BRIEFING_END===\n"
+            "===DECISIONS_START===\n"
+            "===DECISIONS_END==="
+        )
+        rows = run_brief.parse_decision_rows(response)
+        self.assertEqual(rows, [])
+
+    def test_fenced_block_not_required_markers_suffice(self):
+        """Markers alone are enough; code fences are NOT required."""
+        response = (
+            "===BRIEFING_START===\nbrief\n===BRIEFING_END===\n"
+            "===DECISIONS_START===\n"
+            '{"request_excerpt":"S1","decision":"included","rationale":"OK","alternatives":[]}\n'
+            "===DECISIONS_END==="
+        )
+        rows = run_brief.parse_decision_rows(response)
+        self.assertEqual(len(rows), 1)
+
+
+class TestDecisionRecordingInMain(RunBriefTestCase):
+    """Decision recording must enrich rows deterministically and never fail the brief."""
+
+    def _make_fetch_data(self, listed=2):
+        return {
+            "window": "21 Aug 2026 05:00 – 21 Aug 2026 19:00 IST",
+            "window_end_utc": "2026-08-21T13:30:00+00:00",
+            "listed_count": listed,
+            "total_count": listed,
+            "emails": [
+                {"id": f"e{i}", "from": "a@b.com", "subject": "subj",
+                 "gmail_category": "unknown", "in_inbox": True, "is_unread": True, "snippet": ""}
+                for i in range(listed)
+            ],
+        }
+
+    def _patch_run_py(self, fetch_data):
+        fetch_result = MagicMock(returncode=0, stdout=json.dumps(fetch_data))
+
+        def fake_run_py(script, *args, check=True):
+            if "fetch_headers" in script:
+                return fetch_result
+            return MagicMock(returncode=0)
+
+        return fake_run_py
+
+    @patch("run_brief.load_portfolio_context", return_value="")
+    @patch("run_brief.run_py")
+    @patch("run_brief.call_llm")
+    @patch("run_brief.decisions_lib.record_decision")
+    def test_decision_rows_enriched_and_recorded(
+        self, mock_record, mock_llm, mock_run_py, _mock_portfolio
+    ):
+        """Decision rows from the LLM are enriched with deterministic fields and recorded."""
+        fetch_data = self._make_fetch_data()
+        mock_run_py.side_effect = self._patch_run_py(fetch_data)
+
+        llm_response = (
+            "===BRIEFING_START===\n[pa assert] emails.json listed=2\n\nbrief\n===BRIEFING_END===\n"
+            "===DECISIONS_START===\n"
+            '{"request_excerpt":"Sender - Subject","decision":"included","rationale":"Borderline","alternatives":["excluded"]}\n'
+            "===DECISIONS_END==="
+        )
+        mock_llm.return_value = llm_response
+
+        env_patch = patch.dict(
+            os.environ,
+            {"TELEGRAM_DAILY_BRIEFING_THREAD_ID": "4242", "TELEGRAM_BRIEFING_CHAT_ID": "-1009999999999"},
+            clear=False,
+        )
+
+        emails_path = os.path.join(self.project_root, "emails.json")
+        with open(emails_path, "w", encoding="utf-8") as f:
+            json.dump({"emails": [{}, {}], "listed_count": 2}, f)
+
+        with env_patch:
+            try:
+                run_brief.main()
+            except SystemExit:
+                pass
+
+        self.assertEqual(mock_record.call_count, 1)
+        call_args = mock_record.call_args.args[0]
+        self.assertEqual(call_args["source"], "skill")
+        self.assertEqual(call_args["skill"], "daily-mail-brief")
+        self.assertEqual(call_args["thread_id"], 4242)
+        self.assertEqual(call_args["chat_id"], -1009999999999)
+        self.assertEqual(call_args["request_excerpt"], "Sender - Subject")
+        self.assertEqual(call_args["decision"], "included")
+
+    @patch("run_brief.load_portfolio_context", return_value="")
+    @patch("run_brief.run_py")
+    @patch("run_brief.call_llm")
+    @patch("run_brief.decisions_lib.record_decision")
+    def test_recording_failure_does_not_fail_brief(
+        self, mock_record, mock_llm, mock_run_py, _mock_portfolio
+    ):
+        """A recording failure must print a warning and never fail the brief (try/except)."""
+        fetch_data = self._make_fetch_data()
+        mock_run_py.side_effect = self._patch_run_py(fetch_data)
+
+        llm_response = (
+            "===BRIEFING_START===\n[pa assert] emails.json listed=2\n\nbrief\n===BRIEFING_END===\n"
+            "===DECISIONS_START===\n"
+            '{"request_excerpt":"S","decision":"included","rationale":"R","alternatives":[]}\n'
+            "===DECISIONS_END==="
+        )
+        mock_llm.return_value = llm_response
+        mock_record.return_value = {"ok": False, "error": "DB write failed"}
+
+        emails_path = os.path.join(self.project_root, "emails.json")
+        with open(emails_path, "w", encoding="utf-8") as f:
+            json.dump({"emails": [{}, {}], "listed_count": 2}, f)
+
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            try:
+                run_brief.main()
+            except SystemExit as e:
+                # Should exit successfully (or with unrelated code), NOT crash
+                pass
+
+        logged = stderr.getvalue()
+        self.assertIn("decision trace write failed", logged)
+
+    @patch("run_brief.load_portfolio_context", return_value="")
+    @patch("run_brief.run_py")
+    @patch("run_brief.call_llm")
+    @patch("run_brief.decisions_lib.record_decision")
+    def test_record_decision_exception_caught_and_warned(
+        self, mock_record, mock_llm, mock_run_py, _mock_portfolio
+    ):
+        """An exception during recording must be caught, warned, and never fail the brief."""
+        fetch_data = self._make_fetch_data()
+        mock_run_py.side_effect = self._patch_run_py(fetch_data)
+
+        llm_response = (
+            "===BRIEFING_START===\n[pa assert] emails.json listed=2\n\nbrief\n===BRIEFING_END===\n"
+            "===DECISIONS_START===\n"
+            '{"request_excerpt":"S","decision":"included","rationale":"R","alternatives":[]}\n'
+            "===DECISIONS_END==="
+        )
+        mock_llm.return_value = llm_response
+        mock_record.side_effect = RuntimeError("Unexpected DB error")
+
+        emails_path = os.path.join(self.project_root, "emails.json")
+        with open(emails_path, "w", encoding="utf-8") as f:
+            json.dump({"emails": [{}, {}], "listed_count": 2}, f)
+
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            try:
+                run_brief.main()
+            except SystemExit:
+                pass
+
+        logged = stderr.getvalue()
+        self.assertIn("decision trace recording failed", logged)
+
+    @patch("run_brief.load_portfolio_context", return_value="")
+    @patch("run_brief.run_py")
+    @patch("run_brief.call_llm")
+    def test_brief_succeeds_without_decision_block(self, mock_llm, mock_run_py, _mock_portfolio):
+        """A brief without a DECISIONS block must still succeed (the block is optional)."""
+        fetch_data = self._make_fetch_data()
+        mock_run_py.side_effect = self._patch_run_py(fetch_data)
+
+        llm_response = (
+            "===BRIEFING_START===\n[pa assert] emails.json listed=2\n\nbrief\n===BRIEFING_END===\n"
+            "===ANALYSIS_START===\nanalysis\n===ANALYSIS_END==="
+        )
+        mock_llm.return_value = llm_response
+
+        emails_path = os.path.join(self.project_root, "emails.json")
+        with open(emails_path, "w", encoding="utf-8") as f:
+            json.dump({"emails": [{}, {}], "listed_count": 2}, f)
+
+        try:
+            run_brief.main()
+        except SystemExit as e:
+            # Should exit successfully
+            pass
+
+        # The brief should complete without trying to record any decisions
+        briefing_path = os.path.join(self.project_root, "briefing_output.md")
+        self.assertTrue(os.path.exists(briefing_path), "Briefing must be written even without decisions")
+
+
+class TestDecisionBlockInPrompt(RunBriefTestCase):
+    """build_prompt must include the DECISIONS section in the prompt."""
+
+    def test_build_prompt_contains_decision_markers(self):
+        prompt = run_brief.build_prompt("some window", 3, "emails here")
+        self.assertIn("===DECISIONS_START===", prompt)
+        self.assertIn("===DECISIONS_END===", prompt)
+
+    def test_build_prompt_contains_max_ten_lines_instruction(self):
+        prompt = run_brief.build_prompt("some window", 3, "emails here")
+        self.assertIn("max 10 lines", prompt)
+
+    def test_build_prompt_explains_optional_block(self):
+        prompt = run_brief.build_prompt("some window", 3, "emails here")
+        self.assertIn("optional section", prompt.lower())
+        self.assertIn("only when there were non-obvious choices", prompt.lower())
 
 
 if __name__ == "__main__":

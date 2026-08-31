@@ -4,65 +4,44 @@ import { promisify } from 'util';
 
 const execAsync = promisify(exec);
 
+// Hidden exec wrapper for Windows — prevents console window flash on every spawn
+const execHidden = (cmd: string) => execAsync(cmd, { windowsHide: true });
+
 export type ExecFn = (cmd: string) => Promise<{ stdout: string; stderr: string }>;
 
 const BATCH_SIZE = 50;
 
-// Emit at most one warning per process lifetime when process-listing tools are absent
-let _warnedProcessTree = false;
-function warnProcessTreeUnavailable(tool: string, fn: string): void {
-  if (_warnedProcessTree) return;
-  _warnedProcessTree = true;
-  console.warn(
-    `[pa/process-tree] ${tool} not found. Child-process tracking disabled. ` +
-    `To add support for this system, implement a new branch in pa/src/process-tree.ts:${fn}() ` +
-    `using your platform's process-listing tool.`
-  );
-}
-
-export async function getChildPids(pid: number): Promise<number[]> {
-  try {
-    if (platform() === 'win32') {
-      // Use PowerShell Get-CimInstance instead of deprecated wmic
-      const { stdout } = await execAsync(
-        `powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter 'ParentProcessId=${pid}' | Select-Object -ExpandProperty ProcessId"`
-      );
-      return stdout.trim().split('\n').map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n));
-    } else {
-      const { stdout } = await execAsync(`pgrep -P ${pid}`);
-      return stdout.trim().split('\n').map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n));
-    }
-  } catch (err: any) {
-    if (err.code === 'ENOENT') warnProcessTreeUnavailable('pgrep', 'getChildPids');
-    return [];
-  }
-}
-
-export async function hasChildProcesses(pid: number, isShell: boolean = false): Promise<boolean> {
-  const children = await getChildPids(pid);
-  if (children.length === 0) return false;
-
-  if (isShell) {
-    // If we are spawning via a shell, the direct child is the worker agent.
-    // We only count it as "having active children" if the agent itself has children (e.g. running a tool).
-    for (const childPid of children) {
-      const grandchildren = await getChildPids(childPid);
-      if (grandchildren.length > 0) return true;
-    }
-    return false;
-  }
-
-  return true;
-}
+// Snapshot cache to avoid per-PID OS queries on hot paths (heartbeat, idle checks)
+const SNAPSHOT_TTL_MS = 300;
+let _cachedSnapshot: Map<number, number[]> | null = null;
+let _snapshotExpiresAt = 0;
 
 /**
- * Return ALL descendants (grandchildren, great-grandchildren, etc.) of a process.
- * Issues ONE OS-level query and BFS in memory — O(total processes), not O(tree depth).
+ * Get a process-tree snapshot in ONE OS query. Returns a parent→children adjacency map.
+ * Results are cached for 300ms to make consecutive heartbeats/idle checks essentially free.
+ * When a custom execFn is injected (tests), bypass the cache to preserve call-count semantics.
  */
-export async function getDescendantPids(
-  workerPid: number,
-  execFn: ExecFn = execAsync
-): Promise<Array<{ pid: number; parentPid: number }>> {
+async function getProcessSnapshot(execFn?: ExecFn): Promise<Map<number, number[]>> {
+  const now = Date.now();
+
+  // If injected execFn, bypass cache entirely (tests need exact call counts)
+  if (execFn) {
+    return buildSnapshotFromQuery(execFn);
+  }
+
+  // Check cache for default path
+  if (_cachedSnapshot && now < _snapshotExpiresAt) {
+    return _cachedSnapshot;
+  }
+
+  // Cache miss or expired — fetch and cache
+  const snapshot = await buildSnapshotFromQuery(execAsync);
+  _cachedSnapshot = snapshot;
+  _snapshotExpiresAt = now + SNAPSHOT_TTL_MS;
+  return snapshot;
+}
+
+async function buildSnapshotFromQuery(execFn: ExecFn): Promise<Map<number, number[]>> {
   try {
     let pairs: Array<{ pid: number; parentPid: number }>;
 
@@ -71,7 +50,7 @@ export async function getDescendantPids(
         `powershell -NoProfile -Command "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress"`
       );
       const raw = stdout.trim();
-      if (!raw) return [];
+      if (!raw) return new Map();
       const data = JSON.parse(raw);
       const arr = Array.isArray(data) ? data : [data];
       pairs = arr
@@ -95,27 +74,76 @@ export async function getDescendantPids(
       childMap.get(parentPid)!.push(pid);
     }
 
-    // BFS from workerPid — collect all descendants
-    const result: Array<{ pid: number; parentPid: number }> = [];
-    const queue: Array<{ pid: number; parent: number }> = [{ pid: workerPid, parent: 0 }];
-    const visited = new Set<number>([workerPid]);
+    return childMap;
+  } catch (err: any) {
+    if (err.code === 'ENOENT') warnProcessTreeUnavailable(platform() === 'win32' ? 'powershell' : 'ps', 'getProcessSnapshot');
+    return new Map();
+  }
+}
 
-    while (queue.length > 0) {
-      const { pid: current } = queue.shift()!;
-      for (const childPid of childMap.get(current) ?? []) {
-        if (!visited.has(childPid)) {
-          visited.add(childPid);
-          result.push({ pid: childPid, parentPid: current });
-          queue.push({ pid: childPid, parent: current });
-        }
+// Emit at most one warning per process lifetime when process-listing tools are absent
+let _warnedProcessTree = false;
+function warnProcessTreeUnavailable(tool: string, fn: string): void {
+  if (_warnedProcessTree) return;
+  _warnedProcessTree = true;
+  console.warn(
+    `[pa/process-tree] ${tool} not found. Child-process tracking disabled. ` +
+    `To add support for this system, implement a new branch in pa/src/process-tree.ts:${fn}() ` +
+    `using your platform's process-listing tool.`
+  );
+}
+
+export async function getChildPids(pid: number, execFn?: ExecFn): Promise<number[]> {
+  const snapshot = await getProcessSnapshot(execFn);
+  return snapshot.get(pid) ?? [];
+}
+
+export async function hasChildProcesses(pid: number, isShell: boolean = false, execFn?: ExecFn): Promise<boolean> {
+  const snapshot = await getProcessSnapshot(execFn);
+  const children = snapshot.get(pid) ?? [];
+
+  if (children.length === 0) return false;
+
+  if (isShell) {
+    // If we are spawning via a shell, the direct child is the worker agent.
+    // We only count it as "having active children" if the agent itself has children (e.g. running a tool).
+    for (const childPid of children) {
+      const grandchildren = snapshot.get(childPid) ?? [];
+      if (grandchildren.length > 0) return true;
+    }
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Return ALL descendants (grandchildren, great-grandchildren, etc.) of a process.
+ * Issues ONE OS-level query and BFS in memory — O(total processes), not O(tree depth).
+ */
+export async function getDescendantPids(
+  workerPid: number,
+  execFn: ExecFn = execHidden
+): Promise<Array<{ pid: number; parentPid: number }>> {
+  const snapshot = await getProcessSnapshot(execFn);
+
+  // BFS from workerPid — collect all descendants
+  const result: Array<{ pid: number; parentPid: number }> = [];
+  const queue: Array<{ pid: number; parent: number }> = [{ pid: workerPid, parent: 0 }];
+  const visited = new Set<number>([workerPid]);
+
+  while (queue.length > 0) {
+    const { pid: current } = queue.shift()!;
+    for (const childPid of snapshot.get(current) ?? []) {
+      if (!visited.has(childPid)) {
+        visited.add(childPid);
+        result.push({ pid: childPid, parentPid: current });
+        queue.push({ pid: childPid, parent: current });
       }
     }
-
-    return result;
-  } catch (err: any) {
-    if (err.code === 'ENOENT') warnProcessTreeUnavailable('ps', 'getDescendantPids');
-    return [];
   }
+
+  return result;
 }
 
 /**
@@ -123,7 +151,7 @@ export async function getDescendantPids(
  */
 export async function getCommandLines(
   pids: number[],
-  execFn: ExecFn = execAsync
+  execFn: ExecFn = execHidden
 ): Promise<Map<number, string>> {
   const result = new Map<number, string>();
   if (pids.length === 0) return result;
@@ -170,7 +198,7 @@ export async function getCommandLines(
  */
 export async function areProcessesAlive(
   pids: number[],
-  execFn: ExecFn = execAsync
+  execFn: ExecFn = execHidden
 ): Promise<Map<number, boolean>> {
   const result = new Map<number, boolean>();
   if (pids.length === 0) return result;
@@ -214,7 +242,7 @@ export async function areProcessesAlive(
 export function killProcessTree(pid: number): void {
   if (platform() === 'win32') {
     // taskkill /T kills the tree, /F forces it
-    exec(`taskkill /T /F /PID ${pid}`, () => {});
+    exec(`taskkill /T /F /PID ${pid}`, { windowsHide: true }, () => {});
   } else if (platform() === 'linux' || platform() === 'darwin') {
     try {
       process.kill(-pid, 'SIGTERM'); // negative PID = process group

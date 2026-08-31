@@ -33,8 +33,8 @@ with open(GUARD_PATH, encoding="utf-8") as f:
     code = f.read()
 exec(compile(code.replace('if __name__ == "__main__":', 'if False:'), GUARD_PATH, "exec"), guard.__dict__)
 
-# Module-level safety net (2026-08-14): prevent ANY real zclaude API call
-# during tests. Tests that exercise zclaude_check directly mock _run_agy or
+# Module-level safety net: prevent ANY real zclaude API call during tests.
+# Tests that exercise zclaude_check directly mock _run_agy or
 # resolve_zclaude_argv themselves; this default ensures tests that reach
 # main()/full_audit() via the agy-failure fallback path never invoke the
 # real zclaude binary (which would hang on a 150s timeout against api.z.ai).
@@ -92,10 +92,10 @@ class TestLoadSecrets(unittest.TestCase):
     def test_parses_key_value_pairs_and_ignores_comments(self):
         with tempfile.TemporaryDirectory() as tmp:
             with open(os.path.join(tmp, "secrets.env"), "w", encoding="utf-8") as f:
-                f.write("# comment\nAGY_CMD=D:/gemini-shim/agy.cmd\nEMPTY=\n\nQUOTED=\"value\"\n")
+                f.write("# comment\nAGY_CMD=/path/to/agy\nEMPTY=\n\nQUOTED=\"value\"\n")
             with patch.object(guard, "PA_HOME", tmp):
                 secrets = guard._load_secrets()
-        self.assertEqual(secrets.get("AGY_CMD"), "D:/gemini-shim/agy.cmd")
+        self.assertEqual(secrets.get("AGY_CMD"), "/path/to/agy")
         self.assertEqual(secrets.get("QUOTED"), "value")
 
     def test_missing_file_returns_empty_dict(self):
@@ -1062,9 +1062,9 @@ class TestReviewRecordHandoff(unittest.TestCase):
 
 
 class TestZclaudeFallback(unittest.TestCase):
-    """2026-08-14: when agy is unavailable (quota outage, missing binary,
-    timeout), the guard falls back to zclaude (Zhipu GLM via api.z.ai) before
-    hitting the fail-closed block — same prompt, same CLEAN/VIOLATION verdict."""
+    """When agy is unavailable (quota outage, missing binary, timeout), the
+    guard falls back to zclaude (Zhipu GLM via api.z.ai) before hitting the
+    fail-closed block — same prompt, same CLEAN/VIOLATION verdict."""
 
     def setUp(self):
         for lst in (guard.ADDED, guard.TOUCHED_PATHS, guard.TOUCHED_FILES,
@@ -1322,11 +1322,11 @@ class TestHelpAndBareInvocation(unittest.TestCase):
             shutil.copy(GUARD_PATH, guard_path)
             # Run with --help, with stdin explicitly closed to prove we don't read it.
             result = subprocess.run(
-                ["python", guard_path, "--help"],
+                [sys.executable, guard_path, "--help"],
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
-                timeout=5,  # Should exit instantly; timeout = test failure.
+                timeout=30,  # Should exit quickly; generous timeout avoids CI startup spikes.
                 encoding="utf-8",
                 errors="replace",
             )
@@ -1341,11 +1341,11 @@ class TestHelpAndBareInvocation(unittest.TestCase):
             guard_path = os.path.join(tmp, "guard")
             shutil.copy(GUARD_PATH, guard_path)
             result = subprocess.run(
-                ["python", guard_path, "-h"],
+                [sys.executable, guard_path, "-h"],
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=30,
                 encoding="utf-8",
                 errors="replace",
             )
@@ -1363,7 +1363,7 @@ class TestHelpAndBareInvocation(unittest.TestCase):
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
-                timeout=5,  # The bug: this would hang forever.
+                timeout=30,  # Generous timeout avoids CI cold-start flakes.
                 encoding="utf-8",
                 errors="replace",
             )

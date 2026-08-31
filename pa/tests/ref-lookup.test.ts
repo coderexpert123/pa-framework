@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { lookupRefId } from '../src/lib/ref-lookup.js';
+import { lookupRefId, lookupTrace, lookupTraceByUpdate } from '../src/lib/ref-lookup.js';
 
 let tempDir: string;
 let originalPaHome: string | undefined;
@@ -392,5 +392,61 @@ describe('lookupRefId — ambiguity-detection warning', () => {
     assert.ok(result);
     assert.equal(result.text, 'third (newest)');
     assert.equal(warnCalls.length, 1, 'warnings are deduped to one per lookup');
+  });
+});
+
+describe('lookupTrace / lookupTraceByUpdate — turn-traces.jsonl sidecar lookups (2026-08-24, C11/A5)', () => {
+  async function writeTraces(entries: any[]): Promise<void> {
+    const path = join(tempDir, 'turn-traces.jsonl');
+    const content = entries.map((e) => JSON.stringify(e)).join('\n') + '\n';
+    await writeFile(path, content, 'utf8');
+  }
+
+  it('lookupTrace finds the LAST line for a run_id', async () => {
+    await writeTraces([
+      { run_id: 'r-1', outcome: 'ok', worker: 'agy', ts_start: 'a' },
+      { run_id: 'r-1', outcome: 'error', worker: 'agy', ts_start: 'b' }, // same run_id, later line
+    ]);
+    const result = await lookupTrace('r-1');
+    assert.ok(result);
+    assert.equal(result!.outcome, 'error', 'returns the LAST matching line');
+  });
+
+  it('lookupTrace returns null for an unknown run_id', async () => {
+    await writeTraces([{ run_id: 'r-1', outcome: 'ok' }]);
+    assert.equal(await lookupTrace('r-does-not-exist'), null);
+  });
+
+  it('lookupTrace returns null when the file is missing', async () => {
+    assert.equal(await lookupTrace('r-anything'), null);
+  });
+
+  it('lookupTraceByUpdate matches on BOTH thread_id and update_id — two lines sharing update_id across different threads resolve to the right one', async () => {
+    await writeTraces([
+      { run_id: 'r-a', thread_id: 100, update_id: 500, outcome: 'ok' },
+      { run_id: 'r-b', thread_id: 200, update_id: 500, outcome: 'error' },
+    ]);
+    const result = await lookupTraceByUpdate(200, 500);
+    assert.ok(result);
+    assert.equal(result!.run_id, 'r-b');
+  });
+
+  it('lookupTraceByUpdate returns null when update_id matches but thread_id does not — update_id alone is not unique', async () => {
+    await writeTraces([
+      { run_id: 'r-a', thread_id: 100, update_id: 500, outcome: 'ok' },
+    ]);
+    assert.equal(await lookupTraceByUpdate(999, 500), null);
+  });
+});
+
+describe('lookupRefId — RefRecord exposes updateId; runId stays undefined for a normal bot turn (C24)', () => {
+  it('an archive row carrying update_id exposes updateId on the RefRecord; runId is undefined', async () => {
+    await writeConversationHistory([
+      { role: 'assistant', text: 'reply', timestamp: '2026-04-28T10:00:01Z', worker: 'agy', refId: 'c-upd1', thread_id: 100, update_id: 4242 },
+    ]);
+    const result = await lookupRefId('c-upd1');
+    assert.ok(result);
+    assert.equal(result.updateId, 4242);
+    assert.equal(result.runId, undefined, 'the normal bot case — the archive row never carries run_id (C24)');
   });
 });
