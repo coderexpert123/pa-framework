@@ -114,7 +114,10 @@ action envelope for cross-skill triggering.
   (30d retention, `~/.pa/attachments/`). **Since 2026-08-15, transcription happens at
   ARRIVAL** (`voice-prefetch.ts` + poll-loop enqueue) — the transcript becomes the queue
   entry's text, so voice follows /stop//steer flush semantics like text; see
-  `docs/bot-reliability-internals.md`'s AI-092 section.
+  `docs/bot-reliability-internals.md`'s AI-092 section. **Smart `/retranscribe` (2026-08-31)**:
+  durable audio index (`audio-index.ts` → `~/.pa/attachments/<chatId>/audio-index.json`,
+  25-entry cap) allows `/retranscribe` without replying — targets newest failed note first,
+  else newest note.
 - **Archive join fields (2026-08-24)**: assistant rows carry `session_id`+`update_id`, user rows
   carry `update_id` (`main.ts:1457`/`:2126`) via a `JoinableTurn` alias in `conversation.ts` (bot
   `types.ts` was owned by a concurrent wave that day). Trace join key for a bot turn:

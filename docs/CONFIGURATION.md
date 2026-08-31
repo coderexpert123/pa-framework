@@ -41,6 +41,7 @@ The framework reads configuration from `~/.pa/` (or wherever `PA_HOME` env var p
 | `bg_tasks` | `BgTasksConfig` | No | See below | Thresholds for background-leak detection. |
 | `usage` | `UsageConfig` | No | None | Token usage tracking and budget alerts. See below. |
 | `model_pricing` | `Record<string, {input, output, cache_read?}>` | No | No | Built-in defaults. Per-MTok USD price overrides for cost estimates. Keys are model names, with worker-name fallback. See below. |
+| `git_workflow` | `GitWorkflowConfig` | No | absent block = enabled | Opt-in for git-touching skills — see `GitWorkflowConfig` below. |
 
 ### `WorkerConfig`
 
@@ -95,6 +96,14 @@ Controls token usage tracking. Optional — omit the whole `usage:` block and us
 | `budget_monthly_usd` | number | No | None | Optional monthly USD budget; alerting not implemented yet (reserved). |
 
 Run `pa costs [--day|--week|--month] [--skill] [--json]` for rollups by worker/model/skill. Tokens are factual; dollars are read-time estimates from built-in list prices + `model_pricing` overrides; unpriced keys show `-`/`null`.
+
+### GitWorkflowConfig
+
+Whether shipped skills may run git on your behalf. `pa init` scaffolds `enabled: false` (run-only).
+
+| Field | Type | Required | Default | Effect |
+|---|---|---|---|---|
+| `enabled` | boolean | No | `true` (block absent) | `false` = run-only: `update-brain` skips snapshot commits, the self-improver code-fix lane skips. Probe from any skill/script: `pa git-guard [<dir>]` — exit 0 only when this is enabled (or absent) AND `<dir>` is inside a git work tree. |
 
 ### CostTierConfig
 

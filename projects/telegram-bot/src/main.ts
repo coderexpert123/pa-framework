@@ -159,6 +159,15 @@ import {
   type VoiceResult,
 } from './voice.js';
 import {
+  audioIndexRoot,
+  recordAudioMessage,
+  markAudioResult,
+  loadAudioIndex,
+  selectRetranscribeTarget,
+  describeAudioTarget,
+  type AudioIndexEntry,
+} from './audio-index.js';
+import {
   startPrefetch,
   lookupPrefetch,
   userTextFromVoiceResult,
@@ -1353,6 +1362,16 @@ async function processUpdate(
       // Fall through to command parsing with the original caption.
     } else if (audioAttachment) {
       // A5/D2: Consume prefetched result if present; otherwise transcribe inline.
+      // Durable audio index (2026-08-31 retranscribe-smart plan): record BEFORE
+      // transcription so failed notes are recoverable by a bare /retranscribe.
+      // Best-effort by contract — an index failure must never break the note.
+      recordAudioMessage(audioIndexRoot(), chatId, {
+        messageId,
+        threadId: threadId || null,
+        kind: audioAttachment.kind,
+        media: audioAttachment.media,
+        date: new Date().toISOString(),
+      }).catch(() => {});
       let vr: VoiceResult;
       const prefetched = (update as any).__voiceResult as VoiceResult | undefined;
       if (prefetched) {
@@ -1365,6 +1384,13 @@ async function processUpdate(
           threadId,
         }, audioAttachment.kind);
       }
+      markAudioResult(
+        audioIndexRoot(),
+        chatId,
+        audioAttachment.media.file_unique_id,
+        vr.ok ? 'ok' : 'failed',
+        vr.ok ? { engine: vr.engine } : { reason: vr.reason }
+      ).catch(() => {});
       const forwardedFrom = describeForwardOrigin(msg);
       if (!vr.ok) {
         // D2: If normalizer already combined held entries + transcript, don't overwrite.
@@ -1719,16 +1745,23 @@ async function processUpdate(
       }
     }
 
-    // Hardened plan WP6 item 6: /retranscribe [engine], replying to a voice/
-    // audio/video_note message. Always re-transcribes AND dispatches the
-    // result through the normal chain (not a show-only mode) — simpler, one
-    // behavior to explain, per the plan.
+    // Hardened plan WP6 item 6 + 2026-08-31 retranscribe-smart: /retranscribe
+    // [engine]. A replied-to note always wins; with no reply, the target is
+    // picked from the durable audio index — newest not-yet-succeeded note in
+    // this thread, else the newest note. Always re-transcribes AND dispatches
+    // the result through the normal chain (not a show-only mode).
     if (!skipWorker) {
       const rt = handleRetranscribeCommand(userText);
       if (rt.matched) {
-        const target = extractAudioAttachment(msg.reply_to_message ?? {});
+        const replyTarget = extractAudioAttachment(msg.reply_to_message ?? {});
+        let indexedEntry: AudioIndexEntry | undefined;
+        if (!replyTarget) {
+          const index = await loadAudioIndex(audioIndexRoot(), chatId);
+          indexedEntry = selectRetranscribeTarget(index.entries, threadId || null);
+        }
+        const target = replyTarget ?? (indexedEntry ? { kind: indexedEntry.kind, media: indexedEntry.media } : undefined);
         if (!target) {
-          response = 'Reply to a voice note or audio message with /retranscribe to try again.';
+          response = '🎙 No recent voice or audio messages from this topic to re-transcribe — reply to the note you want, or send a new one.';
           skipWorker = true;
         } else {
           const cachedPath = await findCachedAudio(chatId, target.media.file_unique_id).catch(() => undefined);
@@ -1740,12 +1773,20 @@ async function processUpdate(
             engineOverride: rt.engine,
             cachedPath,
           }, target.kind);
+          markAudioResult(
+            audioIndexRoot(),
+            chatId,
+            target.media.file_unique_id,
+            vr.ok ? 'ok' : 'failed',
+            vr.ok ? { engine: vr.engine } : { reason: vr.reason }
+          ).catch(() => {});
           if (!vr.ok) {
             response = voiceErrorMessage(vr);
             skipWorker = true;
           } else {
             const engineLabel = rt.engine ?? vr.engine;
-            await sendMessage(token, chatId, `🎙 Re-transcribed (${engineLabel}):\n\n${vr.text}`, messageId, threadId).catch(() => {});
+            const targetLabel = indexedEntry ? ` — ${describeAudioTarget(indexedEntry)}` : '';
+            await sendMessage(token, chatId, `🎙 Re-transcribed (${engineLabel})${targetLabel}:\n\n${vr.text}`, messageId, threadId).catch(() => {});
             userText = formatTranscriptUserText(vr.text, {
               truncated: vr.truncated,
               kind: target.kind,

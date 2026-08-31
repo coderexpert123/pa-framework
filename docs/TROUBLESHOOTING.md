@@ -221,7 +221,7 @@ Expected on the local engine in `spawn` mode (the default) — it reloads the sp
 
 ### Transcription timed out or failed
 
-The bot's reply names the reason (timeout, no engine, auth failure, ffmpeg missing, file too large). Reply to the failed voice note with `/retranscribe` to retry — it reuses the cached audio if still available, so you don't need to resend the note.
+The bot's reply names the reason (timeout, no engine, auth failure, ffmpeg missing, file too large). Send `/retranscribe` to retry the most recent voice, audio, or video note in this topic; reply to a specific note to target it. It reuses the cached audio when still available, so you don't need to resend the note.
 
 ## Cross-platform issues
 

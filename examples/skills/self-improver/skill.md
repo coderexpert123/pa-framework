@@ -24,7 +24,7 @@ The self-improvement loop analyzes framework behavior and applies fixes automati
    - **Validation floor** — every applied change must pass its validation gate (fix/new-skill failing validation stays `pending`, never deploys broken)
    - **Protected-skills floor** — changes to git-workflow skills (commit, push, push-public, investigate-flagged) require explicit approval
    - **Critical-change flagging** — `isCriticalChange`/`hasRealSideEffects` proposals are recorded with risk flags rather than blocked
-6. **Commit** — one pathspec commit per applied fix (rolled back via `git revert` if needed)
+6. **Commit** — one pathspec commit per applied fix (rolled back via `git revert` if needed), only when `pa git-guard` allows it: inside a git work tree AND `git_workflow: { enabled: true }` in `~/.pa/config.yaml`. With the run-only default (`enabled: false`, what `pa init` scaffolds), the code-fix lane skips entirely — analysis and skill-draft proposals still run.
 7. **Audit trail** — every terminal decision logged to `~/.pa/self-improver-audit.jsonl` (diff, validation, run-stats)
 8. **Evaluation** — `pa improvements [--since N]` recomputes before/after state from the audit trail
 

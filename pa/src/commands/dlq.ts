@@ -32,6 +32,13 @@ async function loadDlq(): Promise<DlqEntry[]> {
   }
 }
 
+/** Entry counts for `pa status` — total plus how many are quarantined
+ *  (a quarantined entry will not be retried until `pa dlq replay`). */
+export async function dlqEntryCount(): Promise<{ total: number; quarantined: number }> {
+  const entries = await loadDlq();
+  return { total: entries.length, quarantined: entries.filter((e) => e.quarantined).length };
+}
+
 async function writeDlq(entries: DlqEntry[]): Promise<void> {
   const path = dlqPath();
   const tmp = path + '.tmp';

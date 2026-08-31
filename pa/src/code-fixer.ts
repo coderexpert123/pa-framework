@@ -16,6 +16,8 @@ import { recentActivity } from './commands/claim.js';
 import { readActive } from './lib/reservations.js';
 import { withBuildLock } from './lib/build-lock.js';
 import { parsePorcelainPaths } from './lib/git-status.js';
+import { checkGitWorkflowAllowed } from './lib/git-guard.js';
+import type { GitGuardResult } from './lib/git-guard.js';
 import type { DraftProposal, Skill } from './types.js';
 import type { FailureRecord } from './failure-analyzer.js';
 import type { AuditTestRunCounts } from './lib/improvement-audit.js';
@@ -101,7 +103,8 @@ export type CodeFixOutcome =
   // one-fix-per-night cap is gone; these three replace it as the per-run bounds.
   | 'code-fix-skipped-same-run-overlap'      // code-fixer: diff touches a file an earlier fix THIS run already changed
   | 'code-fix-skipped-target-already-attempted' // orchestrator: one attempt per target skill per run
-  | 'code-fix-skipped-budget-exhausted';      // orchestrator: per-run wall-clock budget spent
+  | 'code-fix-skipped-budget-exhausted'      // orchestrator: per-run wall-clock budget spent
+  | 'code-fix-skipped-git-disabled';         // git-optional gate: git_workflow disabled or not a work tree
 
 export interface CodeFixResult {
   outcome: CodeFixOutcome;
@@ -126,6 +129,8 @@ export interface CodeFixOptions {
   readActiveFn?: () => Promise<import('./lib/reservations.js').Reservation[]>;
   /** Test-only: overrides withBuildLock so tests never touch the real reservation store. */
   withBuildLockFn?: typeof withBuildLock;
+  /** Test-only: overrides the git-optional gate (2026-08-31 WP-B). */
+  gitGuardFn?: () => Promise<GitGuardResult>;
   /**
    * Repo-relative paths changed by code fixes ALREADY APPLIED earlier in the same nightly
    * run (2026-08-23 F5 rework). A diff that touches any of them is reverted and recorded as
@@ -716,6 +721,18 @@ export async function attemptCodeFix(
   // runBody() is a nested closure, so the narrowing this early-return performs on
   // proposal.target_skill itself doesn't carry across the function boundary.
   const targetSkillName = proposal.target_skill;
+
+  // Git-optional gate (2026-08-31, plans/2026-08-31-git-optional-SPEC.md): this
+  // lane commits and pushes on the user's behalf. Unless the deployment opted
+  // in (git_workflow.enabled — absent block = legacy-allowed) AND we are inside
+  // a git work tree, skip the whole lane: the nightly loop degrades to
+  // analysis + skill-draft proposals, exactly like the other skip outcomes.
+  const gitGuard = await (opts.gitGuardFn ?? checkGitWorkflowAllowed)();
+  if (!gitGuard.allowed) {
+    const reason = `Git not allowed — ${gitGuard.reason}. Code-fix lane skipped; analysis and skill-draft proposals unaffected.`;
+    await appendAuditRecord({ ...baseAudit, action: 'code-fix-skipped-git-disabled', reason });
+    return { outcome: 'code-fix-skipped-git-disabled', reason };
+  }
 
   // 2026-08-23 (alerts wave, WP-J2a): a maintenance-job target has no skill.md to load — its
   // "target" is a declared MaintenanceJob whose source file is proposal.code_target instead.

@@ -1,7 +1,7 @@
 import { readFile, writeFile } from 'fs/promises';
 import { parse as parseYaml } from 'yaml';
 import { configPath } from './paths.js';
-import type { PaConfig, WorkerConfig, EvaluatorConfig, BgTasksConfig, TunableSpec, TunableValues, MaintenanceConfig, TranscriptionConfig, TranscriptionEnginePreference, TranscriptionWorkerMode, UsageConfig } from './types.js';
+import type { PaConfig, WorkerConfig, EvaluatorConfig, BgTasksConfig, TunableSpec, TunableValues, MaintenanceConfig, TranscriptionConfig, TranscriptionEnginePreference, TranscriptionWorkerMode, UsageConfig, GitWorkflowConfig } from './types.js';
 
 /**
  * Parse a tunable's optional `values:` — a DISPLAY HINT, never a gate.
@@ -355,6 +355,25 @@ export function parseTranscription(raw: any): TranscriptionConfig | undefined {
   return resolveTranscriptionConfig(partial);
 }
 
+/** Parse the optional top-level `git_workflow:` block. WARN-AND-SKIP, same
+ *  house style as parseMaintenance/parseUsage. A skipped or absent block
+ *  resolves to undefined, which consumers read as ENABLED: pre-knob configs
+ *  keep their existing git behavior, and only an explicit `enabled: false`
+ *  opts a deployment out (pa init scaffolds exactly that for new installs). */
+export function parseGitWorkflow(raw: any): GitWorkflowConfig | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    console.warn("[config] ~/.pa/config.yaml: 'git_workflow' must be a mapping with 'enabled'; ignoring (git stays allowed)");
+    return undefined;
+  }
+  if (raw.enabled === undefined || raw.enabled === null) return undefined;
+  if (typeof raw.enabled !== 'boolean') {
+    console.warn(`[config] ~/.pa/config.yaml: git_workflow.enabled must be true/false (got ${JSON.stringify(raw.enabled)}); ignoring (git stays allowed)`);
+    return undefined;
+  }
+  return { enabled: raw.enabled };
+}
+
 /** Parse the optional top-level `usage:` block. WARN-AND-SKIP, same
  *  house style as parseTunables/parseMaintenance/parseTranscription. */
 export function parseUsage(raw: any): UsageConfig | undefined {
@@ -541,6 +560,7 @@ export async function loadConfig(): Promise<PaConfig> {
       transcription: parseTranscription(parsed.transcription),
       usage: parseUsage(parsed.usage),
       cost_tier: parseCostTier(parsed.cost_tier),
+      git_workflow: parseGitWorkflow(parsed.git_workflow),
       quota_aware_failover: typeof parsed.quota_aware_failover === 'boolean' ? parsed.quota_aware_failover : false,
       worker_pin: typeof parsed.worker_pin === 'string' ? parsed.worker_pin.trim() : undefined,
     };

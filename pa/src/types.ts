@@ -203,10 +203,19 @@ export interface PaConfig {
   cost_tier?: CostTierConfig;  // optional cost-tier window configuration
   quota_aware_failover?: boolean;  // opt-in flag for health-score-based worker ordering (default false)
   worker_pin?: string;  // persisted override for 'pa worker pin <name>'
+  git_workflow?: GitWorkflowConfig;  // absent = legacy git-allowed; see GitWorkflowConfig
 }
 
 export interface UsageConfig {
   budget_monthly_usd?: number;  // optional monthly budget in USD; parsed but alerting is not implemented yet — reserved for future budget alerts
+}
+
+/** Opt-in switch for skills that run git on the user's behalf (commit/push/
+ *  revert). ABSENT = enabled: every config written before this knob existed
+ *  (2026-08-31) keeps its git behavior; `pa init` scaffolds the block with
+ *  enabled: false so NEW installs default to run-only (persona B). */
+export interface GitWorkflowConfig {
+  enabled: boolean;
 }
 
 export interface CostTierPeakWindowUtc {

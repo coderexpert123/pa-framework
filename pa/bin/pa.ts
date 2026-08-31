@@ -30,6 +30,8 @@ import { chainRunCommand, chainListCommand } from '../src/commands/chain.js';
 import { sloReportCommand } from '../src/commands/slo.js';
 import { rulesCommand } from '../src/commands/rules.js';
 import { fixCommand } from '../src/commands/fix.js';
+import { gitGuardCommand } from '../src/commands/git-guard.js';
+import { statusCommand } from '../src/commands/status.js';
 
 async function mcpServeCommand(): Promise<void> {
   // @ts-ignore - .mjs module without declaration file
@@ -132,7 +134,9 @@ Usage:
   pa reject <name>            Reject a skill draft
   pa fix <family> [--note "..."]  Record a shipped fix in the fix ledger (stops the family re-alerting)
   pa fix --list                 List fix-ledger records (oldest first)
+  pa git-guard [<dir>]        Check whether skills may run git on your behalf (exit 0 = yes, 1 = no)
   pa health                   Show system health status
+  pa status                   One-screen overview: health, git, skills/next-due, claims, DLQ, maintenance
   pa notify --subject <s> (--body <b> | --body-file <path> | --body-stdin) [--dedup-key <k>] [--topic-thread <id>] [--severity info|warn|error]
   pa bgtasks [--json] [--kill <pid>]  List or kill background descendant processes
   pa ref <refId>              Look up what message produced a Ref ID (e.g. 'pa ref c-a59a')
@@ -282,8 +286,16 @@ async function main(): Promise<void> {
         await fixCommand(args.slice(1));
         break;
 
+      case 'git-guard':
+        process.exitCode = await gitGuardCommand(args[1]);
+        break;
+
       case 'health':
         await healthCommand(args.slice(1));
+        break;
+
+      case 'status':
+        await statusCommand();
         break;
 
       case 'notify':

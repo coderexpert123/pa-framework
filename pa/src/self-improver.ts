@@ -30,6 +30,8 @@ import { analyzeFailurePatterns, checkForRollbacks, readRecentFailures, censusPr
 import type { FailureRecord } from './failure-analyzer.js';
 import { attemptCodeFix, CHURN_PATHSPEC_ARGS, isChurnPath, parsePorcelainPaths, popChurn, stashChurn, GIT_WORKFLOW_RESOURCE, GIT_LOCK_WAIT_MS } from './code-fixer.js';
 import type { BlackboardLockClient } from './code-fixer.js';
+import { checkGitWorkflowAllowed } from './lib/git-guard.js';
+import type { GitGuardResult } from './lib/git-guard.js';
 import { analyzeFeedbackPatterns } from './feedback-analyzer.js';
 import { exec as execCb } from 'child_process';
 import { promisify } from 'util';
@@ -259,6 +261,8 @@ export interface RollbackDeps {
   execFn?: (command: string, options?: { cwd?: string }) => Promise<{ stdout: string; stderr: string }>;
   blackboardFn?: BlackboardLockClient;
   notifyUserFn?: typeof notifyUser;
+  /** Test-only: overrides the git-optional gate for the git-revert branch (2026-08-31 WP-B). */
+  gitGuardFn?: () => Promise<GitGuardResult>;
 }
 
 type RollbackExec = NonNullable<RollbackDeps['execFn']>;
@@ -377,7 +381,7 @@ export async function gitRevertPreservingChurn(
 }
 
 export async function rollback(deps: RollbackDeps = {}): Promise<string[]> {
-  const { checkForRollbacksFn = checkForRollbacks, execFn = defaultRollbackExec, blackboardFn, notifyUserFn = notifyUser } = deps;
+  const { checkForRollbacksFn = checkForRollbacks, execFn = defaultRollbackExec, blackboardFn, notifyUserFn = notifyUser, gitGuardFn = checkGitWorkflowAllowed } = deps;
   const flags = await checkForRollbacksFn();
   // The overwhelming common case — checkForRollbacksFn() reads run metadata only, no git —
   // so this must never pay for or contend on a lock it doesn't need.
@@ -433,6 +437,14 @@ export async function rollback(deps: RollbackDeps = {}): Promise<string[]> {
         // pa/data/profile* churn can neither abort it nor be destroyed by it.
         if (!flag.commitHash) {
           throw new Error('git-revert rollback flag carries no commit hash — nothing to revert.');
+        }
+        // Git-optional gate (2026-08-31 WP-B): a deployment that disabled git after a fix
+        // was applied cannot autonomously revert it. Throwing lands in the catch below,
+        // which already writes a 'rollback-failed' audit record, a postmortem stub, and a
+        // pa-alerts notification — a bad fix left LIVE must be visible, never silently kept.
+        const rollbackGuard = await gitGuardFn();
+        if (!rollbackGuard.allowed) {
+          throw new Error(`git workflow not allowed (${rollbackGuard.reason}) — manual revert of ${flag.commitHash} required`);
         }
         const { revertCommitHash, churnRestoreError } = await gitRevertPreservingChurn(flag.commitHash, execFn);
         // Push to whatever branch HEAD actually tracks — do NOT hardcode a branch name (the
