@@ -30,8 +30,19 @@ export interface Reservation {
   expiresAt: string;   // ISO 8601 UTC
 }
 
+export interface ReleasedReservation {
+  id: string;
+  paths: string[];
+  session: string;
+  note: string;
+  claimedAt: string;   // ISO 8601 UTC — when the reservation was originally claimed.
+  releasedAt: string;  // ISO 8601 UTC — when it was released.
+}
+
 export interface ReservationStore {
   reservations: Reservation[];
+  /** Release ledger — entries older than RELEASE_LEDGER_TTL_MS are pruned. */
+  released?: ReleasedReservation[];
 }
 
 export interface ClaimOptions {
@@ -63,10 +74,14 @@ export interface ReleaseOptions {
   ownerSession?: string;
   /** Logging-only: the session performing the forced release. */
   bySession?: string;
+  /** Injectable clock for tests. Defaults to Date.now(). */
+  now?: number;
 }
 
 export const DEFAULT_TTL_MINUTES = 45;
 export const MAX_TTL_MINUTES = 240;
+/** How long a release-ledger entry survives before it is pruned (6h). */
+export const RELEASE_LEDGER_TTL_MS = 6 * 60 * 60 * 1000;
 const MINUTE_MS = 60_000;
 
 export function reservationsPath(): string {
@@ -285,12 +300,33 @@ export async function renew(
 
 export async function release(opts: ReleaseOptions): Promise<{ released: number }> {
   const result = await mutate((store) => {
+    const now = opts.now ?? Date.now();
+    const isMatch = (r: Reservation): boolean => {
+      if (opts.id !== undefined) return r.id === opts.id;
+      if (opts.session !== undefined) return r.session === opts.session;
+      return false;
+    };
+
     const before = store.reservations.length;
-    store.reservations = store.reservations.filter((r) => {
-      if (opts.id !== undefined) return r.id !== opts.id;
-      if (opts.session !== undefined) return r.session !== opts.session;
-      return true;
-    });
+    const removed = store.reservations.filter(isMatch);
+    store.reservations = store.reservations.filter((r) => !isMatch(r));
+
+    if (removed.length > 0) {
+      const releasedAt = new Date(now).toISOString();
+      const newEntries: ReleasedReservation[] = removed.map((r) => ({
+        id: r.id,
+        paths: r.paths,
+        session: r.session,
+        note: r.note,
+        claimedAt: r.claimedAt,
+        releasedAt,
+      }));
+      store.released = [...(store.released ?? []), ...newEntries];
+    }
+
+    const cutoff = now - RELEASE_LEDGER_TTL_MS;
+    store.released = (store.released ?? []).filter((e) => new Date(e.releasedAt).getTime() > cutoff);
+
     return { released: before - store.reservations.length };
   });
 
@@ -319,6 +355,8 @@ export async function gcExpired(now: number = Date.now()): Promise<number> {
   const removed = await mutate((store) => {
     const before = store.reservations.length;
     store.reservations = store.reservations.filter((r) => new Date(r.expiresAt).getTime() > now);
+    const cutoff = now - RELEASE_LEDGER_TTL_MS;
+    store.released = (store.released ?? []).filter((e) => new Date(e.releasedAt).getTime() > cutoff);
     return before - store.reservations.length;
   });
 
@@ -330,4 +368,22 @@ export async function gcExpired(now: number = Date.now()): Promise<number> {
   }
 
   return removed;
+}
+
+/**
+ * Reservations released at or after `sinceMs`, still inside the release-ledger TTL.
+ * A read, not a mutate — does not touch the file lock or the mutate queue.
+ */
+export async function readReleasedSince(
+  sinceMs: number,
+  now: number = Date.now()
+): Promise<ReleasedReservation[]> {
+  const path = reservationsPath();
+  await ensureFile(path);
+  const store = await readStore(path);
+  const cutoff = now - RELEASE_LEDGER_TTL_MS;
+  return (store.released ?? []).filter((e) => {
+    const t = new Date(e.releasedAt).getTime();
+    return t >= sinceMs && t > cutoff;
+  });
 }

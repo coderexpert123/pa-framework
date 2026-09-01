@@ -25,6 +25,7 @@ import { deliveredKey, wasDelivered, markDelivered, _resetDeliveredCacheForTest 
 import { isTopicRecovering, _resetRecoveryGateForTest } from '../recovery-gate.js';
 import { markTopicStopped, _clearStoppedForTest } from '../worker-stop.js';
 import { takeResend, resendKey, _resetResendStoreForTest } from '../resend-store.js';
+import { waitForDrain } from './test-teardown-guard.js';
 
 let home: string;
 
@@ -37,7 +38,8 @@ beforeEach(() => {
   _resetResendStoreForTest();
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await waitForDrain();
   delete process.env.PA_HOME;
   _resetPendingDispatchesForTest();
   _resetDeliveredCacheForTest();

@@ -12,6 +12,7 @@ Mirror conventions from memory_consolidation.py for audit compatibility.
 """
 
 import argparse
+import glob
 import json
 import os
 import re
@@ -238,8 +239,12 @@ def count_new_turns(turns: List[Dict], covers_through: Optional[str]) -> int:
         return len(turns)
 
 
-def plan(pa_home: str) -> int:
+def plan(pa_home: str, rescan_keys: Optional[List[str]] = None) -> int:
     """Generate workplan and slice files.
+
+    Args:
+        pa_home: PA_HOME path
+        rescan_keys: Optional list of topic keys for rescan mode (comma-separated from --rescan)
 
     Returns 0 on success, 1 on error.
     """
@@ -247,6 +252,36 @@ def plan(pa_home: str) -> int:
     os.makedirs(paths['topic_brains_dir'], exist_ok=True)
     os.makedirs(paths['slices_dir'], exist_ok=True)
     os.makedirs(paths['staged_dir'], exist_ok=True)
+
+    # Rescan mode: upfront validation per §3.1.1-3.1.3 BEFORE any archive streaming
+    rescan_topic_keys: Set[str] = set()
+    rescan_thread_ids: Set[int] = set()
+    if rescan_keys:
+        # Load EXEMPT registry once for validation (hoist from loop for efficiency)
+        exempt_registry = load_exempt_registry(paths['exempt_registry'])
+        hard_classes = {'output-only', 'duplicate', 'one-off', 'pinned-guide'}
+
+        # Validate each rescan key
+        for key in rescan_keys:
+            # (a) Regex validation: ^-?\d+_\d+$
+            if not re.match(r'^-?\d+_\d+$', key):
+                print(f"Error: Invalid rescan key format: {key}", file=sys.stderr)
+                return 1
+
+            # (b) Check state file exists
+            state_file = os.path.join(pa_home, f'telegram-bot-topic-{key}.json')
+            if not os.path.exists(state_file):
+                print(f"Error: Rescan key has no state file: {key}", file=sys.stderr)
+                return 1
+
+            # (c) Not hard-exempt
+            if key in exempt_registry and exempt_registry[key] in hard_classes:
+                print(f"Error: Rescan key is hard-exempt: {key}", file=sys.stderr)
+                return 1
+
+            # Populate both sets: topic_key for validation, thread_id for cutoff bypass
+            rescan_topic_keys.add(key)
+            rescan_thread_ids.add(int(key.split('_')[1]))
 
     # Read scheduling caps (opt-in budget guards, default unlimited since 2026-08-31)
     max_tasks = _parse_optional_int_cap(os.environ.get('PA_TOPIC_BRAINS_MAX_TASKS'), 'PA_TOPIC_BRAINS_MAX_TASKS')
@@ -258,6 +293,14 @@ def plan(pa_home: str) -> int:
     collision_set: Set[str] = set()
     for keys in collisions.values():
         collision_set.update(keys)
+
+    # Collision validation for rescan keys (spec §3.1.1(d))
+    # Must happen after collision_set is fully built
+    if rescan_keys:
+        for key in rescan_topic_keys:
+            if key in collision_set:
+                print(f"Error: Rescan key is in a thread-id collision: {key}", file=sys.stderr)
+                return 1
 
     # Load EXEMPT registry (spec §3.1)
     exempt_registry = load_exempt_registry(paths['exempt_registry'])
@@ -290,47 +333,74 @@ def plan(pa_home: str) -> int:
         _, covers, _ = stamp_cache.get(topic_key, (None, None, None))
         cutoff_map[thread_id] = covers  # 'none' or None or ISO timestamp
 
-    # Single archive pass with cutoff-aware disk spooling (no truncation, RAM bounded by design)
+    # Iterate ALL input files per §3.2: sorted archive glob THEN live file
+    # Shared dedupe set across all files, hygiene order applied to every row
     # Spools to .slices/.spool-<threadId>.jsonl, returns {threadId: (new_turns, newest_turn_ts)}
-    def spool_archive_with_cutoff(archive_path: str) -> Dict[int, Tuple[int, Optional[str]]]:
-        """Stream archive once, spooling new turns per thread to disk.
+    def spool_archive_with_cutoff(input_files: List[str]) -> Dict[int, Tuple[int, Optional[str]]]:
+        """Stream all input files, spooling eligible turns per thread to disk.
 
-        Hard-exempt threads are NOT spooled (they'll be skipped anyway).
+        Args:
+            input_files: List of file paths in lexical order (oldest archive first, then live)
+
         Returns mapping from threadId to (newTurns, newestTurnTs).
         """
         thread_state: Dict[int, Tuple[int, Optional[str]]] = {}
         spool_dir = paths['slices_dir']
+        seen_dedupe_keys: Set[Tuple] = set()  # Global dedupe across all input files
 
-        if not os.path.exists(archive_path):
-            return thread_state
-
-        # Build set of thread_ids that might be selected (non-hard-exempt)
-        # Hard-exempt keys are known before the stream, so we skip spooling them entirely
+        # Build set of thread_ids that might be selected (non-hard-exempt, non-collision)
         eligible_thread_ids: Set[int] = set()
         for _, chat_id, thread_id, _ in topics:
             topic_key = f"{chat_id}_{thread_id}"
-            if topic_key not in hard_exempt_keys and thread_id not in collisions:
+            if topic_key not in hard_exempt_keys and topic_key not in collision_set:
                 eligible_thread_ids.add(thread_id)
 
-        try:
-            with open(archive_path, 'r', encoding='utf-8') as f:
-                for line_num, line in enumerate(f, 1):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        turn = json.loads(line)
-                        thread_id = turn.get('thread_id')
-                        if not thread_id:
+        for archive_path in input_files:
+            if not os.path.exists(archive_path):
+                continue
+
+            try:
+                with open(archive_path, 'r', encoding='utf-8') as f:
+                    for line_num, line in enumerate(f, 1):
+                        line = line.strip()
+                        if not line:
                             continue
+
+                        # Hygiene step 1: Unparseable line → skip with warning
+                        try:
+                            turn = json.loads(line)
+                        except json.JSONDecodeError:
+                            print(f"Warning: Skipping unparseable line {line_num} in {archive_path}", file=sys.stderr)
+                            continue
+
+                        # Hygiene step 2: thread_id absent/non-int/bool/<=0 → skip silently
+                        thread_id = turn.get('thread_id')
+                        if not thread_id or not isinstance(thread_id, int) or isinstance(thread_id, bool) or thread_id <= 0:
+                            continue
+
+                        # Hygiene step 3: timestamp missing or starting '1970-01-01' → skip silently
+                        timestamp = turn.get('timestamp', '')
+                        if not timestamp or timestamp.startswith('1970-01-01'):
+                            continue
+
+                        # Hygiene step 4: Dedupe key (global across files, scoped per thread)
+                        message_id = turn.get('message_id')
+                        if message_id:
+                            dedupe_key = (thread_id, 'm', message_id)
+                        else:
+                            text = turn.get('text', '')
+                            dedupe_key = (thread_id, 't', timestamp, ' '.join(text.split()).lower())
+                        if dedupe_key in seen_dedupe_keys:
+                            continue  # Already seen this exact turn
+                        seen_dedupe_keys.add(dedupe_key)
 
                         # Always track newest timestamp for ALL threads (dormant rule needs it)
                         # Do this first, before cutoff check, so dormant rule works even for exempt threads
                         try:
-                            turn_ts = datetime.fromisoformat(turn['timestamp'].replace('Z', '+00:00'))
+                            turn_ts = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
                             newest_ts = thread_state.get(thread_id, (0, None))[1]
                             if newest_ts is None or turn_ts > datetime.fromisoformat(newest_ts.replace('Z', '+00:00')):
-                                newest_ts = turn['timestamp']
+                                newest_ts = timestamp
                         except (ValueError, KeyError):
                             pass  # Unparsable timestamp: don't update newest
 
@@ -344,9 +414,13 @@ def plan(pa_home: str) -> int:
                             thread_state[thread_id] = (0, newest_ts)
                             continue
 
-                        # Cutoff filter: only spool turns newer than the stamp's covers timestamp
+                        # Cutoff filter: rescan threads bypass cutoff entirely (treat as none)
+                        # Non-rescan threads: only spool turns newer than the stamp's covers timestamp
                         cutoff = cutoff_map.get(thread_id)
-                        if cutoff and cutoff != 'none':
+                        if thread_id in rescan_thread_ids:
+                            # Rescan mode: treat cutoff as none (skip comparison)
+                            pass
+                        elif cutoff and cutoff != 'none':
                             try:
                                 cutoff_dt = datetime.fromisoformat(cutoff.replace('Z', '+00:00'))
                                 if turn_ts <= cutoff_dt:
@@ -368,15 +442,20 @@ def plan(pa_home: str) -> int:
                             print(f"Warning: Cannot write spool file for thread {thread_id}: {e}", file=sys.stderr)
                             return thread_state  # Abort on spool failure
 
-                    except json.JSONDecodeError:
-                        print(f"Warning: Skipping unparseable line {line_num} in archive", file=sys.stderr)
-                        continue
-        except IOError as e:
-            print(f"Warning: Cannot read archive file: {e}", file=sys.stderr)
+            except IOError as e:
+                print(f"Warning: Cannot read archive file {archive_path}: {e}", file=sys.stderr)
 
         return thread_state
 
-    thread_bounds = spool_archive_with_cutoff(paths['conversation_history'])
+    # Build input file list: sorted archive glob THEN live file (spec §3.2)
+    input_files: List[str] = []
+    archive_dir = os.path.join(pa_home, 'archive')
+    if os.path.exists(archive_dir):
+        archive_files = sorted(glob.glob(os.path.join(archive_dir, '*-conversation-history.jsonl')))
+        input_files.extend(archive_files)
+    input_files.append(paths['conversation_history'])  # Live file last
+
+    thread_bounds = spool_archive_with_cutoff(input_files)
 
     # Build candidates
     candidates = []
@@ -428,8 +507,28 @@ def plan(pa_home: str) -> int:
         if thread_id in thread_bounds:
             new_turns, newest_turn_ts = thread_bounds[thread_id]
 
-        # Dormant rule: skip if newest turn is older than 30 days (spec §3.2)
-        if topic_key in exempt_registry and exempt_registry[topic_key] == 'dormant':
+        # Rescan mode handling (spec §3.1.4, §4 item 4)
+        is_rescan = topic_key in rescan_topic_keys
+
+        # In rescan mode: non-rescan topics are skipped with reason 'rescan-excluded'
+        # (collision and hard-exempt reasons still take precedence - they were handled above)
+        if rescan_keys and not is_rescan:
+            candidates.append({
+                'topicKey': topic_key,
+                'chatId': chat_id,
+                'threadId': thread_id,
+                'topicName': topic_name,
+                'reason': 'rescan-excluded',
+                'skip': True,
+            })
+            continue
+
+        # Rescan topics bypass the dormant rule and activity gate
+        if is_rescan:
+            # Skip dormant rule for rescan topics
+            pass
+        elif topic_key in exempt_registry and exempt_registry[topic_key] == 'dormant':
+            # Dormant rule applies only to non-rescan topics
             if newest_turn_ts:
                 try:
                     newest_dt = datetime.fromisoformat(newest_turn_ts.replace('Z', '+00:00'))
@@ -448,22 +547,29 @@ def plan(pa_home: str) -> int:
                     pass  # Unparsable timestamp: don't apply dormant rule
 
         # Activity gate: staged file counts as activity (spec §3.2)
-        if new_turns == 0 and not has_staged:
-            candidates.append({
-                'topicKey': topic_key,
-                'chatId': chat_id,
-                'threadId': thread_id,
-                'topicName': topic_name,
-                'reason': 'no-new-turns',
-                'skip': True,
-            })
-            continue
+        # Rescan topics bypass this gate
+        if not is_rescan:
+            if new_turns == 0 and not has_staged:
+                candidates.append({
+                    'topicKey': topic_key,
+                    'chatId': chat_id,
+                    'threadId': thread_id,
+                    'topicName': topic_name,
+                    'reason': 'no-new-turns',
+                    'skip': True,
+                })
+                continue
 
-        # Determine kind
-        if not brain_exists:
+        # Determine kind: rescan topics get kind='rescan', others get seed/delta
+        if is_rescan:
+            kind = 'rescan'
+            covers_through = 'none'  # Rescan tasks have coversThrough='none' (spec §3.1.5)
+        elif not brain_exists:
             kind = 'seed'
+            covers_through = covers
         else:
             kind = 'delta'
+            covers_through = covers
 
         # Check for split
         split = False
@@ -488,10 +594,11 @@ def plan(pa_home: str) -> int:
             'split': split,
             'brainPath': brain_path,
             'brainExists': brain_exists,
-            'coversThrough': covers,
+            'coversThrough': covers_through,
             'newTurns': new_turns,
             'skip': False,
             'spoolPath': spool_path,  # For slice promotion (only if selected)
+            'isRescan': is_rescan,  # Track rescan status for caps bypass
         }
 
         if has_staged:
@@ -516,17 +623,20 @@ def plan(pa_home: str) -> int:
             skipped.append(skip_entry)
             continue
 
-        # Task cap (optional)
-        if max_tasks is not None and task_count >= max_tasks:
-            skipped.append({'topicKey': c['topicKey'], 'reason': 'deferred-cap'})
-            continue
-
-        # Seed cap (optional)
-        if c['kind'] == 'seed':
-            if max_seeds is not None and seed_count >= max_seeds:
+        # Caps block: kind=='rescan' candidates bypass both env caps and do not increment counters (spec §4 item 5)
+        is_rescan = c.get('isRescan', False)
+        if not is_rescan:
+            # Task cap (optional)
+            if max_tasks is not None and task_count >= max_tasks:
                 skipped.append({'topicKey': c['topicKey'], 'reason': 'deferred-cap'})
                 continue
-            seed_count += 1
+
+            # Seed cap (optional)
+            if c['kind'] == 'seed':
+                if max_seeds is not None and seed_count >= max_seeds:
+                    skipped.append({'topicKey': c['topicKey'], 'reason': 'deferred-cap'})
+                    continue
+                seed_count += 1
 
         # Promote spool to slice(s) with parts (Task A item 3)
         # Hardcoded constant: ~100KB per part, break on line boundaries only
@@ -702,13 +812,24 @@ def plan(pa_home: str) -> int:
     except OSError:
         pass  # Slices dir may not exist yet
 
-    # Write workplan
+    # Part promotion complete: check if any rescan key spooled 0 unique rows (spec §3.1.3)
+    if rescan_keys:
+        for task in tasks:
+            if task.get('kind') == 'rescan' and task.get('newTurns', 0) == 0:
+                print(f"Error: Rescan key {task['topicKey']} yielded 0 unique eligible rows", file=sys.stderr)
+                return 1
+
+    # Write workplan (spec §4 item 7)
     workplan = {
         'generatedAt': datetime.now(timezone.utc).isoformat(),
         'tasks': tasks,
         'folds': folds,
         'skipped': skipped,
     }
+
+    # Add top-level "rescan": true ONLY in rescan mode (nightly workplans omit the key)
+    if rescan_keys:
+        workplan['rescan'] = True
 
     try:
         temp_path = paths['workplan'] + '.tmp'
@@ -1008,16 +1129,30 @@ def finalize(pa_home: str, stamp_topic_key: Optional[str] = None) -> int:
                 else:
                     content = ''
 
-                # Get max timestamp from slice
-                slice_path = os.path.join(paths['slices_dir'], f'{topic_key}.jsonl')
+                # Get max timestamp from ALL parts (spec §3.3 D4 fix)
+                # Collect <slices_dir>/<key>.jsonl AND sorted <slices_dir>/<key>.part*.jsonl
                 max_ts = None
                 try:
                     turns = []
-                    with open(slice_path, 'r', encoding='utf-8') as f:
-                        for line in f:
-                            line = line.strip()
-                            if line:
-                                turns.append(json.loads(line))
+
+                    # Read main slice file if it exists
+                    slice_path = os.path.join(paths['slices_dir'], f'{topic_key}.jsonl')
+                    if os.path.exists(slice_path):
+                        with open(slice_path, 'r', encoding='utf-8') as f:
+                            for line in f:
+                                line = line.strip()
+                                if line:
+                                    turns.append(json.loads(line))
+
+                    # Read all part files in sorted order
+                    part_files = sorted(glob.glob(os.path.join(paths['slices_dir'], f'{topic_key}.part*.jsonl')))
+                    for part_path in part_files:
+                        with open(part_path, 'r', encoding='utf-8') as f:
+                            for line in f:
+                                line = line.strip()
+                                if line:
+                                    turns.append(json.loads(line))
+
                     if turns:
                         max_ts = max(t['timestamp'] for t in turns)
                 except (IOError, json.JSONDecodeError):
@@ -1027,7 +1162,7 @@ def finalize(pa_home: str, stamp_topic_key: Optional[str] = None) -> int:
                 # Explicit IST offset (+05:30)
                 now_ist = datetime.now(IST)
                 consolidated = now_ist.isoformat()
-                covers = max_ts or 'consolidated'
+                covers = max_ts or 'consolidated'  # Fallback to 'consolidated' literal only when no file/rows exist
 
                 # Remove existing stamp
                 content = re.sub(r'<!-- topic-brain:.*?-->\n?', '', content, flags=re.DOTALL)
@@ -1402,6 +1537,11 @@ def main():
 
     # plan subcommand
     plan_parser = subparsers.add_parser('plan', help='Generate workplan and slice files')
+    plan_parser.add_argument(
+        '--rescan',
+        metavar='TOPIC_KEYS',
+        help='Comma-separated topic keys for rescan mode (e.g., --rescan=-1001234567890_310,-1001234567890_8306)'
+    )
 
     # finalize subcommand
     finalize_parser = subparsers.add_parser('finalize', help='Finalize results: stamp, fold, INDEX')
@@ -1413,15 +1553,17 @@ def main():
 
     # topicKeys in this deployment start with '-' (supergroup chat IDs are
     # negative), and argparse reads a leading-dash value as another flag.
-    # Normalize "--stamp -100..._7822" to "--stamp=-100..._7822" before parsing
-    # so the spec's documented space-separated form works (Gate D2 finding,
-    # 2026-08-21).
+    # Normalize "--stamp -100..._7822" to "--stamp=-100..._7822" and
+    # "--rescan -100..._310,-100..._8306" to "--rescan=-100..._310,-100..._8306"
+    # before parsing so the spec's documented space-separated form works
+    # (Gate D2 finding, 2026-08-21).
     argv = sys.argv[1:]
-    if '--stamp' in argv:
-        i = argv.index('--stamp')
-        if i + 1 < len(argv) and argv[i + 1].startswith('-'):
-            argv[i] = '--stamp=' + argv[i + 1]
-            del argv[i + 1]
+    for flag_name in ['--stamp', '--rescan']:
+        if flag_name in argv:
+            i = argv.index(flag_name)
+            if i + 1 < len(argv) and argv[i + 1].startswith('-'):
+                argv[i] = flag_name + '=' + argv[i + 1]
+                del argv[i + 1]
     args = parser.parse_args(argv)
 
     if not args.command:
@@ -1431,7 +1573,12 @@ def main():
     pa_home = resolve_pa_home()
 
     if args.command == 'plan':
-        return plan(pa_home)
+        # Parse rescan keys if provided
+        rescan_keys = None
+        rescan_arg = getattr(args, 'rescan', None)
+        if rescan_arg:
+            rescan_keys = [k for k in rescan_arg.split(',') if k]
+        return plan(pa_home, rescan_keys=rescan_keys)
     elif args.command == 'finalize':
         return finalize(pa_home, stamp_topic_key=getattr(args, 'stamp', None))
     else:

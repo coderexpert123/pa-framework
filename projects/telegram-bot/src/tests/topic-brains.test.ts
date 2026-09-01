@@ -5,6 +5,7 @@ import { existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { getTopicBrainInfo } from '../topic-brains.js';
+import { waitForDrain } from './test-teardown-guard.js';
 
 // The literal stamp format from spec §3.2 — tests quote this verbatim
 const STAMP_LITERAL = '<!-- topic-brain: consolidated=2026-08-21T21:30:00+05:30 covers=2026-08-21T18:03:11.000Z -->';
@@ -17,6 +18,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  await waitForDrain();
   delete process.env.PA_HOME;
   await rm(tempDir, { recursive: true, force: true });
 });

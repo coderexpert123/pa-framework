@@ -1,11 +1,11 @@
-import { spawn, execFile } from 'child_process';
+import { spawn, execFile, execFileSync } from 'child_process';
 import { randomBytes, randomUUID } from 'crypto';
-import { existsSync, unlinkSync, writeFileSync, mkdirSync } from 'fs';
+import { existsSync, unlinkSync, writeFileSync } from 'fs';
 import { readdir, unlink, rename, writeFile, readFile, stat, mkdir } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
 import { acquireLock, releaseLock } from './lock.js';
-import { getUpdates, sendMessage, sendMessageWithId, pinChatMessage, unpinChatMessage, sendTyping, setMessageReaction, downloadFile, editMessageText, createForumTopic, deleteMessage, sendMessageWithKeyboard } from './telegram.js';
+import { getUpdates, sendMessage, sendMessageWithId, pinChatMessage, unpinChatMessage, sendTyping, setMessageReaction, editMessageText, createForumTopic, deleteMessage, sendMessageWithKeyboard } from './telegram.js';
 import type { InlineKeyboardMarkup } from './telegram.js';
 import {
   handleCallbackQuery,
@@ -118,6 +118,7 @@ import {
   getWorkerCooldown,
   checkWorker,
 } from '../../../pa/dist/src/workers.js';
+import { openWindow, closeWindow, type DispatchWindow } from '../../../pa/dist/src/lib/worker-edit-audit.js';
 import {
   isSessionValid,
   buildResumeArgs,
@@ -151,17 +152,14 @@ import {
 import {
   transcribeVoiceMessage,
   formatTranscriptUserText,
-  formatFailedTranscriptUserText,
   voiceErrorMessage,
   extractAudioAttachment,
   findCachedAudio,
-  voiceAttachmentPath,
   type AudioAttachmentKind,
   type VoiceResult,
 } from './voice.js';
 import {
   audioIndexRoot,
-  recordAudioMessage,
   markAudioResult,
   loadAudioIndex,
   selectRetranscribeTarget,
@@ -177,6 +175,7 @@ import {
 } from './voice-prefetch.js';
 import { resolveReplyContext } from './reply-context.js';
 import { findSessionForRefId } from './ref-lookup.js';
+import { runAttachmentStage } from './attachment-stage.js';
 
 // Import pa modules
 import { loadSecrets } from '../../../pa/dist/src/secrets.js';
@@ -1203,7 +1202,6 @@ function spawnReauthLink(chatId: number, threadId: number | undefined, runtimeEn
  */
 function execPaCommand(args: string[], maxChars: number = 1200): string {
   try {
-    const { execFileSync } = require('node:child_process') as typeof import('node:child_process');
     const stdout = execFileSync(
       'node',
       ['pa/dist/bin/pa.js', ...args],
@@ -1225,7 +1223,6 @@ function execPaCommand(args: string[], maxChars: number = 1200): string {
  */
 function execPaRef(refId: string): string {
   try {
-    const { execFileSync } = require('node:child_process') as typeof import('node:child_process');
     const stdout = execFileSync(
       'node',
       ['pa/dist/bin/pa.js', 'ref', refId],
@@ -1343,116 +1340,34 @@ async function processUpdate(
     // Resolve workdir once per processUpdate (§3.3)
     const workdir = await ensureTopicWorkdir(await resolveTopicWorkdir(topicState), BOT_CWD);
 
-    // Hoisted above the voice-handling block (hardened plan WP6 item 4) —
-    // load-bearing: without this, a failed note's bracketed error text
-    // (>25 chars) would reach the pendingDescription branch below and
-    // silently rename the topic, since that branch used to be the first
-    // thing to see `userText` after this block ran.
-    let response = '';
-    let skipWorker = false;
-    // Set when userText came from a transcribed voice/audio message, not typed
-    // by the user — guards the pendingDescription branch below from treating a
-    // transcribed sentence as an intentional answer to "what's this topic for?".
-    let voiceTranscribed = false;
-
-    const audioAttachment = extractAudioAttachment(msg);
-    // A5: __skipVoice for command-captioned media — skip transcription entirely.
-    // The normalizer set this when enqueue saw a caption starting with '/'.
-    if ((update as any).__skipVoice) {
-      // Leave userText as-is (caption or text). No transcription.
-      // Fall through to command parsing with the original caption.
-    } else if (audioAttachment) {
-      // A5/D2: Consume prefetched result if present; otherwise transcribe inline.
-      // Durable audio index (2026-08-31 retranscribe-smart plan): record BEFORE
-      // transcription so failed notes are recoverable by a bare /retranscribe.
-      // Best-effort by contract — an index failure must never break the note.
-      recordAudioMessage(audioIndexRoot(), chatId, {
-        messageId,
-        threadId: threadId || null,
-        kind: audioAttachment.kind,
-        media: audioAttachment.media,
-        date: new Date().toISOString(),
-      }).catch(() => {});
-      let vr: VoiceResult;
-      const prefetched = (update as any).__voiceResult as VoiceResult | undefined;
-      if (prefetched) {
-        vr = prefetched;
-      } else {
-        vr = await transcribeVoiceMessage(token, chatId, audioAttachment.media, {
-          repoRoot: BOT_CWD,
-          env: runtimeEnv,
-          transcription: config.transcription,
-          threadId,
-        }, audioAttachment.kind);
-      }
-      markAudioResult(
-        audioIndexRoot(),
-        chatId,
-        audioAttachment.media.file_unique_id,
-        vr.ok ? 'ok' : 'failed',
-        vr.ok ? { engine: vr.engine } : { reason: vr.reason }
-      ).catch(() => {});
-      const forwardedFrom = describeForwardOrigin(msg);
-      if (!vr.ok) {
-        // D2: If normalizer already combined held entries + transcript, don't overwrite.
-        if (!(update as any).__heldAbsorbed) {
-          userText = formatFailedTranscriptUserText(audioAttachment.kind, vr.reason, { caption: msg.caption });
-        }
-        response = voiceErrorMessage(vr);
-        skipWorker = true;
-      } else {
-        // D2: If normalizer already set userText (held + transcript), don't overwrite.
-        if ((update as any).__heldAbsorbed) {
-          voiceTranscribed = true;
-        } else {
-          userText = formatTranscriptUserText(vr.text, {
-            truncated: vr.truncated,
-            caption: msg.caption,
-            kind: audioAttachment.kind,
-            fileName: audioAttachment.media.file_name,
-            speakers: vr.speakers,
-            forwardedFrom,
-          });
-          voiceTranscribed = true;
-        }
-      }
-    } else if (msg.document?.mime_type && /^(audio|video)\//.test(msg.document.mime_type)) {
-      // Audio/video uploaded as a generic document — deliberately not routed
-      // through transcription (no `duration` field to pre-download-guard,
-      // and Telegram's own 20MB getFile ceiling makes a large one fail ugly;
-      // hardened plan WP6 item 1). One hint line so the caption isn't
-      // dispatched with no indication the attachment was ignored.
-      const hint = '[An audio file was attached as a document and was not transcribed. Re-send it as a voice note or audio message to have it transcribed.]';
-      userText = userText ? `${userText}\n\n${hint}` : hint;
-    } else if (msg.document || msg.photo) {
-      // WPE3 (2026-08-18): document/photo attachments — download to the same
-      // dated substrate as voice, allowlist the type, and inject the path into
-      // userText (the format context.ts's Attachments section also uses).
-      const ALLOWED_DOC_EXT = /\.(pdf|jpe?g|png|webp|txt|md|csv|xlsx|zip)$/i;
-      const docName = msg.document?.file_name;
-      const photo = Array.isArray(msg.photo) ? msg.photo[msg.photo.length - 1] : undefined; // largest size
-      const fileName = docName ?? (photo ? `photo_${photo.file_unique_id}.jpg` : undefined);
-      if (!fileName || !ALLOWED_DOC_EXT.test(fileName)) {
-        userText = userText ? `${userText}\n\n[Attachment ${fileName ?? '(unnamed)'} rejected: allowed types are pdf, jpg, png, webp, txt, md, csv, xlsx, zip.]` : `[Attachment ${fileName ?? '(unnamed)'} rejected: allowed types are pdf, jpg, png, webp, txt, md, csv, xlsx, zip.]`;
-      } else {
-        const media = (msg.document ?? photo) as { file_id: string; file_unique_id: string };
-        const ext = fileName.includes('.') ? fileName.slice(fileName.lastIndexOf('.') + 1).toLowerCase() : 'bin';
-        try {
-          const destPath = voiceAttachmentPath(chatId, media.file_unique_id, new Date(), ext);
-          // Create parent directory before download (downloadFile does not do this itself)
-          const { dirname } = require('node:path');
-          mkdirSync(dirname(destPath), { recursive: true });
-          const ok = await downloadFile(token, media.file_id, destPath);
-          if (!ok) throw new Error('downloadFile returned false');
-          logger.info('attachments', 'downloaded attachment', { chatId, threadId, fileName, destPath });
-          const line = `[Attachment: ${fileName} at ${destPath}]`;
-          userText = userText ? `${userText}\n\n${line}` : line;
-        } catch (err: any) {
-          logger.warn('attachments', 'attachment download failed', { error: err?.message ?? String(err), fileName });
-          userText = userText ? `${userText}\n\n[Attachment ${fileName} failed to download — see pa-alerts log.]` : `[Attachment ${fileName} failed to download — see pa-alerts log.]`;
-        }
-      }
-    }
+    // Voice/attachment stage (AI-173 phase 1, 2026-09-01):
+    // projects/telegram-bot/src/attachment-stage.ts owns transcription, the audio
+    // index, the 🎙 Heard echo and document/photo download. Everything it decides
+    // arrives here as one result.
+    //
+    // `response`/`skipWorker` are load-bearing OUTPUTS, not bookkeeping (hardened
+    // plan WP6 item 4): without the stage's `skipWorker`, a failed note's bracketed
+    // error text (>25 chars) reaches the pendingDescription branch below and
+    // silently renames the topic. `voiceTranscribed` guards that same branch from
+    // treating a transcribed sentence as an intentional answer to "what's this
+    // topic for?".
+    const stage = await runAttachmentStage({
+      msg,
+      update,
+      userText,
+      token,
+      chatId,
+      threadId,
+      messageId,
+      repoRoot: BOT_CWD,
+      runtimeEnv,
+      transcription: config.transcription,
+    });
+    userText = stage.userText;
+    let response = stage.response;
+    let skipWorker = stage.skipWorker;
+    let voiceTranscribed = stage.voiceTranscribed;
+    const audioAttachment = stage.audioAttachment;
 
     let archivedUserText = userText;
     const workerExpired = expirePreferredWorker(topicState);
@@ -1560,9 +1475,29 @@ async function processUpdate(
       if (modelTarget === effectiveDefault) {
         topicState.preferred_worker = undefined;
         topicState.preferred_worker_set_at = undefined;
+        // AI-171 phase B: explicitly set model_status here (not just clear preferred_worker)
+        // because hydrateModelStatus treats a previously-set model_status as sticky — once
+        // ANY prior action (reset, midnight expiry, failover) has stamped a reason_code, the
+        // generic inferLegacyReasonCode() fallback is never consulted again, so switching back
+        // to the default agent here needs its own explicit stamp or it inherits a stale reason.
+        syncModelStatusState(topicState, buildModelStatusSnapshot({
+          currentWorker: modelTarget,
+          defaultWorker: effectiveDefault,
+          reasonCode: 'user_selected_default',
+          currentLlm: targetLlm,
+          currentEffort: targetEffort,
+        }));
       } else {
         topicState.preferred_worker = modelTarget;
         topicState.preferred_worker_set_at = new Date().toISOString();
+        // Same stickiness reasoning as above, for the override branch.
+        syncModelStatusState(topicState, buildModelStatusSnapshot({
+          currentWorker: modelTarget,
+          defaultWorker: effectiveDefault,
+          reasonCode: 'user_override',
+          currentLlm: targetLlm,
+          currentEffort: targetEffort,
+        }));
       }
       topicState.session = undefined;
       await refreshPinnedStatusCardInPlace(token, chatId, threadId, topicState, effectiveDefault, getKeepAwakeStatus(), config);
@@ -1706,11 +1641,20 @@ async function processUpdate(
         topicState.session = undefined;
 
         const nextDefaultConfig = config?.workers?.find((w: WorkerConfig) => w.name === effectiveDefault);
-        const nextDefaultDescriptor = formatWorkerDescriptor(
-          effectiveDefault,
-          nextDefaultConfig ? resolveWorkerLlm(nextDefaultConfig, undefined, selectWorkerTunables(topicState.tunable_defaults, effectiveDefault)) : undefined,
-          nextDefaultConfig ? resolveWorkerEffort(nextDefaultConfig, undefined, selectWorkerTunables(topicState.tunable_defaults, effectiveDefault)) : undefined
-        );
+        const nextDefaultLlm = nextDefaultConfig ? resolveWorkerLlm(nextDefaultConfig, undefined, selectWorkerTunables(topicState.tunable_defaults, effectiveDefault)) : undefined;
+        const nextDefaultEffort = nextDefaultConfig ? resolveWorkerEffort(nextDefaultConfig, undefined, selectWorkerTunables(topicState.tunable_defaults, effectiveDefault)) : undefined;
+        const nextDefaultDescriptor = formatWorkerDescriptor(effectiveDefault, nextDefaultLlm, nextDefaultEffort);
+
+        // AI-171 phase B: same stickiness reasoning as the /agent-switch block — /default
+        // changes the topic's default agent, so it needs its own explicit model_status
+        // stamp or hydrateModelStatus's sticky prior-reason_code path leaves it stale.
+        syncModelStatusState(topicState, buildModelStatusSnapshot({
+          currentWorker: effectiveDefault,
+          defaultWorker: effectiveDefault,
+          reasonCode: 'default_changed',
+          currentLlm: nextDefaultLlm,
+          currentEffort: nextDefaultEffort,
+        }));
 
         await refreshPinnedStatusCardInPlace(token, chatId, threadId, topicState, effectiveDefault, getKeepAwakeStatus(), config);
         if (dq.worker) {
@@ -2117,6 +2061,7 @@ async function processUpdate(
         );
       };
 
+      const editWindow: DispatchWindow | null = await openWindow({ resource: resourceId });
       try {
         const dr = await dispatchMessage(userText, replyContext, confirmedDescription ?? topicState.pending_action?.description, topicState, secrets, resourceId, effectiveDefault, topicNames, onNotify, update.update_id, workdir, contextId);
         response = dr.response; topicState.session = dr.session;
@@ -2241,7 +2186,7 @@ async function processUpdate(
             messageId, threadId).catch(() => {});
           response = '';
         }
-      } finally { clearInterval(typingInterval); }
+      } finally { clearInterval(typingInterval); await closeWindow(editWindow, { worker: assistantWorker === 'local' ? null : assistantWorker }).catch(() => {}); }
     }
 
     if (response.trim()) {
@@ -2387,6 +2332,28 @@ function getUpdateTopicKey(update: any): string {
   const chatId = update.message?.chat?.id;
   const threadId = update.message?.message_thread_id ?? 0;
   return chatId ? `${chatId}_${threadId}` : 'non-message';
+}
+
+// Injectable exit hook for runPollLoop's end-of-loop process.exit(0) (see the
+// comment at that call site). Root cause of the 2026-08-28/31 "bot dark test
+// files" defect (poll-loop / integration / poll-loop-integration-extra /
+// poll-loop-maintenance / voice-poll-loop, fixed 2026-09-01): `node --test`
+// isolates each test file into its own subprocess, and any test that awaits
+// runPollLoop() to completion (dozens of them, across all five files) drove
+// the loop to its natural exit and hit the real process.exit(0) — killing
+// that file's subprocess before node:test's own TAP output for it reached the
+// parent, so the file read back as an empty shell with zero suites. This was
+// misdiagnosed for months as a `node:test` registration bug (see historical
+// note in scripts/run-tests.mjs). Production behavior is unchanged (default
+// is real process.exit); tests inject a no-op via `_setExitForTest` so
+// runPollLoop's promise resolves normally instead of taking the subprocess
+// down with it.
+const defaultExitFn = (code?: number) => process.exit(code);
+let exitFn: (code?: number) => void = defaultExitFn;
+
+/** Test hook: replace runPollLoop's terminal process.exit with a no-op (or a spy). Pass null to restore the real exit. */
+export function _setExitForTest(fn: ((code?: number) => void) | null): void {
+  exitFn = fn ?? defaultExitFn;
 }
 
 export async function runPollLoop(
@@ -2951,6 +2918,20 @@ export async function runPollLoop(
   // removePendingDispatch stay on disk for recovery.
   if (inFlight.size > 0) {
     logger.info('shutdown', `detaching ${inFlight.size} in-flight dispatch(es) — workers continue independently`);
+    // Test-mode only (2026-09-01 dark-file recheck): when the terminal exit
+    // has been neutered via _setExitForTest, drain in-flight dispatches
+    // before returning. Many revived tests `await runPollLoop(...)` and then
+    // immediately assert on state a dispatch was writing (a local command's
+    // pin-card refresh, a turn write) — an assumption production's real
+    // process.exit() never had to honor (the whole process dies before any of
+    // this code, including this branch, can run), but that plenty of these
+    // tests were written against anyway. See poll-loop.test.ts's "same-topic
+    // updates" test for the one case this trade-off breaks (an extra send
+    // that used to be silently abandoned now completes) — skipped there with
+    // the same dated note. Never runs outside test mode.
+    if (exitFn !== defaultExitFn) {
+      await Promise.allSettled(inFlight);
+    }
   }
   // Bounded drain: waits for every currently in-flight maintenance pass (there
   // can be more than one — kicks are throttled by time, not by whether a prior
@@ -2966,7 +2947,7 @@ export async function runPollLoop(
     ]);
     if (drainTimer) clearTimeout(drainTimer);
   }
-  process.exit(0);
+  exitFn(0);
 }
 
 async function main(): Promise<void> {

@@ -11,6 +11,7 @@ import {
   _resetResendStoreForTest,
   type ResendRecord,
 } from '../resend-store.js';
+import { waitForDrain } from './test-teardown-guard.js';
 
 let home: string;
 
@@ -20,7 +21,8 @@ beforeEach(() => {
   _resetResendStoreForTest();
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await waitForDrain();
   delete process.env.PA_HOME;
   _resetResendStoreForTest();
   try { rmSync(home, { recursive: true, force: true }); } catch {}

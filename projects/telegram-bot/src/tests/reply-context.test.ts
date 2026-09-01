@@ -12,6 +12,7 @@ import {
 import { addTurn } from '../conversation.js';
 import { _setDegradedForTest } from '../health.js';
 import type { ConversationState, ConversationTurn } from '../types.js';
+import { waitForDrain } from './test-teardown-guard.js';
 
 function makeState(overrides: Partial<ConversationState> = {}): ConversationState {
   return { chat_id: 1, last_update_id: 0, thread_id: 0, turns: [], ...overrides };
@@ -237,6 +238,7 @@ describe('resolveReplyContext with default (non-injected) archive lookup', () =>
   });
 
   afterEach(async () => {
+    await waitForDrain();
     delete process.env.PA_HOME;
     await rm(tempDir, { recursive: true, force: true });
   });

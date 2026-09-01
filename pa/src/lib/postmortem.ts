@@ -9,6 +9,8 @@
 import { mkdir, writeFile, readFile } from 'fs/promises';
 import { join } from 'path';
 import { existsSync } from 'fs';
+import { log } from './log.js';
+import { repoRootFromModule } from './git-root.js';
 
 export interface PostmortemInput {
   date: string;           // ISO date string (YYYY-MM-DD)
@@ -36,8 +38,7 @@ const INDEX_PATH = 'plans/INDEX.md';
  *
  * @throws Error if INDEX.md cannot be read or written.
  */
-async function appendIndexRow(date: string, title: string, filename: string): Promise<void> {
-  const repoRoot = process.cwd();
+async function appendIndexRow(repoRoot: string, date: string, title: string, filename: string): Promise<void> {
   const indexPath = join(repoRoot, INDEX_PATH);
 
   if (!existsSync(indexPath)) {
@@ -45,6 +46,16 @@ async function appendIndexRow(date: string, title: string, filename: string): Pr
   }
 
   const indexContent = await readFile(indexPath, 'utf-8');
+
+  // Idempotency guard (AI-176): a retried rollback attempt for the same
+  // postmortem must not accumulate a second INDEX.md row for it. Match on the
+  // row's link target — the postmortem file path is the unique identity here,
+  // independent of title/date formatting.
+  const linkTarget = `(./postmortems/${filename})`;
+  if (indexContent.includes(linkTarget)) {
+    log('info', 'postmortem', 'skipped duplicate INDEX.md row — postmortem file already linked', { filename });
+    return;
+  }
 
   // Build the new row
   const newRow = `| ${date} | ${title} | TODO | [Local](./postmortems/${filename}) |`;
@@ -67,17 +78,40 @@ async function appendIndexRow(date: string, title: string, filename: string): Pr
  *
  * @throws Error if the postmortems directory cannot be created or file cannot be written.
  */
+export interface CreatePostmortemOptions {
+  /**
+   * Explicit override for the repo root postmortem files and INDEX.md rows are
+   * written under. Test-only — production always omits this.
+   *
+   * Default (no override): resolved via `repoRootFromModule(__filename)` —
+   * the TRUE repo root, found via git from THIS MODULE's own on-disk location
+   * — never `process.cwd()`. AI-176: before this fix, two
+   * self-improver.test.ts describes drove the real rollback path with cwd
+   * left pointing at the live repo (no chdir), so every run silently wrote
+   * real postmortem stubs + INDEX.md rows into production plans/ using the
+   * test fixture's literal skillName ('x', 'coding-dirs-update') — the actual
+   * origin of the duplicate/bogus rows found there. A caller that only
+   * isolates process.cwd() is not a durable fix (same class as the
+   * Task-Scheduler cwd=System32 bug, root CLAUDE.md 2026-08-23): resolving
+   * against the module's own location makes the write root correct
+   * regardless of ambient cwd, and callers that genuinely need isolation
+   * (tests) must opt in explicitly via this field.
+   */
+  repoRoot?: string;
+}
+
 export async function createPostmortemStub(
   input: PostmortemInput,
-  meta: PostmortemMetadata
+  meta: PostmortemMetadata,
+  opts: CreatePostmortemOptions = {}
 ): Promise<string> {
-  const repoRoot = process.cwd();
+  const repoRoot = opts.repoRoot ?? await repoRootFromModule(__filename);
 
-  // Wrong-root guard: only a repo ROOT carries plans/. If cwd lacks it (a test
-  // fixture, a subdirectory, pa/ itself), a rollback hook firing from here
-  // would litter stubs into an unrelated tree — skip silently instead.
-  // Production self-improver runs with cwd = repo root, so real incidents
-  // always have plans/ present.
+  // Wrong-root guard: only a repo ROOT carries plans/. If the resolved root
+  // lacks it (a test fixture with no plans/ dir, an extracted subtree), a
+  // rollback hook firing from here would litter stubs into an unrelated tree
+  // — skip silently instead. Production always resolves to the real repo
+  // root, which always has plans/ present.
   if (!existsSync(join(repoRoot, 'plans'))) {
     return '';
   }
@@ -98,7 +132,7 @@ export async function createPostmortemStub(
 
   // WPD6: Also append a row to INDEX.md
   try {
-    await appendIndexRow(input.date, input.title, filename);
+    await appendIndexRow(repoRoot, input.date, input.title, filename);
   } catch (err) {
     // Log but don't fail — the postmortem file itself is the critical output
     console.error(`[postmortem] Failed to append INDEX.md row: ${err}`);

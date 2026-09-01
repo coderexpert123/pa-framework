@@ -242,6 +242,109 @@ describe('reservations', () => {
     });
   });
 
+  describe('release ledger (WP-4, AI-175)', () => {
+    it('release() records a ledger entry carrying paths, session and note', async () => {
+      const { claim, release, readReleasedSince } = await import('../src/lib/reservations.js');
+      const now = Date.now();
+      const claimed = await claim({
+        paths: ['pa/src/ledger-a.ts'],
+        session: 's-ledger',
+        note: 'ledger test',
+        now,
+      });
+      assert.equal(claimed.ok, true);
+
+      const releaseAt = now + 60_000;
+      const { released } = await release({ id: claimed.reservation!.id, now: releaseAt });
+      assert.equal(released, 1);
+
+      const entries = await readReleasedSince(now, releaseAt + 1_000);
+      assert.equal(entries.length, 1);
+      assert.deepEqual(entries[0].paths, ['pa/src/ledger-a.ts']);
+      assert.equal(entries[0].session, 's-ledger');
+      assert.equal(entries[0].note, 'ledger test');
+      assert.equal(entries[0].id, claimed.reservation!.id);
+      assert.equal(entries[0].claimedAt, claimed.reservation!.claimedAt);
+      assert.equal(entries[0].releasedAt, new Date(releaseAt).toISOString());
+    });
+
+    it('readReleasedSince(t) returns an entry released after t and omits one released before it', async () => {
+      const { claim, release, readReleasedSince } = await import('../src/lib/reservations.js');
+      const now = Date.now();
+
+      const early = await claim({ paths: ['pa/src/ledger-early.ts'], session: 's-a', note: 'early', now });
+      await release({ id: early.reservation!.id, now: now + 10_000 });
+
+      const late = await claim({ paths: ['pa/src/ledger-late.ts'], session: 's-b', note: 'late', now: now + 20_000 });
+      await release({ id: late.reservation!.id, now: now + 30_000 });
+
+      const sinceMidpoint = await readReleasedSince(now + 20_000, now + 40_000);
+      assert.equal(sinceMidpoint.length, 1);
+      assert.equal(sinceMidpoint[0].session, 's-b');
+    });
+
+    it('an entry older than RELEASE_LEDGER_TTL_MS is pruned by the next release() and by gcExpired()', async () => {
+      const { claim, release, gcExpired, readReleasedSince, RELEASE_LEDGER_TTL_MS } = await import(
+        '../src/lib/reservations.js'
+      );
+      const now = Date.now();
+      const pastTtl = now + RELEASE_LEDGER_TTL_MS + 60_000;
+
+      // --- pruned as a side effect of a later release() call ---
+      const stale = await claim({ paths: ['pa/src/ledger-stale.ts'], session: 's-a', note: 'stale', now });
+      await release({ id: stale.reservation!.id, now });
+      const beforePrune = await readReleasedSince(now, now + 1_000);
+      assert.equal(beforePrune.length, 1, 'still inside the TTL immediately after release');
+
+      const fresh = await claim({ paths: ['pa/src/ledger-fresh.ts'], session: 's-b', note: 'fresh', now: pastTtl });
+      await release({ id: fresh.reservation!.id, now: pastTtl });
+      const afterReleasePrune = await readReleasedSince(now, pastTtl + 1_000);
+      assert.equal(afterReleasePrune.some((e) => e.session === 's-a'), false, 'stale entry pruned by release()');
+      assert.equal(afterReleasePrune.some((e) => e.session === 's-b'), true, 'fresh entry survives');
+
+      // --- pruned by gcExpired(), independent of any release() call ---
+      const another = await claim({
+        paths: ['pa/src/ledger-another.ts'],
+        session: 's-c',
+        note: 'another',
+        now: pastTtl,
+      });
+      await release({ id: another.reservation!.id, now: pastTtl });
+      const wellPastTtl = pastTtl + RELEASE_LEDGER_TTL_MS + 60_000;
+      await gcExpired(wellPastTtl);
+      const afterGc = await readReleasedSince(now, wellPastTtl + 1_000);
+      assert.equal(afterGc.some((e) => e.session === 's-c'), false, 'gcExpired() prunes the ledger too');
+    });
+
+    it('a store file written without a released key loads, and the first release() creates it (back-compat)', async () => {
+      await writeFile(join(dir, 'reservations.json'), JSON.stringify({ reservations: [] }), 'utf8');
+      const { claim, release, readReleasedSince } = await import('../src/lib/reservations.js');
+      const now = Date.now();
+
+      const claimed = await claim({ paths: ['pa/src/backcompat.ts'], session: 's-a', note: 'back-compat', now });
+      assert.equal(claimed.ok, true);
+      const { released } = await release({ id: claimed.reservation!.id, now: now + 1_000 });
+      assert.equal(released, 1);
+
+      const entries = await readReleasedSince(now, now + 2_000);
+      assert.equal(entries.length, 1);
+      assert.equal(entries[0].session, 's-a');
+    });
+
+    it('readActive() is unaffected by ledger contents', async () => {
+      const { claim, release, readActive } = await import('../src/lib/reservations.js');
+      const now = Date.now();
+
+      const claimed = await claim({ paths: ['pa/src/still-active.ts'], session: 's-a', note: 'active', now });
+      const other = await claim({ paths: ['pa/src/to-release.ts'], session: 's-b', note: 'to release', now });
+      await release({ id: other.reservation!.id, now: now + 1_000 });
+
+      const active = await readActive(now + 2_000);
+      assert.equal(active.length, 1);
+      assert.equal(active[0].id, claimed.reservation!.id);
+    });
+  });
+
   describe('corrupt store recovery', () => {
     it('a corrupt reservations.json is recovered as empty and does not throw', async () => {
       await writeFile(join(dir, 'reservations.json'), '{ this is not json', 'utf8');

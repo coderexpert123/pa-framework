@@ -31,30 +31,8 @@ STAMP_LITERAL = '<!-- topic-brain: consolidated=2026-08-21T21:30:00+05:30 covers
 STAMP_REGEX = r'<!-- topic-brain: consolidated=([^\s]+) covers=([^\s]+)(?: folded-into=([^\s]+))? -->'
 
 
-class TestTopicBrains(unittest.TestCase):
-    """Test suite for topic_brains.py."""
-
-    def setUp(self):
-        """Set up temp PA_HOME for each test."""
-        import tempfile
-        self.test_dir = tempfile.mkdtemp()
-        self.pa_home = os.path.join(self.test_dir, '.pa')
-        os.makedirs(self.pa_home, exist_ok=True)
-        os.makedirs(os.path.join(self.pa_home, 'topic-brains'), exist_ok=True)
-        os.environ['PA_HOME'] = self.pa_home
-
-    def tearDown(self):
-        """Clean up temp directory."""
-        import shutil
-        if 'PA_HOME' in os.environ:
-            del os.environ['PA_HOME']
-        # Clean up cap env vars
-        if 'PA_TOPIC_BRAINS_MAX_TASKS' in os.environ:
-            del os.environ['PA_TOPIC_BRAINS_MAX_TASKS']
-        if 'PA_TOPIC_BRAINS_MAX_SEEDS' in os.environ:
-            del os.environ['PA_TOPIC_BRAINS_MAX_SEEDS']
-        if os.path.exists(self.test_dir):
-            shutil.rmtree(self.test_dir)
+class TopicBrainsFixtureMixin:
+    """Shared PA_HOME-scoped fixture helpers for topic-brains test classes."""
 
     def write_topic_state(self, chat_id, thread_id, turns=None, merged_at=None, parent_key=None):
         """Write a topic-state file."""
@@ -108,6 +86,32 @@ class TestTopicBrains(unittest.TestCase):
         }
         with open(result_path, 'w', encoding='utf-8') as f:
             json.dump(result, f)
+
+
+class TestTopicBrains(TopicBrainsFixtureMixin, unittest.TestCase):
+    """Test suite for topic_brains.py."""
+
+    def setUp(self):
+        """Set up temp PA_HOME for each test."""
+        import tempfile
+        self.test_dir = tempfile.mkdtemp()
+        self.pa_home = os.path.join(self.test_dir, '.pa')
+        os.makedirs(self.pa_home, exist_ok=True)
+        os.makedirs(os.path.join(self.pa_home, 'topic-brains'), exist_ok=True)
+        os.environ['PA_HOME'] = self.pa_home
+
+    def tearDown(self):
+        """Clean up temp directory."""
+        import shutil
+        if 'PA_HOME' in os.environ:
+            del os.environ['PA_HOME']
+        # Clean up cap env vars
+        if 'PA_TOPIC_BRAINS_MAX_TASKS' in os.environ:
+            del os.environ['PA_TOPIC_BRAINS_MAX_TASKS']
+        if 'PA_TOPIC_BRAINS_MAX_SEEDS' in os.environ:
+            del os.environ['PA_TOPIC_BRAINS_MAX_SEEDS']
+        if os.path.exists(self.test_dir):
+            shutil.rmtree(self.test_dir)
 
     # ===== plan subcommand tests =====
 
@@ -1154,6 +1158,456 @@ class TestTopicBrains(unittest.TestCase):
         self.assertRegex(head, STAMP_REGEX)
         # stamp sits right after the title line, not buried
         self.assertLess(head.index('<!-- topic-brain:'), head.index('> Summary:'))
+
+
+class TestArchiveInputAndRescan(TopicBrainsFixtureMixin, unittest.TestCase):
+    """Test archive input hygiene, dedupe, and rescan mode per spec §3.2, §3.1."""
+
+    def setUp(self):
+        """Set up temp PA_HOME for each test."""
+        import tempfile
+        self.test_dir = tempfile.mkdtemp()
+        self.pa_home = os.path.join(self.test_dir, '.pa')
+        os.makedirs(self.pa_home, exist_ok=True)
+        os.makedirs(os.path.join(self.pa_home, 'topic-brains'), exist_ok=True)
+        os.makedirs(os.path.join(self.pa_home, 'archive'), exist_ok=True)
+        os.environ['PA_HOME'] = self.pa_home
+
+    def tearDown(self):
+        """Clean up temp directory."""
+        import shutil
+        if 'PA_HOME' in os.environ:
+            del os.environ['PA_HOME']
+        # Clean up cap env vars (test_rescan_ignores_env_caps sets these)
+        if 'PA_TOPIC_BRAINS_MAX_TASKS' in os.environ:
+            del os.environ['PA_TOPIC_BRAINS_MAX_TASKS']
+        if 'PA_TOPIC_BRAINS_MAX_SEEDS' in os.environ:
+            del os.environ['PA_TOPIC_BRAINS_MAX_SEEDS']
+        if os.path.exists(self.test_dir):
+            shutil.rmtree(self.test_dir)
+
+    def write_archive_shard(self, name, turns):
+        """Write turns to <PA_HOME>/archive/<name>-conversation-history.jsonl."""
+        archive_dir = os.path.join(self.pa_home, 'archive')
+        path = os.path.join(archive_dir, f'{name}-conversation-history.jsonl')
+        with open(path, 'w', encoding='utf-8') as f:
+            for turn in turns:
+                f.write(json.dumps(turn) + '\n')
+
+    def test_archive_shard_rows_spooled(self):
+        """Delta mode spools archive rows newer than covers but not pre-covers rows (rescan-only); no seam duplication."""
+        # Brain with stamp covers=2026-08-21T18:00:00.000Z
+        self.write_brain('-1001234567890_100', '# Test\n', stamp='<!-- topic-brain: consolidated=2026-08-21T21:00:00+05:30 covers=2026-08-21T18:00:00.000Z -->')
+        self.write_topic_state(-1001234567890, 100)
+
+        # Archive shard with both pre-covers and post-covers rows
+        self.write_archive_shard('2026-05-15-000000', [
+            {'role': 'user', 'text': 'old archive', 'timestamp': '2026-08-20T10:00:00.000Z', 'thread_id': 100, 'message_id': 1},
+            {'role': 'user', 'text': 'seam archive', 'timestamp': '2026-08-21T18:30:00.000Z', 'thread_id': 100, 'message_id': 3}
+        ])
+
+        # Live file with rows newer than covers
+        self.write_archive_turns([
+            {'role': 'user', 'text': 'new live', 'timestamp': '2026-08-21T19:00:00.000Z', 'thread_id': 100, 'message_id': 2}
+        ])
+
+        ret = topic_brains.plan(self.pa_home)
+        self.assertEqual(ret, 0)
+
+        # Slice should contain seam-archive + live rows (pre-covers archive excluded in delta mode)
+        slice_path = os.path.join(self.pa_home, 'topic-brains', '.slices', '-1001234567890_100.jsonl')
+        with open(slice_path, 'r') as f:
+            slice_turns = [json.loads(line) for line in f]
+
+        # Should have exactly 2 rows: seam archive (post-covers) + live (pre-covers excluded)
+        self.assertEqual(len(slice_turns), 2)
+        # Verify we have the right rows (seam archive message_id 3 and live message_id 2)
+        message_ids = {t.get('message_id') for t in slice_turns}
+        self.assertEqual(message_ids, {2, 3})
+
+    def test_archive_junk_rows_skipped(self):
+        """Test thread_id 0/-5/missing/bool, 1970-01-01 timestamps, unparseable lines skipped."""
+        self.write_topic_state(-1001234567890, 100)
+
+        # Mix of valid and junk rows
+        self.write_archive_turns([
+            {'role': 'user', 'text': 'valid', 'timestamp': '2026-08-21T10:00:00.000Z', 'thread_id': 100, 'message_id': 1},
+            {'role': 'user', 'text': 'thread zero', 'timestamp': '2026-08-21T10:00:00.000Z', 'thread_id': 0, 'message_id': 2},
+            {'role': 'user', 'text': 'thread negative', 'timestamp': '2026-08-21T10:00:00.000Z', 'thread_id': -5, 'message_id': 3},
+            {'role': 'user', 'text': 'thread missing', 'timestamp': '2026-08-21T10:00:00.000Z', 'message_id': 4},
+            {'role': 'user', 'text': 'epoch junk', 'timestamp': '1970-01-01T00:00:00.000Z', 'thread_id': 100, 'message_id': 5},
+            {'role': 'user', 'text': 'thread bool', 'timestamp': '2026-08-21T10:00:00.000Z', 'thread_id': True, 'message_id': 6}
+        ])
+
+        ret = topic_brains.plan(self.pa_home)
+        self.assertEqual(ret, 0)
+
+        # Only valid row should be spooled
+        slice_path = os.path.join(self.pa_home, 'topic-brains', '.slices', '-1001234567890_100.jsonl')
+        with open(slice_path, 'r') as f:
+            slice_turns = [json.loads(line) for line in f]
+
+        self.assertEqual(len(slice_turns), 1)
+        self.assertEqual(slice_turns[0]['text'], 'valid')
+
+    def test_archive_dedupe(self):
+        """Test literal duplicates, message_id dups, and composite-key dups are removed."""
+        self.write_topic_state(-1001234567890, 100)
+
+        # Duplicate rows with different keys
+        self.write_archive_turns([
+            {'role': 'user', 'text': 'same text', 'timestamp': '2026-08-21T10:00:00.000Z', 'thread_id': 100, 'message_id': 1},
+            {'role': 'user', 'text': 'same text', 'timestamp': '2026-08-21T10:00:00.000Z', 'thread_id': 100, 'message_id': 1},  # Literal dup (message_id)
+            {'role': 'user', 'text': 'same text', 'timestamp': '2026-08-21T10:00:00.000Z', 'thread_id': 100, 'message_id': None},  # Composite-key dup (no message_id)
+            {'role': 'user', 'text': 'same   text', 'timestamp': '2026-08-21T10:00:00.000Z', 'thread_id': 100, 'message_id': None},  # Whitespace variation
+            {'role': 'user', 'text': 'SAME TEXT', 'timestamp': '2026-08-21T10:00:00.000Z', 'thread_id': 100, 'message_id': None},  # Case variation
+            {'role': 'user', 'text': 'different', 'timestamp': '2026-08-21T10:00:00.000Z', 'thread_id': 100, 'message_id': 2}
+        ])
+
+        ret = topic_brains.plan(self.pa_home)
+        self.assertEqual(ret, 0)
+
+        slice_path = os.path.join(self.pa_home, 'topic-brains', '.slices', '-1001234567890_100.jsonl')
+        with open(slice_path, 'r') as f:
+            slice_turns = [json.loads(line) for line in f]
+
+        # Should have 3 unique rows: one with message_id, one composite-key group, one different
+        # (message_id row + composite-key row are BOTH kept per spec edge case)
+        self.assertEqual(len(slice_turns), 3)
+
+    def test_archive_glob_order(self):
+        """Test archive glob is lexical (oldest-first) and excludes *-app.log.jsonl."""
+        self.write_topic_state(-1001234567890, 100)
+
+        # Two archive shards (lexically: 2026-03-01 before 2026-05-15)
+        self.write_archive_shard('2026-03-01-120000', [
+            {'role': 'user', 'text': 'shard1', 'timestamp': '2026-03-01T10:00:00.000Z', 'thread_id': 100, 'message_id': 1}
+        ])
+        self.write_archive_shard('2026-05-15-000000', [
+            {'role': 'user', 'text': 'shard2', 'timestamp': '2026-05-15T10:00:00.000Z', 'thread_id': 100, 'message_id': 2}
+        ])
+
+        # Live file
+        self.write_archive_turns([
+            {'role': 'user', 'text': 'live', 'timestamp': '2026-08-21T10:00:00.000Z', 'thread_id': 100, 'message_id': 3}
+        ])
+
+        # App log file (should be excluded)
+        with open(os.path.join(self.pa_home, 'archive', '2026-04-01-120000-app.log.jsonl'), 'w') as f:
+            f.write('{"should":"be excluded"}\n')
+
+        ret = topic_brains.plan(self.pa_home)
+        self.assertEqual(ret, 0)
+
+        slice_path = os.path.join(self.pa_home, 'topic-brains', '.slices', '-1001234567890_100.jsonl')
+        with open(slice_path, 'r') as f:
+            slice_turns = [json.loads(line) for line in f]
+
+        # Order should be: shard1, shard2, live (chronological/lexical)
+        self.assertEqual(len(slice_turns), 3)
+        self.assertEqual(slice_turns[0]['text'], 'shard1')
+        self.assertEqual(slice_turns[1]['text'], 'shard2')
+        self.assertEqual(slice_turns[2]['text'], 'live')
+
+    def test_rescan_single_task_excludes_others(self):
+        """Test rescan mode produces one task, excludes others with rescan-excluded."""
+        # Two topics
+        self.write_topic_state(-1001234567890, 100)
+        self.write_topic_state(-1001234567890, 101)
+
+        # Both have new turns
+        self.write_archive_turns([
+            {'role': 'user', 'text': 't100', 'timestamp': '2026-08-21T10:00:00.000Z', 'thread_id': 100, 'message_id': 1},
+            {'role': 'user', 'text': 't101', 'timestamp': '2026-08-21T10:00:00.000Z', 'thread_id': 101, 'message_id': 1}
+        ])
+
+        # Rescan only thread 100
+        ret = topic_brains.plan(self.pa_home, rescan_keys=['-1001234567890_100'])
+        self.assertEqual(ret, 0)
+
+        workplan_path = os.path.join(self.pa_home, 'topic-brains', '.workplan.json')
+        with open(workplan_path, 'r') as f:
+            workplan = json.load(f)
+
+        # Should have exactly one task (rescan)
+        self.assertEqual(len(workplan['tasks']), 1)
+        task = workplan['tasks'][0]
+        self.assertEqual(task['kind'], 'rescan')
+        self.assertEqual(task['coversThrough'], 'none')
+        self.assertEqual(task['topicKey'], '-1001234567890_100')
+
+        # Workplan should have rescan: true
+        self.assertTrue(workplan.get('rescan'))
+
+        # Other topic should be skipped with rescan-excluded
+        skipped = {s['topicKey']: s for s in workplan['skipped']}
+        self.assertIn('-1001234567890_101', skipped)
+        self.assertEqual(skipped['-1001234567890_101']['reason'], 'rescan-excluded')
+
+        # Slice should contain ALL rows for thread 100 (including pre-covers if any)
+        slice_path = os.path.join(self.pa_home, 'topic-brains', '.slices', '-1001234567890_100.jsonl')
+        with open(slice_path, 'r') as f:
+            slice_turns = [json.loads(line) for line in f]
+        self.assertEqual(len(slice_turns), 1)
+
+    def test_rescan_multi_part(self):
+        """Test rescan tasks split into >100 KB parts."""
+        self.write_topic_state(-1001234567890, 100)
+
+        # Create >100 KB of turns (large text to hit byte limit quickly)
+        turns = []
+        for i in range(450):
+            turns.append({
+                'role': 'user',
+                'text': f'Large message number {i} with some padding ' * 10,
+                'timestamp': f'2026-08-21T{i:02d}:00:00.000Z',
+                'thread_id': 100,
+                'message_id': i
+            })
+        self.write_archive_turns(turns)
+
+        ret = topic_brains.plan(self.pa_home, rescan_keys=['-1001234567890_100'])
+        self.assertEqual(ret, 0)
+
+        workplan_path = os.path.join(self.pa_home, 'topic-brains', '.workplan.json')
+        with open(workplan_path, 'r') as f:
+            workplan = json.load(f)
+
+        task = workplan['tasks'][0]
+        self.assertGreater(task['parts'], 1)
+        self.assertEqual(len(task['slicePaths']), task['parts'])
+
+        # Verify parts are ordered and disjoint
+        all_turns = []
+        for part_path in task['slicePaths']:
+            with open(part_path, 'r') as f:
+                part_turns = [json.loads(line) for line in f]
+                all_turns.extend(part_turns)
+
+        # All unique turns preserved in order
+        self.assertEqual(len(all_turns), 450)
+        self.assertEqual(all_turns[0]['message_id'], 0)
+        self.assertEqual(all_turns[-1]['message_id'], 449)
+
+    def test_rescan_ignores_env_caps(self):
+        """Test rescan tasks bypass PA_TOPIC_BRAINS_MAX_TASKS."""
+        self.write_topic_state(-1001234567890, 100)
+        self.write_topic_state(-1001234567890, 101)
+
+        self.write_archive_turns([
+            {'role': 'user', 'text': 't100', 'timestamp': '2026-08-21T10:00:00.000Z', 'thread_id': 100, 'message_id': 1},
+            {'role': 'user', 'text': 't101', 'timestamp': '2026-08-21T10:00:00.000Z', 'thread_id': 101, 'message_id': 1}
+        ])
+
+        # Set cap to 1, but rescan 2 topics
+        os.environ['PA_TOPIC_BRAINS_MAX_TASKS'] = '1'
+
+        ret = topic_brains.plan(self.pa_home, rescan_keys=['-1001234567890_100', '-1001234567890_101'])
+        self.assertEqual(ret, 0)
+
+        workplan_path = os.path.join(self.pa_home, 'topic-brains', '.workplan.json')
+        with open(workplan_path, 'r') as f:
+            workplan = json.load(f)
+
+        # Both rescan tasks should be created (cap bypassed)
+        self.assertEqual(len(workplan['tasks']), 2)
+
+    def test_rescan_dormant_topic_allowed(self):
+        """Test dormant-exempt topics are allowed in rescan mode."""
+        # Write EXEMPT.json with dormant entry
+        exempt_path = os.path.join(self.pa_home, 'topic-brains', 'EXEMPT.json')
+        with open(exempt_path, 'w', encoding='utf-8') as f:
+            json.dump({'-1001234567890_100': 'dormant'}, f)
+
+        self.write_topic_state(-1001234567890, 100)
+
+        # Old turn (would trigger dormant rule in normal mode)
+        self.write_archive_turns([
+            {'role': 'user', 'text': 'old', 'timestamp': '2026-07-01T10:00:00.000Z', 'thread_id': 100, 'message_id': 1}
+        ])
+
+        ret = topic_brains.plan(self.pa_home, rescan_keys=['-1001234567890_100'])
+        self.assertEqual(ret, 0)
+
+        workplan_path = os.path.join(self.pa_home, 'topic-brains', '.workplan.json')
+        with open(workplan_path, 'r') as f:
+            workplan = json.load(f)
+
+        # Rescan task should be created (dormant bypassed)
+        self.assertEqual(len(workplan['tasks']), 1)
+
+    def test_rescan_hard_exempt_key_rejected(self):
+        """Test hard-exempt keys are rejected in rescan mode."""
+        # Write EXEMPT.json with hard-exempt entry
+        exempt_path = os.path.join(self.pa_home, 'topic-brains', 'EXEMPT.json')
+        with open(exempt_path, 'w', encoding='utf-8') as f:
+            json.dump({'-1001234567890_100': 'output-only'}, f)
+
+        self.write_topic_state(-1001234567890, 100)
+
+        # Capture stderr
+        import io
+        from contextlib import redirect_stderr
+
+        stderr_capture = io.StringIO()
+        with redirect_stderr(stderr_capture):
+            ret = topic_brains.plan(self.pa_home, rescan_keys=['-1001234567890_100'])
+
+        self.assertEqual(ret, 1)  # Should exit 1
+
+        # Workplan should not be written
+        workplan_path = os.path.join(self.pa_home, 'topic-brains', '.workplan.json')
+        self.assertFalse(os.path.exists(workplan_path))
+
+        # Should have error message
+        stderr_output = stderr_capture.getvalue()
+        self.assertIn('hard-exempt', stderr_output)
+
+    def test_rescan_collision_key_rejected(self):
+        """Test collision keys are rejected in rescan mode."""
+        self.write_topic_state(-1001234567890, 100)
+        self.write_topic_state(-1009999999999, 100)  # Same thread_id, different chat
+
+        import io
+        from contextlib import redirect_stderr
+
+        stderr_capture = io.StringIO()
+        with redirect_stderr(stderr_capture):
+            ret = topic_brains.plan(self.pa_home, rescan_keys=['-1001234567890_100'])
+
+        self.assertEqual(ret, 1)  # Should exit 1
+
+        workplan_path = os.path.join(self.pa_home, 'topic-brains', '.workplan.json')
+        self.assertFalse(os.path.exists(workplan_path))
+
+    def test_rescan_unknown_key_rejected(self):
+        """Test unknown keys are rejected in rescan mode."""
+        # Don't write any topic state
+
+        import io
+        from contextlib import redirect_stderr
+
+        stderr_capture = io.StringIO()
+        with redirect_stderr(stderr_capture):
+            ret = topic_brains.plan(self.pa_home, rescan_keys=['-1001234567890_999'])
+
+        self.assertEqual(ret, 1)  # Should exit 1
+
+        # Should have error about no state file
+        stderr_output = stderr_capture.getvalue()
+        self.assertIn('no state file', stderr_output)
+
+    def test_rescan_zero_rows_rejected(self):
+        """Test rescan keys with zero unique rows are rejected."""
+        self.write_topic_state(-1001234567890, 100)
+
+        # Empty archive
+        self.write_archive_turns([])
+
+        import io
+        from contextlib import redirect_stderr
+
+        stderr_capture = io.StringIO()
+        with redirect_stderr(stderr_capture):
+            ret = topic_brains.plan(self.pa_home, rescan_keys=['-1001234567890_100'])
+
+        self.assertEqual(ret, 1)  # Should exit 1
+
+        # Should have error about zero rows
+        stderr_output = stderr_capture.getvalue()
+        self.assertIn('0 unique eligible rows', stderr_output)
+
+    def test_main_rescan_dash_value_normalized(self):
+        """Test `plan --rescan -100..._100` normalizes to `--rescan=-100..._100`."""
+        self.write_topic_state(-1001234567890, 100)
+        self.write_archive_turns([
+            {'role': 'user', 'text': 'test', 'timestamp': '2026-08-21T10:00:00.000Z', 'thread_id': 100, 'message_id': 1}
+        ])
+
+        argv = ['topic_brains.py', 'plan', '--rescan', '-1001234567890_100']
+        with patch.object(sys, 'argv', argv):
+            rc = topic_brains.main()
+
+        self.assertEqual(rc, 0)
+
+        workplan_path = os.path.join(self.pa_home, 'topic-brains', '.workplan.json')
+        self.assertTrue(os.path.exists(workplan_path))
+
+    def test_nightly_workplan_shape_unchanged(self):
+        """Test normal plan() has no rescan key and no rescan-excluded skips."""
+        self.write_topic_state(-1001234567890, 100)
+        self.write_archive_turns([
+            {'role': 'user', 'text': 'test', 'timestamp': '2026-08-21T10:00:00.000Z', 'thread_id': 100, 'message_id': 1}
+        ])
+
+        ret = topic_brains.plan(self.pa_home)
+        self.assertEqual(ret, 0)
+
+        workplan_path = os.path.join(self.pa_home, 'topic-brains', '.workplan.json')
+        with open(workplan_path, 'r') as f:
+            workplan = json.load(f)
+
+        # Should NOT have rescan key
+        self.assertNotIn('rescan', workplan)
+
+        # Should NOT have rescan-excluded in skips
+        skip_reasons = {s.get('reason') for s in workplan['skipped']}
+        self.assertNotIn('rescan-excluded', skip_reasons)
+
+    def test_finalize_covers_from_parts(self):
+        """Test D4 regression: covers from multi-part slices (must fail pre-fix)."""
+        # Write multi-part slice files (NO main .jsonl file)
+        slices_dir = os.path.join(self.pa_home, 'topic-brains', '.slices')
+        os.makedirs(slices_dir, exist_ok=True)
+
+        # Part 1 with older timestamp
+        part1_path = os.path.join(slices_dir, '-1001234567890_100.part01.jsonl')
+        with open(part1_path, 'w', encoding='utf-8') as f:
+            f.write('{"timestamp":"2026-08-21T10:00:00.000Z"}\n')
+
+        # Part 2 with newer timestamp
+        part2_path = os.path.join(slices_dir, '-1001234567890_100.part02.jsonl')
+        with open(part2_path, 'w', encoding='utf-8') as f:
+            f.write('{"timestamp":"2026-08-21T15:00:00.000Z"}\n')
+
+        # Write result and brain
+        self.write_result('-1001234567890_100', updated=True)
+        self.write_brain('-1001234567890_100', '# Test\n')
+
+        ret = topic_brains.finalize(self.pa_home)
+        self.assertEqual(ret, 0)
+
+        # Read brain and verify stamp
+        brain_path = os.path.join(self.pa_home, 'topic-brains', '-1001234567890_100', 'BRAIN.md')
+        with open(brain_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # Should have covers=2026-08-21T15:00:00.000Z (max from both parts)
+        self.assertIn('covers=2026-08-21T15:00:00.000Z', content)
+
+    def test_finalize_covers_single_slice_unchanged(self):
+        """Test single-slice behavior unchanged (covers = that file's max ts)."""
+        slices_dir = os.path.join(self.pa_home, 'topic-brains', '.slices')
+        os.makedirs(slices_dir, exist_ok=True)
+
+        # Single slice file
+        slice_path = os.path.join(slices_dir, '-1001234567890_100.jsonl')
+        with open(slice_path, 'w', encoding='utf-8') as f:
+            f.write('{"timestamp":"2026-08-21T12:00:00.000Z"}\n')
+            f.write('{"timestamp":"2026-08-21T14:00:00.000Z"}\n')
+
+        self.write_result('-1001234567890_100', updated=True)
+        self.write_brain('-1001234567890_100', '# Test\n')
+
+        ret = topic_brains.finalize(self.pa_home)
+        self.assertEqual(ret, 0)
+
+        brain_path = os.path.join(self.pa_home, 'topic-brains', '-1001234567890_100', 'BRAIN.md')
+        with open(brain_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # Should have covers=2026-08-21T14:00:00.000Z (max from single file)
+        self.assertIn('covers=2026-08-21T14:00:00.000Z', content)
 
 
 class TestAtomicWrites(unittest.TestCase):

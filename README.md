@@ -72,7 +72,7 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for complete technical archit
 - **`projects/google-oauth-redirect/`** — Static bridge page for Telegram and mobile Google OAuth recovery.
 - **`.env.example`** & **`config.example.yaml`** — Root-level turnkey configuration templates for environment and workers.
 - **`examples/`** — Sample skills, OAuth helpers, and topic structures + ops watchdogs, injection redteam, brain audit.
-- **`docs/`** — Detailed guides: quickstart, configuration, skills development, workers, and deployment.
+- **`docs/`** — Detailed guides: quickstart, development, configuration, skills development, workers, and deployment.
 
 ---
 
@@ -88,6 +88,18 @@ The framework runs natively on **Windows, macOS, and Linux**.
 | `/keepawake` | `SetThreadExecutionState` | `caffeinate -s` | `systemd-inhibit` |
 
 For detailed per-OS installation instructions and troubleshooting, see [`docs/QUICKSTART.md`](docs/QUICKSTART.md) and [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md).
+
+---
+
+## 🧑‍💻 Development
+
+```bash
+cd pa && npm install && npm run build && npm test
+```
+
+Working on the framework? Both packages' `npm run build` and `npm test` take a shared `@build` reservation automatically. When several terminals or AI agents share one checkout, builds and test suites serialize instead of rewriting `dist/` under each other. A `waiting for @build` line is that coordination working; the run continues on its own.
+
+Build, test, and scoped-run workflow: [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md). Full multi-session protocol: [`docs/multi-session-protocol.md`](docs/multi-session-protocol.md).
 
 ---
 

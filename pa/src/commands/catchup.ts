@@ -54,11 +54,14 @@ export async function catchupCommand(opts: CatchupOptions = {}): Promise<void> {
     return;
   }
 
-  // Heartbeat the lock while the run is in flight: acquireLock purges any
-  // lock whose heartbeat is older than HEARTBEAT_STALE_MS (10 min) even when
-  // the holder is alive, and catchup runs can exceed that (skill execution +
-  // rotation + prune). Without this, Task Scheduler's next invocation would
-  // steal the lock mid-run and two catchups would overlap.
+  // Heartbeat the lock while the run is in flight: acquireLock evicts a lock
+  // whose heartbeat is older than HEARTBEAT_STALE_MS (10 min) plus a bounded
+  // grace window when the holder's PID is dead — an alive holder gets that
+  // grace before eviction (blackboard.ts's classifyLock, 2026-09-01
+  // followup-defects Defect 1), and catchup runs can exceed the stale
+  // threshold (skill execution + rotation + prune). Without this heartbeat,
+  // Task Scheduler's next invocation would eventually steal the lock mid-run
+  // (once even the grace window elapsed) and two catchups would overlap.
   //
   // Catchup's cadence is EVERY MINUTE, not every 15 minutes (this comment
   // claimed 15m until 2026-07-21 — wrong by 15x). Both registrations say so:

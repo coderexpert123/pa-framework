@@ -9,24 +9,23 @@ removing, or debugging a maintenance job.
 ## Catchup -> Maintenance Runner -> declared jobs (AI-100, 2026-08-02)
 
 `pa catchup`'s maintenance phase is one call — `runDueJobs('pa', jobsForHost('pa'), ...)`
-— driving 20 declared jobs (`pa/src/lib/maintenance/registry.ts`: `orphanWorkerReapJob`,
+— driving 21 declared jobs (`pa/src/lib/maintenance/registry.ts`: `orphanWorkerReapJob`,
 `blackboardPurgeJob`, `stalenessCheckJob`, `skillLogRotateJob`, `archivePruneJob`,
 `alertStateGcJob`, `weeklyLearnJob`, `sessionGcJob`, `voiceAttachmentGcJob`,
-`workerTeeGcJob`, `reservationGcJob` — added 2026-08-06 as part of the multi-session
-coordination protocol, GC'ing expired rows in `~/.pa/reservations.json` — `restoreDrillJob`,
+`workerTeeGcJob`, `reservationGcJob` — GC's expired rows in `~/.pa/reservations.json`
+(2026-08-06) — `restoreDrillJob`,
 `alertCensusJob`, `clobberSentinelJob`, `redteamRecurringJob`, `reviewConflictButtonsJob`,
-`recallIndexJob`, and `sharedTmpSweepJob`, `skillEngagementAuditJob` and `watchJobsRunnerJob`) against the ledger
-`~/.pa/maintenance-state.json`. **Total declared registry, both hosts: 30 jobs (20 pa + 10 bot)** as of the 2026-08-28 wave-4 tractable (`docs/ARCHITECTURE.md`'s "Turn-trace
+`recallIndexJob`, and `sharedTmpSweepJob`, `skillEngagementAuditJob`, `watchJobsRunnerJob`
+and `workerEditAuditSweepJob`) against the ledger
+`~/.pa/maintenance-state.json`. **Total declared registry, both hosts: 31 jobs (21 pa + 10 bot)** as of the 2026-09-01 AI-175 wave (`docs/ARCHITECTURE.md`'s "Turn-trace
 sidecar" / "Recall" sections; also see `pa/tests/maintenance-registry.test.ts`'s pinned
 counts). The pass is deliberately not gated on `!opts.topic` (fixed
 a live bug: `alert-state-gc`/staleness migration had never run in production because it was
 gated that way while both registered scheduled tasks pass `--topic`). **Single-tick gate
-(2026-08-23):** both registered Task Scheduler tasks fire every minute
-(`catchup --topic default` and `catchup --topic reminders`), and each used to run this
-whole pa-host pass — roughly doubling every job's due-check rate. `catchup.ts` now runs
-the pass only from the `--topic default` invocation; cadence itself is still owned by each
-job's own declaration and enforced against the ledger, so this gate only picks which of
-the two per-minute invocations drives it.
+(2026-08-23):** both per-minute Task Scheduler tasks (`--topic default`, `--topic
+reminders`) used to run this whole pa-host pass, doubling every job's due-check rate;
+`catchup.ts` now runs it only from `--topic default` — job cadence is still owned by each
+declaration, enforced against the ledger.
 
 **`orphanWorkerReapJob` harvest-window carve-out (AI-114, 2026-08-08):** this job calls
 `cleanupOrphanedWorkers()` with no `excludeSkills` — it runs every 60 seconds from a
@@ -47,18 +46,14 @@ failures" alert for them, so reporting them here too would be a third copy of on
 condition. `cost_tier: off_peak` periodic skills (cron has no fixed hour/minute, i.e. not
 time-pinned) get their threshold widened by the 4h z.ai peak-billing window
 (`isPeakWindow`, `scheduler.ts:28`), since `partitionOverdueByCostTier` defers exactly
-these skills during that window by design. (Note: `cost_tier: off_peak` currently defers
-runs during the Zhipu (z.ai) peak billing window, Mon-Fri 06:00-10:00 UTC by default —
-configurable via `cost_tier.peak_window_utc` in config.yaml.) a time-pinned cron gets no widening, matching
+these skills during that window by design (default Mon-Fri 06:00-10:00 UTC, overridable via
+`cost_tier.peak_window_utc`); a time-pinned cron gets no widening, matching
 `partitionOverdueByCostTier`'s own behaviour. The dedup key is transition-keyed —
 `stalenessDedupKey`, a sha1 of the sorted stale-skill-name set — so the alert fires on a
 CHANGE of the stale set rather than resending every tick with a new hours-ago number.
 
-**`skillCadenceAuditJob` (added 2026-08-17, retired 2026-08-23).** Its threshold
-(max(2× interval, 26h)) was always ≥ staleness-check's, so it could only fire strictly
-later about a skill staleness-check had already reported, and its `[PARKED]` annotation
-labelled the alert text without ever `continue`ing past it — a parked skill was paged
-three times. The old "avoided double-reporting" claim here was false; retirement is the fix.
+**`skillCadenceAuditJob` (added 2026-08-17, retired 2026-08-23)** double-paged parked
+skills against `stalenessCheckJob`, so it no longer exists.
 
 Built after an undeclared bot timer deleted 248 real Claude Code transcripts — full
 audit + governing rule in `plans/2026-08-02-maintenance-framework.md`; enforced in CI by
@@ -215,3 +210,12 @@ no shell, no network, no writes. 10 per tick, 25 active. Every terminal state bu
 SENDS, and the send precedes the status write. `shedWhenDegraded: false`; row-level target on
 `~/.pa/watch-jobs.json`, pruned 14 d after `terminalAt`. Mechanics:
 `plans/2026-08-31-ai170-async-watch-SPEC.md`.
+
+**`workerEditAuditSweepJob` (added 2026-09-01, AI-175).** Every 15 minutes, closes
+dispatch edit-audit windows the bot never closed — it crashed or restarted mid-dispatch.
+A window whose `botPid` is dead closes immediately; one whose PID is alive closes after
+`PA_WORKER_EDIT_WINDOW_MAX_MS` (2 h). Closing takes the after-snapshot, filters findings
+against active and recently-released reservations, and emits at most one `Unreserved
+worker edits` alert. Windows live in `~/.pa/worker-edit-audit/`; the retention target is
+the 24 h backstop for a window the sweeper could not parse. Design:
+`plans/2026-09-01-ai175-worker-edit-enforcement-SPEC.md`.

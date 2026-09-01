@@ -264,6 +264,7 @@ describe('a torn blackboard.json (D7)', () => {
 describe('startLockRenewal', () => {
   let dir: string;
   let originalStaleMs: string | undefined;
+  let originalGraceMs: string | undefined;
 
   // A dedicated temp PA_HOME (and therefore a dedicated blackboard.json +
   // lockfile) per test, not shared across the whole describe. These tests are
@@ -282,6 +283,9 @@ describe('startLockRenewal', () => {
     if (originalStaleMs === undefined) delete process.env.PA_HEARTBEAT_STALE_MS;
     else process.env.PA_HEARTBEAT_STALE_MS = originalStaleMs;
     originalStaleMs = undefined;
+    if (originalGraceMs === undefined) delete process.env.PA_HEARTBEAT_GRACE_MS;
+    else process.env.PA_HEARTBEAT_GRACE_MS = originalGraceMs;
+    originalGraceMs = undefined;
   });
 
   async function lockHeartbeat(resource: string): Promise<string | undefined> {
@@ -293,10 +297,16 @@ describe('startLockRenewal', () => {
     const { blackboard, startLockRenewal } = await import('../src/blackboard.js');
     const resource = 'renew-test-blocking';
     originalStaleMs = process.env.PA_HEARTBEAT_STALE_MS;
+    originalGraceMs = process.env.PA_HEARTBEAT_GRACE_MS;
     // Generous margins throughout: this is a real fs-lock-backed system
     // (proper-lockfile), and a single slow disk op must not flake this test —
-    // only a tick GAP longer than the TTL should ever cause a purge.
+    // only a tick GAP longer than the TTL should ever cause a purge. Grace
+    // zeroed: this test proves TTL+renewal interaction, not the grace window
+    // (covered separately below) — with the 3-minute default grace left in
+    // place, "past its TTL" would enter grace instead of evicting, and the
+    // second half of this test (unblocks once genuinely stale) would time out.
     process.env.PA_HEARTBEAT_STALE_MS = '2000';
+    process.env.PA_HEARTBEAT_GRACE_MS = '0';
 
     const acquired = await blackboard.acquireLock(resource, 'holder', process.pid, 2000);
     assert.equal(acquired, true);
@@ -508,5 +518,180 @@ describe('startLockRenewal', () => {
 
     assert.ok(clientCalls >= 1, `expected the injected client to receive at least one heartbeat tick, got ${clientCalls}`);
     assert.equal(singletonCalls, 0, 'the real blackboard singleton must never be touched when a client is injected');
+  });
+});
+
+// Followup-defects Defect 1 (2026-09-01): purge decisions must check holder
+// liveness, not staleness alone. Full decision matrix: dead PID -> evict now;
+// alive + fresh -> keep; alive + stale-but-in-grace -> keep (still blocks a
+// competing acquire — the double-occupancy safety property); alive +
+// grace-expired -> evict. Also covers the sibling defect: an unrelated purge
+// decision must be PERSISTED even when the caller's own requested resource
+// stays contended (previously only written on the no-conflict success path,
+// so it was recomputed and re-logged every ~1s retry without ever landing).
+describe('lock purge liveness + grace (Defect 1, 2026-09-01)', () => {
+  let dir: string;
+  let originalStaleMs: string | undefined;
+  let originalGraceMs: string | undefined;
+
+  beforeEach(async () => {
+    dir = await createTempPaHome();
+    originalStaleMs = process.env.PA_HEARTBEAT_STALE_MS;
+    originalGraceMs = process.env.PA_HEARTBEAT_GRACE_MS;
+    // Small, deterministic thresholds: stale at 500ms, grace window another
+    // 1000ms on top (evict at 1500ms total). Seeded row ages are chosen with
+    // generous margin either side of both boundaries.
+    process.env.PA_HEARTBEAT_STALE_MS = '500';
+    process.env.PA_HEARTBEAT_GRACE_MS = '1000';
+  });
+
+  afterEach(async () => {
+    await cleanup(dir);
+    if (originalStaleMs === undefined) delete process.env.PA_HEARTBEAT_STALE_MS;
+    else process.env.PA_HEARTBEAT_STALE_MS = originalStaleMs;
+    originalStaleMs = undefined;
+    if (originalGraceMs === undefined) delete process.env.PA_HEARTBEAT_GRACE_MS;
+    else process.env.PA_HEARTBEAT_GRACE_MS = originalGraceMs;
+    originalGraceMs = undefined;
+  });
+
+  async function seedRow(row: { resource: string; agent: string; pid: number; ageMs: number; contextId?: string }): Promise<void> {
+    const path = `${process.env.PA_HOME}/blackboard.json`;
+    let data: { active_locks: any[] };
+    try {
+      data = JSON.parse(await readFile(path, 'utf8'));
+    } catch {
+      data = { active_locks: [] };
+    }
+    data.active_locks.push({
+      resource: row.resource,
+      agent: row.agent,
+      pid: row.pid,
+      heartbeat: new Date(Date.now() - row.ageMs).toISOString(),
+      ...(row.contextId !== undefined ? { contextId: row.contextId } : {}),
+    });
+    const { writeFile } = await import('fs/promises');
+    await writeFile(path, JSON.stringify(data, null, 2), 'utf8');
+  }
+
+  async function readRows(): Promise<any[]> {
+    const path = `${process.env.PA_HOME}/blackboard.json`;
+    return JSON.parse(await readFile(path, 'utf8')).active_locks;
+  }
+
+  // Real spawn+kill (not a hardcoded PID literal) so "dead" is genuine, not
+  // an assumption about which PIDs happen to be unassigned on this machine —
+  // mirrors run-exclusive-lock.test.ts's spawnDummyHolder precedent.
+  async function spawnAndKill(): Promise<number> {
+    const { spawn } = await import('child_process');
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' });
+    const pid = child.pid!;
+    await new Promise((resolve) => setTimeout(resolve, 150)); // let it actually start
+    child.kill();
+    await new Promise<void>((resolve) => child.once('exit', () => resolve()));
+    await new Promise((resolve) => setTimeout(resolve, 150)); // let the OS actually reap it
+    return pid;
+  }
+
+  it('alive + stale-but-in-grace row is NOT evicted and still blocks a competing acquire (no double-occupancy)', async () => {
+    const { blackboard } = await import('../src/blackboard.js');
+    const resource = 'grace-blocks-competitor';
+    await seedRow({ resource, agent: 'holder', pid: process.pid, ageMs: 750 }); // > 500 stale, <= 1500 grace ceiling
+
+    const start = Date.now();
+    const competing = await blackboard.acquireLock(resource, 'competitor', 999999997, 800);
+    const elapsed = Date.now() - start;
+
+    assert.equal(competing, false, 'a graced row must still block a competing acquirer for a different pid');
+    assert.ok(elapsed >= 700, `should have waited out its timeout, took ${elapsed}ms`);
+
+    const rows = await readRows();
+    assert.equal(rows.filter((r: any) => r.resource === resource).length, 1, 'the graced row must still be present on disk, not purged');
+  });
+
+  it('alive + grace-expired row IS evicted and a competing acquire succeeds', async () => {
+    const { blackboard } = await import('../src/blackboard.js');
+    const resource = 'grace-expired-evicts';
+    await seedRow({ resource, agent: 'holder', pid: process.pid, ageMs: 1700 }); // past 500 stale + 1000 grace
+
+    const start = Date.now();
+    const competing = await blackboard.acquireLock(resource, 'competitor', 999999996, 2000);
+    const elapsed = Date.now() - start;
+
+    assert.equal(competing, true, 'a grace-expired row must be evicted, letting a new acquirer through');
+    assert.ok(elapsed < 1500, `should not have waited out the full timeout, took ${elapsed}ms`);
+
+    await blackboard.releaseLock(resource, 'competitor');
+  });
+
+  it('a dead PID is evicted immediately regardless of a fresh heartbeat (grace never applies to a dead holder)', async () => {
+    const { blackboard } = await import('../src/blackboard.js');
+    const resource = 'dead-pid-evicts-immediately';
+    const deadPid = await spawnAndKill();
+    await seedRow({ resource, agent: 'holder', pid: deadPid, ageMs: 0 }); // heartbeat is FRESH
+
+    const start = Date.now();
+    const competing = await blackboard.acquireLock(resource, 'competitor', 999999995, 2000);
+    const elapsed = Date.now() - start;
+
+    assert.equal(competing, true, 'a dead PID must be purged on the very next acquire, independent of heartbeat age/grace');
+    assert.ok(elapsed < 1500, `should not have waited, took ${elapsed}ms`);
+
+    await blackboard.releaseLock(resource, 'competitor');
+  });
+
+  it('getActiveLocks() includes a grace-zone row and excludes a grace-expired row', async () => {
+    const { blackboard } = await import('../src/blackboard.js');
+    await seedRow({ resource: 'active-grace-zone', agent: 'holder', pid: process.pid, ageMs: 750 });
+    await seedRow({ resource: 'active-grace-expired', agent: 'holder', pid: process.pid, ageMs: 1700 });
+
+    const rows = await blackboard.getActiveLocks();
+    assert.ok(rows.some((r) => r.resource === 'active-grace-zone'), 'grace-zone row must still read as active (matters for catchup.ts isLockLost())');
+    assert.ok(!rows.some((r) => r.resource === 'active-grace-expired'), 'grace-expired row must not read as active');
+  });
+
+  it('purgeStaleLocks() evicts dead-PID and grace-expired rows but keeps a grace-zone row', async () => {
+    const { blackboard } = await import('../src/blackboard.js');
+    const deadPid = await spawnAndKill();
+    await seedRow({ resource: 'sweep-dead', agent: 'a', pid: deadPid, ageMs: 0 });
+    await seedRow({ resource: 'sweep-grace', agent: 'a', pid: process.pid, ageMs: 750 });
+    await seedRow({ resource: 'sweep-expired', agent: 'a', pid: process.pid, ageMs: 1700 });
+
+    const purged = await blackboard.purgeStaleLocks();
+    assert.equal(purged, 2, 'expected exactly the dead-PID and grace-expired rows to be purged');
+
+    const rows = await readRows();
+    assert.deepEqual(rows.map((r: any) => r.resource).sort(), ['sweep-grace']);
+  });
+
+  it("acquireLock persists an unrelated purge even while its OWN requested resource stays contended (fixes the 1Hz purge-retry spin)", async () => {
+    const { blackboard } = await import('../src/blackboard.js');
+    // An unrelated resource, already past grace — eligible for eviction.
+    await seedRow({ resource: 'unrelated-stale', agent: 'holder', pid: process.pid, ageMs: 1700 });
+
+    // A real foreign process holds 'contended-target' so this call's own
+    // resource stays conflicted for its whole timeout budget — before the
+    // fix, that meant the purge computed above was never written to disk
+    // (only the no-conflict success branch persisted it).
+    const { spawn } = await import('child_process');
+    const foreignHolder = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' });
+    try {
+      await new Promise((r) => setTimeout(r, 150));
+      const seeded = await blackboard.acquireLock('contended-target', 'foreign-agent', foreignHolder.pid!, 2000);
+      assert.equal(seeded, true, 'precondition: the foreign holder must have acquired the target resource');
+
+      const acquired = await blackboard.acquireLock('contended-target', 'me', 999999994, 1200);
+      assert.equal(acquired, false, 'precondition: the target resource must have stayed contended for this call');
+
+      const rows = await readRows();
+      assert.equal(
+        rows.some((r: any) => r.resource === 'unrelated-stale'),
+        false,
+        'the unrelated grace-expired row must have been purged to disk even though this call never won its own resource'
+      );
+    } finally {
+      foreignHolder.kill();
+      await blackboard.releaseLock('contended-target', 'foreign-agent');
+    }
   });
 });

@@ -6,6 +6,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { runRulesCritic } from '../rules-critic.js';
 import { addRule } from '../../../../pa/dist/src/lib/feedback-rules.js';
+import { waitForDrain } from './test-teardown-guard.js';
 
 const TEST_HOME = join(tmpdir(), `pa-test-rules-critic-${process.pid}`);
 
@@ -25,8 +26,9 @@ describe('rules-critic', () => {
     process.env.PA_HOME = TEST_HOME;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     if (existsSync(TEST_HOME)) rmSync(TEST_HOME, { recursive: true, force: true });
+    await waitForDrain();
     delete process.env.PA_HOME;
   });
 

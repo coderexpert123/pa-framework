@@ -5,10 +5,18 @@ import { mkdtemp, writeFile, readFile, mkdir } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { fileURLToPath } from 'url';
-import { runPollLoop } from '../main.js';
+import { runPollLoop, _setExitForTest } from '../main.js';
 import { _setDegradedForTest } from '../health.js';
 import { rmRetry } from './rm-retry.js';
 import type { ConversationState } from '../types.js';
+import { waitForDrain } from './test-teardown-guard.js';
+
+// Root cause of this file registering ZERO tests under `node --test` (dark
+// since ~2026-08-28, fixed 2026-09-01): each awaited runPollLoop() below runs
+// its loop to completion and hits the real process.exit(0), killing this
+// file's isolated test subprocess before its TAP output reaches the parent.
+// See the matching comment in poll-loop.test.ts for the full mechanism.
+_setExitForTest(() => {});
 
 // ---------------------------------------------------------------------------
 // AI-100 Wave 2: bot poll-loop collapse onto the declared maintenance
@@ -69,6 +77,7 @@ describe('runPollLoop: maintenance ledger wiring (AI-100 Wave 2)', { concurrency
   });
 
   afterEach(async () => {
+    await waitForDrain();
     delete process.env.PA_HOME;
     await rmRetry(tempDir);
     (globalThis as Record<string, unknown>).fetch = savedFetch;
@@ -218,6 +227,7 @@ describe('runPollLoop: maintenance drain ordering (AI-100 Wave 2)', { concurrenc
   });
 
   afterEach(async () => {
+    await waitForDrain();
     delete process.env.PA_HOME;
     await rmRetry(tempDir);
     (globalThis as Record<string, unknown>).fetch = savedFetch;
@@ -277,6 +287,7 @@ describe('runPollLoop: maintenance log rotation (AI-100 Wave 2)', { concurrency:
   });
 
   afterEach(async () => {
+    await waitForDrain();
     delete process.env.PA_HOME;
     await rmRetry(tempDir);
     (globalThis as Record<string, unknown>).fetch = savedFetch;

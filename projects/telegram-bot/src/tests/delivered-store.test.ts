@@ -10,6 +10,7 @@ import {
   DELIVERED_MAX_AGE_MS,
   _resetDeliveredCacheForTest,
 } from '../delivered-store.js';
+import { waitForDrain } from './test-teardown-guard.js';
 
 let home: string;
 
@@ -19,7 +20,8 @@ beforeEach(() => {
   _resetDeliveredCacheForTest();
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await waitForDrain();
   delete process.env.PA_HOME;
   _resetDeliveredCacheForTest();
   try { rmSync(home, { recursive: true, force: true }); } catch {}

@@ -13,6 +13,7 @@ import {
   _resetPendingDispatchesForTest,
   type PendingDispatch,
 } from '../pending-dispatches.js';
+import { waitForDrain } from './test-teardown-guard.js';
 
 let home: string;
 
@@ -22,7 +23,8 @@ beforeEach(() => {
   _resetPendingDispatchesForTest();
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await waitForDrain();
   delete process.env.PA_HOME;
   _resetPendingDispatchesForTest();
   try { rmSync(home, { recursive: true, force: true }); } catch {}

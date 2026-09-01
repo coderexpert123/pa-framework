@@ -44,19 +44,18 @@ npm run build
 npm test
 ```
 
-Both acquire the `@build` reservation themselves and release it when they finish. You do not
-claim it, and you must not: a hand-claim under your own session label collides with the one
-the npm script takes, and your build then polls for 15 minutes and gives up.
+Both acquire and release `@build` themselves. Do not hand-claim it yourself — that collides
+with the npm script's own claim, and your build then polls 15 minutes and gives up.
 
 - Concurrent builds tear each other's `pa/dist` output (the bot loads it live)
 - D:'s 5400rpm HDD starves other D: I/O under one concurrent build
-- **`@build` covers test runs, not just builds** — a `npm test` run reads `dist/` the whole time, so a concurrent build tears it out from under a running suite
+- **Covers test runs too** — `npm test` reads `dist/` throughout, so a concurrent build tears it out from under a running suite
 - `@build` is a logical resource, not a path (the `@` prefix can never collide with a filename)
 - A `waiting for @build (held by "…")` line is the lock working. The run continues by itself once the holder releases; do not cancel it
-- **It fails open.** If the wait passes 15 minutes the run proceeds *without* the lock and says so, rather than failing for a reason unrelated to the code. A stale reservation therefore degrades serialization; it never bricks the machine's builds
-- **It is a no-op** when `PA_BUILD_LOCK=0`, when a parent already holds it (`PA_BUILD_LOCK_HELD`), when `~/.pa` does not exist, or when `pa/dist` has not been built yet — so CI, a fresh clone, and the very first build never claim anything
-- Set `PA_BUILD_LOCK=0` for **scoped** test runs inside an orchestrated wave, where several builders would otherwise serialize behind one another. Never set it for a full-suite or pre-push gate
-- Implementation: `pa/src/lib/build-lock.ts`, used by `pa/scripts/build.mjs`, `pa/scripts/run-tests.mjs`, the bot's copies of both, and `pa/src/code-fixer.ts`'s verification gate. It is the only implementation — do not add a second
+- **A DEAD holder is taken over, not run around (AI-174).** Past the 15-min wait, the holder's PID (from its label) is checked once — alive iff it started before the reservation's `claimedAt` (PID-reuse guard). Dead ⇒ its stale row is force-released and re-claimed, and your run holds the lock normally — proceeding unlocked instead would leave the dead row standing for the NEXT waiter too, running two builds concurrently. Only an unparseable label or an uncertain liveness check still proceeds *without* the lock. **Alive** ⇒ waits to a 45-min hard cap, then fails **CLOSED** (throws, names the holder)
+- **No-op** when `PA_BUILD_LOCK=0` (also the closed-fail bypass — no new env knob), a parent already holds it (`PA_BUILD_LOCK_HELD`), `~/.pa` is missing, or `pa/dist` isn't built yet — so CI/fresh-clone/first-build never claim anything
+- Set `PA_BUILD_LOCK=0` for **scoped** runs in an orchestrated wave so builders don't serialize behind each other. Never for a full-suite or pre-push gate
+- Implementation: `pa/src/lib/build-lock.ts` (both packages' build/test scripts, code-fixer's gate) — the only implementation, never add a second
 - In PowerShell, a hand-typed `pa claim '@build' …` still needs the quotes: an unquoted leading `@` is parsed as a splat of a nonexistent variable
 
 ## Rule 5: Never Run Raw Git Commands
@@ -97,14 +96,14 @@ For a large, self-contained, multi-file refactor that will not need to exercise 
 ## Rule 8: Long-Running Skills Hold the Tree
 
 - `update-brain` fires nightly at 21:30 IST and commits pending `CLAUDE.md` / `inventory/` changes — since 2026-08-23 it DEFERS that sweep for any managed path under an active foreign reservation or modified in the last 15 minutes, and names the deferred paths in its Telegram report. Reserve `CLAUDE.md` (`pa claim CLAUDE.md …`) if you are mid-edit across 21:30 IST; it will not be swept.
-- `self-improver`'s code-fixer can hold the `git-workflow` lock 30+ minutes. Every long holder (`pa run` skills, `pa catchup`, code-fixer) renews through `startLockRenewal()`; if its row is purged out from under it (a >10-minute sleep or I/O stall) the run FAILS loudly — alert families `Skill failed (lock lost)` / `Catchup aborted (lock lost)`, and code-fixer hard-reverts — instead of continuing as a silent second writer.
+- `self-improver`'s code-fixer can hold `git-workflow` 30+ minutes. Long holders (`pa run` skills, `pa catchup`, code-fixer) renew via `startLockRenewal()`; a genuinely purged row FAILS the run loudly (`Skill failed (lock lost)` / `Catchup aborted (lock lost)`, code-fixer hard-reverts) rather than continuing as a silent second writer. **Purge checks holder liveness, not staleness alone (2026-09-01):** dead PID ⇒ purge immediately; alive-but-stale (>10 min, `PA_HEARTBEAT_STALE_MS`) ⇒ a grace window (3 min, `PA_HEARTBEAT_GRACE_MS`) before eviction — `blackboard.ts`'s `classifyLock()` is the single decision point for `acquireLock`'s purge, `getActiveLocks()`, and `purgeStaleLocks()` (fixed after staleness-alone let a race steal an alive holder's row — three skill deaths 2026-08-31). `updateHeartbeat()` also retries internally (3x) before conceding.
 - Neither is a bug. A held lock or reservation is honoured; an unheld, recently-untouched file is fair game for the nightly sweep.
 
 ## Rule 9: Never Destroy What You Do Not Own
 
 No session, skill, worker or subagent may run `git stash`, `git checkout -- <path>`, `git reset`, `git clean`, or `git worktree remove` against a file it does not own. These rewrite other sessions' uncommitted work irreversibly and outside every lock in this system.
 
-On 2026-08-23 a skill's LLM worker ran `git stash push -m temp-stash-backlog BACKLOG.md` to make a size gate pass, popping it four minutes later. During that window three sessions' edits to that file were invisible on disk and one was about to write it. Nothing in the skill's own text forbade it, and Rule 5 does not bind a worker's improvisation.
+On 2026-08-23 a skill's LLM worker ran `git stash push -m temp-stash-backlog BACKLOG.md` to make a size gate pass, popping it four minutes later — three sessions' edits were briefly invisible on disk, and nothing in the skill's text forbade it.
 
 If a gate needs a clean tree, run the gate against a fresh checkout of the committed head — `git worktree add --detach C:/wt/gate-<name> HEAD` — never by mutating the shared tree. The `push` gate does this by construction since 2026-08-23 (Wave C): its skill runs the whole gate in `C:/wt/gate-push`, a detached checkout of HEAD. A gate that fails because of another session's WIP is reported as such, never stashed away.
 
@@ -124,7 +123,11 @@ These rules governed this repo from global machine notes only until 2026-08-23. 
 
 `pa claim --force` is the last step, not the first. When a reservation blocks work that genuinely cannot wait, message the holding session directly and agree on who yields. That ad-hoc session-to-session channel is a real, used part of this protocol — on 2026-08-23 it was how two sessions resolved a live conflict correctly — and it was undocumented until now.
 
-Five forced claims landed in the week of 2026-08-16, four of them on `@build`. A force with no conversation behind it is how two agents silently overwrite each other. Every claim, denial, force, release and expiry is now logged to `app.log.jsonl` under module `reservations`; `pa claims --stats` summarizes the last 7 days and the weekly ops digest carries a one-line rollup.
+Every claim, denial, force, release and expiry is now logged to `app.log.jsonl` under module `reservations`; `pa claims --stats` summarizes the last 7 days and the weekly ops digest carries a one-line rollup.
+
+## Rule 12: Unreserved Worker Edits Are Detected
+
+A bot dispatch snapshots `git status` before and after the worker runs. Any tracked path that appears, changes, or vanishes inside that window without a covering reservation — active at either end, or claimed and released inside it — produces ONE `Unreserved worker edits` alert naming the paths, the topic and the worker. A worker that claims its paths produces no alert; that is the whole incentive. If the bot restarts mid-dispatch, the `worker-edit-audit-sweep` maintenance job closes the window instead. Detection only — nothing is blocked or reverted. Disable with `PA_WORKER_EDIT_AUDIT=0`. Design: `plans/2026-09-01-ai175-worker-edit-enforcement-SPEC.md`.
 
 ## See also
 
