@@ -6,6 +6,7 @@ import { join } from 'path';
 import { makeRefId, appendRefId, appendRefIdAndLog } from '../ref-id.js';
 import { flushLog } from '../../../../pa/dist/src/lib/log.js';
 import { rmRetry } from './rm-retry.js';
+import { waitForDrain } from './test-teardown-guard.js';
 
 describe('makeRefId', { concurrency: 1 }, () => {
   it('returns s-xxxx format by default', () => {
@@ -63,6 +64,7 @@ describe('appendRefIdAndLog', { concurrency: 1 }, () => {
 
   afterEach(async () => {
     await flushLog(); // drain fire-and-forget appendRefIdAndLog writes to tempDir before removing it
+    await waitForDrain();
     if (originalPaHome === undefined) delete process.env.PA_HOME;
     else process.env.PA_HOME = originalPaHome;
     await rmRetry(tempDir);

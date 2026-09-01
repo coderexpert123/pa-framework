@@ -28,6 +28,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import type { ConversationState } from '../types.js';
 import { rmRetry } from './rm-retry.js';
+import { waitForDrain } from './test-teardown-guard.js';
 
 const testRunId = `test-${process.pid}-${Date.now()}`;
 
@@ -135,6 +136,7 @@ describe('dispatchMessage non-rate-limit failover cascade', () => {
   });
 
   afterEach(async () => {
+    await waitForDrain();
     process.env.PA_HOME = sharedTempDir;
     await rmRetry(testDir);
   });
@@ -272,6 +274,7 @@ describe('dispatchMessage stop-marker guard', () => {
   });
 
   afterEach(async () => {
+    await waitForDrain();
     process.env.PA_HOME = sharedTempDir;
     _clearStoppedForTest();
     await rmRetry(testDir);

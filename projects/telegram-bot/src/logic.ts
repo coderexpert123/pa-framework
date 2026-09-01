@@ -514,6 +514,18 @@ export function handleResetCommand(state: ConversationState): { matched: boolean
   state.preferred_worker = undefined;
   state.preferred_worker_set_at = undefined;
   state.cwd_override = undefined;
+  // Same reason_code-plumbing pattern as expirePreferredWorker: main.ts's RESET_PATTERN
+  // branch calls refreshPinnedStatusCardInPlace right after this, which re-hydrates and
+  // recomputes current_worker/default_worker from live config — the '' placeholders here
+  // only need to be falsy so that recompute's priority chain falls through correctly.
+  // pinned_worker is cleared too — see expirePreferredWorker's comment for why a stale
+  // mirror left from a prior override would otherwise outrank the real default.
+  state.pinned_worker = undefined;
+  state.model_status = buildModelStatusSnapshot({
+    currentWorker: '',
+    defaultWorker: '',
+    reasonCode: 'reset',
+  });
   return { matched: true, response: '🔄 Conversation and session cleared for this topic.' };
 }
 
@@ -896,6 +908,21 @@ export function handleModelSwitch(
 /**
  * Expire a /agent or /model override if it was set on a previous IST calendar day.
  * Returns true if the override was cleared, false if no change.
+ *
+ * Sets model_status.reason_code to 'midnight_reset' so the next status-card refresh
+ * reports the real cause instead of falling back through hydrateModelStatus's generic
+ * inferLegacyReasonCode() (which would call this ambient 'default_active'). current_worker
+ * and default_worker are placeholders ('') deliberately — hydrateModelStatus/refresh
+ * always recomputes both from live state + config on the very next hydrate, so a wrong
+ * guess here (main.ts has no reachable point where THIS function knows the effective
+ * default worker) can never survive to the saved snapshot; the placeholder only needs to
+ * be falsy so the current_worker priority chain falls through to the real default.
+ * pinned_worker is cleared alongside model_status for the same reason: hydrateModelStatus's
+ * candidateWorker chain also falls back to state.pinned_worker, and a stale mirror left
+ * from a PRIOR override would otherwise outrank the real default the same way a stale
+ * model_status.current_worker would (see the /agent-switch-to-default finding,
+ * plans/2026-09-01-revived-bot-tests-bitrot-findings.md family notes) — this only guards
+ * this function's own callers, not the deeper hydrateModelStatus resolution-order gap.
  */
 export function expirePreferredWorker(state: ConversationState): boolean {
   if (!state.preferred_worker || !state.preferred_worker_set_at) return false;
@@ -907,6 +934,12 @@ export function expirePreferredWorker(state: ConversationState): boolean {
     state.preferred_worker = undefined;
     state.preferred_worker_set_at = undefined;
     state.session = undefined;
+    state.pinned_worker = undefined;
+    state.model_status = buildModelStatusSnapshot({
+      currentWorker: '',
+      defaultWorker: '',
+      reasonCode: 'midnight_reset',
+    });
     return true;
   }
   return false;

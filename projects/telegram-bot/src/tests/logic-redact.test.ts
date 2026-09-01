@@ -12,6 +12,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { buildWorkerResponse } from '../logic.js';
 import { resetRedactCache } from '../../../../pa/dist/src/lib/redact.js';
+import { waitForDrain } from './test-teardown-guard.js';
 
 const TEST_PA_HOME = join(tmpdir(), `pa-test-logic-redact-${process.pid}`);
 
@@ -27,11 +28,12 @@ describe('logic.ts redaction', () => {
     process.env.PA_HOME = TEST_PA_HOME;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     // Clean up test directory
     if (existsSync(TEST_PA_HOME)) {
       rmSync(TEST_PA_HOME, { recursive: true, force: true });
     }
+    await waitForDrain();
     delete process.env.PA_HOME;
   });
 

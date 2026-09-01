@@ -22,6 +22,7 @@ import {
 import type { TelegramMessage } from '../types.js';
 import { buildTopicDescription } from '../context.js';
 import type { ConversationState } from '../types.js';
+import { waitForDrain } from './test-teardown-guard.js';
 
 function makeState(overrides: Partial<ConversationState> = {}): ConversationState {
   return {
@@ -41,6 +42,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  await waitForDrain();
   delete process.env.PA_HOME;
   await rm(tempDir, { recursive: true, force: true });
 });

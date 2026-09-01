@@ -194,23 +194,25 @@ function spawnTests(testFiles, distDir) {
 
 /** Files allowlisted to contribute zero tests (legitimately-empty placeholders). */
 const DARK_FILE_ALLOWLIST = new Set([
-  // KNOWN-DARK (2026-08-28 deep-recheck; re-verified 2026-08-31): these
-  // integration-class bot test files pass as empty shells with ZERO suites
-  // registered (node:test runner bug; pure-sync describes register fine).
-  // Splitting cannot fix it (each dark describe is dark SOLO). The 2026-08-28
-  // hypothesis that Node 22.14→22.23 would fix it is DISPROVEN: on 22.23.2
-  // (upgraded 2026-08-31) all five files STILL register zero tests (verified
-  // per-file with --test direct invocation) while pa's previously-dark
-  // workers.test.js runs its 89 tests fine — so the trigger is structural to
-  // these files (async-describe/timer shape), not the Node version. Root-cause
-  // fix is a follow-up (BACKLOG); these entries STAY until the files' tests
-  // actually run. The bot's poll-loop/integration layer is silently skipped by
-  // local gates — treat bot "green" accordingly. Do not add new files.
-  'dist/tests/poll-loop.test.js',
-  'dist/tests/integration.test.js',
-  'dist/tests/poll-loop-integration-extra.test.js',
-  'dist/tests/poll-loop-maintenance.test.js',
-  'dist/tests/voice-poll-loop.test.js',
+  // HISTORICAL (2026-08-28 deep-recheck; re-verified 2026-08-31; ROOT-CAUSED
+  // AND FIXED 2026-09-01): these five files used to register zero suites
+  // under `node --test`, misdiagnosed at the time as a node:test runner bug
+  // (registrations "always happened", process just never reported them). The
+  // real cause: `runPollLoop()` (main.ts) unconditionally called the real
+  // `process.exit(0)` at the natural end of its poll loop. `node --test`
+  // isolates each test file into its own subprocess, and every test in these
+  // five files that `await`s runPollLoop() to completion drove that exit,
+  // killing the file's subprocess before node:test's own TAP output for it
+  // reached the parent — reading back as an empty shell with zero suites.
+  // `poll-loop-callbacks.test.ts` (never dark) carried the tell: lines 5-29
+  // document this exact landmine and deliberately avoid awaiting runPollLoop
+  // to completion to dodge it. Fix: an injectable `exitFn` + `_setExitForTest`
+  // test hook (main.ts) — production behavior unchanged, tests inject a
+  // no-op. All five files now register real suites and pass (bit-rot findings
+  // from reviving them: plans/2026-09-01-revived-bot-tests-bitrot-findings.md,
+  // ~30 individually-skipped, dated, evidence-specific TODOs across the five
+  // files). This allowlist now stays EMPTY — do not add new files without the
+  // same root-cause rigor.
 ]);
 
 /**

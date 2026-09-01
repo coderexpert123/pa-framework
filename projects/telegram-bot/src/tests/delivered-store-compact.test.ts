@@ -10,6 +10,7 @@ import {
   deliveredKey,
   _resetDeliveredCacheForTest,
 } from '../delivered-store.js';
+import { waitForDrain } from './test-teardown-guard.js';
 
 let tempDir: string;
 let originalPaHome: string | undefined;
@@ -23,6 +24,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await rm(tempDir, { recursive: true, force: true });
+  await waitForDrain();
   if (originalPaHome === undefined) delete process.env.PA_HOME;
   else process.env.PA_HOME = originalPaHome;
   _resetDeliveredCacheForTest();

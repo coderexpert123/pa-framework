@@ -6,6 +6,8 @@ import {
   withBuildLock,
   buildLockDisabled,
   buildLockLabel,
+  parseHolderPid,
+  isHolderAlive,
   BUILD_LOCK_HELD_ENV,
   BUILD_LOCK_DISABLE_ENV,
 } from '../src/lib/build-lock.js';
@@ -229,10 +231,139 @@ describe('build-lock: withBuildLock', () => {
     assert.ok(waitingNotices[0].includes('other build'));
   });
 
-  it('fail-open: always conflicts past the deadline ⇒ fn still runs once, releaseFn never called', async () => {
-    const holder = fakeReservation({ id: 'r-holder002', session: 'npm-pa-555', note: 'stale build' });
+  it('AI-174: dead-holder takeover — releases the dead reservation, re-claims, HOLDS the lock during fn(), and releases after', async () => {
+    // Corrected 2026-09-01: proceeding UNLOCKED for a confirmed-dead holder (the
+    // original design) would leave the dead row standing, so a second waiter behind
+    // the same dead holder would ALSO fail open and run CONCURRENTLY with the first
+    // — the exact hazard AI-174 exists to prevent. Takeover means we hold a live row
+    // and everyone else serializes behind it properly. This supersedes the earlier
+    // "fail-open ... confirmed DEAD ⇒ releaseFn never called" test, whose premise is
+    // no longer true under the corrected design.
+    const deadHolder = fakeReservation({ id: 'r-holder010', session: 'npm-pa-9999', note: 'killed build' });
+    const newReservation = fakeReservation({ id: 'r-takeover010', session: 'npm-pa-1' });
     let fnCalls = 0;
+    let seenDuring: string | undefined;
+    let claimCalls = 0;
     let releaseCalls = 0;
+    const releaseArgs: unknown[] = [];
+    let livenessArgs: [number, number] | undefined;
+    let livenessCalls = 0;
+    let clock = 0;
+    const notices: string[] = [];
+    const result = await withBuildLock(
+      'npm-pa-1',
+      async () => {
+        fnCalls++;
+        seenDuring = process.env[BUILD_LOCK_HELD_ENV];
+        return 'ran-with-lock';
+      },
+      {
+        waitMs: 100,
+        pollMs: 1,
+        now: () => clock,
+        sleep: async () => {
+          clock = 1_000_000;
+        },
+        notice: (line) => notices.push(line),
+        claimFn: async () => {
+          claimCalls++;
+          if (claimCalls === 1) return conflictResult(deadHolder);
+          return okResult(newReservation); // the takeover retry succeeds
+        },
+        releaseFn: async (opts) => {
+          releaseCalls++;
+          releaseArgs.push(opts);
+          return { released: 1 };
+        },
+        checkHolderAliveFn: async (pid, claimedAtMs) => {
+          livenessCalls++;
+          livenessArgs = [pid, claimedAtMs];
+          return false;
+        },
+      }
+    );
+    assert.equal(result, 'ran-with-lock');
+    assert.equal(fnCalls, 1);
+    assert.equal(livenessCalls, 1);
+    assert.deepEqual(livenessArgs, [9999, new Date(deadHolder.claimedAt).getTime()]);
+    assert.equal(seenDuring, newReservation.id, 'expected the lock to be genuinely held during fn()');
+    assert.equal(claimCalls, 2, 'expected the initial conflicting attempt plus the takeover retry');
+    assert.equal(releaseCalls, 2, 'expected the forced takeover release plus the normal end-of-fn release');
+    assert.deepEqual(releaseArgs[0], {
+      id: deadHolder.id,
+      force: true,
+      ownerSession: deadHolder.session,
+      bySession: 'npm-pa-1',
+    });
+    assert.deepEqual(releaseArgs[1], { id: newReservation.id });
+    assert.ok(notices.some((n) => n.includes('is dead') && n.includes('taking over')));
+  });
+
+  it('AI-174: takeover races another waiter behind the same dead holder — never force-releases the new legitimate holder, waits it out then succeeds', async () => {
+    const deadHolder = fakeReservation({ id: 'r-dead020', session: 'npm-pa-9999', note: 'killed build' });
+    const raceWinner = fakeReservation({ id: 'r-race020', session: 'npm-pa-4242', note: 'took over first' });
+    const finalReservation = fakeReservation({ id: 'r-final020', session: 'npm-pa-1' });
+    let claimCalls = 0;
+    let releaseCalls = 0;
+    const releaseArgs: unknown[] = [];
+    let livenessCalls = 0;
+    let fnCalls = 0;
+    let seenDuring: string | undefined;
+    let clock = 0;
+    const notices: string[] = [];
+    const result = await withBuildLock(
+      'npm-pa-1',
+      async () => {
+        fnCalls++;
+        seenDuring = process.env[BUILD_LOCK_HELD_ENV];
+        return 'ok-after-race';
+      },
+      {
+        waitMs: 100,
+        pollMs: 1,
+        now: () => clock,
+        sleep: async () => {
+          clock += 200;
+        },
+        notice: (line) => notices.push(line),
+        claimFn: async () => {
+          claimCalls++;
+          if (claimCalls === 1) return conflictResult(deadHolder);
+          // Our takeover retry races against another waiter who claimed first.
+          if (claimCalls === 2) return conflictResult(raceWinner);
+          return okResult(finalReservation); // raceWinner eventually released it
+        },
+        releaseFn: async (opts) => {
+          releaseCalls++;
+          releaseArgs.push(opts);
+          return { released: 1 };
+        },
+        checkHolderAliveFn: async () => {
+          livenessCalls++;
+          return false; // only ever asked about the ORIGINAL dead holder
+        },
+      }
+    );
+    assert.equal(result, 'ok-after-race');
+    assert.equal(fnCalls, 1);
+    assert.equal(seenDuring, finalReservation.id);
+    assert.equal(claimCalls, 3);
+    assert.equal(livenessCalls, 1, 'expected the race winner to never be re-checked for liveness');
+    assert.equal(releaseCalls, 2, 'expected exactly one forced takeover release plus one normal end-of-fn release');
+    assert.deepEqual(releaseArgs[0], {
+      id: deadHolder.id,
+      force: true,
+      ownerSession: deadHolder.session,
+      bySession: 'npm-pa-1',
+    });
+    assert.deepEqual(releaseArgs[1], { id: finalReservation.id });
+    assert.ok(notices.some((n) => n.includes('is dead') && n.includes('taking over')));
+  });
+
+  it('AI-174: no-PID label ⇒ legacy fail-open, liveness check never called', async () => {
+    const holder = fakeReservation({ id: 'r-holder011', session: 'legacy-worker', note: 'old-style label' });
+    let fnCalls = 0;
+    let livenessCalls = 0;
     let clock = 0;
     const notices: string[] = [];
     const result = await withBuildLock(
@@ -246,20 +377,96 @@ describe('build-lock: withBuildLock', () => {
         pollMs: 1,
         now: () => clock,
         sleep: async () => {
-          clock = 1_000_000; // jump well past the deadline after the first wait
+          clock = 1_000_000;
         },
         notice: (line) => notices.push(line),
         claimFn: async () => conflictResult(holder),
-        releaseFn: async () => {
-          releaseCalls++;
-          return { released: 1 };
+        checkHolderAliveFn: async () => {
+          livenessCalls++;
+          return true; // must never be reached — pid is unparseable
         },
       }
     );
     assert.equal(result, 'ran-anyway');
     assert.equal(fnCalls, 1);
-    assert.equal(releaseCalls, 0);
+    assert.equal(livenessCalls, 0);
+    assert.ok(notices.some((n) => n.includes('legacy behavior')));
     assert.ok(notices.some((n) => n.includes('proceeding WITHOUT the lock')));
+  });
+
+  it('AI-174: alive holder extends the wait past the original deadline, then fails CLOSED at the hard cap', async () => {
+    const holder = fakeReservation({ id: 'r-holder012', session: 'npm-pa-8888', note: 'long build' });
+    let fnCalls = 0;
+    let claimCalls = 0;
+    let livenessCalls = 0;
+    let clock = 0;
+    const notices: string[] = [];
+    await assert.rejects(
+      () =>
+        withBuildLock(
+          'npm-pa-1',
+          async () => {
+            fnCalls++;
+            return 'should-not-run';
+          },
+          {
+            waitMs: 100,
+            hardCapMs: 500,
+            pollMs: 1,
+            now: () => clock,
+            sleep: async () => {
+              clock += 200;
+            },
+            notice: (line) => notices.push(line),
+            claimFn: async () => {
+              claimCalls++;
+              return conflictResult(holder);
+            },
+            checkHolderAliveFn: async () => {
+              livenessCalls++;
+              return true;
+            },
+          }
+        ),
+      /@build still held by "npm-pa-8888"/
+    );
+    assert.equal(fnCalls, 0);
+    // Liveness runs exactly once (at the original waitMs deadline), never again while
+    // extending the wait toward the hard cap.
+    assert.equal(livenessCalls, 1);
+    assert.ok(claimCalls >= 3, `expected at least 3 claim attempts, got ${claimCalls}`);
+    assert.ok(notices.some((n) => n.includes('still alive — continuing to wait')));
+  });
+
+  it('parseHolderPid: extracts the trailing PID from npm-<pkg>-<pid> and code-fixer-<pid> labels', () => {
+    assert.equal(parseHolderPid('npm-pa-1234'), 1234);
+    assert.equal(parseHolderPid('npm-bot-5678'), 5678);
+    assert.equal(parseHolderPid('code-fixer-9999'), 9999);
+  });
+
+  it('parseHolderPid: returns null for a label with no trailing numeric segment', () => {
+    assert.equal(parseHolderPid('legacy-worker'), null);
+    assert.equal(parseHolderPid(undefined), null);
+    assert.equal(parseHolderPid(null), null);
+    assert.equal(parseHolderPid(''), null);
+  });
+
+  it('isHolderAlive: PID not found (null start time) ⇒ dead', async () => {
+    const alive = await isHolderAlive(9999, 5000, async () => null);
+    assert.equal(alive, false);
+  });
+
+  it('isHolderAlive: PID started before the claim ⇒ alive', async () => {
+    const alive = await isHolderAlive(9999, 5000, async () => 1000);
+    assert.equal(alive, true);
+  });
+
+  it('isHolderAlive: PID-reused-younger-than-claim (started AFTER claimedAt) ⇒ treated as dead', async () => {
+    // PID-reuse guard: a process bearing this PID exists, but it started AFTER the
+    // reservation was claimed, so it cannot be the process that claimed it — some
+    // other process has since taken over the recycled PID number.
+    const alive = await isHolderAlive(9999, 1000, async () => 5000);
+    assert.equal(alive, false);
   });
 
   it('claimFn throwing ⇒ fn still runs once, no unhandled rejection', async () => {

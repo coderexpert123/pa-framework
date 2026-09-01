@@ -5,6 +5,7 @@ import { mkdtempSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { acquireLock } from '../lock.js';
+import { waitForDrain } from './test-teardown-guard.js';
 
 // Known limitation (2026-08-23): the stale-overwrite path's plain unlink+create
 // is not a compare-and-swap, so two racing callers can still both observe a
@@ -25,6 +26,7 @@ afterEach(async () => {
   // D15 reset-never-delete pattern: `delete process.env.PA_HOME` is the exact
   // shape that sent real Telegram alerts in production (2026-08-18) when a
   // later, unrelated module read an unset PA_HOME mid-suite.
+  await waitForDrain();
   process.env.PA_HOME = process.env.PA_TEST_LOG_HOME ?? mkdtempSync(join(tmpdir(), 'tgbot-lock-fallback-'));
   await rm(tempDir, { recursive: true, force: true });
 });

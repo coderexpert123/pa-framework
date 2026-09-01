@@ -15,9 +15,17 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, readFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { runPollLoop } from '../main.js';
+import { runPollLoop, _setExitForTest } from '../main.js';
 import { loadTopicState, saveTopicState, loadState } from '../conversation.js';
 import type { ConversationState, SessionInfo } from '../types.js';
+import { waitForDrain } from './test-teardown-guard.js';
+
+// Root cause of this file registering ZERO tests under `node --test` (dark
+// since ~2026-08-28, fixed 2026-09-01): each awaited runPollLoop() below runs
+// its loop to completion and hits the real process.exit(0), killing this
+// file's isolated test subprocess before its TAP output reaches the parent.
+// See the matching comment in poll-loop.test.ts for the full mechanism.
+_setExitForTest(() => {});
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -103,6 +111,7 @@ describe('integration: at-least-once delivery', { concurrency: 1 }, () => {
   afterEach(async () => {
     restore?.();
     restore = undefined;
+    await waitForDrain();
     delete process.env.PA_HOME;
     await rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });

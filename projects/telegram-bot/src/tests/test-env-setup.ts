@@ -37,6 +37,14 @@ process.env.PA_TEST_LOG_HOME = suiteHome;
 // 200 {ok:true} Response under this flag and never touches the network
 // (pa/src/lib/telegram-proxy.ts), and the reply-path dedup honours it too.
 process.env.PA_NOTIFY_DISABLED = '1';
+
+// AI-173 phase 1 / AI-175 WP-3: the worker-edit audit defaults ON
+// (isAuditEnabled() is `!== '0'`), and openWindow/closeWindow each shell out to a
+// real `git status --porcelain` against the live D: checkout. Left on, every
+// dispatch-driving test in this suite would pay two HDD-bound git subprocesses and
+// could raise a finding from a concurrent session's edits. Off by default here;
+// worker-edit-audit-wiring.test.ts re-enables it per-case.
+process.env.PA_WORKER_EDIT_AUDIT = '0';
 // The pa CLI tees an agy worker's output by exporting AGY_TEE_OUT to the worker
 // process (worker-exec.ts keys the tee path off it when present). When a test run is
 // HOSTED INSIDE such a worker — the push skill's gate runs via an agy dispatch — the

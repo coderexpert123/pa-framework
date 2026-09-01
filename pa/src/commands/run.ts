@@ -452,11 +452,16 @@ export async function runCommand(
       await handleSkillResult(lockResult, 'lock', skillName, Date.now() - waitStart, extraArgs, depth, preferredWorker, skill.frontmatter.telegram_output, allSecrets);
       return lockResult;
     }
-    // Heartbeat while the run is in flight: acquireLock purges any lock whose
-    // heartbeat is older than HEARTBEAT_STALE_MS (10 min) even when the holder
-    // is alive (see blackboard.ts), and push/push-public/investigate-flagged
-    // can all legitimately run well past that. Without this, a second run
-    // would steal the lock mid-work. Mirrors catchup.ts's own heartbeat.
+    // Heartbeat while the run is in flight: acquireLock evicts a lock whose
+    // heartbeat is older than HEARTBEAT_STALE_MS (10 min) PLUS a bounded grace
+    // window when the holder's PID is still alive (see blackboard.ts's
+    // classifyLock — 2026-09-01 followup-defects Defect 1; before that fix, an
+    // alive holder was purged on staleness alone, which killed three real
+    // push/push-public runs mid-gate on 2026-08-31), and dead-PID rows are
+    // still purged immediately. push/push-public/investigate-flagged can all
+    // legitimately run well past the stale threshold. Without this heartbeat,
+    // a second run would eventually steal the lock mid-work once even the
+    // grace window elapsed. Mirrors catchup.ts's own heartbeat.
     // startLockRenewal (2026-08-23) additionally detects a PURGED row via
     // onLost — the old hand-rolled setInterval renewed blindly and never
     // noticed a purge, so a concurrent commit could land undetected.

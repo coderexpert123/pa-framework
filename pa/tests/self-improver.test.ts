@@ -6,7 +6,7 @@ import { GIT_WORKFLOW_RESOURCE, GIT_LOCK_WAIT_MS } from '../src/code-fixer.js';
 import type { BlackboardLockClient } from '../src/code-fixer.js';
 import { exclusiveLockKey } from '../src/commands/run.js';
 import { createTempPaHome, createTempSkill, createTempDraft, createTempSecrets, createTempConfig, cleanup } from './helpers.js';
-import { readFile, mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
+import { readFile, mkdir, mkdtemp, rm, writeFile, readdir } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { exec as execCb } from 'child_process';
@@ -970,6 +970,17 @@ describe('rollback', () => {
     // Git-optional guard (2026-08-31): the guard reads config.yaml, which must exist.
     // Omitting the git_workflow block defaults to "allowed" (legacy behavior).
     await createTempConfig(dir, []);
+    // AI-176: this describe's first test drives the REAL rollback() (called with
+    // no deps at all in one case) down a REAL 'restore' flag for skill
+    // 'reminders' — production root cause of the 'Rollback: reminders'
+    // duplicate rows found in plans/INDEX.md. Give every call an explicit
+    // postmortemRepoRoot so it can never resolve to the live repo tree.
+    await mkdir(join(dir, 'plans', 'postmortems'), { recursive: true });
+    await writeFile(
+      join(dir, 'plans', 'INDEX.md'),
+      '# Plans Index\n\n| Date | Title | Status | Link |\n|------|-------|--------|------|\n',
+      'utf8'
+    );
   });
 
   afterEach(async () => {
@@ -1007,7 +1018,7 @@ describe('rollback', () => {
       copyFile(join(dir, 'skills', 'reminders', 'skill.md'), join(dir, 'skill-drafts', 'reminders-fix', 'target-backup.skill.md'))
     );
 
-    const lines = await rollback();
+    const lines = await rollback({ postmortemRepoRoot: dir });
     assert.equal(lines.length, 1);
     assert.match(lines[0], /Restored.*reminders/);
 
@@ -1021,7 +1032,7 @@ describe('rollback', () => {
   });
 
   it('returns an empty array and writes no audit records when nothing needs rolling back', async () => {
-    const lines = await rollback();
+    const lines = await rollback({ postmortemRepoRoot: dir });
     assert.deepEqual(lines, []);
     const records = await readAuditRecords(dir);
     assert.equal(records.length, 0);
@@ -1073,7 +1084,7 @@ describe('rollback', () => {
       },
     };
 
-    await rollback({ blackboardFn: bb, gitGuardFn });
+    await rollback({ blackboardFn: bb, gitGuardFn, postmortemRepoRoot: dir });
 
     assert.equal(acquireCalls.length, 1);
     assert.equal(acquireCalls[0].resource, exclusiveLockKey(GIT_WORKFLOW_RESOURCE));
@@ -1243,15 +1254,40 @@ describe('sweepStaleDrafts (thrash control — 2026-07-11)', () => {
 
 describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
   let dir: string;
+  let originalCwd: string;
 
   beforeEach(async () => {
     dir = await createTempPaHome();
     // Git-optional guard (2026-08-31): the guard reads config.yaml, which must exist.
     // Omitting the git_workflow block defaults to "allowed" (legacy behavior).
     await createTempConfig(dir, []);
+    // AI-176: rollback() here is the REAL self-improver code (not mocked), and it
+    // reaches maybeCreatePostmortem -> createPostmortemStub, which resolves its
+    // write root from process.cwd() rather than an injected path. Without a
+    // chdir, every test below wrote a real postmortem stub + INDEX.md row into
+    // the actual repo tree — root cause of the 'Rollback: coding-dirs-update'
+    // (commit abc1234) duplicate rows found in production plans/INDEX.md.
+    // Isolate the same way the 'postmortem stub creation (WPD6)' describe below
+    // already does.
+    originalCwd = process.cwd();
+    await mkdir(join(dir, 'plans', 'postmortems'), { recursive: true });
+    await writeFile(
+      join(dir, 'plans', 'INDEX.md'),
+      '# Plans Index\n\n| Date | Title | Status | Link |\n|------|-------|--------|------|\n',
+      'utf8'
+    );
+    // Some tests below use the REAL default gitGuardFn (checkGitWorkflowAllowed),
+    // which probes `git rev-parse --is-inside-work-tree` against process.cwd() —
+    // `dir` must actually be a work tree or that guard now fails "not inside a
+    // git work tree" for every test that doesn't override gitGuardFn. No commit
+    // is needed for the probe to pass; every git command a test cares about goes
+    // through its own mocked execFn, never real git.
+    await promisify(execCb)('git init -q', { cwd: dir });
+    process.chdir(dir);
   });
 
   afterEach(async () => {
+    process.chdir(originalCwd);
     await cleanup(dir);
   });
 
@@ -1288,6 +1324,7 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
       },
       blackboardFn: bb,
       gitGuardFn,
+      postmortemRepoRoot: dir,
     });
 
     // `-n` (staged, not committed) since 2026-07-21 so the pa/data/profile* churn can be
@@ -1324,6 +1361,7 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
       },
       blackboardFn: bb,
       gitGuardFn,
+      postmortemRepoRoot: dir,
     });
 
     assert.equal(lines.length, 1);
@@ -1352,6 +1390,7 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
       execFn: async (cmd: string) => ({ stdout: cmd.includes('rev-parse') ? 'def5678\n' : '', stderr: '' }),
       blackboardFn: bb,
       gitGuardFn,
+      postmortemRepoRoot: dir,
     });
 
     assert.match(lines[0], /bot restart|rebuild/i);
@@ -1378,6 +1417,7 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
         return { stdout: '', stderr: '' };
       },
       blackboardFn: bb,
+      postmortemRepoRoot: dir,
     });
 
     assert.match(lines[0], /Rollback FAILED/);
@@ -1412,6 +1452,7 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
       },
       blackboardFn: bb,
       gitGuardFn,
+      postmortemRepoRoot: dir,
     });
 
     // Should proceed with the revert
@@ -1440,6 +1481,7 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
       },
       blackboardFn: bb,
       gitGuardFn,
+      postmortemRepoRoot: dir,
     });
 
     assert.match(lines[0], /Rollback FAILED/);
@@ -1464,6 +1506,7 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
         return { stdout: '', stderr: '' };
       },
       blackboardFn: bb,
+      postmortemRepoRoot: dir,
     });
 
     assert.match(lines[0], /Rollback FAILED/);
@@ -1487,6 +1530,7 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
       },
       blackboardFn: bb,
       gitGuardFn,
+      postmortemRepoRoot: dir,
     });
 
     assert.equal(state.acquireCalls.length, 1);
@@ -1514,6 +1558,7 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
       },
       blackboardFn: bb,
       gitGuardFn,
+      postmortemRepoRoot: dir,
     });
 
     assert.equal(state.releaseCalls, 1);
@@ -1536,6 +1581,7 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
       execFn: async (cmd: string) => { execCalled = true; return { stdout: '', stderr: '' }; },
       blackboardFn: bb,
       gitGuardFn,
+      postmortemRepoRoot: dir,
     });
 
     assert.equal(execCalled, false, 'must not touch git at all when the lock is busy');
@@ -1553,6 +1599,7 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
       checkForRollbacksFn: async () => [],
       blackboardFn: bb,
       gitGuardFn,
+      postmortemRepoRoot: dir,
     });
 
     assert.deepEqual(lines, []);
@@ -1578,6 +1625,7 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
       },
       blackboardFn: bb,
       gitGuardFn: async () => ({ allowed: false, reason: 'git_workflow.enabled is false' } as const),
+      postmortemRepoRoot: dir,
     });
 
     // Guard blocked before git was touched: no exec calls.
@@ -1590,6 +1638,36 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
     const failedRecord = records.find((r) => r.action === 'rollback-failed');
     assert.ok(failedRecord, 'expected a rollback-failed audit record');
     assert.match(failedRecord.reason, /git workflow not allowed.*git_workflow\.enabled is false/);
+  });
+
+  // AI-176 regression: the postmortem stub triggered by a rollback must land in
+  // the isolated fixture (not the real repo tree — see the chdir in beforeEach
+  // above) and must carry the REAL target skill name. This also settles the
+  // "'Rollback: x' name" investigation for THIS path: flag.skillName flows
+  // through unmodified, with no resolution fall-through to a placeholder.
+  it('writes the rollback postmortem stub into the isolated fixture with the real target skill name', async () => {
+    await seedDraft();
+    const { bb } = makeLockFake();
+    await rollback({
+      checkForRollbacksFn: async () => [gitRevertFlag()],
+      execFn: async (cmd: string) => ({ stdout: cmd.includes('rev-parse') ? 'def5678\n' : '', stderr: '' }),
+      blackboardFn: bb,
+      gitGuardFn,
+      postmortemRepoRoot: dir,
+    });
+
+    const postmortemFiles = await readdir(join(dir, 'plans', 'postmortems'));
+    assert.ok(
+      postmortemFiles.some((f) => f.includes('rolled-back-coding-dirs-update')),
+      `expected a postmortem stub naming coding-dirs-update, got: ${postmortemFiles.join(', ')}`
+    );
+    assert.ok(
+      !postmortemFiles.some((f) => /rolled-back-x[-.]/.test(f)),
+      'skillName must not fall through to a bare "x" placeholder'
+    );
+
+    const indexContent = await readFile(join(dir, 'plans', 'INDEX.md'), 'utf-8');
+    assert.match(indexContent, /Rollback: coding-dirs-update/);
   });
 });
 
@@ -1604,11 +1682,14 @@ describe('rollback: git-revert kind (2026-07-11 code-fix capability)', () => {
 describe('rollback: git-revert survives (and preserves) nightly pa/data/profile churn', () => {
   let paHome: string;
   let repo: string;
+  let originalCwd: string;
   const runShell = promisify(execCb);
   const CHURN = '{"v":3,"learned":"today"}\n';
   let badFix: string;
 
   const git = async (cmd: string): Promise<{ stdout: string; stderr: string }> => {
+    // Explicit cwd, unaffected by the process.chdir() below — safe to isolate
+    // process.cwd() elsewhere for postmortem.ts (see beforeEach comment).
     const { stdout, stderr } = await runShell(cmd, { cwd: repo });
     return { stdout: String(stdout), stderr: String(stderr) };
   };
@@ -1643,9 +1724,37 @@ describe('rollback: git-revert survives (and preserves) nightly pa/data/profile 
 
     // Tonight's learn_agent/oracle write — uncommitted, and irreplaceable.
     await writeFile(join(repo, 'pa', 'data', 'profile.json'), CHURN, 'utf8');
+
+    // AI-176: rollback() here is the REAL self-improver code (by design — see
+    // the comment above this describe), and it reaches
+    // maybeCreatePostmortem -> createPostmortemStub, which resolves its write
+    // root from process.cwd() rather than an injected path; separately, the
+    // rollback()'s default gitGuardFn (checkGitWorkflowAllowed, used below
+    // since none of this describe's tests override it) also probes
+    // process.cwd() for "inside a git work tree". `repo` already satisfies
+    // BOTH needs — it is a real git work tree AND, once given a plans/ dir,
+    // a valid postmortem-write root — so chdir here rather than into paHome
+    // (which is neither). Added AFTER the git-add/commit calls above so the
+    // fixture's own `git add -A` never sweeps these scaffolding files into a
+    // commit; every real git command in `git()`/gitRevertPreservingChurn below
+    // targets specific pathspecs (or the condemned commit's own diff-tree), so
+    // these untracked files never affect the WIP/churn scoping logic. Without
+    // this isolation, every test below wrote a real postmortem stub + INDEX.md
+    // row into the actual repo tree using the literal skillName 'x' from the
+    // fixture — root cause of the six 'Rollback: x' rows found in production
+    // plans/INDEX.md.
+    originalCwd = process.cwd();
+    await mkdir(join(repo, 'plans', 'postmortems'), { recursive: true });
+    await writeFile(
+      join(repo, 'plans', 'INDEX.md'),
+      '# Plans Index\n\n| Date | Title | Status | Link |\n|------|-------|--------|------|\n',
+      'utf8'
+    );
+    process.chdir(repo);
   });
 
   afterEach(async () => {
+    process.chdir(originalCwd);
     await cleanup(paHome);
     await rm(repo, { recursive: true, force: true }).catch(() => {});
   });
@@ -1659,6 +1768,12 @@ describe('rollback: git-revert survives (and preserves) nightly pa/data/profile 
         if (cmd.startsWith('git push')) return { stdout: '', stderr: '' }; // no remote in the fixture
         return git(cmd);
       },
+      // AI-176: createPostmortemStub's default write root is now derived via
+      // repoRootFromModule (independent of process.cwd()), so this real
+      // rollback path — the exact one that produced the 'Rollback: x' rows in
+      // production — needs an explicit override even though `repo` is chdir'd
+      // into above.
+      postmortemRepoRoot: repo,
     });
   }
 
@@ -1675,6 +1790,28 @@ describe('rollback: git-revert survives (and preserves) nightly pa/data/profile 
     assert.ok(rec, 'expected a rolled-back audit record');
     assert.equal(rec.commit_hash, badFix);
     assert.equal(rec.revert_commit_hash, (await git('git rev-parse HEAD')).stdout.trim());
+  });
+
+  // AI-176 investigation finding: this fixture's checkForRollbacksFn mock genuinely
+  // uses the literal skillName 'x' (a throwaway placeholder for its own disposable git
+  // repo, chosen independently of any real skill) — there is no resolution fall-through
+  // in self-improver.ts. Before the beforeEach chdir added above, every run of this
+  // describe wrote that literal title into the REAL repo's plans/INDEX.md via
+  // postmortem.ts's unconditional process.cwd() lookup — that is the actual origin of
+  // the "Rollback: x" rows found in production, not a name-resolution bug. This test
+  // pins both halves: the title is genuinely 'x' (matching the fixture, as expected),
+  // and it lands in the isolated fixture rather than the real repo.
+  it('creates the "Rollback: x" postmortem in the isolated fixture, matching this fixture\'s literal skillName', async () => {
+    await runRollback();
+
+    const postmortemFiles = await readdir(join(repo, 'plans', 'postmortems'));
+    assert.ok(
+      postmortemFiles.some((f) => /^\d{4}-\d{2}-\d{2}-rolled-back-x-[0-9a-f]+\.md$/.test(f)),
+      `expected a rolled-back-x-<hash> postmortem stub, got: ${postmortemFiles.join(', ')}`
+    );
+
+    const indexContent = await readFile(join(repo, 'plans', 'INDEX.md'), 'utf-8');
+    assert.match(indexContent, /Rollback: x/);
   });
 
   it('leaves the uncommitted profile data byte-for-byte intact, with nothing stranded in the stash', async () => {
@@ -1756,6 +1893,16 @@ describe('P2-19: rollback-failed notification (self-improver rollback path)', ()
 
   beforeEach(async () => {
     dir = await createTempPaHome();
+    // AI-176: this describe's rollback-failed path also drives the REAL
+    // maybeCreatePostmortem — commit 'abc1234'/skill 'coding-dirs-update',
+    // one of the historical sources of duplicate rows in production
+    // plans/INDEX.md. Give it an isolated fixture + explicit override.
+    await mkdir(join(dir, 'plans', 'postmortems'), { recursive: true });
+    await writeFile(
+      join(dir, 'plans', 'INDEX.md'),
+      '# Plans Index\n\n| Date | Title | Status | Link |\n|------|-------|--------|------|\n',
+      'utf8'
+    );
   });
 
   afterEach(async () => {
@@ -1802,6 +1949,7 @@ describe('P2-19: rollback-failed notification (self-improver rollback path)', ()
       blackboardFn: bb,
       notifyUserFn: mockNotify,
       gitGuardFn,
+      postmortemRepoRoot: dir,
     });
 
     assert.equal(lines.length, 1);
@@ -1837,6 +1985,7 @@ describe('P2-19: rollback-failed notification (self-improver rollback path)', ()
       blackboardFn: bb,
       notifyUserFn: mockNotify,
       gitGuardFn,
+      postmortemRepoRoot: dir,
     });
 
     // Audit record should still be written
@@ -1895,6 +2044,7 @@ describe('postmortem stub creation (WPD6)', () => {
       }],
       execFn: async () => ({ stdout: '', stderr: '' }),
       blackboardFn: bb,
+      postmortemRepoRoot: dir,
     });
 
     // Verify rollback completed
@@ -1944,6 +2094,7 @@ describe('postmortem stub creation (WPD6)', () => {
       }],
       execFn: async () => ({ stdout: '', stderr: '' }),
       blackboardFn: bb,
+      postmortemRepoRoot: dir,
     });
 
     // Rollback should still succeed even if postmortem had issues

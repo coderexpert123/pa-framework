@@ -5,6 +5,7 @@ import { mkdtempSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { acquireLock, releaseLock } from '../lock.js';
+import { waitForDrain } from './test-teardown-guard.js';
 
 // Multiple acquireLock calls register multiple exit handlers — raise the limit
 // to suppress the MaxListenersExceededWarning during test runs.
@@ -22,6 +23,7 @@ afterEach(async () => {
   // the exact pattern that sent 3 real Telegram alerts on 2026-08-18 — a late
   // fire-and-forget write after the delete resolved paHome() to the REAL
   // ~/.pa. Byte-for-byte the shape of pa/tests/helpers.ts:85-93.
+  await waitForDrain();
   process.env.PA_HOME = process.env.PA_TEST_LOG_HOME ?? mkdtempSync(join(tmpdir(), 'tgbot-lock-fallback-'));
   await rm(tempDir, { recursive: true, force: true });
 });

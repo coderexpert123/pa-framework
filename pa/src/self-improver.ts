@@ -136,7 +136,12 @@ async function maybeCreatePostmortem(
   skillName: string,
   reason: string,
   commitHash?: string,
-  revertCommitHash?: string
+  revertCommitHash?: string,
+  // Test-only (AI-176): forwarded from RollbackDeps.postmortemRepoRoot so tests
+  // driving the real rollback path never write into the live repo tree.
+  // Production always omits this — createPostmortemStub derives the true repo
+  // root itself, independent of process.cwd().
+  repoRoot?: string
 ): Promise<void> {
   try {
     const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
@@ -161,7 +166,7 @@ async function maybeCreatePostmortem(
       sourceCommit: commitHash,
     };
 
-    const filepath = await createPostmortemStub(input, meta);
+    const filepath = await createPostmortemStub(input, meta, { repoRoot });
 
     // Log to console so it appears in the self-improver run log
     console.log(`[self-improver] Postmortem stub created: ${filepath}`);
@@ -263,6 +268,12 @@ export interface RollbackDeps {
   notifyUserFn?: typeof notifyUser;
   /** Test-only: overrides the git-optional gate for the git-revert branch (2026-08-31 WP-B). */
   gitGuardFn?: () => Promise<GitGuardResult>;
+  /** Test-only (AI-176): overrides createPostmortemStub's write root. Production
+   *  always omits this — postmortem.ts resolves the true repo root itself via
+   *  repoRootFromModule, independent of process.cwd(), so a test that drives
+   *  this real (unmocked) rollback path must pass its own isolated fixture
+   *  root here or it writes real postmortem stubs into the live repo tree. */
+  postmortemRepoRoot?: string;
 }
 
 type RollbackExec = NonNullable<RollbackDeps['execFn']>;
@@ -381,7 +392,7 @@ export async function gitRevertPreservingChurn(
 }
 
 export async function rollback(deps: RollbackDeps = {}): Promise<string[]> {
-  const { checkForRollbacksFn = checkForRollbacks, execFn = defaultRollbackExec, blackboardFn, notifyUserFn = notifyUser, gitGuardFn = checkGitWorkflowAllowed } = deps;
+  const { checkForRollbacksFn = checkForRollbacks, execFn = defaultRollbackExec, blackboardFn, notifyUserFn = notifyUser, gitGuardFn = checkGitWorkflowAllowed, postmortemRepoRoot } = deps;
   const flags = await checkForRollbacksFn();
   // The overwhelming common case — checkForRollbacksFn() reads run metadata only, no git —
   // so this must never pay for or contend on a lock it doesn't need.
@@ -475,7 +486,7 @@ export async function rollback(deps: RollbackDeps = {}): Promise<string[]> {
           baseline: toAuditBaseline(await skillRunStats(flag.skillName, ANALYSIS_DAYS)),
         });
         // WPD6: Create postmortem stub after rollback
-        await maybeCreatePostmortem('rolled-back', flag.skillName, 'Elevated failure rate since the code fix was applied — git-reverted.', flag.commitHash, revertCommitHash);
+        await maybeCreatePostmortem('rolled-back', flag.skillName, 'Elevated failure rate since the code fix was applied — git-reverted.', flag.commitHash, revertCommitHash, postmortemRepoRoot);
         continue; // audit written above with the revert-specific fields — skip the shared one
       } else {
         await rm(join(skillsDir(), flag.skillName), { recursive: true, force: true });
@@ -494,7 +505,7 @@ export async function rollback(deps: RollbackDeps = {}): Promise<string[]> {
         baseline: toAuditBaseline(await skillRunStats(flag.skillName, ANALYSIS_DAYS)),
       });
       // WPD6: Create postmortem stub after rollback
-      await maybeCreatePostmortem('rolled-back', flag.skillName, `Elevated failure rate since ${flag.kind === 'restore' ? 'the fix was applied' : 'it was approved'} — auto-rolled-back.`);
+      await maybeCreatePostmortem('rolled-back', flag.skillName, `Elevated failure rate since ${flag.kind === 'restore' ? 'the fix was applied' : 'it was approved'} — auto-rolled-back.`, undefined, undefined, postmortemRepoRoot);
     } catch (err: any) {
       lines.push(`- Rollback FAILED for \`${flag.skillName}\` (${flag.kind}): ${err.message}`);
       if (flag.kind === 'git-revert') {
@@ -512,7 +523,7 @@ export async function rollback(deps: RollbackDeps = {}): Promise<string[]> {
         }).catch(() => {});
 
         // WPD6: Create postmortem stub after rollback-failed
-        await maybeCreatePostmortem('rollback-failed', flag.skillName, `git revert ${flag.commitHash} failed: ${err.message}`.slice(0, 500), flag.commitHash).catch(() => {});
+        await maybeCreatePostmortem('rollback-failed', flag.skillName, `git revert ${flag.commitHash} failed: ${err.message}`.slice(0, 500), flag.commitHash, undefined, postmortemRepoRoot).catch(() => {});
 
         // Send pa-alerts notification (P2-19) — a bad fix is live pending manual revert
         const refId = Math.random().toString(16).slice(2, 14);

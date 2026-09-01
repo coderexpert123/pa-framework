@@ -35,6 +35,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { runPollLoop } from '../main.js';
 import { rmRetry } from './rm-retry.js';
+import { waitForDrain } from './test-teardown-guard.js';
 
 type FetchCall = { url: string; body: string };
 
@@ -73,6 +74,7 @@ describe('runPollLoop: buttons & interactivity wiring (WP-B1)', { concurrency: 1
   });
 
   afterEach(async () => {
+    await waitForDrain();
     delete process.env.PA_HOME;
     await rmRetry(tempDir);
     (globalThis as Record<string, unknown>).fetch = savedFetch;

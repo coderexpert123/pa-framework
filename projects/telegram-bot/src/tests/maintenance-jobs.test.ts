@@ -13,6 +13,7 @@ import { RUNTIME_ARCHIVE_MAX_BYTES } from '../../../../pa/dist/src/lib/archive-f
 import { flushLog } from '../../../../pa/dist/src/lib/log.js';
 import { loadJobState, updateJobState } from '../../../../pa/dist/src/lib/maintenance/state.js';
 import type { TopicNameMap } from '../topic-names.js';
+import { waitForDrain } from './test-teardown-guard.js';
 
 /**
  * Config-shaped rule fixtures matching ~/.pa/registry-content-rules.json format.
@@ -69,6 +70,7 @@ afterEach(async () => {
   // pa/tests/helpers.ts's cleanup().
   await flushLog();
   await rm(tempDir, { recursive: true, force: true });
+  await waitForDrain();
   if (originalPaHome === undefined) delete process.env.PA_HOME;
   else process.env.PA_HOME = originalPaHome;
 });

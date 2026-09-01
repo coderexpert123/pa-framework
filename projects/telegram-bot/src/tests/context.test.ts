@@ -10,6 +10,7 @@ import { buildResumedPrompt, buildPrompt, shouldIncludeSkillStatus, buildSkillSt
 import type { ConversationState } from '../types.js';
 import type { TopicNameMap } from '../topic-names.js';
 import type { Reservation } from '../../../../pa/dist/src/lib/reservations.js';
+import { waitForDrain } from './test-teardown-guard.js';
 
 // Resolve path to bot-instructions.md relative to compiled test location.
 // Tests run from dist/tests/ so dist/../../bot-instructions.md = projects/telegram-bot/bot-instructions.md
@@ -29,6 +30,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  await waitForDrain();
   delete process.env.PA_HOME;
   await rm(tempDir, { recursive: true, force: true });
 });

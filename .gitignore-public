@@ -73,6 +73,7 @@ projects/telegram-bot/.claude-needs-brain
 projects/telegram-bot/bot-instructions.md
 projects/telegram-bot/run-bot-hidden.vbs
 projects/telegram-bot/test_repro.mjs
+projects/telegram-bot/src/tests/apply-teardown-guard.ps1
 
 # Inside projects/daily-mail-brief/: track only scripts + README + requirements + config template
 projects/daily-mail-brief/*

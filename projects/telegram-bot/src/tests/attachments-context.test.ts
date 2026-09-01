@@ -5,6 +5,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { buildPrompt } from '../context.js';
 import type { ConversationState } from '../types.js';
+import { waitForDrain } from './test-teardown-guard.js';
 
 let tempDir: string;
 
@@ -14,6 +15,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  await waitForDrain();
   delete process.env.PA_HOME;
   await rm(tempDir, { recursive: true, force: true }).catch(() => {});
 });

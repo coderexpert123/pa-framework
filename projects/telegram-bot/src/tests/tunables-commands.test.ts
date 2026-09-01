@@ -41,6 +41,7 @@ import {
   selectWorkerTunables,
   validateTunable,
 } from '../../../../pa/dist/src/lib/tunables.js';
+import { waitForDrain } from './test-teardown-guard.js';
 
 const testRunId = `test-${process.pid}-${Date.now()}`;
 
@@ -54,6 +55,7 @@ before(async () => {
 });
 
 after(async () => {
+  await waitForDrain();
   delete process.env.PA_HOME;
   await rmRetry(sharedTempDir);
 });
@@ -781,6 +783,7 @@ describe('dispatchMessage injects tunable args into the worker command line', ()
   });
 
   afterEach(async () => {
+    await waitForDrain();
     process.env.PA_HOME = sharedTempDir;
     await rmRetry(testDir);
   });

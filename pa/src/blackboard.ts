@@ -21,6 +21,23 @@ export interface BlackboardData {
 
 const HEARTBEAT_STALE_MS = 10 * 60 * 1000; // 10 minutes (default)
 
+// Bounded grace window added AFTER heartbeatStaleMs() before an ALIVE holder's
+// row is actually evicted (2026-09-01, followup-defects Defect 1). Before this,
+// staleness alone evicted a row regardless of liveness — a holder whose PID was
+// still alive and working (renewal merely delayed by real contention: the
+// shared blackboard.json file serializes EVERY concurrent heartbeat source —
+// bot topic locks, catchup, skill runs — through one proper-lockfile lock, and
+// a single acquireLock() from a completely different caller could then steal
+// the resource in the same atomic write the instant staleMs was crossed) had
+// its lock purged and immediately handed to a racing acquirer, then aborted
+// mid-run when its own updateHeartbeat found its row gone ("Lock lost mid-run
+// ... Reason: purged" — three real skill deaths on 2026-08-31, one on an idle
+// machine). A dead PID still purges immediately; only an alive-but-stale
+// holder gets this grace, and grace never opens a double-occupancy window
+// (see classifyLock: a graced row stays IN activeLocks, so it still blocks any
+// competing acquireLock for the same resource — see blackboard.test.ts).
+const HEARTBEAT_GRACE_MS_DEFAULT = 3 * 60 * 1000; // 3 minutes
+
 /**
  * Reads the stale-lock TTL fresh on every call from PA_HEARTBEAT_STALE_MS
  * (falls back to the 10-minute default) — so tests can shrink it instead of
@@ -33,6 +50,37 @@ function heartbeatStaleMs(): number {
     if (Number.isFinite(n) && n > 0) return n;
   }
   return HEARTBEAT_STALE_MS;
+}
+
+/** Same override pattern as heartbeatStaleMs() — PA_HEARTBEAT_GRACE_MS, tests
+ *  shrink it; 0 is a valid override (no grace, restores pre-fix behaviour). */
+function heartbeatGraceMs(): number {
+  const raw = process.env.PA_HEARTBEAT_GRACE_MS;
+  if (raw) {
+    const n = parseInt(raw, 10);
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  return HEARTBEAT_GRACE_MS_DEFAULT;
+}
+
+type LockDisposition = 'alive' | 'grace' | 'evict-dead' | 'evict-expired';
+
+/**
+ * Single decision point for whether a lock row still counts as held. Used by
+ * acquireLock's purge, getActiveLocks, and purgeStaleLocks — previously each
+ * had its own (subtly different) staleness check, which meant a row could be
+ * "active" by one call's reckoning and "gone" by another's. Decision matrix:
+ * dead PID -> evict now; alive + fresh -> alive; alive + stale but within
+ * grace -> grace (still counts as held, blocks competing acquires, logged
+ * once); alive + stale past grace -> evict.
+ */
+function classifyLock(lock: LockEntry, nowMs: number): LockDisposition {
+  if (!isPidAlive(lock.pid)) return 'evict-dead';
+  const age = nowMs - new Date(lock.heartbeat).getTime();
+  const staleMs = heartbeatStaleMs();
+  if (age <= staleMs) return 'alive';
+  if (age <= staleMs + heartbeatGraceMs()) return 'grace';
+  return 'evict-expired';
 }
 
 function envMs(varName: string): number | undefined {
@@ -66,6 +114,22 @@ export class Blackboard {
   // operating against a stale, possibly-deleted directory.
   private get path(): string {
     return getBlackboardPath();
+  }
+
+  // Dedupes the "entering grace" log line to once per (resource, heartbeat)
+  // pair — the heartbeat value is frozen for the whole grace window (that's
+  // WHY it's stale), so this key naturally logs exactly once per stale event,
+  // never once per purge-check tick. Unbounded only in proportion to how many
+  // distinct resources actually go stale over this process's lifetime, which
+  // in practice is rare; not worth GC'ing for a long-lived CLI invocation.
+  private graceLogged = new Set<string>();
+
+  private logGraceOnce(lock: LockEntry, nowMs: number): void {
+    const key = `${lock.resource}|${lock.heartbeat}`;
+    if (this.graceLogged.has(key)) return;
+    this.graceLogged.add(key);
+    const age = nowMs - new Date(lock.heartbeat).getTime();
+    console.log(`[blackboard] Stale heartbeat, holder alive — grace period: ${lock.resource} (age:${Math.round(age / 1000)}s, pid:${lock.pid})`);
   }
 
   private async ensureFile(): Promise<void> {
@@ -127,23 +191,47 @@ export class Blackboard {
 
         const data = await this.readData();
         const now = new Date();
+        const nowMs = now.getTime();
 
-        // Purge stale locks first
+        // Purge dead-PID or grace-expired-stale locks first. An alive PID
+        // whose heartbeat is merely stale (not yet past grace) is KEPT — it
+        // still counts as held and still blocks a competing acquire below,
+        // which is what makes grace safe against double-occupancy: the row
+        // never disappears from activeLocks until it is genuinely dead or its
+        // grace has fully elapsed, so there is never a window where two
+        // holders can both believe they hold the same resource.
+        let purgedAny = false;
         const activeLocks = data.active_locks.filter((lock) => {
-          const isAlive = isPidAlive(lock.pid);
-          const heartbeatAge = now.getTime() - new Date(lock.heartbeat).getTime();
-          const isStale = heartbeatAge > heartbeatStaleMs();
-
-          if (!isAlive) {
+          const disposition = classifyLock(lock, nowMs);
+          if (disposition === 'evict-dead') {
             console.log(`[blackboard] Purging dead PID lock: ${lock.resource} (pid:${lock.pid})`);
+            purgedAny = true;
             return false;
           }
-          if (isStale) {
-            console.log(`[blackboard] Purging stale heartbeat lock: ${lock.resource} (age:${Math.round(heartbeatAge/1000)}s)`);
+          if (disposition === 'evict-expired') {
+            const heartbeatAge = nowMs - new Date(lock.heartbeat).getTime();
+            console.log(`[blackboard] Purging stale heartbeat lock (grace expired): ${lock.resource} (age:${Math.round(heartbeatAge / 1000)}s, pid:${lock.pid} alive)`);
+            purgedAny = true;
             return false;
+          }
+          if (disposition === 'grace') {
+            this.logGraceOnce(lock, nowMs);
           }
           return true;
         });
+
+        // Persist any eviction immediately, regardless of whether THIS call's
+        // own requested resource ends up contended below. Before this fix, a
+        // purge decision computed here was only ever written to disk in the
+        // no-conflict success branch further down — when the caller's own
+        // resource stayed contended, the loop released the file lock and
+        // retried after 1s WITHOUT writing, so an unrelated stale row got
+        // recomputed and re-logged every retry (observed: "[blackboard]
+        // Purging stale heartbeat lock..." repeating at ~1 Hz for 650+s,
+        // never actually removing the row) instead of being purged once.
+        if (purgedAny) {
+          await writeJsonAtomic(this.path, { active_locks: activeLocks }, { spaces: 2 });
+        }
 
         // Re-entrance check:
         // - Different PID → always block (another process holds the lock)
@@ -236,36 +324,64 @@ export class Blackboard {
    */
   async updateHeartbeat(resource: string, agent: string, contextId?: string): Promise<boolean> {
     await this.ensureFile();
-    let release: (() => Promise<void>) | undefined;
-    try {
-      release = await lockfile.lock(this.path, safeLockOptions('blackboard', { retries: 3 }));
-      const data = await this.readData();
-      const entry = data.active_locks.find(
-        (l) => l.resource === resource && l.agent === agent && (!contextId || l.contextId === contextId)
-      );
-      if (entry) {
-        entry.heartbeat = new Date().toISOString();
-        await writeJsonAtomic(this.path, data, { spaces: 2 });
-        return true;
+    // Absorbs transient blackboard.json lock contention: EVERY concurrent
+    // heartbeat source in the system (bot topic locks, catchup, skill runs)
+    // serializes through this ONE proper-lockfile lock on one shared file, so
+    // a single acquisition hiccup under real disk/event-loop pressure is
+    // expected, not exceptional. Before this fix a single throw here (lock
+    // acquisition failure, transient I/O error) returned `false` — IDENTICAL
+    // to the legitimate "row was purged" signal — so startLockRenewal's
+    // onLost('purged') fired on a transient blip as readily as on a real
+    // purge, aborting an otherwise-healthy run. Retrying here (cheap: this
+    // only runs once per renewal tick, ~60s) does not change the return
+    // contract or any caller, it just makes the "false" that callers see far
+    // more likely to mean what it says.
+    const attempts = 3;
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      let release: (() => Promise<void>) | undefined;
+      try {
+        release = await lockfile.lock(this.path, safeLockOptions('blackboard', { retries: 5 }));
+        const data = await this.readData();
+        const entry = data.active_locks.find(
+          (l) => l.resource === resource && l.agent === agent && (!contextId || l.contextId === contextId)
+        );
+        if (entry) {
+          entry.heartbeat = new Date().toISOString();
+          await writeJsonAtomic(this.path, data, { spaces: 2 });
+          return true;
+        }
+        return false; // row genuinely absent — not a lock-acquisition failure, don't retry
+      } catch (err) {
+        lastErr = err;
+        if (attempt < attempts) {
+          await new Promise((r) => setTimeout(r, 250 * attempt));
+          continue;
+        }
+      } finally {
+        if (release) await release();
       }
-      return false;
-    } catch {
-      // Non-fatal
-      return false;
-    } finally {
-      if (release) await release();
     }
+    console.warn(`[blackboard] updateHeartbeat: giving up for ${resource}/${agent} after ${attempts} attempts: ${lastErr instanceof Error ? lastErr.message : String(lastErr)}`);
+    return false;
   }
 
   /**
-   * Return all active (non-stale, alive-PID) locks without modifying the file.
+   * Return all active (non-evicted) locks without modifying the file. A
+   * grace-window row counts as active here too (it still legitimately holds
+   * the resource) — consistency with acquireLock's purge classification
+   * matters because catchup.ts's isLockLost() checkpoint reads this list to
+   * decide whether ITS OWN row is still valid; before this fix it used a
+   * plain staleness check with no grace, so it could declare itself "lost"
+   * purely from raw heartbeat age even when nothing had actually purged it.
    */
   async getActiveLocks(): Promise<LockEntry[]> {
     await this.ensureFile();
     const data = await this.readData();
-    const now = new Date();
+    const nowMs = Date.now();
     return data.active_locks.filter((lock) => {
-      return isPidAlive(lock.pid) && (now.getTime() - new Date(lock.heartbeat).getTime() < heartbeatStaleMs());
+      const disposition = classifyLock(lock, nowMs);
+      return disposition === 'alive' || disposition === 'grace';
     });
   }
 
@@ -279,9 +395,11 @@ export class Blackboard {
       release = await lockfile.lock(this.path, safeLockOptions('blackboard', { retries: 5 }));
       const data = await this.readData();
       const before = data.active_locks.length;
-      const now = new Date();
+      const nowMs = Date.now();
       const activeLocks = data.active_locks.filter((lock) => {
-        return isPidAlive(lock.pid) && (now.getTime() - new Date(lock.heartbeat).getTime() < heartbeatStaleMs());
+        const disposition = classifyLock(lock, nowMs);
+        if (disposition === 'grace') this.logGraceOnce(lock, nowMs);
+        return disposition === 'alive' || disposition === 'grace';
       });
       await writeJsonAtomic(this.path, { active_locks: activeLocks }, { spaces: 2 });
       return before - activeLocks.length;

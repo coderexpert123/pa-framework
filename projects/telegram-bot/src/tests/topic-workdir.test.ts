@@ -8,6 +8,7 @@ import { fileURLToPath } from 'url';
 import { dirname, resolve } from 'path';
 import { topicHomeDir, parseProjectPointer, resolveTopicWorkdir, ensureTopicWorkdir, type TopicWorkdir } from '../topic-workdir.js';
 import type { ConversationState } from '../types.js';
+import { waitForDrain } from './test-teardown-guard.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -21,6 +22,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  await waitForDrain();
   delete process.env.PA_HOME;
   await rm(tempDir, { recursive: true, force: true });
   await rm(tempPAHome, { recursive: true, force: true });

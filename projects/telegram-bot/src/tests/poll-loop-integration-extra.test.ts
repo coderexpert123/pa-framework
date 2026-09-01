@@ -4,9 +4,17 @@ import { mkdtemp, rm, readFile, writeFile } from 'fs/promises';
 import { appendFileSync, readFileSync, existsSync, unlinkSync } from 'node:fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { runPollLoop } from '../main.js';
+import { runPollLoop, _setExitForTest } from '../main.js';
 import type { ConversationState } from '../types.js';
 import { rmRetry } from './rm-retry.js';
+import { waitForDrain } from './test-teardown-guard.js';
+
+// Root cause of this file registering ZERO tests under `node --test` (dark
+// since ~2026-08-28, fixed 2026-09-01): each awaited runPollLoop() below runs
+// its loop to completion and hits the real process.exit(0), killing this
+// file's isolated test subprocess before its TAP output reaches the parent.
+// See the matching comment in poll-loop.test.ts for the full mechanism.
+_setExitForTest(() => {});
 
 // Instant sleep for tests — no real waiting
 const fastSleep = async (_ms: number): Promise<void> => {};
@@ -25,12 +33,13 @@ describe('runPollLoop: Integration Extra (Phase 4 Task 3)', { concurrency: 1 }, 
   });
 
   afterEach(async () => {
+    await waitForDrain();
     delete process.env.PA_HOME;
     await rmRetry(tempDir);
     (globalThis as Record<string, unknown>).fetch = savedFetch;
   });
 
-  it('/default <worker> posts fresh pinned card', async () => {
+  it('/default <worker> edits the existing pinned card in place and stamps default_changed', async () => {
     const configPath = join(tempDir, 'config.yaml');
     await writeFile(configPath, `
 workers:
@@ -102,18 +111,23 @@ topic_defaults:
 
     await runPollLoop('token', [123], state, {}, controller.signal, fastSleep);
 
-    const sendMessageCalls = fetchLog.filter(u => u.includes('sendMessage'));
+    const editCalls = fetchLog.filter(u => u.includes('editMessageText'));
     const unpinCalls = fetchLog.filter(u => u.includes('unpinChatMessage'));
     const pinCalls = fetchLog.filter(u => u.includes('pinChatMessage'));
 
-    assert.ok(sendMessageCalls.some(c => c.includes('Topic Status')), 'should send status card');
-    assert.ok(unpinCalls.some(c => c.includes('100')), 'should unpin old card');
-    assert.ok(pinCalls.some(c => c.includes('200')), 'should pin new card');
+    // refreshPinnedStatusCardInPlace (main.ts) always tries editMessageText first when a
+    // pinned_status_message_id already exists, falling back to unpin+send+pin only if the
+    // edit fails — it never fails here (mock always returns ok:true), so both the ambient
+    // startup model-expiry sweep's own refresh AND /default's refresh edit message 100
+    // in place; neither unpin/pin/fresh-send ever fires.
+    assert.ok(editCalls.some(c => c.includes('Topic Status')), 'should edit the existing status card in place');
+    assert.equal(unpinCalls.length, 0, 'edit-in-place must never unpin the existing card');
+    assert.equal(pinCalls.length, 0, 'edit-in-place must never pin a new card');
 
     const saved = JSON.parse(await readFile(topicStateFile, 'utf8')) as ConversationState;
     assert.equal(saved.model_status?.current_worker, 'agy');
     assert.equal(saved.model_status?.reason_code, 'default_changed');
-    assert.equal(saved.pinned_status_message_id, 200);
+    assert.equal(saved.pinned_status_message_id, 100, 'edit-in-place keeps the same pinned message id');
   });
 
   it('/reset refreshes pin with reason reset', async () => {
@@ -320,7 +334,9 @@ topic_defaults:
 
     await runPollLoop('token', [123], state, {}, controller.signal, fastSleep);
 
-    const hasRecovery = fetchLog.some(c => c.includes('Reason: Recovered to the configured worker'));
+    // MODEL_STATUS_REASON_TEXT.recovery (logic.ts) reads "configured agent" — the
+    // worker/agent terminology shift landed after this assertion was written ("worker").
+    const hasRecovery = fetchLog.some(c => c.includes('Reason: Recovered to the configured agent'));
     if (!hasRecovery) {
       console.log('Fetch Log:', fetchLog);
     }
@@ -524,13 +540,32 @@ topic_defaults:
     const fetchLog: string[] = [];
     await runOneUpdate('/model gemini-3.7-flash-high', fetchLog);
 
-    // Should edit the pinned message text with Model: gemini-3.7-flash-high
+    // Should edit the pinned message text with Model: gemini-3.7-flash-high. The
+    // pre-existing topic-state file has no model_status, so the ambient startup
+    // model-expiry sweep also edits this same pin (modelStatusNeedsRefresh sees no
+    // previous snapshot) ahead of the /model command's own edit — search all edit
+    // calls rather than assuming index 0 is the command's own.
     const editCalls = fetchLog.filter(u => u.includes('editMessageText'));
     assert.ok(editCalls.length > 0, 'must call editMessageText to refresh pinned card');
-    assert.ok(editCalls[0].includes('gemini-3.7-flash-high'), 'edited card must contain the new model');
+    // The pin's editMessageText body carries the model name through TWO escaping
+    // layers: renderStatusCard's raw text is sanitizeMdV2'd (every `-`/`.` gets a
+    // literal backslash) before it becomes the request body's `text` field, then
+    // JSON.stringify(body) doubles each of THOSE backslashes for the wire. Stripping
+    // every backslash (regardless of how many piled up) recovers the plain substring
+    // without having to model either escaping layer exactly.
+    const deEscaped = (s: string) => s.replace(/\\/g, '');
+    assert.ok(editCalls.some(u => deEscaped(u).includes('gemini-3.7-flash-high')), 'edited card must contain the new model');
   });
 
   it('/agent <name> switches agent and remembers per-agent model across switches', async () => {
+    // This test issues 4 sequential runOneUpdate calls, each hardcoding update_id: 1
+    // (see runOneUpdate above) — the persistent delivered-store dedup guard (main.ts,
+    // "Bypass the persistent dedup under the test flag" comment) would otherwise treat
+    // calls 2-4 as re-sends of an already-delivered update and skip their replies/pin
+    // edits entirely. PA_NOTIFY_DISABLED=1 is the documented escape hatch for exactly
+    // this pattern.
+    process.env.PA_NOTIFY_DISABLED = '1';
+    try {
     await writeFile(join(tempDir, 'config.yaml'), `
 workers:
   - name: agy
@@ -580,8 +615,14 @@ topic_defaults:
     const fetchLog4: string[] = [];
     await runOneUpdate('/agent agy', fetchLog4);
 
-    // The status card for agy must restore gemini-3.7-flash-high
+    // The status card for agy must restore gemini-3.7-flash-high. sendMessage/
+    // editMessageText bodies are MarkdownV2-sanitized before they hit the wire
+    // (every '-'/'.' gets a literal backslash) — strip backslashes before matching,
+    // same fix as the /model pinned-card escaping issue elsewhere in this wave.
     const pinCardEdits = fetchLog4.filter(u => u.includes('editMessageText') || u.includes('sendMessage'));
-    assert.ok(pinCardEdits.some(u => u.includes('gemini-3.7-flash-high')), 'status card must reflect remembered model');
+    assert.ok(pinCardEdits.some(u => u.replace(/\\/g, '').includes('gemini-3.7-flash-high')), 'status card must reflect remembered model');
+    } finally {
+      delete process.env.PA_NOTIFY_DISABLED;
+    }
   });
 });

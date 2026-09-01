@@ -14,10 +14,18 @@ import { mkdtemp, readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { Readable } from 'stream';
-import { runPollLoop } from '../main.js';
+import { runPollLoop, _setExitForTest } from '../main.js';
 import type { ConversationState } from '../types.js';
 import { rmRetry } from './rm-retry.js';
 import { listPendingDispatches, _resetPendingDispatchesForTest } from '../pending-dispatches.js';
+import { waitForDrain } from './test-teardown-guard.js';
+
+// Root cause of this file registering ZERO tests under `node --test` (dark
+// since ~2026-08-28, fixed 2026-09-01): each awaited runPollLoop() below runs
+// its loop to completion and hits the real process.exit(0), killing this
+// file's isolated test subprocess before its TAP output reaches the parent.
+// See the matching comment in poll-loop.test.ts for the full mechanism.
+_setExitForTest(() => {});
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -111,6 +119,50 @@ function setupVoiceFetchMock(opts: {
   return calls;
 }
 
+/**
+ * Same as setupVoiceFetchMock, but any sendMessage whose body carries the
+ * transcript-echo marker (🎙 Heard) gets a non-retryable 400 back instead of
+ * success — simulates Telegram rejecting the echo send. A 400 is used rather
+ * than a thrown network error / 5xx so telegram.ts's postSendMessageWithRetries
+ * takes its non-retryable branch (line ~118-119) instead of the ~3s of real
+ * setTimeout-backed retry backoff a network-error/5xx path would burn.
+ */
+function setupVoiceFetchMockWithEchoFailure(opts: {
+  batches: any[][];
+  controller: AbortController;
+}): Array<{ url: string; body?: string }> {
+  const calls: Array<{ url: string; body?: string }> = [];
+  let batchIndex = 0;
+
+  (globalThis as Record<string, unknown>).fetch = async (url: string, init?: any) => {
+    calls.push({ url, body: init?.body });
+
+    if (url.includes('getUpdates')) {
+      const batch = opts.batches[batchIndex] ?? [];
+      batchIndex++;
+      if (batchIndex >= opts.batches.length) opts.controller.abort();
+      return jsonResponse({ ok: true, result: batch });
+    }
+    if (url.includes('/getFile?file_id=')) {
+      return jsonResponse({ ok: true, result: { file_path: 'voice/note.oga' } });
+    }
+    if (url.includes('/file/bot')) {
+      return { ok: true, status: 200, body: Readable.from(Buffer.from('fake-ogg-bytes')), text: async () => '', json: async () => ({}) };
+    }
+    if (url.includes('/sendMessage') && typeof init?.body === 'string' && init.body.includes('🎙 Heard')) {
+      return {
+        ok: false,
+        status: 400,
+        text: async () => JSON.stringify({ ok: false, description: 'Bad Request: echo rejected (test)' }),
+        json: async () => ({ ok: false }),
+      };
+    }
+    return jsonResponse({ ok: true, result: { message_id: 900 + calls.length } });
+  };
+
+  return calls;
+}
+
 async function writeEchoWorkerConfig(tempDir: string, extraYaml = ''): Promise<string> {
   const scriptPath = join(tempDir, 'echo-worker.mjs');
   await writeFile(
@@ -169,6 +221,7 @@ describe('runPollLoop: voice notes', { concurrency: 1 }, () => {
   });
 
   afterEach(async () => {
+    await waitForDrain();
     delete process.env.PA_HOME;
     for (const k of ENV_KEYS) {
       if (savedEnv[k] === undefined) delete process.env[k];
@@ -495,5 +548,71 @@ describe('runPollLoop: voice notes', { concurrency: 1 }, () => {
     assert.deepEqual(await listPendingDispatches(), [], 'store must be empty after the run settles');
     await new Promise((r) => setTimeout(r, 200));
     assert.deepEqual(await listPendingDispatches(), [], 'a late backfill cannot recreate a removed record');
+  });
+
+  // -------------------------------------------------------------------
+  // Cases 14-16: transcript echo (2026-09-01,
+  // plans/2026-09-01-voice-transcript-echo-SPEC.md) — the "🎙 Heard" mirror
+  // sent back to the topic before worker dispatch.
+  // -------------------------------------------------------------------
+
+  it('case 14 (echo): a successful transcription sends a 🎙 Heard echo, to the same chat and reply target, before the worker reply', async () => {
+    const scriptPath = await writePythonStub(tempDir, 'success_stub.py', SUCCESS_STUB);
+    process.env.PA_VOICE_TRANSCRIBE_SCRIPT = scriptPath;
+    await writeEchoWorkerConfig(tempDir);
+    const controller = new AbortController();
+    const state = makeState(123, -1);
+    const update = voiceUpdate(15, { messageId: 15 });
+    const calls = setupVoiceFetchMock({ batches: [[update], []], controller });
+
+    await runPollLoop('token', [123], state, {}, controller.signal, fastSleep);
+
+    const sendCalls = calls.filter((c) => c.url.includes('/sendMessage'));
+    const echoIdx = sendCalls.findIndex((c) => unescapedBody(c.body).includes('🎙 Heard'));
+    const workerIdx = sendCalls.findIndex((c) => unescapedBody(c.body).includes('WORKER_ECHO:'));
+    assert.notEqual(echoIdx, -1, 'a 🎙 Heard echo should have been sent');
+    assert.notEqual(workerIdx, -1, 'the worker reply should have been sent');
+    assert.ok(echoIdx < workerIdx, 'the echo must be sent before the worker reply');
+
+    const echoBody = unescapedBody(sendCalls[echoIdx].body);
+    assert.ok(echoBody.includes('hello there'), 'the echo should contain the raw transcript');
+    assert.ok(echoBody.includes('(whisper_local)'), 'the echo should carry the engine label');
+    assert.ok(/Ref:/.test(echoBody), 'the echo must carry a ref-ID per the Ref-ID Mandatory rule');
+    assert.ok(sendCalls[echoIdx].body!.includes('"chat_id":123'), 'the echo should be sent to the same chat as the voice note');
+    assert.ok(sendCalls[echoIdx].body!.includes('"reply_to_message_id":15'), 'the echo should reply to the original voice message');
+  });
+
+  it('case 15 (echo): a failed transcription sends no 🎙 Heard echo', async () => {
+    process.env.PA_VOICE_TRANSCRIBE_SCRIPT = join(tempDir, 'does-not-exist.py');
+    const controller = new AbortController();
+    const state = makeState(123, -1);
+    const update = voiceUpdate(16, { messageId: 16 });
+    const calls = setupVoiceFetchMock({ batches: [[update], []], controller });
+
+    await runPollLoop('token', [123], state, {}, controller.signal, fastSleep);
+
+    const sendCalls = calls.filter((c) => c.url.includes('/sendMessage'));
+    assert.ok(!sendCalls.some((c) => unescapedBody(c.body).includes('🎙 Heard')), 'a failed transcription must not produce a 🎙 Heard echo');
+    assert.equal(sendCalls.length, 1, 'only the failure notice should be sent');
+  });
+
+  it('case 16 (echo): a rejected echo send does not prevent worker dispatch or the reply', async () => {
+    const scriptPath = await writePythonStub(tempDir, 'success_stub.py', SUCCESS_STUB);
+    process.env.PA_VOICE_TRANSCRIBE_SCRIPT = scriptPath;
+    await writeEchoWorkerConfig(tempDir);
+    const controller = new AbortController();
+    const state = makeState(123, -1);
+    const update = voiceUpdate(17, { messageId: 17 });
+    const calls = setupVoiceFetchMockWithEchoFailure({ batches: [[update], []], controller });
+
+    await runPollLoop('token', [123], state, {}, controller.signal, fastSleep);
+
+    const sendCalls = calls.filter((c) => c.url.includes('/sendMessage'));
+    assert.ok(sendCalls.some((c) => unescapedBody(c.body).includes('🎙 Heard')), 'the echo attempt should still have been made (and rejected by the mock)');
+    assert.ok(sendCalls.some((c) => unescapedBody(c.body).includes('WORKER_ECHO:')), 'worker dispatch/reply must still happen despite the echo send failing');
+
+    const topicState = JSON.parse(await readFile(join(tempDir, 'telegram-bot-topic-123_0.json'), 'utf8'));
+    const userTurn = topicState.turns.find((t: any) => t.role === 'user');
+    assert.ok(userTurn, 'a user turn should still be archived even though the echo send failed');
   });
 });

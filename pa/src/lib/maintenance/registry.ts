@@ -27,6 +27,7 @@ import { recallIndexJob } from './jobs/recall-index.js';
 import { skillEngagementAuditJob } from './jobs/skill-engagement-audit.js';
 import { sharedTmpSweepJob } from './jobs/shared-tmp-sweep.js';
 import { watchJobsRunnerJob } from './jobs/watch-jobs-runner.js';
+import { workerEditAuditSweepJob } from './jobs/worker-edit-audit-sweep.js';
 import { botSelfRestartJob } from './jobs/bot-self-restart.js';
 import { alertDigestJob } from './jobs/alert-digest.js';
 
@@ -54,6 +55,7 @@ export const MAINTENANCE_JOBS: readonly MaintenanceJob[] = [
   skillEngagementAuditJob,
   sharedTmpSweepJob,
   watchJobsRunnerJob,
+  workerEditAuditSweepJob,
   // bot-host jobs
   botLogRotationCheckJob,
   modelOverrideSweepJob,

@@ -34,6 +34,7 @@ import {
 import { editMessageText } from '../telegram.js';
 import { _resetResendStoreForTest, putResend } from '../resend-store.js';
 import type { CallbackQuery, ConversationState, MessageReactionUpdated, TelegramUser } from '../types.js';
+import { waitForDrain } from './test-teardown-guard.js';
 
 // ---------------------------------------------------------------------------
 // parseCallbackData — one valid example per §3.2 row, plus the invalid list.
@@ -579,6 +580,7 @@ describe('handleCallbackQuery', () => {
     });
 
     afterEach(async () => {
+      await waitForDrain();
       if (savedPaHome === undefined) delete process.env.PA_HOME;
       else process.env.PA_HOME = savedPaHome;
       await rm(paHome, { recursive: true, force: true });

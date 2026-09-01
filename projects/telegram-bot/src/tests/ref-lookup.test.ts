@@ -4,6 +4,7 @@ import { mkdtemp, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { findSessionForRefId } from '../ref-lookup.js';
+import { waitForDrain } from './test-teardown-guard.js';
 
 let tempDir: string;
 
@@ -13,6 +14,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  await waitForDrain();
   delete process.env.PA_HOME;
   await rm(tempDir, { recursive: true, force: true });
 });

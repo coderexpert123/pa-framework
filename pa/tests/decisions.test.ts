@@ -727,8 +727,10 @@ describe('decisions.ts', () => {
       db.close();
 
       const windowStart = new Date(nowMs - 30 * 24 * 60 * 60 * 1000).toISOString();
-      const windowEnd = new Date(nowMs).toISOString();
-      const stats = decisionStatsBySkill(windowStart, windowEnd);
+      // Open end (same millisecond-boundary class as the window-filter test above):
+      // a windowEnd pinned to the pre-write nowMs excludes rows minted milliseconds
+      // later — green locally (same-ms writes), 0 !== 1 on CI (CI run 33464035427).
+      const stats = decisionStatsBySkill(windowStart);
 
       assert.ok(stats);
       assert.strictEqual(stats.size, 1);

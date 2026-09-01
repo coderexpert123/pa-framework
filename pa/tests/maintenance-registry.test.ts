@@ -10,8 +10,8 @@ describe('MAINTENANCE_JOBS registry', () => {
     assert.doesNotThrow(() => validateRegistry([...MAINTENANCE_JOBS]));
   });
 
-  it('declares exactly 30 jobs (20 pa + 10 bot) with the expected names', () => {
-    assert.equal(MAINTENANCE_JOBS.length, 30);
+  it('declares exactly 31 jobs (21 pa + 10 bot) with the expected names', () => {
+    assert.equal(MAINTENANCE_JOBS.length, 31);
     const names = MAINTENANCE_JOBS.map((j) => j.name).sort();
     assert.deepEqual(names, [
       'alert-census',
@@ -43,12 +43,13 @@ describe('MAINTENANCE_JOBS registry', () => {
       'voice-attachment-gc',
       'watch-jobs-runner',
       'weekly-learn',
+      'worker-edit-audit-sweep',
       'worker-tee-gc',
     ]);
   });
 
-  it('splits jobs correctly by host (20 pa, 10 bot)', () => {
-    assert.equal(jobsForHost('pa').length, 20);
+  it('splits jobs correctly by host (21 pa, 10 bot)', () => {
+    assert.equal(jobsForHost('pa').length, 21);
     assert.equal(jobsForHost('bot').length, 10);
     const botNames = jobsForHost('bot').map((j) => j.name).sort();
     assert.deepEqual(botNames, [
@@ -179,6 +180,7 @@ describe('MAINTENANCE_JOBS registry', () => {
       'skill-log-rotate',
       'voice-attachment-gc',
       'watch-jobs-runner',
+      'worker-edit-audit-sweep',
       'worker-tee-gc',
     ]);
   });
