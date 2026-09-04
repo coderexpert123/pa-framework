@@ -434,7 +434,8 @@ def render_report(alerts: list[dict], resolved_notes: list[str], postmortem_aler
             if pm['unclosed_count'] > 3:
                 lines.append(f"  - ... and {pm['unclosed_count'] - 3} more")
         lines.append("")
-        lines.append("_Postmortems live in plans/postmortems/ — close action items "
+        lines.append("_Postmortems live in the PA home's plans/postmortems/ "
+                     "(~/.pa/plans/postmortems/) — close action items "
                      "by replacing `- [ ]` with `- [x]`._")
 
     if google_auth_alerts:

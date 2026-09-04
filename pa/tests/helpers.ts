@@ -79,8 +79,8 @@ export async function cleanup(dir: string): Promise<void> {
   // Telegram alerts reached chat/thread 3376 (`worker-under-test`, `test`,
   // `kill-tree-worker`; archive/2026-08-18-134211-app.log.jsonl:12647,12764,
   // 14202) and 64 `telegram`-module rows plus 40 of 63 429 rows carried the
-  // `-1001234567` fixture chat id from pa/tests/telegram.test.ts:76 (review
-  // plans/2026-08-23-alerts-week-review.md §5.3). Fix: never delete PA_HOME —
+  // `-1001234567` fixture chat id from pa/tests/telegram.test.ts:76 (the
+  // 2026-08-23 alerts-week review §5.3). Fix: never delete PA_HOME —
   // mint a fresh temp home via mkdtempSync when no preload ran, so an unset
   // PA_TEST_LOG_HOME can no longer make paHome() fall back to the real ~/.pa.
   if (!process.env.PA_TEST_LOG_HOME) {

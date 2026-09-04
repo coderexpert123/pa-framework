@@ -4,7 +4,8 @@ import { mkdtemp, rm, readFile, mkdir, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { appendDlq, loadDlq, clearDlq, writeDlq, flushDlq, DLQ_MAX_AGE_MS, QUARANTINE_THRESHOLD, type DlqEntry } from '../dlq.js';
-import { markDelivered, deliveredKey, _resetDeliveredCacheForTest } from '../delivered-store.js';
+import { markDelivered, deliveredKey, wasDelivered, _resetDeliveredCacheForTest } from '../delivered-store.js';
+import { resetRedactCache } from '../../../../pa/dist/src/lib/redact.js';
 
 function makeEntry(overrides: Partial<DlqEntry> = {}): DlqEntry {
   return {
@@ -72,6 +73,38 @@ describe('appendDlq', () => {
     const loaded = await loadDlq();
     assert.equal(loaded.length, 1);
     assert.equal(loaded[0].refId, 'c-a59a');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// appendDlq redaction (AI-184) — the DLQ is persistence, not delivery; the
+// at-rest copy keeps the scrub the send path used to provide pre-AI-184.
+// ---------------------------------------------------------------------------
+
+describe('appendDlq redaction (AI-184)', () => {
+  const OPERATOR_NAME = 'OperatorNameFixture';
+
+  beforeEach(async () => {
+    await writeFile(join(tempDir, 'secrets.env'), `PA_USER_NAME=${OPERATOR_NAME}\n`, 'utf8');
+    resetRedactCache();
+  });
+
+  afterEach(() => {
+    resetRedactCache();
+  });
+
+  it('stored entry carries the placeholder, never the literal', async () => {
+    await appendDlq(makeEntry({ text: `Hi ${OPERATOR_NAME}, unsent reply`, updateId: 1 }));
+    const rows = await loadDlq();
+    assert.equal(rows.length, 1);
+    assert.ok(!rows[0].text.includes(OPERATOR_NAME), 'DLQ at-rest copy must NOT keep the name');
+    assert.ok(rows[0].text.includes('<redacted:PA_USER_NAME>'), 'placeholder recorded instead');
+  });
+
+  it('redaction is a no-op for text without secrets', async () => {
+    await appendDlq(makeEntry({ text: 'plain text', updateId: 2 }));
+    const rows = await loadDlq();
+    assert.equal(rows[rows.length - 1].text, 'plain text');
   });
 });
 
@@ -409,5 +442,120 @@ describe('quarantine', () => {
     const loaded = await loadDlq();
     assert.equal(loaded.length, 1);
     assert.equal(loaded[0].text, 'fresh entry');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Terminal chat-error drop (AI-172 fix#2; set widened 2026-09-03): a flush
+// send whose failure classifies as isTerminalChatError is dropped
+// immediately — it never enters the attempts/quarantine ladder and never
+// counts toward `remaining` — while every other failure keeps the existing
+// ladder and a success still marks delivered. These drive the REAL
+// sendMessageWithDetails through a fetch double, not a stubbed telegram
+// module.
+// ---------------------------------------------------------------------------
+
+describe('flushDlq terminal chat-error drop (AI-172 fix#2)', () => {
+  const CHAT_NOT_FOUND_BODY = JSON.stringify({ ok: false, description: 'Bad Request: chat not found' });
+
+  function setupFetch(status: number, bodyText: string) {
+    (globalThis as Record<string, unknown>).fetch = async () => ({
+      ok: status >= 200 && status < 300,
+      status,
+      text: async () => bodyText,
+      json: async () => JSON.parse(bodyText),
+    });
+  }
+
+  it('drops a chat-not-found entry: not delivered, not remaining, not quarantined', async () => {
+    setupFetch(400, CHAT_NOT_FOUND_BODY);
+    await appendDlq(makeEntry({ text: 'unroutable', chatId: 777, threadId: 3, updateId: 11 }));
+
+    const result = await flushDlq('token');
+
+    assert.equal(result.delivered, 0);
+    assert.equal(result.remaining, 0, 'terminal entry must NOT count toward remaining');
+    assert.equal(result.deduped, 0);
+    const loaded = await loadDlq();
+    assert.equal(loaded.length, 0, 'entry must be dropped, not persisted for retry');
+  });
+
+  it('drops a 403 bot-blocked entry: not delivered, not remaining, not quarantined', async () => {
+    setupFetch(403, JSON.stringify({ ok: false, description: 'Forbidden: bot was blocked by the user' }));
+    await appendDlq(makeEntry({ text: 'blocked', chatId: 777, threadId: 3, updateId: 12 }));
+
+    const result = await flushDlq('token');
+
+    assert.equal(result.delivered, 0);
+    assert.equal(result.remaining, 0, 'terminal entry must NOT count toward remaining');
+    assert.equal(result.deduped, 0);
+    const loaded = await loadDlq();
+    assert.equal(loaded.length, 0, 'entry must be dropped, not persisted for retry');
+  });
+
+  it('drops only the terminal entry; the rest of the batch stays on the normal ladder', async () => {
+    // First send (entry order = append order) fails terminal, second fails
+    // with a plain non-terminal 400 ('Bad Request', same convention as the
+    // existing quarantine tests — no fallback-triggering substrings).
+    let calls = 0;
+    (globalThis as Record<string, unknown>).fetch = async () => {
+      const terminal = calls === 0;
+      calls++;
+      return {
+        ok: false,
+        status: 400,
+        text: async () => (terminal ? CHAT_NOT_FOUND_BODY : 'Bad Request'),
+        json: async () => ({ ok: false }),
+      };
+    };
+    await appendDlq(makeEntry({ text: 'terminal one', chatId: 701, threadId: 0, updateId: 21 }));
+    await appendDlq(makeEntry({ text: 'transient one', chatId: 702, threadId: 0, updateId: 22 }));
+
+    const result = await flushDlq('token');
+
+    assert.equal(result.delivered, 0);
+    assert.equal(result.remaining, 1, 'only the non-terminal entry survives the flush');
+    const loaded = await loadDlq();
+    assert.equal(loaded.length, 1);
+    assert.equal(loaded[0].updateId, 22, 'the terminal entry is gone; the transient entry persists');
+    assert.equal(loaded[0].attempts, 1, 'survivor sits on the normal ladder at attempts=1');
+    assert.ok(!loaded[0].quarantined, 'survivor is not quarantined');
+  });
+
+  it('a non-terminal 400 failure keeps the existing ladder (attempts increment, quarantine at threshold)', async () => {
+    setupFetch(400, 'Bad Request');
+    const entry = makeEntry({ text: 'flaky', chatId: 703, threadId: 0, updateId: 23 });
+    await appendDlq(entry);
+
+    await flushDlq('token');
+    let loaded = await loadDlq();
+    assert.equal(loaded.length, 1);
+    assert.equal(loaded[0].attempts, 1, 'first failed flush increments attempts');
+    assert.ok(!loaded[0].quarantined, 'non-terminal failures do not quarantine early');
+
+    for (let i = 0; i < QUARANTINE_THRESHOLD - 1; i++) {
+      await flushDlq('token');
+    }
+    loaded = await loadDlq();
+    assert.equal(loaded.length, 1);
+    assert.equal(loaded[0].quarantined, true, 'ladder still reaches quarantine at the threshold');
+    assert.equal(loaded[0].attempts, QUARANTINE_THRESHOLD);
+  });
+
+  it('a successful flush still marks the entry delivered (happy path unchanged)', async () => {
+    let sends = 0;
+    (globalThis as Record<string, unknown>).fetch = async () => {
+      sends++;
+      return { ok: true, status: 200, text: async () => '{"ok":true}', json: async () => ({ ok: true }) };
+    };
+    const entry = makeEntry({ text: 'deliver me', chatId: 704, threadId: 5, updateId: 24 });
+    await appendDlq(entry);
+
+    const result = await flushDlq('token');
+
+    assert.equal(result.delivered, 1);
+    assert.equal(result.remaining, 0);
+    assert.equal(await wasDelivered(deliveredKey(704, 5, 24)), true, 'delivered-marked as today');
+    assert.equal(sends, 1, 'exactly one send attempt per entry');
   });
 });

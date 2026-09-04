@@ -7,6 +7,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import type { ConversationState, ConversationTurn } from './types.js';
 import { rotateFileIfNeeded } from './archive-files.js';
+import { redactSecrets } from '../../../pa/dist/src/lib/redact.js';
 
 /** Archive join fields the rolling in-memory window does not need to know about.
  *  Declared HERE, not on ConversationTurn, because projects/telegram-bot/src/types.ts
@@ -451,6 +452,22 @@ export async function findArchivedTurnByMessageId(
 }
 
 export function addTurn(state: ConversationState, turn: ConversationTurn): void {
+  // AI-184 (2026-09-03): redaction used to ride the SEND path (logic.ts
+  // formatWorkerReply / buildWorkerResponse), which scrubbed the operator's own
+  // delivered reply — their name could never appear in their own chat — and
+  // corrupted name-bearing third-party drafts in transit (wa.me prefill text).
+  // It belongs on this persistence/worker-read boundary instead: the delivered
+  // reply keeps real text, while this turn store — re-read by workers via
+  // buildResumedPrompt (formatHistory) and archived to
+  // conversation-history.jsonl by saveTopicState/archiveNewTurns — stays
+  // redacted, matching the pre-AI-184 coverage those surfaces had.
+  // Assistant rows only: user rows never passed the old send path (they were
+  // never redacted at rest) and redacting them would alter worker-visible
+  // prompt history beyond AI-184's scope. Double redaction is a safe no-op.
+  if (turn.role === 'assistant') {
+    state.turns.push({ ...turn, text: redactSecrets(turn.text) as string });
+    return;
+  }
   state.turns.push(turn);
 }
 

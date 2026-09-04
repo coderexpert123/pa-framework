@@ -128,7 +128,7 @@ export async function runSkillEngagementAudit(deps: SkillEngagementDeps = {}): P
 }
 
 /**
- * Monthly skill-engagement audit (AI-168, plans/2026-08-27-ai168-outcome-slos-SPEC.md):
+ * Monthly skill-engagement audit (AI-168, the 2026-08-27 outcome-SLO spec):
  * joins listSkills + last-success run meta + decisions.sqlite rows + alert census;
  * writes ~/.pa/skill-engagement.json listing skills with ZERO user-facing engagement
  * for >=90 days. Report only — NEVER deletes, disables, or unschedules anything.
@@ -138,7 +138,7 @@ export const skillEngagementAuditJob: MaintenanceJob = {
   name: 'skill-engagement-audit',
   host: 'pa',
   everyMs: 30 * DAY,
-  description: 'Monthly skill-engagement audit (AI-168, plans/2026-08-27-ai168-outcome-slos-SPEC.md): joins listSkills + last-success run meta + decisions.sqlite rows + alert census; writes ~/.pa/skill-engagement.json listing skills with ZERO user-facing engagement for >=90 days. Report only — NEVER deletes, disables, or unschedules anything. Non-destructive: no retention targets.',
+  description: 'Monthly skill-engagement audit (AI-168, the 2026-08-27 outcome-SLO spec): joins listSkills + last-success run meta + decisions.sqlite rows + alert census; writes ~/.pa/skill-engagement.json listing skills with ZERO user-facing engagement for >=90 days. Report only — NEVER deletes, disables, or unschedules anything. Non-destructive: no retention targets.',
   destructive: false,
   shedWhenDegraded: true,
   targets: [],

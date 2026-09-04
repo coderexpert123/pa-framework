@@ -26,7 +26,7 @@ export const ALLOWED_ROOTS: PolicyRoot[] = [
     evidence:
       'Antigravity CLI (agy) resumable-conversation files. agy ships NO ' +
       'retention policy of its own, so PA prunes them at GC_RETENTION_MS (30d) ' +
-      '— audit 2026-08-02, plans/2026-08-02-session-gc-scope-to-pa-spawned.md. ' +
+      '— audit 2026-08-02, the internal session-gc scoping plan. ' +
       'Scoped to conversations/ only: ~/.gemini/antigravity and ' +
       'antigravity-browser-profile are app state, not transcripts, and are ' +
       'deliberately out of scope.',

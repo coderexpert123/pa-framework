@@ -121,7 +121,7 @@ class TestManifestAndPack(unittest.TestCase):
 
 class TestReauthKickOnDriveFailure(unittest.TestCase):
     """backup_secrets.py had NO existing handler around _drive() before this
-    (correction 14 of plans/2026-08-23-alerts-wave-SPEC.md) — main() must wrap
+    (correction 14 of the 2026-08-23 alerts-wave spec) — main() must wrap
     it, kick a reauth link via the WP-G helper, and still exit 1 without
     masking the real error. The helper module doesn't exist at collection time
     in every environment (WP-G's own file) so it's stubbed via sys.modules,

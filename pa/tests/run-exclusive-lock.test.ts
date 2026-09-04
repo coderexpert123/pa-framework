@@ -72,7 +72,7 @@ describe('exclusiveLockKey / lockWaitBudgetMs (pure)', () => {
 // used to alert its skill's own telegram_output topic with the same
 // "Skill failed: <name>" subject/severity/dedupKey as a real failure, reading
 // to the operator as "Skill failed: commit" three times in one week
-// (plans/2026-08-23-alerts-week-review.md §5.5). run.ts now discriminates via
+// (the 2026-08-23 alerts-week review §5.5). run.ts now discriminates via
 // lockSkipAlertFields(worker, skillName), tested directly here since this
 // file has no existing mechanism for observing a fired notifyUser call.
 describe('lockSkipAlertFields (pure)', () => {

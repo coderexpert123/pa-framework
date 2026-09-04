@@ -1,6 +1,6 @@
 /**
- * Analyzer watermark + candidate ledger (spec: plans/2026-08-24-recall-traces-wave-SPEC.md
- * §3.5/E1). Two durable files under PA_HOME:
+ * Analyzer watermark + candidate ledger (spec: the 2026-08-24 recall-traces
+ * spec §3.5/E1). Two durable files under PA_HOME:
  *
  *  - analyzer-state.json   — the incremental watermark (`covers_through`) that
  *    `analyzeConversationPatterns` (analyzer.ts) advances after a fully-successful

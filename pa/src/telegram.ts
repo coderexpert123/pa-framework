@@ -3,7 +3,6 @@ import type { TelegramOutput } from './types.js';
 import { log } from './lib/log.js';
 import { sanitizeMdV2, normalizeMarkdown } from './lib/mdv2.js';
 import { telegramFetch } from './lib/telegram-proxy.js';
-import { redactSecrets } from './lib/redact.js';
 
 const BASE = 'https://api.telegram.org';
 const MAX_MSG_LEN = 4000;
@@ -110,19 +109,25 @@ export async function sendToTelegram(
    *  fallback because that path mutates the same `body` (2026-08-24 buttons program, P3). */
   replyMarkup?: Record<string, unknown>,
 ): Promise<SendResult> {
-  // Apply redaction as the last line of defense
-  const redactedText = String(redactSecrets(text) ?? '');
+  // AI-184 (2026-09-03): the send body is the OPERATOR'S OWN CHAT — alerts, the
+  // `pa notify` command and every skill's telegram_output deliver here — so the
+  // text is deliberately NOT redacted on this path. Redacting here scrubbed the
+  // operator's name out of their own chat and corrupted name-bearing outbound
+  // drafts in transit (wa.me prefill text). The scrub lives on the log side:
+  // every context logged below (textPreview, detail) redacts inside the logger
+  // (lib/log.ts), which is the surviving seam — the name reaches the operator's
+  // eyes, never the logs.
+  const trimmedInput = text.trim();
 
   // Ref reuse (2026-08-26): callers may stamp their own ref trailer — catchup's
   // lock-lost alert mints and logs its refId in the body BEFORE notifyUser
   // runs, and this send used to append a SECOND trailer, so the delivered
   // message carried two refs while the delivery row keyed under an id nobody
-  // quoted. A TRAILING `_Ref: <prefix>-<hex>_` on the redacted text is now
+  // quoted. A TRAILING `_Ref: <prefix>-<hex>_` on the send text is now
   // extracted before sanitization and reused: the message carries exactly one
   // ref, and every log row below (send, 429 retries, failures, aborts) keys
   // under the caller's id, so `pa ref` resolves origin AND delivery. A
   // mid-text `_Ref:` occurrence is NOT a trailer — quoted refs stay quoted.
-  const trimmedInput = redactedText.trim();
   const stampedRef = /_Ref: ([a-z]+)-([0-9a-f]{4,16})_\s*$/.exec(trimmedInput);
   const refId = stampedRef ? `${stampedRef[1]}-${stampedRef[2]}` : `s-${randomBytes(6).toString('hex')}`;
   const bodyCore = stampedRef ? trimmedInput.slice(0, stampedRef.index).trimEnd() : trimmedInput;

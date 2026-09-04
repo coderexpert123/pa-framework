@@ -230,7 +230,7 @@ export async function runWithFailover(
   // Under noFallback there is no next hop by definition.
   // Why this exists: an intermediate failover hop paged
   // "Worker exited with code 1: <worker>" even when the next worker answered
-  // (plans/2026-08-23-alerts-week-review.md §5.3).
+  // (the 2026-08-23 alerts-week review §5.3).
   const hasEligibleCandidateAfter = async (index: number): Promise<boolean> => {
     if (options.noFallback) return false;
     for (let j = index + 1; j < workers.length; j++) {

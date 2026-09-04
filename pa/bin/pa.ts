@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { runCommand } from '../src/commands/run.js';
+import { runCommand, exitCodeForCommandResult } from '../src/commands/run.js';
 import { listCommand } from '../src/commands/list.js';
 import { workersCommand } from '../src/commands/workers-cmd.js';
 import { logsCommand } from '../src/commands/logs.js';
@@ -10,6 +10,7 @@ import { initCommand } from '../src/commands/init.js';
 import { purgeLocksCommand } from '../src/commands/purge-locks.js';
 import { botStopCommand, botRestartCommand, botRotateCommand } from '../src/commands/bot.js';
 import { setupTopicsCommand } from '../src/commands/setup-topics.js';
+import { refreshCardsCommand } from '../src/commands/refresh-cards.js';
 import { learnCommand } from '../src/commands/learn.js';
 import { draftsCommand } from '../src/commands/drafts-cmd.js';
 import { approveCommand } from '../src/commands/approve.js';
@@ -33,6 +34,7 @@ import { fixCommand } from '../src/commands/fix.js';
 import { gitGuardCommand } from '../src/commands/git-guard.js';
 import { statusCommand } from '../src/commands/status.js';
 import { watchCommand } from '../src/commands/watch.js';
+import { topicTaskCommand, topicNoteCommand, topicEventsCommand } from '../src/commands/topic.js';
 
 async function mcpServeCommand(): Promise<void> {
   // @ts-ignore - .mjs module without declaration file
@@ -129,6 +131,7 @@ Usage:
   pa bot restart              Gracefully stop the bot (Task Scheduler restarts it)
   pa bot rotate               Rotate the bot log file if it exceeds the size limit
   pa bot setup-topics         Auto-create canonical Telegram forum topics from a template
+  pa bot refresh-cards        Refresh pinned status cards across topics
   pa learn [--days N]         Analyze conversations & failures, propose skill drafts
   pa drafts [--pending|--rejected|--approved]  List skill drafts
   pa approve <name> [--edit]  Approve a draft and install as active skill
@@ -138,6 +141,13 @@ Usage:
   pa watch add --desc "<text>" --type <file_exists|file_gone|file_newer_than|file_contains|process_gone> [--path <p>|--pattern <re>|--pid <n>|--since <iso>] [--deadline <dur>] [--interval <dur>] [--chat-id <id>] [--thread-id <n>]
   pa watch list [--json]      List registered async watches (active + last 10 terminal)
   pa watch rm <id>            Cancel a watch (no Telegram report is sent)
+  pa watch re-register <id>   Re-arm a terminal watch (copy spec into a fresh active row)
+  pa topic-task add <chatId>_<threadId> --title "<t>" --prompt "<p>" [--worker <pin>]  Queue a task for the topic's bot drain (content-hash dedup)
+  pa topic-task list <topicKey>  List a topic's queued + in-flight (running/parked) tasks
+  pa topic-note add <topicKey> "<text>" [--key <k>] [--expires YYYY-MM-DD]  Add an OPEN note to the topic store (rendered into the prompt's Open items)
+  pa topic-note list <topicKey>  List the topic's notes from the store
+  pa topic-note close <topicKey> <key>  Close an OPEN note (DONE)
+  pa topic-events <topicKey>  Show the topic's event log (newest last, last 20)
   pa git-guard [<dir>]        Check whether skills may run git on your behalf (exit 0 = yes, 1 = no)
   pa health                   Show system health status
   pa status                   One-screen overview: health, git, skills/next-due, claims, DLQ, maintenance
@@ -197,7 +207,13 @@ async function main(): Promise<void> {
           break;
         }
         const extraArgs = dashIdx !== -1 ? args.slice(dashIdx + 1) : [];
-        await runCommand(skillName, extraArgs, 0, preferredWorker, promptArgs);
+        // AI-179 WP-2: this CommandResult used to be discarded, so every `pa run`
+        // exited 0 and a failed push read as success. Map it to the exit code —
+        // chains.ts's spawnPa keys success on this code, so chain `on_failure` now
+        // fires on real skill failures. The bot's spawns stay fire-and-forget BY
+        // DESIGN and must NOT start consuming it (no failover on a lock-lost abort).
+        const result = await runCommand(skillName, extraArgs, 0, preferredWorker, promptArgs);
+        process.exitCode = exitCodeForCommandResult(result);
         break;
       }
 
@@ -255,8 +271,10 @@ async function main(): Promise<void> {
           await botRotateCommand();
         } else if (sub === 'setup-topics') {
           await setupTopicsCommand(args.slice(2));
+        } else if (sub === 'refresh-cards') {
+          process.exitCode = await refreshCardsCommand(args.slice(2));
         } else {
-          console.log('Usage: pa bot <stop|restart|rotate|setup-topics>');
+          console.log('Usage: pa bot <stop|restart|rotate|setup-topics|refresh-cards>');
         }
         break;
       }
@@ -296,6 +314,18 @@ async function main(): Promise<void> {
 
       case 'watch':
         process.exitCode = await watchCommand(args.slice(1));
+        break;
+
+      case 'topic-task':
+        process.exitCode = await topicTaskCommand(args.slice(1));
+        break;
+
+      case 'topic-note':
+        process.exitCode = await topicNoteCommand(args.slice(1));
+        break;
+
+      case 'topic-events':
+        process.exitCode = await topicEventsCommand(args.slice(1));
         break;
 
       case 'health':

@@ -19,7 +19,8 @@ export interface OAuthExchangeResult {
   thread_id?: number;
 }
 
-export type OAuthResumeStatus = 'not_needed' | 'started' | 'missing_hook' | 'failed';
+export type OAuthResumeStatus = 'not_needed' | 'started' | 'missing_hook' | 'failed'
+  | 'topic_resumed' | 'topic_resume_failed';
 
 export interface OAuthResumeInvoker {
   unref(): void;
@@ -53,6 +54,48 @@ export function normalizeResumeAction(result: OAuthExchangeResult): OAuthResumeA
   return undefined;
 }
 
+export const TOPIC_RESUME_MAX_PROMPT_CHARS = 500;
+
+export type TopicResumeValidation =
+  | { ok: true; prompt: string }
+  | { ok: false; error: string };
+
+/** AI-181 (SPEC §2.1-2.2): the closed topic_resume vocabulary. ONE action
+ * type, two keys, a single-line <=500-char prompt — no skill names, no args,
+ * no nested objects — validated identically here (fire time, called from
+ * main.ts's /auth branch) and at mint time in
+ * pa/scripts/start_google_telegram_reauth.py (byte-identical error strings;
+ * both pinned by tests). This is the same closed-vocabulary treatment
+ * pa/src/lib/watch-jobs.ts gives watch checks, for the same reason: the
+ * payload is armed by LLM output. A topic_resume action never reaches
+ * oauth_resume_hook.py — the hook has no dispatch path into a topic. */
+export function validateTopicResumeAction(action: OAuthResumeAction | undefined): TopicResumeValidation {
+  if (!action || action.type !== 'topic_resume') {
+    return { ok: false, error: 'not a topic_resume action' };
+  }
+  const keys = Object.keys(action).sort();
+  if (keys.length !== 2 || keys[0] !== 'prompt' || keys[1] !== 'type') {
+    return { ok: false, error: 'topic_resume must have exactly the keys "type" and "prompt"' };
+  }
+  const prompt = action.prompt;
+  if (typeof prompt !== 'string') {
+    return { ok: false, error: 'topic_resume.prompt must be a string' };
+  }
+  if (!prompt.trim()) {
+    return { ok: false, error: 'topic_resume.prompt must not be empty' };
+  }
+  if (/[\r\n]/.test(prompt)) {
+    return { ok: false, error: 'topic_resume.prompt must be a single line' };
+  }
+  if (prompt.length > TOPIC_RESUME_MAX_PROMPT_CHARS) {
+    return { ok: false, error: 'topic_resume.prompt exceeds 500 characters' };
+  }
+  if (prompt.trim().startsWith('/')) {
+    return { ok: false, error: 'topic_resume.prompt must not start with "/"' };
+  }
+  return { ok: true, prompt: prompt.trim() };
+}
+
 export function redactAuthCommand(): string {
   return '/auth [redacted]';
 }
@@ -77,6 +120,24 @@ function describeResumeAction(action: OAuthResumeAction): string {
   if (actionType) return actionType;
 
   return 'saved action';
+}
+
+function topicResumeExcerpt(result: OAuthExchangeResult): string {
+  const raw = result.resume_action && typeof (result.resume_action as any).prompt === 'string'
+    ? (result.resume_action as any).prompt as string : '';
+  return raw.split(/\r?\n/)[0].trim().slice(0, 120);
+}
+
+function describeTopicResumeTarget(
+  result: OAuthExchangeResult,
+  source?: { chatId: number; threadId: number }
+): string {
+  const sameTopic = source
+    && String(source.chatId) === String(result.chat_id)
+    && (result.thread_id ?? 0) === source.threadId;
+  return sameTopic
+    ? 'to this topic'
+    : `to chat ${result.chat_id} thread ${result.thread_id ?? 0}`;
 }
 
 export function launchOAuthResumeAction(
@@ -115,7 +176,8 @@ export function launchOAuthResumeAction(
 
 export function buildOAuthCompletionMessage(
   result: OAuthExchangeResult,
-  resumeStatus: OAuthResumeStatus
+  resumeStatus: OAuthResumeStatus,
+  source?: { chatId: number; threadId: number }
 ): string {
   if (result.status !== 'success') {
     return `❌ *Authentication failed*: ${result.error || 'Unknown error'}`;
@@ -127,7 +189,16 @@ export function buildOAuthCompletionMessage(
   }
 
   const action = normalizeResumeAction(result);
-  if (!action) return lines.join('\n');
+  if (!action) {
+    if (result.chat_id) {
+      // AI-181 interim dead-end fix (plan §5): a successful /auth with a
+      // pending session that recorded a chat but attached NO resume action
+      // used to end in total silence — the operator never learned a task
+      // might be waiting on the now-valid token.
+      lines.push('', '_(No resume action was attached — if a task was waiting, tell it to continue.)_');
+    }
+    return lines.join('\n');
+  }
 
   const description = describeResumeAction(action);
   if (resumeStatus === 'started') {
@@ -136,6 +207,10 @@ export function buildOAuthCompletionMessage(
     lines.push('', `_(Saved action: ${description}. No OAuth resume hook is configured, so it was not restarted automatically.)_`);
   } else if (resumeStatus === 'failed') {
     lines.push('', `_(Saved action: ${description}. Automatic resume failed to start.)_`);
+  } else if (resumeStatus === 'topic_resumed') {
+    lines.push('', `_(Resuming saved task after Google auth — a new turn has been dispatched ${describeTopicResumeTarget(result, source)}: "${topicResumeExcerpt(result)}")_`);
+  } else if (resumeStatus === 'topic_resume_failed') {
+    lines.push('', '_(Saved task could not be resumed automatically — nothing was dispatched. If a task was waiting, tell it to continue.)_');
   } else {
     lines.push('', `_(Saved action: ${description})_`);
   }

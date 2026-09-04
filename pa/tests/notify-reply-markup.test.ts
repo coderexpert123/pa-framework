@@ -6,7 +6,7 @@ import { notifyUser } from '../src/lib/notify.js';
 import { createTempPaHome, createTempSecrets, cleanup } from './helpers.js';
 import type { TelegramOutput } from '../src/types.js';
 
-// WP-P1 (2026-08-24, plans/2026-08-24-buttons-program-SPEC.md): collateral tests for pre-work
+// WP-P1 (2026-08-24, the buttons-program spec): collateral tests for pre-work
 // P3 (pa/src/telegram.ts sendToTelegram's 5th positional replyMarkup) and P4
 // (pa/src/lib/notify.ts NotifyOpts.replyMarkup) — both FROZEN files, owned by the orchestrator;
 // this file only asserts their behaviour.

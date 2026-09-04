@@ -9,7 +9,7 @@ import { runRecallEngine } from '../../../commands/recall.js';
  * the AI-098-style backoff ladder paces retries instead of hammering the
  * store every 10 minutes.
  *
- * Spec: plans/2026-08-24-recall-traces-wave-SPEC.md §3.4 (WP-D), step 9.
+ * Spec: the 2026-08-24 recall-traces spec §3.4 (WP-D), step 9.
  */
 export const recallIndexJob: MaintenanceJob = {
   name: 'recall-index',

@@ -57,7 +57,7 @@ export const workerTeeGcJob: MaintenanceJob = {
       maxAgeMs: RETENTION_MS,
       action: 'delete',
       ownership: 'pa-owned',
-      evidence: 'pa/src/worker-exec.ts writes these via the tee helper (plans/2026-08-15-agy-tee-recovery.md); they are runtime state with no long-term value after recovery or normal delivery.',
+      evidence: 'pa/src/worker-exec.ts writes these via the tee helper (the 2026-08-15 agy-tee-recovery plan); they are runtime state with no long-term value after recovery or normal delivery.',
     },
   ],
   async run(ctx) {

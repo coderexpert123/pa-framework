@@ -69,11 +69,11 @@ describe('worker-exec stdin-marker splice (codex trailing "-")', () => {
     const resultFile = join(scriptDir, 'result-fresh.txt');
     const stubPath = await writeArgvDumpStub('codex', resultFile);
 
-    // Shape mirrors the live codex config.yaml: [..., '-C', 'D:/Personal Assistant', '-']
+    // Shape mirrors the live codex config.yaml: [..., '-C', 'C:/pa-checkout', '-']
     const worker = makeWorker({
       name: 'codex',
       command: stubPath,
-      args: ['exec', '-C', 'D:/Personal Assistant', '-'],
+      args: ['exec', '-C', 'C:/pa-checkout', '-'],
       input_mode: 'stdin-text',
     });
 
@@ -111,7 +111,7 @@ describe('worker-exec stdin-marker splice (codex trailing "-")', () => {
     const worker = makeWorker({
       name: 'codex',
       command: stubPath,
-      args: ['exec', '-C', 'D:/Personal Assistant', '-'],
+      args: ['exec', '-C', 'C:/pa-checkout', '-'],
       input_mode: 'stdin-text',
     });
 

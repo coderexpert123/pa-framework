@@ -2,7 +2,7 @@
 On-demand drift checker for CLI brain/skill parity — a thin combined-report
 wrapper around sync_cli_parity.py's three --check targets (gemini, agy,
 skills). Not wired into any schedule/skill trigger in this pass (per
-plans/2026-07-29-cli-brain-skill-parity-agy-gemini.md Phase 4) — manual/
+the 2026-07-29 CLI/brain parity plan, Phase 4) — manual/
 on-demand only. A natural fit for the update-brain nightly cadence later,
 once proven stable unattended (brain-recheck's own cadence was folded into
 update-brain's Step 9 on 2026-08-28 and no longer runs independently).

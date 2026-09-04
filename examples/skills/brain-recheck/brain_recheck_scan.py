@@ -7,7 +7,7 @@ this JSON into the Telegram block.
 
 Why this exists
 ---------------
-`brain-recheck` used to ask a gemini worker to count `plans/INDEX.md` rows and
+`brain-recheck` used to ask a gemini worker to count the internal plan-index rows and
 stat files by hand. Two verified failures in the 2026-07-16..21 audit window:
 
   * It mis-counted INDEX.md in all four gemini runs (reported 43 completed vs
@@ -86,7 +86,7 @@ RUNBOOK_RE = re.compile(r"runbook:\s*([^\s/]+(?:/[^\s/]+)*)")
 
 
 # --------------------------------------------------------------------------
-# plans/INDEX.md
+# plan index (internal plans register)
 # --------------------------------------------------------------------------
 
 def classify_status(status: str) -> str:
@@ -317,7 +317,7 @@ def scan(repo_root: Path, memory_dir: Path, skills_dir: Path, today: date) -> di
     memory_md = _read(memory_dir / "MEMORY.md")
 
     missing_sources = [name for name, txt in (
-        ("CLAUDE.md", claude_md), ("plans/INDEX.md", index_md),
+        ("CLAUDE.md", claude_md), ("plan index (internal)", index_md),
         ("BACKLOG.md", backlog_root_md), ("MEMORY.md", memory_md)) if not txt]
     for name in missing_sources:
         issue("critical", "MISSING BRAIN FILE", name)
@@ -340,7 +340,7 @@ def scan(repo_root: Path, memory_dir: Path, skills_dir: Path, today: date) -> di
     plans_dir = repo_root / "plans"
     for target in local_plan_links(rows):
         if not (plans_dir / target).resolve().exists():
-            issue("critical", "BROKEN LINK", f"plans/INDEX.md links missing `{target}`")
+            issue("critical", "BROKEN LINK", f"plan index (internal) links missing `{target}`")
 
     # --- broken memory links ---------------------------------------------
     for target in memory_links(memory_md):

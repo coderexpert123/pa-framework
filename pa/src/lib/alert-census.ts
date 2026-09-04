@@ -1,5 +1,5 @@
 /**
- * Alert census (2026-08-23, plans/2026-08-23-alerts-wave-SPEC.md).
+ * Alert census (2026-08-23, the alerts-wave spec).
  *
  * Deterministic, LLM-free census of what the notify substrate actually SENT (and suppressed)
  * over the last N days, joined with the current health of whatever each alert family points
@@ -13,7 +13,7 @@
  * Why it exists: in the week 2026-08-16..23 the loop reported "0 proposals — nothing to
  * report" while ~110 alerts/day fired, because its only failure input was skill .meta
  * status:error — maintenance-job failures, staleness/bg-leak/worker-exit alerts, notify
- * volume and exit-0-masked failures were all invisible (plans/2026-08-23-alerts-week-review.md §4).
+ * volume and exit-0-masked failures were all invisible (the 2026-08-23 alerts-week review §4).
  *
  * Contract file: the TYPES below are the cross-package contract (self-improver + weekly digest
  * read them).
@@ -61,7 +61,7 @@ export interface CensusFamily {
   bodySample?: string;
   distinctBodies: number;
   classification: CensusClassification;
-  // --- Suppression overlay (2026-08-29, plans/2026-08-29-alert-suppression-SPEC.md).
+  // --- Suppression overlay (2026-08-29, the alert-suppression spec).
   // Additive and optional: absent on every pre-overlay census JSON. classification
   // above stays UNTOUCHED — history counts remain honest for consumers that do not
   // read these fields. Field is suppressedBy, NOT suppressed (that name is already
@@ -182,7 +182,7 @@ export function classifyFamily(f: Omit<CensusFamily, 'classification'>): CensusC
 }
 
 // ---------------------------------------------------------------------------
-// Suppression overlay helpers (2026-08-29, plans/2026-08-29-alert-suppression-SPEC.md)
+// Suppression overlay helpers (2026-08-29, the alert-suppression spec)
 // ---------------------------------------------------------------------------
 
 /** Owner is green ONLY on verifiable health (PLAN §3d): a skill needs

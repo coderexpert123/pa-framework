@@ -366,7 +366,7 @@ describe('notifyUser — route resolution and confirmed delivery', () => {
     assert.equal(result.reason, 'timeout-unknown-outcome', 'the race does not cancel the send — outcome is unknown, not failed');
     // 2026-08-23 (alerts wave, WP-D): a timeout used to write NO dedup state, so a
     // chronically-timing-out alert re-fired on every per-minute tick (the 429 loop of
-    // plans/2026-08-23-alerts-week-review.md §5.4). It now writes a SHORT mute only —
+    // the 2026-08-23 alerts-week review §5.4). It now writes a SHORT mute only —
     // TIMEOUT_DEDUP_MS, count not advanced — never the confirmed-send escalated window.
     const record = await readDedupFile('timeout-key');
     assert.equal(record.windowMs, TIMEOUT_DEDUP_MS, 'timeout writes the short mute, not a confirmed-send window');

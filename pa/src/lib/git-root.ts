@@ -50,7 +50,7 @@ const repoRootCache = new Map<string, string>();
  * in a maintenance job resolved into System32 and ENOENT'd: restore-drill
  * accumulated 11,228 consecutive failures and 180 sent alerts, and
  * clobber-sentinel reported green while detecting nothing, from 2026-08-17
- * until 2026-08-23 (plans/2026-08-23-alerts-week-review.md §5.2).
+ * until 2026-08-23 (the alerts-week review §5.2).
  * resolveRepoRoot()'s DEFAULT argument is process.cwd(), i.e. the bug itself —
  * always call this instead from module scope: repoRootFromModule(__filename).
  * (pa/ compiles to CommonJS — tsconfig module Node16, no "type":"module" — so

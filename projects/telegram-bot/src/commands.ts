@@ -24,6 +24,7 @@ export const BOT_COMMANDS: BotCommand[] = [
   { command: 'health', description: 'Show pa system health check (read-only)' },
   { command: 'ref', description: 'Look up a ref-ID: /ref <id> (read-only)' },
   { command: 'claims', description: 'Show active file reservations and recent changes (read-only)' },
+  { command: 'debug', description: 'Open a debug task with pa-support for a message — reply to it, or send /debug right after (operator only)' },
   { command: 'branch', description: 'Create a branch from this topic: /branch <name> [prompt]' },
   { command: 'child_of', description: 'Link this topic as a child of a named parent topic' },
   { command: 'merge', description: 'Merge this branch context back into the parent topic' },

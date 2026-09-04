@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Nightly self-improvement loop orchestrator. Fully autonomous since 2026-07-11 — see
- * plans/2026-07-11-autonomous-self-improver-full-autonomy.md.
+ * the full-autonomy plan (internal, 2026-07-11).
  *
  * 1. Roll back any autonomous change from a prior night that's now causing elevated failures.
  * 2. Sweep stale pending drafts (proposed_at >14 days ago) — reject them so the same idea can
@@ -49,7 +49,7 @@ import { buildHITLKeyboard, buildDraftKeyboard } from './lib/hitl-keyboard.js';
 import { createPostmortemStub } from './lib/postmortem.js';
 import type { PostmortemInput, PostmortemMetadata } from './lib/postmortem.js';
 import { buildAlertCensus } from './lib/alert-census.js';
-import type { AlertCensus } from './lib/alert-census.js';
+import type { AlertCensus, CensusFamily } from './lib/alert-census.js';
 import { jobsForHost } from './lib/maintenance/registry.js';
 import { repoRootFromModule } from './lib/git-root.js';
 import { rm, copyFile } from 'fs/promises';
@@ -60,7 +60,7 @@ import type { DraftProposal, DraftMeta } from './types.js';
 // git-workflow lock (2026-08-05) — rollback()'s git-revert path shells out to git directly
 // (git status/revert/reset --hard/push), entirely outside the skill-frontmatter
 // exclusive_resource mechanism. Same lock as code-fixer.ts's attemptCodeFix, acquired here
-// independently (not held across the whole nightly main()) — see plans/federated-booping-hammock.md.
+// independently (not held across the whole nightly main()) — see the nightly lock-isolation plan (internal).
 const ROLLBACK_LOCK_AGENT = 'self-improver-rollback';
 
 const SELF_NAME = 'self-improver';
@@ -136,12 +136,7 @@ async function maybeCreatePostmortem(
   skillName: string,
   reason: string,
   commitHash?: string,
-  revertCommitHash?: string,
-  // Test-only (AI-176): forwarded from RollbackDeps.postmortemRepoRoot so tests
-  // driving the real rollback path never write into the live repo tree.
-  // Production always omits this — createPostmortemStub derives the true repo
-  // root itself, independent of process.cwd().
-  repoRoot?: string
+  revertCommitHash?: string
 ): Promise<void> {
   try {
     const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
@@ -166,7 +161,7 @@ async function maybeCreatePostmortem(
       sourceCommit: commitHash,
     };
 
-    const filepath = await createPostmortemStub(input, meta, { repoRoot });
+    const filepath = await createPostmortemStub(input, meta);
 
     // Log to console so it appears in the self-improver run log
     console.log(`[self-improver] Postmortem stub created: ${filepath}`);
@@ -268,12 +263,6 @@ export interface RollbackDeps {
   notifyUserFn?: typeof notifyUser;
   /** Test-only: overrides the git-optional gate for the git-revert branch (2026-08-31 WP-B). */
   gitGuardFn?: () => Promise<GitGuardResult>;
-  /** Test-only (AI-176): overrides createPostmortemStub's write root. Production
-   *  always omits this — postmortem.ts resolves the true repo root itself via
-   *  repoRootFromModule, independent of process.cwd(), so a test that drives
-   *  this real (unmocked) rollback path must pass its own isolated fixture
-   *  root here or it writes real postmortem stubs into the live repo tree. */
-  postmortemRepoRoot?: string;
 }
 
 type RollbackExec = NonNullable<RollbackDeps['execFn']>;
@@ -392,7 +381,7 @@ export async function gitRevertPreservingChurn(
 }
 
 export async function rollback(deps: RollbackDeps = {}): Promise<string[]> {
-  const { checkForRollbacksFn = checkForRollbacks, execFn = defaultRollbackExec, blackboardFn, notifyUserFn = notifyUser, gitGuardFn = checkGitWorkflowAllowed, postmortemRepoRoot } = deps;
+  const { checkForRollbacksFn = checkForRollbacks, execFn = defaultRollbackExec, blackboardFn, notifyUserFn = notifyUser, gitGuardFn = checkGitWorkflowAllowed } = deps;
   const flags = await checkForRollbacksFn();
   // The overwhelming common case — checkForRollbacksFn() reads run metadata only, no git —
   // so this must never pay for or contend on a lock it doesn't need.
@@ -486,7 +475,7 @@ export async function rollback(deps: RollbackDeps = {}): Promise<string[]> {
           baseline: toAuditBaseline(await skillRunStats(flag.skillName, ANALYSIS_DAYS)),
         });
         // WPD6: Create postmortem stub after rollback
-        await maybeCreatePostmortem('rolled-back', flag.skillName, 'Elevated failure rate since the code fix was applied — git-reverted.', flag.commitHash, revertCommitHash, postmortemRepoRoot);
+        await maybeCreatePostmortem('rolled-back', flag.skillName, 'Elevated failure rate since the code fix was applied — git-reverted.', flag.commitHash, revertCommitHash);
         continue; // audit written above with the revert-specific fields — skip the shared one
       } else {
         await rm(join(skillsDir(), flag.skillName), { recursive: true, force: true });
@@ -505,7 +494,7 @@ export async function rollback(deps: RollbackDeps = {}): Promise<string[]> {
         baseline: toAuditBaseline(await skillRunStats(flag.skillName, ANALYSIS_DAYS)),
       });
       // WPD6: Create postmortem stub after rollback
-      await maybeCreatePostmortem('rolled-back', flag.skillName, `Elevated failure rate since ${flag.kind === 'restore' ? 'the fix was applied' : 'it was approved'} — auto-rolled-back.`, undefined, undefined, postmortemRepoRoot);
+      await maybeCreatePostmortem('rolled-back', flag.skillName, `Elevated failure rate since ${flag.kind === 'restore' ? 'the fix was applied' : 'it was approved'} — auto-rolled-back.`, undefined, undefined);
     } catch (err: any) {
       lines.push(`- Rollback FAILED for \`${flag.skillName}\` (${flag.kind}): ${err.message}`);
       if (flag.kind === 'git-revert') {
@@ -523,7 +512,7 @@ export async function rollback(deps: RollbackDeps = {}): Promise<string[]> {
         }).catch(() => {});
 
         // WPD6: Create postmortem stub after rollback-failed
-        await maybeCreatePostmortem('rollback-failed', flag.skillName, `git revert ${flag.commitHash} failed: ${err.message}`.slice(0, 500), flag.commitHash, undefined, postmortemRepoRoot).catch(() => {});
+        await maybeCreatePostmortem('rollback-failed', flag.skillName, `git revert ${flag.commitHash} failed: ${err.message}`.slice(0, 500), flag.commitHash, undefined).catch(() => {});
 
         // Send pa-alerts notification (P2-19) — a bad fix is live pending manual revert
         const refId = Math.random().toString(16).slice(2, 14);
@@ -551,7 +540,7 @@ interface GeneratedProposals {
  * `census`, when provided, feeds `censusProposals` (deterministic, no LLM) into the same
  * tagged/toGate pipeline as the three LLM-driven analyzers below — thrash control
  * (hasPendingDraftForTarget / wasRecentlyChanged / saveDraft) applies to census proposals
- * unchanged (decision (g), plans/2026-08-23-alerts-wave-SPEC.md §3). Census proposals are
+ * unchanged (decision (g), the 2026-08-23 alerts-wave spec §3). Census proposals are
  * tagged sourceType 'failure' (decision (h) — they ARE failure evidence; a new sourceType
  * union member would ripple into types.ts/drafts.ts/improvement-audit.ts for no gain).
  */
@@ -620,7 +609,7 @@ async function generateProposals(census?: AlertCensus): Promise<GeneratedProposa
 }
 
 // Per-run bounds for autonomous code fixes (2026-08-23 F5 rework — the global
-// one-fix-per-night cap is gone, see plans/2026-08-23-code-fix-multi-per-night-SPEC.md).
+// one-fix-per-night cap is gone, see the code-fix multi-per-night spec).
 // PA_SELF_IMPROVER_CODE_FIX_BUDGET_MS: wall-clock budget for code-fix attempts in one run
 // (default 40 min, comfortably inside the 60-min skill timeout given observed 12-20 min/fix).
 export function readCodeFixBudgetMs(): number {
@@ -685,7 +674,7 @@ export async function gateAndApprove(
   } = deps;
 
   const entries: ReportEntry[] = [];
-  // F5 rework (2026-08-23, plans/2026-08-23-code-fix-multi-per-night-SPEC.md): the global
+  // F5 rework (2026-08-23, the code-fix multi-per-night spec): the global
   // one-fix-per-night cap is gone. Blast radius + rollback attribution are now bounded by,
   // per run: one attempt per target skill (attemptedTargets), disjoint files across every
   // applied fix so each stays independently git-revertable (sameRunAppliedFiles, enforced by
@@ -933,7 +922,7 @@ export function buildReport(
   lines.push(`Analyzed the last ${ANALYSIS_DAYS} days. ${entries.length} proposal(s) generated.`);
   // ALWAYS printed, even with zero proposals — "0 proposals — nothing to report" while ~110
   // alerts/day fired is exactly the failure this line exists to make impossible (2026-08-23,
-  // plans/2026-08-23-alerts-week-review.md §4).
+  // the 2026-08-23 alerts-week review §4).
   lines.push(census ? census.topLine : `Alert census unavailable: ${censusError ?? 'not built'}`);
   lines.push('');
 
@@ -964,7 +953,7 @@ export function buildReport(
     if (repeatUnchanged.length > 0) {
       lines.push(`*Alert hygiene (${repeatUnchanged.length})*`);
       for (const f of repeatUnchanged) {
-        lines.push(`- \`${f.family}\` — sent ${f.sent}, ${f.distinctBodies} distinct bod${f.distinctBodies === 1 ? 'y' : 'ies'} — escalate / merge / mute${f.regressedAfterFix ? ` ⚠ recurred after fix ${f.fixedAt}` : ''}`);
+        lines.push(`- \`${f.family}\` — sent ${f.sent}, ${f.distinctBodies} distinct bod${f.distinctBodies === 1 ? 'y' : 'ies'} — mute via button or \`pa fix\`${f.regressedAfterFix ? ` ⚠ recurred after fix ${f.fixedAt}` : ''}`);
       }
       lines.push('');
     }
@@ -1078,7 +1067,7 @@ export function buildReport(
   return lines.join('\n');
 }
 
-// --- HITL keyboard sends (WP-P1, 2026-08-24, plans/2026-08-24-buttons-program-SPEC.md §WP-P1) ---
+// --- HITL keyboard sends (WP-P1, 2026-08-24, the buttons-program spec §WP-P1) ---
 //
 // Two ADDITIONAL per-item sends appended after the one nightly report notifyUser above (spec
 // correction 14) — the report itself never changes. Both loops in the spec are combined here
@@ -1176,6 +1165,128 @@ async function sendHitlMessages(entries: ReportEntry[]): Promise<void> {
   }
 }
 
+// --- WP-D2 B.4/B.5 (2026-09-02, the topic-handover WAVE2 spec §3.4):
+// per-family Operator-action / Alert-hygiene messages, additional to the nightly report.
+// Each carries the si:<family>:m mute button (two-tap bot-side — the press runs
+// `pa fix <family> --note "muted from nightly report button"`, writing the same
+// fix-record the typed fallback does); operator-action families ALSO carry the one-tap
+// reauth:google button, ONLY when the family is the Google invalid_grant one. Same
+// pure-selector + send-loop split as selectHitlMessages above: never abort the nightly run.
+
+const FAMILY_MESSAGE_CAP = 3;
+// The si: family charset (callback-grammar.ts SI_RE's family group) — a family outside it
+// gets no button at all (report-line only, the same discipline as B.2's ru: ids).
+const SI_FAMILY_RE = /^[A-Za-z0-9._-]{1,40}$/;
+// ONLY the Google invalid_grant family earns the reauth:google button (B.4) — the other
+// human-gated classifications (license, usage limit, …) have no reauth fix.
+const OAUTH_INVALID_GRANT_RE = /invalid_grant/i;
+
+export type FamilyMessageSection = 'operator-action' | 'alert-hygiene';
+
+export interface FamilyMessage {
+  section: FamilyMessageSection;
+  family: CensusFamily;
+  ageDays: number;
+  /** true ⇒ the [🔐 Reauth] → reauth:google button joins the mute button (OAuth only). */
+  oauthReauth: boolean;
+  /** false ⇒ no keyboard at all (family outside the si: charset). */
+  canMute: boolean;
+}
+
+function isOauthInvalidGrant(f: CensusFamily): boolean {
+  return !!(
+    (f.ownerStatus?.lastError && OAUTH_INVALID_GRANT_RE.test(f.ownerStatus.lastError)) ||
+    (f.bodySample && OAUTH_INVALID_GRANT_RE.test(f.bodySample))
+  );
+}
+
+/** Pure. Operator-action families first (newest first), then alert-hygiene (newest first);
+ *  each section capped at FAMILY_MESSAGE_CAP; suppressed families never selected (they are
+ *  absent from the report's own census sections too). */
+export function selectFamilyMessages(census: AlertCensus | undefined): FamilyMessage[] {
+  if (!census) return [];
+  const nowMs = Date.parse(census.generatedAt);
+  const ageDaysOf = (f: CensusFamily): number =>
+    Math.max(0, Math.round((nowMs - Date.parse(f.firstSeen)) / 86_400_000));
+  const newestFirst = (a: CensusFamily, b: CensusFamily): number =>
+    Date.parse(b.firstSeen) - Date.parse(a.firstSeen);
+  const toMessage = (section: FamilyMessageSection) => (f: CensusFamily): FamilyMessage => ({
+    section,
+    family: f,
+    ageDays: ageDaysOf(f),
+    oauthReauth: section === 'operator-action' && isOauthInvalidGrant(f),
+    canMute: SI_FAMILY_RE.test(f.family),
+  });
+  const operatorAction = census.families
+    .filter((f) => f.classification === 'human-gated' && !f.suppressedBy)
+    .sort(newestFirst)
+    .slice(0, FAMILY_MESSAGE_CAP)
+    .map(toMessage('operator-action'));
+  const hygiene = census.families
+    .filter((f) => f.classification === 'repeat-unchanged' && !f.suppressedBy)
+    .sort(newestFirst)
+    .slice(0, FAMILY_MESSAGE_CAP)
+    .map(toMessage('alert-hygiene'));
+  return [...operatorAction, ...hygiene];
+}
+
+/** Pure. The per-family keyboard: [🔇 Mute] → si:<family>:m (two-tap bot-side), plus
+ *  [🔐 Reauth] → reauth:google ONLY for the OAuth invalid_grant operator-action family.
+ *  Undefined when the family is outside the si: charset. */
+export function buildFamilyKeyboard(
+  msg: FamilyMessage,
+): { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } | undefined {
+  if (!msg.canMute) return undefined;
+  const row: Array<{ text: string; callback_data: string }> = [];
+  if (msg.oauthReauth) {
+    row.push({ text: '🔐 Reauth', callback_data: 'reauth:google' });
+  }
+  row.push({
+    text: msg.section === 'alert-hygiene' ? '🔇 Mute (fix-record)' : '🔇 Mute alerts',
+    callback_data: `si:${msg.family.family}:m`,
+  });
+  return { inline_keyboard: [row] };
+}
+
+/** Pure. The per-family message body — age, owner, and the reason (last error, else a
+ *  body sample), mirroring the report's census lines, plus the typed fallback. */
+export function buildFamilyMessageBody(msg: FamilyMessage): string {
+  const f = msg.family;
+  const err = f.ownerStatus?.lastError ?? f.bodySample ?? '';
+  const lines = [
+    `Family: \`${f.family}\` — ${msg.ageDays}d old (first seen ${f.firstSeen.slice(0, 10)})`,
+    `Owner: ${f.owner ?? 'unknown'} (${f.ownerKind}${f.ownerStatus?.status ? `, ${f.ownerStatus.status}` : ''})`,
+  ];
+  if (err) lines.push(`Last error: ${err.slice(0, 200)}`);
+  if (f.regressedAfterFix) lines.push(`⚠ Recurred after fix ${f.fixedAt ?? ''}`.trimEnd());
+  lines.push('', `Mute via the button (writes a fix-record) or \`pa fix ${f.family} --note "..."\`.`);
+  return lines.join('\n');
+}
+
+/** Sends the per-family messages selected by selectFamilyMessages. Same never-abort
+ *  discipline as sendHitlMessages — each send is individually try/caught, and this runs
+ *  after the nightly report has already been delivered. */
+async function sendFamilyActionMessages(census: AlertCensus | undefined): Promise<void> {
+  for (const msg of selectFamilyMessages(census)) {
+    const f = msg.family;
+    try {
+      const title = msg.section === 'alert-hygiene' ? `Alert hygiene: ${f.family}` : `Operator action: ${f.family}`;
+      await notifyUser(title, buildFamilyMessageBody(msg), {
+        topic: await getReportTopic(),
+        severity: msg.section === 'alert-hygiene' ? 'info' : 'warn',
+        dedupKey: `hitl-family-${msg.section}-${f.family}`,
+        dedupWindowMs: 24 * 3_600_000,
+        escalate: false,
+        // NotifyOpts.replyMarkup is `Record<string, unknown>` (FROZEN) — same double-cast
+        // escape hatch as the HITL keyboards above.
+        replyMarkup: buildFamilyKeyboard(msg) as unknown as Record<string, unknown> | undefined,
+      });
+    } catch (err: any) {
+      console.error(`[self-improver] family send failed for ${msg.section} '${f.family}': ${err?.stack || err}`);
+    }
+  }
+}
+
 async function main() {
   const rollbackLines = await rollback();
   const staleCount = await sweepStaleDrafts();
@@ -1214,6 +1325,11 @@ async function main() {
   // correction 14) — never allowed to abort the nightly run (each send is individually
   // try/caught inside sendHitlMessages).
   await sendHitlMessages(entries);
+
+  // WP-D2 B.4/B.5 (2026-09-02): per-family Operator-action / Alert-hygiene messages with
+  // the si: mute keyboard (reauth:google for the OAuth family) — additional to the report,
+  // same never-abort discipline.
+  await sendFamilyActionMessages(census);
 }
 
 // Guard so importing this module (e.g. from a test file, to unit-test buildReport/ReportEntry)

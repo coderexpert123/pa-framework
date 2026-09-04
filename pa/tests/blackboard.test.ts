@@ -1,7 +1,11 @@
 import { describe, it, before, after, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'fs/promises';
+import { readFile, writeFile } from 'fs/promises';
+import { join } from 'path';
 import { createTempPaHome, cleanup } from './helpers.js';
+
+const IS_WIN = process.platform === 'win32';
+const itWin = IS_WIN ? it : it.skip;
 
 describe('Blackboard lock re-entrance', () => {
   let dir: string;
@@ -443,9 +447,9 @@ describe('startLockRenewal', () => {
 
     renewal.stop();
     // stop() only prevents FUTURE ticks — it cannot abort a tick whose
-    // updateHeartbeat call was already in flight. Settle before returning: an
+    // renewHeartbeat call was already in flight. Settle before returning: an
     // unawaited straggler resolving after this test ends would call into the
-    // (real, unpatched-here) blackboard.updateHeartbeat while the NEXT test
+    // (real, unpatched-here) blackboard.renewHeartbeat while the NEXT test
     // ('never overlaps ticks') has already monkeypatched that same singleton
     // method — inflating ITS concurrency counters with a call that has
     // nothing to do with it. Node's test runner does not wait out orphaned
@@ -453,18 +457,21 @@ describe('startLockRenewal', () => {
     await new Promise((r) => setTimeout(r, 250));
   });
 
-  it('never overlaps ticks under a slow updateHeartbeat', async () => {
+  it('never overlaps ticks under a slow renewal', async () => {
     const bbModule = await import('../src/blackboard.js');
     const { blackboard, startLockRenewal } = bbModule;
     const resource = 'renew-test-no-overlap';
 
     await blackboard.acquireLock(resource, 'holder', process.pid, 2000);
 
-    const original = blackboard.updateHeartbeat.bind(blackboard);
+    // The tick drives the renewal through renewHeartbeat (AI-179 tri-state);
+    // updateHeartbeat delegates to it, so this is the one patch point that
+    // observes every production renewal round-trip.
+    const original = blackboard.renewHeartbeat.bind(blackboard);
     let concurrent = 0;
     let maxConcurrent = 0;
     let calls = 0;
-    (blackboard as any).updateHeartbeat = async (...args: Parameters<typeof original>) => {
+    (blackboard as any).renewHeartbeat = async (...args: Parameters<typeof original>) => {
       concurrent++;
       calls++;
       maxConcurrent = Math.max(maxConcurrent, concurrent);
@@ -478,7 +485,7 @@ describe('startLockRenewal', () => {
       await new Promise((r) => setTimeout(r, 400));
     } finally {
       renewal.stop();
-      (blackboard as any).updateHeartbeat = original;
+      (blackboard as any).renewHeartbeat = original;
     }
 
     assert.ok(calls >= 1, 'expected at least one heartbeat tick');
@@ -693,5 +700,285 @@ describe('lock purge liveness + grace (Defect 1, 2026-09-01)', () => {
       foreignHolder.kill();
       await blackboard.releaseLock('contended-target', 'foreign-agent');
     }
+  });
+});
+
+// AI-179 (2026-09-03): the renewal path must distinguish a real purge from a
+// transient write failure. Pre-fix, updateHeartbeat returned `false` both for
+// "row genuinely absent" and "gave up after write errors", so startLockRenewal
+// fired onLost('purged') — aborting healthy runs — whenever any Windows
+// process held blackboard.json open without FILE_SHARE_DELETE during the
+// atomic-replace rename. Proven live pre-fix by scratch/ai179-red-probe.mjs
+// (3 EPERM give-ups, onLost('purged') fired, row continuously present across
+// 358 samples). T7 below pins the same mechanism in-suite.
+describe('AI-179 tri-state heartbeat renewal + verified row-absent', () => {
+  let dir: string;
+  let originalRetryMs: string | undefined;
+
+  beforeEach(async () => {
+    dir = await createTempPaHome();
+    originalRetryMs = process.env.PA_HEARTBEAT_WRITE_RETRY_MS;
+  });
+
+  afterEach(async () => {
+    await cleanup(dir);
+    if (originalRetryMs === undefined) delete process.env.PA_HEARTBEAT_WRITE_RETRY_MS;
+    else process.env.PA_HEARTBEAT_WRITE_RETRY_MS = originalRetryMs;
+    originalRetryMs = undefined;
+  });
+
+  async function readHeartbeat(resource: string): Promise<string | undefined> {
+    const data = JSON.parse(await readFile(`${process.env.PA_HOME}/blackboard.json`, 'utf8'));
+    return data.active_locks.find((l: any) => l.resource === resource)?.heartbeat;
+  }
+
+  // Deterministic non-JSON bytes (arithmetic, no escape literals) — readJson
+  // must throw so the ladder classifies the store as retryable-unreadable.
+  async function corruptStore(): Promise<void> {
+    await writeFile(
+      `${process.env.PA_HOME}/blackboard.json`,
+      Buffer.from(Array.from({ length: 64 }, (_, i) => (i * 37 + 11) & 0xff))
+    );
+  }
+
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  it("T1: renewHeartbeat returns 'updated' on a healthy held row and the heartbeat advances", async () => {
+    const { blackboard } = await import('../src/blackboard.js');
+    const resource = 'ai179-t1-healthy';
+
+    assert.equal(await blackboard.acquireLock(resource, 'holder', process.pid, 2000), true);
+    const before = await readHeartbeat(resource);
+    await sleep(5); // heartbeat timestamps are ISO ms — ensure the value differs
+    assert.equal(await blackboard.renewHeartbeat(resource, 'holder'), 'updated');
+    const after = await readHeartbeat(resource);
+    assert.ok(after && before && after !== before, 'heartbeat value must advance on a successful renewal');
+
+    await blackboard.releaseLock(resource, 'holder');
+  });
+
+  it("T2: renewHeartbeat returns 'row-absent' immediately when the row is deleted first", async () => {
+    const { blackboard } = await import('../src/blackboard.js');
+    const resource = 'ai179-t2-absent';
+
+    assert.equal(await blackboard.acquireLock(resource, 'holder', process.pid, 2000), true);
+    await blackboard.releaseLock(resource, 'holder');
+
+    // Default ladder env (unset → 1s/5s/15s ≈ 21s): a pointless retry of a
+    // gone row would blow way past this bound. row-absent must be immediate.
+    const start = Date.now();
+    const outcome = await blackboard.renewHeartbeat(resource, 'holder');
+    const elapsed = Date.now() - start;
+    assert.equal(outcome, 'row-absent');
+    assert.ok(elapsed < 5000, `row-absent must not walk the retry ladder, took ${elapsed}ms (ladder total ≈ 21s)`);
+  });
+
+  it("T3: an unreadable store yields 'write-failed' (never 'row-absent') and startLockRenewal does not fire onLost while corrupt", async () => {
+    const { blackboard, startLockRenewal } = await import('../src/blackboard.js');
+    const resource = 'ai179-t3-corrupt';
+    process.env.PA_HEARTBEAT_WRITE_RETRY_MS = '10,10,10';
+
+    assert.equal(await blackboard.acquireLock(resource, 'holder', process.pid, 2000), true);
+    await corruptStore();
+
+    assert.equal(await blackboard.renewHeartbeat(resource, 'holder'), 'write-failed');
+
+    const losses: string[] = [];
+    const renewal = startLockRenewal(resource, 'holder', undefined, {
+      intervalMs: 30, maxMs: 60_000, onLost: (reason) => losses.push(reason),
+    });
+    try {
+      await sleep(600);
+      assert.equal(losses.length, 0, 'a corrupt store is NOT a lost lock — onLost must stay silent');
+    } finally {
+      renewal.stop();
+    }
+
+    // Liveness proof that the silence above is meaningful (not a dead timer):
+    // restore a VALID store without the row → the same renewal must now
+    // detect the genuine absence and fire exactly once.
+    await writeFile(`${process.env.PA_HOME}/blackboard.json`, JSON.stringify({ active_locks: [] }), 'utf8');
+    const renewal2 = startLockRenewal(resource, 'holder', undefined, {
+      intervalMs: 30, maxMs: 60_000, onLost: (reason) => losses.push(reason),
+    });
+    try {
+      const deadline = Date.now() + 5000;
+      while (losses.length === 0 && Date.now() < deadline) await sleep(20);
+      assert.deepEqual(losses, ['purged'], 'verified row-absence must still fire onLost exactly once');
+    } finally {
+      renewal.stop();
+      renewal2.stop();
+      await sleep(250); // straggler-tick guard (see startLockRenewal describe notes)
+    }
+  });
+
+  it('T4: updateHeartbeat compat pin — updated→true, row-absent→false, write-failed→false', async () => {
+    const { blackboard } = await import('../src/blackboard.js');
+    const resource = 'ai179-t4-compat';
+    process.env.PA_HEARTBEAT_WRITE_RETRY_MS = '10,10,10';
+
+    assert.equal(await blackboard.acquireLock(resource, 'holder', process.pid, 2000), true);
+    assert.equal(await blackboard.updateHeartbeat(resource, 'holder'), true, "'updated' maps to true");
+
+    await blackboard.releaseLock(resource, 'holder');
+    assert.equal(await blackboard.updateHeartbeat(resource, 'holder'), false, "'row-absent' maps to false");
+
+    await corruptStore();
+    assert.equal(await blackboard.updateHeartbeat(resource, 'holder'), false, "'write-failed' maps to false");
+  });
+
+  it("T5: fallback client pin — an updateHeartbeat-only client maps false → onLost('purged') exactly once", async () => {
+    const { startLockRenewal } = await import('../src/blackboard.js');
+    const resource = 'ai179-t5-fallback';
+
+    let clientCalls = 0;
+    const fakeClient = {
+      updateHeartbeat: async (_resource: string, _agent: string, _contextId?: string) => {
+        clientCalls++;
+        return false;
+      },
+    };
+
+    const losses: string[] = [];
+    const renewal = startLockRenewal(resource, 'holder', undefined, {
+      intervalMs: 30, maxMs: 60_000, client: fakeClient,
+      onLost: (reason) => losses.push(reason),
+    });
+    try {
+      const deadline = Date.now() + 3000;
+      while (losses.length === 0 && Date.now() < deadline) await sleep(20);
+      assert.deepEqual(losses, ['purged'], 'the legacy boolean conflation is preserved verbatim for injected fakes');
+      assert.ok(clientCalls >= 1, 'the fallback path must drive the client, not the singleton');
+    } finally {
+      renewal.stop();
+      await sleep(250);
+    }
+  });
+
+  it("T6: PA_HEARTBEAT_WRITE_RETRY_MS='10,10' → exactly 3 attempts under 500ms, warn names the count", async () => {
+    const { blackboard } = await import('../src/blackboard.js');
+    const resource = 'ai179-t6-ladder';
+    process.env.PA_HEARTBEAT_WRITE_RETRY_MS = '10,10';
+
+    assert.equal(await blackboard.acquireLock(resource, 'holder', process.pid, 2000), true);
+    await corruptStore();
+
+    const warns: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warns.push(args.map(String).join(' ')); };
+    try {
+      const start = Date.now();
+      const outcome = await blackboard.renewHeartbeat(resource, 'holder');
+      const elapsed = Date.now() - start;
+      assert.equal(outcome, 'write-failed');
+      assert.ok(elapsed < 500, `the env ladder must be honored, took ${elapsed}ms (default would be ≈21s)`);
+      const giveUp = warns.find((w) => w.includes('giving up'));
+      assert.ok(giveUp, `expected the give-up warn, got: ${JSON.stringify(warns)}`);
+      assert.match(giveUp!, /after 3 attempts/, '1 immediate attempt + 2 ladder delays = 3 attempts total');
+    } finally {
+      console.warn = origWarn;
+    }
+
+    await blackboard.releaseLock(resource, 'holder');
+  });
+
+  // The falsification gate (spec §8/§9): a REAL foreign handle without
+  // FILE_SHARE_DELETE — the exact EPERM class observed in production — must
+  // produce write-failed renewals that NEVER fire onLost while the row
+  // exists, then a genuine row deletion must still fire onLost('purged')
+  // exactly once. Uses the real startLockRenewal tick path, observed through
+  // a transparent recorder around the REAL renewHeartbeat (the recorder adds
+  // nothing but the observation).
+  itWin("T7 (win32): foreign FILE_SHARE_READ-only handle → write-failed renewals, no onLost while held, 'purged' only on real deletion", async () => {
+    const { blackboard, startLockRenewal } = await import('../src/blackboard.js');
+    const { spawn } = await import('child_process');
+    const resource = 'ai179-t7-foreign-hold';
+
+    // Spec recipe: a short ladder so a full failing ladder (~2.8s) fits inside
+    // the child's 3s hold. With the default 1s/5s/15s ladder a tick entering
+    // the hold would retry past the release and return 'updated', never
+    // observing the failure window.
+    process.env.PA_HEARTBEAT_WRITE_RETRY_MS = '50,50';
+
+    assert.equal(await blackboard.acquireLock(resource, 'holder', process.pid, 2000), true);
+
+    const recorded: Array<{ outcome: string; at: number }> = [];
+    const originalRenew = blackboard.renewHeartbeat.bind(blackboard);
+    (blackboard as any).renewHeartbeat = async (...args: Parameters<typeof originalRenew>) => {
+      const outcome = await originalRenew(...args);
+      recorded.push({ outcome, at: Date.now() });
+      return outcome;
+    };
+
+    const losses: string[] = [];
+    const renewal = startLockRenewal(resource, 'holder', undefined, {
+      intervalMs: 50, maxMs: 60_000, onLost: (reason) => losses.push(reason),
+    });
+
+    let childExitAt = 0;
+    let child: import('child_process').ChildProcess | undefined;
+    try {
+      // The spec's exact recipe: a real foreign handle opened with share=Read
+      // only (no FILE_SHARE_DELETE), held for 3s while renewal ticks run.
+      const bbPath = `${process.env.PA_HOME}/blackboard.json`;
+      child = spawn('powershell', ['-NoProfile', '-Command',
+        `$f=[IO.File]::Open('${bbPath}','Open','Read','Read'); Start-Sleep -Seconds 3; $f.Close()`,
+      ], { stdio: 'ignore', windowsHide: true });
+      const exited = new Promise<void>((resolve) => child!.once('exit', () => { childExitAt = Date.now(); resolve(); }));
+
+      // Legs 1-3: a renewal ladder fully inside the hold reports
+      // 'write-failed' through the whole retry stack, the row is still
+      // verifiably present, and onLost stays silent.
+      const wfDeadline = Date.now() + 25000;
+      while (!recorded.some((r) => r.outcome === 'write-failed') && Date.now() < wfDeadline) await sleep(20);
+      assert.ok(
+        recorded.some((r) => r.outcome === 'write-failed'),
+        `expected a 'write-failed' renewal during the foreign hold, got: ${JSON.stringify(recorded.map((r) => r.outcome))}`
+      );
+      const peek = await blackboard.peekLockRow(resource, 'holder');
+      assert.ok(peek && peek !== 'unreadable', `peekLockRow must still return the row, got: ${String(peek)}`);
+      assert.equal((peek as any).resource, resource);
+      assert.equal(losses.length, 0, 'no onLost may fire while the row exists');
+
+      await exited;
+      assert.equal(losses.length, 0, 'onLost must not fire for the whole duration of the hold');
+
+      // Leg 4: after the foreign handle is released, the next successful
+      // tick proves the row was healthy and recoverable all along.
+      const upDeadline = Date.now() + 5000;
+      while (!recorded.some((r) => r.outcome === 'updated' && r.at > childExitAt - 50) && Date.now() < upDeadline) await sleep(20);
+      assert.ok(
+        recorded.some((r) => r.outcome === 'updated' && r.at > childExitAt - 50),
+        'expected a successful (updated) renewal after the foreign handle was released'
+      );
+
+      // Leg 5: a REAL row deletion → onLost('purged') fires, exactly once.
+      await blackboard.releaseLock(resource, 'holder');
+      const lostDeadline = Date.now() + 5000;
+      while (losses.length === 0 && Date.now() < lostDeadline) await sleep(20);
+      assert.deepEqual(losses, ['purged']);
+    } finally {
+      renewal.stop();
+      (blackboard as any).renewHeartbeat = originalRenew;
+      if (child && child.exitCode === null) child.kill();
+    }
+    await sleep(250); // straggler-tick guard
+  });
+
+  it('T8: static math pin — stale default > renewal interval + ladder total + 10s margin', async () => {
+    const src = await readFile(join(__dirname, '..', '..', 'src', 'blackboard.ts'), 'utf8');
+    const stale = (src.match(/const HEARTBEAT_STALE_MS = ([\d\s*]+);/)?.[1] ?? '')
+      .split('*').map((s) => parseInt(s.trim(), 10)).reduce((a, b) => a * b, 1);
+    const interval = parseInt(
+      (src.match(/PA_LOCK_RENEW_INTERVAL_MS'\) \?\? ([\d_]+)/)?.[1] ?? '0').replace(/_/g, ''), 10
+    );
+    const ladderTotal = (src.match(/HEARTBEAT_WRITE_RETRY_MS_DEFAULT = '([\d,]+)'/)?.[1] ?? '')
+      .split(',').reduce((a, s) => a + parseInt(s, 10), 0);
+    assert.ok(stale > 0 && interval > 0 && ladderTotal > 0,
+      `must parse all three knobs from source, got stale=${stale} interval=${interval} ladder=${ladderTotal}`);
+    assert.ok(
+      stale > interval + ladderTotal + 10_000,
+      `stale (${stale}ms) must exceed renewal interval (${interval}ms) + ladder total (${ladderTotal}ms) + 10s margin — a drifted knob would let the ladder itself cross the stale boundary`
+    );
   });
 });

@@ -30,7 +30,7 @@ function formatListSection(label: string, values: unknown[]): string[] {
 
 /**
  * `--- trace (turn-traces.jsonl) ---` block, per
- * plans/2026-08-24-recall-traces-wave-SPEC.md §3.1/A5. Header fields are
+ * the 2026-08-24 recall-traces spec §3.1/A5. Header fields are
  * space-joined on one line; commands/files/errors render as `  - value`
  * lists capped at 10 entries; errors prints `(none)` when empty (the only
  * section that renders when empty — commands/files are omitted entirely).

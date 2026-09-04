@@ -65,7 +65,7 @@ export async function runAlertCensus(deps: AlertCensusDeps = {}): Promise<{ touc
 }
 
 /**
- * Daily alert census (2026-08-23, plans/2026-08-23-alerts-wave-SPEC.md) — STUB registered so
+ * Daily alert census (2026-08-23, the alerts-wave spec) — STUB registered so
  * the registry compiles while the census work package lands. The real run(): builds the
  * 7-day census via lib/alert-census.ts, writes ~/.pa/alert-census.json atomically, and posts a
  * ONE-line census to pa-alerts only when sent/day ≥ the configured threshold (default 50).

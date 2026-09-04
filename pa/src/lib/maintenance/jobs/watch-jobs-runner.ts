@@ -21,7 +21,7 @@ export const watchJobsRunnerJob: MaintenanceJob = {
       evidence:
         "PA's own async-watch registry (lib/watch-jobs.ts); sole writer. Rows are bounded by their " +
         'own deadlineAt and pruned 14 days after reaching a terminal status — AI-170, 2026-08-31, ' +
-        'plans/2026-08-31-ai170-async-watch-SPEC.md.',
+        'the internal async-watch spec.',
       note:
         'Row-level expiry, not whole-file deletion: each watch carries its own terminalAt; the ' +
         'runner drops only terminal rows older than 14 days and rewrites the file in place. The ' +

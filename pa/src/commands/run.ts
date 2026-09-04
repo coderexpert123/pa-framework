@@ -10,6 +10,8 @@ import { killProcessTree } from '../process-tree.js';
 import { log } from '../lib/log.js';
 import { notifyUser } from '../lib/notify.js';
 import { blackboard, startLockRenewal } from '../blackboard.js';
+import { validateKeyboardRequest } from '../lib/callback-grammar.js';
+import { PROTECTED_SKILLS } from '../validator.js';
 import type { RunMeta, CommandResult, TelegramOutput, RunOptions } from '../types.js';
 
 /**
@@ -34,9 +36,30 @@ export function lockWaitBudgetMs(skillTimeoutSec: number | undefined): number {
   return Math.max(2_000, Math.floor(skillTimeoutMs * 0.5));
 }
 
-/** Builds the per-run operator-arguments block appended to the skill prompt
- *  (AI-148 D-c — the prompt-injection path `-- <extraArgs>` cannot provide,
- *  since those flow to the worker CLI, not the prompt; run.ts:577-580). */
+/**
+ * Maps a CommandResult to the process exit code `pa run` should exit with
+ * (AI-179 WP-2, 2026-09-03): success → 0; a failure whose exitCode lands in
+ * 1..255 keeps that code; anything else → 1 (null exit code, the -1 lock-busy
+ * skip at handleSkillResult, and a lock-lost downgrade that kept the worker's
+ * 0). Consumers: bin/pa.ts's `case 'run'` sets process.exitCode from this, so
+ * chains.ts's spawnPa (`success: code === 0`) now sees real skill failures and
+ * on_failure actually fires. Deliberately NOT consumed by the bot's
+ * fire-and-forget spawns — a lock-lost abort must not re-dispatch (the skill's
+ * own Telegram report + pa's lock-lost alerts carry that signal).
+ */
+export function exitCodeForCommandResult(result: CommandResult): number {
+  if (result.success) return 0;
+  if (typeof result.exitCode === 'number' && result.exitCode >= 1 && result.exitCode <= 255) {
+    return result.exitCode;
+  }
+  return 1;
+}
+
+/** Builds the per-run operator-arguments block appended to the skill prompt.
+ *  AI-148 D-c introduced this for `--prompt-args`; since AI-187 (2026-09-03)
+ *  runCommand ALSO builds it for LLM-worker skills invoked with `-- <extraArgs>`,
+ *  because the args themselves are inert on every current worker CLI and the
+ *  skills' binding-allowlist rules key on this block, not on CLI args. */
 export function buildOperatorArgsBlock(promptArgs: string): string {
   return `\n\n## Operator arguments (this run)\n${promptArgs}\nTreat these as if the operator typed them alongside the skill trigger; they scope and constrain this run only.`;
 }
@@ -65,6 +88,88 @@ export function isNoOutputSentinel(output: string): boolean {
   // e.g. "Checking ... NO_OUTPUT". Suppress only when the prefix looks like
   // worker narration rather than real user-facing content.
   return /(?:^|[\s`"'()[\]{}<>])(?:checking|inspecting|parsing|reading|filtering|summarizing|reviewing|scanning|looking|searching|analyzing|analysing|verifying|loading|opening|processing|working|i(?:'m| am| will| ll)|let me|need to|going to)\b/i.test(prefix);
+}
+
+/**
+ * The `[PA_KEYBOARD]:` envelope (Wave-1 WP-C, 2026-09-02, SPEC §3.4): a
+ * telegram_output skill's SCRIPT may end its output with one line
+ *
+ *   [PA_KEYBOARD]: {"buttons":[{"text":"Run again","callback_data":"sk:run:<skill>"}]}
+ *
+ * whose inline keyboard is validated against the ONE callback grammar
+ * (callback-grammar.ts's validateKeyboardRequest — LLM-improvised callback_data is
+ * grammar-checked, capped at 6 buttons / 40-char labels) and attached to the
+ * delivery's last chunk. The envelope is emitted by the skill's deterministic
+ * script, never trusted free-form from the worker.
+ *
+ * Parsing mirrors parseMetadata's last-marker logic exactly: the LAST
+ * `\n[PA_KEYBOARD]:` occurrence (or a whole-output marker line), the JSON payload
+ * must start with `{`, and the marker line is stripped from the delivered text.
+ *
+ * Every failure mode degrades to "deliver the text without a keyboard" — the
+ * envelope must NEVER fail the run: a non-JSON payload strips silently
+ * (parseMetadata parity); an unparseable or grammar-invalid payload warns and
+ * drops; a skill in PROTECTED_SKILLS is refused outright (git-workflow skills
+ * never get improvised buttons — the one-set-no-third-mirror rule).
+ */
+export function extractKeyboardEnvelope(
+  output: string,
+  skillName: string,
+): { text: string; keyboard?: Record<string, unknown> } {
+  const MARKER = '[PA_KEYBOARD]:';
+  const nlMarker = '\n' + MARKER;
+  const nlPos = output.lastIndexOf(nlMarker);
+
+  let cleanedEnd: number;
+  let markerLineStart: number;
+  if (nlPos >= 0) {
+    cleanedEnd = nlPos;
+    markerLineStart = nlPos + 1;
+  } else if (output.startsWith(MARKER)) {
+    cleanedEnd = 0;
+    markerLineStart = 0;
+  } else {
+    return { text: output };
+  }
+
+  // The envelope is ONE line (`[PA_KEYBOARD]: {json}`), so the payload is bounded
+  // at the line end — NOT at end-of-output. Everything AFTER the line stays in
+  // the delivered text, which is what makes the §3.4 ordering real: for
+  // `report\n[PA_KEYBOARD]: {...}\nNO_OUTPUT` the remainder keeps the sentinel
+  // line and the send is suppressed (a payload sliced to end-of-output would
+  // swallow the sentinel into the JSON parse and the "contradictory request"
+  // would go out as a bare send).
+  const afterMarkerRaw = output.slice(markerLineStart + MARKER.length);
+  const lineNl = afterMarkerRaw.indexOf('\n');
+  const cleaned = (output.slice(0, cleanedEnd) + (lineNl >= 0 ? afterMarkerRaw.slice(lineNl) : '')).trim();
+  const payloadLine = (lineNl >= 0 ? afterMarkerRaw.slice(0, lineNl) : afterMarkerRaw).trim();
+  if (!payloadLine.startsWith('{')) {
+    // parseMetadata parity: a marker line whose payload isn't JSON-shaped strips
+    // silently and delivers the text with no keyboard.
+    return { text: cleaned };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payloadLine);
+  } catch {
+    console.warn('[run] PA_KEYBOARD rejected — payload is not valid JSON — keyboard dropped');
+    return { text: cleaned };
+  }
+
+  // Protected-skill refusal BEFORE grammar validation: the refusal reason is the
+  // security one and must not be shadowed by a payload-shape complaint.
+  if (PROTECTED_SKILLS.has(skillName)) {
+    console.warn(`[run] PA_KEYBOARD refused — skill '${skillName}' is in PROTECTED_SKILLS — keyboard dropped`);
+    return { text: cleaned };
+  }
+
+  const validated = validateKeyboardRequest(parsed);
+  if (!validated.ok) {
+    console.warn(`[run] PA_KEYBOARD rejected — ${validated.error} — keyboard dropped`);
+    return { text: cleaned };
+  }
+  return { text: cleaned, keyboard: validated.keyboard };
 }
 
 /**
@@ -126,6 +231,29 @@ export function filterSecretsForShell(
 }
 
 /**
+ * AI-193: Python on Windows writes stdout/stderr in the machine's legacy ANSI
+ * codepage (cp1252 here) while this runner collects with UTF-8 `toString()`, so
+ * em-dashes and middots in Python skill output arrive as U+FFFD; text mode also
+ * translates LF to CRLF. PYTHONUTF8=1 forces UTF-8 stdio for the child.
+ * Scoped to python-family commands (first token) — a no-op for everyone else.
+ */
+export function shellSkillExtraEnv(cmd: string): Record<string, string> {
+  return /^["']?\s*python(?:\d+(?:\.\d+)*)?(?:\.exe)?\s/i.test(cmd)
+    ? { PYTHONUTF8: '1' }
+    : {};
+}
+
+/**
+ * AI-193: normalize child output collected on Windows — Python text mode emits
+ * CRLF, and every downstream consumer (Telegram, logs, sentinels) expects LF.
+ * Applied once to the fully-collected string, NOT per chunk: a `\r` ending one
+ * chunk with `\n` starting the next must still collapse.
+ */
+export function normalizeCollectedText(text: string): string {
+  return text.replace(/\r\n/g, '\n');
+}
+
+/**
  * Turn an undelivered telegram_output run into a recorded failure. Mutating
  * `result` in place is deliberate for the same reason the silent-no-op rule
  * above does it: `result` IS the object runCommand returns, so the caller,
@@ -157,7 +285,7 @@ function recordDeliveryFailure(
  * exclusive_resource wait timed out (run.ts:399, see runSkillBody). Lock
  * contention is expected multi-session behaviour, not a page: it read to the
  * operator as "Skill failed: commit" three times in one week
- * (plans/2026-08-23-alerts-week-review.md §5.5). Extracted as a pure,
+ * (the 2026-08-23 alerts-week review §5.5). Extracted as a pure,
  * directly-testable function (2026-08-23).
  */
 export function lockSkipAlertFields(
@@ -233,32 +361,38 @@ async function handleSkillResult(
   //     it is also the only thing that buys a retry (transient network) and,
   //     once AI-098 backoff exhausts the retries, a pa-alerts page (permanent
   //     misconfig). A 'success' record buys neither.
-  if (result.success && result.output && !isNoOutputSentinel(result.output) && telegramOutput && secrets) {
-    const token = secrets[telegramOutput.token_secret];
-    if (token) {
-      const send = await sendToTelegram(result.output, telegramOutput, token, 'MarkdownV2');
-      if (!send.ok) {
-        recordDeliveryFailure(result, skillName, worker, duration, describeSendFailure(send), {
-          failure: send.reason,
-          status: send.status,
-          detail: send.detail,
-          chatId: telegramOutput.chat_id,
-          threadId: telegramOutput.thread_id,
-        });
+  if (result.success && result.output && telegramOutput && secrets) {
+    // [PA_KEYBOARD] envelope ordering (SPEC §3.4): the envelope is stripped FIRST;
+    // the NO_OUTPUT sentinel check then applies to the REMAINDER — a keyboard on a
+    // suppressed send is a contradictory request and is dropped with it.
+    const { text: deliveryText, keyboard } = extractKeyboardEnvelope(result.output, skillName);
+    if (!isNoOutputSentinel(deliveryText)) {
+      const token = secrets[telegramOutput.token_secret];
+      if (token) {
+        const send = await sendToTelegram(deliveryText, telegramOutput, token, 'MarkdownV2', keyboard);
+        if (!send.ok) {
+          recordDeliveryFailure(result, skillName, worker, duration, describeSendFailure(send), {
+            failure: send.reason,
+            status: send.status,
+            detail: send.detail,
+            chatId: telegramOutput.chat_id,
+            threadId: telegramOutput.thread_id,
+          });
+        }
+      } else {
+        // Declared telegram_output but the token secret is absent: nothing can be
+        // delivered, now or ever. Same class as a rejected send — a console.warn
+        // on an unattended scheduled run is indistinguishable from silence.
+        console.warn(`[run] telegram_output: secret '${telegramOutput.token_secret}' not found — skipping Telegram delivery`);
+        recordDeliveryFailure(
+          result,
+          skillName,
+          worker,
+          duration,
+          `missing-token: secret '${telegramOutput.token_secret}' not found in secrets.env`,
+          { failure: 'missing-token', chatId: telegramOutput.chat_id, threadId: telegramOutput.thread_id },
+        );
       }
-    } else {
-      // Declared telegram_output but the token secret is absent: nothing can be
-      // delivered, now or ever. Same class as a rejected send — a console.warn
-      // on an unattended scheduled run is indistinguishable from silence.
-      console.warn(`[run] telegram_output: secret '${telegramOutput.token_secret}' not found — skipping Telegram delivery`);
-      recordDeliveryFailure(
-        result,
-        skillName,
-        worker,
-        duration,
-        `missing-token: secret '${telegramOutput.token_secret}' not found in secrets.env`,
-        { failure: 'missing-token', chatId: telegramOutput.chat_id, threadId: telegramOutput.thread_id },
-      );
     }
   }
 
@@ -391,6 +525,32 @@ export async function runCommand(
       throw new Error('--prompt-args applies to LLM-worker skills only; cmd skills take their arguments after --');
     }
     finalPrompt = finalPrompt + buildOperatorArgsBlock(promptArgs);
+    log('info', 'run', `Skill ${skillName}: prompt-args attached as the operator-arguments block`, {
+      skill: skillName,
+      promptArgs: promptArgs.slice(0, 300),
+    });
+  }
+
+  // AI-187 (2026-09-03): bridge `--` extraArgs into the prompt for LLM-worker
+  // skills. Before this, `pa run <llm-skill> -- <args>` handed the args ONLY to
+  // the worker CLI (workerExtraArgs below), where they are inert on every
+  // current worker (zclaude/codex splice them before the trailing `-` stdin
+  // marker; agy gets them after the prompt-file arg). The commit skill's
+  // binding-allowlist rule keys on the "## Operator arguments (this run)"
+  // PROMPT block, so `pa run commit -- <9 paths>` produced NO block, the
+  // worker's survey-everything fallback fired, and 13 dirty paths committed
+  // against a 9-path allowlist (AI-185 wave, 2026-09-02; run
+  // 20260902-043752-21b847). The bridge gives the block in BOTH invocation
+  // forms — a safety rule must not depend on the caller knowing an
+  // undocumented flag distinction. Worker-CLI passthrough is UNCHANGED (the
+  // args still ride workerExtraArgs) — nothing that consumed them loses them.
+  // cmd skills are exempt: their `--` args are real shell-command arguments.
+  if (!skill.frontmatter.cmd && extraArgs.join('').trim() !== '') {
+    finalPrompt = finalPrompt + buildOperatorArgsBlock(extraArgs.join('\n'));
+    log('info', 'run', `Skill ${skillName}: ${extraArgs.length} extra arg(s) after -- bridged into the prompt as the operator-arguments block (AI-187)`, {
+      skill: skillName,
+      bridgedArgs: extraArgs,
+    });
   }
 
   // Load all secrets. For cmd: shell skills, filter to only declared secrets (security hardening).
@@ -429,10 +589,13 @@ export async function runCommand(
   let lockHeld = false;
   let lockContextId: string | undefined;
   let lockRenewal: { stop: () => void } | undefined;
-  // Set by startLockRenewal's onLost (D2/D3/D4, 2026-08-23): a purged row mid-run means
-  // another process may be mutating the shared tree concurrently — the run's own result is
-  // downgraded to a failure once runSkillBody() resolves, rather than trusting a "success"
-  // that raced an unknown concurrent mutation.
+  // Set by startLockRenewal's onLost: the run's result is downgraded to a failure once
+  // runSkillBody() resolves, rather than trusting a "success" that raced an unknown
+  // concurrent mutation. With the AI-179 tri-state renewal (2026-09-03), 'purged' means
+  // the row was VERIFIED absent (renewHeartbeat returned row-absent, or its write
+  // ladder failed and peekLockRow found no row) and 'expired' means the maxMs cap hit —
+  // a transient heartbeat-write failure alone never fires onLost, so phantoms no longer
+  // reach this downgrade.
   let lockLost: 'expired' | 'purged' | undefined;
 
   if (lockKey && exclusiveResource) {
@@ -482,12 +645,28 @@ export async function runCommand(
   try {
     const result = await runSkillBody();
     if (lockLost && lockKey) {
-      return {
+      // The run is deliberately NOT killed mid-gate: killing on a phantom and mid-push
+      // on a real loss are both worse than continue-and-downgrade. Phantoms no longer
+      // reach here — onLost fires on verified row-absence or the maxMs cap only
+      // (AI-179, 2026-09-03).
+      const downgraded: CommandResult = {
         ...result,
         success: false,
         alreadyAlertedPaSupport: true,
         error: `Lock lost (${lockLost}) mid-run — ${lockKey} was purged while this run held it; another process may have committed concurrently. Treat this run's tree mutations as unverified.`,
       };
+      // Corrective note (AI-179 §3.5): the worker's report may claim a commit/push that
+      // raced an unknown concurrent mutation. Whether the worker actually pushed is
+      // unknown from the runner side, so this deliberately does NOT say "NOT pushed" —
+      // ls-remote verification (push skill) is the decider.
+      const refId = `s-${randomBytes(6).toString('hex')}`;
+      log('error', 'run', `Lock-lost downgrade for skill ${skillName}`, { skill: skillName, lockKey, reason: lockLost, refId });
+      void notifyUser(
+        'Skill report unreliable (lock lost)',
+        `⚠️ ${skillName}: this run LOST its "${exclusiveResource}" lock mid-run (${lockLost}). Its report above may be unreliable — before trusting any commit/push it claims, verify the remote with git ls-remote.\n\n_Ref: ${refId}_`,
+        { dedupKey: `skill-lock-lost-followup:${skillName}`, severity: 'error' },
+      ).catch(() => {});
+      return downgraded;
     }
     return result;
   } finally {
@@ -509,7 +688,7 @@ export async function runCommand(
       const child = spawn(fullCmd, {
         shell: true,
         cwd: skill.frontmatter.cwd,
-        env: { ...process.env, ...secrets },
+        env: { ...process.env, ...secrets, ...shellSkillExtraEnv(fullCmd) },
         // POSIX only — see worker-exec.ts spawn for rationale (process-group
         // leader for killProcessTree; Windows keeps taskkill /T).
         detached: process.platform !== 'win32',
@@ -558,10 +737,12 @@ export async function runCommand(
         if (child.pid) {
           await (pidTracked || Promise.resolve()).then(() => removeWorkerPid(child.pid!)).catch(() => {});
         }
+        const collectedOutput = normalizeCollectedText(output);
+        const collectedError = normalizeCollectedText(error);
         const result: CommandResult = {
           success: !killed && code === 0,
-          output: killed ? `[Timed out after ${timeoutSec}s]\n${output.trim()}` : output.trim(),
-          error: error.trim() || undefined,
+          output: killed ? `[Timed out after ${timeoutSec}s]\n${collectedOutput.trim()}` : collectedOutput.trim(),
+          error: collectedError.trim() || undefined,
           exitCode: code,
         };
         // Pass allSecrets for Telegram delivery (needs TELEGRAM_BOT_TOKEN)
@@ -586,7 +767,7 @@ export async function runCommand(
           alreadyAlertedPaSupport: true,
           error: err.message ?? String(err),
           exitCode: -1,
-          output: output.trim(),
+          output: normalizeCollectedText(output).trim(),
         };
         await handleSkillResult(failResult, 'shell', skillName, Date.now() - start, extraArgs, depth, preferredWorker, skill.frontmatter.telegram_output, allSecrets);
         resolve(failResult);

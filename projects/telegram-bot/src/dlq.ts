@@ -1,10 +1,11 @@
 import { appendFile, readFile, unlink, writeFile, rename, mkdir } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
-import { sendMessage, sendMessageWithId } from './telegram.js';
+import { sendMessageWithDetails, sendMessageWithId, isTerminalChatError } from './telegram.js';
 import { buildDlqReplayKeyboard } from './callbacks.js';
 import { deliveredKey, wasDelivered, markDelivered } from './delivered-store.js';
 import { log } from '../../../pa/dist/src/lib/log.js';
+import { redactSecrets } from '../../../pa/dist/src/lib/redact.js';
 import { loadSecrets } from '../../../pa/dist/src/secrets.js';
 
 export const DLQ_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -167,12 +168,27 @@ async function flushDlqInner(token: string): Promise<{ delivered: number; remain
       continue;
     }
 
-    const ok = await sendMessage(token, entry.chatId, entry.text, entry.replyToMessageId, entry.threadId || undefined);
-    if (ok) {
+    const result = await sendMessageWithDetails(token, entry.chatId, entry.text, entry.replyToMessageId, entry.threadId || undefined);
+    if (result.ok) {
       // Mark delivered BEFORE moving on, so a crash later in this loop cannot
       // cause a re-send of this entry on the next startup flush.
       await markDelivered(key);
       delivered++;
+    } else if (result.lastStatus !== undefined && isTerminalChatError(result.lastStatus, result.lastErrorText ?? '')) {
+      // Terminal error (isTerminalChatError): chat gone, blocked/deactivated
+      // recipient, bot kicked, or an invalid peer — the recipient can never
+      // receive, so retrying can never succeed. Drop the entry instead of
+      // quarantine-cycling it (AI-172 fix#2; set widened 2026-09-03). It is
+      // NOT pushed to `remaining`, so the persist below drops it permanently
+      // and it never burns an attempts slot or a quarantine alert.
+      log('warn', 'dlq', 'dropping unroutable DLQ entry (terminal chat error)', {
+        chatId: entry.chatId,
+        threadId: entry.threadId,
+        updateId: entry.updateId,
+        status: result.lastStatus,
+        error: result.lastErrorText,
+      });
+      continue;
     } else {
       // Increment attempts counter
       const attempts = (entry.attempts || 0) + 1;
@@ -201,7 +217,14 @@ async function flushDlqInner(token: string): Promise<{ delivered: number; remain
 }
 
 export async function appendDlq(entry: DlqEntry): Promise<void> {
-  return withDlqMutex(() => appendDlqInner(entry));
+  // AI-184 (2026-09-03): the DLQ is persistence, not delivery. Pre-fix the reply
+  // text arrived here already scrubbed by the send path (logic.ts
+  // formatWorkerReply); post-fix it arrives raw and this at-rest copy keeps that
+  // redaction coverage. Replay (flushDlq / pa dlq replay) sends the stored —
+  // i.e. redacted — text, matching pre-AI-184 replay behavior. Double redaction
+  // is a safe no-op.
+  const redacted: DlqEntry = { ...entry, text: redactSecrets(entry.text) as string };
+  return withDlqMutex(() => appendDlqInner(redacted));
 }
 
 export async function loadDlq(): Promise<DlqEntry[]> {
@@ -218,4 +241,15 @@ export async function writeDlq(entries: DlqEntry[]): Promise<void> {
 
 export async function flushDlq(token: string): Promise<{ delivered: number; remaining: number; deduped: number }> {
   return withDlqMutex(() => flushDlqInner(token));
+}
+
+/**
+ * Test-only: reset the module-level DLQ mutex. An aborted poll loop can leave a
+ * mid-flight send inside flushDlqInner holding the mutex forever; without this,
+ * every subsequent describe's queue-drain pass blocks at its first mutex-taking
+ * source (observed 2026-09-03: poll-loop DLQ pins failing 'in-flight' after an
+ * earlier describe's abort). Same pattern as _resetCardKeyboardIndexForTest.
+ */
+export function _resetDlqMutexForTest(): void {
+  dlqMutex = Promise.resolve();
 }

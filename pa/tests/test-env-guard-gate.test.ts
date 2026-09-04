@@ -7,7 +7,7 @@
  * whole-suite --import preload) still cannot leak PA_HOME to the real
  * ~/.pa. On 2026-08-17 that leak sent 3 real Telegram alerts to pa-alerts
  * and wrote 64 synthetic rows into the production forensic log
- * (plans/2026-08-23-alerts-week-review.md §5.3).
+ * (the 2026-08-23 alerts-week review §5.3).
  *
  * KNOWN LIMITATION, stated here deliberately so a green gate is never read
  * as full coverage: this check is DIRECT-IMPORTS ONLY (a plain per-line

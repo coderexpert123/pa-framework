@@ -404,7 +404,7 @@ describe('trace doc', () => {
         thread_id: 42,
         tool_calls: [{ n: 1, name: 'run_command', arg: 'npm test', ok: true }],
         commands: ['npm test'],
-        files: ['D:/Personal Assistant/pa/src/worker-exec.ts'],
+        files: ['C:/pa-checkout/pa/src/worker-exec.ts'],
         errors: ['boom: something failed'],
       }) + '\n',
       'utf8'

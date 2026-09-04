@@ -3,7 +3,7 @@
  * (the self-improver attaches them to its notices via `notifyUser({ replyMarkup })`)
  * and the bot (which parses the presses in `projects/telegram-bot/src/callbacks.ts`).
  *
- * 2026-08-24 (buttons program, plans/2026-08-24-buttons-program-SPEC.md P5).
+ * 2026-08-24 (buttons program, the buttons-program spec P5).
  * `buildHITLKeyboard` is a verbatim move of the bot's `logic.ts` builder, whose
  * keyboard was built and tested but NEVER SENT (no production caller could reach
  * `sendMessageWithKeyboard`, and pa's notify path had no reply_markup support).

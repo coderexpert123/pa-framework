@@ -33,7 +33,8 @@
  * every nested acquisition attempt return immediately instead.
  */
 
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 import { exec as execCb } from 'node:child_process';
 import { platform } from 'node:os';
 import { promisify } from 'node:util';
@@ -308,7 +309,7 @@ export async function withBuildLock<T>(
 
   const heldReservation = reservation;
   const makeSignalHandler = (code: number) => () => {
-    releaseFn({ id: heldReservation.id })
+    releaseFn({ id: heldReservation.id, bySession: label })
       .catch(() => {})
       .finally(() => process.exit(code));
   };
@@ -327,6 +328,166 @@ export async function withBuildLock<T>(
     } else {
       process.env[BUILD_LOCK_HELD_ENV] = prev;
     }
-    await releaseFn({ id: heldReservation.id }).catch(() => {});
+    await releaseFn({ id: heldReservation.id, bySession: label }).catch(() => {});
+  }
+}
+
+// ---- AI-180: dist-identity guard ----
+
+/** Escape hatch for the dist-identity guard (build.mjs's own runs and any
+ * deliberate stale-dist test run): warn-and-continue instead of refusing. */
+export const ALLOW_STALE_DIST_ENV = 'PA_ALLOW_STALE_DIST';
+
+export interface DistFreshOptions {
+  /** Which package's compiled output to verify. */
+  pkg: 'pa' | 'bot';
+  /** The REPO root the runner already computed for its loadBuildLock — the
+   * stamp, the src roots and the `git rev-parse` all resolve under it. */
+  repoRoot: string;
+  /** Test-only override of the HEAD lookup. Returns the short sha, or null
+   * when HEAD cannot be determined (not a git checkout / git failure). */
+  revParseFn?: (repoRoot: string) => Promise<string | null>;
+}
+
+type DistStaleReason = 'stamp-missing' | 'no-head' | 'sha-mismatch' | 'src-newer';
+
+interface BuildStamp {
+  builtAt?: unknown;
+  sha?: unknown;
+  pkg?: unknown;
+}
+
+function distStale(reason: DistStaleReason, message: string): Error {
+  const err = new Error(message) as Error & { code?: string; reason?: DistStaleReason };
+  err.code = 'DIST_STALE';
+  err.reason = reason;
+  return err;
+}
+
+async function defaultRevParseShortHead(repoRoot: string): Promise<string | null> {
+  try {
+    const { stdout } = await execAsync('git rev-parse --short HEAD', {
+      cwd: repoRoot,
+      windowsHide: true,
+      timeout: 15_000,
+      killSignal: 'SIGKILL',
+    });
+    const sha = stdout.trim();
+    return sha ? sha : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Package layout the runners and compilers already agree on: dist output and
+ * the src roots whose mtimes must never outrun the build stamp. */
+function distLayout(pkg: 'pa' | 'bot', repoRoot: string): { distDir: string; srcRoots: string[] } {
+  if (pkg === 'bot') {
+    return {
+      distDir: join(repoRoot, 'projects', 'telegram-bot', 'dist'),
+      srcRoots: [join(repoRoot, 'projects', 'telegram-bot', 'src')],
+    };
+  }
+  return {
+    distDir: join(repoRoot, 'pa', 'dist'),
+    srcRoots: [join(repoRoot, 'pa', 'bin'), join(repoRoot, 'pa', 'src'), join(repoRoot, 'pa', 'tests')],
+  };
+}
+
+/** First regular file under any of `roots` whose mtime is strictly newer than
+ * `cutoffMs` (up to `limit` names, for the refusal message). Missing roots are
+ * skipped (a fresh clone has no src yet — nothing can be newer). */
+function newerFilesUnder(roots: string[], cutoffMs: number, limit: number): string[] {
+  const found: string[] = [];
+  for (const root of roots) {
+    let names: string[];
+    try {
+      names = readdirSync(root, { recursive: true }) as string[];
+    } catch {
+      continue;
+    }
+    for (const rel of names) {
+      const full = join(root, rel);
+      let st;
+      try {
+        st = statSync(full);
+      } catch {
+        continue;
+      }
+      if (!st.isFile() || st.mtimeMs <= cutoffMs) continue;
+      found.push(join(root, rel));
+      if (found.length >= limit) return found;
+    }
+  }
+  return found;
+}
+
+/**
+ * AI-180: refuse to run tests against a dist that does not belong to this
+ * checkout. Three independent identity failures refuse, FAIL-CLOSED:
+ *   1. the package's `dist/.build-stamp` is missing/unreadable (never built,
+ *      or written by something that does not stamp);
+ *   2. `git rev-parse --short HEAD` at `repoRoot` cannot be determined;
+ *   3. the stamp's sha differs from HEAD (dist predates the last commit);
+ *   4. any src mtime under the package's compiled roots (pa bin/src/tests,
+ *      bot src) is strictly newer than the stamp's builtAt (src edited since
+ *      the last build).
+ * One-line Error naming stamp sha/builtAt vs HEAD. Resolves (possibly after a
+ * warning) when the dist is fresh or PA_ALLOW_STALE_DIST=1. NO auto-build —
+ * the caller rebuilds; there is deliberately no holder-liveness check at
+ * grant time (see this file's header — liveness lives in withBuildLock's
+ * wait-exhaustion takeover only).
+ */
+export async function assertDistFresh(opts: DistFreshOptions): Promise<void> {
+  const { distDir, srcRoots } = distLayout(opts.pkg, opts.repoRoot);
+  const allowStale = process.env[ALLOW_STALE_DIST_ENV] === '1';
+
+  const refuse = (reason: DistStaleReason, detail: string): void => {
+    const message = `DIST STALE (${opts.pkg}): ${detail} — rebuild (npm run build) or set ${ALLOW_STALE_DIST_ENV}=1 to proceed anyway.`;
+    if (allowStale) {
+      console.error(`[build-lock] WARNING: ${message}`);
+      return;
+    }
+    throw distStale(reason, message);
+  };
+
+  let stamp: BuildStamp;
+  let stampRaw = '';
+  try {
+    stampRaw = readFileSync(join(distDir, '.build-stamp'), 'utf8');
+  } catch {
+    /* handled below */
+  }
+  try {
+    stamp = JSON.parse(stampRaw) as BuildStamp;
+  } catch {
+    stamp = {};
+  }
+  const builtAtMs = Date.parse(String(stamp.builtAt ?? ''));
+  if (!stampRaw.trim() || Number.isNaN(builtAtMs)) {
+    refuse('stamp-missing', `no readable .build-stamp under ${distDir} (never built here, or written without one)`);
+    return;
+  }
+
+  const headSha = await (opts.revParseFn ?? defaultRevParseShortHead)(opts.repoRoot);
+  if (!headSha) {
+    refuse('no-head', `cannot verify HEAD (git rev-parse failed at ${opts.repoRoot}); stamp built from ${String(stamp.sha)} at ${stamp.builtAt}`);
+    return;
+  }
+
+  const stampSha = String(stamp.sha ?? '');
+  if (stampSha !== headSha) {
+    refuse('sha-mismatch', `built from ${stampSha} at ${stamp.builtAt}, but HEAD is ${headSha}`);
+    return;
+  }
+
+  const newer = newerFilesUnder(srcRoots, builtAtMs, 4);
+  if (newer.length > 0) {
+    const shown = newer.map((p) => p.split(/[\\/]/).slice(-2).join('/')).join(', ');
+    refuse(
+      'src-newer',
+      `src changed after the ${stamp.builtAt} build of ${stampSha} (e.g. ${shown}) — the dist does not contain it`
+    );
+    return;
   }
 }

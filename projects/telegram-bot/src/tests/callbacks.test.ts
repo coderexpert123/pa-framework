@@ -1,7 +1,7 @@
 import './test-env-guard.js';
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, rm } from 'fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm } from 'fs/promises';
 import { existsSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -16,7 +16,7 @@ import {
   buildValuePickerKeyboard,
   buildFailoverKeyboard,
   buildRunNowKeyboard,
-  buildReminderKeyboard,
+  buildQuestionKeyboard,
   buildResendKeyboard,
   buildDlqReplayKeyboard,
   syntheticTextFor,
@@ -26,6 +26,7 @@ import {
   handleMessageReaction,
   rememberConfirmMessage,
   currentCardKeyboard,
+  _resetCardKeyboardIndexForTest,
   _setSpawnForTest,
   _restoreSpawnForTest,
   type CallbackDeps,
@@ -35,6 +36,16 @@ import { editMessageText } from '../telegram.js';
 import { _resetResendStoreForTest, putResend } from '../resend-store.js';
 import type { CallbackQuery, ConversationState, MessageReactionUpdated, TelegramUser } from '../types.js';
 import { waitForDrain } from './test-teardown-guard.js';
+import {
+  appendTask,
+  claimNextTask,
+  listRunningTasks,
+  parkTask,
+  _resetTopicTasksForTest,
+} from '../../../../pa/dist/src/lib/topic-tasks.js';
+
+const CHAT_ID = -1001234567890;
+const THREAD_ID = 5001;
 
 // ---------------------------------------------------------------------------
 // parseCallbackData — one valid example per §3.2 row, plus the invalid list.
@@ -113,6 +124,14 @@ describe('parseCallbackData — valid examples (one per §3.2 row)', () => {
   it('dq:replay:<index>[:c]', () => {
     assert.deepEqual(parseCallbackData('dq:replay:3'), { prefix: 'dq', index: 3, confirmed: false, raw: 'dq:replay:3' });
     assert.deepEqual(parseCallbackData('dq:replay:12:c'), { prefix: 'dq', index: 12, confirmed: true, raw: 'dq:replay:12:c' });
+  });
+
+  it('q:<0-3> — PA_META question option press (index resolves against pending_question)', () => {
+    for (let i = 0; i <= 3; i++) {
+      assert.deepEqual(parseCallbackData(`q:${i}`), { prefix: 'q', index: i, raw: `q:${i}` });
+    }
+    assert.equal(parseCallbackData('q:4'), null, 'options cap at 4');
+    assert.equal(gateFor(parseCallbackData('q:0')!), 'chat', 'q: is chat-gated like cf:');
   });
 });
 
@@ -300,8 +319,15 @@ describe('keyboard builders stay within the 64-byte callback_data budget', () =>
       for (const d of allButtons(kb)) assert.ok(Buffer.byteLength(d) <= 64, d);
     }
   });
-  it('buildReminderKeyboard', () => {
-    for (const d of allButtons(buildReminderKeyboard())) assert.ok(Buffer.byteLength(d) <= 64, d);
+  it('question keyboard buttons all ≤64 bytes', () => {
+    // buildReminderKeyboard was DELETED (2026-09-02, SPEC §1.3 — dead code; the live
+    // rm: producer is the Python dict in projects/reminders/process_reminders.py).
+    const kb = buildQuestionKeyboard(['A — faster', 'B — safer', 'C', 'D — none of these']);
+    assert.equal(kb.inline_keyboard.length, 4, 'one button per row');
+    for (const d of allButtons(kb)) assert.ok(Buffer.byteLength(d) <= 64, d);
+    assert.deepEqual(allButtons(kb), ['q:0', 'q:1', 'q:2', 'q:3']);
+    // Labels are the option text verbatim — no emoji prefixes, no truncation.
+    assert.equal(kb.inline_keyboard[0][0].text, 'A — faster');
   });
   it('buildResendKeyboard with worst-case-length ids', () => {
     const kb = buildResendKeyboard(-1001234567890123, 9999999999, 4999999999999);
@@ -426,6 +452,7 @@ function makeDeps(overrides: Partial<CallbackDeps> = {}): CallbackDeps & { injec
     injectUpdate: (u) => injected.push(u),
     spawnReauthLink: () => '🔐 link',
     loadTopicState: async () => state,
+    loadRunningTasks: async () => [],
     listWorkerNames: async () => ['agy', 'claude'],
     observedValues: async () => [],
     declaredValues: async () => [],
@@ -446,6 +473,10 @@ describe('handleCallbackQuery', () => {
   afterEach(() => {
     fetchStub.restore();
     _restoreSpawnForTest();
+    // Picker-opening tests record submenus under the shared fixture key
+    // (chat 555, message 100); empty the index so a recording never leaks into
+    // a later test's ackSelection keyboard re-attach (AI-192).
+    _resetCardKeyboardIndexForTest();
   });
 
   it('an unparsed data string answers once and injects nothing', async () => {
@@ -489,6 +520,157 @@ describe('handleCallbackQuery', () => {
     await handleCallbackQuery(makeCb('cf:n'), deps);
     assert.equal(deps.injected.length, 1);
     assert.equal(deps.injected[0].message.text, 'no');
+  });
+
+  describe('q: — PA_META question press (2026-09-02, handover Wave 1 SPEC §3.3)', () => {
+    function stateWithQuestion(overrides: Partial<ConversationState['pending_question']> = {}): ConversationState {
+      return {
+        chat_id: 555,
+        last_update_id: 0,
+        thread_id: 0,
+        turns: [],
+        pending_question: {
+          text: 'Prefer A or B?',
+          options: ['A — faster', 'B — safer'],
+          asked_at: new Date().toISOString(),
+          ...overrides,
+        },
+      };
+    }
+
+    it('q: press injects the option text as a synthetic turn', async () => {
+      const deps = makeDeps({ loadTopicState: async () => stateWithQuestion() });
+      const outcome = await handleCallbackQuery(makeCb('q:1'), deps);
+      assert.equal(outcome, 'q:answered');
+      assert.equal(deps.injected.length, 1, 'exactly one synthetic turn');
+      assert.equal(deps.injected[0].message.text, 'B — safer', 'the option text verbatim');
+      assert.equal((deps.injected[0] as any).__synthetic, 'button');
+      assert.equal(deps.injected[0].message.chat.id, 555);
+    });
+
+    it('q: press appends question_answered event', async () => {
+      const deps = makeDeps({
+        loadTopicState: async () =>
+          stateWithQuestion({ task_id: 'tt-abc123' }),
+      });
+      await handleCallbackQuery(makeCb('q:0'), deps);
+      const eventsPath = join(process.env.PA_HOME!, 'topic-events', '555_0.jsonl');
+      const raw = await readFile(eventsPath, 'utf8');
+      const events = raw.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+      // The event file accumulates across the process (the earlier q:1 press in the
+      // inject test appended its own row) — match THIS press by its full predicate
+      // instead of find()-ing the first question_answered row.
+      const ev = events.find(
+        (e: any) => e.kind === 'question_answered' && e.detail === 'A — faster' && e.ref === 'tt-abc123',
+      );
+      assert.ok(ev, 'question_answered event for this press (detail A — faster, ref tt-abc123) must be appended');
+    });
+
+    it('q: gone when no pending question', async () => {
+      const deps = makeDeps(); // default fixture state has no pending_question
+      const outcome = await handleCallbackQuery(makeCb('q:0'), deps);
+      assert.equal(outcome, 'q:gone');
+      assert.equal(deps.injected.length, 0);
+      const answerCalls = fetchStub.calls.filter((c) => c.url.includes('answerCallbackQuery'));
+      assert.equal(answerCalls.length, 1);
+      assert.equal(answerCalls[0].body.text, 'Question no longer active');
+    });
+
+    it('q: index out of bounds answers with an alert and injects nothing', async () => {
+      const deps = makeDeps({ loadTopicState: async () => stateWithQuestion() });
+      const outcome = await handleCallbackQuery(makeCb('q:3'), deps); // only 2 options
+      assert.equal(outcome, 'q:bad');
+      assert.equal(deps.injected.length, 0);
+    });
+  });
+
+  describe('qt: — task-lane question press (2026-09-02, handover Wave 2 SPEC §3.1 A.3)', () => {
+    // Fresh PA_HOME per test: _resetTopicTasksForTest only clears the module
+    // mutex — store FILES persist, and this file shares one PA_HOME.
+    let tempDir: string;
+    let originalPaHome: string | undefined;
+
+    beforeEach(async () => {
+      tempDir = await mkdtemp(join(tmpdir(), 'callbacks-qt-'));
+      originalPaHome = process.env.PA_HOME;
+      process.env.PA_HOME = tempDir;
+      _resetTopicTasksForTest();
+    });
+
+    afterEach(async () => {
+      _resetTopicTasksForTest();
+      if (originalPaHome === undefined) delete process.env.PA_HOME;
+      else process.env.PA_HOME = originalPaHome;
+      await rm(tempDir, { recursive: true, force: true });
+    });
+
+    /** The press must arrive from the SAME chat/thread the store was seeded under —
+     *  handleCallbackQuery derives (chatId, threadId) from cb.message. */
+    function taskCb(data: string): CallbackQuery {
+      return makeCb(data, {
+        message: {
+          message_id: 100,
+          chat: { id: CHAT_ID, type: 'supergroup' },
+          date: Math.floor(Date.now() / 1000),
+          text: 'card',
+          message_thread_id: THREAD_ID,
+        },
+      });
+    }
+
+    /** REAL producer chain in the sandboxed PA_HOME: queue → claim → park with a
+     *  question, exactly as the executor's parkOnQuestion leaves the record. */
+    async function seedParkedTask(question?: { text: string; options: string[] }): Promise<string> {
+      await appendTask(CHAT_ID, THREAD_ID, { title: 'needs a pick', prompt: 'the prompt text', createdBy: 'cli' });
+      const claimed = await claimNextTask(CHAT_ID, THREAD_ID);
+      assert.ok(claimed);
+      if (question) await parkTask(CHAT_ID, THREAD_ID, claimed.id, question);
+      return claimed.id;
+    }
+
+    it('qt press answers task and writes question_answered event', async () => {
+      const taskId = await seedParkedTask({ text: 'Pick one', options: ['A — faster', 'B — safer'] });
+      const deps = makeDeps({ loadRunningTasks: async () => listRunningTasks(CHAT_ID, THREAD_ID) });
+      const outcome = await handleCallbackQuery(taskCb(`qt:${taskId}:1`), deps);
+      assert.equal(outcome, 'qt:answered');
+      assert.equal(deps.injected.length, 0, 'CONVERGENCE, not injection — no synthetic turn');
+      const [record] = await listRunningTasks(CHAT_ID, THREAD_ID);
+      assert.equal(record.status, 'ready', 'the answer parked the record for the next drain tick');
+      assert.ok(
+        record.micro_thread.some((t) => t.role === 'user' && t.text === 'B — safer'),
+        'the option text landed in the task micro_thread'
+      );
+      const eventsPath = join(process.env.PA_HOME!, 'topic-events', `${CHAT_ID}_${THREAD_ID}.jsonl`);
+      const raw = await readFile(eventsPath, 'utf8');
+      const events = raw.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+      const ev = events.find((e: any) => e.kind === 'question_answered' && e.ref === taskId && e.detail === 'B — safer');
+      assert.ok(ev, 'question_answered event with the task id as ref and the option text as detail');
+    });
+
+    it('qt gone when no question', async () => {
+      const deps = makeDeps({ loadRunningTasks: async () => listRunningTasks(CHAT_ID, THREAD_ID) });
+      // (a) no such task at all
+      assert.equal(await handleCallbackQuery(taskCb('qt:tt-000000000000:0'), deps), 'qt:gone');
+      // (b) the task exists but carries no question (running, never parked)
+      const runningId = await seedParkedTask();
+      assert.equal(await handleCallbackQuery(taskCb(`qt:${runningId}:0`), deps), 'qt:gone');
+      const [record] = await listRunningTasks(CHAT_ID, THREAD_ID);
+      assert.equal(record.status, 'running', 'a gone press never disturbs the record');
+      const answerCalls = fetchStub.calls.filter((c) => c.url.includes('answerCallbackQuery'));
+      assert.equal(answerCalls.length, 2);
+      assert.equal(answerCalls[0].body.text, 'Task question no longer active');
+    });
+
+    it('qt index out of bounds answers with an alert and leaves the record parked', async () => {
+      const taskId = await seedParkedTask({ text: 'Pick one', options: ['A — faster', 'B — safer'] });
+      const deps = makeDeps({ loadRunningTasks: async () => listRunningTasks(CHAT_ID, THREAD_ID) });
+      const outcome = await handleCallbackQuery(taskCb(`qt:${taskId}:3`), deps); // only 2 options
+      assert.equal(outcome, 'qt:bad');
+      assert.equal(deps.injected.length, 0);
+      const [record] = await listRunningTasks(CHAT_ID, THREAD_ID);
+      assert.equal(record.status, 'parked', 'a bad press never answers the task');
+      assert.equal(record.micro_thread.length, 0);
+    });
   });
 
   describe('cc:model / cc:effort — value picker source (declared over hardcoded default)', () => {
@@ -626,6 +808,113 @@ describe('handleCallbackQuery', () => {
       const outcome = await handleCallbackQuery(makeCb('sk:run:push:c'), deps);
       assert.equal(outcome, 'sk:protected');
       assert.equal(spawnCalls.length, 0);
+    });
+  });
+
+  describe('WP-D2 pa-side prefixes — ru/si/ch/wt (2026-09-02, SPEC §3.4)', () => {
+    let paHome: string;
+    let savedPaHome: string | undefined;
+
+    beforeEach(async () => {
+      paHome = await mkdtemp(join(tmpdir(), 'tgbot-cb-wpd2-'));
+      await mkdir(join(paHome, 'chains'), { recursive: true });
+      await writeFile(join(paHome, 'chains', 'nightly-sync.yaml'), 'steps: []\n', 'utf8');
+      savedPaHome = process.env.PA_HOME;
+      process.env.PA_HOME = paHome;
+    });
+
+    afterEach(async () => {
+      await waitForDrain();
+      if (savedPaHome === undefined) delete process.env.PA_HOME;
+      else process.env.PA_HOME = savedPaHome;
+      await rm(paHome, { recursive: true, force: true });
+    });
+
+    it('ru press spawns pa rules accept', async () => {
+      const spawnCalls: Array<{ cmd: string; args: string[] }> = [];
+      _setSpawnForTest(((cmd: string, args: string[]) => {
+        spawnCalls.push({ cmd, args });
+        return { unref: () => {} } as any;
+      }) as any);
+      const deps = makeDeps({ secrets: { PA_OPERATOR_USER_ID: '1' } });
+      const outcome = await handleCallbackQuery(makeCb('ru:rule-feedback-1:a'), deps);
+      assert.equal(outcome, 'ru:accepted');
+      assert.equal(spawnCalls.length, 1);
+      assert.equal(spawnCalls[0].cmd, 'pa');
+      assert.deepEqual(spawnCalls[0].args, ['rules', 'accept', 'rule-feedback-1']);
+
+      const reject = await handleCallbackQuery(makeCb('ru:rule-feedback-1:x'), deps);
+      assert.equal(reject, 'ru:rejected');
+      assert.deepEqual(spawnCalls[1].args, ['rules', 'supersede', 'rule-feedback-1', '--reason', 'rejected via weekly-digest button']);
+    });
+
+    it('si mute requires two taps', async () => {
+      const spawnCalls: Array<{ cmd: string; args: string[] }> = [];
+      _setSpawnForTest(((cmd: string, args: string[]) => {
+        spawnCalls.push({ cmd, args });
+        return { unref: () => {} } as any;
+      }) as any);
+      const deps = makeDeps({ secrets: { PA_OPERATOR_USER_ID: '1' } });
+
+      const first = await handleCallbackQuery(makeCb('si:bg-leak:m'), deps);
+      assert.equal(first, 'si:unconfirmed');
+      assert.equal(spawnCalls.length, 0, 'no spawn until confirmed');
+      const editCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageReplyMarkup'));
+      assert.equal(editCalls.length, 1);
+      const data = editCalls[0].body.reply_markup.inline_keyboard.flat().map((b: any) => b.callback_data);
+      assert.ok(data.includes('si:bg-leak:m:c'), 'first tap rewrites to the confirm-state keyboard');
+
+      const second = await handleCallbackQuery(makeCb('si:bg-leak:m:c'), deps);
+      assert.equal(second, 'si:muted');
+      assert.equal(spawnCalls.length, 1);
+      assert.deepEqual(spawnCalls[0].args, ['fix', 'bg-leak', '--note', 'muted from nightly report button']);
+    });
+
+    it('ch press spawns pa chain run for known chain', async () => {
+      const spawnCalls: Array<{ cmd: string; args: string[] }> = [];
+      _setSpawnForTest(((cmd: string, args: string[]) => {
+        spawnCalls.push({ cmd, args });
+        return { unref: () => {} } as any;
+      }) as any);
+      const deps = makeDeps({ secrets: { PA_OPERATOR_USER_ID: '1' } });
+
+      const first = await handleCallbackQuery(makeCb('ch:r:nightly-sync'), deps);
+      assert.equal(first, 'ch:unconfirmed');
+      assert.equal(spawnCalls.length, 0);
+
+      const second = await handleCallbackQuery(makeCb('ch:r:nightly-sync:c'), deps);
+      assert.equal(second, 'ch:started');
+      assert.equal(spawnCalls.length, 1);
+      assert.equal(spawnCalls[0].cmd, 'pa');
+      assert.deepEqual(spawnCalls[0].args, ['chain', 'run', 'nightly-sync']);
+    });
+
+    it('ch unknown chain refused', async () => {
+      const spawnCalls: Array<{ cmd: string; args: string[] }> = [];
+      _setSpawnForTest(((cmd: string, args: string[]) => {
+        spawnCalls.push({ cmd, args });
+        return { unref: () => {} } as any;
+      }) as any);
+      const deps = makeDeps({ secrets: { PA_OPERATOR_USER_ID: '1' } });
+      const outcome = await handleCallbackQuery(makeCb('ch:r:removed-chain:c'), deps);
+      assert.equal(outcome, 'ch:unknown');
+      assert.equal(spawnCalls.length, 0, 'an unknown chain never spawns');
+      const answerCalls = fetchStub.calls.filter((c) => c.url.includes('answerCallbackQuery'));
+      assert.ok(answerCalls.some((c) => c.body.show_alert === true));
+    });
+
+    it('wt press spawns pa watch re-register', async () => {
+      const spawnCalls: Array<{ cmd: string; args: string[] }> = [];
+      _setSpawnForTest(((cmd: string, args: string[]) => {
+        spawnCalls.push({ cmd, args });
+        return { unref: () => {} } as any;
+      }) as any);
+      const deps = makeDeps({ secrets: { PA_OPERATOR_USER_ID: '1' } });
+      const outcome = await handleCallbackQuery(makeCb('wt:w-0123abcd:r'), deps);
+      assert.equal(outcome, 'wt:re-registered');
+      assert.equal(spawnCalls.length, 1);
+      assert.equal(spawnCalls[0].cmd, 'pa');
+      assert.deepEqual(spawnCalls[0].args, ['watch', 're-register', 'w-0123abcd']);
     });
   });
 
@@ -990,6 +1279,104 @@ describe('handleCallbackQuery', () => {
   });
 
   // Removed dq:replay test - requires mocking DLQ functions which are not injected through CallbackDeps
+});
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// AI-192 (2026-09-03): cc: pickers keep the card's keyboard. ackSelection's
+// editMessageText strips keyboards unless reply_markup is re-passed, so a
+// recorded (fresh) submenu is re-attached; cc: presses add NO selected-value
+// echo (the pin just reflects the new state when the synthetic command's card
+// refresh lands); in-thread prefixes keep their echo.
+// ---------------------------------------------------------------------------
+
+describe('AI-192 — control-card keyboard survives presses', () => {
+  let fetchStub: ReturnType<typeof stubFetch>;
+
+  beforeEach(() => {
+    fetchStub = stubFetch();
+    _resetCardKeyboardIndexForTest();
+  });
+
+  afterEach(() => {
+    fetchStub.restore();
+    _restoreSpawnForTest();
+    _resetCardKeyboardIndexForTest();
+  });
+
+  it('a pin edit (ackSelection) re-attaches the ACTIVE submenu keyboard recorded on that message', async () => {
+    const deps = makeDeps();
+    // Open the agent picker on message 100 — this records it as the active submenu.
+    await handleCallbackQuery(makeCb('cc:agent'), deps);
+    const pickerCall = fetchStub.calls.find((c) => c.url.includes('editMessageReplyMarkup'))!;
+    assert.ok(pickerCall, 'cc:agent must render the picker in place');
+    const pickerData = pickerCall.body.reply_markup.inline_keyboard.flat().map((b: any) => b.callback_data);
+
+    // An in-thread press (cf:) acks by editing the SAME message — the recorded
+    // submenu must ride the edit instead of being stripped.
+    await handleCallbackQuery(makeCb('cf:y'), deps);
+    const editCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageText'));
+    const ackEdit = editCalls.find((c) => String(c.body.text).includes('✅ Selected: Yes'));
+    assert.ok(ackEdit, 'cf: keeps its selected-value echo');
+    assert.deepEqual(
+      ackEdit.body.reply_markup.inline_keyboard.flat().map((b: any) => b.callback_data),
+      pickerData,
+      'the ack edit must re-attach the recorded submenu keyboard'
+    );
+  });
+
+  it('an in-thread press with NO recorded submenu strips the keyboard as always', async () => {
+    const deps = makeDeps();
+    await handleCallbackQuery(makeCb('cf:y'), deps);
+    const editCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageText'));
+    assert.equal(editCalls.length, 1);
+    assert.ok(String(editCalls[0].body.text).includes('✅ Selected: Yes'), 'echo unchanged for in-thread buttons');
+    assert.equal(editCalls[0].body.reply_markup, undefined, 'no submenu recorded → keyboard strips');
+  });
+
+  it('a cc: set press adds NO echo line and does not strip the picker keyboard', async () => {
+    const deps = makeDeps();
+    // Open the picker first (records the submenu), then press a value.
+    await handleCallbackQuery(makeCb('cc:agent'), deps);
+    fetchStub.calls.length = 0; // keep the assertions scoped to the set press
+
+    const outcome = await handleCallbackQuery(makeCb('cc:set:agent:agy'), deps);
+    assert.equal(outcome, 'cc:set:agent');
+
+    const echoEdits = fetchStub.calls.filter(
+      (c) => c.url.includes('editMessageText') && String(c.body.text).includes('✅ Selected')
+    );
+    assert.equal(echoEdits.length, 0, 'the selected-value echo is suppressed for cc: presses');
+
+    // The toast carries the feedback the echo used to.
+    const toast = fetchStub.calls.find((c) => c.url.includes('answerCallbackQuery'));
+    assert.equal(toast?.body.text, 'Agent → agy');
+
+    // The typed command is still injected — button and typing cannot diverge.
+    assert.equal(deps.injected.length, 1);
+    assert.equal(deps.injected[0].message.text, '/agent agy');
+
+    // The press is complete: nothing left to protect from the sweep's rewrite.
+    assert.equal(currentCardKeyboard(555, 100), undefined);
+    // And no stripping edit happened — the picker stays visually attached until
+    // the injected command's dispatch refresh rewrites the card.
+    const anyEdit = fetchStub.calls.filter((c) => c.url.includes('editMessageText'));
+    assert.equal(anyEdit.length, 0);
+  });
+
+  it('a cc: new press adds no echo and still injects /new', async () => {
+    const deps = makeDeps();
+    const outcome = await handleCallbackQuery(makeCb('cc:new'), deps);
+    assert.equal(outcome, 'cc:new');
+    const echoEdits = fetchStub.calls.filter(
+      (c) => c.url.includes('editMessageText') && String(c.body.text).includes('✅ Selected')
+    );
+    assert.equal(echoEdits.length, 0);
+    assert.equal(deps.injected.length, 1);
+    assert.equal(deps.injected[0].message.text, '/new');
+    const toast = fetchStub.calls.find((c) => c.url.includes('answerCallbackQuery'));
+    assert.equal(toast?.body.text, 'New topic');
+  });
 });
 
 // ---------------------------------------------------------------------------

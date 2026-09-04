@@ -1,5 +1,5 @@
 /**
- * Fix ledger (2026-08-29, plans/2026-08-29-alert-suppression-SPEC.md).
+ * Fix ledger (2026-08-29, the alert-suppression spec).
  *
  * Append-only record of SHIPPED fixes, written by the fixer session (or `pa fix`),
  * never the operator. The census overlay (lib/alert-census.ts) consults it so a

@@ -12,7 +12,7 @@ import {
 // ---------------------------------------------------------------------------
 // REAUTH_PATTERN, handleReauthCommand (WP-G2, 2026-08-23, AI-147)
 // Pure-parser only — the spawn (pa/scripts/start_google_telegram_reauth.py)
-// is not unit-tested here; see plans/2026-08-23-alerts-wave-SPEC.md §WP-G2.
+// is not unit-tested here; see the 2026-08-23 alerts-wave design §WP-G2 (internal).
 // ---------------------------------------------------------------------------
 
 describe('REAUTH_PATTERN', () => {

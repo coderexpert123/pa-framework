@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, readdir, writeFile, rename } from 'fs/promises';
+import { mkdtemp, rm, readdir, readFile, writeFile, rename } from 'fs/promises';
 import { existsSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -327,5 +327,132 @@ describe('renameWithRetry', () => {
     (globalThis as any).setTimeout = originalSetTimeout;
 
     assert.deepEqual(delays, [50], 'jitterMs=0 should produce exact baseDelay');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// maintenance run lock (AI-200, 2026-09-04). `pa maintenance run` must refuse
+// loudly when a pass-driving `pa catchup` invocation holds its blackboard
+// lock, and take the lock itself around the forced run. Drives
+// maintenanceCommand over the REAL blackboard (catchup-lock.test.ts's
+// fixture style). The holder fixture is shaped like a cross-context holder:
+// same PID but a DIFFERENT contextId, which is acquireLock's blocking branch
+// for two concurrent flows — deliberately NOT same-PID/no-contextId, which
+// takes the legacy re-entrancy path and would not block. A different-PID
+// holder behaves identically through the same find() branch, but a fake PID
+// risks classifyLock purging it as dead.
+// ---------------------------------------------------------------------------
+
+describe('maintenance run lock (AI-200)', () => {
+  /** Acquire one pass-lock key as a stand-in catchup holder. */
+  async function holdPassKey(key: string): Promise<void> {
+    const { blackboard } = await import('../src/blackboard.js');
+    const ok = await blackboard.acquireLock(key, 'catchup-command', process.pid, 1000, 'ai200-holder-ctx');
+    assert.ok(ok, `precondition: fixture must hold '${key}'`);
+  }
+
+  /** Release the fixture holder (matches holdPassKey's identity exactly). */
+  async function releasePassKey(key: string): Promise<void> {
+    const { blackboard } = await import('../src/blackboard.js');
+    await blackboard.releaseLock(key, 'catchup-command', 'ai200-holder-ctx', { pid: process.pid });
+  }
+
+  /** Leftover rows written by the command under test must be zero — a refusal
+   *  or a completed run may leak NO partial lock rows. */
+  async function commandLockRowCount(): Promise<number> {
+    const raw = await readFile(join(tempDir, 'blackboard.json'), 'utf8').catch(() => '{"active_locks":[]}');
+    const data = JSON.parse(raw) as { active_locks: Array<{ agent: string }> };
+    return data.active_locks.filter((l) => l.agent === 'maintenance-run-command').length;
+  }
+
+  it('refuses loudly when the pass lock is held — catchup:topic:default spelling (the Windows Task Scheduler tick)', async () => {
+    const { maintenanceCommand } = await import('../src/commands/maintenance.js');
+    const key = 'catchup:topic:default';
+    await holdPassKey(key);
+
+    const prevExit = process.exitCode;
+    const origError = console.error;
+    const errors: string[] = [];
+    console.error = (...parts: unknown[]) => { errors.push(parts.map(String).join(' ')); };
+    try {
+      process.exitCode = 0;
+      await maintenanceCommand(['run', 'archive-prune']);
+      assert.equal(process.exitCode, 1, 'a refusal must exit non-zero');
+      const joined = errors.join('\n');
+      assert.match(joined, /catchup:topic:default/, 'the refusal must name the contested resource');
+      assert.match(joined, /catchup-command/, 'the refusal must name the holder agent');
+      const ledger = await readLedger();
+      assert.equal(ledger.jobs['archive-prune'], undefined, 'the job body must not execute under a contested pass lock');
+      assert.equal(await commandLockRowCount(), 0, 'the earlier-acquired key must be released on refusal (no partial rows)');
+    } finally {
+      console.error = origError;
+      await releasePassKey(key);
+      process.exitCode = prevExit;
+    }
+  });
+
+  it('refuses loudly when the pass lock is held — bare catchup spelling (posix crontab / manual topic-less run)', async () => {
+    const { maintenanceCommand } = await import('../src/commands/maintenance.js');
+    const key = 'catchup';
+    await holdPassKey(key);
+
+    const prevExit = process.exitCode;
+    const origError = console.error;
+    const errors: string[] = [];
+    console.error = (...parts: unknown[]) => { errors.push(parts.map(String).join(' ')); };
+    try {
+      process.exitCode = 0;
+      await maintenanceCommand(['run', 'archive-prune']);
+      assert.equal(process.exitCode, 1, 'a refusal must exit non-zero');
+      const joined = errors.join('\n');
+      assert.match(joined, /lock 'catchup' is held/, 'the refusal must name the contested resource');
+      assert.match(joined, /catchup-command/, 'the refusal must name the holder agent');
+      const ledger = await readLedger();
+      assert.equal(ledger.jobs['archive-prune'], undefined, 'the job body must not execute under a contested pass lock');
+      assert.equal(await commandLockRowCount(), 0, 'the earlier-acquired key must be released on refusal (no partial rows)');
+    } finally {
+      console.error = origError;
+      await releasePassKey(key);
+      process.exitCode = prevExit;
+    }
+  });
+
+  it('with both pass keys free, the run proceeds as before and releases the lock', async () => {
+    const { maintenanceCommand } = await import('../src/commands/maintenance.js');
+    const prevExit = process.exitCode;
+    try {
+      process.exitCode = 0;
+      await maintenanceCommand(['run', 'archive-prune']);
+      assert.equal(process.exitCode, 0, 'a clean run must not set a failure exit code');
+      const ledger = await readLedger();
+      assert.equal(ledger.jobs['archive-prune']?.lastOutcome, 'ran', 'the forced run must have executed the job body');
+      assert.equal(typeof ledger.jobs['archive-prune']?.lastTouched, 'number');
+      assert.equal(await commandLockRowCount(), 0, 'the pass lock must be fully released after the run');
+    } finally {
+      process.exitCode = prevExit;
+    }
+  });
+
+  it('--dry-run stays available while the pass lock is held (read-only preview takes no lock)', async () => {
+    const { maintenanceCommand } = await import('../src/commands/maintenance.js');
+    const key = 'catchup:topic:default';
+    await holdPassKey(key);
+
+    const prevExit = process.exitCode;
+    const origLog = console.log;
+    const lines: string[] = [];
+    console.log = (...parts: unknown[]) => { lines.push(parts.map(String).join(' ')); };
+    try {
+      process.exitCode = 0;
+      await maintenanceCommand(['run', 'archive-prune', '--dry-run']);
+      assert.equal(process.exitCode, 0, 'a read-only preview must not be blocked by the pass lock');
+      assert.ok(lines.some((l) => l.includes('Dry run complete')), 'the dry-run preview must complete despite the held pass lock');
+      const ledger = await readLedger();
+      assert.equal(ledger.jobs['archive-prune'], undefined, 'a dry-run still writes nothing');
+    } finally {
+      console.log = origLog;
+      await releasePassKey(key);
+      process.exitCode = prevExit;
+    }
   });
 });

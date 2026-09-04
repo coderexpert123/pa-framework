@@ -8,7 +8,7 @@
  * behind ad-hoc setInterval/next*At/Date.now()>= idioms scattered across the
  * codebase — one such hidden timer (the bot's 24h session GC, since replaced
  * by the declared `session-gc` job) deleted 248 real Claude Code transcripts
- * on 2026-08-02. See plans/2026-08-02-session-gc-scope-to-pa-spawned.md.
+ * on 2026-08-02. See the session-gc scoping plan.
  */
 import { readdirSync, readFileSync, statSync, type Stats } from 'node:fs';
 import { join, relative, sep } from 'node:path';
@@ -51,6 +51,8 @@ export const TIMER_ALLOWLIST: TimerAllowlistEntry[] = [
     reason: 'AI-100 Wave 2: throttles how often runDueJobs("bot", ...) itself gets KICKED (maintenanceKickDueAt, 20s) — deliberately NOT a nextXAt-named variable, so it does not also trip next-at-idiom. It does no maintenance work of its own and touches no file; every actual retention decision happens inside the declared jobs it invokes, whose own due-checks live in decideJob() under pa/src/lib/maintenance/ (exempt by construction). Kept a plain in-process throttle, not a job, because kicking the runner is infrastructure for the framework, not itself durable-state-mutating work. SECOND occurrence (2026-08-17, Wave B P2-3): watchdogStaleJobs gating (5-min cadence) — clears stale in-flight markers the maintenance runner leaves when a job promise never settles; in-process liveness repair for the runner itself, writes no durable state beyond the runner\'s own ledger which the declared jobs own.' },
   { file: 'projects/telegram-bot/src/voice.ts', pattern: 'setInterval', count: 1,
     reason: 'In-flight only: the 4s typing keep-alive for ONE voice transcription, cleared in a finally on every exit path. Mirrors the dispatch typing keep-alive already allowlisted for main.ts. Writes no durable state.' },
+  { file: 'projects/telegram-bot/src/task-executor.ts', pattern: 'setInterval', count: 1,
+    reason: 'task-executor pending-dispatch activity pump: scoped to one in-flight dispatch, interval cleared in the dispatch\'s finally; the durable lastActivityAt write IS the feature (activity-gated demotion), not outliving side work; added retroactively when the full pa suite first ran it (5435153).' },
 ];
 
 function walk(dir: string, out: string[]): void {

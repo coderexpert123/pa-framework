@@ -13,12 +13,12 @@ export * from './restore-drill.js';
 export * from './alert-census.js';
 export * from './clobber-sentinel.js';
 export * from './redteam-recurring.js';
+export * from './daily-recon.js';
 
 export * from './bot-log-rotation-check.js';
 export * from './model-override-sweep.js';
 export * from './delivered-store-compact.js';
 export * from './proxy-pool-refresh.js';
-export * from './dlq-flush.js';
 export * from './grounding-check.js';
 export * from './dashboard-refresh.js';
 export * from './registry-content-watch.js';

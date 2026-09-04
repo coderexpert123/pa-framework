@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import secrets
 from datetime import datetime, timezone, timedelta
 
 # Lazy import of pa/src/telegram_notify.py, resolved relative to this file
@@ -12,6 +13,10 @@ from telegram_notify import send_text
 
 pa_home = os.environ.get("PA_HOME") or os.path.join(os.path.expanduser("~"), ".pa")
 REMINDERS_FILE = os.path.join(pa_home, "reminders.json")
+# AI-185 (executable-reminder-dispatch design, 2026-09-02, internal §3.2):
+# executable reminders are handed to the bot through this queue file; the
+# reminder-resume-drain maintenance job pops and injects them as system turns.
+PENDING_RESUME_FILE = os.path.join(pa_home, "pending-reminder-resume.json")
 
 def now_ist():
     # IST is UTC + 5:30
@@ -29,6 +34,41 @@ def build_reminder_keyboard() -> dict:
 
 def reminder_message_text(msg: str) -> str:
     return f"⏰ *Reminder:* {msg}"
+
+def reminder_dispatch_notice_text(msg: str) -> str:
+    # Notice for an executable reminder: no keyboard, since snoozing after the
+    # prompt is already queued would be misleading (AI-185 §3.2).
+    return f"⏰ *Reminder (dispatched to worker):* {msg}"
+
+def append_resume_record(reminder: dict) -> dict:
+    """Append a pending resume record for an executable reminder to
+    PENDING_RESUME_FILE. Atomic read-modify-write: temp file + os.replace
+    (same pattern as add_reminder.py). An absent file is an empty array."""
+    if os.path.exists(PENDING_RESUME_FILE):
+        try:
+            with open(PENDING_RESUME_FILE, "r", encoding="utf-8") as f:
+                records = json.load(f)
+        except Exception:
+            records = []
+        if not isinstance(records, list):
+            records = []
+    else:
+        records = []
+
+    record = {
+        "id": f"{reminder['due_at']}-{secrets.token_hex(4)}",
+        "queued_at": now_ist().isoformat(),
+        "chat_id": reminder.get("chat_id"),
+        "thread_id": reminder.get("thread_id"),
+        "resume_action": reminder.get("resume_action"),
+    }
+    records.append(record)
+
+    tmp_path = PENDING_RESUME_FILE + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2)
+    os.replace(tmp_path, PENDING_RESUME_FILE)
+    return record
 
 def process_reminders():
     if not os.path.exists(REMINDERS_FILE):
@@ -104,13 +144,36 @@ def process_reminders():
             continue
 
         try:
-            send_text(
-                reminder_message_text(msg),
-                chat_id=chat_id,
-                thread_id=thread_id,
-                reply_markup=build_reminder_keyboard(),
-            )
-            print(f"[Reminders] Sent: {msg}")
+            if r.get("resume_action"):
+                # AI-185: queue the executable payload for the bot first, then
+                # send a notice WITHOUT the keyboard. Queue-append failure falls
+                # back to today's full text send so delivery is never lost.
+                try:
+                    append_resume_record(r)
+                except Exception as e:
+                    print(f"[Reminders] WARN: queue append failed, fell back to text send: {msg}")
+                    send_text(
+                        reminder_message_text(msg),
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        reply_markup=build_reminder_keyboard(),
+                    )
+                    print(f"[Reminders] Sent: {msg}")
+                    continue
+                send_text(
+                    reminder_dispatch_notice_text(msg),
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                )
+                print(f"[Reminders] Queued executable reminder: {msg}")
+            else:
+                send_text(
+                    reminder_message_text(msg),
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    reply_markup=build_reminder_keyboard(),
+                )
+                print(f"[Reminders] Sent: {msg}")
         except SystemExit:
             print(f"[Reminders] FAILED to send: {msg}")
         except Exception:

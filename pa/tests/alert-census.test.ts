@@ -522,7 +522,7 @@ describe('runAlertCensus (job)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Suppression overlay tests (2026-08-29, plans/2026-08-29-alert-suppression-SPEC.md)
+// Suppression overlay tests (2026-08-29, the alert-suppression spec)
 // ---------------------------------------------------------------------------
 
 describe('suppression overlay (fix ledger + green signal)', () => {

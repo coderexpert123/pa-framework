@@ -26,12 +26,19 @@ A tap re-creates the reminder through the unchanged `add_reminder.py` atomic wri
 
 ### Add a reminder
 ```bash
-python projects/reminders/add_reminder.py <due_at_iso> <message> <chat_id> [thread_id]
+python projects/reminders/add_reminder.py <due_at_iso> <message> <chat_id> [thread_id] [--resume-action-json <json>]
 ```
 - Example:
   ```bash
   python projects/reminders/add_reminder.py "2026-08-21T18:00:00+05:30" "Call doctor" "-1001234567890" 123
   ```
+
+### Add an executable reminder (AI-185)
+```bash
+python projects/reminders/add_reminder.py <due_at_iso> <message> <chat_id> [thread_id] \
+  --resume-action-json '{"type": "topic_resume", "prompt": "<single-line instruction>"}'
+```
+The prompt is validated at mint time (closed `topic_resume` shape: exactly the keys `type` + `prompt`; single line, <=500 chars, must not start with `/`) and stored on the record as `resume_action`; `message` remains the human label. At fire time the payload is appended to `~/.pa/pending-reminder-resume.json` for the bot's `reminder-resume-drain` job to inject as a system turn, and the operator receives a `⏰ *Reminder (dispatched to worker):*` notice with **no** inline keyboard (snoozing after the prompt is queued would be misleading). If the queue append fails, delivery is never lost: the reminder falls back to the plain text send with the Done / 1 h / Tomorrow keyboard.
 
 ### Process due reminders
 ```bash

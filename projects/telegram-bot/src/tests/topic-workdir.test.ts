@@ -68,17 +68,17 @@ describe('topic-workdir', () => {
 
     it('extracts first absolute CLAUDE.md path with forward slashes', () => {
       const markdown = `## Project pointers
-- D:/Personal Assistant/projects/fitness-data-sync/CLAUDE.md
+- C:/pa-checkout/projects/sample-project/CLAUDE.md
 - D:/Other/CLAUDE.md`;
       const result = parseProjectPointer(markdown);
-      assert.strictEqual(result, 'D:/Personal Assistant/projects/fitness-data-sync');
+      assert.strictEqual(result, 'C:/pa-checkout/projects/sample-project');
     });
 
     it('normalizes backslashes to forward slashes', () => {
       const markdown = `## Project pointers
-- D:\\Personal Assistant\\projects\\fitness-data-sync\\CLAUDE.md`;
+- C:\\pa-checkout\\projects\\sample-project\\CLAUDE.md`;
       const result = parseProjectPointer(markdown);
-      assert.strictEqual(result, 'D:/Personal Assistant/projects/fitness-data-sync');
+      assert.strictEqual(result, 'C:/pa-checkout/projects/sample-project');
     });
 
     it('returns null for relative paths', () => {
@@ -90,7 +90,7 @@ describe('topic-workdir', () => {
 
     it('returns null for paths not ending in CLAUDE.md', () => {
       const markdown = `## Project pointers
-- D:/Personal Assistant/projects/fitness-data-sync/README.md`;
+- C:/pa-checkout/projects/sample-project/README.md`;
       const result = parseProjectPointer(markdown);
       assert.strictEqual(result, null);
     });

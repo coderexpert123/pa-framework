@@ -28,6 +28,7 @@ import { join } from 'path';
 import { paHome } from '../paths.js';
 import { parse as parseYaml } from 'yaml';
 import { spawn } from 'child_process';
+import { parseCallbackData } from './callback-grammar.js';
 import { log } from './log.js';
 import { notifyUser } from './notify.js';
 
@@ -448,9 +449,18 @@ async function sendReport(report: ChainReportData, reportType: ChainReport | und
   if (reportType === 'telegram') {
     // Dedup by chain-name+date to avoid spamming on repeated failures
     const today = new Date().toISOString().slice(0, 10);
+    const failed = report.details.includes('failed');
     await notifyUser(`Chain report: ${chainName}`, report.details, {
       dedupKey: `chain-${chainName}-${today}`,
-      severity: report.details.includes('failed') ? 'warn' : 'info',
+      severity: failed ? 'warn' : 'info',
+      // WP-D2 B.6 (2026-09-02): a failure report carries the one-tap re-run button.
+      // The bot two-tap-confirms it (first tap rewrites to ch:r:<name>:c) before
+      // spawning `pa chain run <name>`, so the unconfirmed data here is safe. Grammar-
+      // checked: a chain name outside the ch: charset would make a DEAD button — no
+      // button beats a dead one.
+      replyMarkup: failed && parseCallbackData(`ch:r:${chainName}`)
+        ? { inline_keyboard: [[{ text: '🔁 Re-run chain', callback_data: `ch:r:${chainName}` }]] }
+        : undefined,
     });
   } else {
     // stdout

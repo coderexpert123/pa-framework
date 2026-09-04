@@ -3,7 +3,7 @@
  *
  * Single-file, in-process TypeScript store over `better-sqlite3` (already a
  * `pa` dependency; no Python, no spawn — see
- * plans/2026-08-24-recall-traces-wave-SPEC.md §3.3/C1, C8).
+ * the 2026-08-24 recall-traces spec §3.3/C1, C8).
  *
  * better-sqlite3 is synchronous by design, and every exported function here
  * stays synchronous end to end (file reads use the `node:fs` sync API) so

@@ -100,13 +100,27 @@ CLAUDE.md" community guidance assumes — a line budget is the wrong unit here.
 |---|---|---|---|
 | Root `CLAUDE.md` (auto-loaded every session) | 40,000 chars | 48,000 chars | run `/shorten-brain`, extract a topic file |
 | Directory-scoped `CLAUDE.md` (auto-loads on demand, stacks on root) | 8,000 chars | 12,000 chars | extract to `docs/` or a subsystem file |
-| On-demand topic file (`docs/*.md`, `inventory/*.md`) — content a reader holds in mind while working | 12,000 chars | 16,000 chars | split along a natural fault line |
-| Auto-managed glob-derived inventory file (an `inventory/*.md` file the `update-brain` skill rewrites wholesale from one `glob()` pattern) | 12,000 chars | 18,000 chars | see note below before splitting |
+| On-demand topic file (`docs/*.md` and the private inventory files) — content a reader holds in mind while working | 12,000 chars | 16,000 chars | split along a natural fault line |
+| Auto-managed glob-derived inventory file (a private inventory file the `update-brain` skill rewrites wholesale from one `glob()` pattern) | 12,000 chars | 23,000 chars | see note below before splitting — raised 18k→20k 2026-08-30, 20k→23k 2026-09-03 (handover waves' new lib modules; per-module legitimate growth) |
 | Router/index file (a file that replaced a monolith with pointers) | — | 4,000 chars | it stopped being a router; re-split |
 | Evergreen audience-facing guide (the 9 evergreen `UPPERCASE.md` guides under `docs/`) | — | 24,000 chars | separate class from operational-detail docs |
-| Append-only archive file (`backlog/archive-*.md`, `backlog/not-valid.md`) — looked up by ID, never read front to back | — | no hard ceiling | see note below |
-| Completed-item lookup index (`backlog/completed-index.md`) — one row per archived item, grows monotonically with shipped work, never auto-loaded | 16,000 chars | 20,000 chars | raise this row rather than splitting; splitting breaks its "every item exactly once, in one place" contract |
-| Open-program body file (`backlog/programs-*.md`) — bodies lifted out of `BACKLOG.md`, looked up by ID | — | no hard ceiling | same class as the archives |
+| Knobs catalog (`docs/CONFIGURATION.md`) — one row per shipped knob, grows monotonically with the code | — | 25,000 chars | documented raise-class (same as the job catalog): raise per-knob growth, trim nothing (24k→25k 2026-09-04, `PA_CDISK_*` rows) |
+| Append-only archive file (private archive shards) — looked up by ID, never read front to back | — | no hard ceiling | see note below |
+| Completed-item lookup index (the internal completion index) — one row per archived item, grows monotonically with shipped work, never auto-loaded | 16,000 chars | 24,000 chars | raise this row rather than splitting; splitting breaks its "every item exactly once, in one place" contract (21k→24k 2026-09-04: 16 DONE items pruned from BACKLOG.md landed as index rows) |
+| Open-program body file (private backlog program bodies) — bodies lifted out of `BACKLOG.md`, looked up by ID | — | no hard ceiling | same class as the archives |
+
+**Budget-pressure doctrine (operator directive 2026-09-03, after a six-trim night):**
+modularize at natural fault lines proactively; raise documented ceilings for
+monotonic-growth classes; **never trim the same file twice in a day — the second trim
+triggers a contract-look, and the contract picks the response** (auto-managed glob-derived
+→ raise; every-item-exactly-once index → raise; genuine prose/scope growth → split at the
+fault line — never a blanket split, the two raise-classes are exactly where splitting does
+silent damage); and the root of any index chain must stay auto-loaded. **A trim
+removes verbosity, duplication, and iteration residue — never a rule, invariant,
+gotcha, or anti-pattern warning; if a trim would lose a rule, that is a split,
+not a trim** (operator directive 2026-09-03). When in doubt,
+index — but doubt should first trigger a look at the file's contract. Enforced mechanically
+by docs-lint's same-file-trim counter (second trim in 24h fails with this clause's ref).
 
 **Note on the auto-managed inventory row**: this class exists because its size is bounded
 by *how many source files a glob pattern matches*, not by narrative verbosity — splitting
@@ -114,24 +128,24 @@ one further means either minting another `glob()` pattern + marker pair (fragmen
 `~/.pa/skills/update-brain/skill.md`'s otherwise-simple 1-glob-to-1-file mapping into
 content-based routing within a single directory) or shrinking per-entry descriptions
 below what a "do not regress" invariant needs. Prefer raising this specific row's ceiling
-again over either of those. `inventory/telegram-bot.md` (2026-08-07, 37 entries across
+again over either of those. The telegram-bot file inventory (2026-08-07, 37 entries across
 `projects/telegram-bot/src/*.ts`) is the first file at this ceiling — if
 `projects/telegram-bot/src/` keeps growing, the next natural fault line is pulling its
 crash-recovery/delivery cluster (`orphan-reaper.ts`, `pending-dispatches.ts`,
 `recovery-gate.ts`, `delivered-store.ts`, `dlq.ts`, `watermark.ts`, `health.ts`) into its
-own `inventory/telegram-bot-reliability.md`, at the cost of the routing complexity above.
+own reliability-side inventory file, at the cost of the routing complexity above.
 
-**Note on the archive-file row**: `backlog/archive-*.md` holds completed `BACKLOG.md`
+**Note on the archive-file row**: the private archive shards hold completed `BACKLOG.md`
 items verbatim, by design (the 2026-08-07 dedupe pass exists specifically because a prior
 half-archived state had already lost the discipline of "one full body, one place" —
 shrinking these bodies to fit a budget would reintroduce that same failure mode). Their
 size tracks how much work shipped in that window, not anything a reader holds in mind —
 nobody reads an archive front to back, they jump to one `#### [AI-nnn]` id via
-`backlog/completed-index.md`. Splitting one further is fine when it falls on a natural
+the internal completion index. Splitting one further is fine when it falls on a natural
 date/cluster boundary (and the resulting file stays a coherent era, not an arbitrary char
 count), but never split PURELY to hit a number — that would separate cross-referenced
 items (e.g. the crash-survival cluster AI-095/096/097/099) that must stay findable
-together. `backlog/archive-2026-06-07.md` (31.7K, dominated by 4 large incident
+together. The 2026-06-07 archive shard (31.7K, dominated by 4 large incident
 write-ups) is the first file to test this judgment and was deliberately left unsplit.
 
 Anthropic's own qualitative test (`code.claude.com/docs/en/best-practices`) is the

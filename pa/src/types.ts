@@ -388,4 +388,10 @@ export interface CommandResult {
    * (2026-08-24, plans/2026-08-24-recall-traces-wave-SPEC.md). Present on every
    * executeWorker return, including failures. */
   runId?: string;
+  /** Raw-send guard (2026-09-04, plans/2026-09-04-raw-send-guard-SPEC.md): tool
+   * commands from this run that hit the Telegram Bot API directly
+   * (api.telegram.org / telegramFetch). Present only when the detector matched
+   * — the bot turns this into one best-effort pa-support alert and never
+   * blocks the reply on it. */
+  rawTelegramSends?: string[];
 }

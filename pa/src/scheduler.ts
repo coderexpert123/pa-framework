@@ -145,7 +145,7 @@ export async function getOverdueSkills(): Promise<OverdueSkill[]> {
 // whether catchup should retry now, wait, or give up until the skill's own
 // cron fires again. Without it, a skill failing every attempt gets relaunched
 // on every catchup pass forever (real incident: pii-audit, 2026-07-19/20,
-// 24+ timeouts over 34 hours — see plans/2026-07-20-autonomous-pii-audit-retry-storm-fix.md).
+// 24+ timeouts over 34 hours — see the 2026-07-20 pii-audit retry-storm fix plan).
 // ---------------------------------------------------------------------------
 
 /** Retry-pacing ladder for consecutive failures. Index = failures-1.

@@ -1,7 +1,7 @@
 /**
  * Worker-edit-audit sweeper — closes dispatch edit-audit windows the bot
  * never closed (crash/restart mid-dispatch) and reports unreserved edits.
- * Design: plans/2026-09-01-ai175-worker-edit-enforcement-SPEC.md.
+ * Design: the AI-175 worker-edit-enforcement spec (2026-09-01).
  *
  * A window whose bot PID is dead closes immediately; one whose PID still
  * looks alive closes once its age exceeds PA_WORKER_EDIT_WINDOW_MAX_MS (2h).

@@ -4,7 +4,7 @@ import { consumeConfirmation, resolveConfirmation } from '../logic.js';
 import type { ConversationState } from '../types.js';
 
 // consumeConfirmation / resolveConfirmation (2026-08-24 buttons program, WP-B0,
-// plans/2026-08-24-buttons-program-SPEC.md correction 3 + §3.1 R2).
+// buttons-program design correction 3 + §3.1 R2, internal).
 //
 // consumeConfirmation is the fix for a real bug: resolveConfirmation's own comment
 // ("Leave pending_action intact — main.ts clears it before dispatch") was never true —

@@ -9,7 +9,7 @@
  *
  * Advisory only (Git LFS / Perforce / SVN precedent: mandatory locking's
  * dominant real-world failure is the abandoned lock, not the contended
- * one). See plans/2026-08-05-concurrent-session-safety.md §4.5.
+ * one). See the 2026-08-05 multi-session safety plan §4.5.
  */
 
 import { randomBytes } from 'crypto';
@@ -43,6 +43,11 @@ export interface ReservationStore {
   reservations: Reservation[];
   /** Release ledger — entries older than RELEASE_LEDGER_TTL_MS are pruned. */
   released?: ReleasedReservation[];
+}
+
+/** Fresh ref-ID for a deferred or direct reservation log line. */
+function newRefId(): string {
+  return `s-${randomBytes(6).toString('hex')}`;
 }
 
 export interface ClaimOptions {
@@ -168,6 +173,8 @@ async function readStore(path: string): Promise<ReservationStore> {
     if (!data || !Array.isArray(data.reservations)) return { reservations: [] };
     return data;
   } catch (err) {
+    // Direct (not deferred) — a read-side recovery decision, not a mutate-outcome
+    // claim; it fires for the read-only callers too, which never go through mutate.
     log('error', 'reservations', 'store unreadable — resetting to empty', {
       refId: `s-${randomBytes(6).toString('hex')}`,
       path,
@@ -177,12 +184,47 @@ async function readStore(path: string): Promise<ReservationStore> {
   }
 }
 
+/** One log line a mutate fn wants written, returned as DATA instead of being
+ * logged in place (AI-177): mutate flushes them only AFTER writeJsonAtomic has
+ * succeeded, still inside the lock. A "claim granted" line can therefore never
+ * precede a store write that failed. */
+interface DeferredLog {
+  level: 'info' | 'warn' | 'error';
+  message: string;
+  context: Record<string, unknown>;
+}
+
+interface MutateResult<T> {
+  result: T;
+  logEntries: DeferredLog[];
+}
+
+/** Marks an error routed out of onCompromised so the retry can tell a lock
+ * compromise apart from any other failure. */
+type TaggedErr = Error & { compromised?: boolean };
+
+/** Settle time before the single compromise retry (AI-177). */
+export const COMPROMISE_RETRY_DELAY_MS = 1_000;
+
 /**
  * Read-modify-write a fresh copy of the store under the file lock. `fn`
- * mutates `store` in place (or reassigns `store.reservations`); whatever it
- * returns becomes the lock's result. The store is always written back,
- * even when `fn` reports a logical failure (e.g. a conflict) — this keeps
- * the write unconditional and the accept/reject decision purely in `fn`.
+ * mutates `store` in place (or reassigns `store.reservations`) and returns its
+ * outcome PLUS its log lines as data ({@link MutateResult}) — `fn` itself must
+ * have no side effects, so that (a) the grant/deny log can be flushed only
+ * after the store write has committed (AI-177), and (b) the compromise retry
+ * below can safely re-run `fn` against a freshly-read store.
+ * Whatever `fn` returns as `result` becomes the lock's result. The store is
+ * always written back, even when `fn` reports a logical failure (e.g. a
+ * conflict) — this keeps the write unconditional and the accept/reject
+ * decision purely in `fn`.
+ *
+ * The file lock is acquired under `compromisedPolicy: 'fail'`: a lock the
+ * heartbeat judged compromised REJECTS this mutate (after one retry, below)
+ * instead of silently continuing unsynchronized — a read-modify-write store
+ * must not write unsynchronized. The rejection routing is deliberately NOT a
+ * throw from onCompromised: proper-lockfile invokes it inside an mtime-update
+ * timer callback, where a throw is an uncaught exception that kills the
+ * process (the AI-096 crash class).
  *
  * In-process calls are additionally serialized through `mutateQueue` before
  * ever touching proper-lockfile (same pattern as log.ts's appendQueue).
@@ -193,18 +235,70 @@ async function readStore(path: string): Promise<ReservationStore> {
  */
 let mutateQueue: Promise<unknown> = Promise.resolve();
 
-function mutate<T>(fn: (store: ReservationStore) => T): Promise<T> {
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function mutate<T>(fn: (store: ReservationStore) => MutateResult<T>): Promise<T> {
   const run = async (): Promise<T> => {
     const path = reservationsPath();
     await ensureFile(path);
-    const release = await lockfile.lock(path, safeLockOptions('reservations', { retries: 5 }));
+
+    const attempt = (): Promise<T> =>
+      new Promise<T>((resolveAttempt, rejectAttempt) => {
+        const opts = safeLockOptions(
+          'reservations',
+          {
+            retries: 5,
+            onCompromised: (err: Error) => {
+              // Route the compromise to THIS attempt's rejection. Never throw
+              // from here — timer context (see safe-lock.ts's header, AI-096).
+              (err as TaggedErr).compromised = true;
+              rejectAttempt(err);
+            },
+          },
+          { compromisedPolicy: 'fail' }
+        );
+        lockfile
+          .lock(path, opts)
+          .then(async (release) => {
+            try {
+              const store = await readStore(path);
+              // fn is side-effect-free (its log lines come back as data), so a
+              // compromise retry can safely re-run it against a fresh read.
+              const { result, logEntries } = fn(store);
+              await writeJsonAtomic(path, store, { spaces: 2 });
+              // AI-177: flush the decision lines ONLY after the store write has
+              // committed — still inside the lock, so a reader cannot observe the
+              // new store state ahead of its "granted"/"denied" log line either.
+              for (const entry of logEntries) {
+                log(entry.level, 'reservations', entry.message, entry.context);
+              }
+              return result;
+            } finally {
+              // Cleanup only: the store write above has already committed (or the
+              // section already failed), so a failing unlock must not turn a
+              // settled outcome into a rejection ('fail' policy makes release
+              // able to surface a compromise here).
+              try {
+                await release();
+              } catch {
+                /* cleanup-only */
+              }
+            }
+          })
+          .then(resolveAttempt, rejectAttempt);
+      });
+
     try {
-      const store = await readStore(path);
-      const result = fn(store);
-      await writeJsonAtomic(path, store, { spaces: 2 });
-      return result;
-    } finally {
-      await release();
+      return await attempt();
+    } catch (err) {
+      if ((err as TaggedErr)?.compromised !== true) throw err;
+      // Compromised lock (heartbeat missed its stale threshold): settle briefly —
+      // the competing writer's own heartbeat usually re-touches or exits — and
+      // retry ONCE against a freshly-read store. A second compromise rethrows.
+      await sleep(COMPROMISE_RETRY_DELAY_MS);
+      return await attempt();
     }
   };
 
@@ -226,20 +320,25 @@ export async function claim(opts: ClaimOptions): Promise<ClaimResult> {
   const paths = opts.paths.map(normalizePath);
   const ttlMinutes = clampTtlMinutes(opts.ttlMinutes);
 
-  return mutate((store) => {
+  return mutate((store): MutateResult<ClaimResult> => {
+    const logEntries: DeferredLog[] = [];
     const active = store.reservations.filter((r) => new Date(r.expiresAt).getTime() > now);
     const conflicts = active.filter(
       (r) => r.session !== opts.session && paths.some((p) => r.paths.some((rp) => pathsOverlap(p, rp)))
     );
 
     if (conflicts.length > 0 && !opts.force) {
-      log('warn', 'reservations', 'claim denied', {
-        refId: `s-${randomBytes(6).toString('hex')}`,
-        session: opts.session,
-        paths,
-        conflicts: conflicts.map((c) => ({ id: c.id, session: c.session })),
+      logEntries.push({
+        level: 'warn',
+        message: 'claim denied',
+        context: {
+          refId: newRefId(),
+          session: opts.session,
+          paths,
+          conflicts: conflicts.map((c) => ({ id: c.id, session: c.session })),
+        },
       });
-      return { ok: false, conflicts };
+      return { result: { ok: false, conflicts }, logEntries };
     }
 
     const reservation: Reservation = {
@@ -255,46 +354,78 @@ export async function claim(opts: ClaimOptions): Promise<ClaimResult> {
     const forced = conflicts.length > 0 && !!opts.force;
 
     if (forced) {
-      log('warn', 'reservations', 'force-claim over active conflict', {
-        refId: `s-${randomBytes(6).toString('hex')}`,
-        session: opts.session,
-        newReservationId: reservation.id,
-        paths,
-        conflicts: conflicts.map((c) => ({ id: c.id, session: c.session, note: c.note })),
+      logEntries.push({
+        level: 'warn',
+        message: 'force-claim over active conflict',
+        context: {
+          refId: newRefId(),
+          session: opts.session,
+          newReservationId: reservation.id,
+          paths,
+          conflicts: conflicts.map((c) => ({ id: c.id, session: c.session, note: c.note })),
+        },
       });
     }
 
-    log('info', 'reservations', 'claim granted', {
-      refId: `s-${randomBytes(6).toString('hex')}`,
-      id: reservation.id,
-      session: opts.session,
-      paths,
-      ttlMinutes,
-      forced,
+    logEntries.push({
+      level: 'info',
+      message: 'claim granted',
+      context: {
+        refId: newRefId(),
+        id: reservation.id,
+        session: opts.session,
+        paths,
+        ttlMinutes,
+        forced,
+      },
     });
 
-    return { ok: true, reservation };
+    return { result: { ok: true, reservation }, logEntries };
   });
 }
 
-/** Extend an existing reservation's expiresAt. Leaves claimedAt and id unchanged. */
+/** Extend an existing reservation's expiresAt. Leaves claimedAt and id unchanged.
+ * When `opts.session` is given it must match the row's owning session — a renewal
+ * by anyone else is refused with null (AI-177: a renew is a WRITE to another
+ * session's coordination row; the id alone is not an ownership proof). */
 export async function renew(
   id: string,
-  opts?: { ttlMinutes?: number; now?: number }
+  opts?: { ttlMinutes?: number; now?: number; session?: string }
 ): Promise<Reservation | null> {
   const now = opts?.now ?? Date.now();
   const ttlMinutes = clampTtlMinutes(opts?.ttlMinutes);
 
   return mutate((store) => {
+    const logEntries: DeferredLog[] = [];
     const entry = store.reservations.find((r) => r.id === id);
-    if (!entry) return null;
+    if (!entry) return { result: null, logEntries };
+
+    if (opts?.session !== undefined && entry.session !== opts.session) {
+      logEntries.push({
+        level: 'warn',
+        message: 'renew denied (owner mismatch)',
+        context: {
+          refId: newRefId(),
+          id: entry.id,
+          ownerSession: entry.session,
+          requestedBy: opts.session,
+        },
+      });
+      return { result: null, logEntries };
+    }
+
     entry.expiresAt = new Date(now + ttlMinutes * MINUTE_MS).toISOString();
-    log('info', 'reservations', 'reservation renewed', {
-      refId: `s-${randomBytes(6).toString('hex')}`,
-      id: entry.id,
-      expiresAt: entry.expiresAt,
+    logEntries.push({
+      level: 'info',
+      message: 'reservation renewed',
+      context: {
+        refId: newRefId(),
+        id: entry.id,
+        expiresAt: entry.expiresAt,
+        renewedBy: opts?.session,
+      },
     });
-    return entry;
+    return { result: entry, logEntries };
   });
 }
 
@@ -327,19 +458,23 @@ export async function release(opts: ReleaseOptions): Promise<{ released: number 
     const cutoff = now - RELEASE_LEDGER_TTL_MS;
     store.released = (store.released ?? []).filter((e) => new Date(e.releasedAt).getTime() > cutoff);
 
-    return { released: before - store.reservations.length };
+    return { result: { released: before - store.reservations.length }, logEntries: [] };
   });
 
   if (result.released > 0) {
     log('info', 'reservations', 'reservation released', {
-      refId: `s-${randomBytes(6).toString('hex')}`,
+      refId: newRefId(),
       id: opts.id,
       session: opts.session,
+      // AI-177: who performed the release — the normal single-owner case leaves
+      // this undefined; forced takeovers print the releasing session, keeping
+      // every release greppable in app.log.jsonl.
+      bySession: opts.bySession,
       releasedCount: result.released,
     });
     if (opts.force) {
       log('warn', 'reservations', "forced release of another session's reservation", {
-        refId: `s-${randomBytes(6).toString('hex')}`,
+        refId: newRefId(),
         id: opts.id,
         owner: opts.ownerSession,
         releasedBy: opts.bySession,
@@ -357,7 +492,7 @@ export async function gcExpired(now: number = Date.now()): Promise<number> {
     store.reservations = store.reservations.filter((r) => new Date(r.expiresAt).getTime() > now);
     const cutoff = now - RELEASE_LEDGER_TTL_MS;
     store.released = (store.released ?? []).filter((e) => new Date(e.releasedAt).getTime() > cutoff);
-    return before - store.reservations.length;
+    return { result: before - store.reservations.length, logEntries: [] };
   });
 
   if (removed > 0) {

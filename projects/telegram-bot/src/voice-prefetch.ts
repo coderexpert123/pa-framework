@@ -6,7 +6,7 @@
  * formatted transcripts without blocking the poll loop.
  *
  * Part of the voice-prefetch + stop/steer flush wave (2026-08-15).
- * Spec: plans/2026-08-15-voice-prefetch-stop-steer-flush-SPEC.md
+ * Spec: internal design record for this wave (2026-08-15).
  */
 
 import { transcribeVoiceMessage, formatTranscriptUserText, formatFailedTranscriptUserText } from './voice.js';

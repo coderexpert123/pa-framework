@@ -1,8 +1,25 @@
+import { randomUUID } from 'crypto';
 import { MAINTENANCE_JOBS, findJob } from '../lib/maintenance/registry.js';
 import { previewJob, runDueJobs } from '../lib/maintenance/runner.js';
 import { readLedger, maintenanceStatePath } from '../lib/maintenance/state.js';
 import type { MaintenanceJobState } from '../lib/maintenance/state.js';
 import { loadConfig } from '../config.js';
+import { blackboard, startLockRenewal } from '../blackboard.js';
+import { log } from '../lib/log.js';
+
+// AI-200 (2026-09-04): `pa maintenance run` and `pa catchup` are both "the pa
+// host's maintenance pass" — the same job bodies behind two entry points — so a
+// manual run takes catchup's OWN blackboard lock resource(s), never a per-job
+// scheme. The runner's IN_FLIGHT guard is per-process and invisible
+// cross-process (runner.ts, AI-196), so without this a manual run can execute a
+// job body concurrently with a catchup tick (destructive prunes racing, doubled
+// D: I/O). Full rationale at runSubcommand.
+const MAINTENANCE_PASS_LOCK_KEYS = ['catchup', 'catchup:topic:default'] as const;
+const MAINTENANCE_RUN_LOCK_AGENT = 'maintenance-run-command';
+// Same bounded wait as catchup's own acquire (catchup.ts:51) — a manual run
+// must not queue indefinitely behind a 1-minute tick; it fails fast and the
+// operator retries.
+const MAINTENANCE_RUN_LOCK_WAIT_MS = 5000;
 
 /** Humanise a millisecond duration, picking the largest unit that divides it
  *  evenly (d > h > m > s > ms); falls back to a decimal in the largest unit
@@ -130,6 +147,11 @@ async function runSubcommand(args: string[]): Promise<void> {
     return;
   }
 
+  // Dry-run deliberately skips the maintenance-pass lock (AI-200): previewJob is
+  // read-only — stat/readdir only, never job.run(), never a ledger write
+  // (proved by maintenance-dryrun.test.ts's "writes nothing" test) — so a
+  // preview racing a live pass mutates nothing and must stay available for
+  // inspecting targets WHILE a pass is running. Only the real run below locks.
   if (dryRun) {
     const previews = await previewJob(job);
     for (const preview of previews) {
@@ -148,36 +170,109 @@ async function runSubcommand(args: string[]): Promise<void> {
     return;
   }
 
-  if (job.host === 'bot') {
-    console.log(`Note: '${job.name}' is a host: 'bot' job — runtime execution requires the Telegram bot process (run ` +
-      `via live bot process). Statically previewing targets with --dry-run is fully supported.`);
+  // AI-200: the run is gated on the SAME lock resource(s) the pass-driving
+  // `pa catchup` invocations hold — one logical resource, two spellings, since
+  // catchup suffixes its lock key with the topic (catchup.ts:48). Every
+  // invocation that drives the maintenance pass holds exactly one of:
+  //   'catchup'               — bare `pa catchup` (posix crontab registration;
+  //                               pass runs when !opts.topic), any manual
+  //                               topic-less run
+  //   'catchup:topic:default' — `catchup --topic default` (the Windows Task
+  //                               Scheduler tick; pass runs when topic ===
+  //                               MAINTENANCE_TOPIC)
+  // 'catchup:topic:reminders' never runs the pass and is correctly NOT
+  // excluded. Verified live 2026-09-04: run-catchup-hidden.vbs runs
+  // `catchup --topic default`. Acquired in fixed order (no deadlock between
+  // two maintenance runs).
+  //
+  // Idiom mirrors catchup.ts:51-123 exactly: bounded acquire →
+  // startLockRenewal heartbeat with onLost → release in finally. On
+  // lock-unavailable the run FAILS LOUD naming the holder rather than running
+  // unlocked — a manual run losing the race must tell the operator to retry,
+  // not double-execute a destructive prune. On lock-LOST-mid-run (renewal's
+  // onLost) the pass cannot be un-run, so — unlike catchup — there is no
+  // mid-run checkpoint; the run completes, then reports the loss loudly and
+  // exits non-zero so a clean exit never masks a possibly-overlapped pass.
+  const contextId = randomUUID();
+  const heldKeys: string[] = [];
+  const renewals: Array<{ stop: () => void }> = [];
+  let lockLost: 'expired' | 'purged' | undefined;
+
+  for (const lockKey of MAINTENANCE_PASS_LOCK_KEYS) {
+    const locked = await blackboard.acquireLock(
+      lockKey, MAINTENANCE_RUN_LOCK_AGENT, process.pid, MAINTENANCE_RUN_LOCK_WAIT_MS, contextId,
+    );
+    if (!locked) {
+      for (const renewal of renewals) renewal.stop();
+      for (const held of heldKeys) {
+        await blackboard.releaseLock(held, MAINTENANCE_RUN_LOCK_AGENT, contextId, { pid: process.pid });
+      }
+      const holder = (await blackboard.getActiveLocks()).find((l) => l.resource === lockKey);
+      const holderDesc = holder ? `${holder.agent} (pid ${holder.pid})` : 'another process';
+      console.error(`Maintenance run refused: lock '${lockKey}' is held by ${holderDesc}.`);
+      console.error(
+        'A `pa catchup` maintenance pass is in flight; the runner\'s in-flight guard cannot see across ' +
+        'processes, so this run must not start. Retry once the pass completes.',
+      );
+      log('warn', 'maintenance', `maintenance run refused — lock held`, { lockKey, holder: holderDesc, job: job.name });
+      process.exitCode = 1;
+      return;
+    }
+    heldKeys.push(lockKey);
+    renewals.push(startLockRenewal(lockKey, MAINTENANCE_RUN_LOCK_AGENT, contextId, {
+      onLost: (reason) => {
+        if (lockLost !== undefined) return;
+        lockLost = reason;
+        log('error', 'maintenance', `maintenance run lock lost mid-run`, { lockKey, reason, job: job.name });
+      },
+    }));
   }
 
-  let maintenanceOverrides: Record<string, { enabled?: boolean; everyMs?: number }> | undefined;
   try {
-    const config = await loadConfig();
-    maintenanceOverrides = config.maintenance;
-  } catch {
-    // No config — run with declared defaults.
+    if (job.host === 'bot') {
+      console.log(`Note: '${job.name}' is a host: 'bot' job — runtime execution requires the Telegram bot process (run ` +
+        `via live bot process). Statically previewing targets with --dry-run is fully supported.`);
+    }
+
+    let maintenanceOverrides: Record<string, { enabled?: boolean; everyMs?: number }> | undefined;
+    try {
+      const config = await loadConfig();
+      maintenanceOverrides = config.maintenance;
+    } catch {
+      // No config — run with declared defaults.
+    }
+
+    const records = await runDueJobs(job.host, [job], {
+      overrides: maintenanceOverrides,
+      onlyJob: job.name,
+      force: true,
+    });
+
+    const record = records[0];
+    if (!record) {
+      console.error(`Job '${job.name}' did not produce a run record.`);
+      process.exitCode = 1;
+      return;
+    }
+
+    console.log(`${record.name}: ${record.outcome}`);
+    if (record.touched !== undefined) console.log(`  touched: ${record.touched}`);
+    if (record.error) console.log(`  error: ${record.error}`);
+    if (record.detail) console.log(`  detail: ${JSON.stringify(record.detail)}`);
+
+    if (lockLost !== undefined) {
+      console.error(
+        `WARNING: the maintenance-pass lock (${MAINTENANCE_PASS_LOCK_KEYS.join(' / ')}) was lost mid-run (${lockLost}) — ` +
+        'this pass may have overlapped another holder. Check the ledger before re-running.',
+      );
+      process.exitCode = 1;
+    }
+  } finally {
+    for (const renewal of renewals) renewal.stop();
+    for (const held of heldKeys) {
+      await blackboard.releaseLock(held, MAINTENANCE_RUN_LOCK_AGENT, contextId, { pid: process.pid });
+    }
   }
-
-  const records = await runDueJobs(job.host, [job], {
-    overrides: maintenanceOverrides,
-    onlyJob: job.name,
-    force: true,
-  });
-
-  const record = records[0];
-  if (!record) {
-    console.error(`Job '${job.name}' did not produce a run record.`);
-    process.exitCode = 1;
-    return;
-  }
-
-  console.log(`${record.name}: ${record.outcome}`);
-  if (record.touched !== undefined) console.log(`  touched: ${record.touched}`);
-  if (record.error) console.log(`  error: ${record.error}`);
-  if (record.detail) console.log(`  detail: ${JSON.stringify(record.detail)}`);
 }
 
 export async function maintenanceCommand(args: string[]): Promise<void> {
