@@ -38,7 +38,7 @@ function makeRecord(overrides: Partial<PendingDispatch> = {}): PendingDispatch {
     messageId: 900,
     userText: 'go yes on that plan',
     startedAt: new Date().toISOString(),
-    cwd: 'D:/Personal Assistant',
+    cwd: 'C:/pa-checkout',
     session: { session_id: 'abc-123', worker: 'claude', started_at: new Date().toISOString() },
     ...overrides,
   };
@@ -128,7 +128,7 @@ describe('pending-dispatches store', () => {
     _resetPendingDispatchesForTest();
     const listed = await listPendingDispatches();
     assert.equal(listed.length, 1);
-    assert.equal(listed[0].cwd, 'D:/Personal Assistant');
+    assert.equal(listed[0].cwd, 'C:/pa-checkout');
   });
 
   // WP1: updatePendingDispatch tests
@@ -183,7 +183,7 @@ describe('pending-dispatches store', () => {
     assert.equal(updated.userText, '[Voice message] hello');
     assert.equal(updated.userTextSettled, true);
     // Original fields preserved
-    assert.equal(updated.cwd, 'D:/Personal Assistant');
+    assert.equal(updated.cwd, 'C:/pa-checkout');
     assert.equal(updated.session?.session_id, 'abc-123');
   });
 

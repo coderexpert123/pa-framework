@@ -161,7 +161,9 @@ topic_defaults:
         return jsonOk(true);
       };
 
-      // Deliberately NOT awaited to completion — see the file header comment.
+      // Deliberately NOT awaited to completion — see the file header comment. Also deliberately
+      // NOT latched (trackPendingWork): the loop dies via the REAL process.exit(0) before afterEach
+      // runs, so a held latch only hands that exit the window to darken the file mid-TAP.
       runPollLoop('token', [ALLOWED_CHAT], state, {}, controller.signal, async () => {}).catch(() => {});
 
       // The cf:y press has been answered, and the resulting synthetic "yes" has been

@@ -70,7 +70,7 @@ function makeRequest(overrides: Partial<VoiceWorkerRequest> = {}): VoiceWorkerRe
 
 function makeDeps(env: NodeJS.ProcessEnv, overrides: Partial<VoiceWorkerClientDeps> = {}): VoiceWorkerClientDeps {
   return {
-    repoRoot: 'D:/Personal Assistant',
+    repoRoot: 'C:/pa-checkout',
     env,
     ...overrides,
   };
@@ -139,12 +139,12 @@ describe('readVoiceWorkerState', () => {
 
 describe('voiceWorkerScriptPath', () => {
   it('defaults to <repoRoot>/pa/scripts/voice_worker.py', () => {
-    const p = voiceWorkerScriptPath(makeEnv(), 'D:/Personal Assistant');
-    assert.equal(p, join('D:/Personal Assistant', 'pa', 'scripts', 'voice_worker.py'));
+    const p = voiceWorkerScriptPath(makeEnv(), 'C:/pa-checkout');
+    assert.equal(p, join('C:/pa-checkout', 'pa', 'scripts', 'voice_worker.py'));
   });
 
   it('honors PA_VOICE_WORKER_SCRIPT override', () => {
-    const p = voiceWorkerScriptPath(makeEnv({ PA_VOICE_WORKER_SCRIPT: 'C:/custom/worker.py' }), 'D:/Personal Assistant');
+    const p = voiceWorkerScriptPath(makeEnv({ PA_VOICE_WORKER_SCRIPT: 'C:/custom/worker.py' }), 'C:/pa-checkout');
     assert.equal(p, 'C:/custom/worker.py');
   });
 });

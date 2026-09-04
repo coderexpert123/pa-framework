@@ -93,10 +93,18 @@ export function resolveEveryMs(job: MaintenanceJob, override?: { everyMs?: numbe
   return o;
 }
 
-// Per-process in-flight guard. The `pa` host is additionally serialised by
-// catchup's blackboard lock, so this mainly matters for concurrent
-// `pa maintenance run` invocations and the future bot host (which shares this
-// module but runs in a different, always-on process).
+// Per-process in-flight guard (AI-196 adjudication, 2026-09-03). It can only
+// fire skip:in-flight when two overlapping runDueJobs passes share ONE process.
+// The pa host never overlaps in-process: each pa-host process makes exactly one
+// awaited pass — `pa catchup` (which holds its blackboard lock around the call)
+// or `pa maintenance run` (one forced, lock-free pass in its own process) — so
+// on pa this set is empty at every production decision and the guard is purely
+// a same-process backstop, exercised by tests and held ready for any future
+// in-process caller. The bot host IS a multi-pass process; it queues passes
+// behind each other in bot main.ts (140db6d). Cross-process overlap (a catchup
+// tick × `pa maintenance run`) is possible and invisible here — that is a
+// caller-level mutual-exclusion question, not a due-check-loss risk, because
+// with no shared set no skip:in-flight is ever recorded.
 const IN_FLIGHT = new Set<string>();
 
 export interface RunDueJobsOptions {

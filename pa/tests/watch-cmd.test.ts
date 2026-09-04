@@ -229,6 +229,86 @@ describe('watchCommand', () => {
     });
   });
 
+  // WP-D2 B.7 (2026-09-02, plans/2026-09-02-topic-handover-WAVE2-SPEC.md §3.4 item 7a):
+  // `pa watch re-register <id>` copies a TERMINAL row's spec into a fresh active watch
+  // via the existing add path; unknown/active/cancelled ids are refused (exit 3 — the
+  // documented store-rejection code, per this file's header convention).
+  describe('re-register', () => {
+    async function addAndTerminal(description: string, status: 'reported' | 'expired' | 'cancelled' | 'check-failed') {
+      await watchCommand([
+        'add', '--desc', description, '--type', 'file_exists',
+        '--path', absPath(`${description.replace(/\s+/g, '-')}.txt`), '--chat-id', '1',
+      ]);
+      const all = await listWatchJobs();
+      const row = all.find((w) => w.description === description)!;
+      // Force a terminal status directly in the store file — re-register's contract
+      // is about TERMINAL rows, however they got there.
+      const { readFile, writeFile } = await import('fs/promises');
+      const storePath = join(tempDir, 'watch-jobs.json');
+      const store = JSON.parse(await readFile(storePath, 'utf8'));
+      const record = store.watches.find((w: { id: string }) => w.id === row.id);
+      record.status = status;
+      record.terminalAt = new Date().toISOString();
+      record.outcome = 'test-seeded terminal';
+      await writeFile(storePath, JSON.stringify(store, null, 2), 'utf8');
+      return row;
+    }
+
+    it('copies a terminal row into a fresh active watch, exit 0', async () => {
+      const original = await addAndTerminal('re-register me', 'expired');
+
+      consoleLogOutput = [];
+      const code = await watchCommand(['re-register', original.id]);
+      assert.equal(code, 0);
+      assert.match(joinedLog(), new RegExp(`Watch w-[0-9a-f]{8} re-registered from ${original.id}`));
+
+      const all = await listWatchJobs();
+      assert.equal(all.length, 2, 'the terminal original stays for audit');
+      const fresh = all.find((w) => w.id !== original.id && w.status === 'active')!;
+      assert.ok(fresh, 'a new ACTIVE row exists');
+      assert.equal(fresh.description, original.description);
+      assert.deepEqual(fresh.check, original.check);
+      assert.equal(fresh.intervalMs, original.intervalMs);
+      assert.equal(fresh.source.chatId, original.source.chatId);
+      assert.equal(fresh.source.threadId, original.source.threadId);
+      // deadline span reproduced from the original createdAt→deadlineAt window
+      const originalSpanMs = Date.parse(original.deadlineAt) - Date.parse(original.createdAt);
+      const freshSpanMs = Date.parse(fresh.deadlineAt) - Date.parse(fresh.createdAt);
+      assert.ok(Math.abs(freshSpanMs - originalSpanMs) < 5_000, `deadline span copied (${freshSpanMs} vs ${originalSpanMs})`);
+      assert.notEqual(fresh.id, original.id);
+    });
+
+    it('unknown id exits 3 with a clear line', async () => {
+      const code = await watchCommand(['re-register', 'w-deadbeef']);
+      assert.equal(code, 3);
+      assert.match(joinedError(), /Error: unknown watch id w-deadbeef/);
+    });
+
+    it('still-active id exits 3 — nothing to re-register', async () => {
+      await watchCommand([
+        'add', '--desc', 'still active', '--type', 'file_exists',
+        '--path', absPath('still-active.txt'), '--chat-id', '1',
+      ]);
+      const all = await listWatchJobs();
+      const code = await watchCommand(['re-register', all[0].id]);
+      assert.equal(code, 3);
+      assert.match(joinedError(), /still active/);
+    });
+
+    it('cancelled id exits 3 — cancelling was an explicit kill', async () => {
+      const original = await addAndTerminal('explicitly cancelled', 'cancelled');
+      const code = await watchCommand(['re-register', original.id]);
+      assert.equal(code, 3);
+      assert.match(joinedError(), /was cancelled/);
+    });
+
+    it('missing id argument exits 2 with the usage block', async () => {
+      const code = await watchCommand(['re-register']);
+      assert.equal(code, 2);
+      assert.match(joinedError(), /Usage:/);
+    });
+  });
+
   it('no subcommand exits 2 with the usage block', async () => {
     const code = await watchCommand([]);
     assert.equal(code, 2);

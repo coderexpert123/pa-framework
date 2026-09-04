@@ -294,7 +294,7 @@ describe('buildReport', () => {
       });
       const report = buildReport([], [], 0, 0, census);
       assert.match(report, /\*Alert hygiene \(1\)\*/);
-      assert.match(report, /bg-leak.*sent 88, 2 distinct bodies.*escalate \/ merge \/ mute/);
+      assert.match(report, /bg-leak.*sent 88, 2 distinct bodies.*mute via button or `pa fix`/);
 
       const emptyReport = buildReport([], [], 0, 0, makeCensus({ families: [] }));
       assert.doesNotMatch(emptyReport, /Alert hygiene/);

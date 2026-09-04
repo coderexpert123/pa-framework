@@ -41,6 +41,8 @@ import { writeJsonAtomic } from './atomic-write.js';
 import { log } from './log.js';
 import { redactSecrets } from './redact.js';
 import { notifyUser } from './notify.js';
+import { appendTopicEvent } from './topic-events.js';
+import { appendTask, TOPIC_TASK_MAX_TITLE_CHARS } from './topic-tasks.js';
 import { areProcessesAlive } from '../process-tree.js';
 
 // ---------------------------------------------------------------------------
@@ -134,7 +136,11 @@ export interface WatchEvaluation {
 
 export type AliveFn = (pids: number[]) => Promise<Map<number, boolean>>;
 
-/** Structural subset of notifyUser — do not widen. */
+/** Structural subset of notifyUser — §1.10 AMENDMENT (WP-D2 B.7, 2026-09-02): widened
+ *  by exactly ONE optional keyboard param. The terminal check-failed and expired
+ *  reports carry the wt: re-register button
+ *  (plans/2026-09-02-topic-handover-WAVE2-SPEC.md §3.4 item 7b); nothing else about
+ *  the subset changes. */
 export type WatchNotifyFn = (
   subject: string,
   body: string,
@@ -142,6 +148,7 @@ export type WatchNotifyFn = (
     dedupKey?: string;
     topic?: { chat_id: string; thread_id?: number };
     severity?: 'info' | 'warn' | 'error';
+    replyMarkup?: Record<string, unknown>;
   },
 ) => Promise<{ sent: boolean; suppressed: boolean }>;
 
@@ -536,9 +543,23 @@ function updateWatch(id: string, patch: Partial<WatchJob>): Promise<void> {
 }
 
 /**
- * Send one terminal report. Redacts the body before the notify call
- * (SPEC §2.6) and never throws — a notify rejection maps to a not-delivered
- * result so the caller's send-then-persist decision still runs.
+ * The wt: re-register keyboard attached to terminal check-failed/expired reports
+ * (WP-D2 B.7). Watch ids are generator-controlled (`w-` + 8 lowercase hex), so the
+ * data always parses against WT_RE — no emitter-side grammar guard needed (unlike
+ * chains.ts, where the chain name comes from a user file).
+ */
+function reRegisterKeyboard(id: string): Record<string, unknown> {
+  return { inline_keyboard: [[{ text: '🔁 Re-register watch', callback_data: `wt:${id}:r` }]] };
+}
+
+/**
+ * Send one terminal report. The body reaches the operator's own chat UNREDACTED
+ * (AI-184, 2026-09-03 — supersedes SPEC §2.6's send-side scrub for the delivered
+ * body: redacting here scrubbed the operator's name out of their own chat). The
+ * scrub survives on the persistence side: the stored `outcome` stays redacted.
+ * Never throws — a notify rejection maps to a not-delivered result so the
+ * caller's send-then-persist decision still runs.
+ * replyMarkup (WP-D2 B.7) rides the send when provided.
  */
 async function sendReport(
   subject: string,
@@ -547,17 +568,68 @@ async function sendReport(
   severity: 'info' | 'warn' | 'error',
   topic: { chat_id: string; thread_id?: number } | undefined,
   notify: WatchNotifyFn,
+  replyMarkup?: Record<string, unknown>,
 ): Promise<{ delivered: boolean; outcome: string }> {
-  const body = redactSecrets(rawBody) as string;
+  const body = rawBody;
   let result: { sent: boolean; suppressed: boolean };
   try {
-    result = await notify(subject, body, { dedupKey, topic, severity });
+    result = await notify(subject, body, { dedupKey, topic, severity, replyMarkup });
   } catch {
     result = { sent: false, suppressed: false };
   }
   const delivered = result.sent === true || result.suppressed === true;
   const outcome = (redactSecrets(`${subject}\n${body}`) as string).slice(0, OUTCOME_MAX_CHARS);
   return { delivered, outcome };
+}
+
+/**
+ * WP-D2 ADDITION (operator directive, 2026-09-02): a terminal watch outcome must
+ * ACT, not just report. Success ⇒ one `wave_done` event on the registering topic
+ * (the report itself is the notification — no task). Failure ⇒ a `task_failed`
+ * event AND an auto-filed reaction task to the registering topic, so the bot's
+ * executor lane dispatches the diagnosis instead of the report dying unread, then
+ * a `task_queued` event for the new task. ALL best-effort: never throws, never
+ * blocks the tick, and adds NO fields to WatchTickResult (its shape is frozen —
+ * the 'never throws when store path is a directory' test deepEquals it).
+ */
+async function actOnTerminalOutcome(w: WatchJob, failureReason: string | null): Promise<void> {
+  const chatId = Number(w.source.chatId);
+  const threadId = w.source.threadId;
+  if (!Number.isFinite(chatId)) return; // never a valid topic target
+  try {
+    if (failureReason === null) {
+      await appendTopicEvent(chatId, threadId, {
+        kind: 'wave_done',
+        ref: w.id,
+        detail: w.description,
+      });
+      return;
+    }
+    await appendTopicEvent(chatId, threadId, {
+      kind: 'task_failed',
+      ref: w.id,
+      detail: failureReason,
+    });
+    // Title <=80 chars single line; description is already stored single-line but
+    // normalize whitespace anyway before the slice.
+    const desc = w.description.replace(/\s+/g, ' ').trim();
+    const title = `Watch ${w.id} failed: ${desc}`.slice(0, TOPIC_TASK_MAX_TITLE_CHARS);
+    const reg = await appendTask(chatId, threadId, {
+      title,
+      prompt: `Your watch ${w.id} failed its check — diagnose, retry, or ask the operator`,
+      createdBy: 'watch-system',
+    });
+    await appendTopicEvent(chatId, threadId, {
+      kind: 'task_queued',
+      ref: reg.id,
+      detail: reg.deduped ? `auto-filed by watch ${w.id} (deduped)` : `auto-filed by watch ${w.id}`,
+    });
+  } catch (err: any) {
+    log('warn', 'watch-jobs', 'terminal-outcome action failed (best-effort)', {
+      id: w.id,
+      error: String(err?.message ?? err),
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -612,6 +684,9 @@ export async function runWatchTick(opts: RunWatchTickOptions = {}): Promise<Watc
           lastError: 'terminal send never confirmed within 3 days of deadline',
         });
         result.forced++;
+        // ADDITION failure lane: the watch is terminaled regardless of send
+        // delivery here, so the reaction task files unconditionally too.
+        await actOnTerminalOutcome(w, 'terminal send never confirmed within 3 days of deadline');
         continue;
       }
 
@@ -630,6 +705,7 @@ export async function runWatchTick(opts: RunWatchTickOptions = {}): Promise<Watc
             'warn',
             topic,
             notify,
+            reRegisterKeyboard(w.id),
           );
           if (delivered) {
             await updateWatch(w.id, {
@@ -641,6 +717,8 @@ export async function runWatchTick(opts: RunWatchTickOptions = {}): Promise<Watc
               outcome,
             });
             result.failed++;
+            // ADDITION failure lane (WP-D2, 2026-09-02): the executor lane reacts.
+            await actOnTerminalOutcome(w, `5 consecutive check errors: ${lastError}`);
           } else {
             await updateWatch(w.id, { lastCheckedAt: nowIso, consecutiveErrors: errors, lastError });
           }
@@ -672,6 +750,9 @@ export async function runWatchTick(opts: RunWatchTickOptions = {}): Promise<Watc
             outcome,
           });
           result.reported++;
+          // ADDITION success lane (WP-D2, 2026-09-02): the report IS the
+          // notification — only the wave_done event is added.
+          await actOnTerminalOutcome(w, null);
         } else {
           await updateWatch(w.id, {
             lastCheckedAt: nowIso,
@@ -693,6 +774,7 @@ export async function runWatchTick(opts: RunWatchTickOptions = {}): Promise<Watc
           'warn',
           topic,
           notify,
+          reRegisterKeyboard(w.id),
         );
         if (delivered) {
           await updateWatch(w.id, {
@@ -703,6 +785,9 @@ export async function runWatchTick(opts: RunWatchTickOptions = {}): Promise<Watc
             outcome,
           });
           result.expired++;
+          // ADDITION failure lane (WP-D2, 2026-09-02): expiry is a terminal
+          // failure to complete — the executor lane reacts.
+          await actOnTerminalOutcome(w, `deadline ${w.deadlineAt} passed without completing`);
         } else {
           await updateWatch(w.id, { lastCheckedAt: nowIso, consecutiveErrors: 0 });
         }

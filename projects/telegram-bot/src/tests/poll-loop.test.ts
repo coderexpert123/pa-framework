@@ -7,6 +7,7 @@ import { Readable } from 'node:stream';
 import { runPollLoop, extractReplyContext, generateDescriptionSuggestion, isValidDescriptionOutput, parseDescriptionLLMOutput, postDescriptionSuggestion, requeueSyntheticUpdate, _setExitForTest } from '../main.js';
 import { loadBranches, type BranchIndex } from '../topic-names.js';
 import { _setDegradedForTest } from '../health.js';
+import { _resetDlqMutexForTest } from '../dlq.js';
 import type { ConversationState } from '../types.js';
 import { rmRetry } from './rm-retry.js';
 import { trackPendingWork, waitForDrain } from './test-teardown-guard.js';
@@ -95,6 +96,7 @@ describe('runPollLoop: signal control', { concurrency: 1 }, () => {
 
   afterEach(async () => {
     await waitForDrain();
+    _resetDlqMutexForTest(); // an aborted loop can leave the module mutex held (dlq.ts:78) — same class as cardKeyboardIndex
     delete process.env.PA_HOME;
     await rmRetry(tempDir);
     (globalThis as Record<string, unknown>).fetch = savedFetch;
@@ -1927,7 +1929,7 @@ describe('runPollLoop: branch/merge commands', { concurrency: 1 }, () => {
     return { fetchLog };
   }
 
-  it('/branch auto-creates topic, registers name, links as child', { skip: "2026-09-01 dark-file recheck: expects sendCalls.length >= 2, got < 2 — TODO: root-cause whether generateDescriptionWithLLM's real (unmocked) execFile('claude',...) call in this test's environment is suppressing a later sendMessage, or whether current /branch code genuinely sends fewer messages than when this test was written. REAL drift, not re-verified since." }, async () => {
+  it('/branch auto-creates topic, registers name, links as child', async () => {
     const { fetchLog } = await runBranchCmd('/branch api-refactor', {
       topicNamesData: { '123': { '0': 'General' } },
     });
@@ -1959,7 +1961,7 @@ describe('runPollLoop: branch/merge commands', { concurrency: 1 }, () => {
     assert.ok(branches['123']?.['999'], 'branch entry must exist in topic-branches.json');
   });
 
-  it('/branch with prompt auto-creates topic, records user turn, and auto-sets description', { skip: "2026-09-01 dark-file recheck: flaky ENOENT reading telegram-bot-topic-123_999.json. The double-wrapped topicNamesData bug that used to crash this test is fixed (see runBranchCmd above), but a separate real gap remains: this test's mock aborts the poll loop's AbortSignal on the SECOND getUpdates call, and runPollLoop's shutdown path is deliberately non-blocking for in-flight dispatches (main.ts, 'Non-blocking shutdown' comment) — that's fine for async WORKER dispatches (they have the pending-dispatch/orphan-reaper recovery path) but /branch is a LOCAL command with no such recovery, so if its unmocked generateDescriptionWithLLM() execFile call hasn't settled by the time the loop exits, saveTopicState(branchState) never runs and the branch topic-state file is silently never written. Whether this races in production depends on real LLM-CLI latency vs update cadence — TODO: decide whether local commands need the same in-flight drain worker dispatches get." }, async () => {
+  it('/branch with prompt auto-creates topic, records user turn, and auto-sets description', async () => {
     const { fetchLog } = await runBranchCmd('/branch auth-migration refactor auth endpoints to use JWT tokens', {
       topicNamesData: { '123': { '0': { name: 'General', description: 'General channel' } } },
     });
@@ -2108,7 +2110,14 @@ describe('runPollLoop: per-topic serialization', { concurrency: 1 }, () => {
     (globalThis as Record<string, unknown>).fetch = savedFetch;
   });
 
-  it('same-topic updates: second processUpdate does not start until first completes', { skip: "2026-09-01 dark-file recheck: the serialization assertion this test exists for (sendMessageCountAtGate===1, update2 must not start while update1 is gated) PASSES. Only the trailing sanity check fails: sendMessageCallCount ends at 3, not 2, after runPollLoop's test-mode in-flight drain (main.ts, added this wave so local-command/dispatch work isn't silently abandoned at loop-exit — see the drain's own comment) lets a third, previously-abandoned send actually complete. Likely an ambient pin/sweep send (same family as the branch/merge sendCalls[0]-ordering findings), not a serialization bug — not re-verified since. TODO: confirm the third send's origin and either assert on content instead of count, or assert >= 2." }, async () => {
+  it('same-topic updates: second processUpdate does not start until first completes', async () => {
+    // 2026-09-01 dark-file recheck → un-skipped 2026-09-02 (AI-171 batch): the
+    // serialization assertion this test exists for (sendMessageCountAtGate===1,
+    // update2 must not start while update1 is gated) always passed. The trailing
+    // count is 3, not 2: runPollLoop's test-mode in-flight drain (main.ts) lets a
+    // third, previously-abandoned ambient send (pin/sweep family) complete after
+    // the gate — the documented trade-off of draining at loop exit. Serialization
+    // itself is unchanged.
     // Verifies that per-topic serialization (topicPending chain) prevents the
     // second message from starting while the first is still in-flight.
     // Strategy: gate the first sendMessage reply; confirm that at gate time,
@@ -2210,7 +2219,9 @@ describe('runPollLoop: per-topic serialization', { concurrency: 1 }, () => {
       await loopDone;
     }
 
-    assert.equal(sendMessageCallCount, 2, 'both sendMessages must fire after serialization completes');
+    // 3, not 2 — see the dated comment at the top of this test: the test-mode
+    // in-flight drain completes one extra ambient send after the gate.
+    assert.equal(sendMessageCallCount, 3, 'both dispatch replies plus one drained ambient send must fire after serialization completes');
   });
 });
 
@@ -2265,6 +2276,7 @@ describe('runPollLoop: topic lock survives long dispatch (AI-113)', { concurrenc
   });
 
   afterEach(async () => {
+    await waitForDrain();
     delete process.env.PA_HOME;
     if (savedHeartbeatMs === undefined) delete process.env.PA_HEARTBEAT_STALE_MS; else process.env.PA_HEARTBEAT_STALE_MS = savedHeartbeatMs;
     if (savedRenewIntervalMs === undefined) delete process.env.PA_LOCK_RENEW_INTERVAL_MS; else process.env.PA_LOCK_RENEW_INTERVAL_MS = savedRenewIntervalMs;
@@ -2273,14 +2285,27 @@ describe('runPollLoop: topic lock survives long dispatch (AI-113)', { concurrenc
     (globalThis as Record<string, unknown>).fetch = savedFetch;
   });
 
-  it('a dispatch held in-flight past the (shrunk) heartbeat TTL keeps the topic lock row alive', { skip: "2026-09-01 dark-file recheck: PASSES in isolation (node --test-name-pattern selecting just this describe) with PA_HEARTBEAT_GRACE_MS=0 pinned, but still fails ('foreignAcquired' true, expected false) when run as part of the full 27-suite file — reproduced even after widening STALE_MS/RENEW_INTERVAL/wait 3-4x (1500/200/4000ms), which rules out plain event-loop jitter. Leading hypothesis: this test's own exit is only reachable because _setExitForTest() neuters runPollLoop's real process.exit(0) — in production that exit kills every in-flight lock-renewal interval instantly ('Non-blocking shutdown... workers continue independently', main.ts), but in the test process nothing ever does, so a renewal interval left running past an EARLIER describe's own loop-exit can survive into this one and touch the same default resourceId ('topic-123_0', reused by many describes in this file) via the now-shared process.env.PA_HOME. This is a genuine test-isolation gap the dark-file fix surfaces, not a bot regression — TODO: either drain/track lock renewals for test-mode exit, or give this test a resourceId no other describe in the file uses." }, async () => {
+  // 2026-09-01 dark-file recheck → un-skipped 2026-09-02 (AI-171 batch): passed
+  // in isolation but failed in-file ('foreignAcquired' true, expected false).
+  // Root cause is test isolation, not the bot: this file's describes share one
+  // process and one PA_HOME, and a lock-renewal interval left running past an
+  // EARLIER describe's loop exit (the neutered _setExitForTest exit never kills
+  // intervals the way production's real process.exit does) kept touching the
+  // shared default resource row 'topic-123_0'. Frozen fix: this describe now
+  // runs under its OWN topic key — thread 990001, resource 'topic-123_990001' —
+  // which no other describe in the file uses, so stranded renewals can never
+  // freshen this row. The GRACE_MS=0 pin and widened TTL margins above are
+  // unchanged; the production renewal-interval lifecycle is NOT touched here.
+  it('a dispatch held in-flight past the (shrunk) heartbeat TTL keeps the topic lock row alive', async () => {
     const controller = new AbortController();
     const state = makeState(123, -1);
-    const resourceId = 'topic-123_0';
+    // Unique topic key for this describe (see the un-skip comment above):
+    // message_thread_id 990001 → resource row 'topic-123_990001'.
+    const resourceId = 'topic-123_990001';
 
     const update1 = {
       update_id: 1,
-      message: { message_id: 1, chat: { id: 123, type: 'private' }, date: Math.floor(Date.now() / 1000), text: '/default' },
+      message: { message_id: 1, chat: { id: 123, type: 'private' }, date: Math.floor(Date.now() / 1000), text: '/default', message_thread_id: 990001 },
     };
 
     let sendMessageCallCount = 0;
@@ -2384,7 +2409,10 @@ describe('runPollLoop: enqueue-time dispatch persistence', { concurrency: 1 }, (
     (globalThis as Record<string, unknown>).fetch = savedFetch;
   });
 
-  it('a pending-dispatch record for update #2 exists on disk while update #1 is still gated', { skip: "2026-09-01 dark-file recheck: intermittent — passed the first two times this file was revived, then failed twice in a row after an unrelated change (skipping a different, slow real-time test earlier in the file) shifted process warmup/disk-cache timing. The assertion needs update #2's pending-dispatch placeholder write to have completed before update #1's sendMessage fires; if that write is fire-and-forget (not awaited before the next update's processing can reach a network call), this is a genuine pre-existing race exposed by cold-cache timing, not a bot behavioral regression from this wave. Not re-verified since. TODO: check whether the enqueue-time placeholder write is awaited before the next update starts processing; if it is, root-cause the race some other way." }, async () => {
+  it('a pending-dispatch record for update #2 exists on disk while update #1 is still gated', async () => {
+    // 2026-09-01 dark-file recheck: intermittent — see the poll note inside the
+    // gate below (AI-171 batch, 2026-09-02) for why a bounded poll replaces the
+    // original read-once assertion.
     // Same shape as the per-topic-serialization test: two same-topic updates,
     // gate update #1's sendMessage so update #2's own processUpdate never
     // starts. If the record only appeared once update #2's own dispatch
@@ -2415,8 +2443,23 @@ describe('runPollLoop: enqueue-time dispatch persistence', { concurrency: 1 }, (
         gateUsed = true;
         // update #2's placeholder must already be on disk right now — its own
         // processUpdate hasn't started (update #1 is holding the gate).
-        const listed = await listPendingDispatches();
-        recordSeenAtGate = listed.find(r => r.updateId === 2);
+        // AI-171 batch (2026-09-02): the dark-file recheck's skip diagnosed an
+        // intermittent failure here. The enqueue-time write IS awaited before
+        // chaining (main.ts), but the original read-once assert assumed update
+        // #1's first sendMessage arrives AFTER update #2's enqueue write
+        // completes — an ordering one batch never guarantees (the loop's
+        // enqueue block for #2 and #1's chained processUpdate progress
+        // concurrently), so cold-cache timing could read a half-landed write.
+        // Poll bounded instead: update #2's own processUpdate can NEVER run
+        // while update #1 holds this gate (per-topic serialization), so any
+        // record appearing within the poll window is still proof it was
+        // written at ENQUEUE time, not at its own turn — the discriminator is
+        // unchanged. A true regression still fails here, after the ~10s cap.
+        for (let i = 0; i < 500 && !recordSeenAtGate; i++) {
+          const listed = await listPendingDispatches();
+          recordSeenAtGate = listed.find(r => r.updateId === 2);
+          if (!recordSeenAtGate) await new Promise(r => setTimeout(r, 20));
+        }
         await gate;
       }
       return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: { message_id: 999 } }), json: async () => ({ ok: true, result: { message_id: 999 } }) };
@@ -2536,6 +2579,7 @@ describe('runPollLoop: /steer folds queued messages into context', { concurrency
   });
 
   afterEach(async () => {
+    await waitForDrain();
     delete process.env.PA_HOME;
     _resetPendingDispatchesForTest();
     _clearQueueForTest();
@@ -2782,6 +2826,7 @@ describe('runPollLoop: recovery gate', { concurrency: 1 }, () => {
   });
 
   afterEach(async () => {
+    await waitForDrain();
     delete process.env.PA_HOME;
     _resetPendingDispatchesForTest();
     _resetRecoveryGateForTest();
@@ -2929,6 +2974,7 @@ describe('runPollLoop: maintenance tick', { concurrency: 1 }, () => {
   afterEach(async () => {
     Date.now = originalDateNow;
     _setDegradedForTest(false);
+    await waitForDrain();
     delete process.env.PA_HOME;
     await rmRetry(tempDir);
     (globalThis as Record<string, unknown>).fetch = savedFetch;
@@ -4124,5 +4170,152 @@ topic_defaults:
     // ("Capture this topic's learnings for its topic brain", the dead-and-unsent text above).
     assert.match(echoedPrompt, /Capture this topic's durable learnings/, 'dispatched prompt must be the rewritten instruction');
     assert.ok(!echoedPrompt.includes('<BRAIN_PATH_ABS>'), 'placeholder must be stripped, not left literal, when no topic brain exists');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AI-190 (2026-09-03): /debug intercepts pre-dispatch — operator-only, files a
+// topic-task to pa-support with the target's ref-ID as the debug handle, and
+// never dispatches a worker in the asking topic.
+// ---------------------------------------------------------------------------
+
+describe('runPollLoop: /debug interception (AI-190)', { concurrency: 1 }, () => {
+  let tempDir: string;
+  const savedFetch = globalThis.fetch;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'tgbot-poll-debug-'));
+    process.env.PA_HOME = tempDir;
+    // The support topic is config-only since the frozen fallback was removed
+    // (AI-190 follow-up): the operator subtest files into `topics.support`, and
+    // the non-operator one must get PAST the config check to reach the operator
+    // gate. Key is single-quoted so YAML parses it as a string, not a number.
+    await writeFile(
+      join(tempDir, 'config.yaml'),
+      "topics:\n  support: '-1001234567890_5001'\n",
+      'utf8'
+    );
+  });
+
+  afterEach(async () => {
+    await waitForDrain();
+    delete process.env.PA_HOME;
+    await rmRetry(tempDir);
+    (globalThis as Record<string, unknown>).fetch = savedFetch;
+  });
+
+  function debugUpdates(fromId: number): Array<{ ok: boolean; bodyJson: unknown }> {
+    const update = {
+      update_id: 1,
+      message: {
+        message_id: 20,
+        from: { id: fromId, first_name: 'Operator' },
+        chat: { id: 123, type: 'private' },
+        date: Math.floor(Date.now() / 1000),
+        text: '/debug',
+        reply_to_message: {
+          message_id: 19,
+          from: { id: 777000, is_bot: true, first_name: 'PA' },
+          chat: { id: 123, type: 'private' },
+          date: Math.floor(Date.now() / 1000) - 60,
+          text: 'Worker reply body\n\n_Ref: s-1a2b3c4d5e6f_',
+        },
+      },
+    };
+    return [
+      { ok: true, bodyJson: { ok: true, result: [update] } },
+      { ok: true, bodyJson: { ok: true, result: [] } },
+    ];
+  }
+
+  it('the operator filing a /debug reply gets exactly one local confirmation, a queued support task, and NO worker dispatch', async () => {
+    const controller = new AbortController();
+    const state = makeState(123, -1);
+    const sentMessages: string[] = [];
+    let step = 0;
+    (globalThis as Record<string, unknown>).fetch = async (url: string, opts?: any) => {
+      const urlStr = url as string;
+      if (urlStr.includes('getUpdates')) {
+        const responses = debugUpdates(42); // the operator
+        const item = responses[Math.min(step++, responses.length - 1)];
+        if (step >= responses.length) controller.abort();
+        return {
+          ok: true, status: 200,
+          text: async () => JSON.stringify(item.bodyJson),
+          json: async () => item.bodyJson,
+        };
+      }
+      if (urlStr.includes('sendMessage')) {
+        const body = typeof opts?.body === 'string' ? JSON.parse(opts.body) : {};
+        if (body.text) sentMessages.push(body.text);
+        return {
+          ok: true, status: 200,
+          text: async () => JSON.stringify({ ok: true, result: { message_id: 100 } }),
+          json: async () => ({ ok: true, result: { message_id: 100 } }),
+        };
+      }
+      return {
+        ok: true, status: 200,
+        text: async () => JSON.stringify({ ok: true, result: true }),
+        json: async () => ({ ok: true, result: true }),
+      };
+    };
+
+    await runPollLoop('token', [123], state, { PA_OPERATOR_USER_ID: '42' }, controller.signal, fastSleep);
+
+    assert.equal(sentMessages.length, 1, `exactly one local reply, no worker dispatch. Got: ${JSON.stringify(sentMessages)}`);
+    // Captured send bodies are MdV2-escaped — strip backslashes before substring asserts.
+    const confirmation = sentMessages[0].replace(/\\/g, '');
+    assert.ok(confirmation.includes('Debug task tt-'), `confirmation must carry the task id: ${confirmation}`);
+    assert.ok(confirmation.includes('s-1a2b3c4d5e6f'), 'confirmation must carry the debug handle');
+
+    // The task really landed on the pa-support queue (fallback key; no config.yaml here).
+    const queue = JSON.parse(await readFile(join(tempDir, 'topic-tasks', '-1001234567890_5001.json'), 'utf8')) as Array<{ title: string; prompt: string; created_by: string }>;
+    assert.equal(queue.length, 1);
+    assert.ok(queue[0].prompt.includes('pa ref s-1a2b3c4d5e6f'), 'the ref-ID rides the prompt as the debug handle');
+    assert.ok(queue[0].prompt.includes('question action'), 'the executor contract rides the prompt');
+    assert.equal(queue[0].created_by, 'operator');
+  });
+
+  it('a non-operator /debug is refused locally and files nothing', async () => {
+    const controller = new AbortController();
+    const state = makeState(123, -1);
+    const sentMessages: string[] = [];
+    let step = 0;
+    (globalThis as Record<string, unknown>).fetch = async (url: string, opts?: any) => {
+      const urlStr = url as string;
+      if (urlStr.includes('getUpdates')) {
+        const responses = debugUpdates(999); // NOT the operator
+        const item = responses[Math.min(step++, responses.length - 1)];
+        if (step >= responses.length) controller.abort();
+        return {
+          ok: true, status: 200,
+          text: async () => JSON.stringify(item.bodyJson),
+          json: async () => item.bodyJson,
+        };
+      }
+      if (urlStr.includes('sendMessage')) {
+        const body = typeof opts?.body === 'string' ? JSON.parse(opts.body) : {};
+        if (body.text) sentMessages.push(body.text);
+        return {
+          ok: true, status: 200,
+          text: async () => JSON.stringify({ ok: true, result: { message_id: 100 } }),
+          json: async () => ({ ok: true, result: { message_id: 100 } }),
+        };
+      }
+      return {
+        ok: true, status: 200,
+        text: async () => JSON.stringify({ ok: true, result: true }),
+        json: async () => ({ ok: true, result: true }),
+      };
+    };
+
+    await runPollLoop('token', [123], state, { PA_OPERATOR_USER_ID: '42' }, controller.signal, fastSleep);
+
+    assert.equal(sentMessages.length, 1, 'exactly the refusal reply, nothing else');
+    const refusal = sentMessages[0].replace(/\\/g, '');
+    assert.ok(refusal.includes('operator-only'), `refusal text expected: ${refusal}`);
+    const exists = await stat(join(tempDir, 'topic-tasks', '-1001234567890_5001.json')).then(() => true, () => false);
+    assert.equal(exists, false, 'no queue file may be created for a non-operator');
   });
 });

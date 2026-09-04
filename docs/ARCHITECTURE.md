@@ -1,10 +1,10 @@
 # pa-framework — Architecture
 
-> Audience: developers extending the framework or building skills on top of it.
+> Developers extending the framework or building skills.
 
 ## Five intelligence layers
 
-The framework is structured so that each layer depends only on the ones below it:
+Each layer depends only on the ones below it:
 
 | # | Layer | Where it lives | What it does |
 |---|---|---|---|
@@ -14,32 +14,17 @@ The framework is structured so that each layer depends only on the ones below it
 | 2 | Worker pool | `pa/src/{workers,worker-exec,worker-evaluator,state-monitor,rate-limits-*}.ts` | CLI spawn, failover, rate-limit parsing, stuck-state evaluation |
 | 1 | Auth substrate | `~/.pa/google_auth.py` + Telegram/mobile bridge helpers (see `examples/oauth/README.md`) | Shared Google OAuth for Gmail/Drive/Docs plus optional Telegram/mobile recovery |
 
-Domain projects (e.g., `projects/daily-mail-brief/`) sit *above* layer 5; they use the bot for delivery, register skills in `~/.pa/skills/`, and call into the orchestrator via the `pa` CLI or `pa notify`.
+Domain projects (e.g. daily-mail-brief) sit *above* layer 5: bot for delivery, skills in `~/.pa/skills/`, orchestrator via the `pa` CLI.
 
 ## Telegram/mobile OAuth recovery
 
-The framework also supports a mobile-friendly Google OAuth recovery loop:
+Expired Google credentials: `start_google_telegram_reauth.py` sends a consent URL to Telegram (state in `~/.pa/google-telegram-auth.json`); Google redirects to `projects/google-oauth-redirect/`, the user pastes `/auth <code> <state>`, the bot runs `finish_google_telegram_reauth.py` — refreshed token + optional resume hook.
 
-1. A project detects expired Google credentials and launches
-   `pa/scripts/start_google_telegram_reauth.py`.
-2. That script generates a consent URL, stores pending state in
-   `~/.pa/google-telegram-auth.json`, and sends the URL to Telegram.
-3. Google redirects the user to `projects/google-oauth-redirect/`, a static
-   page that renders `/auth <code> <state>`.
-4. The user pastes that command into Telegram.
-5. The bot's `/auth` handler runs `finish_google_telegram_reauth.py`, writes the
-   refreshed token, and optionally invokes a private resume hook.
-
-Public/private boundary:
-
-- **Public substrate**: the bot `/auth` surface, pending auth-session format,
-  start/finish scripts, static bridge page, and docs.
-- **Private deployment**: OAuth client JSONs, token/state storage paths, and the
-  action registry in `~/.pa/oauth_resume_hook.py`.
+Boundary: **public** = bot `/auth` surface, auth-session format, start/finish scripts, bridge page, docs; **private** = OAuth client JSONs, token/state paths, the `~/.pa/oauth_resume_hook.py` action registry.
 
 ## Worker pool contract
 
-Workers are external CLI processes spawned via `child_process.spawn`. Configured in `~/.pa/config.yaml` `workers:` array with fields: `name`, `command`, `args`, `check` (availability probe), `input_mode` (arg/stdin-text/stdin-json), `output_format` (stream-json), `secret_allowlist` (default-deny per worker), `rate_limit_patterns`, `priority`, `state_dir`/`state_pattern` (session-mode rate-limit detection), `worker` (force specific), `no_fallback`. See `docs/WORKERS_GUIDE.md`.
+External CLI processes via `child_process.spawn`, configured in `~/.pa/config.yaml` `workers:` (fields: `name`, `command`, `args`, `check`, `input_mode`, `output_format`, `secret_allowlist` (default-deny), `rate_limit_patterns`, `priority`, `state_dir`/`state_pattern`, `worker`, `no_fallback`). See `docs/WORKERS_GUIDE.md`.
 
 **Input modes**: `arg` (prompt file, `{prompt}`→`@path`), `stdin-text`, `stdin-json`. **Output**: exit 0=success; NDJSON events parsed for session/rate-limit. **Rate-limit**: text-pattern (stdout/stderr substrings) or session-mode (state file tail, 429 events). **Process tree**: tracked and killed on timeout; Windows uses CIM, POSIX uses `ps`/`pgrep`.
 
@@ -62,7 +47,7 @@ Skills live at `~/.pa/skills/<name>/skill.md`. The YAML frontmatter (between `--
 | `no_fallback` | boolean | false | When true with `worker:`, don't failover on failure. |
 | `cmd` | string | — | Direct shell command (bypasses LLM). `${VAR}` env-interpolated. |
 | `telegram_output` | object | — | Deliver LLM output to Telegram. See below. |
-| `cost_tier` | `'off_peak' \| 'anytime'` | `'anytime'` | Cost tier for scheduled skills. `off_peak` skills run only during the z.ai off-peak window (19:30-11:30 IST; configurable via `cost_tier.peak_window_utc` in config.yaml, default Mon-Fri 06:00-10:00 UTC); periodic off_peak skills are deferred during peak hours with once-daily logging. Time-pinned crons with `cost_tier` are ignored with a config warning. |
+| `cost_tier` | `'off_peak' \| 'anytime'` | `'anytime'` | `off_peak` skills run only in the z.ai off-peak window (configurable `cost_tier.peak_window_utc`); periodic off_peak skills defer during peak with once-daily logging; time-pinned crons with `cost_tier` are ignored with a warning. |
 
 ### `telegram_output`
 
@@ -88,7 +73,7 @@ Action types:
 - **`retry_with_worker{reason}`** — worker declares it can't complete; orchestrator routes to the next-priority worker.
 - **`run_skill{skill}`** — trigger another skill automatically after this one finishes.
 - **`confirm_required`** — used by the bot in place of "Reply *yes* to confirm" text; the bot tracks pending confirmations per-topic.
-- **`watch_job{description,check,deadline_minutes,interval_seconds}`** — register an async watch (AI-170). `check` is `{type, path?, pattern?, since_iso?, pid?}`; `type` is one of `file_exists`, `file_gone`, `file_newer_than`, `file_contains`, `process_gone`. Read-only observations only — no shell, no network, no writes. `logic.ts` validates the shape, `main.ts` writes, and the reply always states the registered id or the rejection reason.
+- **`watch_job{description,check,deadline_minutes,interval_seconds}`** — register an async watch (AI-170). `check` is `{type, path?, pattern?, since_iso?, pid?}`; `type` ∈ `file_exists`/`file_gone`/`file_newer_than`/`file_contains`/`process_gone`; read-only (no shell/network/writes). The reply always states the registered id or the rejection.
 
 The bot strips the envelope before delivering text to the user. In execution mode (`Pending Confirmation` set), the bot suppresses any `[PA_META]` the model emits.
 
@@ -111,42 +96,13 @@ report: telegram|stdout         # default: stdout
 
 ### Execution model
 
-- **Sequential only**: No parallel execution. Steps run in order.
-- **Subprocess spawning**: Each step spawns `pa run <skill>` as a subprocess, inheriting git-workflow lock discipline automatically (children take their own locks).
-- **Failure propagation**:
-  - `on_failure: stop` (default): Chain stops immediately on step failure.
-  - `on_failure: notify`: Sends a Telegram notification but continues to next step.
-  - `on_failure: continue`: Continues silently to next step.
-- **Retry logic**: If a step fails, it retries up to `max` attempts with `backoff_s` seconds between attempts.
-- **End-of-chain report**:
-  - `report: telegram`: Sends a summary to pa-alerts (deduped by chain-name+date).
-  - `report: stdout`: Prints the summary to console.
+- **Sequential**; each step spawns `pa run <skill>` as a subprocess (own git-workflow locks).
+- **Failure**: `stop` (default) halts; `notify` pages and continues; `continue` is silent.
+- **Retry**: up to `max` attempts, `backoff_s` apart.
+- **Report**: `telegram` → pa-alerts summary (deduped chain-name+date); or `stdout`.
+- **Validation (strict, on load)**: unknown fields/invalid values rejected; `skill` required; defaults applied.
 
-### Example
-
-The `commit-ship.yaml` chain (included as `~/.pa/chains/commit-ship.yaml`):
-
-```yaml
-steps:
-  - skill: update-brain
-    on_failure: notify
-
-  - skill: commit
-    on_failure: stop
-
-  - skill: push
-    retry:
-      max: 3
-      backoff_s: 5
-    on_failure: stop
-
-  - skill: push-public
-    on_failure: notify
-
-report: telegram
-```
-
-This chain stages and ships all pending work: update brain → commit → push → sync to public mirror.
+Example — the shipped `~/.pa/chains/commit-ship.yaml` runs `update-brain` (notify on failure) → `commit` (stop) → `push` (retry 3×, backoff 5s, stop) → `push-public` (notify), `report: telegram`: stage and ship all pending work.
 
 ### CLI
 
@@ -155,59 +111,16 @@ pa chain run <name>    # Execute a chain
 pa chain list          # List available chains
 ```
 
-### Validation
-
-The chain schema is strict and validated on load:
-
-- Unknown fields are rejected (at top level, step level, and retry level).
-- Invalid values are rejected (e.g., negative `max`, unknown `on_failure` values).
-- Missing required fields are rejected (`skill` is required).
-- Defaults are applied automatically (`retry.max: 1`, `retry.backoff_s: 0`, `on_failure: stop`, `report: stdout`).
-
 ## Golden-task eval gate (self-improver)
 
-The autonomous self-improvement loop (`pa/src/self-improver.ts`) includes a golden-task eval gate (Wave H WPH1) that validates skill prompt changes against a suite of deterministic quality checks.
+The autonomous self-improvement loop (`pa/src/self-improver.ts`) gates skill prompt changes behind deterministic quality checks. When a prompt fix passes validation, golden tasks run against the change:
 
-### Gate operation
+- **v1 (deterministic-only)**: tasks 4-6 run on static fixtures (no worker dispatch): `markdown_shape`, `pa_meta_wellformedness` (protected-skill forgery rejected), `injection_resistance`.
+- **v2 (LLM-dependent, skipped unless `PA_EVAL_FULL=1`)**: tasks 1-3 require worker dispatch: `ref_id_format`, `date_arithmetic`, `grounding_citation`.
 
-When a skill prompt fix passes validation, the eval gate runs a subset of golden tasks against the change:
+The gate is SOFT in v1: pass → change applied, eval recorded in the audit trail; fail → parked as `validation-failed-pending` for human review via `pa improvements`. The validation floor still governs — a change failing validation stays pending regardless of eval results.
 
-- **Deterministic-only (v1)**: Tasks 4-6 run against static fixture inputs (no worker dispatch):
-  - `markdown_shape`: Output parses as valid Markdown
-  - `pa_meta_wellformedness`: PA_META envelope parses correctly, protected-skill forgery rejected
-  - `injection_resistance`: Output refuses prompt injection attempts
-- **LLM-dependent (deferred to v2)**: Tasks 1-3 require worker dispatch and are skipped unless `PA_EVAL_FULL=1`:
-  - `ref_id_format`: Output includes properly formatted ref-ID (`_Ref: s-[0-9a-f]{12}_`)
-  - `date_arithmetic`: Correct date arithmetic for calendar events
-  - `grounding_citation`: Output cites source documents correctly
-
-### Gate behavior (SOFT in v1)
-
-The gate is deliberately non-blocking in v1:
-
-- **Pass**: Change is applied, eval outcome recorded in audit trail
-- **Fail**: Change is parked as `validation-failed-pending` with eval detail, human reviews via `pa improvements`
-
-The validation floor still governs — a change that fails validation stays pending regardless of eval results.
-
-### Scoring
-
-Each task has a `scorer.py` that outputs JSON `{pass: bool, detail: string}` and exits 0 (pass) or 1 (fail). Results are aggregated and appended to `~/.pa/eval-results.jsonl` for audit trail inspection.
-
-### Audit trail
-
-Applied changes gain an `eval` field in their audit record:
-
-```json
-"eval": {
-  "pass": 2,
-  "fail": 1,
-  "skipped": 3,
-  "detail": "Eval gate: 2 passed, 1 failed, 3 skipped. Failures: ..."
-}
-```
-
-This enables post-factum review via `pa improvements --show <draft>`.
+Each task's `scorer.py` outputs JSON `{pass, detail}`, exit 0/1; results aggregate into `~/.pa/eval-results.jsonl`, and applied changes gain an `eval` field (`{pass, fail, skipped, detail}`) reviewable via `pa improvements --show <draft>`.
 
 ## Async watch jobs (AI-170, 2026-08-31)
 
@@ -236,15 +149,12 @@ Lock rows are `(resource, agent, pid, heartbeat, contextId?)`. A holder that run
 
 ## Ref-IDs
 
-Every notable message in the system gets a 4-character ref ID with a single-letter prefix:
-
-- `c-XXXX` — Claude conversation message
-- `g-XXXX` — Gemini conversation message (legacy; the Gemini CLI worker was sunset 2026-08-08, AI-131)
-- `l-XXXX` — Log entry
-- `z-XXXX` — zClaude message
-- `s-XXXX` — Skill output
-
-The `pa ref <id>` command resolves any ref to its source. Used in alert bodies (`_Ref: l-AB12_`) so the user can `pa ref l-AB12` to drill into the originating message.
+Every system-generated message carries a ref-ID — `_Ref: s-XXXXXXXXXXXX_` (12 hex chars,
+stamped by pa's `sendToTelegram`, the bot's `appendRefIdAndLog`, and Python
+`telegram_notify.py`) — and is logged to `app.log.jsonl` with a `refId` field, so all
+system activity is queryable via `pa ref <id>`. Feedback rules carry `r-` + 12 hex
+(`pa/src/lib/feedback-rules.ts`). Alert bodies embed the ref-ID so the user can drill into
+the originating message.
 
 ## Turn-trace sidecar (2026-08-24)
 
@@ -255,34 +165,29 @@ never blocks or fails a dispatch (`appendTurnTrace` never throws or rejects; the
 is fired with `void`, not awaited).
 
 Schema v1 (`TurnTraceV1`): `v`, `run_id` (uuid, `CommandResult.runId`), `ts_start`/`ts_end`/
-`duration_ms`, `origin` (`'bot'|'skill'|'self-improver'|'other'`, from the dispatch's
-`resource` string), `chat_id`/`thread_id`/`update_id` for bot origins, `skill` for skill
-origins, `worker`/`model`/`session_id`, `exit_code`/`outcome`
+`duration_ms`, `origin` (`'bot'|'skill'|'self-improver'|'other'`), `chat_id`/`thread_id`/
+`update_id` (bot) or `skill` (skill), `worker`/`model`/`session_id`, `exit_code`/`outcome`
 (`'ok'|'error'|'timeout'|'killed'|'failover'`), `parsed` (whether the stream dialect was
-recognized at all), `tool_calls[]`/`commands[]`/`files[]`/`errors[]` (each capped —
+recognized at all), `tool_calls[]`/`commands[]`/`files[]`/`errors[]` (capped
 200/50/50/5 entries, 200/300 chars per string), `retries` (always 0 in v1 — the seam for
 a future retry loop), `tokens`, `bytes_out`, `truncated`. Two dialects are parsed: agy/agyc
 `step_update` stream events, and claude-family `tool_use`/`tool_result` blocks; codex
 matches neither (`parsed:false`) until it comes off cooldown.
 
-Join keys: `run_id` resolves any run directly (`pa ref <uuid>` — see below). A bot-origin
-turn's archive row (`~/.pa/conversation-history.jsonl`) does **not** carry `run_id` —
-`pa ref <refId>` instead resolves the trace via `(thread_id, update_id)`, both written on
-the archive row by `main.ts`. `pa ref` prints a `--- trace (turn-traces.jsonl) ---` block
-(outcome, worker, model, duration, tool-call counts by name, commands/files/errors) after
-the resolved text, when a trace is found.
+Join keys: `run_id` resolves any run directly (`pa ref <uuid>`). A bot-origin turn's archive
+row does **not** carry `run_id` — `pa ref <refId>` resolves the trace via
+`(thread_id, update_id)`, both written on the archive row by `main.ts`, and prints the
+`--- trace (turn-traces.jsonl) ---` block after the resolved text.
 
-Rotated `-turn-traces.jsonl` shards are derived debugging data (rebuildable from
-nothing) and prune at 90 days via the existing `archive-prune` maintenance job —
-`PRUNABLE_ARCHIVE_SUFFIXES` (`pa/src/lib/archive-files.ts`) now includes the suffix, so
-no new job or registry entry was needed (C7 in the wave spec). The `recall-index`
-maintenance job (below) refreshes `~/.pa/recall.sqlite` from the live file every 10
-minutes, so a trace becomes searchable without any manual step.
+Rotated `-turn-traces.jsonl` shards are derived debugging data (rebuildable from nothing)
+and prune at 90 days via the existing `archive-prune` job (`PRUNABLE_ARCHIVE_SUFFIXES`,
+`pa/src/lib/archive-files.ts`). The `recall-index` job refreshes `~/.pa/recall.sqlite` from
+the live file every 10 minutes, so a trace becomes searchable without any manual step.
 
 ## Recall (`pa recall`, 2026-08-24)
 
-Full-text search over six sources, so a worker (or human) can answer "did we discuss
-this" / "what did that run do" without grepping raw JSONL:
+Full-text search over six sources, so workers/humans answer "did we discuss this"
+without grepping raw JSONL:
 
 | Source | What's indexed | Doc unit |
 |---|---|---|
@@ -295,16 +200,13 @@ this" / "what did that run do" without grepping raw JSONL:
 
 ### Decision traces (2026-08-27)
 
-`~/.pa/decisions.sqlite` records the PA's judgment calls (request, decision, rationale, alternatives) with outcome (👍/👎 ⇒ approved/rejected; next in-thread user turn ⇒ weak "replied") and reaction. Twins `pa/src/lib/decisions.ts` + `pa/scripts/decisions.py` enforce immutable-after-insert and redact before insert. Writers: daily-mail-brief (deterministic inner-LLM marker block), travel-butler, `rm:` buttons. Durable, no retention. Contract: the AI-164 SPEC §2.
+`~/.pa/decisions.sqlite` records judgment calls with outcome (👍/👎 ⇒ approved/rejected; next turn ⇒ "replied"). Twins `decisions.ts` + `decisions.py` enforce immutable-after-insert + redact-before-insert. Writers: daily-mail-brief, travel-butler, `rm:` buttons. Contract: AI-164 SPEC §2.
 
-Engine: `pa/src/lib/recall-store.ts` — in-process TypeScript over `better-sqlite3` FTS5, WAL, incremental per-source cursors (byte-offset for append-only JSONL; mtime+size→sha256 for whole-file sources). Query: AND-first (`bm25`), OR-rescue fills under the limit (flagged `rescue:true`), `total` never inflated; `--limit` ≤50; filters `--thread/--source/--role/--since/--until`.
+Engine: `pa/src/lib/recall-store.ts` — in-process TS over `better-sqlite3` FTS5, WAL, incremental per-source cursors. Query: AND-first (`bm25`), OR-rescue under the limit (`rescue:true`), `total` never inflated; `--limit` ≤50; filters `--thread/--source/--role/--since/--until`.
 
-Surfaces: `pa recall "<query>" [--thread <id>] [--source <s>] [--role <user|assistant>] [--since <d>] [--until <d>] [--limit <n>] [--json] [--reindex] [--rebuild]`
-(`pa/src/commands/recall.ts`); the `pa_recall` MCP tool (`docs/WORKERS_GUIDE.md` §
-"MCP integration"); the `recall-index` maintenance job (pa host, every 10 minutes,
-non-destructive — `recall.sqlite` is fully derived and rebuildable with `pa recall
---rebuild`); and a standing prompt bullet + per-thread pointer line in the bot's system
-prompt (`projects/telegram-bot/src/context.ts`, `projects/telegram-bot/CLAUDE.md`).
+Surfaces: `pa recall` CLI (`pa/src/commands/recall.ts`), the `pa_recall` MCP tool, the
+non-destructive `recall-index` job, and a standing pointer line in the bot's system
+prompt (`projects/telegram-bot/src/context.ts`).
 
 ## Feedback rules (AI-165, 2026-08-27)
 
@@ -312,7 +214,22 @@ Store: `~/.pa/feedback-rules.yaml` (add-only, supersede-by-key). Nightly triage 
 
 ## SLO report (`pa slo report`, 2026-08-27)
 
-Error-budget reports per service from `~/.pa/app.log.jsonl`. Services are config-driven (`~/.pa/slo.yaml` via `--config` or the default path; generic examples ship in code — a deployment names its own, see `pa/examples/slo.yaml.example`). **Per-skill outcome SLOs**: trailing 30d, `acted_on = approved + replied`, renders `no decision data` for skills with zero rows. **`unknown` status fix** (was dead code — `missingData` never filled before status computation): services whose source file is absent (e.g. `~/.pa/<skill>/latest.json`, a watchdog receipts file) now report `status: unknown` instead of silent `OK`. Sources: `fetch_headers.py` writes misses; `verify_alert_sent.py` appends ok/missed receipts per run. CLI: `pa/src/commands/slo.ts`; lib: `pa/src/lib/slo.ts`.
+Error-budget reports per service from `~/.pa/app.log.jsonl`; config-driven (`~/.pa/slo.yaml`; examples in `pa/examples/slo.yaml.example`). **Per-skill outcome SLOs**: trailing 30d, `acted_on = approved + replied`; zero rows → `no decision data`. **`unknown`**: absent source files report `status: unknown` via `missingData`, never silent `OK`. Sources: `fetch_headers.py` writes misses; `verify_alert_sent.py` appends ok/missed receipts per run. CLI: `pa/src/commands/slo.ts`; lib: `pa/src/lib/slo.ts`.
+
+## Topic task queue, event log + button grammar (`pa topic-*`, 2026-09-02)
+
+Wave-1 substrate of the topic-task handover (`plans/2026-09-02-topic-task-handover-WAVE1-SPEC.md`):
+
+- **`pa/src/lib/topic-tasks.ts`** — durable per-topic task queue at `~/.pa/topic-tasks/<chatId>_<threadId>.json`. `appendTask` dedups by content hash (double-queueing cannot double-execute); pop is pop-first persist-before-inject (Wave-2's `claimNextTask` moves records into the running store under the same lock). Read-modify-writes run under proper-lockfile + in-process mutex via `writeJsonAtomic`; `validateTaskPrompt` mirrors the AI-185 topic_resume rules (non-empty, single line, ≤500 chars, no leading `/`).
+- **`pa/src/lib/topic-events.ts`** — append-only per-topic event log at `~/.pa/topic-events/<chatId>_<threadId>.jsonl` (one JSON line per event, UTF-8; no retention in Wave 1). Closed kind enum (`task_queued`/`task_started`/`task_failed`/`question_asked`/`question_answered`/`note_added`/`wave_done`); the tolerant reader skips malformed lines with a warn-once log and returns events newest LAST; `resolveTopicKey` resolves `<chatId>_<threadId>` or a bare thread id by unique filename match across `topic-tasks`/`topic-events`/`topic-brains`.
+- **`pa/src/commands/topic.ts`** — the CLI shell: `pa topic-task add|list`, `pa topic-note add|list|close` (notes live in the topic store beside tasks — `~/.pa/topic-tasks/<key>.notes.json`; the prompt's `## Open items` section renders tasks + notes from that one source, no derived file), and `pa topic-events <key>`; task/note writes append the `task_queued`/`note_added` events.
+- **`pa/src/lib/callback-grammar.ts`** — the ONE inline-button grammar (`CallbackPrefix`, `parseCallbackData`, `gateFor`, `OPERATOR_PREFIXES`, the `q:` answer prefix, and `validateKeyboardRequest`), owned by pa and re-exported by the bot's callbacks.ts, so pa-side emitters validate `callback_data` against the same source the bot parses with (two producers of a frozen grammar = drift).
+- **`[PA_KEYBOARD]:` envelope on `pa run` telegram_output** — a skill SCRIPT may end its output with one `[PA_KEYBOARD]: {"buttons":[...]}` line; run.ts strips it from the delivered text, validates it via `validateKeyboardRequest` (1..6 buttons, ≤40-char labels, grammar-valid `callback_data`), refuses keyboards for protected skills, and attaches it to the Telegram send. Any failure strips the keyboard and warns — it never fails the run.
+- **PA_META `question` action** — `question{text, options (1..4), taskId?}` arms `state.pending_question`; the reply renders option buttons and a press is injected back into the topic as a synthetic turn through the one-parser `q:` callback path. A question is rejected while a pending action or confirm is armed (confirm wins).
+
+### Topic executor lane (Wave 2, 2026-09-02)
+
+Queued tasks execute on a DEDICATED lane (SPEC `plans/2026-09-02-topic-handover-WAVE2-SPEC.md` §3.1). The bot's 60s `topic-task-drain` claims ≤2 tasks/tick (global) via `claimNextTask` into `~/.pa/topic-tasks/<key>.running.json`: no per-topic cap (`TOPIC_TASK_SLOTS`=100 backstop; budget = `running.length`), 3 attempts max (exhausted → remove + `task_failed`), failed dispatches defer 10 min, stale `running` (30 min) demotes to ready for EVERY enumerated topic before claims (crash recovery, no pid checks); prompts re-validated at drain (invalid → WARN + `failTask`), foreign chats skipped pre-claim. `task-executor.ts` dispatches NEVER take the topic blackboard lock, touch `state.turns`, or ride the human reply pipeline. Task prompts carry the micro-thread (last 6 turns), open items, and in-flight siblings; task-lane PA_META handles ONLY `question` (park + `qt:` keyboard) / `watch_job` / `kb_note` / `run_skill` (non-protected). Pickup/question FYI message ids are tier-1 anchors (user reply → `routeReplyToTask` → `answerTask`; `qt:` press answers the parked task directly — convergence, not injection). Status: the card's `Tasks:` line + `renderOpenItems` tier-2 in-flight lines.
 
 ## Logging
 

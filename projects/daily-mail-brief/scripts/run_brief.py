@@ -33,6 +33,18 @@ AGY_CMD = os.environ.get("AGY_CMD", "D:/gemini-shim/agy.cmd")
 AGY_MODEL = os.environ.get("DAILY_MAIL_BRIEF_MODEL", "gemini-3.7-flash-high")
 AGY_PRINT_TIMEOUT = os.environ.get("DAILY_MAIL_BRIEF_PRINT_TIMEOUT", "10m")
 
+# Fallback inner-LLM CLI, used when agy exhausts its quota: the next healthy
+# worker of the failover chain in ~/.pa/config.yaml (agy → codex → zclaude →
+# claude — each worker draws from its own quota pool, so a quota-dead agy does
+# not imply a quota-dead fallback). codex was cooling until 2026-09-07
+# (operator fleet note, 2026-08-21) and zclaude is operator-ordered ahead of
+# claude, so zclaude is the default; override per this script's AGY_CMD
+# convention. No --model pin: the fallback keeps its own CLI default (operator
+# directive 2026-08-15, mirrored in the zclaude worker block).
+FALLBACK_LLM_CMD = os.environ.get(
+    "DAILY_MAIL_BRIEF_FALLBACK_CMD", "zclaude"
+)
+
 
 def _duration_to_seconds(text: str, default: float) -> float:
     """'45s'/'10m'/'1h'/'90' → seconds; unparseable/empty → default."""
@@ -113,12 +125,63 @@ def build_agy_command(prompt_path: str) -> list:
             "-p", f"@{prompt_path}"]
 
 
+def build_fallback_llm_command() -> list:
+    """Fallback CLI argv for a one-shot text completion.
+
+    The prompt travels on stdin (never argv) — the same ~32 KB Windows
+    command-line cap protection that build_agy_command's @-file reference
+    provides, using the fallback CLI's native `cat prompt | cli -p` shape.
+    """
+    return ["cmd", "/c", FALLBACK_LLM_CMD,
+            "--dangerously-skip-permissions",
+            "--output-format", "text",
+            "-p"]
+
+
+def _strip_cli_noise(output: str) -> str:
+    """Strip session-hook noise a CLI may append after the real response, and
+    surrounding whitespace (harmless and cheap to keep checking on every path)."""
+    noise_marker = "Created execution plan for SessionEnd:"
+    if noise_marker in output:
+        output = output[:output.index(noise_marker)]
+    return output.strip()
+
+
+def call_fallback_llm(prompt: str) -> str:
+    """Run the fallback CLI with the prompt on stdin; return cleaned text.
+
+    Any failure raises RuntimeError that stays transient-classified (never an
+    auth signature), so main()'s retry loop and catchup keep retrying instead
+    of taking the fatal llm-auth path.
+    """
+    try:
+        result = subprocess.run(
+            build_fallback_llm_command(),
+            input=prompt,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            cwd=PROJECT_ROOT,
+            timeout=LLM_SUBPROCESS_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"fallback LLM timed out after {LLM_SUBPROCESS_TIMEOUT_S:g}s"
+        ) from e
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"fallback LLM exited {result.returncode}: {result.stderr[:300]}"
+        )
+    return _strip_cli_noise(result.stdout)
+
+
 def call_llm(prompt: str) -> str:
     """Call the configured LLM CLI and return cleaned response text.
 
     Default path shells agy via a temp-file @-reference (see build_agy_command),
     since the prompt can carry email headers well past the ~32 KB Windows
-    command-line cap.
+    command-line cap. A QUOTA failure on agy fails over to the fallback CLI
+    (call_fallback_llm): quota exhaustion is capacity, not credentials, and the
+    fallback worker draws from its own quota pool, so the brief can still
+    deliver instead of aborting until Google's quota resets.
     """
 
     prompt_path = None
@@ -152,40 +215,63 @@ def call_llm(prompt: str) -> str:
 
     if result.returncode != 0:
         error_text = f"agy exited {result.returncode}: {result.stderr[:300]}"
-        if is_llm_auth_failure(error_text):
-            # The primary CLI's credentials/license/quota are dead — non-transient.
-            # Surface the agy failure directly rather than masking it with a fallback.
-            raise RuntimeError(error_text)
+        if is_llm_quota_failure(error_text):
+            # Quota exhaustion is capacity, not credentials: agy's quota resets
+            # on Google's own schedule (16-26h in the recorded 2026-09-02
+            # failures), but the fallback CLI draws from a different worker's
+            # pool — deliver the brief now instead of aborting until the reset.
+            print(
+                f"[WARN] agy quota exhausted — failing over to fallback LLM: {error_text}",
+                file=sys.stderr,
+            )
+            return call_fallback_llm(prompt)
+        # Credential/license failures are dead — non-transient. Surface the
+        # agy failure directly rather than masking it with a fallback.
         raise RuntimeError(error_text)
 
-    # Strip session hook noise a CLI may append after the real response
-    # (harmless and cheap to keep checking for on this path too).
-    output = result.stdout
-    noise_marker = "Created execution plan for SessionEnd:"
-    if noise_marker in output:
-        output = output[:output.index(noise_marker)]
-    return output.strip()
+    return _strip_cli_noise(result.stdout)
 
 
-# Signatures of non-transient LLM CLI (agy) credential failures.
-# A 10s retry cannot
-# fix these: the 2026-08-19..21 license invalidation burned both attempts on
-# every scheduled run because the retry loop treated a dead license as a
-# transient blip. Matched case-insensitively against the raised error text.
+# Signatures of non-transient LLM CLI (agy) credential failures. A 10s retry
+# cannot fix these: the 2026-08-19..21 license invalidation burned both
+# attempts on every scheduled run because the retry loop treated a dead
+# license as a transient blip. Matched case-insensitively against the raised
+# error text. Quota exhaustion is deliberately NOT here (2026-09-02 revision):
+# it is capacity, not credentials — see LLM_QUOTA_FAILURE_SIGNATURES below.
 LLM_AUTH_FAILURE_SIGNATURES = (
     "error authenticating",  # "Error authenticating: _GaxiosError: You do not have a valid license..."
     "valid license",
     "invalid_grant",         # OAuth refresh token rejected
     "unauthenticated",       # API-level credential rejection
-    "individual quota reached",  # agy quota exhaustion (project_worker_fleet_state memory)
 )
 
 
 def is_llm_auth_failure(error_text: str) -> bool:
-    """True when an LLM CLI (agy) error indicates a credential/license/quota
-    failure (non-transient), so callers fail fast instead of retrying."""
+    """True when an LLM CLI (agy) error indicates a credential/license failure
+    (non-transient), so callers fail fast instead of retrying."""
     lowered = (error_text or "").lower()
     return any(signature in lowered for signature in LLM_AUTH_FAILURE_SIGNATURES)
+
+
+# Signatures of LLM CLI (agy) quota exhaustion — capacity, not credentials.
+# The recorded 2026-09-02 failures ("Individual quota reached ... Resets in
+# 26h16m20s" / "16h19m8s") reset on Google's own schedule, so neither a 10s
+# retry nor a re-auth can fix them — but the fallback CLI (a different worker
+# with its own quota pool) can still deliver the brief. RESOURCE_EXHAUSTED is
+# Google's API-level marker for the same pool (~/.pa/config.yaml pairs it with
+# the quota string in the agy worker's rate_limit_patterns).
+LLM_QUOTA_FAILURE_SIGNATURES = (
+    "individual quota reached",
+    "resource_exhausted",
+)
+
+
+def is_llm_quota_failure(error_text: str) -> bool:
+    """True when an LLM CLI (agy) error indicates quota exhaustion (capacity,
+    not credentials), so call_llm fails over to the fallback CLI instead of
+    aborting the brief."""
+    lowered = (error_text or "").lower()
+    return any(signature in lowered for signature in LLM_QUOTA_FAILURE_SIGNATURES)
 
 
 PORTFOLIO_JSON_DIR = os.path.normpath(
@@ -663,8 +749,8 @@ def main():
         if auth_failure:
             body += (
                 "This failure is not transient — catchup retries will keep failing until "
-                "the LLM credential/license/quota is fixed. Re-authenticate agy (AGY_CMD) or "
-                "restore its license/quota, then re-run `pa run daily-mail-brief`."
+                "the LLM credential/license is fixed. Re-authenticate agy (AGY_CMD) or "
+                "restore its license, then re-run `pa run daily-mail-brief`."
             )
         else:
             body += "State not advanced — next catchup will retry."

@@ -5,6 +5,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { addTurn, formatHistory, loadState, saveState, loadTopicState, saveTopicState, findHistoricalSessionTurns, findRecentTurnsByTopic, listTopicStateRefs, findArchivedTurnByMessageId, type JoinableTurn } from '../conversation.js';
 import type { ConversationState, ConversationTurn } from '../types.js';
+import { resetRedactCache } from '../../../../pa/dist/src/lib/redact.js';
 import { waitForDrain } from './test-teardown-guard.js';
 
 let tempDir: string;
@@ -127,6 +128,51 @@ describe('addTurn', () => {
     addTurn(state, turn);
     // If worker field is missing, it should be handled gracefully
     assert.equal(state.turns[0].role, 'assistant');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// addTurn redaction (AI-184) — persistence/worker-read boundary, NOT the send
+// path. The delivered reply keeps real text (pinned in logic-redact.test.ts);
+// these drive the REAL seam — addTurn → saveTopicState → topic-state file +
+// conversation-history.jsonl archive — and pin the scrub on both at-rest copies.
+// ---------------------------------------------------------------------------
+
+describe('addTurn redaction (AI-184 persistence boundary)', () => {
+  const OPERATOR_NAME = 'OperatorNameFixture';
+
+  beforeEach(async () => {
+    await writeFile(join(tempDir, 'secrets.env'), `PA_USER_NAME=${OPERATOR_NAME}\n`, 'utf8');
+    resetRedactCache();
+  });
+
+  afterEach(() => {
+    resetRedactCache();
+  });
+
+  it('archived assistant turn carries the placeholder, never the literal (state file + archive)', async () => {
+    const state = makeState();
+    state.thread_id = 7;
+    addTurn(state, makeTurn('assistant', `Reply for ${OPERATOR_NAME} here`));
+    await saveTopicState(state);
+
+    const topicRaw = await readFile(join(tempDir, 'telegram-bot-topic-123_7.json'), 'utf8');
+    assert.ok(!topicRaw.includes(OPERATOR_NAME), 'worker-readable topic state must NOT keep the name');
+    assert.ok(topicRaw.includes('<redacted:PA_USER_NAME>'), 'topic state records the placeholder');
+
+    const archiveRaw = await readFile(join(tempDir, 'conversation-history.jsonl'), 'utf8');
+    assert.ok(!archiveRaw.includes(OPERATOR_NAME), 'conversation-history.jsonl must NOT keep the name');
+    assert.ok(archiveRaw.includes('<redacted:PA_USER_NAME>'), 'archive records the placeholder');
+  });
+
+  it('archived user turn is unredacted (never passed the old send path — out of AI-184 scope)', async () => {
+    const state = makeState();
+    state.thread_id = 7;
+    addTurn(state, makeTurn('user', `from ${OPERATOR_NAME}`));
+    await saveTopicState(state);
+
+    const topicRaw = await readFile(join(tempDir, 'telegram-bot-topic-123_7.json'), 'utf8');
+    assert.ok(topicRaw.includes(OPERATOR_NAME), 'user turns were never redacted; AI-184 does not change that');
   });
 });
 

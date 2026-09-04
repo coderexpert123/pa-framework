@@ -481,6 +481,41 @@ describe('watch-jobs', () => {
       assert.ok(row.outcome && row.outcome.length > 0);
     });
 
+    // AI-184 (2026-09-03): the report body reaches the operator's own chat
+    // UNREDACTED; the scrub survives on the persistence side (the stored row
+    // outcome). BOTH directions pinned on the real runWatchTick → sendReport
+    // → notify seam, with the name riding the BODY (file_contains Match line),
+    // not just the subject.
+    it('terminal report delivers the body raw; the stored outcome stays redacted (AI-184)', async () => {
+      const OPERATOR_NAME = 'OperatorNameFixture';
+      await createTempSecrets(dir, `PA_USER_NAME=${OPERATOR_NAME}\n`);
+      resetRedactCache();
+      try {
+        const { addWatchJob, runWatchTick, listWatchJobs } = await import('../src/lib/watch-jobs.js');
+        const target = join(dir, 'ai184-done.log');
+        const reg = await addWatchJob({
+          description: 'watch report delivery shape (AI-184)',
+          check: { type: 'file_contains', path: target, pattern: OPERATOR_NAME },
+          source: baseSource(),
+        });
+        const id = (reg as any).watch.id;
+        await writeFile(target, `status: ${OPERATOR_NAME} signed off\n`, 'utf8');
+
+        const { fn, calls } = recordingNotify();
+        const result = await runWatchTick({ now: Date.now(), notify: fn });
+        assert.equal(result.reported, 1);
+        assert.equal(calls.length, 1);
+        assert.ok(calls[0].body.includes(OPERATOR_NAME), 'delivered body keeps the name');
+        assert.ok(!calls[0].body.includes('<redacted:'), 'delivered body carries no placeholder');
+
+        const row = (await listWatchJobs()).find((w) => w.id === id)!;
+        assert.ok(!row.outcome!.includes(OPERATOR_NAME), 'stored outcome must NOT keep the name');
+        assert.ok(row.outcome!.includes('<redacted:PA_USER_NAME>'), 'stored outcome records the placeholder');
+      } finally {
+        resetRedactCache();
+      }
+    });
+
     it('send-then-persist: a not-sent/not-suppressed result leaves the row active and re-sends next tick', async () => {
       const { addWatchJob, runWatchTick, listWatchJobs } = await import('../src/lib/watch-jobs.js');
       const target = join(dir, 'donenotsent.txt');
@@ -583,6 +618,116 @@ describe('watch-jobs', () => {
       const row = (await listWatchJobs()).find((w) => w.id === id)!;
       assert.equal(row.status, 'check-failed');
       assert.equal(row.consecutiveErrors, 5);
+    });
+
+    // --- WP-D2 B.7 + ADDITION (2026-09-02, plans/2026-09-02-topic-handover-WAVE2-SPEC.md):
+    // terminal reports carry the wt: re-register keyboard, and terminal outcomes ACT —
+    // wave_done event on success; task_failed event + auto-filed reaction task on failure.
+
+    async function readTopicEventsFile(): Promise<Array<{ kind: string; ref: string | null; detail: string }>> {
+      const { readFile } = await import('fs/promises');
+      try {
+        const raw = await readFile(join(dir, 'topic-events', '12345_0.jsonl'), 'utf8');
+        return raw.split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l));
+      } catch {
+        return [];
+      }
+    }
+
+    async function readTopicTaskQueue(): Promise<Array<{ id: string; title: string; prompt: string; created_by: string }>> {
+      const { readFile } = await import('fs/promises');
+      try {
+        const raw = await readFile(join(dir, 'topic-tasks', '12345_0.json'), 'utf8');
+        return JSON.parse(raw);
+      } catch {
+        return [];
+      }
+    }
+
+    it('watch check-failed report carries re-register button', async () => {
+      const { addWatchJob, runWatchTick } = await import('../src/lib/watch-jobs.js');
+      const reg = await addWatchJob(
+        {
+          description: 'keyboard ladder',
+          check: { type: 'process_gone', pid: 1 },
+          source: baseSource(),
+        },
+        T0,
+      );
+      const id = (reg as any).watch.id;
+      const failingAlive = async () => {
+        throw new Error('simulated OS failure');
+      };
+      const { fn, calls } = recordingNotify();
+      let now = T0;
+      for (let tick = 1; tick <= 5; tick++) {
+        now += 61_000;
+        await runWatchTick({ now, notify: fn, aliveFn: failingAlive });
+      }
+      assert.equal(calls.length, 1);
+      assert.deepEqual(calls[0].opts?.replyMarkup, {
+        inline_keyboard: [[{ text: '🔁 Re-register watch', callback_data: `wt:${id}:r` }]],
+      });
+
+      // ADDITION failure lane: task_failed event, the auto-filed reaction task
+      // (verbatim prompt, watch-system provenance), then a task_queued event.
+      const events = await readTopicEventsFile();
+      assert.deepEqual(events.map((e) => e.kind), ['task_failed', 'task_queued']);
+      assert.equal(events[0].ref, id);
+      assert.match(events[0].detail, /simulated OS failure/);
+      const tasks = await readTopicTaskQueue();
+      assert.equal(tasks.length, 1);
+      assert.equal(tasks[0].prompt, `Your watch ${id} failed its check — diagnose, retry, or ask the operator`);
+      assert.equal(tasks[0].created_by, 'watch-system');
+      assert.match(tasks[0].title, new RegExp(`^Watch ${id} failed: keyboard ladder$`));
+      assert.equal(events[1].ref, tasks[0].id);
+    });
+
+    it('watch completion writes wave_done and files NO task (the report suffices)', async () => {
+      const { addWatchJob, runWatchTick } = await import('../src/lib/watch-jobs.js');
+      const target = join(dir, 'wavedone.txt');
+      const reg = await addWatchJob(
+        {
+          description: 'completes cleanly',
+          check: { type: 'file_exists', path: target },
+          source: baseSource(),
+        },
+        T0,
+      );
+      const id = (reg as any).watch.id;
+      await writeFile(target, 'x', 'utf8');
+      const { fn } = recordingNotify();
+      const result = await runWatchTick({ now: T0 + 61_000, notify: fn });
+      assert.equal(result.reported, 1);
+      const events = await readTopicEventsFile();
+      assert.deepEqual(events.map((e) => e.kind), ['wave_done']);
+      assert.equal(events[0].ref, id, 'ref carries the watch id');
+      assert.deepEqual(await readTopicTaskQueue(), [], 'success files no reaction task');
+    });
+
+    it('expired report carries the re-register button and files the reaction task', async () => {
+      const { addWatchJob, runWatchTick } = await import('../src/lib/watch-jobs.js');
+      const reg = await addWatchJob(
+        {
+          description: 'never finishes',
+          check: { type: 'file_exists', path: join(dir, 'neverexists-kb.txt') },
+          deadlineMinutes: 1,
+          source: baseSource(),
+        },
+        T0,
+      );
+      const id = (reg as any).watch.id;
+      const { fn, calls } = recordingNotify();
+      const result = await runWatchTick({ now: T0 + 2 * 60_000, notify: fn });
+      assert.equal(result.expired, 1);
+      assert.deepEqual(calls[0].opts?.replyMarkup, {
+        inline_keyboard: [[{ text: '🔁 Re-register watch', callback_data: `wt:${id}:r` }]],
+      });
+      const events = await readTopicEventsFile();
+      assert.deepEqual(events.map((e) => e.kind), ['task_failed', 'task_queued']);
+      const tasks = await readTopicTaskQueue();
+      assert.equal(tasks.length, 1);
+      assert.match(tasks[0].prompt, new RegExp(`^Your watch ${id} failed its check`));
     });
 
     it('met wins over an already-passed deadline (reports complete, not expired)', async () => {
@@ -729,12 +874,12 @@ describe('watch-jobs', () => {
   });
 
   describe('redaction', () => {
-    it('a matched secret in the report body is redacted, never sent literally', async () => {
+    it('delivered body keeps the matched text raw (AI-184); the scrub survives in the stored outcome', async () => {
       await createTempSecrets(dir, 'MY_TEST_SECRET=sk_live_verylongsecretvalue123\n');
       resetRedactCache();
-      const { addWatchJob, runWatchTick } = await import('../src/lib/watch-jobs.js');
+      const { addWatchJob, runWatchTick, listWatchJobs } = await import('../src/lib/watch-jobs.js');
       const target = join(dir, 'secretfile.txt');
-      await addWatchJob(
+      const reg = await addWatchJob(
         {
           description: 'secret leak check',
           check: { type: 'file_contains', path: target, pattern: 'sk_live_verylongsecretvalue123' },
@@ -742,13 +887,19 @@ describe('watch-jobs', () => {
         },
         T0,
       );
+      const id = (reg as any).watch.id;
       await writeFile(target, 'token=sk_live_verylongsecretvalue123 end', 'utf8');
 
       const { fn, calls } = recordingNotify();
       await runWatchTick({ now: T0, notify: fn });
       assert.equal(calls.length, 1);
-      assert.ok(calls[0].body.includes('<redacted:'), 'redacted body must carry a <redacted: tag');
-      assert.equal(calls[0].body.includes('sk_live_verylongsecretvalue123'), false, 'the raw secret must never appear');
+      // AI-184: the report reaches the operator's own chat — raw text, no placeholder.
+      assert.ok(calls[0].body.includes('sk_live_verylongsecretvalue123'), 'delivered body keeps real text (AI-184)');
+      assert.ok(!calls[0].body.includes('<redacted:'), 'delivered body carries no placeholder');
+      // The scrub survives where the report PERSISTS: the row outcome.
+      const row = (await listWatchJobs()).find((w) => w.id === id)!;
+      assert.ok(!row.outcome!.includes('sk_live_verylongsecretvalue123'), 'stored outcome must not carry the raw secret');
+      assert.ok(row.outcome!.includes('<redacted:MY_TEST_SECRET>'), 'stored outcome records the placeholder');
     });
   });
 });

@@ -6,6 +6,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { runRulesCritic } from '../rules-critic.js';
 import { addRule } from '../../../../pa/dist/src/lib/feedback-rules.js';
+import { resetRedactCache } from '../../../../pa/dist/src/lib/redact.js';
 import { waitForDrain } from './test-teardown-guard.js';
 
 const TEST_HOME = join(tmpdir(), `pa-test-rules-critic-${process.pid}`);
@@ -85,5 +86,34 @@ describe('rules-critic', () => {
     // Never-throws: garbage inputs must not raise into the send path
     runRulesCritic({ text: '', chatId: 0, threadId: 0, refId: '' });
     assert.doesNotThrow(() => runRulesCritic({ text: 'fine', chatId: -1, threadId: -1, refId: 'x' }));
+  });
+
+  // AI-184 (2026-09-03): the violations row is a LOGGED copy of the delivered
+  // reply — since redaction left the send path, this excerpt is where the scrub
+  // must keep happening.
+  it('logged excerpt keeps the scrub: secrets.env literal is redacted in the violations row', async () => {
+    const OPERATOR_NAME = 'OperatorNameFixture';
+    writeFileSync(join(TEST_HOME, 'secrets.env'), `PA_USER_NAME=${OPERATOR_NAME}\n`, 'utf8');
+    resetRedactCache();
+    try {
+      await addRule({
+        key: 'no-bad-word-2',
+        text: 'Never say the bad word',
+        scope: 'global',
+        status: 'active',
+        check: { kind: 'forbidden_phrase', phrase: 'BadWord' },
+        origin: { thread_id: null, message_id: null, refId: null, ts: '2026-08-28T00:03:00.000Z', decision_ids: [] },
+      });
+
+      runRulesCritic({ text: `badword appears after ${OPERATOR_NAME} signed the draft`, chatId: -1009999999999, threadId: 4242, refId: 's-test0005' });
+
+      const rows = readViolations();
+      assert.equal(rows.length, 1);
+      const excerpt = String(rows[0].excerpt);
+      assert.ok(!excerpt.includes(OPERATOR_NAME), 'logged copy must NOT keep the name');
+      assert.ok(excerpt.includes('<redacted:PA_USER_NAME>'), 'placeholder recorded instead');
+    } finally {
+      resetRedactCache();
+    }
   });
 });

@@ -15,6 +15,37 @@ const execHidden = (cmd: string) => execAsync(cmd, { windowsHide: true, timeout:
 
 export type ExecFn = (cmd: string) => Promise<{ stdout: string; stderr: string }>;
 
+// Raw C0 control characters (U+0000 through U+001F) are ILLEGAL inside JSON
+// strings, but PowerShell's ConvertTo-Json leaves some of them unescaped in its
+// output (incident 2026-09-03: a bash wrapper's argv carried a mangled arrow
+// glyph as a raw SUB byte; ONE poisoned argv string made JSON.parse throw and
+// the whole snapshot degrade to an empty map — which then got cached for the
+// TTL — so every liveness read machine-wide saw an empty machine for as long as
+// the carrier process lived, blinding idle-kill, orphan-sweep and bg-leak).
+// The character class is built at RUNTIME from char codes: a literal escape in
+// source risks the file-writing tooling decoding it into a real control byte
+// (repo lesson 2026-08-31).
+const C0_CONTROL_CHARS_RE = new RegExp(
+  `[${String.fromCharCode(0)}-${String.fromCharCode(0x1f)}]`,
+  'g'
+);
+
+/**
+ * JSON.parse for process-listing payloads, tolerating raw C0 control characters.
+ * The first parse is plain JSON.parse (the healthy path stays byte-identical);
+ * only on a throw does the sanitized retry run. Stripping C0 chars cannot
+ * corrupt valid JSON: inside strings they are illegal anyway, and outside
+ * strings they are optional whitespace. Legal ESCAPED forms (backslash-n,
+ * backslash-u001a — two characters each, not raw bytes) are untouched.
+ */
+export function parseProcessJson(raw: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return JSON.parse(raw.replace(C0_CONTROL_CHARS_RE, ''));
+  }
+}
+
 const BATCH_SIZE = 50;
 
 // Snapshot cache to avoid per-PID OS queries on hot paths (heartbeat, idle checks)
@@ -64,7 +95,7 @@ async function buildSnapshotFromQuery(execFn: ExecFn): Promise<Map<number, Proce
       );
       const raw = stdout.trim();
       if (!raw) return new Map();
-      const data = JSON.parse(raw);
+      const data = parseProcessJson(raw);
       const arr = Array.isArray(data) ? data : [data];
       records = new Map();
       for (const p of arr) {
@@ -92,8 +123,23 @@ async function buildSnapshotFromQuery(execFn: ExecFn): Promise<Map<number, Proce
     return records;
   } catch (err: any) {
     if (err.code === 'ENOENT') warnProcessTreeUnavailable(platform() === 'win32' ? 'powershell' : 'ps', 'getProcessSnapshot');
+    else if (err instanceof SyntaxError) warnSnapshotUnparseable(err);
     return new Map();
   }
+}
+
+// A snapshot that STILL fails to parse after C0 sanitization is genuine
+// corruption. Warn once so a blinded machine is observable instead of silently
+// reading as empty — that silent-empty was the 2026-09-03 incident's
+// detection gap (~40 min of machine-wide blindness before anyone looked).
+let _warnedUnparseableSnapshot = false;
+function warnSnapshotUnparseable(err: SyntaxError): void {
+  if (_warnedUnparseableSnapshot) return;
+  _warnedUnparseableSnapshot = true;
+  console.warn(
+    `[pa/process-tree] process snapshot still unparseable after control-char sanitize — ` +
+    `liveness reads degrade to EMPTY until the payload is clean: ${err.message}`
+  );
 }
 
 /**
@@ -228,7 +274,7 @@ async function getCommandLinesDirect(
         );
         const raw = stdout.trim();
         if (!raw) continue;
-        const data = JSON.parse(raw);
+        const data = parseProcessJson(raw);
         const arr = Array.isArray(data) ? data : [data];
         for (const p of arr) {
           if (typeof p.ProcessId === 'number') {

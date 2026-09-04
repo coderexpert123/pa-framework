@@ -49,7 +49,7 @@ import { buildHITLKeyboard, buildDraftKeyboard } from './lib/hitl-keyboard.js';
 import { createPostmortemStub } from './lib/postmortem.js';
 import type { PostmortemInput, PostmortemMetadata } from './lib/postmortem.js';
 import { buildAlertCensus } from './lib/alert-census.js';
-import type { AlertCensus } from './lib/alert-census.js';
+import type { AlertCensus, CensusFamily } from './lib/alert-census.js';
 import { jobsForHost } from './lib/maintenance/registry.js';
 import { repoRootFromModule } from './lib/git-root.js';
 import { rm, copyFile } from 'fs/promises';
@@ -964,7 +964,7 @@ export function buildReport(
     if (repeatUnchanged.length > 0) {
       lines.push(`*Alert hygiene (${repeatUnchanged.length})*`);
       for (const f of repeatUnchanged) {
-        lines.push(`- \`${f.family}\` — sent ${f.sent}, ${f.distinctBodies} distinct bod${f.distinctBodies === 1 ? 'y' : 'ies'} — escalate / merge / mute${f.regressedAfterFix ? ` ⚠ recurred after fix ${f.fixedAt}` : ''}`);
+        lines.push(`- \`${f.family}\` — sent ${f.sent}, ${f.distinctBodies} distinct bod${f.distinctBodies === 1 ? 'y' : 'ies'} — mute via button or \`pa fix\`${f.regressedAfterFix ? ` ⚠ recurred after fix ${f.fixedAt}` : ''}`);
       }
       lines.push('');
     }
@@ -1176,6 +1176,128 @@ async function sendHitlMessages(entries: ReportEntry[]): Promise<void> {
   }
 }
 
+// --- WP-D2 B.4/B.5 (2026-09-02, plans/2026-09-02-topic-handover-WAVE2-SPEC.md §3.4):
+// per-family Operator-action / Alert-hygiene messages, additional to the nightly report.
+// Each carries the si:<family>:m mute button (two-tap bot-side — the press runs
+// `pa fix <family> --note "muted from nightly report button"`, writing the same
+// fix-record the typed fallback does); operator-action families ALSO carry the one-tap
+// reauth:google button, ONLY when the family is the Google invalid_grant one. Same
+// pure-selector + send-loop split as selectHitlMessages above: never abort the nightly run.
+
+const FAMILY_MESSAGE_CAP = 3;
+// The si: family charset (callback-grammar.ts SI_RE's family group) — a family outside it
+// gets no button at all (report-line only, the same discipline as B.2's ru: ids).
+const SI_FAMILY_RE = /^[A-Za-z0-9._-]{1,40}$/;
+// ONLY the Google invalid_grant family earns the reauth:google button (B.4) — the other
+// human-gated classifications (license, usage limit, …) have no reauth fix.
+const OAUTH_INVALID_GRANT_RE = /invalid_grant/i;
+
+export type FamilyMessageSection = 'operator-action' | 'alert-hygiene';
+
+export interface FamilyMessage {
+  section: FamilyMessageSection;
+  family: CensusFamily;
+  ageDays: number;
+  /** true ⇒ the [🔐 Reauth] → reauth:google button joins the mute button (OAuth only). */
+  oauthReauth: boolean;
+  /** false ⇒ no keyboard at all (family outside the si: charset). */
+  canMute: boolean;
+}
+
+function isOauthInvalidGrant(f: CensusFamily): boolean {
+  return !!(
+    (f.ownerStatus?.lastError && OAUTH_INVALID_GRANT_RE.test(f.ownerStatus.lastError)) ||
+    (f.bodySample && OAUTH_INVALID_GRANT_RE.test(f.bodySample))
+  );
+}
+
+/** Pure. Operator-action families first (newest first), then alert-hygiene (newest first);
+ *  each section capped at FAMILY_MESSAGE_CAP; suppressed families never selected (they are
+ *  absent from the report's own census sections too). */
+export function selectFamilyMessages(census: AlertCensus | undefined): FamilyMessage[] {
+  if (!census) return [];
+  const nowMs = Date.parse(census.generatedAt);
+  const ageDaysOf = (f: CensusFamily): number =>
+    Math.max(0, Math.round((nowMs - Date.parse(f.firstSeen)) / 86_400_000));
+  const newestFirst = (a: CensusFamily, b: CensusFamily): number =>
+    Date.parse(b.firstSeen) - Date.parse(a.firstSeen);
+  const toMessage = (section: FamilyMessageSection) => (f: CensusFamily): FamilyMessage => ({
+    section,
+    family: f,
+    ageDays: ageDaysOf(f),
+    oauthReauth: section === 'operator-action' && isOauthInvalidGrant(f),
+    canMute: SI_FAMILY_RE.test(f.family),
+  });
+  const operatorAction = census.families
+    .filter((f) => f.classification === 'human-gated' && !f.suppressedBy)
+    .sort(newestFirst)
+    .slice(0, FAMILY_MESSAGE_CAP)
+    .map(toMessage('operator-action'));
+  const hygiene = census.families
+    .filter((f) => f.classification === 'repeat-unchanged' && !f.suppressedBy)
+    .sort(newestFirst)
+    .slice(0, FAMILY_MESSAGE_CAP)
+    .map(toMessage('alert-hygiene'));
+  return [...operatorAction, ...hygiene];
+}
+
+/** Pure. The per-family keyboard: [🔇 Mute] → si:<family>:m (two-tap bot-side), plus
+ *  [🔐 Reauth] → reauth:google ONLY for the OAuth invalid_grant operator-action family.
+ *  Undefined when the family is outside the si: charset. */
+export function buildFamilyKeyboard(
+  msg: FamilyMessage,
+): { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } | undefined {
+  if (!msg.canMute) return undefined;
+  const row: Array<{ text: string; callback_data: string }> = [];
+  if (msg.oauthReauth) {
+    row.push({ text: '🔐 Reauth', callback_data: 'reauth:google' });
+  }
+  row.push({
+    text: msg.section === 'alert-hygiene' ? '🔇 Mute (fix-record)' : '🔇 Mute alerts',
+    callback_data: `si:${msg.family.family}:m`,
+  });
+  return { inline_keyboard: [row] };
+}
+
+/** Pure. The per-family message body — age, owner, and the reason (last error, else a
+ *  body sample), mirroring the report's census lines, plus the typed fallback. */
+export function buildFamilyMessageBody(msg: FamilyMessage): string {
+  const f = msg.family;
+  const err = f.ownerStatus?.lastError ?? f.bodySample ?? '';
+  const lines = [
+    `Family: \`${f.family}\` — ${msg.ageDays}d old (first seen ${f.firstSeen.slice(0, 10)})`,
+    `Owner: ${f.owner ?? 'unknown'} (${f.ownerKind}${f.ownerStatus?.status ? `, ${f.ownerStatus.status}` : ''})`,
+  ];
+  if (err) lines.push(`Last error: ${err.slice(0, 200)}`);
+  if (f.regressedAfterFix) lines.push(`⚠ Recurred after fix ${f.fixedAt ?? ''}`.trimEnd());
+  lines.push('', `Mute via the button (writes a fix-record) or \`pa fix ${f.family} --note "..."\`.`);
+  return lines.join('\n');
+}
+
+/** Sends the per-family messages selected by selectFamilyMessages. Same never-abort
+ *  discipline as sendHitlMessages — each send is individually try/caught, and this runs
+ *  after the nightly report has already been delivered. */
+async function sendFamilyActionMessages(census: AlertCensus | undefined): Promise<void> {
+  for (const msg of selectFamilyMessages(census)) {
+    const f = msg.family;
+    try {
+      const title = msg.section === 'alert-hygiene' ? `Alert hygiene: ${f.family}` : `Operator action: ${f.family}`;
+      await notifyUser(title, buildFamilyMessageBody(msg), {
+        topic: await getReportTopic(),
+        severity: msg.section === 'alert-hygiene' ? 'info' : 'warn',
+        dedupKey: `hitl-family-${msg.section}-${f.family}`,
+        dedupWindowMs: 24 * 3_600_000,
+        escalate: false,
+        // NotifyOpts.replyMarkup is `Record<string, unknown>` (FROZEN) — same double-cast
+        // escape hatch as the HITL keyboards above.
+        replyMarkup: buildFamilyKeyboard(msg) as unknown as Record<string, unknown> | undefined,
+      });
+    } catch (err: any) {
+      console.error(`[self-improver] family send failed for ${msg.section} '${f.family}': ${err?.stack || err}`);
+    }
+  }
+}
+
 async function main() {
   const rollbackLines = await rollback();
   const staleCount = await sweepStaleDrafts();
@@ -1214,6 +1336,11 @@ async function main() {
   // correction 14) — never allowed to abort the nightly run (each send is individually
   // try/caught inside sendHitlMessages).
   await sendHitlMessages(entries);
+
+  // WP-D2 B.4/B.5 (2026-09-02): per-family Operator-action / Alert-hygiene messages with
+  // the si: mute keyboard (reauth:google for the OAuth family) — additional to the report,
+  // same never-abort discipline.
+  await sendFamilyActionMessages(census);
 }
 
 // Guard so importing this module (e.g. from a test file, to unit-test buildReport/ReportEntry)

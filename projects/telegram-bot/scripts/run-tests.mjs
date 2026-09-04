@@ -26,6 +26,27 @@ function loadBuildLock(repoRoot) {
   if (!existsSync(p)) return null;
   try { return requireCjs(p); } catch { return null; }
 }
+
+// Deployment-env scrub (AI-199, 2026-09-03): `pa run` hands every secrets.env
+// value to LLM workers, so a suite run from inside a worker shell (the push
+// skill's gate) inherits deployment config as process.env — and runtime code
+// reads some of it (PA_RICH_MESSAGES=1 rerouted worker replies over
+// /sendRichMessage; 12 subtests failed on every gate run, never locally, never
+// on CI). The policy (variable list + rationale) lives in exactly one place:
+// pa/src/lib/test-env-scrub.ts, compiled to pa/dist/src/lib/test-env-scrub.js.
+// A missing compiled module (pre-build bootstrap) runs unscrubbed — the same
+// fallback policy as the lock loader above.
+function loadTestEnvScrub(repoRoot) {
+  const p = join(repoRoot, 'pa/dist/src/lib/test-env-scrub.js');
+  if (!existsSync(p)) return null;
+  try { return requireCjs(p); } catch { return null; }
+}
+
+function scrubDeploymentEnv(repoRoot, env) {
+  const scrub = loadTestEnvScrub(repoRoot);
+  if (!scrub) return env;
+  return scrub.stripDeploymentEnv(env);
+}
 async function withBuildLockOrRun(repoRoot, pkg, fn) {
   const bl = loadBuildLock(repoRoot);
   if (!bl) return await fn();
@@ -48,8 +69,10 @@ function matchesAnyFilterName(filePath, names) {
 }
 
 // D17: redirect the SPAWNED CHILD's TMP/TEMP only — never the parent process
-// env, never creates a directory, never fails when neither candidate exists
-// (a no-op on CI, which has neither PA_TEST_TMP_DIR nor C:/wt/tmp).
+// env. PA_TEST_TMP_DIR wins when it is set and exists; otherwise the
+// deployment's conventional fast-drive scratch directory is used when it
+// exists; with neither present there is no override (a no-op on CI). Never
+// creates a directory, never fails when neither candidate exists.
 function computeTmpOverride() {
   const candidate = process.env.PA_TEST_TMP_DIR;
   if (candidate && existsSync(candidate)) {
@@ -109,7 +132,8 @@ async function main() {
     testsToRun = allTests.filter((t) => quarantinedFiles.has(t));
     if (testsToRun.length === 0) {
       console.log('No quarantined tests to run');
-      process.exit(0);
+      process.exitCode = 0;
+      return;
     }
     console.log(`Running ${testsToRun.length} quarantined test(s)...`);
   } else {
@@ -132,7 +156,8 @@ async function main() {
       );
       const suffix = quarantinedHits.length > 0 ? ` (quarantined: ${quarantinedHits.join(', ')})` : '';
       console.log(`No test files matched: ${filterNames.join(', ')}${suffix}`);
-      process.exit(1);
+      process.exitCode = 1;
+      return;
     }
     testsToRun = filtered;
   }
@@ -141,11 +166,35 @@ async function main() {
   // not acquire the reservation at all.
   if (testsToRun.length === 0) {
     console.log('No tests to run');
-    process.exit(0);
+    process.exitCode = 0;
+    return;
+  }
+
+  // AI-180: refuse to run tests against a dist that does not belong to this
+  // checkout (missing stamp, sha drift, or src newer than the last build).
+  // EVERY run checks — scoped runs included: PA_BUILD_LOCK=0 bypasses the
+  // lock, never the guard. The policy (incl. the PA_ALLOW_STALE_DIST=1
+  // warn-and-continue escape hatch) lives in pa's assertDistFresh (this
+  // runner passes pkg:'bot' so the BOT's stamp/src roots are checked); a
+  // missing compiled module/function (fresh clone, pre-build bootstrap)
+  // skips it.
+  const blGuard = loadBuildLock(repoRoot);
+  if (blGuard && typeof blGuard.assertDistFresh === 'function') {
+    try {
+      await blGuard.assertDistFresh({ pkg: 'bot', repoRoot });
+    } catch (e) {
+      console.error(`Refusing to run tests against this dist (AI-180): ${e?.message ?? e}`);
+      process.exitCode = 1;
+      return;
+    }
   }
 
   const code = await withBuildLockOrRun(repoRoot, 'bot', () => spawnTests(testsToRun, distDir));
-  process.exit(code);
+  // exitCode + natural exit, NOT process.exit(): a forced exit truncates this
+  // process's own still-pending stdout writes — the child's relayed TAP (and
+  // with a fast small file, effectively ALL of it) never reaches the caller.
+  // Natural exit flushes pending writes before the process goes away.
+  process.exitCode = code;
 }
 
 function spawnTests(testFiles, distDir) {
@@ -175,12 +224,17 @@ function spawnTests(testFiles, distDir) {
     const child = spawn(process.execPath, testArgs, {
       stdio: ['inherit', 'pipe', 'inherit'],
       cwd: botRoot,
-      env: { ...process.env, ...computeTmpOverride() },
+      env: scrubDeploymentEnv(repoRoot, { ...process.env, ...computeTmpOverride() }),
     });
     child.stdout.on('data', (chunk) => { tapBuffer += chunk.toString(); });
     child.stdout.pipe(process.stdout);
 
-    child.on('exit', (code) => {
+    // 'close', not 'exit': 'exit' can fire BEFORE the piped stdout has flushed,
+    // so an immediate process.exit() truncated both the TAP relayed to our own
+    // stdout and (for a fast, small file) the tail of tapBuffer the dark-file
+    // detector judges — surfaced by the AI-180 guard test's tiny smoke file.
+    // 'close' fires only after the child's stdio streams have fully ended.
+    child.on('close', (code) => {
       const dark = findDarkFiles(tapBuffer, testFiles.map((f) => relative(botRoot, f)));
       if (dark.length > 0) {
         console.error(`\nDARK FILE FAILURE: ${dark.join(', ')} — ran as a file-shell with zero tests (Node 22.14 test-runner bug class). Suite result is NOT trustworthy; see scripts/run-tests.mjs.`);
@@ -219,6 +273,12 @@ const DARK_FILE_ALLOWLIST = new Set([
  * Parse a node:test TAP stream and return the relative paths of files that
  * appear as a `# Subtest: <path>` entry whose following ok/not-ok line arrived
  * with no nested `# Subtest:` between them — i.e. the file registered nothing.
+ * ALSO: a child that ran NOTHING emits no TAP at all — no header, no file
+ * shells (healthy files get NO file shell either, so shell absence alone is
+ * not evidence) — yet still exits 0: the nested `node:test run()`
+ * recursion-guard skip when test-runner env (NODE_TEST_CONTEXT) leaks into a
+ * spawned runner, or a crash before any output. If no expected file appeared
+ * AND the stream has no TAP header, every file is dark.
  */
 function findDarkFiles(tap, relFiles) {
   // TAP escapes backslashes (dist\\tests\\x.test.js on Windows) — collapse any
@@ -226,6 +286,10 @@ function findDarkFiles(tap, relFiles) {
   const norm = (p) => p.trim().replace(/\\+/g, '/');
   const lines = tap.split(/\r?\n/);
   const normalized = relFiles.map(norm);
+  const seenAnyExpectedFile = lines.some((l) => {
+    const m = l.match(/^# Subtest: (.+)$/);
+    return m ? normalized.includes(norm(m[1])) : false;
+  });
   const dark = [];
   for (let i = 0; i < lines.length; i++) {
     const m = lines[i].match(/^# Subtest: (.+)$/);
@@ -238,6 +302,9 @@ function findDarkFiles(tap, relFiles) {
       if (/^(not )?ok /.test(lines[j])) break;
     }
     if (darkFile && !DARK_FILE_ALLOWLIST.has(name)) dark.push(name);
+  }
+  if (dark.length === 0 && !seenAnyExpectedFile && !/^TAP version /m.test(tap)) {
+    return normalized.filter((name) => !DARK_FILE_ALLOWLIST.has(name));
   }
   return dark;
 }

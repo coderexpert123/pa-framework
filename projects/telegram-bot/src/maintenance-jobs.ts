@@ -33,7 +33,6 @@ import {
   modelOverrideSweepJob,
   deliveredStoreCompactJob,
   proxyPoolRefreshJob,
-  dlqFlushJob,
   groundingCheckJob,
 } from '../../../pa/dist/src/lib/maintenance/jobs/index.js';
 import { botSelfRestartJob } from '../../../pa/dist/src/lib/maintenance/jobs/bot-self-restart.js';
@@ -107,7 +106,7 @@ export function checkRegistryContentInvariants(
 }
 
 export interface BotMaintenanceDeps {
-  /** Telegram bot token — needed by dlq-flush and proxy-pool-refresh. */
+  /** Telegram bot token — needed by the queue-drain dlq source and proxy-pool-refresh. */
   token: string;
   /** Allowed chat ids — needed by model-override-sweep. */
   chatIds: number[];
@@ -126,6 +125,16 @@ export interface BotMaintenanceDeps {
   /** Injected (runModelSweep precedent — avoids a main.ts import cycle):
    *  drain due parked requeues; returns the number re-injected. */
   requeueDrain: () => Promise<number>;
+  /** Injected (requeueDrain precedent): drain queued executable reminder
+   *  payloads (AI-185) into the dispatch pipeline; returns the number
+   *  injected. Lives in main.ts — it needs runPollLoop's allowedChatIds and
+   *  the synthetic-update injector. */
+  reminderResumeDrain: () => Promise<number>;
+  /** Injected (reminderResumeDrain precedent): drain queued topic tasks
+   *  (topic-task handover Wave 1, SPEC §3.6) into the dispatch pipeline; one
+   *  task per topic per tick; returns the number injected. Lives in main.ts —
+   *  it needs runPollLoop's allowedChatIds and the synthetic-update injector. */
+  topicTaskDrain: () => Promise<number>;
   /**
    * Registry content rules loaded from ~/.pa/registry-content-rules.json.
    * Injected for testability (default: loadRegistryContentRules()).
@@ -137,11 +146,50 @@ export interface BotMaintenanceDeps {
  * Binds runtime execution closures (token, chatIds, sentinelPath) to the statically
  * declared bot-host jobs in the pa maintenance registry (AI-108).
  *
- * ORDER IS LOAD-BEARING: runDueJobs runs jobs sequentially, and dlq-flush can
+ * ORDER IS LOAD-BEARING: runDueJobs runs jobs sequentially. The dlq queue can
  * block for minutes during a Telegram outage (N queued replies x 30s send
- * timeout). It runs LAST so a stalled flush never delays the cheap jobs that
- * share the pass.
+ * timeout) — it is the LAST SOURCE inside queue-drain's pass so a stalled
+ * flush never delays the cheap injectors sharing the job (the pre-consolidation
+ * job-array constraint, now per-source).
  */
+
+// ─── Queue-drain family (AI-189 unification, Wave-2 SPEC §3.2) ─────────────
+
+/**
+ * The whole queue-drain family is ONE job with registered SOURCES (spec §3.2).
+ * A new queue-shaped drain joins HERE as a source — the registry admission
+ * rule (docs/maintenance-jobs.md) forbids a sibling job without first proving
+ * this shape doesn't cover it. Each source keeps its own cadence, cold-start
+ * policy and documented semantics.
+ */
+export type DrainSourceName = 'requeue' | 'reminder-resume' | 'topic-task' | 'dlq';
+
+export interface DrainSourceSpec {
+  name: DrainSourceName;
+  /** Per-source cadence inside the job's 60s pass (the family minimum). */
+  everyMs: number;
+  /** Cold-start seeding: the source reads as "just ran" at job creation, so it
+   *  waits one full interval after a bot restart instead of firing on the
+   *  first tick (the per-source successor of the pre-consolidation job-level
+   *  cold-start list). The three non-drain seeded jobs (delivered-store-compact,
+   *  proxy-pool-refresh, dashboard-refresh) stay in main.ts's job-level list. */
+  coldStartSeed: boolean;
+  /** Documented attributes, asserted by maintenance-jobs.test.ts and rendered
+   *  in docs/maintenance-jobs.md's source table:
+   *  ['pop-first','persist-before-inject','no-age-drop'] for the three
+   *  injectors; ['entry-idempotent','send-before-mark'] for dlq. */
+  semantics: readonly string[];
+}
+
+/** Frozen per-source attributes (spec §3.2). The run fns are bound per-deps in
+ *  createBotMaintenanceJobs; dlq is LAST — see the order comment above. */
+export const DRAIN_SOURCE_SPECS: readonly DrainSourceSpec[] = [
+  { name: 'requeue', everyMs: 300_000, coldStartSeed: true, semantics: ['pop-first', 'persist-before-inject', 'no-age-drop'] },
+  { name: 'reminder-resume', everyMs: 60_000, coldStartSeed: false, semantics: ['pop-first', 'persist-before-inject', 'no-age-drop'] },
+  { name: 'topic-task', everyMs: 60_000, coldStartSeed: false, semantics: ['pop-first', 'persist-before-inject', 'no-age-drop'] },
+  { name: 'dlq', everyMs: 300_000, coldStartSeed: true, semantics: ['entry-idempotent', 'send-before-mark'] },
+];
+
 /**
  * Watchdog for stuck maintenance jobs (P2-3 fix). Detects and clears in-flight markers
  * that are older than 10x the job's everyMs interval, which indicates the job's
@@ -274,14 +322,6 @@ export function createBotMaintenanceJobs(deps: BotMaintenanceDeps): MaintenanceJ
     ...proxyPoolRefreshJob,
     async run() {
       return { touched: await runScheduledPoolRefresh(deps.token) };
-    },
-  };
-
-  const boundDlqFlush: MaintenanceJob = {
-    ...dlqFlushJob,
-    async run() {
-      const r = await flushDlq(deps.token);
-      return { touched: r.delivered, detail: { remaining: r.remaining, deduped: r.deduped } };
     },
   };
 
@@ -430,9 +470,9 @@ export function createBotMaintenanceJobs(deps: BotMaintenanceDeps): MaintenanceJ
   };
 
   // Parity with the pa-side stub (pa/src/lib/maintenance/jobs/alert-digest.ts)
-  // is asserted by maintenance-jobs.test.ts. Cheap job runs BEFORE dlq-flush
-  // (jobs array order is load-bearing — see the comment above
-  // createBotMaintenanceJobs).
+  // is asserted by maintenance-jobs.test.ts. alert-digest is LAST in the array
+  // (queue-drain's spec) — the pre-consolidation "cheap before dlq" rationale
+  // now lives per-source inside queue-drain.
   const boundAlertDigest: MaintenanceJob = {
     ...alertDigestJob,
     async run(ctx) {
@@ -458,16 +498,67 @@ export function createBotMaintenanceJobs(deps: BotMaintenanceDeps): MaintenanceJ
     },
   };
 
-  const boundRequeueDrain: MaintenanceJob = {
-    name: 'requeue-drain',
-    description: 'Re-inject parked requeue-ladder dispatches whose backoff has elapsed (seamless restart recovery, 2026-08-27). Request recovery, not housekeeping — never shed under DEGRADED, mirroring dlq-flush.',
+  // ─── queue-drain: the consolidated drain family (AI-189, SPEC §3.2) ──────
+  //
+  // ONE job for requeue + reminder-resume + topic-task + dlq. Per-source
+  // lastRunAtMs lives in a closure Map seeded per coldStartSeed at creation:
+  // MaintenanceJobState has no detail field and the runner never persists
+  // run() detail (SPEC §3.2's ledger anchor is impossible — the same defect
+  // WP-C hit for daily-recon's once-per-day stamp), and the spec explicitly
+  // blesses stamp loss as harmless ("dlq idempotency makes one extra flush
+  // harmless"). A bot restart therefore re-seeds from this registry — exactly
+  // the pre-consolidation cold-start behavior.
+  const drainSourceLastRunMs = new Map<DrainSourceName, number>();
+  const drainCreatedMs = Date.now();
+  for (const spec of DRAIN_SOURCE_SPECS) {
+    if (spec.coldStartSeed) drainSourceLastRunMs.set(spec.name, drainCreatedMs);
+  }
+
+  // The per-source run fns — "the existing injected dep fn, unchanged" for the
+  // three injectors; dlq keeps its flushDlq body (its remaining/deduped detail
+  // rides the log line: the DrainSource shape carries a count only).
+  const drainSourceRunners: Record<DrainSourceName, () => Promise<number>> = {
+    requeue: () => deps.requeueDrain(),
+    'reminder-resume': () => deps.reminderResumeDrain(),
+    'topic-task': () => deps.topicTaskDrain(),
+    dlq: async () => {
+      const r = await flushDlq(deps.token);
+      if (r.delivered > 0 || r.remaining > 0) {
+        logger.info('maintenance', `queue-drain/dlq: delivered ${r.delivered}, remaining ${r.remaining}, deduped ${r.deduped}`);
+      }
+      return r.delivered;
+    },
+  };
+
+  const boundQueueDrain: MaintenanceJob = {
+    name: 'queue-drain',
+    description: 'Consolidated queue-drain family (AI-189): registered sources requeue (5m, cold-start-seeded), reminder-resume (60s), topic-task (60s) and dlq (5m, cold-start-seeded) run on their own cadences inside one pass — pop-first, persist-before-inject, no age drop (dlq: entry-idempotent, send-before-mark). Request recovery, not housekeeping — never shed under DEGRADED.',
     host: 'bot',
-    everyMs: 5 * 60_000,
+    everyMs: 60_000, // the family minimum
     shedWhenDegraded: false,
     destructive: false,
     targets: [],
-    async run() {
-      return { touched: await deps.requeueDrain() };
+    async run(ctx) {
+      let touched = 0;
+      const sources: Partial<Record<DrainSourceName, number>> = {};
+      for (const spec of DRAIN_SOURCE_SPECS) {
+        const last = drainSourceLastRunMs.get(spec.name);
+        if (last !== undefined && ctx.now - last < spec.everyMs) continue;
+        // Stamp BEFORE the run: a source that throws waits out its own cadence
+        // before retrying instead of re-failing every 60s tick (per-source
+        // failures are invisible to the runner's job-level backoff ladder).
+        drainSourceLastRunMs.set(spec.name, ctx.now);
+        try {
+          const n = await drainSourceRunners[spec.name]();
+          sources[spec.name] = n;
+          touched += n;
+        } catch (err) {
+          // Per-source isolation (SPEC §3.2): one failed source is logged and
+          // skipped, never fails the job — the others still run this pass.
+          logger.warn('maintenance', `queue-drain source '${spec.name}' failed (isolated; other sources still ran)`, { source: spec.name, error: String(err) });
+        }
+      }
+      return { touched, detail: { sources } };
     },
   };
 
@@ -493,9 +584,8 @@ export function createBotMaintenanceJobs(deps: BotMaintenanceDeps): MaintenanceJ
     boundGroundingCheck,
     boundRegistryContentWatch,
     boundDashboardRefresh,
-    boundRequeueDrain,
+    boundQueueDrain,
     boundBotSelfRestart,
     boundAlertDigest,
-    boundDlqFlush,
   ];
 }

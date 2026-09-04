@@ -21,7 +21,9 @@ import { join } from 'path';
 import { defaultGitRunner, type GitRunner } from './tree-drift.js';
 import { parsePorcelainEntries } from './git-status.js';
 import { pathsOverlap, readActive, readReleasedSince } from './reservations.js';
+import type { Reservation, ReleasedReservation } from './reservations.js';
 import { repoRootFromModule } from './git-root.js';
+import { appendOrphanRecord } from './orphan-ledger.js';
 import { notifyUser } from './notify.js';
 import { log } from './log.js';
 import { writeJsonAtomic } from './atomic-write.js';
@@ -308,6 +310,85 @@ function buildAlertBody(
   return parts.join('\n');
 }
 
+// ---- Orphan ledger (Wave 2 WP-C, AI-189) ----
+
+export interface OrphanLedgerLaneInput {
+  /** Findings after the ignore list — the pool both lanes draw from. */
+  ignored: EditFinding[];
+  /** Normalized paths covered by a reservation (reservedAtStart + active +
+   *  released), exactly what filterUnreserved consumed. */
+  coveredPaths: string[];
+  /** filterUnreserved's output — the alerted (uncovered) lane. */
+  unreservedFindings: EditFinding[];
+  after: TreeSnapshot;
+  active: Reservation[];
+  released: ReleasedReservation[];
+  /** Paths covered when the window OPENED — paths only, no session label. */
+  reservedAtStart: string[];
+  topic?: { chatId: number; threadId: number };
+}
+
+/** A finding is still dirty when its path remains in the after-snapshot.
+ *  `vanished` findings left the dirty set (committed or deleted mid-window)
+ *  and would make the sweep file a land-or-discard task for a clean path. */
+function isStillDirty(f: EditFinding, after: TreeSnapshot): boolean {
+  return after.entries[f.path] !== undefined;
+}
+
+/**
+ * Write the close's orphan-ledger records: at most TWO lines — one for the
+ * covered-but-still-dirty lane (owner_session = the first covering
+ * reservation's session label, active first, then released-during-window;
+ * paths covered only by reservedAtStart carry no label anywhere and read as
+ * null), one for the uncovered lane (owner_session null). Returns lines
+ * written. Throws on write failure; closeWindow wraps the call in try/catch
+ * so a ledger failure can never break a reply-path close.
+ */
+export async function writeOrphanLedgerRecords(input: OrphanLedgerLaneInput): Promise<number> {
+  const ts = new Date().toISOString();
+  const ownerTopic = input.topic ? `${input.topic.chatId}_${input.topic.threadId}` : null;
+
+  const covered = input.ignored.filter(
+    (f) => input.coveredPaths.some((c) => pathsOverlap(f.path, c)) && isStillDirty(f, input.after),
+  );
+  const unowned = input.unreservedFindings.filter((f) => isStillDirty(f, input.after));
+
+  const coveringReservation = (p: string): { session: string | null; releasedAt: string | null } | null => {
+    const a = input.active.find((r) => r.paths.some((rp) => pathsOverlap(p, rp)));
+    if (a) return { session: a.session, releasedAt: a.expiresAt };
+    const r = input.released.find((rr) => rr.paths.some((rp) => pathsOverlap(p, rp)));
+    if (r) return { session: r.session, releasedAt: r.releasedAt };
+    if (input.reservedAtStart.some((rp) => pathsOverlap(p, rp))) return { session: null, releasedAt: null };
+    return null;
+  };
+
+  let written = 0;
+  if (covered.length > 0) {
+    const first = covered
+      .map((f) => coveringReservation(f.path))
+      .find((a) => a !== undefined && a !== null) ?? null;
+    written += await appendOrphanRecord({
+      ts,
+      paths: covered.map((f) => f.path),
+      owner_session: first ? first.session : null,
+      owner_topic: ownerTopic,
+      source: 'dispatch-close',
+      released_at: first ? first.releasedAt : null,
+    });
+  }
+  if (unowned.length > 0) {
+    written += await appendOrphanRecord({
+      ts,
+      paths: unowned.map((f) => f.path),
+      owner_session: null,
+      owner_topic: ownerTopic,
+      source: 'dispatch-close',
+      released_at: null,
+    });
+  }
+  return written;
+}
+
 // ---- Window lifecycle ----
 
 export interface OpenWindowOptions {
@@ -367,6 +448,11 @@ type NotifyFn = (subject: string, body: string, opts?: WorkerEditNotifyOpts) => 
 
 export interface CloseWindowOptions {
   worker: string | null;
+  /** Wave 2 WP-C (AI-189): the dispatching topic, when the caller knows it —
+   *  written into the orphan ledger record so the daily-recon sweep can file
+   *  a land-or-discard task back to the owning topic. The sweeper never has
+   *  one (its bot is gone by definition), so it stays optional. */
+  topic?: { chatId: number; threadId: number };
   gitRunner?: GitRunner;
   /** Test-only injection point — the real notifyUser can never be relied on
    *  to throw (it documents "never throws"), so exercising closeWindow's own
@@ -416,6 +502,31 @@ export async function closeWindow(win: DispatchWindow | null, opts: CloseWindowO
       ...released.flatMap((r) => r.paths),
     ];
     const findings = filterUnreserved(ignored, coveredPaths);
+
+    // Orphan ledger (Wave 2 WP-C, AI-189) — written BEFORE the empty-findings
+    // early return, the alert-cap gate and the notify path: a covered-only
+    // close (findings empty after filtering) still needs its owned record,
+    // and the cap gates only the ALERT, never the sweep's input. Ledger
+    // failure logs and continues — the audit sits on the live reply path.
+    try {
+      await writeOrphanLedgerRecords({
+        ignored,
+        coveredPaths,
+        unreservedFindings: findings,
+        after,
+        active,
+        released,
+        reservedAtStart: win.reservedAtStart,
+        topic: opts.topic,
+      });
+    } catch (err) {
+      log('warn', 'worker-edit-audit', 'orphan ledger write failed; continuing', {
+        refId: refId(),
+        windowId: win.id,
+        resource: win.resource,
+        error: String(err),
+      });
+    }
 
     if (findings.length === 0) {
       return { findings: [], notified: false, concurrentWindows: 0 };

@@ -106,7 +106,7 @@ stays prompt.
    align; offset comes from the real batch only), so the full normal path re-dispatches it.
    The requeue is a durable ladder — a failed requeued dispatch below `PA_REQUEUE_MAX`
    (default 2) parks (`requeueNotBefore`, `PA_REQUEUE_BACKOFF_MS` default 15 min) and the
-   `requeue-drain` maintenance job re-injects when due; a /stop during the window cancels
+   the `queue-drain` job's `requeue` source re-injects when due; a /stop during the window cancels
    the parked record. Three hard rules: the "retrying automatically" status line goes
    OUT-OF-BAND (raw `sendMessage` + `appendRefIdAndLog`) — a reply-path send would
    `markDelivered` the key and the retry's REAL reply would be dedup-skipped at
@@ -215,3 +215,5 @@ do not "fix" either back.
    semantics above). `worker-exec.ts` additionally enforces machine-wide worker
    admission control via `PA_MAX_CONCURRENT_WORKERS` blackboard slots (evaluators
    exempt).
+
+---

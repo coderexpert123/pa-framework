@@ -63,6 +63,34 @@ function heartbeatGraceMs(): number {
   return HEARTBEAT_GRACE_MS_DEFAULT;
 }
 
+// AI-179 (2026-09-03): outer retry ladder for heartbeat renewals. Delays
+// BETWEEN attempts after the immediate first attempt, so the default
+// "1000,5000,15000" is 4 attempts spanning ~21s — plus each attempt's own
+// inner renameWithRetry (~0.85s), for ≈22s of total EPERM exposure. Read
+// fresh per call, same pattern as heartbeatStaleMs(). Comma-separated
+// integers ≥0; anything invalid or absent falls back to the default whole.
+const HEARTBEAT_WRITE_RETRY_MS_DEFAULT = '1000,5000,15000';
+
+function heartbeatWriteRetryDelaysMs(): number[] {
+  const raw = process.env.PA_HEARTBEAT_WRITE_RETRY_MS;
+  const source = raw && raw.trim() ? raw : HEARTBEAT_WRITE_RETRY_MS_DEFAULT;
+  const parts = source.split(',').map((s) => s.trim());
+  const usable = parts.length > 0 && parts.every((p) => /^\d+$/.test(p));
+  return (usable ? parts : HEARTBEAT_WRITE_RETRY_MS_DEFAULT.split(',')).map((p) => parseInt(p, 10));
+}
+
+/**
+ * Outcome of one full renewal attempt ladder (AI-179, 2026-09-03):
+ * - `'updated'` — the row was found and its heartbeat written.
+ * - `'row-absent'` — the store read fine but the row is genuinely gone.
+ *   Never retried: no ladder can resurrect it.
+ * - `'write-failed'` — the renewal could not complete (lock acquisition,
+ *   store read, or atomic write threw through the whole ladder). Says
+ *   NOTHING about whether the row still exists; callers must verify with
+ *   {@link Blackboard.peekLockRow} before treating a loss as real.
+ */
+export type HeartbeatRenewOutcome = 'updated' | 'row-absent' | 'write-failed';
+
 type LockDisposition = 'alive' | 'grace' | 'evict-dead' | 'evict-expired';
 
 /**
@@ -316,54 +344,106 @@ export class Blackboard {
   }
 
   /**
+   * Renew an existing lock row's heartbeat, reporting the FULL outcome as a
+   * tri-state (AI-179, 2026-09-03). The pre-AI-179 `updateHeartbeat` boolean
+   * returned `false` both for "row genuinely absent" and for "gave up after
+   * write errors" — a transient EPERM on the atomic-replace rename (any
+   * Windows process holding blackboard.json open without FILE_SHARE_DELETE:
+   * Defender, Search indexer, backup agents) was therefore indistinguishable
+   * from a real purge, and startLockRenewal aborted healthy runs with
+   * onLost('purged').
+   *
+   * Attempt ladder: 1 immediate attempt + 1 retry per delay in
+   * PA_HEARTBEAT_WRITE_RETRY_MS (default 1s/5s/15s → 4 attempts spanning
+   * ~21s + per-attempt inner rename retries). Every concurrent heartbeat
+   * source in the system serializes through this ONE proper-lockfile lock on
+   * one shared file, so acquisition hiccups are expected, not exceptional —
+   * the ladder adds outer seconds instead of aborting on the first blip.
+   *
+   * The read here is deliberately NOT this.readData(): readData's catch
+   * swallows a torn/unreadable store into `{ active_locks: [] }`, which would
+   * read as "row absent" and manufacture a phantom 'row-absent' (and thence
+   * onLost) out of a plain read failure. A read throw is retryable, not a
+   * verdict.
+   */
+  async renewHeartbeat(resource: string, agent: string, contextId?: string): Promise<HeartbeatRenewOutcome> {
+    await this.ensureFile();
+    const delays = heartbeatWriteRetryDelaysMs();
+    const start = Date.now();
+    let lastErr: unknown;
+    const attempts = delays.length + 1;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      let release: (() => Promise<void>) | undefined;
+      try {
+        release = await lockfile.lock(this.path, safeLockOptions('blackboard', { retries: 5 }));
+        // Own read, not readData() — see docstring.
+        const data: BlackboardData = await fs.readJson(this.path);
+        const entry = data.active_locks.find(
+          (l) => l.resource === resource && l.agent === agent && (!contextId || l.contextId === contextId)
+        );
+        if (!entry) {
+          // Row genuinely absent — not a lock-acquisition failure, don't
+          // retry: no ladder can resurrect it.
+          return 'row-absent';
+        }
+        entry.heartbeat = new Date().toISOString();
+        await writeJsonAtomic(this.path, data, { spaces: 2 });
+        return 'updated';
+      } catch (err) {
+        lastErr = err;
+      } finally {
+        if (release) await release();
+      }
+      if (attempt <= delays.length) {
+        await new Promise((r) => setTimeout(r, delays[attempt - 1]));
+      }
+    }
+    console.warn(
+      `[blackboard] renewHeartbeat: giving up for ${resource}/${agent} after ${attempts} attempts ` +
+      `(${Date.now() - start}ms elapsed, target ${this.path}): ` +
+      `${lastErr instanceof Error ? lastErr.message : String(lastErr)}`
+    );
+    return 'write-failed';
+  }
+
+  /**
+   * Read-only row verification for renewal loss-detection (AI-179): does the
+   * (resource, agent[, contextId]) row exist right now? No proper-lockfile
+   * acquisition — unlocked reads are safe because every writer replaces the
+   * file by atomic rename, so a concurrent reader sees old-or-new, both valid
+   * JSON. Raw presence only — no staleness classification. Any read failure
+   * (torn/unreadable/missing store) → 'unreadable': callers must treat that
+   * as NOT proof of absence, never as a purge.
+   */
+  async peekLockRow(resource: string, agent: string, contextId?: string): Promise<LockEntry | null | 'unreadable'> {
+    try {
+      const data: BlackboardData = await fs.readJson(this.path);
+      return data.active_locks.find(
+        (l) => l.resource === resource && l.agent === agent && (!contextId || l.contextId === contextId)
+      ) ?? null;
+    } catch {
+      return 'unreadable';
+    }
+  }
+
+  /**
    * Update the heartbeat for an existing lock.
+   *
+   * Boolean compatibility wrapper (AI-179, 2026-09-03) over renewHeartbeat's
+   * tri-state: true ⇔ 'updated'. Every pre-existing caller keeps compiling
+   * and behaving — worker-exec's informational heartbeats (:197, :592, :594)
+   * keep the boolean; every test fake keeps passing. Note the residual
+   * ambiguity this shape cannot escape: `false` still means "row-absent OR
+   * write-failed", which is exactly the AI-179 conflation — renewal-driven
+   * callers must use renewHeartbeat + peekLockRow instead (startLockRenewal
+   * does).
    *
    * contextId (3rd param, optional): when provided, updates only the matching
    * entry. When omitted, updates the first matching resource+agent entry
    * (legacy behaviour — safe once the concurrent-hold bug is fixed).
    */
   async updateHeartbeat(resource: string, agent: string, contextId?: string): Promise<boolean> {
-    await this.ensureFile();
-    // Absorbs transient blackboard.json lock contention: EVERY concurrent
-    // heartbeat source in the system (bot topic locks, catchup, skill runs)
-    // serializes through this ONE proper-lockfile lock on one shared file, so
-    // a single acquisition hiccup under real disk/event-loop pressure is
-    // expected, not exceptional. Before this fix a single throw here (lock
-    // acquisition failure, transient I/O error) returned `false` — IDENTICAL
-    // to the legitimate "row was purged" signal — so startLockRenewal's
-    // onLost('purged') fired on a transient blip as readily as on a real
-    // purge, aborting an otherwise-healthy run. Retrying here (cheap: this
-    // only runs once per renewal tick, ~60s) does not change the return
-    // contract or any caller, it just makes the "false" that callers see far
-    // more likely to mean what it says.
-    const attempts = 3;
-    let lastErr: unknown;
-    for (let attempt = 1; attempt <= attempts; attempt++) {
-      let release: (() => Promise<void>) | undefined;
-      try {
-        release = await lockfile.lock(this.path, safeLockOptions('blackboard', { retries: 5 }));
-        const data = await this.readData();
-        const entry = data.active_locks.find(
-          (l) => l.resource === resource && l.agent === agent && (!contextId || l.contextId === contextId)
-        );
-        if (entry) {
-          entry.heartbeat = new Date().toISOString();
-          await writeJsonAtomic(this.path, data, { spaces: 2 });
-          return true;
-        }
-        return false; // row genuinely absent — not a lock-acquisition failure, don't retry
-      } catch (err) {
-        lastErr = err;
-        if (attempt < attempts) {
-          await new Promise((r) => setTimeout(r, 250 * attempt));
-          continue;
-        }
-      } finally {
-        if (release) await release();
-      }
-    }
-    console.warn(`[blackboard] updateHeartbeat: giving up for ${resource}/${agent} after ${attempts} attempts: ${lastErr instanceof Error ? lastErr.message : String(lastErr)}`);
-    return false;
+    return (await this.renewHeartbeat(resource, agent, contextId)) === 'updated';
   }
 
   /**
@@ -429,18 +509,24 @@ export interface LockRenewalOptions {
    * (C13) — callers that inject a fake/BlackboardLockClient for their own
    * acquire/release (code-fixer.ts, self-improver.ts) must renew through the
    * SAME client, or their tests' fakes silently start hitting the real
-   * blackboard singleton the moment they migrate onto this helper. */
-  client?: Pick<Blackboard, 'updateHeartbeat'>;
+   * blackboard singleton the moment they migrate onto this helper. Two
+   * shapes: the tri-state pair (renewHeartbeat + peekLockRow) that the real
+   * singleton exposes, or the legacy boolean-only { updateHeartbeat } shape
+   * every pre-AI-179 fake still uses (mapped by the fallback path below). */
+  client?: Pick<Blackboard, 'updateHeartbeat'> | Pick<Blackboard, 'renewHeartbeat' | 'peekLockRow'>;
 }
 
 /**
  * Keeps a single (resource, agent, contextId) lock row's heartbeat fresh for
- * the lifetime of a long-running holder, via setInterval → updateHeartbeat —
+ * the lifetime of a long-running holder, via setInterval → renewHeartbeat —
  * the same hand-rolled pattern already used twice in this codebase
  * (pa/src/commands/catchup.ts, pa/src/code-fixer.ts), generalized into a
  * reusable helper. AI-113: without this, any single dispatch running past
  * HEARTBEAT_STALE_MS (10 min default) has its lock purged out from under it by
  * the next acquireLock call, even though the holder is alive and working.
+ * AI-179 (2026-09-03): a renewal tick can no longer abort a healthy run on a
+ * transient write failure — the tri-state outcome decides, and onLost('purged')
+ * fires only on a VERIFIED absent row (see the tick body below).
  */
 export function startLockRenewal(
   resource: string,
@@ -463,13 +549,55 @@ export function startLockRenewal(
     onLost?.(reason);
   };
 
+  const runRenewalAttempt = async (): Promise<void> => {
+    if ('renewHeartbeat' in client) {
+      // Tri-state path (AI-179): the module singleton always lands here.
+      const outcome = await client.renewHeartbeat(resource, agent, contextId);
+      if (outcome === 'updated') return;
+      if (outcome === 'row-absent') {
+        // Row already purged (e.g. a competing holder acquired it, or it went
+        // stale before this renewer's first tick) — latched, never re-acquire,
+        // a legitimate new holder may already exist. Keep ticking harmlessly.
+        if (!stopped) fireLostOnce('purged');
+        return;
+      }
+      // outcome === 'write-failed' — never fire onLost on the write failure
+      // alone: this is exactly the transient-EPERM class that produced the
+      // phantom purges. Verify the row before conceding anything.
+      if (typeof client.peekLockRow !== 'function') {
+        // Tri-state client without verification — skip, next tick retries.
+        return;
+      }
+      const row = await client.peekLockRow(resource, agent, contextId);
+      if (row === null) {
+        // Write AND row gone = a real loss — detect it now, not next tick.
+        if (!stopped) fireLostOnce('purged');
+        return;
+      }
+      // Row present, or store unreadable (not proven absent): the lock is not
+      // lost. Warn and let the next tick retry the ladder.
+      console.warn(
+        `[blackboard] startLockRenewal: ${resource}/${agent} heartbeat write failed but row ` +
+        `${row === 'unreadable' ? 'unreadable (not proven absent)' : 'verified present'} — retrying next tick`
+      );
+      return;
+    }
+    // Legacy fallback: boolean-only client (pre-AI-179 injected fakes).
+    // true → 'updated', false → 'row-absent' — the historical conflation,
+    // preserved deliberately for injected fakes only; production callers
+    // (module singleton) always take the tri-state path above.
+    const refreshed = await client.updateHeartbeat(resource, agent, contextId);
+    if (!refreshed && !stopped) fireLostOnce('purged');
+  };
+
   const tick = () => {
     if (stopped) return;
     // The maxMs cap must be checked on EVERY tick, unconditionally — never
-    // gated behind the overlap guard below. A slow updateHeartbeat (real fs
-    // lock contention) could otherwise leave inFlight true across several
-    // tick callbacks, silently delaying the cap past its deadline and
-    // defeating the one thing it exists for: freeing a truly-hung holder.
+    // gated behind the overlap guard below. A slow renewal (real fs lock
+    // contention, or the AI-179 write-retry ladder) could otherwise leave
+    // inFlight true across several tick callbacks, silently delaying the cap
+    // past its deadline and defeating the one thing it exists for: freeing a
+    // truly-hung holder.
     if (Date.now() - start >= maxMs) {
       stopped = true;
       clearInterval(timer);
@@ -478,13 +606,7 @@ export function startLockRenewal(
     }
     if (inFlight) return; // overlap guard: skip the UPDATE if the previous hasn't settled
     inFlight = true;
-    client.updateHeartbeat(resource, agent, contextId)
-      .then((refreshed) => {
-        // Row already purged (e.g. a competing holder acquired it, or it went
-        // stale before this renewer's first tick) — latched, never re-acquire,
-        // a legitimate new holder may already exist. Keep ticking harmlessly.
-        if (!refreshed && !stopped) fireLostOnce('purged');
-      })
+    runRenewalAttempt()
       .catch(() => {})
       .finally(() => { inFlight = false; });
   };

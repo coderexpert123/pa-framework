@@ -194,3 +194,12 @@ transcription:
   worker_mode: spawn
   cloud_order: [groq, openai, deepgram]
   language: null
+
+# === Topic routing (optional) ===
+# support: which topic receives land-or-discard triage for dirty working-tree
+# paths the daily-recon sweep cannot attribute to an owner (no record in
+# ~/.pa/orphan-ledger.jsonl). Format "<chatId>_<threadId>", e.g. "310_5".
+# Unset/invalid: unattributed paths are counted in daily-recon.json's
+# unknown_n (and surfaced by the weekly ops digest) but no task is filed.
+topics:
+  support: "310_5"

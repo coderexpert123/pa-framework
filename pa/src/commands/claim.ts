@@ -92,8 +92,23 @@ export async function claimCommand(args: string[]): Promise<number> {
   }
 
   if (parsed.renewId) {
-    const result = await renew(parsed.renewId, { ttlMinutes: parsed.ttlMinutes });
+    // AI-177: the renew is owner-checked inside reservations.renew — a session
+    // label passed here is verified against the row's owning session.
+    const session = parsed.session ?? process.env.PA_SESSION;
+    const result = await renew(parsed.renewId, { ttlMinutes: parsed.ttlMinutes, session });
     if (!result) {
+      // Distinguish "no such row" from "owned by another session" the same way
+      // releaseCommand does (exit 3 for a refusal, 1 for not-found).
+      if (session) {
+        const active = await readActive();
+        const reservation = active.find((r) => r.id === parsed.renewId);
+        if (reservation && reservation.session !== session) {
+          console.error(
+            `pa claim --renew: ${parsed.renewId} is held by "${reservation.session}" — pass --session ${reservation.session} (or drop --session) to renew it.`
+          );
+          return 3;
+        }
+      }
       console.error(`No active reservation found with id ${parsed.renewId}`);
       return 1;
     }

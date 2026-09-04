@@ -1,5 +1,4 @@
 import type { ConversationState } from './types.js';
-import { formatHistory } from './conversation.js';
 import type { TopicNameMap } from './topic-names.js';
 import { getTopicBrainInfo } from './topic-brains.js';
 
@@ -9,6 +8,14 @@ import { getLastRun } from '../../../pa/dist/src/logger.js';
 import { todayIST, nowIST, formatIST } from '../../../pa/dist/src/ist.js';
 import { readActive } from '../../../pa/dist/src/lib/reservations.js';
 import { activeRulesFor } from '../../../pa/dist/src/lib/feedback-rules.js';
+import {
+  listTasks,
+  listRunningTasks,
+  TOPIC_TASK_MAX_ATTEMPTS,
+  listNotes,
+  noteDisplayText,
+  TOPIC_NOTE_RENDER_CAP,
+} from '../../../pa/dist/src/lib/topic-tasks.js';
 
 const SKILL_STATUS_TTL_MS = 60_000;
 let skillStatusCache: { value: string; expiresAt: number } | null = null;
@@ -119,6 +126,82 @@ async function buildReservationLines(readActiveFn: typeof readActive = readActiv
   }
 }
 
+// Open items: queued topic tasks, in-flight (running/parked) siblings, and
+// notes — ALL rendered from the unified topic store (pa/src/lib/topic-tasks.ts,
+// operator directive 2026-09-03: notes moved off the per-topic SHORT-TERM.md
+// markdown index into the same store as tasks), INLINED rather than a pointer
+// — workers outside the repo tree (agy shim sandbox) cannot read ~/.pa.
+// buildTaskPrompt (task-executor.ts) renders the same open items into task
+// prompts via this same helper. Fail-silent — open items must never break a
+// dispatch. The "do not re-run" wording is load-bearing: an eager worker
+// seeing a queued task in its prompt must not double-execute it (the drain
+// owns execution).
+export async function renderOpenItems(chatId: number, threadId: number): Promise<string> {
+  try {
+    const [notes, queued, running] = await Promise.all([
+      listNotes(chatId, threadId),
+      listTasks(chatId, threadId),
+      listRunningTasks(chatId, threadId),
+    ]);
+    const taskLines = queued
+      .filter((t) => t.kind === 'task')
+      .map((t) => {
+        const queuedMs = Date.parse(t.created_at);
+        // Same bare HH:MM IST clock label the reminder drain uses (main.ts queuedAtIst).
+        const queuedAtIst = formatIST(new Date(Number.isFinite(queuedMs) ? queuedMs : Date.now())).slice(11, 16);
+        return `- ${t.id} — ${t.title} (queued ${queuedAtIst} IST)`;
+      });
+    // Wave-2 tier-2 attribution (SPEC §3.1 A.3): running/parked siblings, with
+    // the lead line telling workers (and the operator reading a transcript)
+    // that a reply to those messages routes into the task automatically.
+    const inflightLines = running.map(
+      (r) => `- ${r.id} — ${r.title} (${r.status}, attempt ${r.attempts}/${TOPIC_TASK_MAX_ATTEMPTS})`
+    );
+    const openNotes = notes.filter((n) => n.status === 'OPEN').slice(0, TOPIC_NOTE_RENDER_CAP);
+    const noteOverflow = notes.filter((n) => n.status === 'OPEN').length - openNotes.length;
+    const noteLines = openNotes.map((n) => `- ${n.key} — ${noteDisplayText(n)}`);
+    if (noteOverflow > 0) {
+      noteLines.push(`(+${noteOverflow} more — pa topic-note list)`);
+    }
+    if (taskLines.length > 0 || inflightLines.length > 0 || noteLines.length > 0) {
+      const parts = ['\n## Open items (short-term)'];
+      if (taskLines.length > 0) {
+        parts.push(
+          'Queued tasks (dispatched automatically by the system — do not re-run them yourself):',
+          ...taskLines
+        );
+      }
+      if (inflightLines.length > 0) {
+        parts.push(
+          'In-flight tasks (answers to their questions route automatically when you reply to their messages):',
+          ...inflightLines
+        );
+      }
+      if (noteLines.length > 0) {
+        parts.push('Notes:', ...noteLines);
+      }
+      return parts.join('\n') + '\n';
+    }
+    return '';
+  } catch { /* no open items on any failure */ }
+  return '';
+}
+
+/**
+ * AI-188, superseded (operator directive 2026-09-03): a fresh dispatch NEVER
+ * carries conversation turns — the recency window and the 10-turn slice are
+ * retired, not widened. Every fresh prompt renders the same two-line
+ * retrieval pointer (topic brain + `pa recall`) regardless of how much or how
+ * little history exists; a replied-to message still resolves mechanically
+ * via resolveReplyContext, independent of this section entirely.
+ */
+function renderHistorySection(state: ConversationState): string {
+  return (
+    `(Conversation turns are not injected into this prompt.)\n` +
+    `Use the topic brain above and \`pa recall "<terms>" --thread ${state.thread_id} --json\` for this topic's history.`
+  );
+}
+
 export async function buildResumedPrompt(
   userMessage: string,
   replyContext?: string,
@@ -168,7 +251,8 @@ export async function buildPrompt(
   const includeSkillStatus = shouldIncludeSkillStatus(userMessage);
   const skillStatus = includeSkillStatus ? await buildSkillStatus() : '';
 
-  const historySection = formatHistory(state.turns.slice(-10)); // last 10 turns in prompt
+  // Fresh dispatches never carry turns (operator directive 2026-09-03) — see renderHistorySection.
+  const historySection = renderHistorySection(state);
 
   let priorContextSection = '';
   if (options?.priorContext) {
@@ -228,6 +312,7 @@ export async function buildPrompt(
 - Ambiguous intent: ask exactly ONE clarifying question.
 - Never fabricate data. If you don't know, say so.
 - Never promise to report back later: you are a one-shot process with no timer, so "I'll let you know when it finishes" never fires. If the result will land in a file or a process you can name, emit a \`watch_job\` PA_META action and say the watch is registered; otherwise tell the user the exact command or file that will show them the answer.
+- Blocked on Google auth mid-task: mint a resumable reauth link instead of exiting — run python <repo>/pa/scripts/start_google_telegram_reauth.py --redirect-uri <GOOGLE_AUTH_REDIRECT_URI from ~/.pa/secrets.env> --chat-id <chat> --thread-id <thread> (IDs from your Telegram Metadata section; <repo> from your Working Directory section) --resume-action-json '{"type":"topic_resume","prompt":"<the waiting work, one line, <=500 chars>"}'. The link posts to that chat/thread, and once the user completes /auth the bot re-dispatches your prompt into the topic automatically as a system turn. For a skill-shaped blockage prefer telling the user to run /reauth <skill-name>. Never mint a mid-task reauth link without a resume payload.
 ${kbSourcesLine}
 - Shared working tree: other sessions, skills and agents write this repo at the same time you do.
 - Before editing a tracked file, run \`pa claims\`; if your path appears under an active reservation or in the recently-modified list, say so and pick different work rather than editing over it.
@@ -241,8 +326,8 @@ ${kbSourcesLine}
 - Infrastructure outside the repo tree — worker shims, ~/.pa config, installed CLI binaries — is never to be rewritten, replaced, or worked around to fix a failure. Diagnose, then surface the blocker to the operator and stop. Substituting one CLI for another behind a worker's name breaks every assumption the dispatcher, guards, and docs make about that worker (2026-08-14: agy's shim was silently rerouted to a different CLI).
 - PA_META (optional last line, single-line JSON, nothing after it):
   [PA_META]: {"actions":[{"type":"T",...}]}
-  Types: retry_with_worker{reason} | run_skill{skill} | confirm_required | kb_note{domain,note} | watch_job{description,check,deadline_minutes,interval_seconds}
-  retry_with_worker = you cannot complete the task, route to another worker. run_skill = trigger a pa skill automatically after your response (different from telling the user to run it). PA_META run_skill must never target the git-workflow skills (commit/push/push-public/investigate-flagged/update-brain); those are human-command-only. confirm_required = use instead of the "Reply *yes*" text. kb_note = you changed a deterministic source another topic's domain depends on — records a dated note into Ecosystem KB Sources.md immediately (domain = section name, note = one-line fact, <=300 chars); does not replace your normal response. watch_job = something you started finishes later in a file or process you can name — registers a read-only check (file_exists | file_gone | file_newer_than | file_contains | process_gone; absolute paths only) that reports into this topic when it completes or when its deadline passes; use it instead of promising to report back. Omit PA_META otherwise.`;
+  Types: retry_with_worker{reason} | run_skill{skill} | confirm_required | kb_note{domain,note} | watch_job{description,check,deadline_minutes,interval_seconds} | question{text,options}
+  retry_with_worker = you cannot complete the task, route to another worker. run_skill = trigger a pa skill automatically after your response (different from telling the user to run it). PA_META run_skill must never target the git-workflow skills (commit/push/push-public/investigate-flagged/update-brain); those are human-command-only. confirm_required = use instead of the "Reply *yes*" text. kb_note = you changed a deterministic source another topic's domain depends on — records a dated note into Ecosystem KB Sources.md immediately (domain = section name, note = one-line fact, <=300 chars); does not replace your normal response. watch_job = something you started finishes later in a file or process you can name — registers a read-only check (no shell, absolute paths only) that reports into this topic when it completes or when its deadline passes; use it instead of promising to report back. check is a required OBJECT — exact shape {"type":"file_newer_than","path":"C:/abs/path"} — with type one of (file_exists | file_gone | file_newer_than | file_contains | process_gone) plus path (absolute, every file type), pattern (regex string, file_contains only), since_iso (ISO timestamp, file_newer_than only) or pid (positive int, process_gone only); a malformed check is rejected and nothing is watched. question = you need the user to pick one of up to 4 options — the reply renders option buttons; their press is injected back into the topic as your answer. text (the question, <=500 chars), options (1-4 strings, <=40 chars each), taskId (optional, <=64 chars, links the answer to a queued task). Full example: [PA_META]: {"actions":[{"type":"watch_job","description":"Google token refreshed","check":{"type":"file_newer_than","path":"C:/Users/you/.pa/google-token.json"},"deadline_minutes":720}]}. Omit PA_META otherwise.`;
 
   const identity = omitStatic
     ? ''
@@ -303,6 +388,12 @@ ${kbSourcesLine}
     }
   } catch { /* no section on any failure */ }
 
+  // Wave-1 WP-E open items — Wave-2 SPEC §3.1 A.3 extracted the body into the
+  // shared renderOpenItems() helper below (buildTaskPrompt consumes it too).
+  const openItemsSection = !omitStatic && !pendingAction
+    ? await renderOpenItems(state.chat_id, state.thread_id)
+    : '';
+
   const topicDesc = buildTopicDescription(state, topicNames);
   // Topic section renders if EITHER topic description OR brain pointer exists
   const topicSection = (topicDesc || brainPointerLine)
@@ -314,7 +405,7 @@ ${kbSourcesLine}
   const capabilitiesSection = capabilities ? `\n${capabilities}` : '';
 
   return `${identity}Today is ${today}. Current time (IST): ${now}.
-${cwdSection}${skillStatusSection}${topicSection}${standingRulesSection}${telegramMeta}
+${cwdSection}${skillStatusSection}${topicSection}${openItemsSection}${standingRulesSection}${telegramMeta}
 ## Conversation History
 ${historySection}
 ${priorContextSection}

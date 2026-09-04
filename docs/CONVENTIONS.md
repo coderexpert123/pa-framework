@@ -101,12 +101,26 @@ CLAUDE.md" community guidance assumes — a line budget is the wrong unit here.
 | Root `CLAUDE.md` (auto-loaded every session) | 40,000 chars | 48,000 chars | run `/shorten-brain`, extract a topic file |
 | Directory-scoped `CLAUDE.md` (auto-loads on demand, stacks on root) | 8,000 chars | 12,000 chars | extract to `docs/` or a subsystem file |
 | On-demand topic file (`docs/*.md`, `inventory/*.md`) — content a reader holds in mind while working | 12,000 chars | 16,000 chars | split along a natural fault line |
-| Auto-managed glob-derived inventory file (an `inventory/*.md` file the `update-brain` skill rewrites wholesale from one `glob()` pattern) | 12,000 chars | 18,000 chars | see note below before splitting |
+| Auto-managed glob-derived inventory file (an `inventory/*.md` file the `update-brain` skill rewrites wholesale from one `glob()` pattern) | 12,000 chars | 23,000 chars | see note below before splitting — raised 18k→20k 2026-08-30, 20k→23k 2026-09-03 (handover waves' new lib modules; per-module legitimate growth) |
 | Router/index file (a file that replaced a monolith with pointers) | — | 4,000 chars | it stopped being a router; re-split |
 | Evergreen audience-facing guide (the 9 evergreen `UPPERCASE.md` guides under `docs/`) | — | 24,000 chars | separate class from operational-detail docs |
+| Knobs catalog (`docs/CONFIGURATION.md`) — one row per shipped knob, grows monotonically with the code | — | 25,000 chars | documented raise-class (same as the job catalog): raise per-knob growth, trim nothing (24k→25k 2026-09-04, `PA_CDISK_*` rows) |
 | Append-only archive file (`backlog/archive-*.md`, `backlog/not-valid.md`) — looked up by ID, never read front to back | — | no hard ceiling | see note below |
-| Completed-item lookup index (`backlog/completed-index.md`) — one row per archived item, grows monotonically with shipped work, never auto-loaded | 16,000 chars | 20,000 chars | raise this row rather than splitting; splitting breaks its "every item exactly once, in one place" contract |
+| Completed-item lookup index (`backlog/completed-index.md`) — one row per archived item, grows monotonically with shipped work, never auto-loaded | 16,000 chars | 21,000 chars | raise this row rather than splitting; splitting breaks its "every item exactly once, in one place" contract |
 | Open-program body file (`backlog/programs-*.md`) — bodies lifted out of `BACKLOG.md`, looked up by ID | — | no hard ceiling | same class as the archives |
+
+**Budget-pressure doctrine (operator directive 2026-09-03, after a six-trim night):**
+modularize at natural fault lines proactively; raise documented ceilings for
+monotonic-growth classes; **never trim the same file twice in a day — the second trim
+triggers a contract-look, and the contract picks the response** (auto-managed glob-derived
+→ raise; every-item-exactly-once index → raise; genuine prose/scope growth → split at the
+fault line — never a blanket split, the two raise-classes are exactly where splitting does
+silent damage); and the root of any index chain must stay auto-loaded. **A trim
+removes verbosity, duplication, and iteration residue — never a rule, invariant,
+gotcha, or anti-pattern warning; if a trim would lose a rule, that is a split,
+not a trim** (operator directive 2026-09-03). When in doubt,
+index — but doubt should first trigger a look at the file's contract. Enforced mechanically
+by docs-lint's same-file-trim counter (second trim in 24h fails with this clause's ref).
 
 **Note on the auto-managed inventory row**: this class exists because its size is bounded
 by *how many source files a glob pattern matches*, not by narrative verbosity — splitting

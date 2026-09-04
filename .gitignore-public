@@ -24,29 +24,37 @@ projects/*
 !projects/whatsapp-drafts/
 !projects/reminders/
 
+# Inside projects/pa-maintenance/: only the four promoted watchdog engines + their tests
+# are public (engines carry config knobs; deployment wiring stays private)
+!projects/pa-maintenance/
+projects/pa-maintenance/*
+!projects/pa-maintenance/scripts/
+projects/pa-maintenance/scripts/*
+!projects/pa-maintenance/scripts/brain_recheck_scan.py
+!projects/pa-maintenance/scripts/human_gated_blocker_watch.py
+!projects/pa-maintenance/scripts/rate_limit_digest.py
+!projects/pa-maintenance/scripts/worker_capability_scan.py
+!projects/pa-maintenance/tests/
+projects/pa-maintenance/tests/*
+!projects/pa-maintenance/tests/test_human_gated_blocker_watch.py
+!projects/pa-maintenance/tests/test_rate_limit_digest.py
+
+
 # Inside pa/: exclude personal/build/private artifacts
 pa/data/
 pa/.claude-needs-brain
 pa/dist/
 pa/node_modules/
 pa/src/oracle_agent.py
-pa/src/active_mail.py
 pa/src/learn_agent.py
 pa/src/travel_butler.py
-pa/src/gmail_utils.py
-pa/src/telegram_notify.py
 pa/scripts/backup_fitness.py
-# Python tests for the excluded modules above — they import learn_agent/
-# telegram_notify, which don't exist in the public mirror (permanently-broken
-# tests there), and their fixtures/docstrings reference personal context.
+# Python tests for the remaining excluded modules (learn_agent riders) — they import
+# modules that don't exist in the public mirror (permanently-broken tests there)
 pa/src/tests/
-pa/scripts/tests/test_telegram_notify_429.py
-pa/scripts/memory_consolidation.py
-pa/scripts/tests/test_memory_consolidation.py
+pa/scripts/memory_consolidation_ops.py
 # Tests importing the private modules above — CI unittest-discover dies on them
 pa/scripts/tests/test_unconfirmed_facts.py
-pa/scripts/tests/test_start_google_telegram_reauth.py
-pa/scripts/tests/test_reservation_guard.py
 pa/scripts/migrate_profile_metadata.py
 pa/scripts/tests/test_migrate_profile_metadata.py
 pa/scripts/profile_repair.py

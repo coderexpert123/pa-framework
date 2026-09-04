@@ -23,7 +23,7 @@ DEFAULT_SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.compose",
     "https://www.googleapis.com/auth/documents",
-    "https://www.googleapis.com/auth/contacts.readonly",
+    "https://www.googleapis.com/auth/contacts",
     "https://www.googleapis.com/auth/photoslibrary.readonly",
 ]
 

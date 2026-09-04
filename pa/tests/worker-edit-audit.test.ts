@@ -471,4 +471,127 @@ describe('worker-edit-audit', () => {
       }
     });
   });
+
+  // ---------------------------------------------------------------------
+  // Orphan ledger (Wave 2 WP-C, AI-189): every close that leaves still-dirty
+  // paths records them durably so the daily-recon sweep can file
+  // land-or-discard tasks to the owning topic — including covered-only
+  // closes that alert nothing.
+  // ---------------------------------------------------------------------
+  describe('orphan ledger', () => {
+    it('ledger records covered dirty findings with owner session', async () => {
+      const { openWindow, closeWindow } = await import('../src/lib/worker-edit-audit.js');
+      const { claim } = await import('../src/lib/reservations.js');
+      const { readOrphanLedger } = await import('../src/lib/orphan-ledger.js');
+
+      const claimed = await claim({ paths: ['fake/owned.ts'], session: 's-owner', note: 'owned work' });
+      assert.equal(claimed.ok, true);
+
+      const gitRunner = sequencedGitRunner(['', ' M fake/owned.ts\n']);
+      const win = await openWindow({ resource: 'topic-ledger-owned_1', gitRunner });
+      assert.ok(win);
+      await closeWindow(win, {
+        worker: 'agy',
+        gitRunner,
+        topic: { chatId: 7366, threadId: 42 },
+        notifyFn: async () => ({ sent: true }),
+      });
+
+      const records = await readOrphanLedger();
+      assert.equal(records.length, 1);
+      assert.deepEqual(records[0].paths, ['fake/owned.ts']);
+      assert.equal(records[0].owner_session, 's-owner', 'the covering reservation labels the owner');
+      assert.equal(records[0].owner_topic, '7366_42', 'the caller-supplied dispatch topic rides the record');
+      assert.equal(records[0].source, 'dispatch-close');
+      assert.ok(records[0].released_at, 'an active reservation contributes its expiry as released_at');
+    });
+
+    it('ledger records unowned findings with null owner', async () => {
+      const { openWindow, closeWindow } = await import('../src/lib/worker-edit-audit.js');
+      const { readOrphanLedger } = await import('../src/lib/orphan-ledger.js');
+
+      const gitRunner = sequencedGitRunner(['', 'A  fake/wild.ts\n']);
+      const win = await openWindow({ resource: 'topic-ledger-wild_1', gitRunner });
+      assert.ok(win);
+      await closeWindow(win, {
+        worker: 'agy',
+        gitRunner,
+        notifyFn: async () => ({ sent: true }),
+      });
+
+      const records = await readOrphanLedger();
+      assert.equal(records.length, 1);
+      assert.deepEqual(records[0].paths, ['fake/wild.ts']);
+      assert.equal(records[0].owner_session, null);
+      assert.equal(records[0].owner_topic, null, 'no topic option → null, the unknown lane');
+      assert.equal(records[0].released_at, null);
+    });
+
+    it('closeWindow writes ledger once per close', async () => {
+      const { openWindow, closeWindow } = await import('../src/lib/worker-edit-audit.js');
+      const { claim } = await import('../src/lib/reservations.js');
+      const { readOrphanLedger } = await import('../src/lib/orphan-ledger.js');
+
+      const claimed = await claim({ paths: ['fake/owned.ts'], session: 's-once', note: 'once' });
+      assert.equal(claimed.ok, true);
+
+      const gitRunner = sequencedGitRunner([
+        '', // open 1
+        ' M fake/owned.ts\nA  fake/wild.ts\n', // close 1 — one covered + one unowned
+        '', // open 2
+        '', // close 2 — nothing dirty at all
+      ]);
+
+      const win1 = await openWindow({ resource: 'topic-ledger-once_1', gitRunner });
+      assert.ok(win1);
+      await closeWindow(win1, { worker: 'agy', gitRunner, notifyFn: async () => ({ sent: true }) });
+      assert.equal(
+        (await readOrphanLedger()).length,
+        2,
+        'one covered lane + one unowned lane — exactly two records, never duplicated by the notify path',
+      );
+
+      const win2 = await openWindow({ resource: 'topic-ledger-once_2', gitRunner });
+      assert.ok(win2);
+      await closeWindow(win2, { worker: 'agy', gitRunner });
+      assert.equal(
+        (await readOrphanLedger()).length,
+        2,
+        'a clean close (no findings, no coverage) writes no empty records',
+      );
+    });
+
+    it('audit disabled writes no ledger', async () => {
+      const { openWindow, closeWindow, windowDir } = await import('../src/lib/worker-edit-audit.js');
+      const { readOrphanLedger, orphanLedgerPath } = await import('../src/lib/orphan-ledger.js');
+      const { access } = await import('fs/promises');
+
+      const gitRunner = sequencedGitRunner(['', ' M fake/x.ts\n']);
+      const win = await openWindow({ resource: 'topic-ledger-disabled_1', gitRunner });
+      assert.ok(win);
+      process.env.PA_WORKER_EDIT_AUDIT = '0';
+      const result = await closeWindow(win, { worker: 'agy', gitRunner });
+      assert.equal(result.skipped, 'disabled');
+      assert.deepEqual(await readOrphanLedger(), []);
+      await assert.rejects(access(orphanLedgerPath()), 'no ledger file is created at all');
+      assert.deepEqual(await listWindowFiles(windowDir()), []);
+    });
+
+    it('vanished findings are never ledgered (the path is already clean)', async () => {
+      const { openWindow, closeWindow } = await import('../src/lib/worker-edit-audit.js');
+      const { readOrphanLedger } = await import('../src/lib/orphan-ledger.js');
+
+      const gitRunner = sequencedGitRunner([' M fake/gone.ts\n', '']);
+      const win = await openWindow({ resource: 'topic-ledger-gone_1', gitRunner });
+      assert.ok(win);
+      const result = await closeWindow(win, { worker: 'agy', gitRunner, notifyFn: async () => ({ sent: true }) });
+      assert.equal(result.findings.length, 1);
+      assert.equal(result.findings[0].kind, 'vanished');
+      assert.deepEqual(
+        await readOrphanLedger(),
+        [],
+        'a vanished path left the dirty set — the sweep must not file a task for it',
+      );
+    });
+  });
 });

@@ -67,6 +67,50 @@ function isReplyTargetGoneError(status: number, errorText: string): boolean {
 }
 
 /**
+ * True when a failed send is permanently unroutable — retrying can never
+ * succeed. Callers use this to classify a failure as terminal (AI-186's
+ * keyboard send; AI-172's dlq.ts drop; widened from 'chat not found'-only to
+ * the full set by operator decision 2026-09-03).
+ *
+ * Terminal classes (permanent, and why):
+ * - 'chat not found' (400/403) — the chat does not exist or the bot cannot
+ *   address it; no retry changes that.
+ * - 'peer_id_invalid' / 'chat_id_invalid' (400) — the peer reference is
+ *   permanently invalid for this bot.
+ * - 'bot was blocked by the user' (403) — only the user can unblock; a human
+ *   cannot make a blocked recipient receive.
+ * - 'user is deactivated' (403) — the recipient account no longer exists.
+ * - 'bot was kicked from' (403) — the bot is out of the chat until re-added.
+ *
+ * Deliberately NOT terminal (exclusions):
+ * - 'have no rights to send a message' — an admin can restore the bot's
+ *   rights, so this is transient; keep retrying.
+ * - group-migration errors — the chat continues under a new id, so the
+ *   conversation is not dead.
+ * - Unknown strings stay false by design: fail toward retry, never toward
+ *   drop.
+ */
+export function isTerminalChatError(status: number, errorText: string): boolean {
+  const lower = errorText.toLowerCase();
+  if (status === 400) {
+    return (
+      lower.includes('chat not found') ||
+      lower.includes('peer_id_invalid') ||
+      lower.includes('chat_id_invalid')
+    );
+  }
+  if (status === 403) {
+    return (
+      lower.includes('chat not found') ||
+      lower.includes('bot was blocked by the user') ||
+      lower.includes('user is deactivated') ||
+      lower.includes('bot was kicked from')
+    );
+  }
+  return false;
+}
+
+/**
  * POST a sendMessage body with the existing 429/5xx retry-with-backoff
  * behavior, shared by sendMessage's initial attempt and its corrective
  * retries (MarkdownV2 fallback, reply-target fallback — see sendMessage).
@@ -280,18 +324,30 @@ export function sanitizeMdV2(text: string): string {
   return out;
 }
 
-export async function sendMessage(
+export interface SendMessageResult {
+  ok: boolean;
+  // Meaningful only when ok === false: the HTTP status and body text of the
+  // LAST failed attempt across all chunks/phases (a success leaves whatever a
+  // pre-fallback failure set, so read them only on the failure path). A
+  // timed-out chunk — treated as possibly-delivered — leaves both undefined.
+  lastStatus?: number;
+  lastErrorText?: string;
+}
+
+async function sendChunksWithDetails(
   token: string,
   chatId: number,
   text: string,
   replyToMessageId?: number,
   threadId?: number
-): Promise<boolean> {
+): Promise<SendMessageResult> {
   const trimmed = text.trim();
-  if (!trimmed) return true;
+  if (!trimmed) return { ok: true };
 
   const chunks = splitMessage(trimmed);
   let allDelivered = true;
+  let lastStatus: number | undefined;
+  let lastErrorText: string | undefined;
 
   for (const chunk of chunks) {
     const body: Record<string, unknown> = {
@@ -328,6 +384,8 @@ export async function sendMessage(
       if (!res || res.ok) break;
 
       const errorText = await safeResponseText(res);
+      lastStatus = res.status;
+      lastErrorText = errorText;
 
       // Fallback: if Markdown parse fails, retry as plain text.
       if (!parseModeStripped && res.status === 400 && errorText.includes('parse')) {
@@ -366,7 +424,35 @@ export async function sendMessage(
     if (!res.ok && !timedOut) allDelivered = false;
   }
 
-  return allDelivered;
+  return { ok: allDelivered, lastStatus, lastErrorText };
+}
+
+export async function sendMessage(
+  token: string,
+  chatId: number,
+  text: string,
+  replyToMessageId?: number,
+  threadId?: number
+): Promise<boolean> {
+  return (await sendChunksWithDetails(token, chatId, text, replyToMessageId, threadId)).ok;
+}
+
+/**
+ * Like sendMessage but returns details of the last failed attempt so the
+ * caller can classify the failure — the DLQ flush uses this to DROP entries
+ * whose chat is terminal-unroutable (isTerminalChatError) instead of
+ * quarantine-cycling them (AI-172 fix#2). Delivery semantics are sendMessage's
+ * exactly: same MarkdownV2 / reply-target fallbacks, same 429/5xx retry core,
+ * same timed-out-is-possibly-delivered rule.
+ */
+export async function sendMessageWithDetails(
+  token: string,
+  chatId: number,
+  text: string,
+  replyToMessageId?: number,
+  threadId?: number
+): Promise<SendMessageResult> {
+  return sendChunksWithDetails(token, chatId, text, replyToMessageId, threadId);
 }
 
 /**
@@ -696,28 +782,30 @@ export interface InlineKeyboardMarkup {
 }
 
 /**
- * Send a message with inline keyboard markup for HITL interactions.
- * Used for self-improver risk-flagged alerts with approve/reject/diff buttons.
+ * Same contract as `sendMessageWithKeyboard`, plus `terminalError`: true only
+ * when at least one chunk failed AND every failed chunk's final failure was a
+ * 400 "chat not found" (AI-186) — a send that can never succeed on retry.
  */
-export async function sendMessageWithKeyboard(
+export async function sendMessageWithKeyboardDetailed(
   token: string,
   chatId: number,
   text: string,
   keyboard: InlineKeyboardMarkup,
   replyToMessageId?: number,
   threadId?: number
-): Promise<number | null> {
+): Promise<{ messageId: number | null; terminalError: boolean }> {
   // 2026-08-24 (buttons program, P1f): the keyboard goes on the LAST chunk only
   // (Telegram allows one keyboard per message; the press must land on the message
   // the reader finishes on), and the return value is the FIRST chunk's message_id
   // (null on any failure) — mirroring sendMessageWithId — so a caller can anchor
   // `pending_action.message_id` / a later editMessageReplyMarkup on it.
   const trimmed = text.trim();
-  if (!trimmed) return null;
+  if (!trimmed) return { messageId: null, terminalError: false };
 
   const chunks = splitMessage(trimmed);
   let firstMessageId: number | null = null;
   let anyFailed = false;
+  let allFailuresChatNotFound = true;
 
   for (let i = 0; i < chunks.length; i++) {
     const body: Record<string, unknown> = {
@@ -737,6 +825,7 @@ export async function sendMessageWithKeyboard(
     let parseModeStripped = false;
     let replyTargetStripped = false;
     let succeeded = false;
+    let chunkChatNotFound = false;
 
     // At most 3 attempts per chunk: the initial send, plus at most one
     // corrective retry for each of the two known causes (MarkdownV2 parse
@@ -787,18 +876,37 @@ export async function sendMessageWithKeyboard(
           continue;
         }
 
-        console.error(`sendMessageWithKeyboard failed: ${res.status} ${errorText}`);
+        console.error(`sendMessageWithKeyboard failed: ${res.status} ${errorText} (chatId=${chatId}, threadId=${threadId})`);
+        if (isTerminalChatError(res.status, errorText)) chunkChatNotFound = true;
         break;
       } catch (err) {
-        console.error('sendMessageWithKeyboard network error:', err);
+        console.error(`sendMessageWithKeyboard network error: (chatId=${chatId}, threadId=${threadId})`, err);
         break;
       }
     }
 
-    if (!succeeded) anyFailed = true;
+    if (!succeeded) {
+      anyFailed = true;
+      if (!chunkChatNotFound) allFailuresChatNotFound = false;
+    }
   }
 
-  return anyFailed ? null : firstMessageId;
+  return { messageId: anyFailed ? null : firstMessageId, terminalError: anyFailed && allFailuresChatNotFound };
+}
+
+/**
+ * Send a message with inline keyboard markup for HITL interactions.
+ * Used for self-improver risk-flagged alerts with approve/reject/diff buttons.
+ */
+export async function sendMessageWithKeyboard(
+  token: string,
+  chatId: number,
+  text: string,
+  keyboard: InlineKeyboardMarkup,
+  replyToMessageId?: number,
+  threadId?: number
+): Promise<number | null> {
+  return (await sendMessageWithKeyboardDetailed(token, chatId, text, keyboard, replyToMessageId, threadId)).messageId;
 }
 
 /**

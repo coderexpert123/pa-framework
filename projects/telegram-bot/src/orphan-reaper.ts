@@ -20,7 +20,7 @@
  * the honest death notice.
  */
 import { readFile, stat } from 'fs/promises';
-import { sendMessage, sendMessageWithKeyboard, sendTyping, editMessageText, type InlineKeyboardMarkup } from './telegram.js';
+import { sendMessage, sendMessageWithKeyboard, sendMessageWithKeyboardDetailed, sendTyping, editMessageText, type InlineKeyboardMarkup } from './telegram.js';
 import { sendReplyText } from './rich-message.js';
 import { getPriorSessionPath, buildResumeArgs } from './session.js';
 import { parseMetadata, buildModelStatusSnapshot, renderStatusCard, resolveWorkerLlm, selectWorkerTunables, formatWorkerReply } from './logic.js';
@@ -28,7 +28,7 @@ import type { ModelStatusReasonCode } from './types.js';
 import { loadTopicState, saveTopicState, addTurn } from './conversation.js';
 import { deliveredKey, wasDelivered, markDelivered } from './delivered-store.js';
 import { listPendingDispatches, removePendingDispatch, pendingDispatchKey, updatePendingDispatch, type PendingDispatch } from './pending-dispatches.js';
-import { putResend } from './resend-store.js';
+import { putResend, takeResend, resendKey } from './resend-store.js';
 import { isBarePlaceholderUserText, transcribeVoiceMessage, formatTranscriptUserText, extensionForAttachment, voiceAttachmentPath } from './voice.js';
 import { buildResendKeyboard } from './callbacks.js';
 import { makeRefId } from './ref-id.js';
@@ -155,6 +155,11 @@ export function extractTeeResult(raw: string): string | null {
 
 export interface ReaperDeps {
   send: (record: PendingDispatch, text: string, replyMarkup?: InlineKeyboardMarkup) => Promise<boolean>;
+  /** Optional: like `send`, but reports whether a delivery failure is terminal
+   * (retrying can never succeed — e.g. Telegram 400 "chat not found"). The
+   * death-notice path prefers it; when absent, `send` is used and every
+   * failure is treated as non-terminal (pre-AI-186 behavior). */
+  sendDetailed?: (record: PendingDispatch, text: string, replyMarkup?: InlineKeyboardMarkup) => Promise<{ delivered: boolean; terminal?: boolean }>;
   readTranscript: (record: PendingDispatch) => Promise<{ content: string; mtimeMs: number } | null>;
   isTopicWorkerAlive: (record: PendingDispatch) => Promise<boolean>;
   now: () => number;
@@ -295,6 +300,38 @@ export function makeDefaultDeps(token: string, secrets?: Record<string, string>)
         }
       }
       return delivered;
+    },
+    sendDetailed: async (record, text, replyMarkup) => {
+      const refId = makeRefId();
+      const fullText = `${text}\n\n_Ref: ${refId}_`;
+      let delivered: boolean;
+      let terminal = false;
+      if (replyMarkup !== undefined) {
+        const r = await sendMessageWithKeyboardDetailed(token, record.chatId, fullText, replyMarkup, record.messageId, record.threadId);
+        delivered = r.messageId !== null;
+        terminal = r.terminalError;
+      } else {
+        delivered = (await sendReplyText(token, record.chatId, fullText, record.messageId, record.threadId, process.env)).delivered;
+      }
+      if (delivered) {
+        logger.info('bot', 'system message sent', { refId, kind: 'recovered', chatId: record.chatId, threadId: record.threadId, textPreview: text.slice(0, 200) });
+        // Same post-delivery bookkeeping as `send` (duplicated deliberately —
+        // minimal diff; extract only if a third caller appears).
+        try {
+          const topicState = await loadTopicState(record.chatId, record.threadId);
+          const userTurnPresent = topicState.turns.some(
+            (t) => t.role === 'user' && t.message_id === record.messageId,
+          );
+          if (!userTurnPresent) {
+            addTurn(topicState, { role: 'user', text: record.userText, timestamp: record.startedAt, message_id: record.messageId, worker: record.session?.worker ?? 'worker' });
+          }
+          addTurn(topicState, { role: 'assistant', text, timestamp: new Date().toISOString(), worker: 'worker', refId });
+          await saveTopicState(topicState);
+        } catch (err) {
+          logger.warn('reaper', 'failed to persist recovered turns', { error: String(err) });
+        }
+      }
+      return { delivered, terminal };
     },
     readTranscript: defaultReadTranscript,
     isTopicWorkerAlive: isTopicWorkerAliveByRegistry,
@@ -715,8 +752,21 @@ export async function evaluatePendingDispatch(
       storedAt: new Date().toISOString(),
     }).catch(() => {});
     const keyboard = buildResendKeyboard(record.chatId, record.threadId, record.updateId);
-    const sent = await deps.send(record, deathNotice(record), keyboard).catch(() => false);
-    if (!sent) return 'waiting';
+    // AI-186: prefer the detailed send when injected — it classifies terminal
+    // failures (400 chat not found) so an unreachable chat settles 'dead'
+    // instead of retrying every poll for the whole reap window.
+    const sentInfo = deps.sendDetailed
+      ? await deps.sendDetailed(record, deathNotice(record), keyboard).catch(() => ({ delivered: false, terminal: false }))
+      : { delivered: await deps.send(record, deathNotice(record), keyboard).catch(() => false), terminal: false as const };
+    if (!sentInfo.delivered) {
+      if (sentInfo.terminal) {
+        logger.warn('reaper', 'death notice undeliverable (terminal send failure) — dropping dispatch and its resend record', { updateId: record.updateId, chatId: record.chatId, threadId: record.threadId });
+        await takeResend(resendKey(record.chatId, record.threadId, record.updateId)).catch(() => {});
+        await finish(record, 'dead');
+        return 'dead';
+      }
+      return 'waiting';
+    }
     await finish(record, 'dead');
     return 'dead';
   }
@@ -747,7 +797,7 @@ function recordTopicKey(record: PendingDispatch): string {
  */
 export async function reapOrphanedDispatches(
   token: string,
-  opts: { deps?: ReaperDeps; maxWaitMs?: number; pollMs?: number; sleep?: (ms: number) => Promise<void>; secrets?: Record<string, string>; requeueUpdate?: (record: PendingDispatch) => void; reviveVoiceNote?: (record: PendingDispatch) => Promise<string | null> } = {},
+  opts: { deps?: ReaperDeps; maxWaitMs?: number; pollMs?: number; sleep?: (ms: number) => Promise<void>; secrets?: Record<string, string>; requeueUpdate?: (record: PendingDispatch) => void; reviveVoiceNote?: (record: PendingDispatch) => Promise<string | null>; allowedChatIds?: ReadonlySet<number> } = {},
 ): Promise<void> {
   const deps = opts.deps
     ?? { ...makeDefaultDeps(token, opts.secrets ?? {}),
@@ -775,6 +825,14 @@ export async function reapOrphanedDispatches(
       const waiting: PendingDispatch[] = [];
       for (const record of records) {
         try {
+          // AI-186: a record for a chat the operator never allowed (e.g. a leaked
+          // test fixture) can never be delivered — quarantine it dead at round 0
+          // instead of death-noticing into a 400 chat-not-found retry flood.
+          if (opts.allowedChatIds && !opts.allowedChatIds.has(record.chatId)) {
+            logger.warn('reaper', 'quarantining dispatch to chat outside allowedChatIds — unreachable', { updateId: record.updateId, chatId: record.chatId, threadId: record.threadId });
+            await finish(record, 'dead');
+            continue;
+          }
           const outcome = await evaluatePendingDispatch(record, deps, deadline);
           if (outcome === 'waiting') waiting.push(record);
         } catch (err) {

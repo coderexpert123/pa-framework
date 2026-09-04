@@ -98,6 +98,18 @@ export interface PendingAction {
   message_id?: number;
 }
 
+/** PA_META `question` action armed for this topic (2026-09-02, topic-task handover
+ *  Wave 1 SPEC §3.3). The reply renders one option button per entry (`q:<idx>`); the
+ *  press — or a typed answer matching an option — resolves it. TTL/expiry mirrors
+ *  pending_action (same PENDING_ACTION_TTL_MS). */
+export interface PendingQuestion {
+  text: string;
+  options: string[];        // 1..4
+  task_id?: string;
+  asked_at: string;         // ISO
+  message_id?: number;      // set by main.ts at attach (WP-F)
+}
+
 export interface SessionInfo {
   session_id: string;  // UUID of the CLI session (Claude: JSONL filename)
   worker: string;      // 'claude', 'zclaude', 'codex', or 'agy'
@@ -132,6 +144,7 @@ export interface ConversationState {
   thread_id: number;              // 0 = General / no-topic (private chat); N = forum topic ID
   turns: ConversationTurn[];
   pending_action?: PendingAction;
+  pending_question?: PendingQuestion;
   session?: SessionInfo;          // Active CLI session for resumption
   preferred_worker?: string;      // 'agy' | 'claude' | 'zclaude' | 'codex' — overrides config priority order
   preferred_worker_set_at?: string; // ISO timestamp when preferred_worker was set — cleared at IST midnight
@@ -177,6 +190,11 @@ export interface PAMetaAction {
   check?: { type?: string; path?: string; pattern?: string; since_iso?: string; pid?: number };
   deadline_minutes?: number;
   interval_seconds?: number;
+  // PA_META `question` (2026-09-02, handover Wave 1 SPEC §3.3) — closed shape validated
+  // at arm time in logic.ts's applyMetaActions; the reply renders option buttons.
+  text?: string;      // the question, <=500 chars
+  options?: string[]; // 1..4 strings, <=40 chars each
+  task_id?: string;   // optional, <=64 chars [A-Za-z0-9_-]* — links the answer to a queued task
 }
 
 export interface PAMeta {

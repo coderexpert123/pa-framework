@@ -1,6 +1,6 @@
 # Multi-Session Coordination Protocol
 
-Several Claude Code sessions, plus the Telegram bot's worker dispatches, run against this ONE working tree concurrently — this tree is the live installation (`pa` runs from `pa/dist` built here, the bot from its own `dist` here, skills and Task Scheduler entries point here). Sessions share a tree, not worktrees, because a worktree is invisible to the running system until merged back. (Added 2026-08-05 after a concurrent-edit collision on `pa/src/code-fixer.ts` — full incident and design: `plans/2026-08-05-concurrent-session-safety.md`.)
+Several Claude Code sessions, plus the Telegram bot's worker dispatches, run against this ONE working tree concurrently — this tree is the live installation (`pa` runs from `pa/dist` built here, the bot from its own `dist` here, skills and Task Scheduler entries point here). Sessions share a tree, not worktrees, because a worktree is invisible to the running system until merged back. Ask any long-running session for the rules not covered here.
 
 Enforcement audit and the findings behind the 2026-08-23 changes: `plans/2026-08-23-coordination-audit.md`. This file is THE surface for this protocol — if a coordination rule lives only in a global config file or an agent definition, it belongs here too.
 
@@ -38,6 +38,7 @@ Mandatory locking's dominant real-world failure is the abandoned lock, not the c
 - Use `--force` only after actually reconciling with the other session's intent, never to silence the warning
 
 ## Rule 4: Builds and Tests Serialize on @build — Automatically
+> **Build-before-test is ENFORCED (AI-180):** runners fail closed on stale dist (stamp sha + src mtimes); `PA_ALLOW_STALE_DIST=1` is the bisect escape.
 
 ```
 npm run build
@@ -60,11 +61,11 @@ with the npm script's own claim, and your build then polls 15 minutes and gives 
 
 ## Rule 5: Never Run Raw Git Commands
 
-Never run raw `git commit` / `git push` / `git-public …` yourself (concurrency is one reason; see Public/private repo topology in root CLAUDE.md for the other).
+Never run raw `git commit` / `git push` / `git-public …` yourself (concurrency; the other reason is repo topology — root CLAUDE.md).
 
 The `commit`/`push`/`push-public`/`investigate-flagged`/`update-brain` family serializes through the `git-workflow` blackboard lock. A raw git invocation sits entirely outside that lock and can collide on `.git/index.lock` — a failure mode with documented silent work-loss behaviour in concurrent-agent setups.
 
-**Rule 5 is convention, exactly as unenforced at the git level as Rule 3's reservations.** Nothing blocks a raw `git commit`; the pre-push PII guard is a different, unrelated mechanism (content scanning, not workflow routing). A git `pre-commit` hook that refuses paths under a foreign active reservation is C1 in the audit and is not built.
+**Rule 5 is convention** — nothing blocks a raw `git commit` (the pre-push PII guard is content scanning, unrelated); a reservation-refusing pre-commit hook is C1 in the audit, not built.
 
 ### Rule 5a: The wave exception
 
@@ -73,7 +74,7 @@ A builder, verifier or deep-planner subagent inside an orchestrated wave commits
 - **`git commit -- <pathspec>` does not stage untracked files.** `git add` the new paths first, then commit with the same pathspec.
 - **A pathspec does not protect WITHIN a file.** If your target file already carries uncommitted changes at dispatch, `git add <path>` stages that whole diff and your commit bundles a stranger's unlanded work — a later revert of your commit then destroys theirs. Run `git diff HEAD -- <file>` before your FIRST edit to any file; non-empty means stop and surface it.
 
-Outside a wave — an interactive session doing an ad-hoc commit — Rule 5 applies unchanged.
+The `commit` skill (AI-195) FLAGS `src/`-touching commits lacking the waterfall's `exception:` line (wave commits exempt; flag in its Telegram report). Outside a wave, Rule 5 applies unchanged.
 
 ## Rule 6: Check For Clobbers
 
@@ -95,8 +96,8 @@ For a large, self-contained, multi-file refactor that will not need to exercise 
 
 ## Rule 8: Long-Running Skills Hold the Tree
 
-- `update-brain` fires nightly at 21:30 IST and commits pending `CLAUDE.md` / `inventory/` changes — since 2026-08-23 it DEFERS that sweep for any managed path under an active foreign reservation or modified in the last 15 minutes, and names the deferred paths in its Telegram report. Reserve `CLAUDE.md` (`pa claim CLAUDE.md …`) if you are mid-edit across 21:30 IST; it will not be swept.
-- `self-improver`'s code-fixer can hold `git-workflow` 30+ minutes. Long holders (`pa run` skills, `pa catchup`, code-fixer) renew via `startLockRenewal()`; a genuinely purged row FAILS the run loudly (`Skill failed (lock lost)` / `Catchup aborted (lock lost)`, code-fixer hard-reverts) rather than continuing as a silent second writer. **Purge checks holder liveness, not staleness alone (2026-09-01):** dead PID ⇒ purge immediately; alive-but-stale (>10 min, `PA_HEARTBEAT_STALE_MS`) ⇒ a grace window (3 min, `PA_HEARTBEAT_GRACE_MS`) before eviction — `blackboard.ts`'s `classifyLock()` is the single decision point for `acquireLock`'s purge, `getActiveLocks()`, and `purgeStaleLocks()` (fixed after staleness-alone let a race steal an alive holder's row — three skill deaths 2026-08-31). `updateHeartbeat()` also retries internally (3x) before conceding.
+- `update-brain` fires nightly at 21:30 IST and commits pending `CLAUDE.md` / `inventory/` changes — it DEFERS the sweep for any managed path under an active foreign reservation or edited in the last 15 minutes, naming them in its Telegram report. Reserve `CLAUDE.md` (`pa claim CLAUDE.md …`) if mid-edit across 21:30 IST.
+- `self-improver`'s code-fixer can hold `git-workflow` 30+ minutes. Long holders (`pa run` skills, `pa catchup`, code-fixer) renew via `startLockRenewal()`; a genuinely purged row FAILS the run loudly (`Skill failed (lock lost)` / `Catchup aborted (lock lost)`, code-fixer hard-reverts) rather than continuing as a silent second writer. **Purge checks holder liveness, not staleness alone:** dead PID ⇒ purge immediately; alive-but-stale (>10 min, `PA_HEARTBEAT_STALE_MS`) ⇒ a grace window (3 min, `PA_HEARTBEAT_GRACE_MS`) before eviction — `blackboard.ts`'s `classifyLock()` is the single decision point for `acquireLock`'s purge, `getActiveLocks()`, and `purgeStaleLocks()` (fixed after staleness-alone let a race steal an alive holder's row — three skill deaths 2026-08-31). `updateHeartbeat()` also retries internally (3x) before conceding.
 - Neither is a bug. A held lock or reservation is honoured; an unheld, recently-untouched file is fair game for the nightly sweep.
 
 ## Rule 9: Never Destroy What You Do Not Own
@@ -105,16 +106,16 @@ No session, skill, worker or subagent may run `git stash`, `git checkout -- <pat
 
 On 2026-08-23 a skill's LLM worker ran `git stash push -m temp-stash-backlog BACKLOG.md` to make a size gate pass, popping it four minutes later — three sessions' edits were briefly invisible on disk, and nothing in the skill's text forbade it.
 
-If a gate needs a clean tree, run the gate against a fresh checkout of the committed head — `git worktree add --detach C:/wt/gate-<name> HEAD` — never by mutating the shared tree. The `push` gate does this by construction since 2026-08-23 (Wave C): its skill runs the whole gate in `C:/wt/gate-push`, a detached checkout of HEAD. A gate that fails because of another session's WIP is reported as such, never stashed away.
+If a gate needs a clean tree, run the gate against a fresh checkout of the committed head — `git worktree add --detach C:/wt/gate-<name> HEAD`, where `C:/wt` is the deployment's gate-checkout root (`C:/wt/gate-push` for the push gate) — never by mutating the shared tree. The `push` gate does this by construction (Wave C): the whole gate runs in `C:/wt/gate-push`, a detached checkout of HEAD. A gate that fails because of another session's WIP is reported as such, never stashed away.
 
 ## Rule 10: Test Runs Are Isolated, Serialized, and Off D:
 
-These rules governed this repo from global machine notes only until 2026-08-23. They are repo-operational, not machine trivia.
+These rules lived in global machine notes until 2026-08-23; they are repo-operational, not machine trivia.
 
 - **One test process on this machine at a time.** Gates run in the FOREGROUND, serialized. Never launch a suite in the background and move on — on 2026-08-15 a background 35-file run alongside two other agents' runs starved the machine to a hard hang.
-- **Agent test runs belong on C:, never on D:.** `git worktree add --detach C:/wt/<name> <sha>` gives a same-repo, zero-contention checkout in seconds (git objects stay in the D: `.git`). `git worktree remove` when done — but if you junctioned `node_modules` into the worktree, delete the junctions FIRST (`cmd /c rmdir C:\wt\<name>\pa\node_modules`, same for the bot): `git worktree remove --force` follows a junction and empties the LIVE `node_modules` on D: (2026-08-23: both packages' modules were wiped for ~90 s and one `pa catchup` tick died; restored with `npm ci`). Prefer `npm ci` in the worktree (~35 s) over junctions; a `git worktree add` interrupted mid-checkout leaves a `locked: initializing` entry that only `git worktree remove -f -f <path>` clears.
+- **Agent test runs belong on C:, never on D:.** `git worktree add --detach <gate-root>/<name> <sha>` — `<gate-root>` is the gate-checkout root (Rule 9) — gives a same-repo, zero-contention checkout in seconds (git objects stay in the D: `.git`). `git worktree remove` when done — but if you junctioned `node_modules` into the worktree, delete the junctions FIRST (`cmd /c rmdir <gate-root>\<name>\pa\node_modules`, same for the bot): `git worktree remove --force` follows a junction and empties the LIVE `node_modules` on D: (2026-08-23: both packages' modules were wiped for ~90 s and one `pa catchup` tick died; restored with `npm ci`). Prefer `npm ci` in the worktree (~35 s) over junctions; a `git worktree add` interrupted mid-checkout leaves a `locked: initializing` entry that only `git worktree remove -f -f <path>` clears.
 - **Verify the worktree's base before trusting any gate.** A harness-created worktree can be cut from a stale ref: `git merge-base main <branch>` must equal current `main`, or the gate is measuring a different tree than you think.
-- **Point TEMP at C: for every test run:** `TMP=C:/wt/tmp TEMP=C:/wt/tmp npm test -- <file>`. The user TEMP directory lives on D:, so temp sqlite files fsync against the saturated HDD; a trivial test "hung" for 30+ minutes on 2026-08-15 and passed in 22 seconds with TEMP on C:. `pa/scripts/run-tests.mjs` and the bot's copy do this automatically when `PA_TEST_TMP_DIR` or `C:/wt/tmp` exists.
+- **Point TEMP at a fast-drive scratch dir for every test run:** `TMP=<scratch> TEMP=<scratch> npm test -- <file>`. The user TEMP directory lives on D:, so temp sqlite files fsync against the saturated HDD; a trivial test "hung" for 30+ minutes on 2026-08-15 and passed in 22 seconds with TEMP on C:. Both run-tests.mjs wrappers do this via `PA_TEST_TMP_DIR` (falling back to the deployment's conventional scratch dir if present).
 - **Run a scoped test through the package's own `npm test`:** `npm test -- <file.test.js>` (added 2026-08-23; matches on basename, still preloads the safety file, still excludes quarantined files, exits 1 if nothing matched). **Never hand-construct a `node --test` invocation** — it skips the `--import test-env-setup.js` preload, so `PA_HOME` resolves to the real `~/.pa` from the file's first line. That leak sent 3 real Telegram alerts to production on 2026-08-17.
 - A slow run under contention is reported as "unverified, I/O-starved" — never as evidence either way.
 - `npm test` now takes `@build` itself (Rule 4), so a scoped run inside an orchestrated wave should set `PA_BUILD_LOCK=0` to avoid six builders serializing behind each other; the integrator's full-suite runs must NOT set it.

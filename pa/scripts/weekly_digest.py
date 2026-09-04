@@ -152,36 +152,6 @@ def read_parked_skills() -> list:
     return parked
 
 
-def read_pending_conflicts(days: int = 7) -> list:
-    """
-    Read review-digest-pending.jsonl for unresolved conflicts in the last N days.
-    Returns list of conflict entries.
-    """
-    pending_path = os.path.join(_pa_home(), "review-digest-pending.jsonl")
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat().replace("+00:00", "Z")
-
-    conflicts = []
-    try:
-        with open(pending_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                    # Filter: unresolved AND created within window
-                    if not entry.get("resolved", False):
-                        created_at = entry.get("created_at", "")
-                        if created_at >= cutoff:
-                            conflicts.append(entry)
-                except (json.JSONDecodeError, KeyError):
-                    continue
-    except FileNotFoundError:
-        pass
-
-    return conflicts
-
-
 def read_alert_census(max_age_days: int = 8) -> dict | None:
     """
     Read ~/.pa/alert-census.json (written daily by the alert-census maintenance
@@ -290,6 +260,36 @@ def get_rules_summary(runner=None) -> dict | None:
         return json.loads(result.stdout)
     except (json.JSONDecodeError, TypeError):
         return None
+
+
+# WP-D2 B.2 (2026-09-02): the ru: grammar's rule-id charset (pa/src/lib/callback-grammar.ts
+# RU_RE — the single source; mirrored here ONLY as an emission pre-filter, so a rule id
+# outside the grammar never produces a button the runner's validateKeyboardRequest would
+# refuse — that would drop the WHOLE keyboard, not just the bad button).
+RU_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+# validateKeyboardRequest caps a keyboard at 6 buttons; Accept+Reject pairs mean the
+# first 3 charset-valid rules get buttons and the rest stay report-line only.
+MAX_KEYBOARD_BUTTONS = 6
+
+
+def build_rules_keyboard_payload(pending_rules: list | None) -> dict | None:
+    """
+    Build the [PA_KEYBOARD] envelope payload for the digest's pending rules, or
+    None when nothing qualifies (no pending rules, or every id fails the ru:
+    charset — those stay report-line only).
+    """
+    buttons = []
+    for r in pending_rules or []:
+        r_id = r.get("id", "")
+        if not isinstance(r_id, str) or not RU_ID_RE.match(r_id):
+            continue
+        if len(buttons) + 2 > MAX_KEYBOARD_BUTTONS:
+            break
+        buttons.append({"text": "✅ Accept", "callback_data": f"ru:{r_id}:a"})
+        buttons.append({"text": "✖ Reject", "callback_data": f"ru:{r_id}:x"})
+    if not buttons:
+        return None
+    return {"buttons": buttons}
 
 
 def render_rules_section(data: dict | None) -> list[str]:
@@ -604,7 +604,7 @@ def render_scorecard_section(
     return lines
 
 
-def compose_digest(audit_entries: list, maintenance_summary: dict, parked_skills: list, pending_conflicts: list, alert_census: dict | None = None, coordination_stats: dict | None = None) -> str:
+def compose_digest(audit_entries: list, maintenance_summary: dict, parked_skills: list, alert_census: dict | None = None, coordination_stats: dict | None = None, rules_summary: dict | None = None) -> str:
     """Compose the weekly digest markdown."""
     lines = []
 
@@ -752,43 +752,20 @@ def compose_digest(audit_entries: list, maintenance_summary: dict, parked_skills
         lines.append(f"*Unable to check rotation status: {e}*")
         lines.append("")
 
-    # Section 5: Memory Conflicts Pending Review
-    lines.append("## Memory Conflicts Pending Review")
-    conflicts = pending_conflicts
-
-    if conflicts:
-        lines.append("The following memory conflicts require manual resolution:")
-        for item in conflicts:
-            key = item.get("key", "unknown")
-            new_text = item.get("new_text", "")
-            existing_text = item.get("existing_text", "")
-            category = item.get("category", "unknown")
-            created_at = item.get("created_at", "")
-
-            # Truncate text to 80 chars
-            new_text_truncated = new_text[:77] + "..." if len(new_text) > 80 else new_text
-            existing_text_truncated = existing_text[:77] + "..." if len(existing_text) > 80 else existing_text
-
-            lines.append(f"- **{key}** ({category})")
-            lines.append(f"  - New: {new_text_truncated}")
-            lines.append(f"  - Existing: {existing_text_truncated}")
-            lines.append(f"  - Created: {created_at}")
-        lines.append("")
-    else:
-        lines.append("*No memory conflicts pending review.*")
-        lines.append("")
-
-    # Section 6: Standing Rules (AI-165)
-    rules_summary = get_rules_summary()
-    rules_lines = render_rules_section(rules_summary)
+    # Section 5: Standing Rules (AI-165). WP-D2 B.3 (2026-09-02) DELETED the former
+    # Section 5 ("Memory Conflicts Pending Review") — it only ever rendered the
+    # review-digest-pending.jsonl backlog as prose; conflicts surface through the
+    # nightly consolidation report flow instead.
+    rules_data = rules_summary if rules_summary is not None else get_rules_summary()
+    rules_lines = render_rules_section(rules_data)
     lines.extend(rules_lines)
 
-    # Section 7: Skills — Retire? (90d zero engagement) (NEW, AI-168)
+    # Section 6: Skills — Retire? (90d zero engagement) (NEW, AI-168)
     engagement_data = read_skill_engagement()
     retire_lines = render_retire_section(engagement_data)
     lines.extend(retire_lines)
 
-    # Section 8: Complexity budget scorecard (NEW, AI-168)
+    # Section 7: Complexity budget scorecard (NEW, AI-168)
     intervention_counts = read_intervention_counts(days=7)
     feature_count = read_new_feature_count(BUDGET_START)
     scorecard_lines = render_scorecard_section(alert_census, audit_entries, intervention_counts, feature_count)
@@ -805,12 +782,14 @@ def main():
     audit_entries = read_audit_trail(days)
     maintenance_summary = read_maintenance_state(days)
     parked_skills = read_parked_skills()
-    pending_conflicts = read_pending_conflicts(days)
     alert_census = read_alert_census()
     coordination_stats = read_coordination_stats(days)
+    # Fetched ONCE here (not also inside compose_digest) so the prose and the
+    # B.2 keyboard come from the same snapshot.
+    rules_summary = get_rules_summary()
 
     # Compose digest
-    digest = compose_digest(audit_entries, maintenance_summary, parked_skills, pending_conflicts, alert_census, coordination_stats)
+    digest = compose_digest(audit_entries, maintenance_summary, parked_skills, alert_census, coordination_stats, rules_summary)
 
     # Print to stdout — the pa runner relays this to pa-alerts via the skill's
     # telegram_output. Do NOT dispatch telegram_notify from here: cmd skills run
@@ -819,6 +798,15 @@ def main():
     iso_week = get_iso_week(datetime.now(timezone.utc))
     dedup_key = f"weekly-digest-{iso_week}"
     print(f"{digest}\n\n_Dedup: {dedup_key}_")
+
+    # WP-D2 B.2 (2026-09-02): the rules accept/reject keyboard rides the
+    # [PA_KEYBOARD] envelope (Wave-1 WP-C, run.ts extractKeyboardEnvelope) as the
+    # LAST stdout line, so it attaches to the delivery's last chunk and the marker
+    # line is stripped from the delivered text. No pending rules (or none whose id
+    # passes the ru: charset) prints nothing.
+    keyboard_payload = build_rules_keyboard_payload(rules_summary.get("pending_rules") if rules_summary else None)
+    if keyboard_payload:
+        print(f"[PA_KEYBOARD]: {json.dumps(keyboard_payload)}")
 
 
 if __name__ == "__main__":
