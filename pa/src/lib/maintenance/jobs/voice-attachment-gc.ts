@@ -89,7 +89,7 @@ export const voiceAttachmentGcJob: MaintenanceJob = {
       maxAgeMs: RETENTION_MS,
       action: 'delete',
       ownership: 'pa-owned',
-      evidence: 'PA writes these itself from Telegram voice notes (plans/2026-08-04-telegram-voice-transcription.md); widened 2026-08-04 to the full audio/video-note allowlist for WP4\'s audio-file and video_note support (voice-transcription hardening plan, WP8) — the transcript is archived in conversation-history.jsonl, so the audio is debug-only after 30d.',
+      evidence: 'PA writes these itself from Telegram voice notes (the 2026-08-04 voice-transcription plan); widened 2026-08-04 to the full audio/video-note allowlist for WP4\'s audio-file and video_note support (voice-transcription hardening plan, WP8) — the transcript is archived in conversation-history.jsonl, so the audio is debug-only after 30d.',
       note: 'Files live two levels deep under <chat_id>/<date>/<id>.oga; the generic dry-run previewer only readdir()s one level, so it will report 0 candidates here even when deletions are pending — the job\'s own run() walks the nesting.',
     },
   ],

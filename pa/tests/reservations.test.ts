@@ -511,4 +511,136 @@ describe('reservations', () => {
       assert.match(entry.refId, /^s-[0-9a-f]{12}$/);
     });
   });
+
+  describe('renew ownership checks (AI-177)', () => {
+    it('renew with the OWNING session extends the row', async () => {
+      const { claim, renew } = await import('../src/lib/reservations.js');
+      const now = Date.now();
+      const claimed = await claim({ paths: ['pa/src/owned.ts'], session: 's-owner', note: 'mine', now });
+      const original = claimed.reservation!;
+
+      const renewed = await renew(original.id, { session: 's-owner', now: now + 60_000 });
+      assert.ok(renewed, 'the owner must be able to renew');
+      assert.equal(renewed!.id, original.id);
+      assert.equal(new Date(renewed!.expiresAt).getTime(), now + 60_000 + 45 * 60_000);
+    });
+
+    it('renew with a FOREIGN session returns null and leaves the row untouched', async () => {
+      const { claim, renew, readActive } = await import('../src/lib/reservations.js');
+      const now = Date.now();
+      const claimed = await claim({
+        paths: ['pa/src/owned.ts'],
+        session: 's-owner',
+        note: 'mine',
+        ttlMinutes: 45,
+        now,
+      });
+      const original = claimed.reservation!;
+
+      const renewed = await renew(original.id, { session: 's-intruder', now: now + 60_000 });
+      assert.equal(renewed, null, 'a foreign session must not be able to renew');
+
+      const active = await readActive(now + 61_000);
+      const row = active.find((r) => r.id === original.id);
+      assert.ok(row, 'the row must still exist');
+      assert.equal(row!.expiresAt, original.expiresAt, 'the row must be untouched by the denied renew');
+    });
+
+    it('renew WITHOUT a session keeps the legacy behavior (no ownership check)', async () => {
+      const { claim, renew } = await import('../src/lib/reservations.js');
+      const now = Date.now();
+      const claimed = await claim({ paths: ['pa/src/legacy.ts'], session: 's-owner', note: 'mine', now });
+      const renewed = await renew(claimed.reservation!.id, { now: now + 60_000 });
+      assert.ok(renewed, 'a sessionless renew (existing callers) must keep working');
+    });
+
+    it('a denied renew logs "renew denied (owner mismatch)" naming owner and requester', async () => {
+      const { claim, renew } = await import('../src/lib/reservations.js');
+      const now = Date.now();
+      const claimed = await claim({ paths: ['pa/src/owned.ts'], session: 's-owner', note: 'mine', now });
+      await renew(claimed.reservation!.id, { session: 's-intruder', now: now + 60_000 });
+      await flushLog();
+
+      const lines = await readAppLogLines(dir);
+      const entry = lines.find((l) => l.message === 'renew denied (owner mismatch)');
+      assert.ok(entry, 'expected a "renew denied (owner mismatch)" log line');
+      assert.equal(entry.level, 'warn');
+      assert.equal(entry.ownerSession, 's-owner');
+      assert.equal(entry.requestedBy, 's-intruder');
+      assert.match(entry.refId, /^s-[0-9a-f]{12}$/);
+    });
+  });
+
+  describe('release attribution (AI-177)', () => {
+    it('the release log line prints bySession so releases stay greppable', async () => {
+      const { claim, release } = await import('../src/lib/reservations.js');
+      const claimed = await claim({ paths: ['pa/src/attribution.ts'], session: 's-holder', note: 'held' });
+      await release({ id: claimed.reservation!.id, bySession: 's-releaser' });
+      await flushLog();
+
+      const lines = await readAppLogLines(dir);
+      const entry = lines.find((l) => l.message === 'reservation released');
+      assert.ok(entry, 'expected a "reservation released" log line');
+      assert.equal(entry.bySession, 's-releaser');
+    });
+  });
+
+  describe('safeLockOptions compromise policies (AI-177)', () => {
+    const captureConsoleError = async (fn: () => Promise<void> | void): Promise<string[]> => {
+      const errors: string[] = [];
+      const orig = console.error;
+      console.error = (...a: unknown[]) => {
+        errors.push(a.map(String).join(' '));
+      };
+      try {
+        await fn();
+      } finally {
+        console.error = orig;
+      }
+      return errors;
+    };
+
+    it('continue (default): logs and keeps going — never throws', async () => {
+      const { safeLockOptions } = await import('../src/lib/safe-lock.js');
+      const opts = safeLockOptions('t-continue');
+      const err = new Error('mtime missed');
+      const errors = await captureConsoleError(() => {
+        (opts.onCompromised as (e: Error) => void)(err);
+      });
+      assert.match(errors.join('\n'), /continuing unsynchronized/);
+      assert.equal((err as Error & { compromised?: boolean }).compromised, undefined);
+    });
+
+    it('fail policy default: tags the error and NEVER throws (onCompromised runs in a timer — AI-096)', async () => {
+      const { safeLockOptions } = await import('../src/lib/safe-lock.js');
+      const opts = safeLockOptions('t-fail', {}, { compromisedPolicy: 'fail' });
+      const err = new Error('mtime missed');
+      const errors = await captureConsoleError(() => {
+        (opts.onCompromised as (e: Error) => void)(err);
+      });
+      assert.equal(
+        (err as Error & { compromised?: boolean }).compromised,
+        true,
+        'the error must carry the compromised tag for the caller to route'
+      );
+      assert.match(errors.join('\n'), /fail-policy/);
+    });
+
+    it('fail policy with a caller onCompromised in extra: the caller handler wins (reject routing)', async () => {
+      const { safeLockOptions } = await import('../src/lib/safe-lock.js');
+      let routed: Error | undefined;
+      const opts = safeLockOptions(
+        't-fail-routed',
+        {
+          onCompromised: (e: Error) => {
+            routed = e;
+          },
+        },
+        { compromisedPolicy: 'fail' }
+      );
+      const err = new Error('mtime missed');
+      (opts.onCompromised as (e: Error) => void)(err);
+      assert.equal(routed, err, 'the reservations-style reject route must receive the error');
+    });
+  });
 });

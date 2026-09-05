@@ -39,7 +39,7 @@ const ALL_JOB_NAMES = [
   'model-override-sweep',
   'delivered-store-compact',
   'proxy-pool-refresh',
-  'dlq-flush',
+  'queue-drain',
 ];
 
 async function readMaintenanceLedger(tempDir: string): Promise<any> {
@@ -127,21 +127,25 @@ describe('runPollLoop: maintenance DEGRADED shedding (AI-100 Wave 2)', { concurr
   afterEach(async () => {
     Date.now = originalDateNow;
     _setDegradedForTest(false);
+    await waitForDrain();
     delete process.env.PA_HOME;
     await rmRetry(tempDir);
     (globalThis as Record<string, unknown>).fetch = savedFetch;
   });
 
-  it('sheds shedWhenDegraded jobs but still runs dlq-flush/proxy-pool-refresh once due', async () => {
-    // dlq-flush, delivered-store-compact and proxy-pool-refresh are cold-start
-    // seeded as "just ran" at loop entry (mirrors the old setInterval timers —
-    // see runPollLoop's cold-start seeding comment), so on the VERY FIRST pass
-    // they read as 'not-due', not proof of anything about shedding. Advance the
-    // clock past all of their cadences (proxy-pool-refresh's 30-min default is
-    // the long pole) between getUpdates calls so a LATER pass, while still
-    // DEGRADED, is the one that actually proves dlq-flush/proxy-pool-refresh
-    // run despite DEGRADED (shedWhenDegraded: false) while the other three are
-    // shed (shedWhenDegraded: true, which short-circuits before the due check).
+  it('sheds shedWhenDegraded jobs but still runs queue-drain/proxy-pool-refresh once due', async () => {
+    // proxy-pool-refresh is cold-start seeded as "just ran" at loop entry
+    // (mirrors the old setInterval timers — see runPollLoop's cold-start
+    // seeding comment), so on the VERY FIRST pass it reads as 'not-due', not
+    // proof of anything about shedding. queue-drain (Wave-2 AI-189
+    // consolidation, replaced dlq-flush in this assertion) IS due on its first
+    // pass — the job itself is not seeded; only its requeue/dlq SOURCES carry
+    // coldStartSeed, in-memory inside maintenance-jobs.ts. Advance the clock
+    // past the cadences (proxy-pool-refresh's 30-min default is the long pole)
+    // between getUpdates calls so a LATER pass, while still DEGRADED, is the
+    // one that actually proves queue-drain/proxy-pool-refresh run despite
+    // DEGRADED (shedWhenDegraded: false) while the other three are shed
+    // (shedWhenDegraded: true, which short-circuits before the due check).
     //
     // The kick is a plain time throttle (main.ts's maintenanceKickDueAt) —
     // deliberately NOT gated on whether a previous pass has settled (see
@@ -198,12 +202,12 @@ describe('runPollLoop: maintenance DEGRADED shedding (AI-100 Wave 2)', { concurr
     let ledger: any;
     for (let i = 0; i < 100; i++) {
       ledger = await readMaintenanceLedger(tempDir).catch(() => null);
-      if (ledger?.jobs?.['dlq-flush']?.lastOutcome === 'ran') break;
+      if (ledger?.jobs?.['queue-drain']?.lastOutcome === 'ran') break;
       await new Promise((r) => setTimeout(r, 50));
     }
 
     assert.ok(ledger, 'maintenance-state.json must exist');
-    assert.equal(ledger.jobs['dlq-flush'].lastOutcome, 'ran', 'dlq-flush must run despite DEGRADED once due (shedWhenDegraded: false)');
+    assert.equal(ledger.jobs['queue-drain'].lastOutcome, 'ran', 'queue-drain must run despite DEGRADED once due (shedWhenDegraded: false)');
     assert.equal(ledger.jobs['proxy-pool-refresh'].lastOutcome, 'ran', 'proxy-pool-refresh must run despite DEGRADED once due (shedWhenDegraded: false)');
     for (const name of ['model-override-sweep', 'delivered-store-compact', 'bot-log-rotation-check']) {
       assert.equal(ledger.jobs[name].lastOutcome, 'skipped', `'${name}' must be shed under DEGRADED`);

@@ -7,6 +7,8 @@ import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   sendMessageWithKeyboard,
+  sendMessageWithKeyboardDetailed,
+  isTerminalChatError,
   editMessageText,
   editMessageReplyMarkup,
   sendMessageWithId,
@@ -14,8 +16,8 @@ import {
 } from '../telegram.js';
 
 /**
- * Unit tests for the FROZEN pre-work in telegram.ts (P1c-f,
- * plans/2026-08-24-buttons-program-SPEC.md), owned as collateral by WP-B1
+ * Unit tests for the FROZEN pre-work in telegram.ts (P1c-f of the
+ * buttons-program design, internal), owned as collateral by WP-B1
  * (spec §4 "Gate", WP-B1 test list). These are the last-chunk-only keyboard
  * attachment, the number|null return shape, and editMessageReplyMarkup.
  */
@@ -251,5 +253,90 @@ describe('sendMessageWithId — reply_markup forwarding', () => {
     const calls = setupFetchMock([{ ok: true, bodyJson: { ok: true, result: { message_id: 42 } } }]);
     await sendMessageWithId('token', 123, 'hello');
     assert.equal(bodyOf(calls[0]).reply_markup, undefined);
+  });
+});
+
+describe('sendMessageWithKeyboardDetailed + isTerminalChatError (AI-186, widened 2026-09-03)', () => {
+  it('isTerminalChatError: true for each terminal string at its correct status', () => {
+    // 400 family
+    assert.equal(isTerminalChatError(400, 'Bad Request: chat not found'), true);
+    assert.equal(isTerminalChatError(400, '{"ok":false,"description":"Bad Request: chat not found"}'), true);
+    assert.equal(isTerminalChatError(400, 'Bad Request: PEER_ID_INVALID'), true, 'case-insensitive');
+    assert.equal(isTerminalChatError(400, 'Bad Request: chat_id_invalid'), true);
+    // 403 family
+    assert.equal(isTerminalChatError(403, 'Forbidden: chat not found'), true);
+    assert.equal(isTerminalChatError(403, 'Forbidden: bot was blocked by the user'), true);
+    assert.equal(isTerminalChatError(403, 'Forbidden: user is deactivated'), true);
+    assert.equal(isTerminalChatError(403, 'Forbidden: bot was kicked from the group chat'), true);
+  });
+
+  it('isTerminalChatError: false for transient, rights-based, unknown, and wrong-status failures', () => {
+    assert.equal(isTerminalChatError(429, 'Too Many Requests: retry after 3'), false, '429 is never terminal');
+    assert.equal(isTerminalChatError(500, 'Internal Server Error'), false, '5xx is never terminal');
+    assert.equal(isTerminalChatError(500, 'Bad Request: chat not found'), false, 'status gate: terminal string at a wrong status');
+    assert.equal(isTerminalChatError(400, 'Bad Request: have no rights to send a message to the chat'), false, 'bot rights can be restored by an admin — transient, stays retryable');
+    assert.equal(isTerminalChatError(400, "Bad Request: can't parse entities"), false);
+    assert.equal(isTerminalChatError(403, 'Forbidden: some other forbidden string'), false, 'unknown 403 strings stay false (fail toward retry, never toward drop)');
+    assert.equal(isTerminalChatError(400, 'Bad Request: peer_id_invaild'), false, 'misspelled terminal string is unknown — stays false');
+    assert.equal(isTerminalChatError(400, 'Forbidden: bot was blocked by the user'), false, '403 string at 400 is the wrong status gate');
+    assert.equal(isTerminalChatError(400, 'Bad Request: message to be replied not found'), false, 'reply-target-gone is a different, recoverable class');
+  });
+
+  it('detailed send: single-chunk 400 chat not found → terminalError true, messageId null', async () => {
+    const calls = setupFetchMock([{ ok: false, status: 400, bodyText: 'Bad Request: chat not found' }]);
+    const r = await sendMessageWithKeyboardDetailed('token', 123, 'hello', KB);
+    assert.equal(calls.length, 1, 'no fallback retry for chat-not-found');
+    assert.equal(r.messageId, null);
+    assert.equal(r.terminalError, true);
+  });
+
+  it('detailed send: 500 failure → terminalError false', async () => {
+    const calls = setupFetchMock([{ ok: false, status: 500, bodyText: 'Internal Server Error' }]);
+    const r = await sendMessageWithKeyboardDetailed('token', 123, 'hello', KB);
+    assert.equal(calls.length, 1);
+    assert.equal(r.messageId, null);
+    assert.equal(r.terminalError, false, '5xx is transient, never terminal');
+  });
+
+  it('detailed send: network error → terminalError false', async () => {
+    const calls = setupFetchMock([{ ok: false, throwError: new Error('ECONNRESET') }]);
+    const r = await sendMessageWithKeyboardDetailed('token', 123, 'hello', KB);
+    assert.equal(calls.length, 1);
+    assert.equal(r.messageId, null);
+    assert.equal(r.terminalError, false, 'network errors are transient');
+  });
+
+  it('detailed send: multi-chunk with ALL chunk failures chat-not-found → terminalError true', async () => {
+    const text = 'x'.repeat(9000); // 3 chunks
+    const calls = setupFetchMock([{ ok: false, status: 400, bodyText: 'Bad Request: chat not found' }]);
+    const r = await sendMessageWithKeyboardDetailed('token', 123, text, KB);
+    assert.equal(calls.length, 3, 'still attempts every chunk');
+    assert.equal(r.messageId, null);
+    assert.equal(r.terminalError, true);
+  });
+
+  it('detailed send: multi-chunk with a parse failure on chunk 2 → terminalError false', async () => {
+    const text = 'x'.repeat(9000); // 3 chunks
+    const calls = setupFetchMock([
+      { ok: false, status: 400, bodyText: 'Bad Request: chat not found' }, // chunk 1 dies chat-not-found
+      { ok: false, status: 400, bodyText: "Bad Request: can't parse entities" }, // chunk 2 phase 0: parse error
+      { ok: false, status: 400, bodyText: 'Bad Request: message is too long' }, // chunk 2 plain-text retry fails non-chat-not-found
+    ]);
+    const r = await sendMessageWithKeyboardDetailed('token', 123, text, KB);
+    assert.equal(calls.length, 4, '3 chunks (one attempt each) + 1 parse-fallback retry on chunk 2');
+    assert.equal(r.messageId, null);
+    assert.equal(r.terminalError, false, 'a parse failure on chunk 2 is not terminal');
+  });
+
+  it('detailed send: success passthrough — first chunk messageId, terminalError false', async () => {
+    const text = 'y'.repeat(5000); // 2 chunks
+    const calls = setupFetchMock([
+      { ok: true, bodyJson: { ok: true, result: { message_id: 201 } } },
+      { ok: true, bodyJson: { ok: true, result: { message_id: 202 } } },
+    ]);
+    const r = await sendMessageWithKeyboardDetailed('token', 123, text, KB);
+    assert.equal(calls.length, 2);
+    assert.equal(r.messageId, 201, 'first chunk message_id passthrough');
+    assert.equal(r.terminalError, false);
   });
 });

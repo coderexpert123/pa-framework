@@ -41,7 +41,8 @@ The framework reads configuration from `~/.pa/` (or wherever `PA_HOME` env var p
 | `bg_tasks` | `BgTasksConfig` | No | See below | Thresholds for background-leak detection. |
 | `usage` | `UsageConfig` | No | None | Token usage tracking and budget alerts. See below. |
 | `model_pricing` | `Record<string, {input, output, cache_read?}>` | No | No | Built-in defaults. Per-MTok USD price overrides for cost estimates. Keys are model names, with worker-name fallback. See below. |
-| `git_workflow` | `GitWorkflowConfig` | No | absent block = enabled | Opt-in for git-touching skills — see `GitWorkflowConfig` below. |
+| `git_workflow` | `GitWorkflowConfig` | No | absent block = enabled | Opt-in for git-touching skills (see below). |
+| `topics` | `{ support?: string }` | No | absent | Topic-routing knobs. `support` = `"<chatId>_<threadId>"` — the topic receiving land-or-discard triage tasks for working-tree paths the daily-recon maintenance job cannot attribute to an owner (no record in `~/.pa/orphan-ledger.jsonl`). Unset/invalid: unattributed paths are still counted in `~/.pa/daily-recon.json`'s `unknown_n` (surfaced by the weekly ops digest), but no task is filed. |
 
 ### `WorkerConfig`
 
@@ -80,10 +81,10 @@ Controls how Telegram voice notes become text. Optional — omit the whole `tran
 
 | Field | Type | Required | Default | Effect |
 |---|---|---|---|---|
-| `engine_preference` | `'auto' \| 'cloud' \| 'local'` | No | `'auto'` | `auto` = use a cloud engine when an API key is set, otherwise fall back to local. `cloud` = cloud only; fail rather than fall back to local if every provider fails. `local` = local only; audio NEVER leaves this machine, even if API keys are set. |
-| `worker_mode` | `'spawn' \| 'persistent'` | No | `'spawn'` | How the LOCAL engine runs — ignored entirely when a cloud engine handles the note. `spawn` = one fresh process per note (simple, reloads the model every time). `persistent` = a resident background process (~230MB+ RAM) that keeps the model warm, shuts down after 10 idle minutes. |
-| `cloud_order` | string[] | No | `[groq, openai, deepgram]` | Cloud providers to try, in order. Only providers whose API key is actually set are attempted. |
-| `language` | string \| null | No | `null` (auto-detect) | ISO 639-1 code, optionally region-qualified (`en`, `en-US`). Threaded into every cloud provider call and the local engine's language hint. A non-English value paired with `engine_preference: local` is accepted but warns at config-load time — the bundled local model (`small.en`) is English-only. |
+| `engine_preference` | `'auto' \| 'cloud' \| 'local'` | No | `'auto'` | `auto` = cloud engine when an API key is set, else local. `cloud` = cloud only; fail rather than fall back to local if every provider fails. `local` = local only; audio NEVER leaves this machine, even if API keys are set. |
+| `worker_mode` | `'spawn' \| 'persistent'` | No | `'spawn'` | LOCAL engine only (ignored when cloud handles the note). `spawn` = one fresh process per note (simple, reloads the model every time). `persistent` = a resident background process (~230MB+ RAM) that keeps the model warm, shuts down after 10 idle minutes. |
+| `cloud_order` | string[] | No | `[groq, openai, deepgram]` | Providers to try, in order; only ones with a set API key are attempted. |
+| `language` | string \| null | No | `null` (auto-detect) | ISO 639-1, optionally region-qualified (`en-US`); threaded into every cloud call and the local engine's language hint. A non-English value paired with `engine_preference: local` is accepted but warns at config-load time — the bundled local model (`small.en`) is English-only. |
 
 Full walkthrough: docs/BOT_GUIDE.md "Voice messages (speech to text)". Something broken? docs/TROUBLESHOOTING.md "Voice-message transcription". Annotated example: `examples/config.yaml.example`.
 
@@ -127,7 +128,7 @@ Table semantics (per-million-token USD):
 
 ```yaml
 model_pricing:
-  gemini-3.7-flash: { input: 0.75, output: 3.75, cache_read: 0.075 }
+  gemini-3.8-flash: { input: 0.75, output: 3.75, cache_read: 0.075 }
   agy:              { input: 0.75, output: 3.75, cache_read: 0.075 }   # worker fallback
 ```
 
@@ -135,7 +136,7 @@ Key resolution: try `record.model` (trimmed), else `record.worker`. Config merge
 
 Parsed by `pa/src/lib/model-pricing.ts` (not `loadConfig`); any read/parse failure warns and falls back to built-ins — never crashes.
 
-Usage records often carry no model field, so the built-ins include worker-level entries (`agy` = gemini-3.7-flash rates, `zclaude` = glm-5.3); `claude`/`codex` price via model key or show unpriced.
+Usage records often carry no model field, so the built-ins include worker-level entries (`agy` = gemini-3.8-flash rates, `zclaude` = glm-5.3); `claude`/`codex` price via model key or show unpriced.
 
 ### Validation
 
@@ -191,31 +192,35 @@ When set, the framework derives all paths from `${PA_HOME}/` instead of `~/.pa/`
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `PA_MAX_CONCURRENT_WORKERS` | `3` | Machine-wide cap on concurrently running LLM CLI workers (bot dispatches + LLM skills share the pool via blackboard slot locks). Excess dispatches queue until a slot frees. Set `0` or negative to disable limiting. Evaluator calls are exempt (they run while a slot-holding worker awaits their verdict). Shell/`cmd:` skills are unaffected. |
-| `UV_THREADPOOL_SIZE` | Node default `4` | Recommended `16` for the bot and catchup processes: Node's fs and DNS lookups share this libuv pool, so heavy disk I/O can starve DNS and take all networking down with it. Set it in the process launcher (Task Scheduler wrapper, systemd unit, shell profile) — it must exist before Node starts. |
+| `PA_MAX_CONCURRENT_WORKERS` | `3` | Machine-wide cap on concurrent LLM workers (bot + skills share the pool via slot locks); excess dispatches queue until a slot frees. Set `0` or negative to disable limiting. Evaluator calls are exempt (they run while a slot-holding worker awaits their verdict). Shell/`cmd:` skills are unaffected. |
+| `UV_THREADPOOL_SIZE` | Node default `4` | Recommended `16` for bot + catchup: fs and DNS share the libuv pool; heavy disk I/O can starve DNS and take all networking down with it. Set it in the process launcher (Task Scheduler wrapper, systemd unit, shell profile) — it must exist before Node starts. |
 | `PA_SELF_IMPROVER_CODE_FIX_BUDGET_MS` | `2400000` (40 min) | Per-run wall-clock budget for the self-improver's code-fix loop; once elapsed, a new fix is skipped (`code-fix-skipped-budget-exhausted`) rather than killed mid-verification. Replaced the one-fix-per-night cap (2026-08-23). |
 | `PA_SELF_IMPROVER_MAX_CODE_FIXES` | unset (unlimited) | Optional hard cap on the number of code-fix attempts (applied or not) in one self-improver run (`code-fix-skipped-limit-reached` past the cap). |
-| `PA_ALERT_CENSUS_NOTIFY_PER_DAY` | `50` | Threshold for the `alert-census` maintenance job (2026-08-23, daily, pa host). The job always writes `~/.pa/alert-census.json`; it posts a one-line "Alert census (7d)" summary to pa-alerts only when `totalSent / windowDays` is at or above this value. |
-| `PA_BUILD_LOCK` | unset (lock ON) | Set to `0` to skip the `@build` reservation that `npm run build` / `npm test` take automatically. For scoped test runs inside an orchestrated wave, where several builders would otherwise serialize behind one another. Never set it for a full-suite or pre-push gate. |
-| `PA_BUILD_LOCK_HELD` | unset | Set automatically by `pa/src/lib/build-lock.ts` while it holds `@build`, to the reservation id. Do not set it by hand. |
-| `PA_WORKER_EDIT_AUDIT` | unset (on) | Set to `0` to disable the whole worker-edit audit mechanism (AI-175) — no dispatch window is opened, no sweep alert fires. |
-| `PA_WORKER_EDIT_AUDIT_IGNORE` | unset (empty) | Comma-separated repo-relative path prefixes the audit never reports (non-ignored noise classes). |
-| `PA_WORKER_EDIT_AUDIT_MAX_ALERTS_PER_DAY` | `10` | Delivered-alert cap per UTC day for `Unreserved worker edits`; past it, findings are logged only, never sent. |
-| `PA_WORKER_EDIT_WINDOW_MAX_MS` | `7200000` (2 h) | Age past which `worker-edit-audit-sweep` closes a dispatch window whose bot PID still looks alive. |
+| `PA_ALERT_CENSUS_NOTIFY_PER_DAY` | `50` | `alert-census` job threshold (daily, pa host). Always writes `~/.pa/alert-census.json`; pages above the cap with a one-line "Alert census (7d)" summary to pa-alerts only when `totalSent / windowDays` is at or above this value. |
+| `PA_ALLOW_STALE_DIST` | unset (guard ON) | `1` = warn-and-continue when the dist-identity guard (AI-180) refuses a test run on a stale/mixed dist (bisect escape; builds stay mandatory in waves). |
+| `PA_BUILD_LOCK` | unset (lock ON) | `0` skips the automatic `@build` reservation of `npm run build`/`npm test` — for scoped runs inside an orchestrated wave, where several builders would otherwise serialize behind one another. Never set it for a full-suite or pre-push gate. |
+| `PA_BUILD_LOCK_HELD` | unset | Set by `build-lock.ts` while holding `@build` (the reservation id); never by hand. |
+| `PA_WORKER_EDIT_AUDIT` | unset (on) | `0` disables the worker-edit audit entirely (AI-175) — no windows, no sweep alerts. |
+| `PA_WORKER_EDIT_AUDIT_IGNORE` | unset (empty) | Repo-relative path prefixes the audit never reports. |
+| `PA_WORKER_EDIT_AUDIT_MAX_ALERTS_PER_DAY` | `10` | Daily delivered cap for `Unreserved worker edits`; past it, log-only. |
+| `PA_WORKER_EDIT_WINDOW_MAX_MS` | `7200000` (2 h) | Window age past which the sweep closes it even if the bot PID looks alive. |
 
 ## Blackboard lock env vars (AI-113)
 
-Only relevant if you're debugging a lock that's expiring too early/late, or writing a
-test that needs a short TTL instead of waiting out the real one. See `docs/multi-session-protocol.md` Rule 10 for the surrounding test-isolation discipline.
+Only for lock-TTL debugging or tests needing short TTLs — see `docs/multi-session-protocol.md` Rule 10.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `PA_HEARTBEAT_STALE_MS` | `600000` (10 min) | How long a blackboard lock can go without a heartbeat before it's considered stale and purged. Read fresh per-call, not just at process start. |
+| `PA_HEARTBEAT_STALE_MS` | `600000` (10 min) | Heartbeat silence before a lock is stale/purged; read fresh per-call. |
 | `PA_LOCK_RENEW_INTERVAL_MS` | `60000` (1 min) | How often `startLockRenewal()` refreshes a held lock's heartbeat. |
-| `PA_LOCK_RENEW_MAX_MS` | `21600000` (6 h) | Absolute cap on how long `startLockRenewal()` will keep renewing — past this it stops and the lock is allowed to go stale via the normal TTL/purge mechanism. |
-| `PA_PUBLIC_SYNC_LOCK_WAIT_MS` | `300000` (5 min) | How long `pa public-sync` waits for the `skill-exclusive:git-public-workflow` blackboard lock before exiting with code 5 (lock busy). Test-only override in practice — leave unset in production. |
-| `PA_TEST_TMP_DIR` | unset | Directory `pa/scripts/run-tests.mjs` and the bot's copy point `TMP`/`TEMP` at for the spawned test process, so temp files (sqlite fsyncs especially) land off the D: HDD. Used only when the directory exists; otherwise the runners fall back to `C:/wt/tmp` if that exists, and leave the OS default alone if neither does. Never set on CI. |
-| `PA_BOT_SELF_RESTART` | unset (enabled) | `0` disables the `bot-self-restart` job — a graceful stop-sentinel restart the bot performs when `pa/dist/.build-stamp` or `projects/telegram-bot/dist/.build-stamp` is newer than the running process start time and the bot is idle (no dispatch, no pending action, no topic lock, `@build` free). Never in-process — Task Scheduler relaunches on the newer `dist/`. See `docs/maintenance-jobs.md`. |
+| `PA_LOCK_RENEW_MAX_MS` | `21600000` (6 h) | Absolute cap on `startLockRenewal()`; past it the lock goes stale normally. |
+| `PA_HEARTBEAT_WRITE_RETRY_MS` | `1000,5000,15000` (1 s/5 s/15 s) | Renewal write-failure retry ladder (`renewHeartbeat()`, AI-179): one immediate attempt plus one retry per comma-separated ms delay (invalid/absent → default); on ladder exhaustion the tick verifies the row via `peekLockRow` before `onLost` fires. |
+| `PA_PUBLIC_SYNC_LOCK_WAIT_MS` | `300000` (5 min) | `public-sync` wait for the git-public lock before exit 5 (busy); test-only override in practice — leave unset in production. |
+| `PA_TEST_TMP_DIR` | unset | Where run-tests.mjs points `TMP`/`TEMP` so test temp files (sqlite fsyncs) land off the repo drive. When set, that directory is used (it must already exist); otherwise the runners fall back to the deployment's conventional fast-drive scratch directory if it exists, and leave the OS default alone if neither does. Unset on CI. |
+| `PA_CDISK_FLOOR_BYTES` | `5368709120` (5 GiB) | `c-disk-floor-watchdog` (pa host) alert floor: pages when C: free bytes cross below it. The default is a deployment convention — the push gate's manual free-space precondition — not a property of the job; set it where the deployment's floor differs. |
+| `PA_CDISK_SCAN_ROOT` | `C:/wt` (win32) | `c-disk-floor-watchdog` scratch root whose top consumers the crossing alert names. Default is the deployment's conventional scratch root. |
+| `PA_CDISK_SCAN_BUDGET_MS` | `2000` (2 s) | `c-disk-floor-watchdog` best-effort budget for that consumer scan; exhausted, the alert defers to a manual sweep instead of stalling the maintenance tick. |
+| `PA_BOT_SELF_RESTART` | unset (enabled) | `0` disables `bot-self-restart` — the graceful restart the bot performs when its dist stamp is newer than the process start time and the bot is idle (no dispatch, no pending action, no topic lock, `@build` free). Never in-process — Task Scheduler relaunches on the newer `dist/`. See `docs/maintenance-jobs.md`. |
 
 ## Voice transcription env vars
 
@@ -281,6 +286,6 @@ command-line cap.
 | Variable | Default | Purpose |
 |---|---|---|
 | `AGY_CMD` | `<path-to-agy>` | Path to the agy shim/binary. Same variable the pre-push PII guard already reads (`examples/secrets.env.example`) — one setting covers both. |
-| `DAILY_MAIL_BRIEF_MODEL` | `gemini-3.7-flash-high` | `--model` value passed to agy. |
+| `DAILY_MAIL_BRIEF_MODEL` | `gemini-3.8-flash-high` | `--model` value passed to agy. |
 | `DAILY_MAIL_BRIEF_PRINT_TIMEOUT` | `10m` | `--print-timeout` value passed to agy. |
 

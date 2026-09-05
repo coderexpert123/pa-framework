@@ -3,7 +3,7 @@ import { appendAuditRecord } from '../lib/improvement-audit.js';
 
 // ---------------------------------------------------------------------------
 // One-off backlog triage (2026-07-11 full-autonomy regime — see
-// plans/2026-07-11-autonomous-self-improver-full-autonomy.md, Phase E). Run
+// the full-autonomy plan, Phase E). Run
 // once, after Phases A-D land, to clear the 54 drafts that piled up under the
 // pre-autonomy gates (see self-improver.ts's now-fixed hasRealSideEffects /
 // validateSkillFix root causes). Every draft still pending at that point

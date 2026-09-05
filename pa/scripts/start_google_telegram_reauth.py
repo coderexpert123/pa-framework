@@ -16,7 +16,7 @@ DEFAULT_SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.compose",
     "https://www.googleapis.com/auth/documents",
-    "https://www.googleapis.com/auth/contacts.readonly",
+    "https://www.googleapis.com/auth/contacts",
     "https://www.googleapis.com/auth/photoslibrary.readonly",
 ]
 
@@ -59,7 +59,7 @@ def _send_reauth_message(auth_url: str, resume_skill_name, chat_id, thread_id) -
     """Deliver the reauth link via Telegram, PLAIN TEXT (parse_mode=None) —
     a Google consent URL's underscores/parentheses are exactly what
     Telegram's legacy Markdown parser mangles (memory 2026-08-15; correction
-    13 of plans/2026-08-23-alerts-wave-SPEC.md). Returns True on success,
+    13 of the 2026-08-23 alerts-wave spec). Returns True on success,
     False on any failure or exception — never raises (a raise here must not
     prevent the caller from cleaning up a just-written session)."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -82,7 +82,7 @@ def _send_reauth_message(auth_url: str, resume_skill_name, chat_id, thread_id) -
     lines.append("Or tap the button below later for a fresh link.")
     message = "\n".join(lines)
 
-    # Callback data contract (plans/2026-08-24-buttons-program-SPEC.md §3.2):
+    # Callback data contract (2026-08-24 buttons-program spec §3.2):
     # "reauth:google" or "reauth:google:<skill>" where <skill> matches
     # [a-z0-9-]{1,50}. The whole callback_data is capped at 64 bytes by
     # Telegram; "reauth:google:" alone is already 14 of those bytes, leaving
@@ -109,6 +109,32 @@ def _send_reauth_message(auth_url: str, resume_skill_name, chat_id, thread_id) -
     finally:
         for key in injected:
             os.environ.pop(key, None)
+
+
+# AI-181 reauth-resume spec (2026-09-01, §2.1-2.2): the closed
+# topic_resume vocabulary, validated at MINT time. Byte-identical rules and
+# error strings to projects/telegram-bot/src/oauth.ts's
+# validateTopicResumeAction (fire time) — both pinned by their own tests.
+# Other resume_action types stay opaque exactly as before.
+TOPIC_RESUME_MAX_PROMPT_CHARS = 500
+
+
+def validate_topic_resume(action: dict) -> "str | None":
+    """Return an error string, or None when the action is a valid topic_resume."""
+    if set(action.keys()) != {"type", "prompt"}:
+        return 'topic_resume must have exactly the keys "type" and "prompt"'
+    prompt = action.get("prompt")
+    if not isinstance(prompt, str):
+        return "topic_resume.prompt must be a string"
+    if not prompt.strip():
+        return "topic_resume.prompt must not be empty"
+    if "\n" in prompt or "\r" in prompt:
+        return "topic_resume.prompt must be a single line"
+    if len(prompt) > TOPIC_RESUME_MAX_PROMPT_CHARS:
+        return f"topic_resume.prompt exceeds {TOPIC_RESUME_MAX_PROMPT_CHARS} characters"
+    if prompt.lstrip().startswith("/"):
+        return 'topic_resume.prompt must not start with "/"'
+    return None
 
 
 def main():
@@ -166,6 +192,12 @@ def main():
 
         resume_skill_name = resume_action.get("skill") if isinstance(resume_action, dict) else None
 
+        if isinstance(resume_action, dict) and resume_action.get("type") == "topic_resume":
+            resume_error = validate_topic_resume(resume_action)
+            if resume_error:
+                print(json.dumps({"error": resume_error}))
+                sys.exit(1)
+
         # Load existing + prune expired, for both the reuse and mint paths.
         all_pending = []
         if state_file.exists():
@@ -179,6 +211,18 @@ def main():
         if args.reuse_pending:
             reusable = next((p for p in all_pending if p.get('scopes') == scopes), None)
             if reusable is not None:
+                # AI-181: a re-mint carrying a NEW resume payload must not
+                # silently keep the stale one — the second worker's
+                # topic_resume would never fire (the exact silent dead-end
+                # this feature exists to end). `reusable` is the same dict
+                # object inside all_pending, so mutate + rewrite persists it.
+                if resume_action is not None or args.retry_action is not None:
+                    reusable["resume_action"] = resume_action
+                    reusable["retry_action"] = args.retry_action
+                    reusable["chat_id"] = args.chat_id
+                    reusable["thread_id"] = args.thread_id
+                    state_file.write_text(json.dumps(all_pending, indent=2))
+
                 sent = False
                 if not args.no_send:
                     sent = _send_reauth_message(reusable["auth_url"], resume_skill_name, args.chat_id, args.thread_id)

@@ -4,6 +4,7 @@ import type {
   PAMeta,
   ModelStatusReasonCode,
   ModelStatusSnapshot,
+  PendingQuestion,
 } from './types.js';
 import { toIST, todayIST, formatIST } from '../../../pa/dist/src/ist.js';
 import { getSkillTranslationPatterns } from '../../../pa/dist/src/lib/skill-translations.js';
@@ -29,7 +30,7 @@ import {
 } from '../../../pa/dist/src/lib/tunables.js';
 import type { WorkerConfig } from '../../../pa/dist/src/types.js';
 import { BOT_COMMANDS } from './commands.js';
-import { redactSecrets } from '../../../pa/dist/src/lib/redact.js';
+import { DEBUG_PATTERN } from './debug-command.js';
 import { validateWatchInput } from '../../../pa/dist/src/lib/watch-jobs.js';
 import type { WatchInput } from '../../../pa/dist/src/lib/watch-jobs.js';
 
@@ -60,12 +61,11 @@ export const CLAIMS_PATTERN = /^\/claims(?:@\w+)?$/i;
 // the operator asks for this precisely when four skills are already blocked, and
 // the link has a 12 h fuse. `/reauth [skill]` optionally names the skill to resume.
 export const REAUTH_PATTERN = /^\/reauth(?:@\w+)?(?:\s+([a-z0-9][a-z0-9-]*))?\s*$/i;
-// Callback-data contract for the inline "Re-authorize Google" button carried by every
-// reauth notice (bot + Python sender share this shape): `reauth:google` or
-// `reauth:google:<skill>` where `<skill>` matches [a-z0-9-]{1,50}.
-// `reauth:google:` is 14 bytes, so 50 is the largest suffix that fits Telegram's
-// 64-byte `callback_data` limit.
-export const REAUTH_CALLBACK_PATTERN = /^reauth:(google)(?::([a-z0-9-]{1,50}))?$/;
+// REAUTH_CALLBACK_PATTERN + parseReauthCallback (the `reauth:google[:skill]` callback
+// grammar row) moved 2026-09-02 to pa/src/lib/callback-grammar.ts — the single
+// callback-grammar source (handover Wave 1 SPEC §3.4); re-exported so main.ts's and
+// reauth-command.test.ts's existing imports keep working unchanged.
+export { REAUTH_CALLBACK_PATTERN, parseReauthCallback } from '../../../pa/dist/src/lib/callback-grammar.js';
 // [Voice message]/[Audio file]/[Video note] re-transcription (WP5 of the
 // hardened voice-transcription plan). Wiring (locate the replied media,
 // call voice.ts's findCachedAudio/transcribeVoiceMessage) is WP6's job in
@@ -134,6 +134,10 @@ export interface StatusCardArgs {
     active: boolean;
     since?: string;
   };
+  /** Wave-2 executor lane (SPEC §3.1 A.3): task-lane counts. Optional — callers
+   *  that don't compute them (and every pre-Wave-2 test/byte pin) render exactly
+   *  as before; a zero line renders nothing, never "0 running · 0 parked · 0 queued". */
+  tasks?: { running: number; parked: number; queued: number };
 }
 
 const FALLBACK_DEFAULT_WORKER = 'claude';
@@ -287,6 +291,9 @@ export function renderStatusCard(args: StatusCardArgs): string {
       ? `Keep-awake: on${keepAwake.since ? ` since ${keepAwake.since}` : ''}`
       : 'Keep-awake: off',
   ];
+  if (args.tasks && (args.tasks.running > 0 || args.tasks.parked > 0 || args.tasks.queued > 0)) {
+    lines.push(`Tasks: ${args.tasks.running} running · ${args.tasks.parked} parked · ${args.tasks.queued} queued`);
+  }
   return lines.join('\n');
 }
 
@@ -303,7 +310,10 @@ export const MERGE_PATTERN    = /^\/merge(?:@\w+)?$/i;
 // Env-driven base for resolving short folder names in /code commands.
 // User sets PA_REPOS_BASE to wherever their repos live (e.g. ~/code).
 // If unset, /code <relative> requires an absolute path — no auto-prefix.
-export const REPOS_BASE = process.env.PA_REPOS_BASE || '';
+// Read per call (not frozen at module init) so tests can pin it per-test.
+function reposBase(): string {
+  return process.env.PA_REPOS_BASE || '';
+}
 
 /**
  * Resolve a /code path argument.
@@ -314,8 +324,9 @@ export const REPOS_BASE = process.env.PA_REPOS_BASE || '';
  */
 export function resolveCodePath(raw: string): string {
   if (/^[A-Za-z]:[\\/]/.test(raw) || raw.startsWith('/')) return raw;
-  if (!REPOS_BASE) return raw;
-  return `${REPOS_BASE}/${raw}`;
+  const base = reposBase();
+  if (!base) return raw;
+  return `${base}/${raw}`;
 }
 
 export interface CodeCommandResult {
@@ -428,6 +439,88 @@ export function handleCodeCommand(
  *
  * Pure function — no mkdir here (that's main.ts's job before calling this).
  */
+export function isSingleSlashCommand(userText: string): string | undefined {
+  const trimmed = userText.trim();
+  if (!trimmed.startsWith('/')) return undefined;
+
+  // Split on whitespace to check if it's a single token
+  const tokens = trimmed.split(/\s+/);
+  if (tokens.length !== 1) return undefined;
+
+  // Strip @botname suffix if present
+  const withoutBotname = tokens[0].replace(/@[\w]+$/, '');
+  return withoutBotname || undefined;
+}
+
+/**
+ * Check if a command string matches any known command pattern.
+ * Returns true if the command is known, false otherwise.
+ */
+export function isKnownCommand(command: string): boolean {
+  const testPatterns = [
+    AGENT_SWITCH_PATTERN,
+    AGENT_BARE_PATTERN,
+    MODEL_SWITCH_PATTERN,
+    DEFAULT_SWITCH_PATTERN,
+    CODE_PATTERN,
+    RESET_PATTERN,
+    NEW_PATTERN,
+    STATUS_PATTERN,
+    KEEP_AWAKE_PATTERN,
+    SKILLS_PATTERN,
+    AUTH_PATTERN,
+    HELP_PATTERN,
+    HEALTH_PATTERN,
+    REF_PATTERN,
+    CLAIMS_PATTERN,
+    REAUTH_PATTERN,
+    RETRANSCRIBE_PATTERN,
+    COMMIT_PATTERN,
+    PUSH_PATTERN,
+    PUSH_PUBLIC_PATTERN,
+    INVESTIGATE_FLAGGED_PATTERN,
+    UPDATE_BRAIN_PATTERN,
+    // AI-190: /debug is intercepted in processUpdate; known here so the
+    // unknown-command guard (which runs earlier) does not eat it.
+    DEBUG_PATTERN,
+    MODEL_TUNABLE_PATTERN,
+    LLM_PATTERN,
+    EFFORT_PATTERN,
+    DEFAULT_TUNABLE_PATTERN,
+    BRANCH_PATTERN,
+    CHILD_OF_PATTERN,
+    MERGE_PATTERN,
+  ];
+
+  // Also check pass-through patterns
+  const testText = `/${command.replace(/^\//, '')}`; // Ensure it starts with / for the test
+  if (PASS_THROUGH_PATTERN.test(testText)) return true;
+
+  for (const pattern of testPatterns) {
+    if (pattern.test(testText)) return true;
+  }
+
+  return false;
+}
+
+/**
+ * Guard for unknown slash commands.
+ * If the text is a single-token slash command that doesn't match any known command,
+ * returns a response that should be sent locally and skipWorker=true.
+ * Otherwise returns undefined (proceed to normal dispatch).
+ */
+export function guardUnknownCommand(userText: string): { response: string; skipWorker: true } | undefined {
+  const singleCommand = isSingleSlashCommand(userText);
+  if (!singleCommand) return undefined;
+
+  if (isKnownCommand(singleCommand)) return undefined;
+
+  return {
+    response: `Unknown command: ${singleCommand}\n\nTry /help for available commands.`,
+    skipWorker: true,
+  };
+}
+
 export function handleUpdateBrainCommand(
   state: ConversationState,
   userText: string,
@@ -589,17 +682,8 @@ export function handleReauthCommand(userText: string): { matched: boolean; skill
   return { matched: true, skill: m[1] };
 }
 
-/**
- * Parses the `reauth:google[:skill]` inline-button callback_data. Pure — no I/O.
- * The actual link request is executed in main.ts via spawnReauthLink, same as
- * handleReauthCommand above.
- */
-export function parseReauthCallback(data: string | undefined): { provider: 'google'; skill?: string } | null {
-  if (!data) return null;
-  const m = REAUTH_CALLBACK_PATTERN.exec(data);
-  if (!m) return null;
-  return { provider: 'google', skill: m[2] };
-}
+// parseReauthCallback lives in pa/src/lib/callback-grammar.ts since 2026-09-02 and is
+// re-exported above (see the REAUTH_PATTERN block).
 
 export function isPassThroughCommand(userText: string): boolean {
   return PASS_THROUGH_PATTERN.test(userText);
@@ -798,6 +882,33 @@ export function consumeConfirmation(state: ConversationState): string | undefine
   const desc = state.pending_action?.description;
   state.pending_action = undefined;
   return desc;
+}
+
+/** Mirrors expirePendingAction for the PA_META `question` prompt (2026-09-02, handover
+ *  Wave 1 SPEC §3.3) — same TTL. Called from main.ts's per-turn cluster (WP-F);
+ *  exported-but-uncalled until then, tested directly. */
+export function expirePendingQuestion(state: ConversationState): void {
+  if (!state.pending_question) return;
+  const age = Date.now() - new Date(state.pending_question.asked_at).getTime();
+  if (age >= PENDING_ACTION_TTL_MS) {
+    state.pending_question = undefined;
+  }
+}
+
+/** Typed-answer path for a pending PA_META `question`: when the turn's text matches one
+ *  of the question's options (exact after trim, case-insensitive), the question is
+ *  consumed and the matched option text returned — so a plain typed reply resolves the
+ *  buttons exactly like a `q:` press does. Returns undefined when nothing is pending or
+ *  the text matches no option (non-matching turns fall through to the worker
+ *  untouched). Called from main.ts (WP-F); exported-but-uncalled until then. */
+export function resolveQuestionAnswer(state: ConversationState, userText: string): string | undefined {
+  const question = state.pending_question;
+  if (!question) return undefined;
+  const normalized = userText.trim().toLowerCase();
+  const matched = question.options.find((option) => option.trim().toLowerCase() === normalized);
+  if (matched === undefined) return undefined;
+  state.pending_question = undefined;
+  return matched;
 }
 
 // AI-029 (hardened 2026-08-05, ekadashi-topic incident): resolves a pending
@@ -1344,6 +1455,35 @@ export function renderSessionExpiryMessage(
 }
 
 /**
+ * AI-202 (2026-09-04): true when a turn's final response is a contentless
+ * "launched, waiting" promise — the option-B outcome of a CLI harness
+ * background-tool decision prompt. Such text must never be delivered as the
+ * answer to a Telegram message (incident 2026-09-04 ~07:39 IST, thread 8306:
+ * "I have launched the git log check and will review the output once it
+ * completes." was posted as the whole reply and the real work was lost).
+ *
+ * Deliberately narrow, anchored on the two real instances:
+ *  - length cap 240: the incident reply is 78 chars; the same-morning
+ *    legitimate reply that merely LED with a promise (tee fbfe1348) is ~900
+ *    chars and must NOT be suppressed.
+ *  - deliverable veto: any absolute path, URL, code fence, heading, list
+ *    item or ref id means there is real content — never suppress.
+ * Callers must gate on meta === null so the AI-170-sanctioned
+ * "promise + registered watch_job" shape is never suppressed.
+ */
+export function isPrematureAsyncReply(text: string): boolean {
+  const t = (text ?? '').trim();
+  if (!t || t.length > 240) return false;
+  if (/https?:\/\/|[A-Za-z]:[\\/]|```|^#{1,6}\s/m.test(t)) return false;
+  if (/^\s*([-*]|\d+[.)])\s+\S/m.test(t)) return false;
+  if (/\bs-[0-9a-f]{12}\b/i.test(t)) return false;
+  const launched = /\b(launched|kicked off|dispatched|queued)\b/i.test(t)
+    || /\b(task-\d+)\b/i.test(t);
+  const waiting = /\b(waiting|will wait|wait for it|once it (completes|finishes)|when it (completes|finishes)|will (review|report|follow up)|let you know|report back)\b/i.test(t);
+  return launched && waiting;
+}
+
+/**
  * Parse and strip the [PA_META] envelope from worker output.
  */
 export function parseMetadata(output: string, executionMode = false): { cleaned: string; meta: PAMeta | null } {
@@ -1484,6 +1624,56 @@ export function applyMetaActions(
     } else {
       console.warn(`[pa-meta] watch_job rejected — ${check.error}`);
       out += `\n\n_(watch_job rejected: ${check.error})_`;
+    }
+  }
+
+  // PA_META `question` (2026-09-02, handover Wave 1 SPEC §3.3): a closed-shape,
+  // operator-visible option prompt. Arming here is pure state mutation (same pattern as
+  // pending_action below — no new return field); main.ts renders the keyboard at the
+  // send site (WP-F attach cascade: confirm wins over question). Mutual exclusion is
+  // enforced BEFORE shape validation so a question that could never be attached is
+  // never armed: reject when a pending_action is already live or the same envelope
+  // carries confirm_required — an unattachable orphan keyboard is the failure mode.
+  const questionAction = meta?.actions.find((a) => a.type === 'question');
+  if (questionAction) {
+    if (state.pending_action) {
+      const reason = 'a pending_action confirmation is already active';
+      console.warn(`[pa-meta] question rejected — ${reason}`);
+      out += `\n\n_(question rejected: ${reason})_`;
+    } else if (meta?.actions.some((a) => a.type === 'confirm_required')) {
+      const reason = 'confirm_required takes precedence in the same reply';
+      console.warn(`[pa-meta] question rejected — ${reason}`);
+      out += `\n\n_(question rejected: ${reason})_`;
+    } else {
+      const qText = typeof questionAction.text === 'string' ? questionAction.text.trim() : '';
+      const rawOptions = Array.isArray(questionAction.options) ? questionAction.options : [];
+      const options = rawOptions.filter((o): o is string => typeof o === 'string').map((o) => o.trim());
+      const taskId = typeof questionAction.task_id === 'string' ? questionAction.task_id : undefined;
+      const taskIdOk = taskId === undefined || (taskId.length <= 64 && /^[A-Za-z0-9_-]*$/.test(taskId));
+      const optionsOk =
+        rawOptions.length >= 1 &&
+        rawOptions.length <= 4 &&
+        rawOptions.every((o) => typeof o === 'string' && o.trim().length >= 1 && o.trim().length <= 40);
+      if (qText.length < 1 || qText.length > 500) {
+        const reason = 'text must be 1..500 chars';
+        console.warn(`[pa-meta] question rejected — ${reason}`);
+        out += `\n\n_(question rejected: ${reason})_`;
+      } else if (!optionsOk) {
+        const reason = 'options must be 1..4 strings of 1..40 chars';
+        console.warn(`[pa-meta] question rejected — ${reason}`);
+        out += `\n\n_(question rejected: ${reason})_`;
+      } else if (!taskIdOk) {
+        const reason = 'taskId must be <=64 chars [A-Za-z0-9_-]';
+        console.warn(`[pa-meta] question rejected — ${reason}`);
+        out += `\n\n_(question rejected: ${reason})_`;
+      } else {
+        state.pending_question = {
+          text: qText,
+          options,
+          task_id: taskId,
+          asked_at: new Date().toISOString(),
+        } satisfies PendingQuestion;
+      }
     }
   }
 
@@ -1697,9 +1887,16 @@ export function formatWorkerReply(output: string, worker: string): string {
 
   if (isNoOutputSentinel(out)) return '';
 
-  // Apply redaction as the last line of defense before returning
-  const cleaned = normalizeMarkdown(out);
-  return redactSecrets(cleaned) as string;
+  // AI-184 (2026-09-03): redaction does NOT run on this path anymore. The
+  // return value is the DELIVERED reply — the operator's own private chat —
+  // and scrubbing here meant their name could never appear in their own chat
+  // and name-bearing third-party drafts (wa.me prefill) corrupted in transit.
+  // The scrub lives on the persistence/worker-read boundary instead:
+  // conversation.ts addTurn (turn store + conversation-history.jsonl archive),
+  // dlq.ts appendDlq (DLQ at rest), the logger's context redaction (pa
+  // lib/log.ts) and rules-critic's logged excerpt. normalizeMarkdown stays —
+  // it is formatting, not redaction.
+  return normalizeMarkdown(out);
 }
 
 export function buildWorkerResponse(result: WorkerResult, worker: string): string {
@@ -1709,9 +1906,9 @@ export function buildWorkerResponse(result: WorkerResult, worker: string): strin
 
   if (!result.success) {
     if (result.evaluatorSummary?.trim()) {
-      // Apply redaction to evaluatorSummary as well (WPB2: redaction layers)
-      const cleaned = normalizeMarkdown(result.evaluatorSummary.trim());
-      return redactSecrets(cleaned) as string;
+      // AI-184 (2026-09-03): delivered failure summary — same reasoning as
+      // formatWorkerReply above; the scrub lives on the persistence/log paths.
+      return normalizeMarkdown(result.evaluatorSummary.trim());
     }
     const snippet = result.error ? ` (${result.error})` : '';
     return `Sorry, I couldn't process that.${snippet}`;

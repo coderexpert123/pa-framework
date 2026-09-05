@@ -295,7 +295,9 @@ node pa/dist/bin/pa.js run my-skill --worker codex
 # Inject per-run operator arguments into the skill prompt (LLM skills only)
 node pa/dist/bin/pa.js run my-skill --prompt-args "Focus on section 3 only"
 
-# Pass extra args (after --)
+# Pass extra args (after --) — for LLM skills these are ALSO bridged into the
+# prompt as an "Operator arguments (this run)" scope block (AI-187); for cmd
+# skills they are shell-command arguments
 node pa/dist/bin/pa.js run my-skill -- some additional context
 ```
 

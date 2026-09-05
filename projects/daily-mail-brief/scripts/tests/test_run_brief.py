@@ -65,7 +65,7 @@ class TestBuildAgyCommand(unittest.TestCase):
     def test_prompt_is_never_inlined(self):
         """The prompt text itself must never appear as its own argv element —
         only the @-file reference (worker-exec.ts:231 precedent, correction 28
-        of plans/2026-08-23-alerts-wave-SPEC.md)."""
+        of the 2026-08-23 alerts-wave design, internal)."""
         cmd = run_brief.build_agy_command("some/prompt/path.txt")
         self.assertEqual(cmd[-1], "@some/prompt/path.txt")
         self.assertTrue(cmd[-1].startswith("@"))
@@ -80,6 +80,39 @@ class TestBuildAgyCommand(unittest.TestCase):
         cmd = run_brief.build_agy_command("p.txt")
         self.assertIn("custom-model", cmd)
         self.assertIn("5m", cmd)
+
+
+class TestBuildFallbackLlmCommand(unittest.TestCase):
+    """build_fallback_llm_command is a PURE command builder (mirrors
+    TestBuildAgyCommand). The prompt must travel on stdin — never argv — for
+    the same ~32 KB Windows command-line cap reason build_agy_command's
+    @-file reference exists."""
+
+    def setUp(self):
+        self._orig = run_brief.FALLBACK_LLM_CMD
+
+    def tearDown(self):
+        run_brief.FALLBACK_LLM_CMD = self._orig
+
+    def test_flag_pairs_in_order_and_no_prompt_argument(self):
+        run_brief.FALLBACK_LLM_CMD = "C:/Users/you/.local/bin/zclaude.bat"
+        cmd = run_brief.build_fallback_llm_command()
+        self.assertEqual(cmd, [
+            "cmd", "/c", "C:/Users/you/.local/bin/zclaude.bat",
+            "--dangerously-skip-permissions",
+            "--output-format", "text",
+            "-p",
+        ])
+
+    def test_prompt_text_never_appears_in_argv(self):
+        cmd = run_brief.build_fallback_llm_command()
+        # Print mode with no argument: the prompt arrives on stdin (call_llm
+        # passes it via input=), so no argv slot can carry briefing content.
+        self.assertEqual(cmd[-1], "-p")
+
+    def test_command_comes_from_module_global(self):
+        run_brief.FALLBACK_LLM_CMD = "C:/somewhere/other-cli.exe"
+        self.assertIn("C:/somewhere/other-cli.exe", run_brief.build_fallback_llm_command())
 
 
 class TestDurationToSeconds(unittest.TestCase):
@@ -185,10 +218,21 @@ RECORDED_GEMINI_AUTH_ERROR = (
     "product. Please contact your administrator."
 )
 
+# The exact stderr agy emitted on the recorded quota-exhaustion runs of
+# 2026-09-02: capacity, not credentials. Misclassified as fatal llm-auth
+# ("LLM auth/license failure — not retrying" → status llm-auth, no retry,
+# unactionable re-auth guidance) while agy's own quota message said it would
+# not reset for 16-26h and the failover chain had other workers available.
+RECORDED_AGY_QUOTA_ERROR = (
+    "agy exited 1: Error: Individual quota reached. Please upgrade your "
+    "subscription to increase your limits. Resets in 26h16m20s."
+)
+
 
 class TestIsLlmAuthFailure(unittest.TestCase):
-    """Auth/license/quota failures must be recognizable so the retry loop can
-    fail fast for the LLM CLI (agy)."""
+    """Auth/license failures must be recognizable so the retry loop can fail
+    fast for the LLM CLI (agy). Quota exhaustion is NOT auth (2026-09-02
+    revision) — it is classified separately in TestIsLlmQuotaFailure."""
 
     def test_recorded_license_error_detected(self):
         self.assertTrue(run_brief.is_llm_auth_failure(RECORDED_GEMINI_AUTH_ERROR))
@@ -213,8 +257,11 @@ class TestIsLlmAuthFailure(unittest.TestCase):
             run_brief._dedup_key_for_status("gemini-auth"), "daily-mail-brief-gemini-auth"
         )
 
-    # 2026-08-23 (WP-F step 5): the four cases the spec pins explicitly for the
-    # renamed is_llm_auth_failure, including agy's own quota signature.
+    # 2026-08-23 (WP-F step 5): the cases the spec pinned for the renamed
+    # is_llm_auth_failure. agy's own quota signature lived here until the
+    # 2026-09-02 revision moved it to the separate quota classifier (recorded
+    # quota-exhaustion runs were failing the brief as fatal llm-auth) — see
+    # test_agy_quota_signature_is_quota_not_auth below and TestIsLlmQuotaFailure.
     def test_valid_license_phrase_detected(self):
         self.assertTrue(
             run_brief.is_llm_auth_failure("You do not have a valid license of this product.")
@@ -223,16 +270,166 @@ class TestIsLlmAuthFailure(unittest.TestCase):
     def test_invalid_grant_detected(self):
         self.assertTrue(run_brief.is_llm_auth_failure("OAuth error: invalid_grant"))
 
-    def test_agy_quota_signature_detected_case_insensitively(self):
+    def test_agy_quota_signature_is_quota_not_auth(self):
+        """2026-09-02 revision: quota exhaustion is capacity, not credentials.
+        'Individual quota reached' must classify as quota (failover path) and
+        must NOT classify as auth — the auth classification aborted the brief
+        with a fatal no-retry exit and unactionable re-auth guidance while
+        agy's own message said the quota resets in 16-26h."""
         for text in (
             "Individual quota reached",
             "individual quota reached — try again later",
             "INDIVIDUAL QUOTA REACHED",
         ):
-            self.assertTrue(run_brief.is_llm_auth_failure(text), text)
+            self.assertTrue(run_brief.is_llm_quota_failure(text), text)
+            self.assertFalse(run_brief.is_llm_auth_failure(text), text)
+
+    def test_recorded_quota_error_not_classified_auth(self):
+        self.assertFalse(run_brief.is_llm_auth_failure(RECORDED_AGY_QUOTA_ERROR))
 
     def test_generic_rate_limit_not_classified_auth(self):
         self.assertFalse(run_brief.is_llm_auth_failure("429 Too Many Requests"))
+
+
+class TestIsLlmQuotaFailure(unittest.TestCase):
+    """Quota exhaustion must be recognizable SEPARATELY from auth so call_llm
+    can fail the inner LLM over to the next worker instead of aborting the
+    brief (the worker chain agy → codex → zclaude → claude draws each worker
+    from its own quota pool)."""
+
+    def test_recorded_quota_error_detected(self):
+        self.assertTrue(run_brief.is_llm_quota_failure(RECORDED_AGY_QUOTA_ERROR))
+
+    def test_quota_signature_detected_case_insensitively(self):
+        for text in (
+            "Individual quota reached",
+            "individual quota reached — try again later",
+            "INDIVIDUAL QUOTA REACHED",
+        ):
+            self.assertTrue(run_brief.is_llm_quota_failure(text), text)
+
+    def test_google_resource_exhausted_marker_detected(self):
+        # Google's API-level marker for the same quota pool — paired with the
+        # quota string in ~/.pa/config.yaml's agy rate_limit_patterns.
+        self.assertTrue(
+            run_brief.is_llm_quota_failure("RESOURCE_EXHAUSTED: quota limit exceeded")
+        )
+
+    def test_auth_failures_not_classified_quota(self):
+        for text in (RECORDED_GEMINI_AUTH_ERROR, "OAuth error: invalid_grant"):
+            self.assertFalse(run_brief.is_llm_quota_failure(text), text)
+
+    def test_transient_errors_not_classified_quota(self):
+        for text in (
+            "agy exited 1: Connection reset by peer",
+            "429 Too Many Requests",
+            "agy exited 1: internal server error",
+        ):
+            self.assertFalse(run_brief.is_llm_quota_failure(text), text)
+
+
+class TestQuotaFailoverInCallLlm(unittest.TestCase):
+    """Quota exhaustion on the primary (agy) must fail the inner LLM over to
+    the fallback CLI — the next worker, which draws from its own quota pool —
+    instead of raising. The recorded 2026-09-02 failures aborted the brief with
+    a fatal llm-auth classification while agy's quota wouldn't reset for
+    16-26h. Auth and transient failures must NOT trigger the fallback."""
+
+    QUOTA_STDERR = (
+        "Error: Individual quota reached. Please upgrade your subscription "
+        "to increase your limits. Resets in 16h19m8s."
+    )
+
+    @patch("run_brief.subprocess.run")
+    def test_quota_failure_fails_over_and_returns_fallback_output(self, mock_run):
+        """The exact recorded evidence: agy exits 1 with the quota stderr →
+        the fallback CLI is invoked with the prompt on stdin and its output
+        becomes the LLM response, so the brief still delivers."""
+        fallback_out = "===BRIEFING_START===\nbrief\n===BRIEFING_END==="
+        mock_run.side_effect = [
+            MagicMock(returncode=1, stdout="", stderr=self.QUOTA_STDERR),
+            MagicMock(returncode=0, stdout=fallback_out, stderr=""),
+        ]
+
+        result = run_brief.call_llm("the prompt")
+
+        self.assertEqual(mock_run.call_count, 2, "quota failure must fail over to the fallback CLI")
+        second = mock_run.call_args_list[1]
+        self.assertIn(run_brief.FALLBACK_LLM_CMD, second.args[0])
+        self.assertEqual(
+            second.kwargs.get("input"), "the prompt",
+            "fallback prompt must travel on stdin, never argv",
+        )
+        self.assertIn("timeout", second.kwargs, "fallback call must stay time-bounded")
+        self.assertEqual(result, fallback_out)
+
+    @patch("run_brief.subprocess.run")
+    def test_auth_failure_does_not_fail_over(self, mock_run):
+        """Dead credentials/license are non-transient for the whole run —
+        surfacing the agy error directly is still the right call; the fallback
+        would only mask it (and the recorded license incident must keep its
+        actionable llm-auth alert)."""
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr=RECORDED_GEMINI_AUTH_ERROR)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            run_brief.call_llm("the prompt")
+
+        self.assertEqual(mock_run.call_count, 1, "auth failure must not invoke the fallback")
+        self.assertIn("valid license", str(ctx.exception))
+
+    @patch("run_brief.subprocess.run")
+    def test_transient_failure_does_not_fail_over(self, mock_run):
+        """Generic errors keep the existing story: raise → main() retries once
+        → status 'llm'. The fallback is quota-only (minimal revision)."""
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="Connection reset by peer")
+
+        with self.assertRaises(RuntimeError):
+            run_brief.call_llm("the prompt")
+
+        self.assertEqual(mock_run.call_count, 1, "transient failure must not invoke the fallback")
+
+    @patch("run_brief.subprocess.run")
+    def test_fallback_failure_raises_transient_not_auth(self, mock_run):
+        """Both pools dry (agy quota, fallback exit 1): the raised error must
+        stay transient-classified so catchup keeps retrying until a pool
+        resets — never the fatal llm-auth path of the recorded failure."""
+        mock_run.side_effect = [
+            MagicMock(returncode=1, stdout="", stderr=self.QUOTA_STDERR),
+            MagicMock(returncode=1, stdout="", stderr="billing hard limit reached"),
+        ]
+
+        with self.assertRaises(RuntimeError) as ctx:
+            run_brief.call_llm("the prompt")
+
+        self.assertEqual(mock_run.call_count, 2)
+        self.assertIn("fallback LLM exited 1", str(ctx.exception))
+        self.assertFalse(
+            run_brief.is_llm_auth_failure(str(ctx.exception)),
+            "a failed fallback must not reclassify the run as llm-auth",
+        )
+
+    @patch("run_brief.subprocess.run")
+    def test_fallback_timeout_raises_transient_not_auth(self, mock_run):
+        mock_run.side_effect = [
+            MagicMock(returncode=1, stdout="", stderr=self.QUOTA_STDERR),
+            subprocess.TimeoutExpired(cmd=["cmd", "/c", "zclaude.bat"], timeout=720),
+        ]
+
+        with self.assertRaises(RuntimeError) as ctx:
+            run_brief.call_llm("the prompt")
+
+        self.assertIn("timed out", str(ctx.exception))
+        self.assertFalse(run_brief.is_llm_auth_failure(str(ctx.exception)))
+
+    @patch("run_brief.subprocess.run")
+    def test_fallback_output_gets_same_noise_stripping_as_primary(self, mock_run):
+        noisy = "real reply\nCreated execution plan for SessionEnd: stuff"
+        mock_run.side_effect = [
+            MagicMock(returncode=1, stdout="", stderr=self.QUOTA_STDERR),
+            MagicMock(returncode=0, stdout=noisy, stderr=""),
+        ]
+
+        self.assertEqual(run_brief.call_llm("p"), "real reply")
 
 
 class TestLlmAuthFailureFailsFast(RunBriefTestCase):
@@ -343,6 +540,33 @@ class TestLlmAuthFailureFailsFast(RunBriefTestCase):
         self.assertEqual(mock_llm.call_count, 2, "Transient failures keep the retry")
         mock_notify.assert_called_once()
         self.assertEqual(mock_notify.call_args.args[0], "llm")
+
+    @patch("run_brief._notify_failure")
+    @patch("run_brief.load_portfolio_context", return_value="")
+    @patch("run_brief.run_py")
+    @patch("run_brief.call_llm")
+    def test_recorded_quota_failure_is_transient_not_llm_auth(
+        self, mock_llm, mock_run_py, _portfolio, mock_notify
+    ):
+        """Reproduces the recorded 2026-09-02 evidence at main() level: an agy
+        quota error surfacing from call_llm (i.e. the fallback pool was also
+        dry) must NOT take the fatal llm-auth path — no re-auth can fix
+        capacity, and agy's own message said the quota resets in 16-26h. It
+        keeps the transient retry and the plain 'llm' status so catchup
+        redelivers once any pool has capacity."""
+        mock_run_py.side_effect = self._patch_run_py(self._make_fetch_data())
+        mock_llm.side_effect = RuntimeError(RECORDED_AGY_QUOTA_ERROR)
+
+        with patch("run_brief.time.sleep"):
+            with self.assertRaises(SystemExit):
+                run_brief.main()
+
+        self.assertEqual(mock_llm.call_count, 2, "quota exhaustion keeps the transient retry")
+        mock_notify.assert_called_once()
+        self.assertEqual(
+            mock_notify.call_args.args[0], "llm",
+            "quota exhaustion must never be classified llm-auth",
+        )
 
 
 class TestStateAdvancementLogic(RunBriefTestCase):

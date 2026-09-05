@@ -704,8 +704,8 @@ def check_shim_integrity(shim_dir: Path, baseline_path: Path,
             "shim-drift",
             f"Live shim no longer matches the recorded baseline: {', '.join(drift_details)}. "
             f"If you changed it intentionally, re-run with `--update-shim-baseline`; "
-            f"otherwise see `plans/2026-08-14-agy-restore.md` "
-            f"(a shim was once silently rewritten to a different CLI, AI-154)."
+            f"otherwise see the agy-restore recovery note (2026-08-14, internal; "
+            f"AI-154 — a shim was once silently rewritten to a different CLI)."
         )
 
     return None
@@ -760,8 +760,8 @@ def diff_worker(name: str, worker: dict, probe: dict, prev: dict | None) -> tupl
             f"or returned only an error banner). Known causes: (1) self-junction at "
             f"the install path — check with `fsutil reparsepoint query <path>`; "
             f"(2) binary uninstalled or emptied by a failed update; (3) shim guard "
-            f"reporting the binary missing. See `plans/2026-08-14-agy-restore.md` "
-            f"for recovery. Errors/output: {'; '.join(observed['errors'])[:150] or (probe.get('help') or '')[:150]}"
+            f"reporting the binary missing. See the agy-restore recovery note "
+            f"(2026-08-14, internal) for recovery. Errors/output: {'; '.join(observed['errors'])[:150] or (probe.get('help') or '')[:150]}"
         ))
         # MERGE, do not overwrite (same invariant as the probe-failed branch):
         # there is no real help text to parse, so carry the previous flags.

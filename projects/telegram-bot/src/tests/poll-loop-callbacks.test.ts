@@ -1,4 +1,4 @@
-// WP-B1 (plans/2026-08-24-buttons-program-SPEC.md §3.1) — poll-loop-level tests for the
+// WP-B1 (buttons-program design §3.1, 2026-08-24, internal) — poll-loop-level tests for the
 // buttons & interactivity wiring in runPollLoop: the injection queue, the callback_query /
 // message_reaction branches, and the R1 poll-offset ordering guarantee.
 //
@@ -161,7 +161,9 @@ topic_defaults:
         return jsonOk(true);
       };
 
-      // Deliberately NOT awaited to completion — see the file header comment.
+      // Deliberately NOT awaited to completion — see the file header comment. Also deliberately
+      // NOT latched (trackPendingWork): the loop dies via the REAL process.exit(0) before afterEach
+      // runs, so a held latch only hands that exit the window to darken the file mid-TAP.
       runPollLoop('token', [ALLOWED_CHAT], state, {}, controller.signal, async () => {}).catch(() => {});
 
       // The cf:y press has been answered, and the resulting synthetic "yes" has been

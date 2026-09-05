@@ -195,7 +195,7 @@ export async function analyzeFailurePatterns(
 
 // ---------------------------------------------------------------------------
 // Alert-census -> deterministic proposal mapping (2026-08-23 alerts wave,
-// plans/2026-08-23-alerts-wave-SPEC.md §WP-J2b step 1). No LLM call, no I/O:
+// the alerts-wave spec §WP-J2b step 1). No LLM call, no I/O:
 // every input the mapping needs (the census, the skill list, the maintenance
 // job names, and a file-existence predicate) is passed in by the caller, so
 // this stays a pure function and is unit-tested directly.

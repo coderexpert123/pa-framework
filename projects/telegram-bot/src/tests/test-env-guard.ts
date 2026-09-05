@@ -4,7 +4,7 @@
 // the scoped runs this repo's own guidance recommends (`node --test
 // dist/tests/x.test.js`) bypass it. On 2026-08-17 that leak sent 3 real
 // Telegram alerts to pa-alerts and wrote 64 synthetic rows into the production
-// forensic log (plans/2026-08-23-alerts-week-review.md §5.3).
+// forensic log (2026-08-23 alerts-week review §5.3, internal).
 // Import this FIRST, before any pa or bot module, in every test file that can
 // notify.
 import { mkdtempSync } from 'node:fs';

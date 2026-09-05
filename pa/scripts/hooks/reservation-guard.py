@@ -6,7 +6,7 @@ Wave C, W-C4 (AI-156). Registered PROJECT-scoped in this repo's tracked
 means it fires only for sessions started in this checkout and its worktrees
 — never in an unrelated repo.
 
-Contract notes (see plans/2026-08-23-coordination-waveC-SPEC.md V1-V9b):
+Contract notes (see the 2026-08-23 coordination Wave-C spec, V1-V9b):
   * ALWAYS exits 0. Exit 2 blocks a PreToolUse hook; this guard must never
     block an edit, so `main()` swallows every exception unconditionally and
     never raises past its own boundary.

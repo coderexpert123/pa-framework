@@ -15,7 +15,7 @@ const PEAK_WINDOW_MS = 4 * 3_600_000;
 /** Transition-keyed dedup: the alert fires on a CHANGE of the stale-skill SET,
  *  not on every tick's hours-ago number. Exported so the test can assert
  *  stability/change directly without going through notifyUser (2026-08-23,
- *  plans/2026-08-23-alerts-wave-SPEC.md). */
+ *  the alerts-wave spec). */
 export function stalenessDedupKey(names: string[]): string {
   return 'staleness:' + createHash('sha1').update([...names].sort().join('\n')).digest('hex').slice(0, 16);
 }

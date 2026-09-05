@@ -45,10 +45,15 @@ beforeEach(async () => {
   publicDir = await mkdtemp(join(tmpdir(), 'pa-public-sync-public-'));
   await initGitRepo(privateDir);
   await initGitRepo(publicDir);
+  // Production wiring: the mirror repo's core.excludesfile points at the public
+  // boundary file, so git itself — and public-sync's check-ignore skip probe —
+  // evaluates the boundary against extraction candidates.
+  await git(publicDir, `config core.excludesfile "${privateDir.replace(/\\/g, '/')}/.gitignore-public"`);
 
-  // Private: 2 commits, several files, one matching a .gitignore-public-style
-  // exclusion marker (extraction is unconditional — .gitignore-public only
-  // governs what push-public later stages, not what public-sync extracts).
+  // Private: 2 commits, several files, one exclusion-marker file. Extraction is
+  // FILTERED through the public boundary: HEAD paths the boundary excludes are
+  // counted as skipped and never written to the mirror (push-public's Step-2
+  // check uses the same rule file at staging time).
   await writeAndCommit(privateDir, {
     'README.md': '# hello\n',
     'src/a.ts': 'export const a = 1;\n',
@@ -160,6 +165,94 @@ describe('syncPublicMirror', () => {
     assert.equal(await readFile(gitInternalMarker, 'utf8'), 'must survive\n');
   });
 
+  it('never writes a private HEAD path the public boundary excludes, and reports skipped >= 1', async () => {
+    await writeAndCommit(privateDir, { 'src/token.secret': 'private credentials\n' }, 'add excluded file');
+
+    const result = await syncPublicMirror({ privateDir, publicDir });
+
+    assert.equal(result.ok, true, result.error);
+    assert.ok(result.skipped >= 1, `expected skipped >= 1, got ${result.skipped}`);
+    await assert.rejects(readFile(join(publicDir, 'src/token.secret'), 'utf8'));
+  });
+
+  it('drops tar directory members of boundary-excluded trees — no empty-dir husks survive (production whole-tree boundary shape)', async () => {
+    // Production's .gitignore-public excludes WHOLE TREES (`/*`, `projects/*`),
+    // not single files like the fixture boundary above. `git archive` emits a
+    // directory member for every parent of an extracted file; those members
+    // must be dropped too, or the mirror fills with empty directory husks of
+    // the excluded trees even though every FILE skip worked (found 2026-09-04:
+    // pa-public carried empty plans/ and projects/fitness-data-sync/ husks
+    // after a sync; the refuter's "trees still present" was these husks).
+    await writeAndCommit(privateDir, {
+      '.gitignore-public': 'private/nested/*\nprivate/b.md\n',
+      'private/nested/deep/a.md': 'excluded deep\n',
+      'private/b.md': 'excluded top\n',
+      'private/public-note.md': 'sibling still public\n',
+    }, 'whole-tree boundary');
+
+    const result = await syncPublicMirror({ privateDir, publicDir });
+
+    assert.equal(result.ok, true, result.error);
+    // Exactly the 2 excluded FILES count as skipped — directory members never
+    // do (privateHead counts blobs only, so extracted must stay consistent).
+    assert.equal(result.skipped, 2);
+    // 6 HEAD files (3 base + 3 new; .gitignore-public is a modify) - 2 skips.
+    assert.equal(result.extracted, 4);
+    assert.equal(await readFile(join(publicDir, 'private/public-note.md'), 'utf8'), 'sibling still public\n');
+    await assert.rejects(readFile(join(publicDir, 'private/nested/deep/a.md'), 'utf8'));
+    await assert.rejects(readFile(join(publicDir, 'private/b.md'), 'utf8'));
+    // The husk proof: private/nested/ held ONLY excluded content, so its tar
+    // directory member must be dropped — no empty shell left behind.
+    await assert.rejects(stat(join(publicDir, 'private/nested')));
+  });
+
+  it('still extracts rule-public files and reports zero skips when the boundary excludes nothing', async () => {
+    const result = await syncPublicMirror({ privateDir, publicDir });
+
+    assert.equal(result.ok, true, result.error);
+    assert.equal(result.skipped, 0);
+    assert.equal(await readFile(join(publicDir, 'README.md'), 'utf8'), '# hello\n');
+    assert.equal(await readFile(join(publicDir, 'src/a.ts'), 'utf8'), 'export const a = 2;\n');
+    assert.equal(await readFile(join(publicDir, '.gitignore-public'), 'utf8'), '*.secret\n');
+  });
+
+  it('removes a previously-extracted file the tightened boundary now excludes (pre-extraction clean proof)', async () => {
+    // Cycle 1: the secret is still rule-public — extraction writes it, and
+    // public-sync never stages, so it sits UNTRACKED in the mirror's working
+    // tree (staging is push-public's job).
+    await writeAndCommit(privateDir, {
+      'src/token.secret': 'private credentials\n',
+      '.gitignore-public': '# boundary not covering it yet\n',
+    }, 'secret still public');
+    const first = await syncPublicMirror({ privateDir, publicDir });
+    assert.equal(first.ok, true, first.error);
+    assert.equal(first.skipped, 0);
+    assert.equal(await readFile(join(publicDir, 'src/token.secret'), 'utf8'), 'private credentials\n');
+
+    // The boundary tightens in a later private commit; the NEXT sync's
+    // pre-extraction clean removes the untracked leftover, and extraction
+    // skips it from then on.
+    await writeAndCommit(privateDir, { '.gitignore-public': '*.secret\n' }, 'tighten boundary');
+    const second = await syncPublicMirror({ privateDir, publicDir });
+    assert.equal(second.ok, true, second.error);
+    assert.ok(second.skipped >= 1, `expected skipped >= 1, got ${second.skipped}`);
+    await assert.rejects(readFile(join(publicDir, 'src/token.secret'), 'utf8'));
+  });
+
+  it('--dry-run reports the skipped count without writing the excluded file', async () => {
+    await writeAndCommit(privateDir, { 'src/token.secret': 'private credentials\n' }, 'add excluded file');
+    const beforeStat = await stat(join(publicDir, 'README.md'));
+
+    const result = await syncPublicMirror({ privateDir, publicDir, dryRun: true });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.skipped, 1);
+    await assert.rejects(readFile(join(publicDir, 'src/token.secret'), 'utf8'));
+    // Nothing else moved either.
+    const afterStat = await stat(join(publicDir, 'README.md'));
+    assert.equal(afterStat.mtimeMs, beforeStat.mtimeMs);
+  });
+
   it('--dry-run reports the prune set and writes nothing', async () => {
     const beforeStat = await stat(join(publicDir, 'README.md'));
     const beforeContent = await readFile(join(publicDir, 'README.md'), 'utf8');
@@ -224,7 +317,7 @@ describe('syncPublicMirror', () => {
     // 2026-08-23: a dirty private tree is an expected multi-session state, not
     // a page — it fired on 5 of 7 days, 3 of those from manual commit-and-push
     // runs whose own Step-4 wrap-up already reports it
-    // (plans/2026-08-23-alerts-week-review.md §5.4). public-sync.ts now emits a
+    // (the 2026-08-23 alerts-week-review decision, §5.4). public-sync.ts now emits a
     // `log('warn', 'public-sync', …)` line instead of calling notifyUser.
     // This test still verifies the ERR_DIRTY_PRIVATE return contract.
 

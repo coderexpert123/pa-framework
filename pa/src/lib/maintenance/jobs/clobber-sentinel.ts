@@ -61,7 +61,7 @@ export async function runClobberSentinel(deps: ClobberSentinelDeps = {}): Promis
     // A tamper-detection control that reports green while doing nothing is
     // worse than one that pages: clobber-sentinel was silently a no-op from
     // 2026-08-17 (49 "detectDrift failed" warn lines in a single 17 h shard,
-    // plans/2026-08-23-alerts-wave-SPEC.md §5.2). Page + rethrow so the
+    // the 2026-08-23 alerts-wave spec §5.2). Page + rethrow so the
     // runner records `failed` and WP-B's failure-backoff ladder paces retries
     // instead of the job quietly returning a green result every tick.
     log('error', 'maintenance', 'clobber-sentinel detectDrift failed', {

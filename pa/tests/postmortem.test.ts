@@ -44,7 +44,7 @@ describe('postmortem stub creation', () => {
       sourceCommit: 'abc123def456',
     };
 
-    const filepath = await createPostmortemStub(input, meta, { repoRoot: testDir });
+    const filepath = await createPostmortemStub(input, meta);
 
     assert.ok(existsSync(filepath), 'Postmortem file should exist');
     assert.ok(filepath.endsWith('2026-08-17-rollback-test-skill.md'), 'Filename should match pattern');
@@ -81,7 +81,7 @@ describe('postmortem stub creation', () => {
       sourceSkill: 'empty-skill',
     };
 
-    const filepath = await createPostmortemStub(input, meta, { repoRoot: testDir });
+    const filepath = await createPostmortemStub(input, meta);
     const content = await readFile(filepath, 'utf-8');
 
     assert.match(content, /\(No timeline refs available\)/, 'Should indicate no timeline refs');
@@ -106,7 +106,7 @@ describe('postmortem stub creation', () => {
       sourceSkill: 'test',
     };
 
-    const filepath = await createPostmortemStub(input, meta, { repoRoot: testDir });
+    const filepath = await createPostmortemStub(input, meta);
 
     assert.ok(existsSync(filepath), 'Should create file even when directory did not exist');
   });
@@ -126,7 +126,7 @@ describe('postmortem stub creation', () => {
       sourceSkill: 'test',
     };
 
-    const filepath = await createPostmortemStub(input, meta, { repoRoot: testDir });
+    const filepath = await createPostmortemStub(input, meta);
     const content = await readFile(filepath, 'utf-8');
 
     // The markdown should be valid (no parsing errors when read as markdown)
@@ -177,8 +177,8 @@ describe('postmortem INDEX.md idempotency (AI-176)', () => {
 
     // Simulates a retried rollback attempt for the same target — createPostmortemStub
     // overwrites the stub file itself (writeFile), so only the INDEX.md row is at risk.
-    await createPostmortemStub(input, meta, { repoRoot: testDir });
-    await createPostmortemStub(input, meta, { repoRoot: testDir });
+    await createPostmortemStub(input, meta);
+    await createPostmortemStub(input, meta);
 
     const indexContent = await readFile(indexPath, 'utf-8');
     const occurrences = indexContent.split('2026-09-01-rolled-back-dup-test.md').length - 1;
@@ -194,13 +194,11 @@ describe('postmortem INDEX.md idempotency (AI-176)', () => {
 
     await createPostmortemStub(
       { date: '2026-09-01', slug: 'rolled-back-distinct-a', title: 'Rollback: distinct-a', timelineRefs: [], actionItems: [] },
-      meta,
-      { repoRoot: testDir }
+      meta
     );
     await createPostmortemStub(
       { date: '2026-09-01', slug: 'rolled-back-distinct-b', title: 'Rollback: distinct-b', timelineRefs: [], actionItems: [] },
-      meta,
-      { repoRoot: testDir }
+      meta
     );
 
     const indexContent = await readFile(indexPath, 'utf-8');
@@ -212,15 +210,12 @@ describe('postmortem INDEX.md idempotency (AI-176)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// AI-176: write-root independence from process.cwd() — the actual production
-// fix. Before this, createPostmortemStub resolved its write root from
-// process.cwd(); any caller that left cwd pointed at the live repo (a test
-// that forgot to isolate, exactly as pa/tests/self-improver.test.ts's
-// git-revert-kind and git-revert-churn describes did) silently wrote real
-// postmortem stubs + INDEX.md rows into it. The write root is now derived via
-// repoRootFromModule (this module's own on-disk location, resolved through
-// git) by default, and an explicit repoRoot always wins — so cwd can no
-// longer decide where anything lands.
+// Write-root independence from process.cwd() — originally the AI-176 fix
+// (repoRootFromModule), superseded 2026-09-04 by the PA_HOME relocation:
+// createPostmortemStub writes under paHome(), which honors PA_HOME, so cwd
+// cannot decide where anything lands. (History: before AI-176 the root came
+// from process.cwd() itself, and un-isolated tests wrote real stubs + INDEX
+// rows into the live repo — the production duplicate rows.)
 // ---------------------------------------------------------------------------
 describe('postmortem write root is independent of process.cwd() (AI-176)', () => {
   const testDir = join(process.cwd(), 'scratch', 'postmortem-cwd-test');
@@ -231,6 +226,10 @@ describe('postmortem write root is independent of process.cwd() (AI-176)', () =>
   const originalCwd = process.cwd();
 
   beforeEach(async () => {
+    // Under the PA_HOME relocation (2026-09-04) the module resolves its write
+    // root from the env var, so this describe must point PA_HOME at its own
+    // fixture — the explicit repoRoot argument it used to rely on is gone.
+    process.env.PA_HOME = testDir;
     await mkdir(join(testDir, 'plans', 'postmortems'), { recursive: true });
     await writeFile(
       join(testDir, 'plans', 'INDEX.md'),
@@ -246,34 +245,30 @@ describe('postmortem write root is independent of process.cwd() (AI-176)', () =>
     await rm(elsewhereDir, { recursive: true, force: true }).catch(() => {});
   });
 
-  it('honors an explicit repoRoot even when process.cwd() points elsewhere', async () => {
+  it('writes under PA_HOME even when process.cwd() points elsewhere', async () => {
     process.chdir(elsewhereDir);
 
     const filepath = await createPostmortemStub(
       { date: '2026-09-01', slug: 'cwd-independence-test', title: 'Rollback: cwd-independence-test', timelineRefs: [], actionItems: [] },
-      { created: '2026-09-01T00:00:00Z', sourceAction: 'rolled-back', sourceSkill: 'cwd-independence-test' },
-      { repoRoot: testDir }
+      { created: '2026-09-01T00:00:00Z', sourceAction: 'rolled-back', sourceSkill: 'cwd-independence-test' }
     );
 
-    assert.ok(filepath.startsWith(testDir), `expected the stub under the injected repoRoot, got: ${filepath}`);
-    assert.ok(existsSync(filepath), 'the stub file should exist under the injected repoRoot');
+    assert.ok(filepath.startsWith(testDir), `expected the stub under the PA_HOME fixture, got: ${filepath}`);
+    assert.ok(existsSync(filepath), 'the stub file should exist under the PA_HOME fixture');
 
     const indexContent = await readFile(join(testDir, 'plans', 'INDEX.md'), 'utf-8');
-    assert.match(indexContent, /cwd-independence-test/, 'the INDEX.md row should land under the injected repoRoot');
+    assert.match(indexContent, /cwd-independence-test/, 'the INDEX.md row should land under the PA_HOME fixture');
 
     // The stand-in for "wherever cwd happened to point" must receive NOTHING —
-    // this is the assertion that would have failed before the fix.
+    // this is the assertion that would have failed before both fixes.
     assert.equal(existsSync(join(elsewhereDir, 'plans')), false, 'nothing should be written under process.cwd()');
   });
 
-  // Complements the test above (which proves the EXPLICIT override wins over cwd)
-  // by proving the DEFAULT resolution itself — repoRootFromModule(__filename), what
-  // createPostmortemStub falls back to with no override — is also independent of
-  // process.cwd(). Deliberately does NOT exercise createPostmortemStub's true
-  // no-override default end to end: doing so would resolve to and write into THIS
-  // repo's real plans/ tree, exactly the risk this fix removes. repoRootFromModule
-  // is the sole input that default depends on, so proving IT is cwd-independent
-  // proves the default is too, with no risk of touching the live tree.
+  // Complements the test above by proving the underlying resolution helper many
+  // repo-rooted stores still share — repoRootFromModule — is itself independent
+  // of process.cwd(). createPostmortemStub no longer uses it (PA_HOME since
+  // 2026-09-04), but the mechanism remains cwd-independent for its other
+  // consumers, and proving that costs nothing here.
   it('the default resolution mechanism (repoRootFromModule) ignores a changed process.cwd()', async () => {
     // Distinct, never-before-resolved cache keys (repoRootFromModule memoises per
     // module path) so each call below genuinely re-resolves via git instead of

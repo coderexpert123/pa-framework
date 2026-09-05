@@ -29,7 +29,7 @@ export { parsePorcelainPaths };
 
 // ---------------------------------------------------------------------------
 // Autonomous CODE-fix capability (2026-07-11) — see
-// plans/2026-07-11-autonomous-code-fix-capability.md. The self-improver's fully-autonomous
+// that plan. The self-improver's fully-autonomous
 // prompt-fix loop (validator.ts) is a no-op for a cmd-based skill: the prompt body is
 // documentation, the real behavior lives in the script the frontmatter's `cmd:` points to.
 // This module extends autonomy to that script/framework code itself, with git as the
@@ -49,7 +49,7 @@ export { parsePorcelainPaths };
 //       run's applied fixes (same-run-overlap guard below), wall-clock budget (all three
 //       enforced by self-improver.ts's orchestrator / this module's diff inspection; the
 //       pre-2026-08-23 global one-fix-per-night cap is gone — see
-//       plans/2026-08-23-code-fix-multi-per-night-SPEC.md) + the data-destruction guard
+//       the code-fix multi-per-night spec) + the data-destruction guard
 //       (touchesGuardedDataPath).
 //   F6. Commit + push PRIVATE origin only. NEVER the public mirror (.git-public) — this
 //       module only ever calls plain `git`, which always resolves to `.git`.
@@ -70,7 +70,7 @@ const defaultExec: ExecFn = promisify(execCb);
 // outside the skill-frontmatter exclusive_resource mechanism the commit/push/
 // push-public/investigate-flagged/update-brain skill family already uses. It
 // takes the SAME blackboard lock so a nightly autonomous fix can never race a
-// concurrent manual /commit or /push. See plans/federated-booping-hammock.md.
+// concurrent manual /commit or /push. See the nightly lock-isolation plan (internal).
 //
 // Must match the `exclusive_resource:` value in all five git-workflow skill.md
 // files — changing this string without changing them silently disables the
@@ -99,7 +99,7 @@ export type CodeFixOutcome =
   | 'code-fix-skipped-stranger-overlap'
   | 'code-fix-skipped-staged-mismatch'
   | 'code-fix-skipped-concurrent-activity'
-  // 2026-08-23 (F5 rework, plans/2026-08-23-code-fix-multi-per-night-SPEC.md): the global
+  // 2026-08-23 (F5 rework, the code-fix multi-per-night spec): the global
   // one-fix-per-night cap is gone; these three replace it as the per-run bounds.
   | 'code-fix-skipped-same-run-overlap'      // code-fixer: diff touches a file an earlier fix THIS run already changed
   | 'code-fix-skipped-target-already-attempted' // orchestrator: one attempt per target skill per run
@@ -413,7 +413,7 @@ function gatesSuffixText(gates?: string[]): string {
 
 /**
  * Verification-gate diagnosability (2026-08-23 F5 rework,
- * plans/2026-08-23-code-fix-multi-per-night-SPEC.md): a bare 500-char slice of raw `npm test`
+ * the code-fix multi-per-night spec): a bare 500-char slice of raw `npm test`
  * output rarely lands on the actual failure — two 08-19/08-20 reverts were unexplainable from
  * the audit trail because of it. TAP's `not ok` lines and the `# tests/# pass/# fail` summary
  * are what actually matter, so pull those out instead. Falls back to excerptOf(err) (first 500
@@ -531,7 +531,7 @@ async function pollBotHealth(
 }
 
 /**
- * Scoped verification (2026-08-23, plans/2026-08-23-alerts-wave-SPEC.md WP-J2a). Previously
+ * Scoped verification (2026-08-23, the alerts-wave spec WP-J2a). Previously
  * this ran the pa build + full pa node suite unconditionally on every fix regardless of what
  * it touched — 12-20 min per fix on this machine, and an unexplained-cause candidate behind
  * two 2026-08-19/20 reverts the audit trail couldn't diagnose (review §4). Invariant: a fix
@@ -722,7 +722,7 @@ export async function attemptCodeFix(
   // proposal.target_skill itself doesn't carry across the function boundary.
   const targetSkillName = proposal.target_skill;
 
-  // Git-optional gate (2026-08-31, plans/2026-08-31-git-optional-SPEC.md): this
+  // Git-optional gate (2026-08-31, the git-optional spec): this
   // lane commits and pushes on the user's behalf. Unless the deployment opted
   // in (git_workflow.enabled — absent block = legacy-allowed) AND we are inside
   // a git work tree, skip the whole lane: the nightly loop degrades to

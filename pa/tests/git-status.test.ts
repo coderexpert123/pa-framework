@@ -1,9 +1,11 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { join } from 'path';
 import { parsePorcelainEntries, parsePorcelainPaths } from '../src/lib/git-status.js';
+import { paHome } from '../src/paths.js';
 
 // ---------------------------------------------------------------------------
-// Regression coverage for the C1 defect (plans/2026-08-23-coordination-audit.md
+// Regression coverage for the C1 defect (the 2026-08-23 coordination audit
 // finding 1): `commands/claim.ts`'s old parser trimmed each line BEFORE slicing
 // off the 3-char status prefix, so a leading-space status (` M`, ` D`, ` T`)
 // shifted the whole line left by one and silently ate the path's first
@@ -12,11 +14,19 @@ import { parsePorcelainEntries, parsePorcelainPaths } from '../src/lib/git-statu
 
 describe('parsePorcelainPaths', () => {
   it('the C1 regression: does not eat the first character of a leading-space status path', () => {
-    const output = ' M BACKLOG.md\n M plans/INDEX.md\n?? new.md\n';
-    assert.deepEqual(parsePorcelainPaths(output), ['BACKLOG.md', 'plans/INDEX.md', 'new.md']);
+    // The postmortem index's real production location (PA_HOME since the
+    // 2026-09-04 relocation) — the parser test stays honest about what a
+    // path string actually looks like instead of pinning an invented name.
+    // The parser normalizes backslashes to forward slashes, so expectations
+    // are stated in its normalized form.
+    const pmIndex = join(paHome(), 'plans', 'INDEX.md');
+    const normalized = pmIndex.replace(/\\/g, '/');
+    const output = ` M BACKLOG.md\n M ${pmIndex}\n?? new.md\n`;
+    assert.deepEqual(parsePorcelainPaths(output), ['BACKLOG.md', normalized, 'new.md']);
     // The old (buggy) parser returned this instead — documented here so a
     // future edit that reintroduces trim-before-slice is unmistakable.
-    assert.notDeepEqual(parsePorcelainPaths(output), ['ACKLOG.md', 'lans/INDEX.md', 'new.md']);
+    const eatenArtifact = pmIndex.slice(1).replace(/\\/g, '/');
+    assert.notDeepEqual(parsePorcelainPaths(output), ['ACKLOG.md', eatenArtifact, 'new.md']);
   });
 
   it('preserves every X-is-space status code', () => {

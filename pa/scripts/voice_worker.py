@@ -1,5 +1,5 @@
 """Persistent local worker for Telegram voice-note transcription (WP2 of
-plans/2026-08-04-telegram-voice-transcription.md).
+the 2026-08-04 voice-transcription plan).
 
 Started lazily by the bot (WP6) only when `transcription.worker_mode:
 persistent` is configured and a voice note actually arrives. Holds the

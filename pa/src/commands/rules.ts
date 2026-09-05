@@ -1,7 +1,7 @@
 /**
  * `pa rules` — feedback-rules store CLI (AI-165).
  *
- * Spec: plans/2026-08-27-ai165-feedback-as-rules-SPEC.md §3.3 (WP-C).
+ * Spec: the AI-165 feedback-as-rules spec (2026-08-27) §3.3 (WP-C).
  *
  * Subcommands:
  * - list [--active]    List rules

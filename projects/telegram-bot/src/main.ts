@@ -1,6 +1,6 @@
 import { spawn, execFile, execFileSync } from 'child_process';
 import { randomBytes, randomUUID } from 'crypto';
-import { existsSync, unlinkSync, writeFileSync } from 'fs';
+import { existsSync, readdirSync, unlinkSync, writeFileSync } from 'fs';
 import { readdir, unlink, rename, writeFile, readFile, stat, mkdir } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -13,9 +13,11 @@ import {
   buildConfirmKeyboard,
   buildFailoverKeyboard,
   buildControlCardKeyboard,
+  buildQuestionKeyboard,
   rememberConfirmMessage,
   currentCardKeyboard,
   clearCardKeyboard,
+  nextSyntheticUpdateId,
   type CallbackDeps,
 } from './callbacks.js';
 import { sendReplyText } from './rich-message.js';
@@ -24,7 +26,9 @@ import { buildPrompt, buildResumedPrompt, buildSkillStatus } from './context.js'
 import { stripAnsi } from './ansi.js';
 import {
   expirePendingAction,
+  expirePendingQuestion,
   resolveConfirmation,
+  resolveQuestionAnswer,
   consumeConfirmation,
   resolvePendingDescription,
   buildWorkerResponse,
@@ -54,6 +58,7 @@ import {
   CHILD_OF_PATTERN,
   MERGE_PATTERN,
   parseMetadata,
+  isPrematureAsyncReply,
   applyMetaActions,
   renderStatusCard,
   workerReceivesStaticPromptFile,
@@ -88,9 +93,17 @@ import {
   CLAIMS_PATTERN,
   REAUTH_PATTERN,
   parseReauthCallback,
+  guardUnknownCommand,
   type TunableCommand,
   type UpdateBrainResult,
 } from './logic.js';
+// AI-190 /debug interception (pattern + pure helpers + the operator gate/filing).
+import {
+  DEBUG_PATTERN,
+  handleDebugCommand,
+  parseSupportTopicKey,
+  resolveDebugTarget,
+} from './debug-command.js';
 import { runRulesCritic } from './rules-critic.js';
 import {
   resolveTunable,
@@ -141,13 +154,16 @@ import { appendKbNote } from './kb-notes.js';
 import { addWatchJob } from '../../../pa/dist/src/lib/watch-jobs.js';
 import { formatFailoverMessage, escapeMd } from './notify-format.js';
 import { registerBotCommands } from './commands.js';
-import { resolveTopicWorkdir, ensureTopicWorkdir, type TopicWorkdir } from './topic-workdir.js';
+import { resolveTopicWorkdir, ensureTopicWorkdir, topicHomeDir, type TopicWorkdir } from './topic-workdir.js';
 import { getTopicBrainInfo, getTopicExemptions } from './topic-brains.js';
 import {
   buildOAuthCompletionMessage,
   launchOAuthResumeAction,
   normalizeResumeAction,
   redactAuthCommand,
+  validateTopicResumeAction,
+  type OAuthResumeAction,
+  type OAuthResumeStatus,
 } from './oauth.js';
 import {
   transcribeVoiceMessage,
@@ -185,11 +201,39 @@ import { cleanupOrphanedWorkers } from '../../../pa/dist/src/worker-pids.js';
 import { blackboard, startLockRenewal } from '../../../pa/dist/src/blackboard.js';
 import { loadConfig, saveTopicDefault } from '../../../pa/dist/src/config.js';
 import type { CommandResult, FailoverNotifyPayload, WorkerConfig } from '../../../pa/dist/src/types.js';
+import { redactSecrets } from '../../../pa/dist/src/lib/redact.js';
 import { logger } from '../../../pa/dist/src/lib/log.js';
+import { formatBootIdentity } from './boot-identity.js';
 import { formatIST } from '../../../pa/dist/src/ist.js';
+import { appendTopicEvent } from '../../../pa/dist/src/lib/topic-events.js';
+import {
+  appendTask,
+  claimNextTask,
+  demoteStaleRunningTasks,
+  failTask,
+  listRunningTasks,
+  listTasks,
+  recordFyiMessage,
+  validateTaskPrompt,
+  type RunningTask,
+} from '../../../pa/dist/src/lib/topic-tasks.js';
+import { loadSupportTopic } from '../../../pa/dist/src/lib/maintenance/jobs/daily-recon.js';
+// Wave-2 executor lane (SPEC §3.1 A.3): the drain fires these fire-and-forget and
+// owns the tier-1 reply hook + card refresh wiring (task-executor.ts never imports
+// main.ts — main.ts is the composition root).
+import {
+  TOPIC_TASK_TICK_CAP,
+  ORPHAN_HARVEST_WINDOW_MS,
+  executeTopicTask,
+  routeReplyToTask,
+  activeTaskExecutions,
+  type ExecuteTopicTaskArgs,
+  type TaskFyiSender,
+} from './task-executor.js';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { resolvePythonCommand } from '../../../pa/dist/src/lib/python.js';
 import { paHome } from '../../../pa/dist/src/paths.js';
+import { writeFileAtomic } from '../../../pa/dist/src/lib/atomic-write.js';
 import { runDueJobs } from '../../../pa/dist/src/lib/maintenance/runner.js';
 import { updateJobState } from '../../../pa/dist/src/lib/maintenance/state.js';
 import { createBotMaintenanceJobs, watchdogStaleJobs } from './maintenance-jobs.js';
@@ -268,8 +312,8 @@ export function buildDispatchExtraArgs(
 // plans/2026-07-08-autonomous-scale-longevity-hardening-phase2.md.
 const TOPIC_SWEEP_STALE_MS = 7 * 24 * 60 * 60 * 1000;
 // Cap on how long graceful shutdown waits for an in-flight bot maintenance
-// pass. Bounded because dlq-flush can stall for minutes during a Telegram
-// outage. Uses a real timer, NOT the injected sleepFn — tests inject a
+// pass. Bounded because queue-drain's dlq source can stall for minutes during
+// a Telegram outage. Uses a real timer, NOT the injected sleepFn — tests inject a
 // fast-forwarding sleep that would win the race instantly and reintroduce the
 // exact ordering flake the drain exists to prevent.
 const MAINTENANCE_DRAIN_MS = 10_000;
@@ -291,6 +335,25 @@ function syncModelStatusState(state: ConversationState, snapshot: ModelStatusSna
   state.pinned_worker = snapshot.current_worker;
 }
 
+/** Wave-2 status-card Tasks line source (SPEC §3.1): fail-to-zero counts. `ready`
+ *  records (answered, awaiting the next claim) count under `running` — they are
+ *  active work about to dispatch, and the frozen line has no fourth bucket. */
+async function topicTaskCounts(
+  chatId: number,
+  threadId: number
+): Promise<{ running: number; parked: number; queued: number }> {
+  try {
+    const [running, queued] = await Promise.all([listRunningTasks(chatId, threadId), listTasks(chatId, threadId)]);
+    return {
+      running: running.filter((r) => r.status !== 'parked').length,
+      parked: running.filter((r) => r.status === 'parked').length,
+      queued: queued.filter((t) => t.kind === 'task').length,
+    };
+  } catch {
+    return { running: 0, parked: 0, queued: 0 };
+  }
+}
+
 async function replacePinnedStatusCard(
   token: string,
   chatId: number,
@@ -299,7 +362,7 @@ async function replacePinnedStatusCard(
   snapshot: ModelStatusSnapshot,
   keepAwake = getKeepAwakeStatus()
 ): Promise<{ delivered: boolean; pinned: boolean; messageId: number | null }> {
-  const pinText = renderStatusCard({ snapshot, keepAwake });
+  const pinText = renderStatusCard({ snapshot, keepAwake, tasks: await topicTaskCounts(chatId, threadId) });
   const oldPinId = state.pinned_status_message_id;
   const pinMsgId = await sendMessageWithId(token, chatId, appendRefIdAndLog(pinText, { kind: 'pin', chatId, threadId }), threadId || undefined, buildControlCardKeyboard());
 
@@ -335,7 +398,7 @@ async function refreshPinnedStatusCardInPlace(
   const snapshot = hydrateModelStatus(state, effectiveDefault, config);
   syncModelStatusState(state, snapshot);
 
-  const pinText = renderStatusCard({ snapshot, keepAwake });
+  const pinText = renderStatusCard({ snapshot, keepAwake, tasks: await topicTaskCounts(chatId, threadId) });
   if (state.pinned_status_message_id) {
     // bp-retry (2026-08-25): this sweep used to unconditionally rewrite the card's
     // keyboard back to the top-level menu, silently stranding a user mid-navigation
@@ -528,6 +591,13 @@ const notifyDebounce = new Map<string, number>();
 // Track consecutive spawn-failed failures per topic for pinned-worker hints.
 // Key: `${chatId}_${threadId}`, value: consecutive failure count.
 const topicSpawnFailureCount = new Map<string, number>();
+// WP-D1 (SPEC §3.4-D1 A.2/A.3): per-update kb-cascade inputs, read by the reply-send
+// block which sits OUTSIDE the try/catch block scopes that produce them. Module-level
+// `let`s (beside topicSpawnFailureCount, the frozen shape) are safe because the poll
+// loop processes updates sequentially; both are reset at the top of the dispatch
+// attempt so a value can never leak into a later update's reply.
+let suggestedAlt: string | null = null;
+let drSuggestedWorker: string | null = null;
 
 // ---------------------------------------------------------------------------
 // AI-029: Topic description suggestion helpers
@@ -706,7 +776,11 @@ export async function postDescriptionSuggestion(
     expiresAt: Date.now() + DESCRIPTION_TIMEOUT_MS,
   };
   await saveTopicState(freshState);
-  await sendMessage(token, chatId, appendRefIdAndLog(msg, { kind: 'help', chatId, threadId }), undefined, threadId || undefined);
+  // WP-D1 (SPEC §3.4-D1 A.1): the accept/skip ask is a BUTTON ask — the cf: yes/no
+  // keyboard rides this message; a press injects the typed yes/no that
+  // resolvePendingDescription consumes (§1.5, zero new grammar). No message_id
+  // bookkeeping: the 30-min auto-accept stays the only expiry (no reaction binding).
+  await sendMessageWithKeyboard(token, chatId, appendRefIdAndLog(msg, { kind: 'help', chatId, threadId }), buildConfirmKeyboard(), undefined, threadId || undefined);
 }
 
 async function backfillTopicDescriptions(
@@ -888,6 +962,31 @@ function maybeDropAgySession(session: SessionInfo | undefined, resource: string,
   return undefined;
 }
 
+/**
+ * One best-effort alert to pa-support when a worker turn's collected tool
+ * commands hit the Telegram Bot API directly. Fail-silent by contract: a
+ * failed alert must never block or corrupt the user's reply. Accepted
+ * false-positive class (alert text already says so): dev commands that grep or
+ * edit source containing these strings. The target is config.yaml
+ * `topics.support` (resolved per-alert); when unset the alert skips — there is
+ * no frozen fallback target (2026-09-04 raw-send guard record).
+ */
+async function alertRawTelegramSends(
+  secrets: Record<string, string>,
+  workerName: string,
+  sessionId: string | undefined,
+  sends: string[]
+): Promise<void> {
+  const token = secrets['TELEGRAM_BOT_TOKEN'];
+  if (!token) return;
+  const supportKey = await loadSupportTopic().catch(() => undefined);
+  const support = parseSupportTopicKey(supportKey ?? '');
+  if (!support) return;
+  const excerpt = redactSecrets(sends[0].slice(0, 120)) as string;
+  const text = `⚠️ Raw Telegram Bot API send detected in a worker turn (worker ${workerName}, session ${sessionId ?? 'unknown'}): ${excerpt}… — bypasses refs + logging + the target topic's queue. Contract: use pa notify --topic-thread. Review; may be benign (e.g. dev grep). (raw-send detector)`;
+  await sendMessage(token, support.chatId, text, undefined, support.threadId);
+}
+
 export async function dispatchMessage(
   userText: string,
   replyContext: string | undefined,
@@ -909,6 +1008,9 @@ export async function dispatchMessage(
   dispatchedWorker?: string;
   rateLimitTelemetry?: CommandResult['rateLimitTelemetry'];
   workerError?: boolean;
+  /** WP-D1 (A.3): the alternate findNextAvailableWorker proposed on the empty-output
+   *  return — the caller's reply-send kb cascade offers it as wf:switch. */
+  suggestedWorker?: string | null;
 }> {
   let currentSession = state.session;
   let dispatchResult: { result: CommandResult; worker: string; session: SessionInfo | undefined } | undefined;
@@ -1106,19 +1208,31 @@ export async function dispatchMessage(
       }
     }
     if (sessionId) newSession = { session_id: sessionId, worker: freshResult.worker, started_at: new Date().toISOString() };
+    // Raw-send guard (2026-09-04): after the fresh result is fully settled,
+    // fire ONE best-effort pa-support alert if this run's tool commands hit
+    // the Telegram Bot API directly. Never awaited into the reply path.
+    if (freshResult.result.rawTelegramSends?.length) {
+      alertRawTelegramSends(secrets, freshResult.worker, freshResult.result.sessionId, freshResult.result.rawTelegramSends)
+        .catch((err) => logger.warn('dispatch', `raw-send alert failed: ${(err as Error).message}`, { worker: freshResult.worker }));
+    }
     dispatchResult = { ...freshResult, session: newSession };
   }
 
   const { result, worker: workerName, session: capturedSession } = dispatchResult;
   const { cleaned, meta } = parseMetadata(result.output, pendingDesc !== undefined);
-  if (result.success && cleaned.trim() === '' && meta === null) {
+  let deliverable = cleaned;
+  if (result.success && meta === null && pendingDesc === undefined && isPrematureAsyncReply(cleaned)) {
+    logger.warn('dispatch', 'premature-async-reply suppressed', { worker: workerName, chars: cleaned.length, excerpt: cleaned.slice(0, 120) });
+    deliverable = '';
+  }
+  if (result.success && deliverable.trim() === '' && meta === null) {
     const suggestedWorker = await findNextAvailableWorker(workerName, defaultWorker, state.preferred_worker, config);
-    return { response: buildWorkerErrorResponse({ worker: workerName, emptyResponse: true, suggestedWorker }), session: state.session, meta: null, workerError: true };
+    return { response: buildWorkerErrorResponse({ worker: workerName, emptyResponse: true, suggestedWorker }), session: state.session, meta: null, workerError: true, suggestedWorker };
   }
   // Only report a dispatchedWorker when it actually succeeded — on full cascade
   // exhaustion, `workerName` is the last worker tried, which still failed. Reporting
   // it here would make main.ts's caller pin the status card to a broken worker.
-  return { response: buildWorkerResponse({ ...result, output: cleaned }, workerName), session: capturedSession, meta, rateLimitedWorker, dispatchedWorker: result.success ? workerName : undefined, rateLimitTelemetry: result.rateLimitTelemetry, workerError: result.success ? undefined : true };
+  return { response: buildWorkerResponse({ ...result, output: deliverable }, workerName), session: capturedSession, meta, rateLimitedWorker, dispatchedWorker: result.success ? workerName : undefined, rateLimitTelemetry: result.rateLimitTelemetry, workerError: result.success ? undefined : true };
 }
 
 /**
@@ -1247,10 +1361,9 @@ function execPaRef(refId: string): string {
   }
 }
 
-// AI-114: covers orphan-reaper.ts's 45-min REAP_MAX_WAIT_MS plus slack, so the
-// pa-host orphan-worker-reap maintenance job (runs every minute) doesn't kill
-// a worker the bot is still waiting to harvest a reply from.
-const ORPHAN_HARVEST_WINDOW_MS = 50 * 60 * 1000;
+// ORPHAN_HARVEST_WINDOW_MS moved 2026-09-02 to task-executor.ts (WP-A executor lane —
+// task dispatches share the bot's harvest budget), imported at the top; the human-lane
+// dispatch sites below keep referencing the same value.
 
 /** How long a dispatch waits for a recovering topic before proceeding anyway
  *  (default > the reaper's 45-min REAP_MAX_WAIT_MS so the reaper always wins the
@@ -1318,6 +1431,21 @@ async function processUpdate(
   // B5: Also skip for requeued synthetics — the user already saw the 👍 on first receipt.
   if (!(update as any).__synthetic && (update as any).__requeueCount === undefined) setMessageReaction(token, chatId, messageId, '👍').catch(() => {});
 
+  // Wave-2 tier-1 attribution (SPEC §3.1 A.3): a reply to a task's FYI/question
+  // anchor is answered straight into the task's micro_thread — no topic lock, no
+  // dispatch, nothing archived to state.turns. Miss falls through to normal
+  // topic processing below.
+  if (userText && typeof msg.reply_to_message?.message_id === 'number') {
+    const routed = await routeReplyToTask({
+      chatId,
+      threadId,
+      replyToMessageId: msg.reply_to_message.message_id,
+      text: userText,
+      sendReply: (text, replyTo) => sendMessage(token, chatId, text, replyTo, threadId || undefined),
+    });
+    if (routed) return;
+  }
+
   const resourceId = `topic-${chatId}_${threadId}`;
   const acquired = await blackboard.acquireLock(resourceId, 'telegram-bot', process.pid, 60000, contextId);
   if (!acquired) {
@@ -1378,6 +1506,16 @@ async function processUpdate(
     if (expiredTunables.length > 0) {
       logger.info('tunables', `expired ${expiredTunables.length} session override(s) at the IST day boundary`, { topic: topicKey, cleared: expiredTunables });
     }
+
+    // Unknown-command guard: catch single-token slash commands that don't match any known pattern
+    if (!skipWorker && userText) {
+      const guardResult = guardUnknownCommand(userText);
+      if (guardResult) {
+        response = guardResult.response;
+        skipWorker = true;
+      }
+    }
+
     if (AUTH_PATTERN.test(userText)) {
       const match = AUTH_PATTERN.exec(userText);
       const code = match![1];
@@ -1405,11 +1543,40 @@ async function processUpdate(
         });
       });
 
-      const resumeStatus = launchOAuthResumeAction(normalizeResumeAction(exchangeResult), {
-        cwd: BOT_CWD,
-        env: runtimeEnv,
-      });
-      response = buildOAuthCompletionMessage(exchangeResult, resumeStatus);
+      const resumeAction = normalizeResumeAction(exchangeResult);
+      let resumeStatus: OAuthResumeStatus;
+      if (resumeAction && resumeAction.type === 'topic_resume') {
+        // AI-181: conversation-shaped resume. oauth_resume_hook.py has no
+        // dispatch path into a topic (it only runs `pa run <skill>`), so the
+        // bot itself injects the turn — closed-shape-validated again here at
+        // fire time, target chat guarded by allowedChatIds, and every
+        // failure degrades to a completion-message line, never a crash of
+        // the /auth handler.
+        resumeStatus = 'topic_resume_failed';
+        try {
+          const check = validateTopicResumeAction(resumeAction);
+          const targetChatId = Number(exchangeResult.chat_id);
+          const targetThreadId = Number(exchangeResult.thread_id ?? 0);
+          if (!check.ok) {
+            logger.warn('auth', `topic_resume rejected at fire time: ${check.error}`, { chatId, threadId });
+          } else if (!exchangeResult.chat_id || !Number.isFinite(targetChatId)) {
+            logger.warn('auth', 'topic_resume rejected: exchange result carries no chat_id', { chatId, threadId });
+          } else if (!allowedChatIds.has(targetChatId)) {
+            logger.warn('auth', `topic_resume rejected: target chat ${targetChatId} is not an allowed chat`, { chatId, threadId });
+          } else {
+            injectSystemResumeUpdate({ chatId: targetChatId, threadId: targetThreadId, prompt: check.prompt });
+            resumeStatus = 'topic_resumed';
+          }
+        } catch (err) {
+          logger.warn('auth', `topic_resume injection failed: ${(err as Error).message}`, { chatId, threadId });
+        }
+      } else {
+        resumeStatus = launchOAuthResumeAction(resumeAction, {
+          cwd: BOT_CWD,
+          env: runtimeEnv,
+        });
+      }
+      response = buildOAuthCompletionMessage(exchangeResult, resumeStatus, { chatId, threadId });
       skipWorker = true;
     }
 
@@ -1731,7 +1898,9 @@ async function processUpdate(
           } else {
             const engineLabel = rt.engine ?? vr.engine;
             const targetLabel = indexedEntry ? ` — ${describeAudioTarget(indexedEntry)}` : '';
-            await sendMessage(token, chatId, `🎙 Re-transcribed (${engineLabel})${targetLabel}:\n\n${vr.text}`, messageId, threadId).catch(() => {});
+            await sendMessage(token, chatId, `🎙 Re-transcribed (${engineLabel})${targetLabel}:\n\n${vr.text}`, messageId, threadId).catch((err) => {
+              logger.warn('retranscribe', `Failed to send re-transcription success message for chat ${chatId} thread ${threadId}${targetLabel}`, { error: (err as Error).message, updateId: update.update_id });
+            });
             userText = formatTranscriptUserText(vr.text, {
               truncated: vr.truncated,
               kind: target.kind,
@@ -1784,6 +1953,41 @@ async function processUpdate(
       const claimsResult = execPaCommand(['claims'], 1200);
       response = appendRefIdAndLog(claimsResult, { kind: 'system', chatId, threadId });
       skipWorker = true;
+    }
+
+    if (!skipWorker && DEBUG_PATTERN.test(userText)) {
+      // AI-190 (2026-09-03): operator-only. Files a topic-task to pa-support
+      // with the target message's ref-ID as the debug handle; never dispatches
+      // a worker in the asking topic. The support key is config.yaml
+      // `topics.support` (parsed pa-side via loadSupportTopic()); when unset
+      // or malformed, /debug is unavailable and reports a configuration
+      // error — there is no frozen fallback topic.
+      const operatorId = secrets['PA_OPERATOR_USER_ID'];
+      const supportKey = await loadSupportTopic().catch(() => undefined);
+      const support = parseSupportTopicKey(supportKey ?? '');
+      if (!support) {
+        response = appendRefIdAndLog(
+          '/debug unavailable: config.yaml topics.support is not set or malformed.',
+          { kind: 'system', chatId, threadId }
+        );
+        skipWorker = true;
+      } else {
+        const result = await handleDebugCommand({
+          userId: msg.from?.id?.toString(),
+          operatorId,
+          target: resolveDebugTarget(
+            msg.reply_to_message as { text?: string; caption?: string; message_id?: number } | undefined,
+            topicState.turns,
+            messageId
+          ),
+          chatId,
+          threadId,
+          support,
+          appendTaskFn: appendTask,
+        });
+        response = appendRefIdAndLog(result.response, { kind: 'system', chatId, threadId });
+        skipWorker = true;
+      }
     }
 
     if (!skipWorker && REAUTH_PATTERN.test(userText)) {
@@ -1981,6 +2185,19 @@ async function processUpdate(
         response = resolved.response; skipWorker = resolved.skipWorker;
         if (!skipWorker && topicState.pending_action) confirmedDescription = consumeConfirmation(topicState);
       }
+      // Topic-task handover Wave 1 (SPEC §3.3, WP-F): the pending_question
+      // counterparts. TTL expiry mirrors expirePendingAction (same
+      // PENDING_ACTION_TTL_MS — the ONLY expiry path a stale question has),
+      // and a typed answer matching one of the question's options clears the
+      // question exactly like a `q:` press does. The clearing MUST happen here:
+      // loadTopicState hands the q: handler a COPY, so the press itself cannot
+      // mutate stored state — this mutation, persisted by saveTopicState below,
+      // is the only path. The turn still flows to the worker (the worker must
+      // see the chosen answer). A question and pending_action are mutually
+      // exclusive at arm time (applyMetaActions), so the two blocks never
+      // interact on one turn.
+      expirePendingQuestion(topicState);
+      resolveQuestionAnswer(topicState, userText);
     }
 
     // AI-095 follow-up (deep-recheck 2026-07-08, Phase 1B): a topic with an
@@ -2024,6 +2241,10 @@ async function processUpdate(
     // block below needs to know whether the dispatch errored, to attach a
     // buildFailoverKeyboard to the reply instead of the confirm keyboard.
     let workerErrored = false;
+    // WP-D1 (SPEC §3.4-D1 A.2/A.3): this update's cascade inputs start clean — the
+    // module lets above are per-update values, never carried across updates.
+    suggestedAlt = null;
+    drSuggestedWorker = null;
     if (!skipWorker) {
       // AI-095: persist the in-flight dispatch so a crash mid-dispatch leaves a
       // recoverable record for the startup orphan reaper instead of a silent void.
@@ -2066,6 +2287,9 @@ async function processUpdate(
         const dr = await dispatchMessage(userText, replyContext, confirmedDescription ?? topicState.pending_action?.description, topicState, secrets, resourceId, effectiveDefault, topicNames, onNotify, update.update_id, workdir, contextId);
         response = dr.response; topicState.session = dr.session;
         workerErrored = !!dr.workerError;
+        // WP-D1 (A.3): carry the empty-output suggestion out of dispatchMessage's
+        // scope — the reply-send cascade (outside this block) reads the module let.
+        drSuggestedWorker = dr.suggestedWorker ?? null;
         // AI-151: capture the actual worker that handled this dispatch
         assistantWorker = dr.dispatchedWorker || topicState.session?.worker || topicState.preferred_worker || effectiveDefault;
         // B9 rev 3 (a): HOIST stoppedKind consumption before applyMetaActions (V22)
@@ -2161,6 +2385,10 @@ async function processUpdate(
           topicSpawnFailureCount.set(topicKey, count);
           if (count >= 2) {
             const pinnedName = topicState.preferred_worker || effectiveDefault;
+            // WP-D1 (SPEC §3.4-D1 A.2): capture the alternate this hint proposes so the
+            // reply's failover keyboard can offer wf:switch directly; the typed
+            // /model <alt> advice stays in the text for the keyboard-less paths.
+            suggestedAlt = await findNextAvailableWorker(pinnedName, effectiveDefault, topicState.preferred_worker, config);
             response += `\n\n💡 Pinned worker ${pinnedName} is failing — /model <alt> to switch or /default to reset.`;
             topicSpawnFailureCount.set(topicKey, 0); // reset after showing hint
           }
@@ -2186,7 +2414,7 @@ async function processUpdate(
             messageId, threadId).catch(() => {});
           response = '';
         }
-      } finally { clearInterval(typingInterval); await closeWindow(editWindow, { worker: assistantWorker === 'local' ? null : assistantWorker }).catch(() => {}); }
+      } finally { clearInterval(typingInterval); await closeWindow(editWindow, { worker: assistantWorker === 'local' ? null : assistantWorker, topic: { chatId, threadId } }).catch(() => {}); }
     }
 
     if (response.trim()) {
@@ -2209,11 +2437,21 @@ async function processUpdate(
         // ✅/❌ confirm keyboard, whose press is what populates that message_id for the
         // 👍/👎 reaction path — or (b) the dispatch errored, in which case the failover
         // 🔁 Retry / ↩ Revert keyboard takes priority over the confirm keyboard.
+        // Topic-task handover Wave 1 (SPEC §3.3, WP-F): (c) a freshly-armed
+        // pending_question with no anchor yet renders its option buttons — priority
+        // below confirm, so a question never displaces a confirm ask.
         const wantsConfirm = !!topicState.pending_action && !topicState.pending_action.message_id;
+        const wantsQuestion = !!topicState.pending_question && !topicState.pending_question.message_id;
+        // WP-D1 (A.2/A.3): the workerErrored keyboard now offers the switch the reply
+        // text names — the empty-output suggestion (A.3) wins, else the pinned-worker
+        // spawn-failure hint's alternate (A.2). Both are undefined-safe (the failover
+        // notice at the onNotify send proves the shape).
         const kb = workerErrored
-          ? buildFailoverKeyboard({ previous: assistantWorker })
+          ? buildFailoverKeyboard({ previous: assistantWorker, next: (drSuggestedWorker ?? suggestedAlt) ?? undefined })
           : wantsConfirm
           ? buildConfirmKeyboard()
+          : wantsQuestion
+          ? buildQuestionKeyboard(topicState.pending_question!.options)
           : undefined;
         const sent = await sendReplyText(token, chatId, textToSend, messageId, threadId, process.env, kb);
         if (sent.delivered) {
@@ -2228,6 +2466,29 @@ async function processUpdate(
             // bp-fix: MessageReactionUpdated carries no thread id, so remember which
             // topic this confirm message belongs to for the reaction path to resolve.
             rememberConfirmMessage(chatId, sent.messageId, threadId);
+          }
+          // Handover Wave 1 (SPEC §3.3): anchor the question to the reply that
+          // carried its buttons — mirrors pending_action above, but NO
+          // rememberConfirmMessage (reactions are pending_action-only). Gated on
+          // !workerErrored && !wantsConfirm: only set the anchor when the QUESTION
+          // keyboard was the one the cascade actually attached — message_id's only
+          // consumer is the wantsQuestion flip above, and anchoring a keyboard-less
+          // (failover) or confirm-carrying reply would strand the question
+          // unrendered until TTL. (Arm-time mutual exclusion keeps pending_action
+          // and pending_question from coexisting in production; the !wantsConfirm
+          // term keeps the anchor honest even for the artificial both-armed state.)
+          // A failed audit line never breaks a delivered reply (q: handler precedent).
+          if (wantsQuestion && !workerErrored && !wantsConfirm && sent.messageId && topicState.pending_question) {
+            topicState.pending_question.message_id = sent.messageId;
+            try {
+              await appendTopicEvent(chatId, threadId, {
+                kind: 'question_asked',
+                ref: topicState.pending_question.task_id ?? null,
+                detail: topicState.pending_question.text,
+              });
+            } catch (err) {
+              logger.warn('telegram', `question_asked event failed: ${(err as Error).message}`, { chatId, threadId });
+            }
           }
         } else {
           await appendDlq({ chatId, threadId, replyToMessageId: messageId, text: textToSend, timestamp: new Date().toISOString(), updateId: update.update_id, refId });
@@ -2286,6 +2547,99 @@ export function requeueSyntheticUpdate(record: PendingDispatch): void {
     { updateId: record.updateId, chatId: record.chatId, threadId: record.threadId, requeueCount });
 }
 
+/** AI-181 (plans/2026-09-01-ai181-reauth-resume-SPEC.md §2.4): inject the
+ * topic_resume prompt into its ORIGINATING chat/thread as a system-
+ * originated, dispatchable turn. Reuses the buttons-program injection queue
+ * (injectUpdate above) so the turn flows through the FULL normal pipeline —
+ * per-topic serialization, enqueue-time placeholder, prompt build with topic
+ * context and conversation history, worker dispatch, write-action
+ * confirm-gates, _Ref trailer, delivered-store, DLQ — exactly like a user
+ * message. Built here (not via callbacks.ts's buildSyntheticUpdate) for the
+ * same reason requeueSyntheticUpdate is: no compile dependency on the
+ * callbacks via-union, and `from` is inert on the dispatch path.
+ * `__synthetic: 'system_resume'` skips the 👍 receipt reaction (the guard
+ * above) and is recorded as the turn's `via` in conversation history — the
+ * provenance marker. The prompt was validated (closed shape, <=500 chars,
+ * single line) at BOTH mint time (start_google_telegram_reauth.py) and fire
+ * time (the /auth branch) before this is called. messageId stays 0: there is
+ * no user message to anchor, and sendMessage's truthy replyTo check makes 0
+ * a no-anchor. AI-173 phase 4 note: this function feeds the existing
+ * injection-queue contract; extracting the enqueue normalizer does not move
+ * it. */
+export function injectSystemResumeUpdate(
+  args: { chatId: number; threadId: number; prompt: string },
+  injectFn: (u: TelegramUpdate) => void = injectUpdate
+): number {
+  return injectSystemSyntheticTurn(args, {
+    prefix: '[System: auto-resumed after Google auth]',
+    synthetic: 'system_resume',
+    logComponent: 'system-resume',
+    logMessage: 'injected topic_resume turn after Google auth',
+  }, injectFn);
+}
+
+/** Shared core behind injectSystemResumeUpdate (AI-181) and
+ * injectSystemReminderUpdate (AI-185): builds a system-originated synthetic
+ * message and pushes it through injectUpdate so the turn flows through the
+ * FULL normal pipeline — per-topic serialization, enqueue-time placeholder,
+ * prompt build with topic context and conversation history, worker dispatch,
+ * write-action confirm-gates, _Ref trailer, delivered-store, DLQ — exactly
+ * like a user message. messageId stays 0: there is no user message to anchor,
+ * and sendMessage's truthy replyTo check makes 0 a no-anchor. The
+ * `__synthetic` tag skips the 👍 receipt reaction and is recorded as the
+ * turn's `via` in conversation history — the provenance marker. */
+function injectSystemSyntheticTurn(
+  args: { chatId: number; threadId: number; prompt: string },
+  opts: { prefix: string; synthetic: string; logComponent: string; logMessage: string },
+  injectFn: (u: TelegramUpdate) => void
+): number {
+  const text = `${opts.prefix} ${args.prompt}`;
+  const updateId = nextSyntheticUpdateId();
+  injectFn({
+    update_id: updateId,
+    message: {
+      message_id: 0,
+      from: { id: 0, first_name: 'PA system' },
+      chat: { id: args.chatId, type: args.threadId ? 'supergroup' : 'private' },
+      date: Math.floor(Date.now() / 1000),
+      text,
+      ...(args.threadId ? { message_thread_id: args.threadId } : {}),
+    },
+    __synthetic: opts.synthetic,
+  } as TelegramUpdate);
+  logger.info(opts.logComponent, opts.logMessage, {
+    chatId: args.chatId, threadId: args.threadId, updateId,
+  });
+  return updateId;
+}
+
+/** AI-185 (plans/2026-09-02-ai185-executable-reminder-dispatch-SPEC.md §3.4):
+ * sibling of injectSystemResumeUpdate — injects a queued executable
+ * reminder's prompt as a system turn. Same core, different label + tag:
+ * `__synthetic: 'system_reminder'` and a `[System: reminder-triggered
+ * (queued <HH:MM IST>)]` prefix carrying the record's queued_at, so the
+ * worker sees staleness when a record drained after bot downtime.
+ * `queuedAtIst` is the bare 24-h HH:MM IST clock time (no suffix — the IST
+ * label is added here, inside the parens, per SPEC §3.4's exact text). The
+ * prompt was validated (closed shape, <=500 chars, single line) at BOTH mint
+ * time (add_reminder.py) and fire time (drainDueReminderResumes below)
+ * before this is called. */
+export function injectSystemReminderUpdate(
+  args: { chatId: number; threadId: number; prompt: string; queuedAtIst: string },
+  injectFn: (u: TelegramUpdate) => void = injectUpdate
+): number {
+  return injectSystemSyntheticTurn(
+    { chatId: args.chatId, threadId: args.threadId, prompt: args.prompt },
+    {
+      prefix: `[System: reminder-triggered (queued ${args.queuedAtIst} IST)]`,
+      synthetic: 'system_reminder',
+      logComponent: 'system-reminder',
+      logMessage: 'injected reminder_resume turn',
+    },
+    injectFn
+  );
+}
+
 /** WP-C C2: the maintenance drain. Re-injects parked ladder records whose
  *  requeueNotBefore has passed: increments requeueCount (persisted BEFORE the
  *  injection — a crash in between leaves an un-parked capped-or-not record the
@@ -2326,6 +2680,245 @@ export async function drainDueRequeues(): Promise<number> {
     injected++;
   }
   return injected;
+}
+
+/** One record in PA_HOME/pending-reminder-resume.json, queued by
+ * process_reminders.py at fire time (AI-185 SPEC §3.2). chat_id/thread_id
+ * are JSON round-trips of the reminder's stored values, so they arrive as
+ * unknown and are coerced here (Number(), thread 0 = no-thread sentinel). */
+export interface PendingReminderResumeRecord {
+  id?: string;
+  queued_at?: string;
+  chat_id?: unknown;
+  thread_id?: unknown;
+  resume_action?: OAuthResumeAction;
+}
+
+/** AI-185 (SPEC §3.3): the reminder-resume-drain maintenance job's run fn.
+ * Pops each record off PA_HOME/pending-reminder-resume.json and injects it
+ * as a system-originated, dispatchable turn (injectSystemReminderUpdate).
+ * POP-FIRST: the remaining records are written back BEFORE the injection
+ * (persist-before-injection, requeue-drain precedent) — at-most-once, crash
+ * window is milliseconds. An absent/empty/invalid queue file is a no-op
+ * (returns 0). validateTopicResumeAction and the allowedChatIds guard both
+ * reject-and-drop with a WARN — never crash the job (/auth branch
+ * precedent). NO age-based dropping: stale records (bot was down) drain on
+ * restart; the injected label carries the queued time so the worker sees
+ * staleness. Lossless. */
+export async function drainDueReminderResumes(
+  allowedChatIds: ReadonlySet<number>,
+  injectFn?: (u: TelegramUpdate) => void
+): Promise<number> {
+  const queuePath = join(paHome(), 'pending-reminder-resume.json');
+  let records: PendingReminderResumeRecord[];
+  try {
+    const parsed = JSON.parse(await readFile(queuePath, 'utf8'));
+    records = Array.isArray(parsed) ? (parsed as PendingReminderResumeRecord[]) : [];
+  } catch {
+    return 0; // absent or invalid queue file — nothing to drain
+  }
+  let injected = 0;
+  for (let i = 0; i < records.length; i++) {
+    const record = records[i];
+    const threadId = Number(record.thread_id ?? 0);
+    // POP-FIRST: persist the remaining records BEFORE injecting (at-most-once).
+    await writeFileAtomic(queuePath, JSON.stringify(records.slice(i + 1), null, 2));
+    logger.info('reminder-resume', 'popped record for injection', { id: record.id, chatId: record.chat_id, threadId: threadId || null });
+    const check = validateTopicResumeAction(record.resume_action);
+    if (!check.ok) {
+      logger.warn('reminder-resume', `reminder_resume rejected at fire time: ${check.error}`, { id: record.id });
+      continue;
+    }
+    const chatId = Number(record.chat_id);
+    if (!record.chat_id || !Number.isFinite(chatId)) {
+      logger.warn('reminder-resume', 'reminder_resume rejected: record carries no chat_id', { id: record.id });
+      continue;
+    }
+    if (!allowedChatIds.has(chatId)) {
+      logger.warn('reminder-resume', `reminder_resume rejected: target chat ${chatId} is not an allowed chat`, { id: record.id });
+      continue;
+    }
+    const queuedMs = Date.parse(String(record.queued_at ?? ''));
+    const queuedAtIst = formatIST(new Date(Number.isFinite(queuedMs) ? queuedMs : Date.now())).slice(11, 16);
+    injectSystemReminderUpdate({ chatId, threadId, prompt: check.prompt, queuedAtIst }, injectFn);
+    injected++;
+  }
+  return injected;
+}
+
+/** Best-effort pinned-card refresh after a task terminal state (SPEC §3.1 status-card
+ *  bullet): the Tasks line counts change when a task completes/fails/defers/parks.
+ *  Loads topic state fresh and deliberately does NOT saveTopicState — the poll loop's
+ *  own saves own the state file; a lost pinned_status_message_id update just means the
+ *  card is replaced again on the next refresh. */
+async function refreshTaskCardFor(token: string, chatId: number, threadId: number): Promise<void> {
+  try {
+    const config = await loadConfig().catch(() => ({ workers: [] as WorkerConfig[] }));
+    const state = await loadTopicState(chatId, threadId);
+    await refreshPinnedStatusCardInPlace(
+      token,
+      chatId,
+      threadId,
+      state,
+      getEffectiveDefaultWorker(config, topicKeyFor(chatId, threadId)),
+      getKeepAwakeStatus(),
+      config
+    );
+  } catch (err) {
+    logger.warn('topic-task', `card refresh failed: ${(err as Error).message}`, { chatId, threadId: threadId || null });
+  }
+}
+
+/** FYI sender seam for the drain — `(chatId, threadId, text, refKind, keyboard?)`.
+ *  Default impl is the real sendMessageWithId send with the ref-id footer. */
+type TopicTaskFyiSender = (
+  chatId: number,
+  threadId: number,
+  text: string,
+  kind: Parameters<TaskFyiSender>[1],
+  keyboard?: Parameters<TaskFyiSender>[2]
+) => Promise<number | null>;
+
+export interface TopicTaskDrainOpts {
+  token?: string;
+  secrets?: Record<string, string>;
+  topicNames?: TopicNameMap;
+  /** Test seams — default impls are the real FYI send and the real executor. */
+  sendFyi?: TopicTaskFyiSender;
+  execute?: (args: ExecuteTopicTaskArgs) => Promise<void>;
+}
+
+/** Topic-task handover Wave 2 (SPEC §3.1 A.3): the topic-task-drain maintenance
+ *  job's run fn — REWRITTEN from Wave 1's inject-a-system-turn body into the
+ *  executor lane. Task dispatches NEVER take the topic blackboard lock and NEVER
+ *  touch state.turns; the running store is the sole authority.
+ *
+ *  Enumerates queue AND running-store files under PA_HOME/topic-tasks/
+ *  (`<chatId>_<threadId>.json` / `.running.json`); per topic, in order:
+ *  (1) stale-demotion of every >TOPIC_TASK_STALE_MS `running` record (crash
+ *  recovery — runs for EVERY enumerated topic, not only the ones this tick
+ *  claims, pre-adjudicated 2026-09-02); (2) up to the GLOBAL TOPIC_TASK_TICK_CAP:
+ *  claimNextTask → pickup FYI → fire-and-forget executeTopicTask (tracked in
+ *  activeTaskExecutions, never awaited on the tick). Claim-first semantics live
+ *  inside claimNextTask (queue+running persist atomically under one lock BEFORE
+ *  anything is dispatched — at-most-once, same crash window as Wave 1).
+ *  task_started (fresh claim) / task_resumed (promoted ready record — attempts>1)
+ *  events; invalid prompts are WARN + failTask (the record must not linger
+ *  holding a slot); foreign chats are skipped BEFORE claiming (records stay
+ *  queued, never consumed). Absent store dir → 0; unreadable stores WARN + skip. */
+export async function drainDueTopicTasks(
+  allowedChatIds: ReadonlySet<number>,
+  opts: TopicTaskDrainOpts = {}
+): Promise<number> {
+  let entries: string[];
+  try {
+    entries = readdirSync(join(paHome(), 'topic-tasks'));
+  } catch {
+    return 0; // absent store — nothing queued anywhere
+  }
+  const topics = new Set<string>();
+  for (const entry of entries) {
+    const m = /^(-?\d+)_(\d+)\.json$/.exec(entry) ?? /^(-?\d+)_(\d+)\.running\.json$/.exec(entry);
+    if (!m) continue;
+    topics.add(`${m[1]}_${m[2]}`);
+  }
+
+  const token = opts.token;
+  const secrets = opts.secrets ?? {};
+  const topicNames = opts.topicNames ?? new Map();
+  const sendFyi: TopicTaskFyiSender = opts.sendFyi ?? ((chatId, threadId, text, kind, keyboard) =>
+    token === undefined
+      ? Promise.resolve(null)
+      : sendMessageWithId(token, chatId, appendRefIdAndLog(text, { kind, chatId, threadId }), threadId || undefined, keyboard));
+
+  let claimedTotal = 0;
+  for (const topicKey of topics) {
+    const [chatId, threadId] = topicKey.split('_').map(Number);
+    try {
+      // (1) Stale-demotion FIRST, for EVERY enumerated topic (2026-09-02
+      // adjudication): the global tick cap must not starve a topic that wins no
+      // claim this tick, or its crashed dispatch would sit `running` forever.
+      await demoteStaleRunningTasks(chatId, threadId);
+      if (!allowedChatIds.has(chatId)) {
+        // Foreign chat: never claim/consume — but only warn when something is
+        // actually parked there, so an empty stray file cannot warn every tick.
+        const pending = await listRunningTasks(chatId, threadId);
+        if (pending.length > 0 || (await listTasks(chatId, threadId)).length > 0) {
+          logger.warn('topic-task', `topic_task rejected: target chat ${chatId} is not an allowed chat`, { chatId, threadId: threadId || null });
+        }
+        continue;
+      }
+      while (claimedTotal < TOPIC_TASK_TICK_CAP) {
+        const task: RunningTask | null = await claimNextTask(chatId, threadId);
+        if (!task) break;
+        const check = validateTaskPrompt(task.prompt);
+        if (!check.ok) {
+          logger.warn('topic-task', `topic_task rejected at drain time: ${check.error}`, { id: task.id, chatId });
+          await failTask(chatId, threadId, task.id, `invalid-prompt: ${check.error}`);
+          continue;
+        }
+        claimedTotal += 1;
+        const resumed = task.attempts > 1;
+        logger.info('topic-task', resumed ? 'resumed task for execution' : 'claimed task for execution', { id: task.id, chatId, threadId: threadId || null, attempt: task.attempts });
+        try {
+          await appendTopicEvent(chatId, threadId, {
+            kind: resumed ? 'task_resumed' : 'task_started',
+            ref: task.id,
+            detail: task.title,
+          });
+        } catch (err) {
+          // The claim is the load-bearing effect; a failed audit line must not
+          // uncount it (Wave-1 precedent).
+          logger.warn('topic-task', `task_${resumed ? 'resumed' : 'started'} event failed: ${(err as Error).message}`, { id: task.id, chatId });
+        }
+        // Pickup FYI (exact, A.3): `📌 Picked up: <title>` + queue-depth line; its
+        // message id becomes a tier-1 reply anchor. Retry/failed FYIs are NOT
+        // recorded — the frozen anchor set is pickup/completion/question only.
+        const queuedCount = (await listTasks(chatId, threadId)).filter((t) => t.kind === 'task').length;
+        const messageId = await sendFyi(
+          chatId,
+          threadId,
+          `📌 Picked up: ${task.title}${queuedCount > 0 ? ` (+${queuedCount} queued)` : ''}`,
+          'task-pickup'
+        ).catch(() => null);
+        if (messageId !== null) {
+          await recordFyiMessage(chatId, threadId, task.id, messageId).catch((err) => {
+            logger.warn('topic-task', `recordFyiMessage failed: ${(err as Error).message}`, { id: task.id, chatId });
+          });
+        }
+        // (2) Fire-and-forget dispatch: the tick returns immediately. The pinned-card
+        // refresh rides the executor's refreshCard seam (ONE call per terminal state
+        // inside executeTopicTask); task workdir is the topic home (stateless,
+        // topic-scoped — resolveTopicWorkdir needs ConversationState, which task
+        // turns must never read).
+        const workdir = { dir: topicHomeDir(chatId, threadId) };
+        await mkdir(workdir.dir, { recursive: true }).catch(() => {});
+        const execArgs: ExecuteTopicTaskArgs = {
+          task,
+          topicCtx: {
+            chatId,
+            threadId,
+            topicName: getTopicName(topicNames, chatId, threadId) ?? `${chatId}_${threadId}`,
+          },
+          secrets,
+          token: token ?? '',
+          workdir,
+          sendFyi: (text, kind, keyboard) => sendFyi(chatId, threadId, text, kind, keyboard),
+          refreshCard: token === undefined ? undefined : () => refreshTaskCardFor(token, chatId, threadId),
+        };
+        const exec = (opts.execute ? opts.execute(execArgs) : executeTopicTask(execArgs)).catch((err) => {
+          logger.warn('topic-task', `task execution failed: ${(err as Error).message}`, { id: task.id, chatId });
+        });
+        activeTaskExecutions.add(exec);
+        void exec.finally(() => activeTaskExecutions.delete(exec));
+      }
+    } catch (err) {
+      // Corrupt/unreadable stores — WARN + skip, never crash the job (R6).
+      logger.warn('topic-task', `topic task stores unreadable — skipped: ${(err as Error).message}`, { chatId, threadId: threadId || null });
+      continue;
+    }
+  }
+  return claimedTotal;
 }
 
 function getUpdateTopicKey(update: any): string {
@@ -2385,6 +2978,13 @@ export async function runPollLoop(
     runModelSweep: runExpiredModelOverrideSweep,
     topicNames,
     requeueDrain: drainDueRequeues,
+    // AI-185: allowedChatIds is local to runPollLoop, so the drain takes it
+    // here rather than reaching config again (mirrors the /auth branch guard).
+    reminderResumeDrain: () => drainDueReminderResumes(allowedChatIds),
+    // Topic-task handover Wave 2 (SPEC §3.1 A.3): same shape — allowedChatIds is
+    // local to runPollLoop, so the topic-task drain takes it here too, plus the
+    // token/secrets/topicNames the executor lane needs for its FYI sends and prompts.
+    topicTaskDrain: () => drainDueTopicTasks(allowedChatIds, { token, secrets, topicNames }),
   });
   // Read ONCE: a config.yaml read on every <=30s iteration is not free on this
   // disk. Changing config.maintenance for a bot job needs a bot restart.
@@ -2417,8 +3017,10 @@ export async function runPollLoop(
     // (config.topic_defaults[topicKey], falling back to the first configured worker) — the
     // picker's FINAL fallback so it never collapses to '' for a fresh/never-hydrated topic.
     effectiveDefaultWorker: async (cid, tid) => getEffectiveDefaultWorker(await loadConfig().catch(() => ({})), topicKeyFor(cid, tid)),
+    // Wave-2 `qt:` presses resolve the task id against the RUNNING store (SPEC §3.1).
+    loadRunningTasks: (cid, tid) => listRunningTasks(cid, tid),
   };
-  // Cold-start seeding (AI-100 Wave 2): dlq-flush, delivered-store-compact and
+  // Cold-start seeding (AI-100 Wave 2): delivered-store-compact and
   // proxy-pool-refresh mirror the OLD setInterval-based timers, none of which
   // fired on their very first tick (setInterval always waits one full interval
   // before its first call; nextMaintenanceAt was seeded to now+interval on
@@ -2430,9 +3032,12 @@ export async function runPollLoop(
   // tick before the interval elapses" test. model-override-sweep and
   // bot-log-rotation-check are DELIBERATELY excluded — they mirror
   // nextSweepAt/nextLogCheckAt, both seeded to 0 in the old code (due
-  // immediately on the very first pass, every restart).
+  // immediately on the very first pass, every restart). The drain names
+  // (dlq-flush, requeue-drain) LEFT this list with the AI-189 queue-drain
+  // consolidation — their successors seed per-SOURCE via the registry's
+  // coldStartSeed flag (maintenance-jobs.ts).
   const coldStartAt = Date.now();
-  for (const name of ['dlq-flush', 'delivered-store-compact', 'proxy-pool-refresh', 'requeue-drain', 'dashboard-refresh']) {
+  for (const name of ['delivered-store-compact', 'proxy-pool-refresh', 'dashboard-refresh']) {
     await updateJobState(name, (prev) => ({ ...prev, lastRunAt: new Date(coldStartAt).toISOString() })).catch(() => {});
   }
   // Throttle the KICK, not the pass-in-flight state — deliberately NOT a
@@ -2449,9 +3054,9 @@ export async function runPollLoop(
   // existing per-job IN_FLIGHT guard in runner.ts, not a pass-level lock
   // here; any overlap between two kicks just means some jobs report
   // skipReason:'in-flight' on the later call, which is harmless and
-  // already-tested runner behavior. dlq-flush is ordered LAST in
-  // maintenance-jobs.ts so a stalled flush never delays the cheap jobs
-  // sharing its pass. The interval is well under the smallest declared job
+  // already-tested runner behavior. queue-drain's dlq SOURCE is ordered last
+  // inside the job's pass so a stalled flush never delays the cheap injector
+  // sources sharing it. The interval is well under the smallest declared job
   // cadence (model-override-sweep, 60s) so responsiveness is unaffected;
   // it's there to bound ledger-write frequency when timeout=0 makes
   // iterations rapid-fire during a message burst.
@@ -2470,12 +3075,30 @@ export async function runPollLoop(
     // that abort inside the first getUpdates still observe the sweep's effects.
     if (Date.now() >= maintenanceKickDueAt) {
       maintenanceKickDueAt = Date.now() + MAINTENANCE_KICK_INTERVAL_MS;
-      const pass: Promise<unknown> = runDueJobs('bot', botJobs, {
-        degraded: isDegraded(),
-        overrides: maintenanceOverrides,
-      })
-        .catch((err) => logger.warn('maintenance', `bot maintenance pass failed: ${(err as Error).message}`))
-        .finally(() => { activeMaintenancePasses.delete(pass); });
+      // A kick whose predecessor pass hasn't settled yet QUEUES behind it
+      // (allSettled) instead of overlapping. runDueJobs captures `now` ONCE per
+      // pass, so an overlapping pass decides every job's due-ness against the
+      // kicker's clock while the older pass still holds its per-job IN_FLIGHT
+      // slot — the newer pass's decisions all land as skip:in-flight, wasting
+      // the only pass that saw the advanced clock. Proven by trace (2026-09-03,
+      // dlq drain stall): with the test clock jumping 6 min between two
+      // back-to-back kicks, pass 2 decided queue-drain in the gap between
+      // pass 1's ran-settled and slot-released — one decision slot too late —
+      // so the cold-start-seeded dlq source (5-min cadence, seeded at job
+      // creation) never ran in ANY pass and both DLQ delivery pins failed.
+      // Queueing keeps the kick's due-check (the 2026-08-03 constraint above:
+      // due kicks are never dropped, only ordered) and the runner's IN_FLIGHT
+      // guard stays as the backstop for the other host. isDegraded() is
+      // deliberately evaluated at pass-execution time (fresher than the kick).
+      const runPass = (): Promise<unknown> =>
+        runDueJobs('bot', botJobs, {
+          degraded: isDegraded(),
+          overrides: maintenanceOverrides,
+        }).catch((err) => logger.warn('maintenance', `bot maintenance pass failed: ${(err as Error).message}`));
+      const pass: Promise<unknown> = (activeMaintenancePasses.size === 0
+        ? runPass()
+        : Promise.allSettled([...activeMaintenancePasses]).then(runPass)
+      ).finally(() => { activeMaintenancePasses.delete(pass); });
       activeMaintenancePasses.add(pass);
     }
 
@@ -2958,6 +3581,10 @@ async function main(): Promise<void> {
     const token = secrets['TELEGRAM_BOT_TOKEN'];
     const chatIds = (secrets['TELEGRAM_CHAT_ID'] || '').split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n));
     if (!token || chatIds.length === 0) process.exit(1);
+
+    // Log dist identity banner at startup
+    logger.info('boot', formatBootIdentity(fileURLToPath(import.meta.url)));
+
     // AI-096 item 5: only what the poll loop NEEDS runs before it starts. All
     // fs-heavy / network-heavy maintenance is a background chain — on a starved
     // disk the old sequential startup kept the bot deaf for 15-25 minutes.
@@ -2982,7 +3609,7 @@ async function main(): Promise<void> {
       await flushDlq(token).catch(() => {});
       // AI-095: recover replies from dispatches orphaned by a crashed prior instance.
       // May wait many minutes for an orphan to finish.
-      void reapOrphanedDispatches(token, { secrets, requeueUpdate: requeueSyntheticUpdate })
+      void reapOrphanedDispatches(token, { secrets, requeueUpdate: requeueSyntheticUpdate, allowedChatIds: new Set(chatIds) })
         .catch((err) => logger.warn('reaper', 'reap failed', { error: String(err) }));
       await backfillTopicDescriptions(token, chatIds, topicNames).catch(() => {});
       await registerBotCommands(token).catch(() => {});
@@ -3005,7 +3632,7 @@ async function main(): Promise<void> {
   } finally { await releaseLock().catch(() => {}); }
 }
 
-import { pathToFileURL } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main().catch(() => { process.exit(1); });
+  main().catch((err) => { console.error('[boot] fatal:', err); process.exit(1); });
 }

@@ -1,6 +1,6 @@
 /**
  * Detects a specific, mechanically-decidable signature of a tree clobber
- * (plan: plans/2026-08-05-concurrent-session-safety.md §4.2): a tracked file
+ * (plan: the 2026-08-05 multi-session safety plan §4.2): a tracked file
  * whose working-tree blob is byte-identical to an ANCESTOR of HEAD, and
  * differs from HEAD itself. Normal editing essentially never reproduces a
  * historical version byte-for-byte, so this is a near-zero-false-positive

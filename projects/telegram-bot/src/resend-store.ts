@@ -1,5 +1,5 @@
 /**
- * Resend store (2026-08-24 buttons program, plans/2026-08-24-buttons-program-SPEC.md P7).
+ * Resend store (2026-08-24 buttons program, P7 of the buttons-program design, internal).
  *
  * The orphan reaper's "⚠️ The bot restarted while processing your message … please
  * resend" notice now carries a `🔁 Resend` button (`rs:<chatId>:<threadId>:<updateId>`).

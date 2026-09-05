@@ -4,7 +4,7 @@ import { mkdtemp, rm, mkdir, writeFile, readdir, readFile } from 'fs/promises';
 import { existsSync, readFileSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { createBotMaintenanceJobs, watchdogStaleJobs, checkRegistryContentInvariants, sweepExpiredPendingActions, type BotMaintenanceDeps, type RegistryContentViolation } from '../maintenance-jobs.js';
+import { createBotMaintenanceJobs, watchdogStaleJobs, checkRegistryContentInvariants, sweepExpiredPendingActions, DRAIN_SOURCE_SPECS, type BotMaintenanceDeps, type RegistryContentViolation } from '../maintenance-jobs.js';
 import { PENDING_ACTION_TTL_MS } from '../logic.js';
 import type { RegistryContentRule } from '../registry-content-rules.js';
 import { validateRegistry } from '../../../../pa/dist/src/lib/maintenance/policy.js';
@@ -51,6 +51,8 @@ function stubDeps(overrides: Partial<BotMaintenanceDeps> = {}): BotMaintenanceDe
     runModelSweep: async () => 0,
     topicNames: new Map(),
     requeueDrain: async () => 0,
+    reminderResumeDrain: async () => 0,
+    topicTaskDrain: async () => 0,
     ...overrides,
   };
 }
@@ -80,9 +82,9 @@ describe('createBotMaintenanceJobs', () => {
     assert.doesNotThrow(() => validateRegistry(createBotMaintenanceJobs(stubDeps())));
   });
 
-  it('declares exactly the 11 expected jobs, all host bot', () => {
+  it('declares exactly the 10 expected jobs, all host bot', () => {
     const jobs = createBotMaintenanceJobs(stubDeps());
-    assert.equal(jobs.length, 11);
+    assert.equal(jobs.length, 10);
     const names = jobs.map((j) => j.name).sort();
     assert.deepEqual(names, [
       'alert-digest',
@@ -90,32 +92,42 @@ describe('createBotMaintenanceJobs', () => {
       'bot-self-restart',
       'dashboard-refresh',
       'delivered-store-compact',
-      'dlq-flush',
       'grounding-check',
       'model-override-sweep',
       'proxy-pool-refresh',
+      'queue-drain',
       'registry-content-watch',
-      'requeue-drain',
     ]);
     for (const j of jobs) assert.equal(j.host, 'bot');
   });
 
-  it('orders bot-log-rotation-check first, dashboard-refresh after registry-content-watch, alert-digest before dlq-flush', () => {
+  it('queue-drain replaces four jobs with one', () => {
+    const jobs = createBotMaintenanceJobs(stubDeps());
+    assert.ok(jobs.some((j) => j.name === 'queue-drain'), 'queue-drain must be registered');
+    for (const gone of ['requeue-drain', 'reminder-resume-drain', 'topic-task-drain', 'dlq-flush']) {
+      assert.equal(jobs.some((j) => j.name === gone), false, `'${gone}' must be gone from the bot job array`);
+    }
+    const drains = jobs.filter((j) => j.name.includes('drain') || j.name.includes('flush'));
+    assert.equal(drains.length, 1, 'exactly ONE drain-family job may remain');
+    assert.equal(drains[0].name, 'queue-drain');
+  });
+
+  it('orders bot-log-rotation-check first, queue-drain after dashboard-refresh, alert-digest is last', () => {
     const jobs = createBotMaintenanceJobs(stubDeps());
     assert.equal(jobs[0].name, 'bot-log-rotation-check');
-    assert.equal(jobs[jobs.length - 1].name, 'dlq-flush');
-    assert.equal(jobs[jobs.length - 2].name, 'alert-digest');
-    assert.equal(jobs[jobs.length - 3].name, 'bot-self-restart');
-    assert.equal(jobs[jobs.length - 4].name, 'requeue-drain');
+    assert.equal(jobs[jobs.length - 1].name, 'alert-digest');
+    assert.equal(jobs[jobs.length - 2].name, 'bot-self-restart');
+    assert.equal(jobs[jobs.length - 3].name, 'queue-drain');
     const registryIdx = jobs.findIndex((j) => j.name === 'registry-content-watch');
     const dashboardIdx = jobs.findIndex((j) => j.name === 'dashboard-refresh');
+    const queueIdx = jobs.findIndex((j) => j.name === 'queue-drain');
     assert.equal(dashboardIdx, registryIdx + 1, 'dashboard-refresh immediately follows registry-content-watch');
+    assert.equal(queueIdx, dashboardIdx + 1, 'queue-drain sits where topic-task-drain sat (right after dashboard-refresh)');
   });
 
   it('locks shedWhenDegraded per job', () => {
     const jobs = createBotMaintenanceJobs(stubDeps());
     const byName = new Map(jobs.map((j) => [j.name, j]));
-    assert.equal(byName.get('dlq-flush')!.shedWhenDegraded, false);
     assert.equal(byName.get('proxy-pool-refresh')!.shedWhenDegraded, false);
     assert.equal(byName.get('bot-log-rotation-check')!.shedWhenDegraded, true);
     assert.equal(byName.get('model-override-sweep')!.shedWhenDegraded, true);
@@ -124,13 +136,13 @@ describe('createBotMaintenanceJobs', () => {
     assert.equal(byName.get('registry-content-watch')!.shedWhenDegraded, true);
     assert.equal(byName.get('dashboard-refresh')!.shedWhenDegraded, true);
     assert.equal(byName.get('alert-digest')!.shedWhenDegraded, true);
-    assert.equal(byName.get('requeue-drain')!.shedWhenDegraded, false);
+    assert.equal(byName.get('queue-drain')!.shedWhenDegraded, false);
   });
 
   it('locks the destructive set and its targets resolve under paHome()', () => {
     const jobs = createBotMaintenanceJobs(stubDeps());
     const destructiveNames = jobs.filter((j) => j.destructive).map((j) => j.name).sort();
-    assert.deepEqual(destructiveNames, ['delivered-store-compact', 'dlq-flush']);
+    assert.deepEqual(destructiveNames, ['delivered-store-compact']);
     for (const name of destructiveNames) {
       const job = jobs.find((j) => j.name === name)!;
       assert.ok(job.targets.length >= 1);
@@ -138,6 +150,10 @@ describe('createBotMaintenanceJobs', () => {
         assert.ok(t.resolve().startsWith(tempDir), `${name} target should resolve under paHome()`);
       }
     }
+    // The DLQ TTL-drop declaration went away WITH the dlq-flush stub (frozen
+    // spec §3.2: queue-drain is non-destructive, no targets) — the BEHAVIOR
+    // (expired-entry dropping on flush) lives in dlq.ts's flushDlq and is
+    // unchanged; only the preview/audit declaration was consolidated away.
   });
 
   it('locks cadences', async () => {
@@ -146,12 +162,11 @@ describe('createBotMaintenanceJobs', () => {
     assert.equal(byName.get('bot-log-rotation-check')!.everyMs, 600_000);
     assert.equal(byName.get('model-override-sweep')!.everyMs, 60_000);
     assert.equal(byName.get('delivered-store-compact')!.everyMs, 300_000);
-    assert.equal(byName.get('dlq-flush')!.everyMs, 300_000);
     assert.equal(byName.get('grounding-check')!.everyMs, 21_600_000);
     assert.equal(byName.get('registry-content-watch')!.everyMs, 86_400_000);
     assert.equal(byName.get('dashboard-refresh')!.everyMs, 1_800_000);
     assert.equal(byName.get('alert-digest')!.everyMs, 86_400_000);
-    assert.equal(byName.get('requeue-drain')!.everyMs, 300_000);
+    assert.equal(byName.get('queue-drain')!.everyMs, 60_000, 'the family minimum');
     const proxyEveryMs = byName.get('proxy-pool-refresh')!.everyMs;
     assert.equal(typeof proxyEveryMs, 'function');
     const resolved = (proxyEveryMs as () => number)();
@@ -175,19 +190,209 @@ describe('createBotMaintenanceJobs', () => {
     assert.deepEqual(calls[0].chatIds, deps.chatIds);
   });
 
-  it('requeue-drain.run() invokes the injected drain and reports touched', async () => {
-    let calls = 0;
-    const deps = stubDeps({
-      requeueDrain: async () => {
-        calls++;
-        return 3;
-      },
+  describe('queue-drain (consolidated family, SPEC §3.2)', () => {
+    /** The injected deps are only DUE for a source when the job's synthetic
+     *  clock says so — seeded sources (requeue/dlq) need now past creation+5m,
+     *  unseeded ones (reminder-resume/topic-task) fire on the first tick. */
+    function queueJob(deps: BotMaintenanceDeps): MaintenanceJobLike {
+      return createBotMaintenanceJobs(deps).find((j) => j.name === 'queue-drain')!;
+    }
+    type MaintenanceJobLike = ReturnType<typeof createBotMaintenanceJobs>[number];
+
+    it('queue-drain requeue source invokes the injected drain and reports touched', async () => {
+      let calls = 0;
+      const deps = stubDeps({
+        requeueDrain: async () => {
+          calls++;
+          return 3;
+        },
+      });
+      const result = await queueJob(deps).run({ now: Date.now() + 301_000, everyMs: 60_000 });
+      assert.equal(result.touched, 3);
+      assert.equal(calls, 1);
+      assert.equal((result.detail!.sources as Record<string, number>).requeue, 3);
     });
-    const jobs = createBotMaintenanceJobs(deps);
-    const job = jobs.find((j) => j.name === 'requeue-drain')!;
-    const result = await job.run({ now: Date.now(), everyMs: 300_000 });
-    assert.equal(result.touched, 3);
-    assert.equal(calls, 1);
+
+    it('queue-drain reminder-resume source invokes the injected drain and reports touched', async () => {
+      let calls = 0;
+      const deps = stubDeps({
+        reminderResumeDrain: async () => {
+          calls++;
+          return 2;
+        },
+      });
+      const result = await queueJob(deps).run({ now: Date.now() + 1_000, everyMs: 60_000 });
+      assert.equal(result.touched, 2);
+      assert.equal(calls, 1);
+      assert.equal((result.detail!.sources as Record<string, number>)['reminder-resume'], 2);
+    });
+
+    it('queue-drain topic-task source invokes the injected drain and reports touched', async () => {
+      let calls = 0;
+      const deps = stubDeps({
+        topicTaskDrain: async () => {
+          calls++;
+          return 5;
+        },
+      });
+      const result = await queueJob(deps).run({ now: Date.now() + 1_000, everyMs: 60_000 });
+      assert.equal(result.touched, 5);
+      assert.equal(calls, 1);
+      assert.equal((result.detail!.sources as Record<string, number>)['topic-task'], 5);
+    });
+
+    it('queue-drain dlq source touches 0 with no DLQ file and never attempts a send', async () => {
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = mock.fn(() => {
+        throw new Error('fetch should not be called when the DLQ file does not exist');
+      }) as unknown as typeof fetch;
+      try {
+        const deps = stubDeps();
+        const result = await queueJob(deps).run({ now: Date.now() + 301_000, everyMs: 60_000 });
+        assert.equal(result.touched, 0);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
+    it('sources declare cadence seed and semantics', () => {
+      assert.deepEqual(DRAIN_SOURCE_SPECS.map((s) => s.name), ['requeue', 'reminder-resume', 'topic-task', 'dlq']);
+      assert.deepEqual(DRAIN_SOURCE_SPECS.map((s) => s.everyMs), [300_000, 60_000, 60_000, 300_000]);
+      assert.deepEqual(DRAIN_SOURCE_SPECS.map((s) => s.coldStartSeed), [true, false, false, true]);
+      assert.deepEqual(DRAIN_SOURCE_SPECS.map((s) => [...s.semantics]), [
+        ['pop-first', 'persist-before-inject', 'no-age-drop'],
+        ['pop-first', 'persist-before-inject', 'no-age-drop'],
+        ['pop-first', 'persist-before-inject', 'no-age-drop'],
+        ['entry-idempotent', 'send-before-mark'],
+      ]);
+    });
+
+    it('semantics assertions match source implementations', () => {
+      // The per-source SEMANTIC behavior itself (pop-first, persist-before-
+      // inject, no age drop; dlq's send-before-mark) is pinned where the
+      // implementations live: the reminder-resume/system-resume canaries and
+      // the topic-tasks-drain suite. This pin keeps the REGISTRY's declaration
+      // honest: the three injectors share the identical pipeline triple, and
+      // dlq's contract is a different shape (mark-after-send, idempotent
+      // entries), never silently edited to look like the others.
+      const injector = ['pop-first', 'persist-before-inject', 'no-age-drop'];
+      const byName = new Map(DRAIN_SOURCE_SPECS.map((s) => [s.name, s]));
+      for (const name of ['requeue', 'reminder-resume', 'topic-task'] as const) {
+        assert.deepEqual([...byName.get(name)!.semantics], injector, `${name} must declare the injector triple`);
+      }
+      const dlqSem = [...byName.get('dlq')!.semantics];
+      assert.ok(!dlqSem.includes('pop-first'), 'dlq is a mark-after-send retry loop, not an injector');
+      assert.deepEqual(dlqSem, ['entry-idempotent', 'send-before-mark']);
+    });
+
+    it('per-source due gating honors everyMs', async () => {
+      const counts = { requeue: 0, reminder: 0, topic: 0 };
+      const deps = stubDeps({
+        requeueDrain: async () => {
+          counts.requeue++;
+          return 0;
+        },
+        reminderResumeDrain: async () => {
+          counts.reminder++;
+          return 0;
+        },
+        topicTaskDrain: async () => {
+          counts.topic++;
+          return 0;
+        },
+      });
+      const job = queueJob(deps);
+      const t0 = Date.now(); // ≥ the creation-time seed stamp (microseconds earlier)
+
+      // Tick 1 (+1s): the UNSEEDED 60s sources fire; requeue/dlq were seeded
+      // "just ran" at creation and are not due.
+      await job.run({ now: t0 + 1_000, everyMs: 60_000 });
+      assert.equal(counts.reminder, 1);
+      assert.equal(counts.topic, 1);
+      assert.equal(counts.requeue, 0, 'requeue is cold-start-seeded');
+
+      // Tick 2 (+30s): inside the 60s window stamped at tick 1 — nothing due.
+      await job.run({ now: t0 + 30_000, everyMs: 60_000 });
+      assert.equal(counts.reminder, 1);
+
+      // Tick 3 (+70s): past the 60s sources' stamps — due again.
+      await job.run({ now: t0 + 70_000, everyMs: 60_000 });
+      assert.equal(counts.reminder, 2);
+      assert.equal(counts.topic, 2);
+      assert.equal(counts.requeue, 0, 'requeue still inside its 5m cold-start window');
+
+      // Tick 4 (+320s): past the seeded 5m — requeue finally due.
+      await job.run({ now: t0 + 320_000, everyMs: 60_000 });
+      assert.equal(counts.requeue, 1);
+    });
+
+    it('one failing source does not fail the job', async () => {
+      // reminder-resume is the thrower: UNSEEDED (coldStartSeed false), so it
+      // actually fires on the first tick — the seeded requeue/dlq would
+      // silently skip and the throw would never happen (first version of this
+      // test used requeue and its counter stayed 0 — the gate caught it).
+      let reminderAttempts = 0;
+      let topicRan = 0;
+      const deps = stubDeps({
+        reminderResumeDrain: async () => {
+          reminderAttempts++;
+          throw new Error('reminder source exploded');
+        },
+        topicTaskDrain: async () => {
+          topicRan++;
+          return 4;
+        },
+      });
+      const job = queueJob(deps);
+      const t0 = Date.now();
+
+      // The throw is contained: the job resolves, the survivor counts.
+      const result = await job.run({ now: t0 + 1_000, everyMs: 60_000 });
+      assert.equal(result.touched, 4, 'the surviving source still counts');
+      assert.equal(topicRan, 1);
+      assert.equal(reminderAttempts, 1);
+      assert.equal((result.detail!.sources as Record<string, number>)['reminder-resume'], undefined, 'the failed source contributes nothing');
+
+      // Stamp-before-run holds FOR FAILURES TOO: the failed source waits out
+      // its own cadence instead of re-failing every 60s tick (per-source
+      // failures are invisible to the runner's job-level backoff ladder).
+      await job.run({ now: t0 + 30_000, everyMs: 60_000 });
+      assert.equal(reminderAttempts, 1, 'the failed source did NOT re-fire inside its 60s');
+      assert.equal(topicRan, 1, 'the healthy source is due-gated the same way');
+      await job.run({ now: t0 + 70_000, everyMs: 60_000 });
+      assert.equal(reminderAttempts, 2, 'it retries after its own cadence');
+      assert.equal(topicRan, 2);
+    });
+
+    it('cold start seeds requeue and dlq sources only', async () => {
+      // The flags: exactly requeue + dlq carry coldStartSeed.
+      assert.deepEqual(
+        DRAIN_SOURCE_SPECS.filter((s) => s.coldStartSeed).map((s) => s.name).sort(),
+        ['dlq', 'requeue'],
+      );
+      // The behavior: on the first tick after creation only the UNSEEDED
+      // sources run. dlq's skip is proven by its flag above (its runner is
+      // the imported flushDlq, not an injectable spy — the moved dlq source
+      // test covers its run path).
+      const ran: string[] = [];
+      const deps = stubDeps({
+        requeueDrain: async () => {
+          ran.push('requeue');
+          return 0;
+        },
+        reminderResumeDrain: async () => {
+          ran.push('reminder-resume');
+          return 0;
+        },
+        topicTaskDrain: async () => {
+          ran.push('topic-task');
+          return 0;
+        },
+      });
+      const job = queueJob(deps);
+      await job.run({ now: Date.now() + 1_000, everyMs: 60_000 });
+      assert.deepEqual(ran.sort(), ['reminder-resume', 'topic-task']);
+    });
   });
 
   describe('bot-log-rotation-check', () => {
@@ -359,28 +564,11 @@ describe('createBotMaintenanceJobs', () => {
     });
   });
 
-  describe('dlq-flush', () => {
-    it('no DLQ file present -> touched 0 and no network call attempted', async () => {
-      const originalFetch = globalThis.fetch;
-      globalThis.fetch = mock.fn(() => {
-        throw new Error('fetch should not be called when the DLQ file does not exist');
-      }) as unknown as typeof fetch;
-      try {
-        const jobs = createBotMaintenanceJobs(stubDeps());
-        const job = jobs.find((j) => j.name === 'dlq-flush')!;
-        const result = await job.run({ now: Date.now(), everyMs: 300_000 });
-        assert.equal(result.touched, 0);
-      } finally {
-        globalThis.fetch = originalFetch;
-      }
-    });
-  });
-
   describe('bot-self-restart', () => {
     it('bound job stays in parity with the frozen pa-side stub contract (name/host/everyMs/destructive/shedWhenDegraded)', () => {
       // pa/src/lib/maintenance/jobs/bot-self-restart.ts (WP-D's stub) is
-      // frozen byte-for-byte in
-      // plans/2026-08-24-recall-traces-wave-SPEC.md §3.4 step 10. WP-D lands
+      // frozen byte-for-byte in the recall-traces-wave design §3.4 step 10
+      // (2026-08-24, internal). WP-D lands
       // in a later batch than WP-G (§4 batch 1 vs batch 2), so at WP-G build
       // time that module does not exist in pa/dist and cannot be imported
       // here (unlike the registry-content-watch parity case above). These

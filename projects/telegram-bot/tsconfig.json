@@ -8,7 +8,8 @@
     "strict": true,
     "noImplicitAny": false,
     "esModuleInterop": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "noEmitOnError": true
   },
   "include": ["src/**/*.ts"]
 }

@@ -336,7 +336,7 @@ const noopSleep = async () => {};
 // exception is the dedicated ordering test further down, which supplies its own recording stub.
 const withBuildLockFn: typeof withBuildLock = (_label, fn) => fn();
 
-// Git-optional gate test double (2026-08-31, plans/2026-08-31-git-optional-SPEC.md §4
+// Git-optional gate test double (2026-08-31, the git-optional spec §4
 // spec amendment 2026-08-31-A): all existing tests were written before the guard existed
 // and assume the code-fix lane runs. The test double restores the pre-guard execution path
 // those tests were written against. A dedicated test below pins the blocking behavior.
@@ -946,7 +946,7 @@ describe('attemptCodeFix', () => {
 
   // ---------------------------------------------------------------------------
   // Same-run-overlap guard (2026-08-23 F5 rework,
-  // plans/2026-08-23-code-fix-multi-per-night-SPEC.md)
+  // the code-fix multi-per-night spec)
   // ---------------------------------------------------------------------------
 
   it('reverts (same-run-overlap) when the diff touches a file a fix applied earlier this run already changed', async () => {
@@ -1030,7 +1030,7 @@ describe('attemptCodeFix', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Git-optional gate (2026-08-31, plans/2026-08-31-git-optional-SPEC.md §4
+  // Git-optional gate (2026-08-31, the git-optional spec §4
   // spec amendment 2026-08-31-A)
   // ---------------------------------------------------------------------------
 
@@ -1067,7 +1067,7 @@ describe('attemptCodeFix', () => {
 
 // ---------------------------------------------------------------------------
 // Scoped verification gate matrix (2026-08-23, WP-J2a,
-// plans/2026-08-23-alerts-wave-SPEC.md) — a fix may only skip a gate that its own touched
+// the alerts-wave spec) — a fix may only skip a gate that its own touched
 // paths provably cannot affect. Each case below pins one row of the matrix and asserts the
 // 'Gates run: ...' text (gatesSuffixText) recorded into the audit trail's reason field.
 // ---------------------------------------------------------------------------
@@ -1405,7 +1405,7 @@ describe('attemptCodeFix — verification gate holds @build (W-C8)', () => {
 // exclusive_resource blackboard lock the commit/push/push-public/
 // investigate-flagged/update-brain skill family uses (pa/src/commands/run.ts),
 // so a nightly autonomous fix can never race a concurrent manual /commit or
-// /push. See plans/federated-booping-hammock.md.
+// /push. See the nightly lock-isolation plan (internal).
 // ---------------------------------------------------------------------------
 
 describe('attemptCodeFix — git-workflow lock', () => {

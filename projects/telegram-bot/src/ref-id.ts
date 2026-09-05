@@ -1,7 +1,12 @@
 import { randomBytes } from 'crypto';
 import { logger } from '../../../pa/dist/src/lib/log.js';
 
-export type RefKind = 'pin' | 'help' | 'branch' | 'lock_busy' | 'failover' | 'system' | 'recovered' | 'callback' | 'requeue-deferred';
+// Wave-2 task-lane kinds (SPEC §5 edge 5, coined by WP-A 2026-09-02): the five
+// FYI/notice kinds below, plus 'task-question' for the parked question's
+// keyboard message (the spec's five do not cover it; every appendRefIdAndLog
+// caller needs a kind, and the question FYI is a tier-1 anchor like the pickup).
+export type RefKind = 'pin' | 'help' | 'branch' | 'lock_busy' | 'failover' | 'system' | 'recovered' | 'callback' | 'requeue-deferred'
+  | 'task-pickup' | 'task-done' | 'task-retry' | 'task-failed' | 'task-route' | 'task-question';
 
 export function makeRefId(prefix: string = 's'): string {
   return `${prefix}-${randomBytes(6).toString('hex')}`;

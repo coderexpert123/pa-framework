@@ -13,7 +13,7 @@ export interface CatchupOptions {
 }
 
 // `pa/src/validator.ts`'s PROTECTED_SKILLS is module-private (verified 2026-08-24,
-// not exported) — per plans/2026-08-24-buttons-program-SPEC.md WP-P2 edit 1, this is
+// not exported) — per the 2026-08-24 buttons-program spec WP-P2 edit 1, this is
 // the local fallback: exactly the seven names PA_META_PROTECTED_SKILLS declares in
 // projects/telegram-bot/src/logic.ts:100-108. A "▶ Run now" button must never let an
 // operator dispatch these from a tap — pa cannot import bot code across the package

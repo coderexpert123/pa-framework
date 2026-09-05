@@ -8,7 +8,7 @@ import type { WatchCheck, WatchInput, WatchJob } from '../lib/watch-jobs.js';
 import { resolveNotifyTopic } from '../lib/notify.js';
 
 /**
- * `pa watch add|list|rm` (AI-170, plans/2026-08-31-ai170-async-watch-SPEC.md §5).
+ * `pa watch add|list|rm` (AI-170 async-watch spec, 2026-08-31, §5).
  *
  * A thin CLI shell over `pa/src/lib/watch-jobs.ts` — all validation, the store,
  * and the tick engine live there. This file only parses argv, resolves the
@@ -23,7 +23,8 @@ import { resolveNotifyTopic } from '../lib/notify.js';
 const USAGE = `Usage:
   pa watch add --desc "<text>" --type <file_exists|file_gone|file_newer_than|file_contains|process_gone> [--path <p>] [--pattern <re>] [--pid <n>] [--since <iso>] [--deadline <dur>] [--interval <dur>] [--chat-id <id>] [--thread-id <n>]
   pa watch list [--json]
-  pa watch rm <id>`;
+  pa watch rm <id>
+  pa watch re-register <id>`;
 
 const ADD_FLAGS = new Set([
   '--desc',
@@ -237,6 +238,61 @@ async function rmSubcommand(args: string[]): Promise<number> {
   return 3;
 }
 
+/**
+ * `pa watch re-register <id>` (WP-D2 B.7, 2026-09-02) — copies a TERMINAL row's
+ * spec (description/check/deadline-span/interval/topic) into a FRESH active watch
+ * via the existing add path, so all validation and the cap still apply and the old
+ * row stays for audit until TERMINAL_RETENTION prunes it. Unknown or still-active
+ * ids are refused with exit 3 (the documented store-rejection code); a cancelled
+ * watch is refused too — cancelling was an explicit kill, the re-register button
+ * is not a way around it.
+ */
+async function reRegisterSubcommand(args: string[]): Promise<number> {
+  const parsed = parseFlags(args, new Set());
+  if (parsed.unknown.length > 0) {
+    console.error(USAGE);
+    console.error(`Unrecognized option(s): ${parsed.unknown.join(', ')}`);
+    return 2;
+  }
+
+  const id = parsed.positionals[0];
+  if (!id) {
+    console.error(USAGE);
+    return 2;
+  }
+
+  const all = await listWatchJobs();
+  const row = all.find((w: WatchJob) => w.id === id);
+  if (!row) {
+    console.error(`Error: unknown watch id ${id} — see \`pa watch list\`.`);
+    return 3;
+  }
+  if (row.status === 'active') {
+    console.error(`Error: watch ${id} is still active — nothing to re-register.`);
+    return 3;
+  }
+  if (row.status === 'cancelled') {
+    console.error(`Error: watch ${id} was cancelled — re-add it with \`pa watch add\` instead.`);
+    return 3;
+  }
+
+  const input: WatchInput = {
+    description: row.description,
+    check: row.check,
+    intervalSeconds: row.intervalMs / 1000,
+    deadlineMinutes: (Date.parse(row.deadlineAt) - Date.parse(row.createdAt)) / 60_000,
+    source: { kind: 'cli', chatId: row.source.chatId, threadId: row.source.threadId, refId: null },
+  };
+
+  const reg = await addWatchJob(input);
+  if (reg.ok) {
+    console.log(`Watch ${reg.watch.id} re-registered from ${row.id} — reports to chat ${row.source.chatId} thread ${row.source.threadId}, deadline ${reg.watch.deadlineAt}.`);
+    return 0;
+  }
+  console.error(`Error: ${reg.error}`);
+  return 3;
+}
+
 export async function watchCommand(args: string[]): Promise<number> {
   const sub = args[0];
   switch (sub) {
@@ -246,6 +302,8 @@ export async function watchCommand(args: string[]): Promise<number> {
       return listSubcommand(args.slice(1));
     case 'rm':
       return rmSubcommand(args.slice(1));
+    case 're-register':
+      return reRegisterSubcommand(args.slice(1));
     default:
       console.error(USAGE);
       return 2;

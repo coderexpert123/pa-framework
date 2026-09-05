@@ -280,3 +280,53 @@ describe('hasChildProcesses', () => {
     assert.equal(callCount, 2, 'injected execFn bypasses cache');
   });
 });
+
+// ── Control-char-poisoned payloads (2026-09-03 incident) ─────────────────────
+// PowerShell's ConvertTo-Json leaves some C0 control characters RAW in the
+// payload; one poisoned argv string used to make JSON.parse throw and blank the
+// ENTIRE snapshot (cached for the TTL — machine-wide blindness). The parse must
+// sanitize-and-retry, never return an empty map for a merely-poisoned payload.
+// The poison byte is built at RUNTIME (String.fromCharCode) — never typed as a
+// literal escape, which the file-writing tooling can decode into a real byte.
+describe('control-char-poisoned snapshots (2026-09-03 incident)', () => {
+  // Raw SUB (0x1A) — the byte the incident's mangled arrow glyph produced.
+  const SUB = String.fromCharCode(0x1a);
+
+  /** win32-shape payload: one poisoned record + one clean record, both parent 99. */
+  function poisonedSnapshot(): string {
+    if (!IS_WIN) return '';
+    return (
+      '[{"ProcessId":4242,"ParentProcessId":99,"CommandLine":"git commit -m a ' + SUB + ' b"},' +
+      '{"ProcessId":4243,"ParentProcessId":99,"CommandLine":"clean process"}]'
+    );
+  }
+
+  it('a raw control char in one argv does NOT blank the snapshot (sanitized, not swallowed)', async () => {
+    if (!IS_WIN) return; // the JSON payload path is win32-only
+    const children = await getChildPids(99, async () => ({ stdout: poisonedSnapshot(), stderr: '' }));
+    assert.deepEqual(
+      children.sort(),
+      [4242, 4243],
+      'BOTH records survive — the poison is stripped from the payload, the snapshot stays whole'
+    );
+  });
+
+  it('sanitized parse preserves the records; the cmdline loses only the control char', async () => {
+    if (!IS_WIN) return;
+    const lines = await getCommandLines([4242], async () => ({
+      stdout: '{"ProcessId":4242,"CommandLine":"bash -c ' + SUB + ' echo hi"}',
+      stderr: '',
+    }));
+    assert.equal(
+      lines.get(4242),
+      'bash -c  echo hi',
+      'bare-object ConvertTo-Json shape parses and the SUB byte is gone from the cmdline'
+    );
+  });
+
+  it('payload that fails even after sanitize still degrades to an empty result (graceful floor)', async () => {
+    if (!IS_WIN) return;
+    const children = await getChildPids(99, async () => ({ stdout: 'not json at all {{', stderr: '' }));
+    assert.deepEqual(children, [], 'genuine corruption keeps the graceful empty-map floor');
+  });
+});

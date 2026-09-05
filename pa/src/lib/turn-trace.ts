@@ -1,5 +1,5 @@
 /**
- * Turn-trace sidecar (AI-161, plans/2026-08-24-recall-traces-wave-SPEC.md §3.1).
+ * Turn-trace sidecar (AI-161, the 2026-08-24 recall-traces spec §3.1).
  *
  * One append-only line per `executeWorker` run in `~/.pa/turn-traces.jsonl`,
  * capturing what the worker actually did (tool calls, commands, files,

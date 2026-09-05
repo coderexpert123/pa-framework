@@ -70,8 +70,8 @@ def main():
                 # WP-G (AI-147): resolve chat/thread via google_reauth_kick's
                 # resolver — this deliberately targets the OPERATOR's general
                 # topic (PA_REAUTH_CHAT_ID -> TELEGRAM_CHAT_ID), not the
-                # daily-briefing-specific chat/thread (decision (e) of
-                # plans/2026-08-23-alerts-wave-SPEC.md: NOT pa-alerts, and not
+                # daily-briefing-specific chat/thread (decision (e) of the
+                # 2026-08-23 alerts-wave design, internal: NOT pa-alerts, and not
                 # buried in a low-visibility topic either). Falls back to the
                 # pre-WP-G expression only if the import itself fails.
                 try:

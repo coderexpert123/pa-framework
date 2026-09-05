@@ -1,6 +1,6 @@
 /**
  * Rich Messages (Bot API 10.1/10.2 `sendRichMessage`) — DEAD BY DEFAULT
- * (2026-08-24 buttons program, plans/2026-08-24-buttons-program-SPEC.md P8, §3.6, AI-159).
+ * (2026-08-24 buttons program, P8/§3.6 of the buttons-program design, internal; AI-159).
  *
  * The method is post-cutoff and its client rendering is unverified; the ONLY live call
  * is the orchestrator's integration probe (§7 step 9). Until `PA_RICH_MESSAGES=1` is set

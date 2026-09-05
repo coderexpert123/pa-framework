@@ -30,6 +30,27 @@ function sanitizeCmdline(cmdline: string): string {
   return cmdline.replace(/([?&](api_key|token|password|secret)=)[^\s&]*/gi, '$1<redacted>').slice(0, 200);
 }
 
+/**
+ * Raw-send guard (2026-09-04, plans/2026-09-04-raw-send-guard-SPEC.md WP2.1):
+ * pure detector over a run's collected tool commands. A command matches iff it
+ * contains `api.telegram.org` OR `telegramFetch(` — the two shapes the
+ * hand-written scratch send into pa-support used. Deterministic, no I/O;
+ * returns at most 3 matches, each truncated to 200 chars. Accepted
+ * false-positive class (alert-only, never blocking): dev commands that grep or
+ * edit source containing these strings.
+ */
+export function detectRawTelegramSends(commands: string[]): string[] {
+  const matches: string[] = [];
+  for (const c of commands) {
+    if (typeof c !== 'string') continue;
+    if (c.includes('api.telegram.org') || c.includes('telegramFetch(')) {
+      matches.push(c.slice(0, 200));
+      if (matches.length >= 3) break;
+    }
+  }
+  return matches;
+}
+
 export interface BgEntry {
   firstSeen: number;
   cmdline?: string;
@@ -297,6 +318,10 @@ export async function executeWorker(
         });
         const bot = parseBotResource(options.resource);
         const h = trace.harvest();
+        // Raw-send guard (2026-09-04): scan this run's collected tool commands
+        // for direct Telegram Bot API sends; attached to the result only when
+        // non-empty (optional field — the bot alerts pa-support, never blocks).
+        const rawSends = detectRawTelegramSends(h.commands);
         void appendTurnTrace({
           v: 1,
           run_id: runId,
@@ -322,7 +347,7 @@ export async function executeWorker(
           bytes_out: Buffer.byteLength(r.output ?? '', 'utf8'),
           truncated: h.truncated,
         } satisfies TurnTraceV1);
-        resolve({ teePath: r.teePath ?? teePath, runId, ...r });
+        resolve({ ...r, teePath: r.teePath ?? teePath, runId, ...(rawSends.length > 0 ? { rawTelegramSends: rawSends } : {}) });
       };
 
       let stdout = '';

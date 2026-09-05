@@ -3,7 +3,7 @@
  * traces, per-topic brains, the Ecosystem KB and pending review-digest
  * conflicts. Calls `../lib/recall-store.js` IN-PROCESS (no spawn, no Python).
  *
- * Spec: plans/2026-08-24-recall-traces-wave-SPEC.md §3.4 (WP-D).
+ * Spec: the 2026-08-24 recall-traces spec §3.4 (WP-D).
  */
 
 import { join, dirname } from 'path';
