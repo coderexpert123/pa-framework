@@ -10,7 +10,7 @@ import { mkdir, writeFile, readFile } from 'fs/promises';
 import { join } from 'path';
 import { existsSync } from 'fs';
 import { log } from './log.js';
-import { repoRootFromModule } from './git-root.js';
+import { paHome } from '../paths.js';
 
 export interface PostmortemInput {
   date: string;           // ISO date string (YYYY-MM-DD)
@@ -27,19 +27,26 @@ export interface PostmortemMetadata {
   sourceCommit?: string; // For git-revert rollbacks, the commit that was reverted
 }
 
-const POSTMORTEMS_DIR = 'plans/postmortems';
-const INDEX_PATH = 'plans/INDEX.md';
+// Postmortems are LIVING STATE: they are written under PA_HOME (~/.pa), never
+// the repo tree — the same rule as every other runtime store (2026-09-04
+// relocation, A16 adjudication; the old repo-side location held no records on
+// this deployment, so no legacy read-fallback was added). The layout mirrors
+// the old structure (index in the parent of postmortems/) so the row-link
+// format `(./postmortems/<file>)` is unchanged.
+const PA_PLANS_DIR = 'plans';
+const POSTMORTEMS_DIR = join(PA_PLANS_DIR, 'postmortems');
+const INDEX_PATH = join(PA_PLANS_DIR, 'INDEX.md');
 
 /**
- * Appends a row to plans/INDEX.md for a new postmortem.
+ * Appends a row to the internal plans index for a new postmortem.
  *
  * The row format matches the existing INDEX.md table structure:
  * | Date | Title | Status | Link |
  *
  * @throws Error if INDEX.md cannot be read or written.
  */
-async function appendIndexRow(repoRoot: string, date: string, title: string, filename: string): Promise<void> {
-  const indexPath = join(repoRoot, INDEX_PATH);
+async function appendIndexRow(baseDir: string, date: string, title: string, filename: string): Promise<void> {
+  const indexPath = join(baseDir, INDEX_PATH);
 
   if (!existsSync(indexPath)) {
     throw new Error(`INDEX.md not found at ${indexPath}`);
@@ -78,45 +85,21 @@ async function appendIndexRow(repoRoot: string, date: string, title: string, fil
  *
  * @throws Error if the postmortems directory cannot be created or file cannot be written.
  */
-export interface CreatePostmortemOptions {
-  /**
-   * Explicit override for the repo root postmortem files and INDEX.md rows are
-   * written under. Test-only — production always omits this.
-   *
-   * Default (no override): resolved via `repoRootFromModule(__filename)` —
-   * the TRUE repo root, found via git from THIS MODULE's own on-disk location
-   * — never `process.cwd()`. AI-176: before this fix, two
-   * self-improver.test.ts describes drove the real rollback path with cwd
-   * left pointing at the live repo (no chdir), so every run silently wrote
-   * real postmortem stubs + INDEX.md rows into production plans/ using the
-   * test fixture's literal skillName ('x', 'coding-dirs-update') — the actual
-   * origin of the duplicate/bogus rows found there. A caller that only
-   * isolates process.cwd() is not a durable fix (same class as the
-   * Task-Scheduler cwd=System32 bug, root CLAUDE.md 2026-08-23): resolving
-   * against the module's own location makes the write root correct
-   * regardless of ambient cwd, and callers that genuinely need isolation
-   * (tests) must opt in explicitly via this field.
-   */
-  repoRoot?: string;
-}
-
+/**
+ * Creates a postmortem stub under PA_HOME. Test isolation is via the PA_HOME
+ * env var (the suite's standard convention) — there is deliberately NO
+ * override parameter: the AI-176 repoRoot override existed only because the
+ * write root was repo-derived (module location vs process.cwd() ambiguity).
+ * paHome() is unambiguous by definition, so the old wrong-root guard
+ * ("resolved root carries plans/") has no remaining hazard to guard.
+ */
 export async function createPostmortemStub(
   input: PostmortemInput,
-  meta: PostmortemMetadata,
-  opts: CreatePostmortemOptions = {}
+  meta: PostmortemMetadata
 ): Promise<string> {
-  const repoRoot = opts.repoRoot ?? await repoRootFromModule(__filename);
+  const baseDir = paHome();
 
-  // Wrong-root guard: only a repo ROOT carries plans/. If the resolved root
-  // lacks it (a test fixture with no plans/ dir, an extracted subtree), a
-  // rollback hook firing from here would litter stubs into an unrelated tree
-  // — skip silently instead. Production always resolves to the real repo
-  // root, which always has plans/ present.
-  if (!existsSync(join(repoRoot, 'plans'))) {
-    return '';
-  }
-
-  const postmortemsDir = join(repoRoot, POSTMORTEMS_DIR);
+  const postmortemsDir = join(baseDir, POSTMORTEMS_DIR);
 
   // Ensure the postmortems directory exists
   if (!existsSync(postmortemsDir)) {
@@ -132,7 +115,7 @@ export async function createPostmortemStub(
 
   // WPD6: Also append a row to INDEX.md
   try {
-    await appendIndexRow(repoRoot, input.date, input.title, filename);
+    await appendIndexRow(baseDir, input.date, input.title, filename);
   } catch (err) {
     // Log but don't fail — the postmortem file itself is the critical output
     console.error(`[postmortem] Failed to append INDEX.md row: ${err}`);

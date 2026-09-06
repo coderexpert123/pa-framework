@@ -13,7 +13,7 @@ gitignored by the private repo; override via `PA_PUBLIC_DIR`) as a genuinely
 separate git repository with its own independent clone/pull lifecycle — a
 symlink or hard link crossing that boundary would desync silently the moment
 either repo is re-cloned, which is now a normal, supported recovery path (see
-plans/2026-08-05-concurrent-session-safety.md). Re-running the installer after
+the 2026-08-05 multi-session safety plan). Re-running the installer after
 every edit to the source is the documented, expected workflow; the drift-check
 verdict this file also exercises is what catches "forgot to re-run".
 """

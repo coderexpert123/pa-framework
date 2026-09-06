@@ -15,7 +15,7 @@ import type {
 } from './types.js';
 
 // Typed off notifyUser's own third parameter (rather than a hand-copied opts shape)
-// so this can never drift from NotifyOpts again — plans/2026-08-24-buttons-program-SPEC.md
+// so this can never drift from NotifyOpts again — the 2026-08-24 buttons-program spec
 // WP-P2 edit 2. Widened 2026-08-24 to carry `replyMarkup` for the "▶ Run now" button.
 type NotifyFn = (
   subject: string,
@@ -37,7 +37,7 @@ const RUN_NOW_JOB_NAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,39}$/;
  *  DAILY instead of every tick: restore-drill failed 11,228 times and sent 180
  *  alerts in 7 days because decideJob treats lastRunAt === null as "always due"
  *  and the failure branch never recorded an attempt
- *  (plans/2026-08-23-alerts-week-review.md §5.2). This ladder can only DELAY a
+ *  (the 2026-08-23 alerts-week review §5.2). This ladder can only DELAY a
  *  run — the everyMs/lastRunAt rule still applies after it clears. */
 export const MAINTENANCE_FAILURE_BACKOFF_MS = [0, 30 * 60_000, 2 * 3_600_000, 8 * 3_600_000, 24 * 3_600_000];
 
@@ -93,10 +93,18 @@ export function resolveEveryMs(job: MaintenanceJob, override?: { everyMs?: numbe
   return o;
 }
 
-// Per-process in-flight guard. The `pa` host is additionally serialised by
-// catchup's blackboard lock, so this mainly matters for concurrent
-// `pa maintenance run` invocations and the future bot host (which shares this
-// module but runs in a different, always-on process).
+// Per-process in-flight guard (AI-196 adjudication, 2026-09-03). It can only
+// fire skip:in-flight when two overlapping runDueJobs passes share ONE process.
+// The pa host never overlaps in-process: each pa-host process makes exactly one
+// awaited pass — `pa catchup` (which holds its blackboard lock around the call)
+// or `pa maintenance run` (one forced, lock-free pass in its own process) — so
+// on pa this set is empty at every production decision and the guard is purely
+// a same-process backstop, exercised by tests and held ready for any future
+// in-process caller. The bot host IS a multi-pass process; it queues passes
+// behind each other in bot main.ts (140db6d). Cross-process overlap (a catchup
+// tick × `pa maintenance run`) is possible and invisible here — that is a
+// caller-level mutual-exclusion question, not a due-check-loss risk, because
+// with no shared set no skip:in-flight is ever recorded.
 const IN_FLIGHT = new Set<string>();
 
 export interface RunDueJobsOptions {
@@ -112,7 +120,7 @@ export interface RunDueJobsOptions {
 // Floored at 15 min: for a 60s job (model-override-sweep) the old bare 3x was
 // 3 minutes, and the bot's degraded-mode detector flaps every 30-90s,
 // producing 85 "Maintenance job suppressed" pages in a week
-// (plans/2026-08-23-alerts-week-review.md §5.2).
+// (the 2026-08-23 alerts-week review §5.2).
 function skippedTooLongThreshold(everyMs: number): number {
   return Math.max(3 * everyMs, 15 * 60_000);
 }

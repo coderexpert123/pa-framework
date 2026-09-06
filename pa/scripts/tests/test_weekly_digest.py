@@ -242,9 +242,7 @@ class TestWeeklyDigest(unittest.TestCase):
             {"job": "broken-skill", "consecutiveFailures": 5}
         ]
 
-        pending_conflicts = []
-
-        result = weekly_digest.compose_digest(audit_entries, maintenance_summary, parked_skills, pending_conflicts)
+        result = weekly_digest.compose_digest(audit_entries, maintenance_summary, parked_skills)
 
         # Check that key sections are present
         assert "# Weekly Ops Digest" in result
@@ -260,222 +258,24 @@ class TestWeeklyDigest(unittest.TestCase):
         assert "broken-skill" in result
         assert "5 consecutive failures" in result
 
-    def test_read_pending_conflicts_returns_unresolved(self):
-        """Test reading pending conflicts filters out resolved ones."""
-        # Create a temporary review-digest-pending.jsonl file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
-            pending_path = f.name
+    def test_memory_conflicts_section_removed(self):
+        """WP-D2 B.3 (2026-09-02): the Memory Conflicts Pending Review section is
+        DELETED — read_pending_conflicts no longer exists, compose_digest takes no
+        pending_conflicts parameter, and no digest ever renders the section header
+        again (conflicts surface through the nightly consolidation report flow)."""
+        assert not hasattr(weekly_digest, "read_pending_conflicts"), (
+            "read_pending_conflicts must be gone"
+        )
 
-            # Write some test conflicts
-            now = datetime.now(timezone.utc)
-            recent = now - timedelta(days=2)
+        result = weekly_digest.compose_digest([], {"skipped": [], "shed": []}, [])
+        assert "Memory Conflicts Pending Review" not in result
+        assert "No memory conflicts pending review" not in result
 
-            conflicts = [
-                {
-                    "id": "cf-001",
-                    "created_at": recent.isoformat().replace("+00:00", "Z"),
-                    "resolved": False,
-                    "resolved_at": None,
-                    "resolution": None,
-                    "key": "dietary-mushrooms",
-                    "new_text": "Eats mushrooms regularly now",
-                    "existing_text": "Avoid mushrooms completely",
-                    "existing_valid_from": "2026-06-15",
-                    "category": "preference",
-                    "source": "conversation",
-                    "source_ref": "turn-20260818-1234"
-                },
-                {
-                    "id": "cf-002",
-                    "created_at": recent.isoformat().replace("+00:00", "Z"),
-                    "resolved": False,
-                    "resolved_at": None,
-                    "resolution": None,
-                    "key": "fitness-running",
-                    "new_text": "Running paused due to injury",
-                    "existing_text": "Running active 3x per week",
-                    "existing_valid_from": "2026-07-01",
-                    "category": "fitness",
-                    "source": "conversation",
-                    "source_ref": "turn-20260818-5678"
-                },
-                {
-                    "id": "cf-003",
-                    "created_at": recent.isoformat().replace("+00:00", "Z"),
-                    "resolved": True,
-                    "resolved_at": now.isoformat().replace("+00:00", "Z"),
-                    "resolution": "accepted",
-                    "key": "resolved-conflict",
-                    "new_text": "Old resolved text",
-                    "existing_text": "Old existing text",
-                    "existing_valid_from": "2026-06-15",
-                    "category": "preference",
-                    "source": "conversation",
-                    "source_ref": "turn-20260818-9999"
-                }
-            ]
-            for conflict in conflicts:
-                f.write(json.dumps(conflict) + "\n")
-
-        try:
-            # Temporarily override PA_HOME
-            old_pa_home = os.environ.get("PA_HOME")
-            temp_dir = os.path.dirname(pending_path)
-            os.environ["PA_HOME"] = temp_dir
-
-            # Move the pending file to the right location
-            import shutil
-            target_path = os.path.join(temp_dir, "review-digest-pending.jsonl")
-            shutil.copy(pending_path, target_path)
-
-            # Read conflicts - should return only unresolved
-            result = weekly_digest.read_pending_conflicts(days=7)
-
-            assert len(result) == 2, f"Expected 2 unresolved conflicts, got {len(result)}"
-            keys = [c.get("key") for c in result]
-            assert "dietary-mushrooms" in keys
-            assert "fitness-running" in keys
-            assert "resolved-conflict" not in keys
-
-            # Restore env
-            if old_pa_home:
-                os.environ["PA_HOME"] = old_pa_home
-            else:
-                os.environ.pop("PA_HOME", None)
-
-        finally:
-            os.unlink(pending_path)
-            if os.path.exists(target_path):
-                os.unlink(target_path)
-
-    def test_read_pending_conflicts_filters_by_date(self):
-        """Test reading pending conflicts filters by date window."""
-        # Create a temporary review-digest-pending.jsonl file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
-            pending_path = f.name
-
-            # Write conflicts with different dates
-            now = datetime.now(timezone.utc)
-            recent = now - timedelta(days=2)
-            old = now - timedelta(days=10)
-
-            conflicts = [
-                {
-                    "id": "cf-001",
-                    "created_at": recent.isoformat().replace("+00:00", "Z"),
-                    "resolved": False,
-                    "resolved_at": None,
-                    "resolution": None,
-                    "key": "recent-conflict",
-                    "new_text": "Recent conflict",
-                    "existing_text": "Existing text",
-                    "existing_valid_from": "2026-06-15",
-                    "category": "preference",
-                    "source": "conversation",
-                    "source_ref": "turn-recent"
-                },
-                {
-                    "id": "cf-002",
-                    "created_at": old.isoformat().replace("+00:00", "Z"),
-                    "resolved": False,
-                    "resolved_at": None,
-                    "resolution": None,
-                    "key": "old-conflict",
-                    "new_text": "Old conflict",
-                    "existing_text": "Existing text",
-                    "existing_valid_from": "2026-06-15",
-                    "category": "preference",
-                    "source": "conversation",
-                    "source_ref": "turn-old"
-                }
-            ]
-            for conflict in conflicts:
-                f.write(json.dumps(conflict) + "\n")
-
-        try:
-            # Temporarily override PA_HOME
-            old_pa_home = os.environ.get("PA_HOME")
-            temp_dir = os.path.dirname(pending_path)
-            os.environ["PA_HOME"] = temp_dir
-
-            # Move the pending file to the right location
-            import shutil
-            target_path = os.path.join(temp_dir, "review-digest-pending.jsonl")
-            shutil.copy(pending_path, target_path)
-
-            # Read last 7 days - should exclude the old conflict
-            result = weekly_digest.read_pending_conflicts(days=7)
-
-            assert len(result) == 1, f"Expected 1 recent conflict, got {len(result)}"
-            assert result[0].get("key") == "recent-conflict"
-
-            # Restore env
-            if old_pa_home:
-                os.environ["PA_HOME"] = old_pa_home
-            else:
-                os.environ.pop("PA_HOME", None)
-
-        finally:
-            os.unlink(pending_path)
-            if os.path.exists(target_path):
-                os.unlink(target_path)
-
-    def test_compose_digest_includes_conflicts_section(self):
-        """Test that compose_digest includes conflicts section with details."""
-        audit_entries = [
-            {"action": "applied", "draft": "fix-1", "target_skill": "daily-mail-brief"},
-        ]
-
-        maintenance_summary = {
-            "skipped": [],
-            "shed": []
-        }
-
-        parked_skills = []
-
-        pending_conflicts = [
-            {
-                "id": "cf-001",
-                "created_at": "2026-08-17T10:00:00Z",
-                "resolved": False,
-                "key": "dietary-mushrooms",
-                "new_text": "Eats mushrooms regularly now",
-                "existing_text": "Avoid mushrooms completely",
-                "category": "preference",
-                "source": "conversation"
-            }
-        ]
-
-        result = weekly_digest.compose_digest(audit_entries, maintenance_summary, parked_skills, pending_conflicts)
-
-        # Check that conflicts section is present
-        assert "## Memory Conflicts Pending Review" in result
-        assert "dietary-mushrooms" in result
-        assert "Eats mushrooms regularly now" in result
-        assert "Avoid mushrooms completely" in result
-        assert "preference" in result
-        assert "2026-08-17T10:00:00Z" in result
-
-    def test_compose_digest_no_conflicts_shows_empty(self):
-        """Test that compose_digest shows empty message when no conflicts."""
-        audit_entries = [
-            {"action": "applied", "draft": "fix-1", "target_skill": "daily-mail-brief"},
-        ]
-
-        maintenance_summary = {
-            "skipped": [],
-            "shed": []
-        }
-
-        parked_skills = []
-
-        pending_conflicts = []
-
-        result = weekly_digest.compose_digest(audit_entries, maintenance_summary, parked_skills, pending_conflicts)
-
-        # Check that conflicts section is present with empty message
-        assert "## Memory Conflicts Pending Review" in result
-        assert "*No memory conflicts pending review.*" in result
+        import inspect
+        params = inspect.signature(weekly_digest.compose_digest).parameters
+        assert "pending_conflicts" not in params, (
+            "compose_digest must not keep a pending_conflicts parameter"
+        )
 
     def test_main_delivers_via_stdout_without_direct_telegram_dispatch(self):
         """Reproduces the 2026-08-17 recorded failures: main() dispatched Telegram
@@ -503,6 +303,7 @@ class TestWeeklyDigest(unittest.TestCase):
             old_pa_home = os.environ.get("PA_HOME")
             old_token = os.environ.get("TELEGRAM_BOT_TOKEN")
             real_slo = weekly_digest.get_slo_summary
+            real_rules = weekly_digest.get_rules_summary
             real_send_text = getattr(telegram_notify, "send_text", None)
             direct_calls = []
 
@@ -513,8 +314,11 @@ class TestWeeklyDigest(unittest.TestCase):
 
             os.environ["PA_HOME"] = temp_dir
             os.environ.pop("TELEGRAM_BOT_TOKEN", None)
-            # Keep the test hermetic and fast: no real `pa slo report` subprocess.
+            # Keep the test hermetic and fast: no real `pa slo report` / `pa rules weekly`
+            # subprocesses. A failed rules summary means no pending rules, so main()
+            # must print NO keyboard envelope at all.
             weekly_digest.get_slo_summary = lambda: "No data"
+            weekly_digest.get_rules_summary = lambda: {"ok": False}
             telegram_notify.send_text = tracking_send_text
 
             stdout, stderr = io.StringIO(), io.StringIO()
@@ -530,6 +334,7 @@ class TestWeeklyDigest(unittest.TestCase):
                     )
             finally:
                 weekly_digest.get_slo_summary = real_slo
+                weekly_digest.get_rules_summary = real_rules
                 if real_send_text is not None:
                     telegram_notify.send_text = real_send_text
                 if not had_mod:
@@ -549,11 +354,94 @@ class TestWeeklyDigest(unittest.TestCase):
             err = stderr.getvalue()
             assert "# Weekly Ops Digest" in out
             assert "_Dedup: weekly-digest-" in out
+            assert "[PA_KEYBOARD]" not in out, "no pending rules means no keyboard envelope"
             assert direct_calls == [], (
                 "main() must not dispatch Telegram directly — the runner relays "
                 "stdout via telegram_output"
             )
             assert "Failed to send Telegram notification" not in err
+
+    def test_build_rules_keyboard_payload_charset_filter_and_cap(self):
+        """WP-D2 B.2: build_rules_keyboard_payload emits Accept/Reject pairs only for
+        ids inside the ru: charset ([A-Za-z0-9_-]{1,40}); charset-failing ids stay
+        report-line only; the payload caps at 6 buttons (3 rules)."""
+        payload = weekly_digest.build_rules_keyboard_payload([
+            {"id": "rule-1"},
+            {"id": "has.dot"},  # charset fail — skipped
+            {"id": "rule_2"},
+            {"id": None},       # non-string — skipped
+            {"id": "x" * 41},   # too long — skipped
+            {"id": "rule-3"},
+            {"id": "rule-4"},   # would exceed the 6-button cap
+        ])
+        assert payload is not None
+        buttons = payload["buttons"]
+        assert [b["callback_data"] for b in buttons] == [
+            "ru:rule-1:a", "ru:rule-1:x",
+            "ru:rule_2:a", "ru:rule_2:x",
+            "ru:rule-3:a", "ru:rule-3:x",
+        ]
+        assert len(buttons) <= weekly_digest.MAX_KEYBOARD_BUTTONS
+
+        # None / empty / all-unqualified inputs yield no payload at all.
+        assert weekly_digest.build_rules_keyboard_payload(None) is None
+        assert weekly_digest.build_rules_keyboard_payload([]) is None
+        assert weekly_digest.build_rules_keyboard_payload([{"id": "bad.id"}]) is None
+
+    def test_weekly_digest_pending_rules_carry_ru_keyboard(self):
+        """WP-D2 B.2 (weekly digest pending rules carry ru keyboard): with pending
+        rules in the rules summary, main() ends stdout with a [PA_KEYBOARD] envelope
+        line whose buttons are ru:<id>:a / ru:<id>:x pairs — the channel the pa runner
+        (run.ts extractKeyboardEnvelope) validates against the single grammar and
+        attaches to the delivery's last chunk. The marker line comes AFTER the dedup
+        line so it stays the last chunk's tail."""
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            old_pa_home = os.environ.get("PA_HOME")
+            real_slo = weekly_digest.get_slo_summary
+            real_rules = weekly_digest.get_rules_summary
+            real_engagement = weekly_digest.read_skill_engagement
+            try:
+                os.environ["PA_HOME"] = temp_dir
+                weekly_digest.get_slo_summary = lambda: "No data"
+                weekly_digest.get_rules_summary = lambda: {
+                    "ok": True,
+                    "new_violations": 0,
+                    "violations_7d": [],
+                    "pending_rules": [{"id": "rule-feedback-9", "key": "k", "text": "t"}],
+                }
+                weekly_digest.read_skill_engagement = lambda: None
+
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    weekly_digest.main()
+
+                out = stdout.getvalue()
+                out_lines = out.rstrip("\n").split("\n")
+                envelope = out_lines[-1]
+                assert envelope.startswith("[PA_KEYBOARD]: "), (
+                    f"the LAST stdout line must be the envelope, got: {envelope!r}"
+                )
+                payload = json.loads(envelope[len("[PA_KEYBOARD]: "):])
+                assert [b["callback_data"] for b in payload["buttons"]] == [
+                    "ru:rule-feedback-9:a", "ru:rule-feedback-9:x",
+                ]
+                assert payload["buttons"][0]["text"] == "✅ Accept"
+                assert payload["buttons"][1]["text"] == "✖ Reject"
+                # The envelope is stripped runner-side, so the digest text itself
+                # still carries the report-line and the dedup trailer.
+                assert "_Dedup: weekly-digest-" in out
+                assert "(ID: rule-feedback-9)" in out
+            finally:
+                if old_pa_home is not None:
+                    os.environ["PA_HOME"] = old_pa_home
+                else:
+                    os.environ.pop("PA_HOME", None)
+                weekly_digest.get_slo_summary = real_slo
+                weekly_digest.get_rules_summary = real_rules
+                weekly_digest.read_skill_engagement = real_engagement
 
     def test_read_alert_census_returns_none_when_stale(self):
         """A census file older than max_age_days must not be surfaced as fresh."""
@@ -631,7 +519,6 @@ class TestWeeklyDigest(unittest.TestCase):
         audit_entries = []
         maintenance_summary = {"skipped": [], "shed": []}
         parked_skills = []
-        pending_conflicts = []
 
         alert_census = {
             "generatedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -664,7 +551,7 @@ class TestWeeklyDigest(unittest.TestCase):
             ],
         }
 
-        result = weekly_digest.compose_digest(audit_entries, maintenance_summary, parked_skills, pending_conflicts, alert_census)
+        result = weekly_digest.compose_digest(audit_entries, maintenance_summary, parked_skills, alert_census)
 
         assert "## Alerts (7d)" in result
         assert "60 alerts / 2 families in 7d" in result
@@ -680,9 +567,8 @@ class TestWeeklyDigest(unittest.TestCase):
         audit_entries = []
         maintenance_summary = {"skipped": [], "shed": []}
         parked_skills = []
-        pending_conflicts = []
 
-        result = weekly_digest.compose_digest(audit_entries, maintenance_summary, parked_skills, pending_conflicts, None)
+        result = weekly_digest.compose_digest(audit_entries, maintenance_summary, parked_skills, None)
 
         assert "## Alerts (7d)" in result
         assert "_No alert census available (job has not run in the last 8 days)._" in result
@@ -744,7 +630,6 @@ class TestWeeklyDigest(unittest.TestCase):
         audit_entries = []
         maintenance_summary = {"skipped": [], "shed": []}
         parked_skills = []
-        pending_conflicts = []
         coordination_stats = {
             "days": 7, "claims": 42, "forced": 5, "denied": 3, "released": 31,
             "forcedReleases": 1, "renewed": 3, "gcExpired": 45,
@@ -760,7 +645,7 @@ class TestWeeklyDigest(unittest.TestCase):
         }
 
         result = weekly_digest.compose_digest(
-            audit_entries, maintenance_summary, parked_skills, pending_conflicts, alert_census, coordination_stats
+            audit_entries, maintenance_summary, parked_skills, alert_census, coordination_stats
         )
         lines = result.split("\n")
         headline_idx = lines.index("60 alerts / 2 families in 7d — top: test-followup 44, restore-drill 16")
@@ -770,7 +655,7 @@ class TestWeeklyDigest(unittest.TestCase):
         )
 
         result_none = weekly_digest.compose_digest(
-            audit_entries, maintenance_summary, parked_skills, pending_conflicts, None, coordination_stats
+            audit_entries, maintenance_summary, parked_skills, None, coordination_stats
         )
         lines_none = result_none.split("\n")
         headline_idx_none = lines_none.index("_No alert census available (job has not run in the last 8 days)._")
@@ -787,12 +672,11 @@ class TestWeeklyDigest(unittest.TestCase):
         audit_entries = []
         maintenance_summary = {"skipped": [], "shed": []}
         parked_skills = []
-        pending_conflicts = []
 
-        result = weekly_digest.compose_digest(audit_entries, maintenance_summary, parked_skills, pending_conflicts, None, None)
+        result = weekly_digest.compose_digest(audit_entries, maintenance_summary, parked_skills, None, None)
         assert "**Coordination (7d):** unavailable (`pa claims --stats` failed)." in result
 
-        result_default = weekly_digest.compose_digest(audit_entries, maintenance_summary, parked_skills, pending_conflicts)
+        result_default = weekly_digest.compose_digest(audit_entries, maintenance_summary, parked_skills)
         assert "**Coordination (7d):** unavailable (`pa claims --stats` failed)." in result_default
 
     def test_get_iso_week(self):
@@ -1274,7 +1158,6 @@ class TestWeeklyDigest(unittest.TestCase):
         audit_entries = []
         maintenance_summary = {"skipped": [], "shed": []}
         parked_skills = []
-        pending_conflicts = []
         alert_census = {
             "generatedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "totalSent": 10,
@@ -1296,7 +1179,7 @@ class TestWeeklyDigest(unittest.TestCase):
         weekly_digest.read_new_feature_count = lambda since: 0
 
         try:
-            result = weekly_digest.compose_digest(audit_entries, maintenance_summary, parked_skills, pending_conflicts, alert_census)
+            result = weekly_digest.compose_digest(audit_entries, maintenance_summary, parked_skills, alert_census)
             result_text = result
 
             assert "## Skills — Retire? (90d zero engagement)" in result_text

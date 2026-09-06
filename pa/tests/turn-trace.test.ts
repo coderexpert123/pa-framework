@@ -14,6 +14,7 @@ import {
   classifyOutcome,
   parseBotResource,
   skillFromResource,
+  taskRefFromResource,
   turnTracesPath,
   type TurnTraceV1,
 } from '../src/lib/turn-trace.js';
@@ -27,6 +28,9 @@ describe('classifyOrigin', () => {
   });
   it('self-improver prefix -> self-improver', () => {
     assert.equal(classifyOrigin('self-improver-code-fix-x'), 'self-improver');
+  });
+  it('task- prefix -> task', () => {
+    assert.equal(classifyOrigin('task-tt-abc123'), 'task');
   });
   it('undefined -> other', () => {
     assert.equal(classifyOrigin(undefined), 'other');
@@ -63,6 +67,24 @@ describe('skillFromResource', () => {
   });
   it('returns undefined for undefined', () => {
     assert.equal(skillFromResource(undefined), undefined);
+  });
+});
+
+describe('taskRefFromResource', () => {
+  it('extracts the task ref', () => {
+    assert.equal(taskRefFromResource('task-tt-abc123'), 'tt-abc123');
+  });
+  it('extracts a hyphenated task ref (greedy group)', () => {
+    assert.equal(taskRefFromResource('task-tt-a1b2c3d4e5f6'), 'tt-a1b2c3d4e5f6');
+  });
+  it('returns undefined for a non-task resource', () => {
+    assert.equal(taskRefFromResource('topic-1_2'), undefined);
+  });
+  it('returns undefined for undefined', () => {
+    assert.equal(taskRefFromResource(undefined), undefined);
+  });
+  it('returns undefined for an empty ref (the + quantifier rejects it)', () => {
+    assert.equal(taskRefFromResource('task-'), undefined);
   });
 });
 

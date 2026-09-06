@@ -1,6 +1,6 @@
 /**
  * Tests for catchup.ts's pure "▶ Run now" keyboard helper (WP-P2,
- * plans/2026-08-24-buttons-program-SPEC.md §3.2/§3.3).
+ * the 2026-08-24 buttons-program spec §3.2/§3.3).
  *
  * Dynamic import (not static), mirroring catchup.test.ts's own convention for
  * this module — catchup.ts pulls in the blackboard singleton and other

@@ -92,10 +92,10 @@ Two `.git` directories in the same working tree. Substrate files tracked by BOTH
 > reverted or deleted files the other repo needed, because git has no concept of "this
 > path is also tracked by a different repo I don't know about." The second incident
 > destroyed dozens of files, recovered only because the other repo's `HEAD` still had
-> them. The maintainer migrated OFF this exact topology after that — see
-> `plans/2026-08-05-concurrent-session-safety.md` for the full incident record and the
-> structural fix (a genuinely separate, independently-cloned directory instead of a
-> second git-dir on the same files). **If you build Pattern B as described below, you
+> them. The maintainer migrated OFF this exact topology after that — the internal
+> incident record (2026-08-05) carries the full account and the structural fix (a
+> genuinely separate, independently-cloned directory instead of a second git-dir on
+> the same files). **If you build Pattern B as described below, you
 > are adopting the retired, incident-prone version of this pattern** — the instructions
 > are kept here because some contributors may still want the interleaved-whitelist
 > workflow it enables, but the same safety discipline applies: never run a checkout/reset

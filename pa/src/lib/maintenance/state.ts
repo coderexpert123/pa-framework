@@ -16,7 +16,7 @@ export interface MaintenanceJobState {
   lastRunAt?: string;          // ISO — last successful `ran` outcome
   /** ISO — last time the runner ATTEMPTED this job (success or failure). Unlike
    *  lastRunAt (successes only) this advances on every attempt, so the failure
-   *  backoff ladder has a clock (2026-08-23, plans/2026-08-23-alerts-wave-SPEC.md).
+   *  backoff ladder has a clock (2026-08-23, the alerts-wave spec).
    *  Missing on pre-existing ledger entries = treat as null. */
   lastAttemptAt?: string;
   lastOutcome?: JobOutcome;

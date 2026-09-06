@@ -1,5 +1,6 @@
 // List prices verified 2026-08-27 — platform.claude.com/docs (pricing),
 // ai.google.dev/gemini-api/docs/pricing, docs.z.ai/guides/overview/pricing.
+// gemini-3.8 verified 2026-09-04 — rates identical to 3.7 through 2026-12-31.
 // ESTIMATES ONLY (subscription CLIs are rated at list API prices); override per
 // deployment via config.yaml `model_pricing:` (merged key-by-key over these).
 
@@ -14,7 +15,7 @@ export type ModelPricingTable = Record<string, ModelPrice>;
 export const DEFAULT_MODEL_PRICING: ModelPricingTable = {
   // worker-level fallbacks (usage records often carry no model — 100% of this
   // deployment's ledger as of 2026-08-27)
-  'agy':                    { input: 0.75, output: 3.75, cacheRead: 0.075 },  // = gemini-3.7-flash pin
+  'agy':                    { input: 0.75, output: 3.75, cacheRead: 0.075 },  // = gemini-3.8-flash pin
   'zclaude':                { input: 1.40, output: 4.40, cacheRead: 0.26 },   // = glm-5.3
   // model keys — Anthropic (thinking billed at output rate)
   'claude-opus-4-6':        { input: 5,    output: 25,   cacheRead: 0.50 },
@@ -22,6 +23,7 @@ export const DEFAULT_MODEL_PRICING: ModelPricingTable = {
   'claude-sonnet-5':        { input: 2,    output: 10,   cacheRead: 0.20 },
   'claude-haiku-4-5':       { input: 1,    output: 5,    cacheRead: 0.10 },
   // model keys — Google Gemini
+  'gemini-3.8-flash':       { input: 0.75, output: 3.75, cacheRead: 0.075 },
   'gemini-3.7-flash':       { input: 0.75, output: 3.75, cacheRead: 0.075 },
   'gemini-3.6-flash':       { input: 0.75, output: 3.75, cacheRead: 0.075 },
   'gemini-3.5-flash':       { input: 1.50, output: 9.00, cacheRead: 0.15 },

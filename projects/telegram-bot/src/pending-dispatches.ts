@@ -49,6 +49,10 @@ export interface PendingDispatch {
    * and the rs: callback guard read it to tell a lost transcript from a
    * recovered one. */
   userTextSettled?: boolean;
+  /** ISO timestamp of when the reaper last logged its held-record notice
+   *  (fix-wave m3). Set by the reaper's heldForTopic branch so the notice
+   *  logs ONCE per held record instead of on every reaper pass. */
+  heldNotifiedAt?: string;
   /** Times this dispatch was auto-requeued through the synthetic path (reaper
    *  exhaustion, voice revive, or the maintenance drain). Absent = 0. Cap:
    *  PA_REQUEUE_MAX (default 2) — read via the frozen env-literal (SPEC §2). */
@@ -61,6 +65,20 @@ export interface PendingDispatch {
    *  (name is historical — covers all three kinds). Enables the reaper's
    *  re-download + re-transcription revive path. Written at enqueue only. */
   voiceFileId?: string;
+  /** AI-208 WP-4: true when this update was drained by a /steer or /stop and
+   *  its transcript was HELD for the topic's next dispatch instead of being
+   *  dispatched (or silently cancelled). The normalizer skips
+   *  removePendingDispatch for such a record, so the durable trace survives a
+   *  crash; absorbHeldDispatchRecords consumes it (flag back to false) when
+   *  the next dispatch in the topic folds it into its prompt, and the startup
+   *  reaper leaves held records entirely alone (no death notice, no requeue). */
+  heldForTopic?: boolean;
+  /** ISO timestamp of when the record was marked heldForTopic (audit only). */
+  heldAt?: string;
+  /** AI-209: the messages folded into THIS head's combined prompt, in send order.
+   *  Written by the dispatch-time record (via the __batchFold marker). Durable
+   *  provenance for crash forensics and per-message lookup; read by no code this wave. */
+  foldedFrom?: Array<{ updateId: number; messageId?: number }>;
 }
 
 function storePath(): string {
@@ -155,6 +173,40 @@ export async function updatePendingDispatch(
 /** All live (non-expired) records — what the startup reaper works through. */
 export async function listPendingDispatches(): Promise<PendingDispatch[]> {
   return withMutex(async () => [...(await load()).values()]);
+}
+
+/**
+ * Consume the held dispatch records for one chat+thread (AI-208 WP-4 E2).
+ *
+ * Returns the `userText` (settled transcript) of every record for this chat
+ * and thread carrying `heldForTopic: true`, oldest `startedAt` first, and
+ * marks each record `heldForTopic: false` so it is consumed exactly once.
+ * Called by main.ts's normalizer alongside absorbHeldEntries so a held
+ * record's transcript reaches the next dispatch's prompt — this is the
+ * durable half of the steer/stop hold that survives a crash between the
+ * drain and the fold (the in-memory held list does not).
+ *
+ * Fix-wave M1: a record whose `updateId` is in `excludeUpdateIds` is marked
+ * `heldForTopic: false` (consumed) but emits NO text — the in-memory half of
+ * the absorb already carried that transcript into the same prompt, so
+ * emitting it here would fold it twice.
+ */
+export async function absorbHeldDispatchRecords(
+  chatId: number,
+  threadId: number,
+  excludeUpdateIds?: Set<number>,
+): Promise<string[]> {
+  const records = await listPendingDispatches();
+  const held = records
+    .filter((r) => r.chatId === chatId && r.threadId === threadId && r.heldForTopic === true)
+    .sort((a, b) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime());
+  const texts: string[] = [];
+  for (const rec of held) {
+    await updatePendingDispatch(pendingDispatchKey(chatId, threadId, rec.updateId), { heldForTopic: false });
+    if (excludeUpdateIds?.has(rec.updateId)) continue;
+    texts.push(rec.userText);
+  }
+  return texts;
 }
 
 /** Test hook: drop the in-memory cache so a fresh PA_HOME is re-read. */

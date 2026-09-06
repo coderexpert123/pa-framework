@@ -228,7 +228,7 @@ describe('runDueJobs', () => {
     });
   });
 
-  it('in-flight guard: concurrent runDueJobs calls for the same job — second is skipped, run() invoked once', async () => {
+  it('in-flight guard: concurrent runDueJobs calls for the same job — second is skipped IMMEDIATELY, run() invoked once (AI-196: skip stays wait-free)', async () => {
     let runCount = 0;
     let releaseRun!: () => void;
     const gate = new Promise<void>((resolve) => { releaseRun = resolve; });
@@ -247,14 +247,20 @@ describe('runDueJobs', () => {
     await new Promise((r) => setTimeout(r, 20));
     const second = runDueJobs('pa', [job], { notify });
 
-    const [, secondRecords] = await Promise.all([
-      (async () => { releaseRun(); return first; })(),
-      second,
-    ]);
-
-    assert.equal(runCount, 1);
+    // AI-196 (closed-by-proof 2026-09-03): the pa host makes one awaited
+    // runDueJobs pass per process, so skip:in-flight can never burn a due-check
+    // in production and the guard must stay WAIT-FREE. Awaiting `second` to
+    // completion while the gate still holds the slot fails mechanically (test
+    // timeout) if a bounded wait-and-redecide is ever reintroduced — such a
+    // wait would poll for the very slot this gate keeps closed.
+    const secondRecords = await second;
     assert.equal(secondRecords[0].outcome, 'skipped');
     assert.equal(secondRecords[0].skipReason, 'in-flight');
+
+    releaseRun();
+    const firstRecords = await first;
+    assert.equal(firstRecords[0].outcome, 'ran');
+    assert.equal(runCount, 1);
   });
 
   it('skipped-too-long page fires once lastRunAt is more than 3x cadence stale, degraded+shed', async () => {

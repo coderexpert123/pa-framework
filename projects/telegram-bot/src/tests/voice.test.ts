@@ -57,7 +57,7 @@ type VoiceWorkerOutcome = import('../voice-worker-client.js').VoiceWorkerOutcome
 
 const TOKEN = 'test-token';
 const CHAT_ID = -1001234;
-const REPO_ROOT = 'D:/Personal Assistant';
+const REPO_ROOT = 'C:/pa-checkout';
 
 function makeVoice(overrides: Partial<TelegramVoice> = {}): TelegramVoice {
   return {

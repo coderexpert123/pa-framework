@@ -1,6 +1,6 @@
 /**
  * Inline-button callback surface (2026-08-24 buttons program,
- * plans/2026-08-24-buttons-program-SPEC.md §3.1–§3.3, P6, WP-B0).
+ * buttons-program design (internal) §3.1–§3.3, P6, WP-B0).
  *
  * WP-B0 fills the P6 skeleton. WP-B1 wires `handleCallbackQuery` / `handleMessageReaction`
  * into `runPollLoop` and supplies the `CallbackDeps` (including `injectUpdate`, the seam
@@ -8,11 +8,14 @@
  * command becomes a synthetic TelegramUpdate pushed into the next poll batch, never a
  * second code path).
  *
- * Callback grammar (spec §3.2, ≤64 bytes by construction; the parser returns null for
- * anything longer, malformed, or over-length in a field):
+ * Callback grammar (≤64 bytes by construction; the parser returns null for anything
+ * longer, malformed, or over-length in a field). SINGLE SOURCE since 2026-09-02 (topic-task
+ * handover Wave 1, SPEC §3.4): the pure grammar lives in `pa/src/lib/callback-grammar.ts`
+ * and is re-exported below so every existing import keeps working — pa-side emitters must
+ * validate `callback_data` against the same module, never a mirror.
  *   reauth:google[:skill≤50]                       chat-gated
  *   cf:y | cf:n                                    chat-gated   (pending_action confirmation)
- *   cc:menu|agent|model|effort|back|new|stop|ka    chat-gated   (control card navigation/actions)
+ *   cc:menu|agent|model|effort|back|new|stop|ka|submit|discard  chat-gated   (control card navigation/actions)
  *   cc:set:agent:<≤16> | cc:set:model:<≤40> | cc:set:effort:<≤16>
  *   wf:retry | wf:switch:<worker≤16> | wf:revert:<worker≤16>
  *   pm:<auditId≤40>:approve|reject|diff            operator-gated
@@ -22,6 +25,14 @@
  *   mc:<conflictId≤32>:a|r|x                       operator-gated
  *   rs:<chatId>:<threadId>:<updateId>              operator-gated (parsed with /^rs:(-?\d+):(\d+):(\d+)$/)
  *   dq:replay:<index≤4>[:c]                        operator-gated, two-step
+ *   q:<0-3>                                        chat-gated   (PA_META question option —
+ *                                                               index resolves against the
+ *                                                               topic's pending_question)
+ *   qt:<tt-12hex>:<0-3>                            chat-gated   (executor-lane task question)
+ *   ru:<ruleId≤40>:a|x                             operator-gated (weekly-digest rules)
+ *   si:<family≤40>:m[:c]                           operator-gated, two-step (census mute)
+ *   ch:r:<chain≤40>[:c]                            operator-gated, two-step (chain re-run)
+ *   wt:<watchId≤32>:r                              operator-gated (watch re-register)
  * Conflict ids start with `cf-` (hyphen); the confirmation prefix is `cf:` (colon) —
  * anchored regexes, never startsWith.
  */
@@ -39,7 +50,7 @@ import {
   sanitizeMdV2,
 } from './telegram.js';
 import type { ConversationState, TelegramUpdate, MessageReactionUpdated, CallbackQuery } from './types.js';
-import { PA_META_PROTECTED_SKILLS, parseReauthCallback } from './logic.js';
+import { PA_META_PROTECTED_SKILLS } from './logic.js';
 import { appendRefIdAndLog, makeRefId } from './ref-id.js';
 import { resendKey, takeResend } from './resend-store.js';
 import { isBarePlaceholderUserText } from './voice.js';
@@ -53,104 +64,21 @@ import { findJob } from '../../../pa/dist/src/lib/maintenance/registry.js';
 import { recordDecision, recordReaction } from '../../../pa/dist/src/lib/decisions.js';
 import { dlqReplayCommand } from '../../../pa/dist/src/commands/dlq.js';
 import { KNOWN_CLI_DEFAULT_MODELS, KNOWN_CLI_DEFAULT_EFFORTS } from '../../../pa/dist/src/lib/tunables.js';
+import { appendTopicEvent } from '../../../pa/dist/src/lib/topic-events.js';
+import { answerTask, type RunningTask } from '../../../pa/dist/src/lib/topic-tasks.js';
+// The pure callback grammar is single-sourced in pa (SPEC §3.4) — imported here and
+// re-exported below so every existing `from './callbacks.js'` import keeps working.
+import {
+  parseCallbackData,
+  gateFor,
+  CC_SET_CAPS,
+  SK_NAME_RE,
+} from '../../../pa/dist/src/lib/callback-grammar.js';
 
-export type CallbackPrefix = 'reauth' | 'cf' | 'cc' | 'wf' | 'pm' | 'dr' | 'sk' | 'rm' | 'mc' | 'rs' | 'dq';
-export type CallbackGate = 'chat' | 'operator';
-
-/** Parsed callback_data. `raw` is the original string. */
-export type ParsedCallback =
-  | { prefix: 'reauth'; provider: 'google'; skill?: string; raw: string }
-  | { prefix: 'cf'; answer: 'y' | 'n'; raw: string }
-  | { prefix: 'cc'; action: 'menu' | 'agent' | 'model' | 'effort' | 'back' | 'new' | 'stop' | 'ka'; raw: string }
-  | { prefix: 'cc'; action: 'set'; setting: 'agent' | 'model' | 'effort'; value: string; raw: string }
-  | { prefix: 'wf'; action: 'retry'; raw: string }
-  | { prefix: 'wf'; action: 'switch' | 'revert'; worker: string; raw: string }
-  | { prefix: 'pm'; auditId: string; action: 'approve' | 'reject' | 'diff'; raw: string }
-  | { prefix: 'dr'; draft: string; action: 'approve' | 'reject' | 'show'; raw: string }
-  | { prefix: 'sk'; kind: 'run' | 'job'; name: string; confirmed: boolean; raw: string }
-  | { prefix: 'rm'; action: 'done' | '1h' | 'tmrw'; raw: string }
-  | { prefix: 'mc'; conflictId: string; action: 'a' | 'r' | 'x'; raw: string }
-  | { prefix: 'rs'; chatId: number; threadId: number; updateId: number; raw: string }
-  | { prefix: 'dq'; index: number; confirmed: boolean; raw: string };
-
-// --- Grammar regexes (one per §3.2 row; anchored; never startsWith) --------------
-const CF_RE = /^cf:(y|n)$/;
-const CC_SIMPLE_RE = /^cc:(menu|agent|model|effort|back|new|stop|ka)$/;
-const CC_SET_RE = /^cc:set:(agent|model|effort):([\s\S]{1,64})$/;
-const CC_SET_CAPS: Record<'agent' | 'model' | 'effort', number> = { agent: 16, model: 40, effort: 16 };
-const WF_RETRY_RE = /^wf:retry$/;
-const WF_WORKER_RE = /^wf:(switch|revert):([A-Za-z0-9_-]{1,16})$/;
-// auditId is often an ISO timestamp (colons and all) — the group is greedy-with-
-// backtrack, so it still resolves correctly against the fixed action alternation at
-// the end regardless of colons inside the id (unlike main.ts's old `[^:]+` regex,
-// which could never match a colon-bearing id — this parser supersedes that regex).
-const PM_RE = /^pm:([\s\S]{1,40}):(approve|reject|diff)$/;
-const DR_RE = /^dr:([A-Za-z0-9_-]{1,40}):(approve|reject|show)$/;
-const SK_NAME_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
-const SK_RE = /^sk:(run|job):([a-z0-9][a-z0-9-]{0,39})(:c)?$/;
-const RM_RE = /^rm:(done|1h|tmrw)$/;
-const MC_RE = /^mc:([A-Za-z0-9-]{1,32}):(a|r|x)$/;
-const RS_RE = /^rs:(-?\d+):(\d+):(\d+)$/;
-const DQ_RE = /^dq:replay:(\d{1,4})(:c)?$/;
-
-/** Pure. Returns null for anything unrecognised or over 64 bytes. Every form in the
- *  grammar is ASCII, so `.length` and byte length coincide. */
-export function parseCallbackData(data: string | undefined): ParsedCallback | null {
-  if (!data || data.length > 64) return null;
-
-  const reauth = parseReauthCallback(data);
-  if (reauth) return { prefix: 'reauth', ...reauth, raw: data };
-
-  let m: RegExpExecArray | null;
-
-  if ((m = CF_RE.exec(data))) return { prefix: 'cf', answer: m[1] as 'y' | 'n', raw: data };
-
-  if (WF_RETRY_RE.test(data)) return { prefix: 'wf', action: 'retry', raw: data };
-  if ((m = WF_WORKER_RE.exec(data))) {
-    return { prefix: 'wf', action: m[1] as 'switch' | 'revert', worker: m[2], raw: data };
-  }
-
-  if ((m = CC_SET_RE.exec(data))) {
-    const setting = m[1] as 'agent' | 'model' | 'effort';
-    const value = m[2];
-    if (value.length === 0 || value.length > CC_SET_CAPS[setting]) return null;
-    return { prefix: 'cc', action: 'set', setting, value, raw: data };
-  }
-  if ((m = CC_SIMPLE_RE.exec(data))) {
-    return {
-      prefix: 'cc',
-      action: m[1] as 'menu' | 'agent' | 'model' | 'effort' | 'back' | 'new' | 'stop' | 'ka',
-      raw: data,
-    };
-  }
-
-  if ((m = PM_RE.exec(data))) {
-    return { prefix: 'pm', auditId: m[1], action: m[2] as 'approve' | 'reject' | 'diff', raw: data };
-  }
-  if ((m = DR_RE.exec(data))) {
-    return { prefix: 'dr', draft: m[1], action: m[2] as 'approve' | 'reject' | 'show', raw: data };
-  }
-  if ((m = SK_RE.exec(data))) {
-    return { prefix: 'sk', kind: m[1] as 'run' | 'job', name: m[2], confirmed: !!m[3], raw: data };
-  }
-  if ((m = RM_RE.exec(data))) return { prefix: 'rm', action: m[1] as 'done' | '1h' | 'tmrw', raw: data };
-  if ((m = MC_RE.exec(data))) {
-    return { prefix: 'mc', conflictId: m[1], action: m[2] as 'a' | 'r' | 'x', raw: data };
-  }
-  if ((m = RS_RE.exec(data))) {
-    return { prefix: 'rs', chatId: Number(m[1]), threadId: Number(m[2]), updateId: Number(m[3]), raw: data };
-  }
-  if ((m = DQ_RE.exec(data))) return { prefix: 'dq', index: Number(m[1]), confirmed: !!m[2], raw: data };
-
-  return null;
-}
-
-const OPERATOR_PREFIXES = new Set<CallbackPrefix>(['pm', 'dr', 'sk', 'mc', 'rs', 'dq']);
-
-/** Pure. Which gate class a parsed callback needs (§3.3). */
-export function gateFor(parsed: ParsedCallback): CallbackGate {
-  return OPERATOR_PREFIXES.has(parsed.prefix) ? 'operator' : 'chat';
-}
+export { parseCallbackData, gateFor } from '../../../pa/dist/src/lib/callback-grammar.js';
+export type { CallbackPrefix, CallbackGate, ParsedCallback } from '../../../pa/dist/src/lib/callback-grammar.js';
+// Local type alias (not a re-declaration) so the handlers below keep the name.
+import type { ParsedCallback } from '../../../pa/dist/src/lib/callback-grammar.js';
 
 // --- Pure keyboard builders -------------------------------------------------------
 
@@ -182,31 +110,41 @@ export function buildControlCardKeyboard(): InlineKeyboardMarkup {
   };
 }
 
+// AI-210 (2026-09-06): the pickers stage-then-apply — [✅ Submit][↩ Discard] replaced
+// ◀ Back as their last row. BACK_ROW stays defined: legacy cards on screen still emit
+// cc:back, and sk:/dq:/si: confirm keyboards still use cc:back as their Cancel.
 const BACK_ROW: InlineKeyboardButton[] = [{ text: '◀ Back', callback_data: 'cc:back' }];
+const SUBMIT_DISCARD_ROW: InlineKeyboardButton[] = [
+  { text: '✅ Submit', callback_data: 'cc:submit' },
+  { text: '↩ Discard', callback_data: 'cc:discard' },
+];
 
-export function buildAgentPickerKeyboard(workers: string[], current: string): InlineKeyboardMarkup {
+export function buildAgentPickerKeyboard(workers: string[], current: string | undefined, staged?: string): InlineKeyboardMarkup {
   const rows: InlineKeyboardButton[][] = [];
   for (const worker of workers) {
     const data = `cc:set:agent:${worker}`;
     if (data.length > 64 || worker.length > CC_SET_CAPS.agent) continue;
-    const label = worker === current ? `• ${worker}` : worker;
+    // AI-210: staged wins over applied when both would mark the same button — staged is
+    // staged even when it equals the applied value.
+    const label = worker === staged ? `▸ ${worker}` : worker === current ? `• ${worker}` : worker;
     rows.push([{ text: label, callback_data: data }]);
   }
-  rows.push(BACK_ROW);
+  rows.push(SUBMIT_DISCARD_ROW);
   return { inline_keyboard: rows };
 }
 
 export function buildValuePickerKeyboard(
   setting: 'model' | 'effort',
   values: string[],
-  current?: string
+  current?: string,
+  staged?: string
 ): InlineKeyboardMarkup {
   const cap = CC_SET_CAPS[setting];
   const buttons: InlineKeyboardButton[] = [];
   for (const value of values) {
     const data = `cc:set:${setting}:${value}`;
     if (value.length === 0 || value.length > cap || data.length > 64) continue;
-    const label = value === current ? `• ${value}` : value;
+    const label = value === staged ? `▸ ${value}` : value === current ? `• ${value}` : value;
     buttons.push({ text: label, callback_data: data });
   }
   // A declared value list (e.g. agy's 11 models) makes a 1-per-row keyboard too tall for
@@ -216,7 +154,7 @@ export function buildValuePickerKeyboard(
   for (let i = 0; i < buttons.length; i += perRow) {
     rows.push(buttons.slice(i, i + perRow));
   }
-  rows.push(BACK_ROW);
+  rows.push(SUBMIT_DISCARD_ROW);
   return { inline_keyboard: rows };
 }
 
@@ -252,15 +190,25 @@ export function buildRunNowKeyboard(
   };
 }
 
-export function buildReminderKeyboard(): InlineKeyboardMarkup {
+/** PA_META `question` option buttons (2026-09-02, SPEC §3.3) — one button per row
+ *  (options are prose-length), label = the option text verbatim (no emoji prefixes),
+ *  callback_data `q:<idx>` ≤64 bytes by construction. Consumed by main.ts's kb
+ *  cascade (WP-F); the `q:` press resolves the index against the topic's
+ *  pending_question below. */
+export function buildQuestionKeyboard(options: string[]): InlineKeyboardMarkup {
   return {
-    inline_keyboard: [
-      [
-        { text: '✅ Done', callback_data: 'rm:done' },
-        { text: '💤 1 h', callback_data: 'rm:1h' },
-        { text: '🌅 Tomorrow', callback_data: 'rm:tmrw' },
-      ],
-    ],
+    inline_keyboard: options.map((optionText, idx) => [{ text: optionText, callback_data: `q:${idx}` }]),
+  };
+}
+
+/** Wave-2 task-lane twin of buildQuestionKeyboard (SPEC §3.1 A.3): a parked
+ *  task question renders `qt:<taskId>:<idx>` buttons — the answer routes to the
+ *  TASK's micro-thread (answerTask), never a topic synthetic turn. ≤64 bytes
+ *  by construction (taskId is tt- + 12 hex). Consumed by task-executor.ts's
+ *  question FYI send; presses resolve via deps.loadRunningTasks below. */
+export function buildTaskQuestionKeyboard(taskId: string, options: string[]): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: options.map((optionText, idx) => [{ text: optionText, callback_data: `qt:${taskId}:${idx}` }]),
   };
 }
 
@@ -285,10 +233,48 @@ export function buildDlqReplayKeyboard(index: number, confirmed: boolean): Inlin
   };
 }
 
+/** WP-D2 B.5 (2026-09-02): census-family mute — two-tap like sk:/dq:. The pa-side
+ *  nightly report emits the unconfirmed `si:<family>:m` button; this builder supplies
+ *  the confirmed rewrite on the first tap. undefined for any family the grammar would
+ *  refuse (defensive — pa-side emitters already charset/length-filter). */
+export function buildFamilyMuteKeyboard(family: string, confirmed: boolean): InlineKeyboardMarkup | undefined {
+  if (!parseCallbackData(`si:${family}:m`)) return undefined;
+  if (!confirmed) {
+    return { inline_keyboard: [[{ text: '🔇 Mute alerts', callback_data: `si:${family}:m` }]] };
+  }
+  return {
+    inline_keyboard: [
+      [
+        { text: `⚠️ Confirm mute ${family}`, callback_data: `si:${family}:m:c` },
+        { text: 'Cancel', callback_data: 'cc:back' },
+      ],
+    ],
+  };
+}
+
+/** WP-D2 B.6 (2026-09-02): chain-failure re-run — two-tap like sk:/dq:. Names follow
+ *  the SK_NAME_RE charset (same grammar as the chains store). */
+export function buildChainRetryKeyboard(chain: string, confirmed: boolean): InlineKeyboardMarkup | undefined {
+  if (!SK_NAME_RE.test(chain)) return undefined;
+  if (!confirmed) {
+    return { inline_keyboard: [[{ text: '🔁 Re-run chain', callback_data: `ch:r:${chain}` }]] };
+  }
+  return {
+    inline_keyboard: [
+      [
+        { text: `⚠️ Confirm re-run ${chain}`, callback_data: `ch:r:${chain}:c` },
+        { text: 'Cancel', callback_data: 'cc:back' },
+      ],
+    ],
+  };
+}
+
 /** Pure. The text a press is equivalent to typing, or null when the press is not a
  *  synthetic-message action (menu navigation, approvals handled in-process), or when it
  *  synthesizes but needs an async lookup this pure function cannot do (`wf:retry`,
- *  `rs:`) — those two are built directly by handleCallbackQuery instead. */
+ *  `rs:`) — and `cc:submit`, which derives its injection from the recorded staged
+ *  selection (in-memory card keyboard index), are built directly by
+ *  handleCallbackQuery instead. */
 export function syntheticTextFor(parsed: ParsedCallback): string | null {
   switch (parsed.prefix) {
     case 'cf':
@@ -302,12 +288,12 @@ export function syntheticTextFor(parsed: ParsedCallback): string | null {
       if (parsed.action === 'new') return '/new';
       if (parsed.action === 'stop') return '/stop';
       if (parsed.action === 'ka') return '/keepawake';
-      return null; // menu, agent, model, effort, back — handled in-process
+      return null; // menu, agent, model, effort, back, submit, discard — handled in-process
     case 'wf':
       if (parsed.action === 'switch' || parsed.action === 'revert') return `/agent ${parsed.worker}`;
       return null; // 'retry' needs the topic's last user turn — async, see handleCallbackQuery
     default:
-      return null; // reauth, pm, dr, sk, rm, mc, rs, dq — handled in-process
+      return null; // reauth, q, pm, dr, sk, rm, mc, rs, dq — handled in-process
   }
 }
 
@@ -357,18 +343,37 @@ export function nextSyntheticUpdateId(now?: number): number {
 // confirmThreadIndex above: in-memory, bounded, insertion-order eviction.
 const CARD_KEYBOARD_INDEX_MAX = 200;
 const CARD_KEYBOARD_FRESH_MS = 2 * 60 * 1000;
-const cardKeyboardIndex = new Map<string, { keyboard: InlineKeyboardMarkup; recordedAt: number }>();
+// AI-210 (2026-09-06): a staged selection is stronger intent than an opened submenu —
+// it stays fresh for 10 minutes so the periodic sweep's in-place refresh cannot wipe a
+// selection the operator is still looking at. Past the window the entry reads as
+// absent: the sweep re-attaches the top-level keyboard and the selection is silently
+// dropped — nothing was applied; a later cc:submit finds no entry → "No change".
+const CARD_SELECTION_FRESH_MS = 10 * 60 * 1000;
+interface CardKeyboardEntry {
+  keyboard: InlineKeyboardMarkup;
+  /** The staged-but-not-yet-applied selection, if one is staged on this picker. */
+  selection?: { setting: 'agent' | 'model' | 'effort'; value: string };
+  recordedAt: number;
+}
+const cardKeyboardIndex = new Map<string, CardKeyboardEntry>();
 
 function cardKeyboardKey(chatId: number, messageId: number): string {
   return `${chatId}:${messageId}`;
 }
 
 /** Records the submenu keyboard now displayed on a control-card message. Call this
- *  wherever a cc:agent/cc:model/cc:effort press renders a submenu in place. */
-function recordCardKeyboard(chatId: number, messageId: number, keyboard: InlineKeyboardMarkup, now: number = Date.now()): void {
+ *  wherever a cc: picker is rendered in place — the open branches pass NO selection
+ *  (a fresh open is unstaged); the cc:set staging press passes the selection. */
+function recordCardKeyboard(
+  chatId: number,
+  messageId: number,
+  keyboard: InlineKeyboardMarkup,
+  now: number = Date.now(),
+  selection?: { setting: 'agent' | 'model' | 'effort'; value: string }
+): void {
   const key = cardKeyboardKey(chatId, messageId);
   cardKeyboardIndex.delete(key); // re-inserting moves it to the end (most-recent)
-  cardKeyboardIndex.set(key, { keyboard, recordedAt: now });
+  cardKeyboardIndex.set(key, { keyboard, selection, recordedAt: now });
   while (cardKeyboardIndex.size > CARD_KEYBOARD_INDEX_MAX) {
     const oldestKey = cardKeyboardIndex.keys().next().value;
     if (oldestKey === undefined) break;
@@ -376,22 +381,38 @@ function recordCardKeyboard(chatId: number, messageId: number, keyboard: InlineK
   }
 }
 
-/** Clears any recorded submenu for a control-card message — call on cc:menu/cc:back
- *  (returns to the top-level menu), on any cc:set: (the press is complete), and from
- *  main.ts's replacePinnedStatusCard for the SUPERSEDED card id (its entry can never be
+/** Clears any recorded submenu for a control-card message — call on cc:menu/cc:back/
+ *  cc:submit/cc:discard (returns to the top-level menu), and from main.ts's
+ *  replacePinnedStatusCard for the SUPERSEDED card id (its entry can never be
  *  reached again — Telegram never reuses a message id — so it would sit dead in the map). */
 export function clearCardKeyboard(chatId: number, messageId: number): void {
   cardKeyboardIndex.delete(cardKeyboardKey(chatId, messageId));
 }
 
-/** Returns the submenu keyboard currently displayed on this control-card message, if
- *  one was recorded within the last CARD_KEYBOARD_FRESH_MS — else undefined (meaning:
- *  show the top-level buildControlCardKeyboard()). `now` is injectable for tests. */
-export function currentCardKeyboard(chatId: number, messageId: number, now: number = Date.now()): InlineKeyboardMarkup | undefined {
+/** Test hook: empty the whole submenu index between tests. Picker-opening tests
+ *  record under shared fixture keys (chat 555, message 100); without this, a
+ *  recording from one test leaks into a later test's ackSelection edit. Never
+ *  called in production. */
+export function _resetCardKeyboardIndexForTest(): void {
+  cardKeyboardIndex.clear();
+}
+
+/** AI-210: the fresh-checked entry (keyboard + staged selection) for a control-card
+ *  message — the single freshness decision behind currentCardKeyboard and the
+ *  cc:submit/cc:discard handler. Undefined when absent or stale. `now` injectable. */
+function freshCardEntry(chatId: number, messageId: number, now: number = Date.now()): CardKeyboardEntry | undefined {
   const entry = cardKeyboardIndex.get(cardKeyboardKey(chatId, messageId));
   if (!entry) return undefined;
-  if (now - entry.recordedAt > CARD_KEYBOARD_FRESH_MS) return undefined;
-  return entry.keyboard;
+  if (now - entry.recordedAt > (entry.selection ? CARD_SELECTION_FRESH_MS : CARD_KEYBOARD_FRESH_MS)) return undefined;
+  return entry;
+}
+
+/** Returns the submenu keyboard currently displayed on this control-card message, if
+ *  one was recorded within its freshness window (2 min bare, 10 min with a staged
+ *  selection) — else undefined (meaning: show the top-level buildControlCardKeyboard()).
+ *  `now` is injectable for tests. */
+export function currentCardKeyboard(chatId: number, messageId: number, now: number = Date.now()): InlineKeyboardMarkup | undefined {
+  return freshCardEntry(chatId, messageId, now)?.keyboard;
 }
 
 export interface CallbackDeps {
@@ -417,6 +438,50 @@ export interface CallbackDeps {
    *  `cc:agent`/`cc:model`/`cc:effort` when a topic has neither `preferred_worker` nor
    *  a hydrated `model_status` yet — must never be left to resolve to ''. */
   effectiveDefaultWorker: (chatId: number, threadId: number) => Promise<string>;
+  /** Wave-2 executor lane (SPEC §3.1 A.3): the topic's running-store records,
+   *  read fresh per press — `qt:` resolves its taskId against these. Injected
+   *  (pa/dist listRunningTasks) to keep this module's constructor-time imports
+   *  identical to what tests stub. */
+  loadRunningTasks: (chatId: number, threadId: number) => Promise<RunningTask[]>;
+}
+
+/** AI-210: the ONE derivation behind the cc:agent/cc:model/cc:effort open branches AND
+ *  the cc:set staging re-render — a staged re-render can then never show a different
+ *  list than a fresh open of the same picker.
+ *  bp-retry (2026-08-25) rationale, moved here with the code: mirror the canonical
+ *  cascade (handleTunableCommand's `state.preferred_worker || effectiveDefault`,
+ *  main.ts) instead of terminating on '' — a fresh/never-hydrated topic (no
+ *  preferred_worker, no model_status) used to render a single 'clear' button here
+ *  while typed /model showed the full declared list. `||`, not `??`: the defect being
+ *  fixed is an EMPTY-STRING worker, which `??` preserves. */
+async function pickerContextFor(
+  deps: CallbackDeps,
+  chatId: number,
+  threadId: number,
+  setting: 'agent' | 'model' | 'effort'
+): Promise<{ values: string[]; current: string | undefined }> {
+  if (setting === 'agent') {
+    const [workers, state] = await Promise.all([deps.listWorkerNames(), deps.loadTopicState(chatId, threadId)]);
+    const current = state.preferred_worker || state.model_status?.current_worker || (await deps.effectiveDefaultWorker(chatId, threadId));
+    return { values: workers, current };
+  }
+  const state = await deps.loadTopicState(chatId, threadId);
+  const worker = state.preferred_worker || state.model_status?.current_worker || (await deps.effectiveDefaultWorker(chatId, threadId));
+  // Authoritative list first (config.yaml tunables.<setting>.values — same source the
+  // typed /model and /effort commands read via logic.ts's renderTunableReport), falling
+  // back to the hardcoded CLI default only when nothing is declared.
+  const known = setting === 'model' ? KNOWN_CLI_DEFAULT_MODELS : KNOWN_CLI_DEFAULT_EFFORTS;
+  const declared = worker ? await deps.declaredValues(worker, setting).catch(() => []) : [];
+  const observed = worker ? await deps.observedValues(worker, setting).catch(() => []) : [];
+  const knownDefault = worker ? known[worker.toLowerCase()] : undefined;
+  const values = declared.length > 0
+    ? Array.from(new Set([
+        ...declared,
+        ...observed.filter((v) => !declared.some((d) => d.toLowerCase() === v.toLowerCase())),
+        'clear',
+      ]))
+    : Array.from(new Set([...(knownDefault ? [knownDefault] : []), ...observed, 'clear']));
+  return { values, current: setting === 'model' ? state.model_status?.current_llm : state.model_status?.current_effort };
 }
 
 const SPAWN_OPTS = { detached: true, stdio: 'ignore' as const, shell: true, windowsHide: true };
@@ -497,7 +562,12 @@ async function ackSelection(deps: CallbackDeps, cb: CallbackQuery, label: string
       full = sanitizedAckLine;
     }
 
-    const success = await editMessageText(deps.token, chatId, messageId, full, undefined, { rawMarkdown: true });
+    // AI-192 (2026-09-03): editMessageText strips keyboards unless reply_markup
+    // is re-passed. When this edit lands on the pinned control card mid-submenu
+    // (a fresh recorded keyboard), re-attach it; in-thread button messages have
+    // no recorded submenu → undefined → the keyboard strips after the press
+    // exactly as always.
+    const success = await editMessageText(deps.token, chatId, messageId, full, currentCardKeyboard(chatId, messageId), { rawMarkdown: true });
     if (!success) {
       // Fallback: edit failed (message older than 48h, entity mismatch, network, etc.)
       await editMessageReplyMarkup(deps.token, chatId, messageId, undefined);
@@ -575,6 +645,81 @@ export async function handleCallbackQuery(cb: CallbackQuery, deps: CallbackDeps)
         return `cf:${parsed.answer}`;
       }
 
+      case 'q': {
+        // PA_META question answer (2026-09-02, SPEC §3.3) — the press IS typing the
+        // option text: injected as a synthetic turn through the one-parser path, so
+        // button and typed behaviour cannot diverge. Not reusing cf:y/n — that prefix
+        // is semantically bound to pending_action and cannot carry 1-4 options.
+        const state = await deps.loadTopicState(chatId, threadId);
+        if (!state.pending_question) {
+          await answerCallbackQuery(deps.token, cb.id, 'Question no longer active', true);
+          return 'q:gone';
+        }
+        const optionText = state.pending_question.options[parsed.index];
+        if (optionText === undefined) {
+          await answerCallbackQuery(deps.token, cb.id, 'Invalid option', true);
+          return 'q:bad';
+        }
+        await answerCallbackQuery(deps.token, cb.id, `✅ ${optionText}`);
+        if (messageId) await ackSelection(deps, cb, optionText);
+        deps.injectUpdate(
+          buildSyntheticUpdate({
+            updateId: nextSyntheticUpdateId(),
+            chatId,
+            threadId,
+            messageId: messageId ?? 0,
+            from: cb.from,
+            text: optionText,
+            via: 'button',
+          })
+        );
+        try {
+          await appendTopicEvent(chatId, threadId, {
+            kind: 'question_answered',
+            ref: state.pending_question.task_id ?? null,
+            detail: optionText,
+          });
+        } catch (err) {
+          // The injected turn is the load-bearing effect; a failed audit line must not
+          // turn a completed press into an 'error' outcome (ackSelection precedent).
+          logger.warn('callback', `question_answered event failed: ${(err as Error).message}`, { chatId, threadId });
+        }
+        return 'q:answered';
+      }
+
+      case 'qt': {
+        // Wave-2 task-lane question press (SPEC §3.1 A.3). Convergence, not
+        // injection: the press answers the TASK (answerTask) directly — it must
+        // NOT inject a poll-loop turn, because a task answer lives in the task's
+        // micro-thread and the next drain tick resumes the parked record.
+        const running = await deps.loadRunningTasks(chatId, threadId);
+        const task = running.find((r) => r.id === parsed.taskId);
+        if (!task || task.question === null) {
+          await answerCallbackQuery(deps.token, cb.id, 'Task question no longer active', true);
+          return 'qt:gone';
+        }
+        const optionText = task.question.options[parsed.index];
+        if (optionText === undefined) {
+          await answerCallbackQuery(deps.token, cb.id, 'Invalid option', true);
+          return 'qt:bad';
+        }
+        await answerTask(chatId, threadId, task.id, optionText);
+        if (messageId) await ackSelection(deps, cb, optionText);
+        await answerCallbackQuery(deps.token, cb.id, '✅ Sent to task');
+        try {
+          await appendTopicEvent(chatId, threadId, {
+            kind: 'question_answered',
+            ref: task.id,
+            detail: optionText,
+          });
+        } catch (err) {
+          // answerTask already landed; a failed audit line must not turn the
+          // press into an 'error' outcome (q: precedent above).
+          logger.warn('callback', `question_answered event failed: ${(err as Error).message}`, { chatId, threadId });
+        }
+        return 'qt:answered';
+      }
+
       case 'cc': {
         if (parsed.action === 'menu' || parsed.action === 'back') {
           await answerCallbackQuery(deps.token, cb.id);
@@ -585,15 +730,7 @@ export async function handleCallbackQuery(cb: CallbackQuery, deps: CallbackDeps)
           return `cc:${parsed.action}`;
         }
         if (parsed.action === 'agent') {
-          const [workers, state] = await Promise.all([deps.listWorkerNames(), deps.loadTopicState(chatId, threadId)]);
-          // bp-retry (2026-08-25): mirror the canonical cascade (handleTunableCommand's
-          // `state.preferred_worker || effectiveDefault`, main.ts) instead of terminating
-          // on '' — a fresh/never-hydrated topic (no preferred_worker, no model_status)
-          // used to render a single 'clear' button here while typed /model showed the
-          // full declared list.
-          // `||`, not `??`: the defect being fixed is an EMPTY-STRING worker, which `??`
-          // preserves. Matches the canonical cascade (logic.ts:206, main.ts's tunable handler).
-          const current = state.preferred_worker || state.model_status?.current_worker || (await deps.effectiveDefaultWorker(chatId, threadId));
+          const { values: workers, current } = await pickerContextFor(deps, chatId, threadId, 'agent');
           const keyboard = buildAgentPickerKeyboard(workers, current);
           await answerCallbackQuery(deps.token, cb.id);
           if (messageId) {
@@ -603,26 +740,7 @@ export async function handleCallbackQuery(cb: CallbackQuery, deps: CallbackDeps)
           return 'cc:agent';
         }
         if (parsed.action === 'model' || parsed.action === 'effort') {
-          const state = await deps.loadTopicState(chatId, threadId);
-          // bp-retry (2026-08-25): same fallback fix as cc:agent above — never
-          // terminate on '', which starves declared/observed lookups below and
-          // collapses the picker to just 'clear'.
-          const worker = state.preferred_worker || state.model_status?.current_worker || (await deps.effectiveDefaultWorker(chatId, threadId));
-          const known = parsed.action === 'model' ? KNOWN_CLI_DEFAULT_MODELS : KNOWN_CLI_DEFAULT_EFFORTS;
-          // Authoritative list first (config.yaml tunables.<setting>.values — same source
-          // the typed /model and /effort commands read via logic.ts's renderTunableReport),
-          // falling back to the hardcoded CLI default only when nothing is declared.
-          const declared = worker ? await deps.declaredValues(worker, parsed.action).catch(() => []) : [];
-          const observed = worker ? await deps.observedValues(worker, parsed.action).catch(() => []) : [];
-          const knownDefault = worker ? known[worker.toLowerCase()] : undefined;
-          const values = declared.length > 0
-            ? Array.from(new Set([
-                ...declared,
-                ...observed.filter((v) => !declared.some((d) => d.toLowerCase() === v.toLowerCase())),
-                'clear',
-              ]))
-            : Array.from(new Set([...(knownDefault ? [knownDefault] : []), ...observed, 'clear']));
-          const current = parsed.action === 'model' ? state.model_status?.current_llm : state.model_status?.current_effort;
+          const { values, current } = await pickerContextFor(deps, chatId, threadId, parsed.action);
           const keyboard = buildValuePickerKeyboard(parsed.action, values, current);
           await answerCallbackQuery(deps.token, cb.id);
           if (messageId) {
@@ -631,34 +749,100 @@ export async function handleCallbackQuery(cb: CallbackQuery, deps: CallbackDeps)
           }
           return `cc:${parsed.action}`;
         }
-        // 'set' | 'new' | 'stop' | 'ka' — synthesize a typed command
+        if (parsed.action === 'submit') {
+          // AI-210 (2026-09-06): apply the staged selection by injecting EXACTLY the
+          // typed command the cc:set press used to inject — button and typing cannot
+          // diverge. The staged selection lives in the in-memory card keyboard index
+          // (an async lookup syntheticTextFor cannot do — the wf:retry precedent).
+          const entry = messageId !== undefined ? freshCardEntry(chatId, messageId) : undefined;
+          if (entry?.selection) {
+            const { setting, value } = entry.selection;
+            const text = syntheticTextFor({ prefix: 'cc', action: 'set', setting, value, raw: `cc:set:${setting}:${value}` });
+            await answerCallbackQuery(deps.token, cb.id, `Applying ${setting} → ${value}…`);
+            if (messageId) {
+              // Back to the top-level card (what cc:back does today). The entry is
+              // CLEARED, not re-recorded: after submit the displayed keyboard IS the
+              // top-level menu, and the top-level menu is what the sweep re-attaches
+              // by default — a recorded top-level keyboard would be redundant state.
+              await editMessageReplyMarkup(deps.token, chatId, messageId, buildControlCardKeyboard());
+              clearCardKeyboard(chatId, messageId);
+            }
+            deps.injectUpdate(
+              buildSyntheticUpdate({ updateId: nextSyntheticUpdateId(), chatId, threadId, messageId: messageId ?? 0, from: cb.from, text: text!, via: 'button' })
+            );
+            return 'cc:submit';
+          }
+          // No / expired selection: exactly cc:back — nothing was applied.
+          await answerCallbackQuery(deps.token, cb.id, 'No change');
+          if (messageId) {
+            await editMessageReplyMarkup(deps.token, chatId, messageId, buildControlCardKeyboard());
+            clearCardKeyboard(chatId, messageId);
+          }
+          return 'cc:submit:no-change';
+        }
+        if (parsed.action === 'discard') {
+          // AI-210: revert the staged selection — nothing was applied. Exactly cc:back.
+          const entry = messageId !== undefined ? freshCardEntry(chatId, messageId) : undefined;
+          await answerCallbackQuery(
+            deps.token,
+            cb.id,
+            entry?.selection ? `Discarded — ${entry.selection.setting} unchanged` : 'Discarded'
+          );
+          if (messageId) {
+            await editMessageReplyMarkup(deps.token, chatId, messageId, buildControlCardKeyboard());
+            clearCardKeyboard(chatId, messageId);
+          }
+          return 'cc:discard';
+        }
+        if (parsed.action === 'set') {
+          // AI-210 (2026-09-06): a value press STAGES — no injection, no state change.
+          // Re-render the same picker with the tapped value staged (▸) and record the
+          // selection; Submit injects the typed command. (Topic-state writes happen
+          // under the topic lock inside processUpdate — staging keeps this press
+          // side-effect-free until the operator confirms.)
+          const ctx = await pickerContextFor(deps, chatId, threadId, parsed.setting);
+          const keyboard = parsed.setting === 'agent'
+            ? buildAgentPickerKeyboard(ctx.values, ctx.current, parsed.value)
+            : buildValuePickerKeyboard(parsed.setting, ctx.values, ctx.current, parsed.value);
+          await answerCallbackQuery(
+            deps.token,
+            cb.id,
+            `${parsed.setting[0].toUpperCase()}${parsed.setting.slice(1)} → ${parsed.value} · Submit to apply`
+          );
+          if (messageId) {
+            await editMessageReplyMarkup(deps.token, chatId, messageId, keyboard);
+            recordCardKeyboard(chatId, messageId, keyboard, Date.now(), { setting: parsed.setting, value: parsed.value });
+          }
+          return `cc:set:${parsed.setting}`;
+        }
+        // 'new' | 'stop' | 'ka' — synthesize a typed command
         const text = syntheticTextFor(parsed);
         if (!text) {
           await answerCallbackQuery(deps.token, cb.id, 'Unhandled control');
           return 'cc:unhandled';
         }
-        await answerCallbackQuery(deps.token, cb.id);
+        // AI-192 (2026-09-03): NO selected-value echo on cc: presses. ackSelection
+        // used to append "✅ Selected: …" to the pinned card and strip its keyboard
+        // in the same editMessageText; the echo was erased anyway when the injected
+        // command's dispatch refreshed the card (renderStatusCard regenerates the
+        // text), and between press and refresh the picker was simply gone. The toast
+        // carries the feedback; the pin itself just reflects the new state when the
+        // synthetic command's refresh lands (keyboard re-attached there).
+        await answerCallbackQuery(
+          deps.token,
+          cb.id,
+          parsed.action === 'new' ? 'New topic' : parsed.action === 'stop' ? 'Stop worker' : 'Keep awake'
+        );
         if (messageId) {
-          await ackSelection(
-            deps,
-            cb,
-            parsed.action === 'set'
-              ? `${parsed.setting[0].toUpperCase()}${parsed.setting.slice(1)} → ${parsed.value}`
-              : parsed.action === 'new'
-                ? 'New topic'
-                : parsed.action === 'stop'
-                  ? 'Stop worker'
-                  : 'Keep awake'
-          );
-          // 'set' completes the submenu press; 'new'/'stop'/'ka' also leave no submenu
-          // displayed (keyboard just got stripped above) — either way there is nothing
-          // left to protect from the sweep's top-level rewrite.
+          // 'new'/'stop'/'ka' are top-level presses with no submenu displayed — nothing
+          // left to protect from the sweep's top-level rewrite. (cc:set no longer
+          // passes here — it stages in its own branch above.)
           clearCardKeyboard(chatId, messageId);
         }
         deps.injectUpdate(
           buildSyntheticUpdate({ updateId: nextSyntheticUpdateId(), chatId, threadId, messageId: messageId ?? 0, from: cb.from, text, via: 'button' })
         );
-        return parsed.action === 'set' ? `cc:set:${parsed.setting}` : `cc:${parsed.action}`;
+        return `cc:${parsed.action}`;
       }
 
       case 'wf': {
@@ -966,6 +1150,72 @@ export async function handleCallbackQuery(cb: CallbackQuery, deps: CallbackDeps)
         }
         if (messageId) await ackSelection(deps, cb, 'Replay queued');
         return 'dq:replayed';
+      }
+
+      case 'ru': {
+        // WP-D2 B.2 (2026-09-02): weekly-digest rules accept/reject — same spawn
+        // pattern as dr: (fire-and-forget pa CLI, ack into the message).
+        const args = parsed.action === 'a'
+          ? ['rules', 'accept', parsed.ruleId]
+          : ['rules', 'supersede', parsed.ruleId, '--reason', 'rejected via weekly-digest button'];
+        spawnImpl('pa', args, { cwd: deps.botCwd, ...SPAWN_OPTS }).unref();
+        await answerCallbackQuery(deps.token, cb.id, parsed.action === 'a' ? '✅ Accepting…' : '✖ Rejecting…');
+        if (messageId) {
+          await ackSelection(deps, cb, parsed.action === 'a' ? `Accept rule ${parsed.ruleId}` : `Reject rule ${parsed.ruleId}`);
+        }
+        return parsed.action === 'a' ? 'ru:accepted' : 'ru:rejected';
+      }
+
+      case 'si': {
+        // WP-D2 B.5 (2026-09-02): mute a census family via a fix record — two-tap.
+        if (!parsed.confirmed) {
+          await answerCallbackQuery(deps.token, cb.id, 'Tap again to confirm mute');
+          if (messageId) {
+            await editMessageReplyMarkup(deps.token, chatId, messageId, buildFamilyMuteKeyboard(parsed.family, true));
+          }
+          return 'si:unconfirmed';
+        }
+        spawnImpl('pa', ['fix', parsed.family, '--note', 'muted from nightly report button'], { cwd: deps.botCwd, ...SPAWN_OPTS }).unref();
+        await answerCallbackQuery(deps.token, cb.id, '🔇 Muting…');
+        if (messageId) await ackSelection(deps, cb, `Mute ${parsed.family}`);
+        return 'si:muted';
+      }
+
+      case 'ch': {
+        // WP-D2 B.6 (2026-09-02): re-run a failed chain — two-tap, then re-validate
+        // the chain still exists (the report may predate its removal, dq: precedent).
+        if (!parsed.confirmed) {
+          await answerCallbackQuery(deps.token, cb.id, 'Tap again to confirm re-run');
+          if (messageId) {
+            await editMessageReplyMarkup(deps.token, chatId, messageId, buildChainRetryKeyboard(parsed.chain, true));
+          }
+          return 'ch:unconfirmed';
+        }
+        let exists = false;
+        try {
+          await readFile(join(paHome(), 'chains', `${parsed.chain}.yaml`), 'utf8');
+          exists = true;
+        } catch {
+          exists = false;
+        }
+        if (!exists) {
+          await answerCallbackQuery(deps.token, cb.id, 'Unknown chain — it may have been removed', true);
+          if (messageId) await ackSelection(deps, cb, `Re-run ${parsed.chain} — unknown chain`);
+          return 'ch:unknown';
+        }
+        spawnImpl('pa', ['chain', 'run', parsed.chain], { cwd: deps.botCwd, ...SPAWN_OPTS }).unref();
+        await answerCallbackQuery(deps.token, cb.id, `🔁 Re-running ${parsed.chain}`);
+        if (messageId) await ackSelection(deps, cb, `Chain ${parsed.chain} re-run started`);
+        return 'ch:started';
+      }
+
+      case 'wt': {
+        // WP-D2 B.7 (2026-09-02): re-register a terminal watch — idempotent and
+        // side-effect-light (a fresh watch row), so no two-tap.
+        spawnImpl('pa', ['watch', 're-register', parsed.watchId], { cwd: deps.botCwd, ...SPAWN_OPTS }).unref();
+        await answerCallbackQuery(deps.token, cb.id, '🔁 Re-registering…');
+        if (messageId) await ackSelection(deps, cb, `Re-register watch ${parsed.watchId}`);
+        return 'wt:re-registered';
       }
     }
   } catch (err) {

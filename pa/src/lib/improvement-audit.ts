@@ -44,7 +44,7 @@ export interface AuditRecord {
   target_kind?: 'skill' | 'maintenance-job';
   action: 'applied-fix' | 'approved-new-skill' | 'rejected_auto' | 'rejected_stale' | 'rolled-back' | 'validation-failed'
     // Autonomous CODE-fix capability (2026-07-11) — see
-    // plans/2026-07-11-autonomous-code-fix-capability.md. code-fixer.ts's attemptCodeFix()
+    // that plan. code-fixer.ts's attemptCodeFix()
     // appends one of these for every terminal branch, mirroring gateAndApprove's own
     // one-audit-record-per-decision convention.
     | 'applied-code-fix'
@@ -63,11 +63,11 @@ export interface AuditRecord {
     // Quiet-tree gate (2026-08-15): active reservations or recent non-churn path modifications
     // indicate concurrent work — defer to next nightly run.
     | 'code-fix-skipped-concurrent-activity'
-    // F5 rework (2026-08-23, plans/2026-08-23-code-fix-multi-per-night-SPEC.md): diff touches
+    // F5 rework (2026-08-23, the code-fix multi-per-night spec): diff touches
     // a file a fix applied earlier in the SAME nightly run already changed — reverted so every
     // applied fix in a run stays independently `git revert`-able.
     | 'code-fix-skipped-same-run-overlap'
-    // Git-optional gate (2026-08-31, plans/2026-08-31-git-optional-SPEC.md):
+    // Git-optional gate (2026-08-31, the git-optional spec):
     // git_workflow disabled in config (or not inside a git work tree) — the
     // code-fix lane was never attempted.
     | 'code-fix-skipped-git-disabled'

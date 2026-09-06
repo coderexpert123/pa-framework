@@ -20,26 +20,39 @@
  * the honest death notice.
  */
 import { readFile, stat } from 'fs/promises';
-import { sendMessage, sendMessageWithKeyboard, sendTyping, editMessageText, type InlineKeyboardMarkup } from './telegram.js';
+import { sendMessage, sendMessageWithKeyboard, sendMessageWithKeyboardDetailed, sendTyping, editMessageText, type InlineKeyboardMarkup } from './telegram.js';
 import { sendReplyText } from './rich-message.js';
 import { getPriorSessionPath, buildResumeArgs } from './session.js';
-import { parseMetadata, buildModelStatusSnapshot, renderStatusCard, resolveWorkerLlm, selectWorkerTunables, formatWorkerReply } from './logic.js';
+import { parseMetadata, buildModelStatusSnapshot, renderStatusCard, resolveWorkerLlm, selectWorkerTunables, formatWorkerReply, isPrematureAsyncReply } from './logic.js';
 import type { ModelStatusReasonCode } from './types.js';
 import { loadTopicState, saveTopicState, addTurn } from './conversation.js';
 import { deliveredKey, wasDelivered, markDelivered } from './delivered-store.js';
 import { listPendingDispatches, removePendingDispatch, pendingDispatchKey, updatePendingDispatch, type PendingDispatch } from './pending-dispatches.js';
-import { putResend } from './resend-store.js';
+import { putResend, takeResend, resendKey } from './resend-store.js';
 import { isBarePlaceholderUserText, transcribeVoiceMessage, formatTranscriptUserText, extensionForAttachment, voiceAttachmentPath } from './voice.js';
 import { buildResendKeyboard } from './callbacks.js';
 import { makeRefId } from './ref-id.js';
 import { markTopicRecovering, clearTopicRecovering } from './recovery-gate.js';
 import { isTopicStopped } from './worker-stop.js';
+import { ORPHAN_HARVEST_WINDOW_MS } from './task-executor.js';
 import { listWorkerPids, isProcessAlive } from '../../../pa/dist/src/worker-pids.js';
 import { getDescendantPids } from '../../../pa/dist/src/process-tree.js';
 import { executeWorker } from '../../../pa/dist/src/worker-exec.js';
 import { loadConfig } from '../../../pa/dist/src/config.js';
 import { logger } from '../../../pa/dist/src/lib/log.js';
 import { getKeepAwakeStatus } from './keepawake.js';
+
+/** Minimal structural logger so tests can observe the held-record notice via
+ *  `_setLoggerForTest` (AI-208 fix-wave m3). */
+type ReaperNoticeLogger = {
+  info: (module: string, message: string, ctx?: Record<string, unknown>) => void;
+};
+let noticeLog: ReaperNoticeLogger = logger;
+
+/** Test hook: injects a fake logger for the held-record notice (pass null to restore the real one). */
+export function _setNoticeLoggerForTest(fake: ReaperNoticeLogger | null): void {
+  noticeLog = fake ?? logger;
+}
 
 const CLAUDE_FAMILY = new Set(['claude', 'zclaude']);
 
@@ -49,9 +62,10 @@ export const TRANSCRIPT_QUIESCENT_MS = 90_000;
 export const REAP_MAX_WAIT_MS = 45 * 60 * 1000;
 export const REAP_POLL_MS = 20_000;
 export const TYPING_REFRESH_MS = 4_000;
-/** Same value as main.ts's ORPHAN_HARVEST_WINDOW_MS — protects the
- * re-dispatched worker from the per-minute orphan sweep. */
-const REDISPATCH_HARVEST_MS = 50 * 60 * 1000;
+/** Protects the re-dispatched worker from the per-minute orphan sweep — the
+ * same harvest window that guarded the original dispatch (single source:
+ * task-executor.ts; the "same value" restatement drifted once already). */
+const REDISPATCH_HARVEST_MS = ORPHAN_HARVEST_WINDOW_MS;
 
 // ---------------------------------------------------------------------------
 // Pure transcript parsing
@@ -155,6 +169,11 @@ export function extractTeeResult(raw: string): string | null {
 
 export interface ReaperDeps {
   send: (record: PendingDispatch, text: string, replyMarkup?: InlineKeyboardMarkup) => Promise<boolean>;
+  /** Optional: like `send`, but reports whether a delivery failure is terminal
+   * (retrying can never succeed — e.g. Telegram 400 "chat not found"). The
+   * death-notice path prefers it; when absent, `send` is used and every
+   * failure is treated as non-terminal (pre-AI-186 behavior). */
+  sendDetailed?: (record: PendingDispatch, text: string, replyMarkup?: InlineKeyboardMarkup) => Promise<{ delivered: boolean; terminal?: boolean }>;
   readTranscript: (record: PendingDispatch) => Promise<{ content: string; mtimeMs: number } | null>;
   isTopicWorkerAlive: (record: PendingDispatch) => Promise<boolean>;
   now: () => number;
@@ -296,6 +315,38 @@ export function makeDefaultDeps(token: string, secrets?: Record<string, string>)
       }
       return delivered;
     },
+    sendDetailed: async (record, text, replyMarkup) => {
+      const refId = makeRefId();
+      const fullText = `${text}\n\n_Ref: ${refId}_`;
+      let delivered: boolean;
+      let terminal = false;
+      if (replyMarkup !== undefined) {
+        const r = await sendMessageWithKeyboardDetailed(token, record.chatId, fullText, replyMarkup, record.messageId, record.threadId);
+        delivered = r.messageId !== null;
+        terminal = r.terminalError;
+      } else {
+        delivered = (await sendReplyText(token, record.chatId, fullText, record.messageId, record.threadId, process.env)).delivered;
+      }
+      if (delivered) {
+        logger.info('bot', 'system message sent', { refId, kind: 'recovered', chatId: record.chatId, threadId: record.threadId, textPreview: text.slice(0, 200) });
+        // Same post-delivery bookkeeping as `send` (duplicated deliberately —
+        // minimal diff; extract only if a third caller appears).
+        try {
+          const topicState = await loadTopicState(record.chatId, record.threadId);
+          const userTurnPresent = topicState.turns.some(
+            (t) => t.role === 'user' && t.message_id === record.messageId,
+          );
+          if (!userTurnPresent) {
+            addTurn(topicState, { role: 'user', text: record.userText, timestamp: record.startedAt, message_id: record.messageId, worker: record.session?.worker ?? 'worker' });
+          }
+          addTurn(topicState, { role: 'assistant', text, timestamp: new Date().toISOString(), worker: 'worker', refId });
+          await saveTopicState(topicState);
+        } catch (err) {
+          logger.warn('reaper', 'failed to persist recovered turns', { error: String(err) });
+        }
+      }
+      return { delivered, terminal };
+    },
     readTranscript: defaultReadTranscript,
     isTopicWorkerAlive: isTopicWorkerAliveByRegistry,
     readTeePath: findTeePathByRegistry,
@@ -410,7 +461,7 @@ async function reviveVoiceNote(record: PendingDispatch, token: string, secrets: 
 // Per-record evaluation (single step, no sleeping — the loop lives outside)
 // ---------------------------------------------------------------------------
 
-export type ReapOutcome = 'already-delivered' | 'recovered' | 'dead' | 'waiting' | 'requeued' | 'parked';
+export type ReapOutcome = 'already-delivered' | 'recovered' | 'dead' | 'waiting' | 'requeued' | 'parked' | 'held';
 
 function preview(text: string): string {
   const t = text.replace(/\s+/g, ' ').trim();
@@ -493,6 +544,28 @@ export async function evaluatePendingDispatch(
   deps: ReaperDeps,
   deadlineMs: number,
 ): Promise<ReapOutcome> {
+  // AI-208 WP-4 E3: a held record (drained by a /steer or /stop, transcript
+  // held for the topic's next dispatch instead of dispatched) is NOT a dead
+  // dispatch. It must never get a death notice and never be requeued as a
+  // failure — the next dispatch in the topic absorbs it (absorbHeldDispatchRecords)
+  // and the requeue ladder would only duplicate it. Skip it entirely — not
+  // 'waiting' — so it settles this round and the topic's recovery gate clears,
+  // letting that absorbing dispatch through. The record stays on disk.
+  // Fix-wave m3: the skip notice logs ONCE (first pass sets heldNotifiedAt on
+  // the record, best-effort) so a record held across many reaper passes
+  // doesn't spam the log.
+  if (record.heldForTopic === true) {
+    if (record.heldNotifiedAt === undefined) {
+      noticeLog.info('reaper', 'held record left for next dispatch',
+        { updateId: record.updateId, chatId: record.chatId, threadId: record.threadId });
+      await updatePendingDispatch(
+        pendingDispatchKey(record.chatId, record.threadId, record.updateId),
+        { heldNotifiedAt: new Date().toISOString() },
+      ).catch(() => {}); // best-effort: a failed write must not fail the evaluation
+    }
+    return 'held';
+  }
+
   // WP-C C2: a parked ladder record (requeueNotBefore set by main.ts's failure
   // suppression) belongs to the maintenance drain, not the reaper. Skipping it
   // entirely — not 'waiting' — lets the topic's gate clear this round so the
@@ -525,11 +598,11 @@ export async function evaluatePendingDispatch(
     if (sourceResult !== null) {
       // Worker finished producing output while we were checking.
       // Deliver the harvested reply.
-      const { cleaned } = parseMetadata(sourceResult);
+      const { cleaned, meta } = parseMetadata(sourceResult);
       const body = cleaned.trim() || sourceResult.trim();
       const worker = record.workerName ?? record.session?.worker ?? 'agy';
       const formatted = formatWorkerReply(body, worker);
-      if (formatted === '') {
+      if (formatted === '' || (meta === null && isPrematureAsyncReply(body))) {
         // Worker produced no output — treat as null source
         return 'waiting';
       }
@@ -570,11 +643,11 @@ export async function evaluatePendingDispatch(
   if (teeRaw !== null) {
     const extracted = extractTeeResult(teeRaw);
     if (extracted) {
-      const { cleaned } = parseMetadata(extracted);
+      const { cleaned, meta } = parseMetadata(extracted);
       const body = cleaned.trim() || extracted.trim();
       const worker = record.workerName ?? record.session?.worker ?? 'agy';
       const formatted = formatWorkerReply(body, worker);
-      if (formatted === '') {
+      if (formatted === '' || (meta === null && isPrematureAsyncReply(body))) {
         // Fall through to transcript check
       } else {
         const sent = await deps.send(record, formatted);
@@ -599,11 +672,11 @@ export async function evaluatePendingDispatch(
       const final = extractFinalAssistantText(transcript.content, record.startedAt);
       const quiescent = deps.now() - transcript.mtimeMs >= TRANSCRIPT_QUIESCENT_MS;
       if (final && (quiescent || expired)) {
-        const { cleaned } = parseMetadata(final.text);
+        const { cleaned, meta } = parseMetadata(final.text);
         const body = cleaned.trim() || final.text.trim();
         const worker = record.workerName ?? record.session?.worker ?? 'agy';
         const formatted = formatWorkerReply(body, worker);
-        if (formatted === '') {
+        if (formatted === '' || (meta === null && isPrematureAsyncReply(body))) {
           // Fall through to redispatch
         } else {
           const sent = await deps.send(record, formatted);
@@ -627,11 +700,11 @@ export async function evaluatePendingDispatch(
   if (session?.session_id && !expired && deps.redispatchWithResume) {
     const result = await deps.redispatchWithResume(record);
     if (result !== null && result !== undefined) {
-      const { cleaned } = parseMetadata(result);
+      const { cleaned, meta } = parseMetadata(result);
       const body = cleaned.trim() || result.trim();
       const worker = record.workerName ?? record.session?.worker ?? 'agy';
       const formatted = formatWorkerReply(body, worker);
-      if (formatted === '') {
+      if (formatted === '' || (meta === null && isPrematureAsyncReply(body))) {
         // Fall through to death notice
         resumeAttemptedAndFailed = true;
       } else {
@@ -715,8 +788,21 @@ export async function evaluatePendingDispatch(
       storedAt: new Date().toISOString(),
     }).catch(() => {});
     const keyboard = buildResendKeyboard(record.chatId, record.threadId, record.updateId);
-    const sent = await deps.send(record, deathNotice(record), keyboard).catch(() => false);
-    if (!sent) return 'waiting';
+    // AI-186: prefer the detailed send when injected — it classifies terminal
+    // failures (400 chat not found) so an unreachable chat settles 'dead'
+    // instead of retrying every poll for the whole reap window.
+    const sentInfo = deps.sendDetailed
+      ? await deps.sendDetailed(record, deathNotice(record), keyboard).catch(() => ({ delivered: false, terminal: false }))
+      : { delivered: await deps.send(record, deathNotice(record), keyboard).catch(() => false), terminal: false as const };
+    if (!sentInfo.delivered) {
+      if (sentInfo.terminal) {
+        logger.warn('reaper', 'death notice undeliverable (terminal send failure) — dropping dispatch and its resend record', { updateId: record.updateId, chatId: record.chatId, threadId: record.threadId });
+        await takeResend(resendKey(record.chatId, record.threadId, record.updateId)).catch(() => {});
+        await finish(record, 'dead');
+        return 'dead';
+      }
+      return 'waiting';
+    }
     await finish(record, 'dead');
     return 'dead';
   }
@@ -747,7 +833,7 @@ function recordTopicKey(record: PendingDispatch): string {
  */
 export async function reapOrphanedDispatches(
   token: string,
-  opts: { deps?: ReaperDeps; maxWaitMs?: number; pollMs?: number; sleep?: (ms: number) => Promise<void>; secrets?: Record<string, string>; requeueUpdate?: (record: PendingDispatch) => void; reviveVoiceNote?: (record: PendingDispatch) => Promise<string | null> } = {},
+  opts: { deps?: ReaperDeps; maxWaitMs?: number; pollMs?: number; sleep?: (ms: number) => Promise<void>; secrets?: Record<string, string>; requeueUpdate?: (record: PendingDispatch) => void; reviveVoiceNote?: (record: PendingDispatch) => Promise<string | null>; allowedChatIds?: ReadonlySet<number> } = {},
 ): Promise<void> {
   const deps = opts.deps
     ?? { ...makeDefaultDeps(token, opts.secrets ?? {}),
@@ -775,6 +861,14 @@ export async function reapOrphanedDispatches(
       const waiting: PendingDispatch[] = [];
       for (const record of records) {
         try {
+          // AI-186: a record for a chat the operator never allowed (e.g. a leaked
+          // test fixture) can never be delivered — quarantine it dead at round 0
+          // instead of death-noticing into a 400 chat-not-found retry flood.
+          if (opts.allowedChatIds && !opts.allowedChatIds.has(record.chatId)) {
+            logger.warn('reaper', 'quarantining dispatch to chat outside allowedChatIds — unreachable', { updateId: record.updateId, chatId: record.chatId, threadId: record.threadId });
+            await finish(record, 'dead');
+            continue;
+          }
           const outcome = await evaluatePendingDispatch(record, deps, deadline);
           if (outcome === 'waiting') waiting.push(record);
         } catch (err) {

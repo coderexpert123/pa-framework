@@ -25,7 +25,7 @@ CREDENTIALS_FILE = PA_HOME / "google-credentials.json"
 ALL_SCOPES = [
     "https://www.googleapis.com/auth/chat.messages.readonly",
     "https://www.googleapis.com/auth/chat.spaces.readonly",
-    "https://www.googleapis.com/auth/contacts.readonly",
+    "https://www.googleapis.com/auth/contacts",
     "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/photoslibrary.readonly",
     "https://www.googleapis.com/auth/gmail.send",

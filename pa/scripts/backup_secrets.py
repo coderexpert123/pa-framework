@@ -223,8 +223,8 @@ def main() -> int:
     try:
         service = _drive()
     except RuntimeError as e:
-        # No existing handler around _drive() before this (2026-08-23,
-        # plans/2026-08-23-alerts-wave-SPEC.md WP-F correction 14) — an
+        # No existing handler around _drive() before this (2026-08-23
+        # alerts-wave spec, WP-F correction 14) — an
         # expired/revoked Google token crashed this weekly backup with a raw
         # traceback instead of kicking a reauth link. WP-G's helper rate-limits
         # itself to one Telegram send per 6h across all four Google-auth

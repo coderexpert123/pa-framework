@@ -1,23 +1,61 @@
 // pii-scan:ignore-start
 /**
- * Tests for telegram.ts redaction integration
+ * Tests for AI-184 (2026-09-03): redaction relocation on the pa-side send path.
  *
- * Tests that sendToTelegram applies redaction to message text.
+ * sendToTelegram delivers to the OPERATOR'S OWN CHAT (alerts, `pa notify`,
+ * every skill's telegram_output), so the sent body keeps real text — the
+ * operator's name must be deliverable, and name-bearing outbound drafts must
+ * survive in full. The scrub lives on the LOG side: the app.log.jsonl
+ * delivery row's textPreview context must keep it. BOTH directions pinned:
+ *  - name PRESENT in the delivered body (fetch-stub capture), and
+ *  - name ABSENT from the logged copy (real app.log.jsonl read-back).
  */
 
 import './test-env-guard.js';
 
 import { describe, it, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, writeFileSync, rmSync, existsSync } from 'fs';
+import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { sendToTelegram } from '../src/telegram.js';
+import { flushLog } from '../src/lib/log.js';
 import { resetRedactCache } from '../src/lib/redact.js';
 
 const TEST_PA_HOME = join(tmpdir(), `pa-test-telegram-redact-${process.pid}`);
 
-describe('telegram.ts redaction', () => {
+// Synthetic ≥8-char secrets.env literal exercising the PA_USER_NAME defect class
+// without embedding a real name in the tree.
+const OPERATOR_NAME = 'OperatorNameFixture';
+
+function writeSecrets(): void {
+  writeFileSync(join(TEST_PA_HOME, 'secrets.env'), `PA_USER_NAME=${OPERATOR_NAME}\n`);
+}
+
+function stubFetch(): ReturnType<typeof mock.fn> {
+  const mockFetch = mock.fn(async (_url: unknown, _init: unknown) =>
+    ({
+      ok: true,
+      json: async () => ({ ok: true }),
+      text: async () => '{"ok":true}',
+    } as Response)
+  );
+  global.fetch = mockFetch as unknown as typeof fetch;
+  return mockFetch;
+}
+
+function lastDeliveryRow(): Record<string, unknown> | undefined {
+  const p = join(TEST_PA_HOME, 'app.log.jsonl');
+  if (!existsSync(p)) return undefined;
+  const lines = readFileSync(p, 'utf8').split('\n').filter((l) => l.trim());
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const row = JSON.parse(lines[i]) as Record<string, unknown>;
+    if (row.message === 'skill message sent') return row;
+  }
+  return undefined;
+}
+
+describe('telegram.ts redaction (AI-184: delivered raw, logged scrubbed)', () => {
   beforeEach(() => {
     // Clean up any existing test directory
     if (existsSync(TEST_PA_HOME)) {
@@ -25,10 +63,12 @@ describe('telegram.ts redaction', () => {
     }
     mkdirSync(TEST_PA_HOME, { recursive: true });
     process.env.PA_HOME = TEST_PA_HOME;
+    writeSecrets();
     resetRedactCache();
   });
 
   afterEach(() => {
+    resetRedactCache();
     // Clean up test directory
     if (existsSync(TEST_PA_HOME)) {
       rmSync(TEST_PA_HOME, { recursive: true, force: true });
@@ -36,75 +76,80 @@ describe('telegram.ts redaction', () => {
     delete process.env.PA_HOME;
   });
 
-  it('should redact secrets in message text before sending', async () => {
-    const secretsPath = join(TEST_PA_HOME, 'secrets.env');
-    writeFileSync(secretsPath, 'BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz');
+  it('delivered body keeps a secrets.env literal (operator name PRESENT)', async () => {
+    const mockFetch = stubFetch();
 
-    const mockFetch = mock.fn(async (_url: unknown, _init: unknown) =>
-      ({
-        ok: true,
-        json: async () => ({ ok: true }),
-        text: async () => '{"ok":true}',
-      } as Response)
-    );
-    global.fetch = mockFetch as unknown as typeof fetch;
-
-    const text = 'The bot token is 1234567890:ABCdefGHIjklMNOpqrsTUVwxyz';
+    const text = `Hi ${OPERATOR_NAME}, your monthly transfer draft is ready.`;
     const config = { chat_id: '123', thread_id: 456, token_secret: 'TEST_TOKEN_VAR' };
-    const token = 'test-token';
 
-    const result = await sendToTelegram(text, config, token, 'MarkdownV2');
+    const result = await sendToTelegram(text, config, 'test-token');
 
     assert.equal(result.ok, true);
-    // Verify the redacted text was sent, not the original. NOTE: this test sends
-    // with parseMode 'MarkdownV2', so sanitizeMdV2 escapes the tag's angle
-    // brackets — the wire form is \<redacted:BOT_TOKEN\>.
     const sentBody = JSON.parse((mockFetch.mock.calls[0]!.arguments[1] as { body: string }).body);
-    assert.ok(sentBody.text.includes('<redacted:BOT\\_TOKEN\\>'), `expected escaped redaction tag in: ${sentBody.text}`);
-    assert.ok(!sentBody.text.includes('1234567890:ABCdefGHIjklMNOpqrsTUVwxyz'));
+    assert.ok(sentBody.text.includes(OPERATOR_NAME), `delivered body must keep the name, got: ${sentBody.text}`);
+    assert.ok(!sentBody.text.includes('<redacted:'), 'delivered body must carry no redaction placeholder');
 
     mockFetch.mock.restore();
   });
 
-  it('should apply generic shape patterns to message text', async () => {
-    const mockFetch = mock.fn(async (_url: unknown, _init: unknown) =>
-      ({
-        ok: true,
-        json: async () => ({ ok: true }),
-        text: async () => '{"ok":true}',
-      } as Response)
-    );
-    global.fetch = mockFetch as unknown as typeof fetch;
+  it('delivered body keeps generic token shapes (draft-corruption parity case)', async () => {
+    const mockFetch = stubFetch();
 
-    const text = 'API key: sk-live_1234567890abcdefghijklmnop and GitHub: ghp_1234567890abcdefghijklmnopqrstuvwxyz';
+    const apiToken = 'sk-' + 'TESTSECRET123456abcdefghijklmnop';
+    const text = `API key: ${apiToken}`;
     const config = { chat_id: '123', token_secret: 'TEST_TOKEN_VAR' };
-    const token = 'test-token';
 
-    const result = await sendToTelegram(text, config, token);
+    const result = await sendToTelegram(text, config, 'test-token');
 
     assert.equal(result.ok, true);
     const sentBody = JSON.parse((mockFetch.mock.calls[0]!.arguments[1] as { body: string }).body);
-    assert.ok(sentBody.text.includes('<redacted:token>'));
-    assert.ok(!sentBody.text.includes('sk-live_1234567890abcdefghijklmnop'));
+    assert.ok(sentBody.text.includes(apiToken), 'delivered body must keep token-shaped text intact');
+
+    mockFetch.mock.restore();
+  });
+
+  it('delivered body keeps the literal under MarkdownV2 too (escape-free fixture)', async () => {
+    const mockFetch = stubFetch();
+
+    const text = `Name ${OPERATOR_NAME} and a _Ref: s-abcdef123456_`;
+    const config = { chat_id: '123', token_secret: 'TEST_TOKEN_VAR' };
+
+    const result = await sendToTelegram(text, config, 'test-token', 'MarkdownV2');
+
+    assert.equal(result.ok, true);
+    const sentBody = JSON.parse((mockFetch.mock.calls[0]!.arguments[1] as { body: string }).body);
+    assert.ok(sentBody.text.includes(OPERATOR_NAME), 'MdV2 sanitize must not eat the name');
+    assert.ok(/_Ref: s\\?-abcdef123456_/.test(sentBody.text), 'caller-stamped ref reused');
+
+    mockFetch.mock.restore();
+  });
+
+  it('logged copy stays scrubbed: app.log textPreview has the placeholder, never the literal', async () => {
+    const mockFetch = stubFetch();
+
+    const text = `Hi ${OPERATOR_NAME}, delivery notice`;
+    const config = { chat_id: '123', token_secret: 'TEST_TOKEN_VAR' };
+
+    const result = await sendToTelegram(text, config, 'test-token');
+    assert.equal(result.ok, true);
+    await flushLog();
+
+    const row = lastDeliveryRow();
+    assert.ok(row, 'delivery log row written');
+    const preview = String(row!['textPreview']);
+    assert.ok(!preview.includes(OPERATOR_NAME), 'logged copy must NOT keep the name');
+    assert.ok(preview.includes('<redacted:PA_USER_NAME>'), 'placeholder recorded in the log');
 
     mockFetch.mock.restore();
   });
 
   it('should not redact ordinary text', async () => {
-    const mockFetch = mock.fn(async (_url: unknown, _init: unknown) =>
-      ({
-        ok: true,
-        json: async () => ({ ok: true }),
-        text: async () => '{"ok":true}',
-      } as Response)
-    );
-    global.fetch = mockFetch as unknown as typeof fetch;
+    const mockFetch = stubFetch();
 
     const text = 'The quick brown fox jumps over the lazy dog. Contact support@example.com';
     const config = { chat_id: '123', token_secret: 'TEST_TOKEN_VAR' };
-    const token = 'test-token';
 
-    const result = await sendToTelegram(text, config, token);
+    const result = await sendToTelegram(text, config, 'test-token');
 
     assert.equal(result.ok, true);
     const sentBody = JSON.parse((mockFetch.mock.calls[0]!.arguments[1] as { body: string }).body);
@@ -117,43 +162,30 @@ describe('telegram.ts redaction', () => {
   it('should handle empty chat_id before redaction', async () => {
     const text = 'Message with token sk-1234567890abcdefghijklmnop';
     const config = { chat_id: '', thread_id: 456, token_secret: 'TEST_TOKEN_VAR' };
-    const token = 'test-token';
 
-    const result = await sendToTelegram(text, config, token);
+    const result = await sendToTelegram(text, config, 'test-token');
 
     assert.equal(result.ok, false);
     assert.equal(result.reason, 'no-chat-id');
   });
 
-  it('should handle empty text after redaction gracefully', async () => {
-    const secretsPath = join(TEST_PA_HOME, 'secrets.env');
-    writeFileSync(secretsPath, 'SHORT_TOKEN=ab'); // Too short to redact
-
+  it('should handle empty text gracefully', async () => {
     const text = '   '; // Whitespace only
     const config = { chat_id: '123', token_secret: 'TEST_TOKEN_VAR' };
-    const token = 'test-token';
 
-    const result = await sendToTelegram(text, config, token);
+    const result = await sendToTelegram(text, config, 'test-token');
 
     assert.equal(result.ok, false);
     assert.equal(result.reason, 'empty-text');
   });
 
-  it('should preserve ref-ID trailer after redaction', async () => {
-    const mockFetch = mock.fn(async (_url: unknown, _init: unknown) =>
-      ({
-        ok: true,
-        json: async () => ({ ok: true }),
-        text: async () => '{"ok":true}',
-      } as Response)
-    );
-    global.fetch = mockFetch as unknown as typeof fetch;
+  it('should preserve ref-ID trailer after redaction relocation', async () => {
+    const mockFetch = stubFetch();
 
     const text = 'Message with key abcdef1234567890abcdef12';
     const config = { chat_id: '123', token_secret: 'TEST_TOKEN_VAR' };
-    const token = 'test-token';
 
-    const result = await sendToTelegram(text, config, token, 'MarkdownV2');
+    const result = await sendToTelegram(text, config, 'test-token', 'MarkdownV2');
 
     assert.equal(result.ok, true);
     const sentBody = JSON.parse((mockFetch.mock.calls[0]!.arguments[1] as { body: string }).body);

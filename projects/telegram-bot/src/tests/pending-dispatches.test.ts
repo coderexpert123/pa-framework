@@ -8,6 +8,7 @@ import {
   removePendingDispatch,
   updatePendingDispatch,
   listPendingDispatches,
+  absorbHeldDispatchRecords,
   pendingDispatchKey,
   PENDING_DISPATCH_MAX_AGE_MS,
   _resetPendingDispatchesForTest,
@@ -38,7 +39,7 @@ function makeRecord(overrides: Partial<PendingDispatch> = {}): PendingDispatch {
     messageId: 900,
     userText: 'go yes on that plan',
     startedAt: new Date().toISOString(),
-    cwd: 'D:/Personal Assistant',
+    cwd: 'C:/pa-checkout',
     session: { session_id: 'abc-123', worker: 'claude', started_at: new Date().toISOString() },
     ...overrides,
   };
@@ -128,7 +129,7 @@ describe('pending-dispatches store', () => {
     _resetPendingDispatchesForTest();
     const listed = await listPendingDispatches();
     assert.equal(listed.length, 1);
-    assert.equal(listed[0].cwd, 'D:/Personal Assistant');
+    assert.equal(listed[0].cwd, 'C:/pa-checkout');
   });
 
   // WP1: updatePendingDispatch tests
@@ -183,7 +184,7 @@ describe('pending-dispatches store', () => {
     assert.equal(updated.userText, '[Voice message] hello');
     assert.equal(updated.userTextSettled, true);
     // Original fields preserved
-    assert.equal(updated.cwd, 'D:/Personal Assistant');
+    assert.equal(updated.cwd, 'C:/pa-checkout');
     assert.equal(updated.session?.session_id, 'abc-123');
   });
 
@@ -203,5 +204,69 @@ describe('pending-dispatches store', () => {
     // Original fields intact
     assert.equal(listed[0].userText, 'go yes on that plan');
     assert.equal(listed[0].session?.session_id, 'abc-123');
+  });
+});
+
+// AI-208 WP-4: durable held records (steer/stop drain leaves the transcript on
+// disk flagged heldForTopic; the topic's next dispatch absorbs it here).
+describe('absorbHeldDispatchRecords', () => {
+  it('returns and clears held records in startedAt order', async () => {
+    const t0 = new Date(Date.now() - 60_000).toISOString();
+    const t1 = new Date(Date.now() - 30_000).toISOString();
+    const t2 = new Date(Date.now() - 10_000).toISOString();
+    // Enqueue out of startedAt order on purpose — absorption must sort.
+    await addPendingDispatch(makeRecord({ updateId: 3, startedAt: t2, userText: 'third', heldForTopic: true, heldAt: t2 }));
+    await addPendingDispatch(makeRecord({ updateId: 1, startedAt: t0, userText: 'first', heldForTopic: true, heldAt: t0 }));
+    // A held record for a DIFFERENT chat+thread must not be absorbed.
+    await addPendingDispatch(makeRecord({ updateId: 9, chatId: -100999, threadId: 5, startedAt: t1, userText: 'other topic', heldForTopic: true, heldAt: t1 }));
+
+    const texts = await absorbHeldDispatchRecords(-100123, 5);
+    assert.deepEqual(texts, ['first', 'third']);
+
+    // Consumed exactly once: flags cleared, so a second absorb returns nothing.
+    const listed = await listPendingDispatches();
+    assert.equal(listed.find((r) => r.updateId === 1)?.heldForTopic, false);
+    assert.equal(listed.find((r) => r.updateId === 3)?.heldForTopic, false);
+    assert.deepEqual(await absorbHeldDispatchRecords(-100123, 5), []);
+  });
+
+  it('non-held records untouched', async () => {
+    const t0 = new Date(Date.now() - 60_000).toISOString();
+    const t1 = new Date(Date.now() - 30_000).toISOString();
+    // Same chat+thread but never held (a normal dispatch record).
+    await addPendingDispatch(makeRecord({ updateId: 2, startedAt: t1, userText: 'plain dispatch' }));
+    // Held record in another topic, to prove filtering is by chat+thread too.
+    await addPendingDispatch(makeRecord({ updateId: 9, chatId: -100999, threadId: 5, startedAt: t0, userText: 'other topic', heldForTopic: true, heldAt: t0 }));
+
+    const texts = await absorbHeldDispatchRecords(-100123, 5);
+    assert.deepEqual(texts, []);
+
+    const listed = await listPendingDispatches();
+    const plain = listed.find((r) => r.updateId === 2);
+    assert.equal(plain?.userText, 'plain dispatch'); // survived untouched
+    assert.equal(plain?.heldForTopic, undefined);    // never flagged
+    // The other topic's held record is still held, ready for ITS next dispatch.
+    assert.equal(listed.find((r) => r.updateId === 9)?.heldForTopic, true);
+  });
+
+  it('absorbHeldDispatchRecords skips and consumes records whose updateId is excluded (fix-wave M1)', async () => {
+    const t0 = new Date(Date.now() - 60_000).toISOString();
+    const t1 = new Date(Date.now() - 30_000).toISOString();
+    const t2 = new Date(Date.now() - 10_000).toISOString();
+    // updateId 1 was already carried into the prompt by the in-memory
+    // absorbHeldEntries half (its HeldItem carried updateId 1) — absorbing its
+    // text again here would fold the transcript twice.
+    await addPendingDispatch(makeRecord({ updateId: 1, startedAt: t0, userText: 'already in the prompt', heldForTopic: true, heldAt: t0 }));
+    await addPendingDispatch(makeRecord({ updateId: 3, startedAt: t2, userText: 'record-only', heldForTopic: true, heldAt: t2 }));
+
+    const texts = await absorbHeldDispatchRecords(-100123, 5, new Set([1]));
+    assert.deepEqual(texts, ['record-only'], 'the excluded record emits NO text');
+
+    // Still consumed: both records are unflagged, so a second absorb (no
+    // exclusion) cannot resurrect the excluded transcript either.
+    const listed = await listPendingDispatches();
+    assert.equal(listed.find((r) => r.updateId === 1)?.heldForTopic, false);
+    assert.equal(listed.find((r) => r.updateId === 3)?.heldForTopic, false);
+    assert.deepEqual(await absorbHeldDispatchRecords(-100123, 5), []);
   });
 });

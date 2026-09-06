@@ -87,8 +87,8 @@ private repo's working tree was clean — caused git to physically delete dozens
 (recovered only because private `HEAD` still had them all). Root-caused and fixed
 structurally, not just procedurally: the public mirror now lives at its own
 nested-but-independent directory (`pa-public/`, own `.git/`), so a checkout there can
-never touch anything here again — full design and migration record:
-`plans/2026-08-05-concurrent-session-safety.md`. This entry stays as history so nobody
+never touch anything here again — the full design-and-migration record lives in the
+private planning archive (dated 2026-08-05). This entry stays as history so nobody
 re-diagnoses the same incident class from scratch.
 
 ## Dependabot configuration (2026-08-17)
@@ -112,7 +112,7 @@ were entirely generic (now `download_statement_attachment.py`). It passed every
 pre-push guard layer and the 2026-06-24 full-tree audit because content scanners read
 file CONTENTS and never look at PATHS. Any future scan must check the tracked-path list
 as well — and must not quote the offending name, which is why this entry describes it
-instead. Full record: `plans/2026-07-21-performance-audit-remediation.md`.
+instead. Full record: the private planning archive (dated 2026-07-21).
 
 ## Reference facts (short, kept for completeness)
 
@@ -127,16 +127,20 @@ instead. Full record: `plans/2026-07-21-performance-audit-remediation.md`.
     into `pa-public/`'s own directory (`git -C <pa-public>`) — use them for public-repo
     status/add/commit/push operations instead of hand-rolled invocations. They no longer
     use `--git-dir`/`--work-tree` (see historical note above).
--   **Whitelist boundary**: `.gitignore-public` is the source of truth for what ships to
-    the public framework repo. **It does NOT filter `pa public-sync`'s extraction** —
-    that step (`git archive HEAD | tar -x`) writes the private repo's ENTIRE committed
-    tree into `pa-public/`'s working tree, unfiltered (verified 2026-08-08; the earlier
-    claim here that extraction was filtered was wrong — see
-    `pa/tests/public-sync.test.ts`'s own comment asserting the opposite). The boundary is
-    enforced one step later, at STAGING: `.gitignore-public` is wired in as
-    `pa-public/.git/config`'s `core.excludesfile`, so git itself treats every
-    private-only file `public-sync` just wrote as ignored — invisible to `git status`/
-    `git add` unless force-added. `push-public`'s Step 2 independently re-checks this via
+-   **Whitelist boundary**: `.gitignore-public` — GENERATED from the placement registry's
+    Boundary lines section (`pa/scripts/placement_gate.py gen --gitignore`); never
+    hand-edited — is the enforcement point for what ships to the public framework
+    repo, and it filters the sync itself, not just staging (since
+    2026-09-03): `pa public-sync` consults the boundary through the mirror repo's own
+    `git check-ignore` — the same oracle `push-public` Step 2 uses at staging — and
+    extracts only rule-public paths. The boundary is wired in as
+    `pa-public/.git/config`'s `core.excludesfile`, so the mirror's working tree holds
+    ONLY rule-public files: the tracked set equals the directory content modulo the
+    mirror's own git internals, and nothing the boundary excludes is ever written (the
+    run result reports the excluded count as `skipped`). A boundary change is enforced
+    at the NEXT sync: the pre-extraction reset+clean drops previously-extracted paths
+    the tightened boundary now excludes, and extraction itself skips them from then on.
+    `push-public`'s Step 2 independently re-checks the boundary via
     `git-public.ps1 check-ignore`/`ls-files` before staging.
 -   **Blocked ≠ silent (2026-08-17, RA-1).** When `pa public-sync` refuses because the
     private tree is dirty, it now also sends a deduped pa-alerts page naming the blocker
@@ -172,11 +176,12 @@ instead. Full record: `plans/2026-07-21-performance-audit-remediation.md`.
     backstop exists independently); a layer-3 (agy) infra failure now blocks the push by
     design, not waves it through — UNLESS a fresh hash-pinned review record covers the
     exact added lines (2026-08-13, AI-117 consolidation: `--record-review` after
-    push-public's Step 3 review, 10-minute TTL, `~/.pa/pii-guard-reviews.jsonl`; layers
-    0-2 and `--full` never consult records, and the record waives nothing regex-shaped);
+    push-public's Step 3 review, 10-minute TTL, persisted in the deployment's private
+    review log; layers 0-2 and `--full` never consult records, and the record waives
+    nothing regex-shaped);
     the sanctioned bypass is
-    `PA_SKIP_PII_GUARD=1 git-public push origin main`, logged to
-    `~/.pa/pii-guard-bypass.jsonl`, never silent.
+    `PA_SKIP_PII_GUARD=1 git-public push origin main`, logged to the deployment's
+    private bypass-audit log, never silent.
 -   **OAuth boundary**: generic bridge-page assets, `/auth` handling, auth-session
     schema, and resume-framework plumbing belong in the public mirror;
     deployment-specific secrets, tokens, and the action-registry hook stay private under

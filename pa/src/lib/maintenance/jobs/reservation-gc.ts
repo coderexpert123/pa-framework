@@ -48,7 +48,7 @@ export const reservationGcJob: MaintenanceJob = {
       evidence:
         "PA's own multi-session reservation registry (lib/reservations.ts); sole writer. " +
         'Reservations are TTL-bounded (45m default, 240m hard max) — added 2026-08-05 for ' +
-        'the multi-session coordination protocol (plans/2026-08-05-concurrent-session-safety.md).',
+        'the multi-session coordination protocol (2026-08-05 internal plan).',
       note:
         'Row-level expiry, not whole-file deletion: each reservation carries its own ' +
         'expiresAt; gcExpired() drops only expired rows and rewrites the file in place. ' +

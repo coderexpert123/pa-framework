@@ -2,7 +2,7 @@
 // reimplementations existed until 2026-08-23 and exactly one was wrong
 // (`commands/claim.ts` trimmed before slicing, so every ` M path` line lost
 // the path's first character and was silently dropped by the caller's
-// `fs.stat` — `plans/2026-08-23-coordination-audit.md` finding 1). Do not
+// `fs.stat` — the 2026-08-23 coordination audit, finding 1). Do not
 // add a fourth.
 
 export interface PorcelainEntry {

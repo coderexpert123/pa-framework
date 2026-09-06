@@ -24,9 +24,9 @@ export const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 // must never be merged. There is deliberately no cleanupClaudeSessions /
 // cleanupGeminiSessions anywhere in this codebase anymore — do not reintroduce
 // them; that is now enforced executably by pa/src/lib/maintenance/policy.ts's
-// FORBIDDEN_ROOTS, not just by this comment. See
-// plans/2026-08-02-session-gc-scope-to-pa-spawned.md for the incident that
-// established this (248 real Claude Code transcripts deleted).
+// FORBIDDEN_ROOTS, not just by this comment. See the session-gc scoping
+// record (2026-08-02, internal) for the incident that established this
+// (248 real Claude Code transcripts deleted).
 export { GC_RETENTION_MS, AGY_CONVERSATION_FILE_RE, cleanupAgySessions, cleanupCodexSessions, cleanupExpiredSessions };
 
 // --- Expiry ---

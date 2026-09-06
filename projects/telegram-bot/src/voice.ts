@@ -1,6 +1,6 @@
 /**
- * Bot-side voice module (plan: plans/2026-08-04-telegram-voice-transcription.md, WP5;
- * hardened plan: "federated-booping-hammock" (Claude Code plan-mode session), WP4).
+ * Bot-side voice module (plan: voice-transcription design, 2026-08-04, internal, WP5;
+ * hardened plan: the voice-hardening design session (Claude Code plan mode), WP4).
  *
  * Downloads a Telegram voice/audio/video-note attachment, hands it to the Python
  * transcription bridge (spawn mode) or the persistent voice worker (persistent
@@ -323,8 +323,9 @@ export const KIND_LABEL: Record<AudioAttachmentKind, string> = {
 };
 
 /** True for the enqueue-time placeholder shape `[Voice message|Audio file|Video note]`
- * plus optional RAW trailing caption (placeholderDispatchText's output — main.ts keeps
- * its own copy next to isAcceptableUpdate by design). Deliberately ALSO matches a
+ * plus optional RAW trailing caption (placeholderDispatchText's output — the
+ * single copy lives in enqueue-normalizer.ts next to isAcceptableUpdate; main.ts
+ * re-exports it). Deliberately ALSO matches a
  * bare-label SUCCESS transcript (`[Voice message] <text>` — byte-identical shape, see
  * the HARD GATE test): callers MUST pair it with `record.userTextSettled !== true` to
  * tell a lost transcript from a recovered one (2026-08-27 honest-resend spec).

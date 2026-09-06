@@ -1,7 +1,10 @@
 import { analyzeConversationWindow } from '../analyzer.js';
 import { analyzeFailurePatterns } from '../failure-analyzer.js';
+import { runWithFailover } from '../workers.js';
 import { saveDraft } from '../drafts.js';
 import { skillCandidatesPath } from '../lib/skill-candidates.js';
+import { readTaskLaneActivity, enrichTaskLaneActivity, formatTaskLanePromptSection } from '../lib/task-lane-activity.js';
+import { lookupTraceByTaskRef } from '../lib/ref-lookup.js';
 
 export async function learnCommand(
   days: number = 14,
@@ -12,7 +15,10 @@ export async function learnCommand(
   if (!options.failuresOnly) {
     console.log(`Analyzing last ${days} days of conversation history...`);
     try {
-      const proposals = await analyzeConversationWindow(days);
+      // AI-197: same best-effort task-lane read+enrich as the nightly self-improver
+      // path — a failure here degrades to no prompt section, never a failed command.
+      const taskLane = await readTaskLaneActivity({ days }).then((a) => enrichTaskLaneActivity(a, lookupTraceByTaskRef)).catch(() => undefined);
+      const proposals = await analyzeConversationWindow(days, runWithFailover, formatTaskLanePromptSection(taskLane));
       for (const proposal of proposals) {
         await saveDraft(proposal, 'conversation');
         console.log(`  + Proposed: ${proposal.name} (${proposal.reason.slice(0, 60)}...)`);

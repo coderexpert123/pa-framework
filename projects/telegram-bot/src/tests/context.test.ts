@@ -7,9 +7,17 @@ import { tmpdir } from 'os';
 import { fileURLToPath } from 'url';
 import { dirname, resolve } from 'path';
 import { buildResumedPrompt, buildPrompt, shouldIncludeSkillStatus, buildSkillStatus, _resetSkillStatusCache } from '../context.js';
+import { resolveReplyContext } from '../reply-context.js';
 import type { ConversationState } from '../types.js';
 import type { TopicNameMap } from '../topic-names.js';
 import type { Reservation } from '../../../../pa/dist/src/lib/reservations.js';
+import {
+  appendTask,
+  claimNextTask,
+  TOPIC_TASK_MAX_ATTEMPTS,
+  addNote,
+  closeNote,
+} from '../../../../pa/dist/src/lib/topic-tasks.js';
 import { waitForDrain } from './test-teardown-guard.js';
 
 // Resolve path to bot-instructions.md relative to compiled test location.
@@ -289,7 +297,7 @@ describe('bot-instructions.md content', { skip: !BOT_INSTRUCTIONS_EXISTS && 'bot
     assert.ok(content.includes('<configured PA_KB_SOURCES_PATH>'), 'bot-instructions.md must use configured placeholder (not hardcoded path)');
     // context.ts emits the bullet ONLY when PA_KB_SOURCES_PATH is set
     const originalValue = process.env.PA_KB_SOURCES_PATH;
-    process.env.PA_KB_SOURCES_PATH = 'D:/My Repos/notes/Ecosystem KB/';
+    process.env.PA_KB_SOURCES_PATH = 'C:/notes/Ecosystem KB/';
     try {
       const inlinePrompt = await buildPrompt('hello', makeState(), undefined, undefined, undefined, { omitStatic: false });
       assert.ok(inlinePrompt.includes(GROUNDING_PREFIX), 'context.ts inline capabilities must include the bullet when env is set');
@@ -344,6 +352,46 @@ describe('Shared working tree protocol block', () => {
   it('is absent in execution mode (pendingAction set)', async () => {
     const result = await buildPrompt('yes', makeState(), undefined, undefined, 'send email to John', { omitStatic: false });
     assert.ok(!result.includes(SHARED_TREE_ANCHOR_SENTENCE), 'Shared working tree block must be absent in execution mode');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reminder-discipline teaching sync (AI-207 reminder-delivery wave,
+// 2026-09-05): the two anchor sentences below must stay byte-identical
+// across the three teaching surfaces — context.ts's inline capabilities
+// block (agy/codex never receive bot-instructions.md), examples/
+// bot-instructions.example.md (tracked, CI-enforced half) and the
+// gitignored local bot-instructions.md (skip-guarded half). Same
+// prompt-triangle pattern as the anchor sentences above.
+// ---------------------------------------------------------------------------
+
+const REMINDER_ANCHOR_1 = 'Reminder messages are operator-facing: `message` must be plain language a person can act on, never an instruction for a future assistant session.';
+
+const REMINDER_ANCHOR_2 = 'Schedule work for a future session with `--resume-action-json` instead — it dispatches into the topic queue, and pass `--no-keyboard` for system-executed work: buttons render only when a human decision is genuinely required.';
+
+describe('Reminder discipline sync (AI-207)', () => {
+  it('matches examples/bot-instructions.example.md verbatim', async () => {
+    const exampleContent = await readFile(BOT_INSTRUCTIONS_EXAMPLE_PATH, 'utf8');
+    assert.ok(exampleContent.includes(REMINDER_ANCHOR_1),
+      'examples/bot-instructions.example.md must contain the Reminder ANCHOR_1 sentence verbatim');
+    assert.ok(exampleContent.includes(REMINDER_ANCHOR_2),
+      'examples/bot-instructions.example.md must contain the Reminder ANCHOR_2 sentence verbatim');
+  });
+
+  it('appears in the inline capabilities block verbatim', async () => {
+    const inlinePrompt = await buildPrompt('hello', makeState(), undefined, undefined, undefined, { omitStatic: false });
+    assert.ok(inlinePrompt.includes(REMINDER_ANCHOR_1),
+      'context.ts inline capabilities block must contain the Reminder ANCHOR_1 sentence verbatim');
+    assert.ok(inlinePrompt.includes(REMINDER_ANCHOR_2),
+      'context.ts inline capabilities block must contain the Reminder ANCHOR_2 sentence verbatim');
+  });
+
+  it('matches bot-instructions.md verbatim (local, skip-guarded)', { skip: !BOT_INSTRUCTIONS_EXISTS && 'bot-instructions.md not present locally (public-clone default — see examples/bot-instructions.example.md)' }, async () => {
+    const botInstructionsContent = await readFile(BOT_INSTRUCTIONS_PATH, 'utf8');
+    assert.ok(botInstructionsContent.includes(REMINDER_ANCHOR_1),
+      'bot-instructions.md must contain the Reminder ANCHOR_1 sentence verbatim');
+    assert.ok(botInstructionsContent.includes(REMINDER_ANCHOR_2),
+      'bot-instructions.md must contain the Reminder ANCHOR_2 sentence verbatim');
   });
 });
 
@@ -426,6 +474,35 @@ describe('Recall prompt bullet', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Cross-topic delivery / raw-send guard bullet (2026-09-04,
+// plans/2026-09-04-raw-send-guard-SPEC.md WP1) — an agy worker hand-wrote a
+// scratch script that called the raw Telegram /sendMessage Bot API into
+// pa-support, bypassing ref-minting and logging. Same byte-identical-across-
+// files sync pattern as the anchors above: examples/bot-instructions.example.md
+// is the CI-enforced half; context.ts's inline capabilities block is the
+// agy/codex-visible half.
+// ---------------------------------------------------------------------------
+
+const RAW_SEND_GUARD_ANCHOR_SENTENCE = 'NEVER call the Telegram Bot API directly — no api.telegram.org calls, no sendMessage, no bot-token fetches; no scratch scripts, no curl, no SDK.';
+
+describe('Raw-send guard prompt bullet', () => {
+  it('matches examples/bot-instructions.example.md verbatim', async () => {
+    const exampleContent = await readFile(BOT_INSTRUCTIONS_EXAMPLE_PATH, 'utf8');
+    assert.ok(exampleContent.includes(RAW_SEND_GUARD_ANCHOR_SENTENCE),
+      'examples/bot-instructions.example.md must contain the raw-send guard anchor sentence verbatim');
+
+    const inlinePrompt = await buildPrompt('hello', makeState(), undefined, undefined, undefined, { omitStatic: false });
+    assert.ok(inlinePrompt.includes(RAW_SEND_GUARD_ANCHOR_SENTENCE),
+      'context.ts inline capabilities block must contain the SAME sentence verbatim — keep both in sync');
+  });
+
+  it('is absent in omitStatic (lean) mode', async () => {
+    const result = await buildPrompt('hello', makeState(), undefined, undefined, undefined, { omitStatic: true });
+    assert.ok(!result.includes(RAW_SEND_GUARD_ANCHOR_SENTENCE), 'lean mode must not include the raw-send guard bullet');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // @build reservation bullet (coordination-remediation Wave C, W-C6 §7.3)
 // ---------------------------------------------------------------------------
 // C2a (Wave C) makes `npm run build`/`npm test` take the `@build` reservation
@@ -474,6 +551,34 @@ describe('@build reservation bullet (W-C6 §7.3)', () => {
 
 const WATCH_JOB_BULLET = '- Never promise to report back later: you are a one-shot process with no timer, so "I\'ll let you know when it finishes" never fires. If the result will land in a file or a process you can name, emit a `watch_job` PA_META action and say the watch is registered; otherwise tell the user the exact command or file that will show them the answer.';
 
+// ---------------------------------------------------------------------------
+// watch_job check-shape example (AI-181, BACKLOG.md) — the first live use of
+// watch_job armed NOTHING: the worker guessed the check shape (no "type") and
+// validateWatchInput rejected it ("unknown check type: "), because the PA_META
+// docs named `check` but never showed its object shape. All three synced
+// surfaces must now carry the exact shape plus a copy-pasteable example.
+// ---------------------------------------------------------------------------
+
+const WATCH_CHECK_SHAPE_EXAMPLE = '"check":{"type":"file_newer_than","path":"';
+
+describe('watch_job check-shape example (AI-181)', () => {
+  it('appears in examples/bot-instructions.example.md and the inline capabilities', async () => {
+    const exampleContent = await readFile(BOT_INSTRUCTIONS_EXAMPLE_PATH, 'utf8');
+    assert.ok(exampleContent.includes(WATCH_CHECK_SHAPE_EXAMPLE),
+      'examples/bot-instructions.example.md must show the exact check object shape');
+
+    const inlinePrompt = await buildPrompt('hello', makeState(), undefined, undefined, undefined, { omitStatic: false });
+    assert.ok(inlinePrompt.includes(WATCH_CHECK_SHAPE_EXAMPLE),
+      'context.ts inline PA_META docs must show the exact check object shape');
+  });
+
+  it('appears in bot-instructions.md (local, skip-guarded)', { skip: !BOT_INSTRUCTIONS_EXISTS && 'bot-instructions.md not present locally (public-clone default — see examples/bot-instructions.example.md)' }, async () => {
+    const botInstructionsContent = await readFile(BOT_INSTRUCTIONS_PATH, 'utf8');
+    assert.ok(botInstructionsContent.includes(WATCH_CHECK_SHAPE_EXAMPLE),
+      'bot-instructions.md must show the exact check object shape');
+  });
+});
+
 describe('watch_job standing-rule bullet (AI-170)', () => {
   it('matches examples/bot-instructions.example.md verbatim', async () => {
     const exampleContent = await readFile(BOT_INSTRUCTIONS_EXAMPLE_PATH, 'utf8');
@@ -503,6 +608,86 @@ describe('watch_job standing-rule bullet (AI-170)', () => {
   it('is absent in execution mode (pendingAction set)', async () => {
     const result = await buildPrompt('yes', makeState(), undefined, undefined, 'send email to John', { omitStatic: false });
     assert.ok(!result.includes(WATCH_JOB_BULLET), 'watch_job bullet must be absent in execution mode');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// reauth resume guidance bullet (AI-181) — the topic_resume auto-resume
+// feature arms workers blocked on Google auth with a mintable reauth link
+// that, when /auth completes, injects the pending prompt as a system turn.
+// All three synced prompt surfaces must carry the exact guidance.
+// ---------------------------------------------------------------------------
+
+const REAUTH_RESUME_BULLET = `- Blocked on Google auth mid-task: mint a resumable reauth link instead of exiting — run python <repo>/pa/scripts/start_google_telegram_reauth.py --redirect-uri <GOOGLE_AUTH_REDIRECT_URI from ~/.pa/secrets.env> --chat-id <chat> --thread-id <thread> (IDs from your Telegram Metadata section; <repo> from your Working Directory section) --resume-action-json '{"type":"topic_resume","prompt":"<the waiting work, one line, <=500 chars>"}'. The link posts to that chat/thread, and once the user completes /auth the bot re-dispatches your prompt into the topic automatically as a system turn. For a skill-shaped blockage prefer telling the user to run /reauth <skill-name>. Never mint a mid-task reauth link without a resume payload.`;
+
+describe('reauth resume guidance bullet (AI-181)', () => {
+  it('matches examples/bot-instructions.example.md verbatim', async () => {
+    const exampleContent = await readFile(BOT_INSTRUCTIONS_EXAMPLE_PATH, 'utf8');
+    assert.ok(exampleContent.includes(REAUTH_RESUME_BULLET),
+      'examples/bot-instructions.example.md must contain the reauth resume bullet verbatim');
+
+    const inlinePrompt = await buildPrompt('hello', makeState(), undefined, undefined, undefined, { omitStatic: false });
+    assert.ok(inlinePrompt.includes(REAUTH_RESUME_BULLET),
+      'context.ts inline capabilities block must contain the SAME reauth resume bullet verbatim — keep both in sync');
+  });
+
+  it('matches bot-instructions.md verbatim (local, skip-guarded)', { skip: !BOT_INSTRUCTIONS_EXISTS && 'bot-instructions.md not present locally (public-clone default — see examples/bot-instructions.example.md)' }, async () => {
+    const botInstructionsContent = await readFile(BOT_INSTRUCTIONS_PATH, 'utf8');
+    assert.ok(botInstructionsContent.includes(REAUTH_RESUME_BULLET),
+      'bot-instructions.md must contain the reauth resume bullet verbatim');
+
+    const inlinePrompt = await buildPrompt('hello', makeState(), undefined, undefined, undefined, { omitStatic: false });
+    assert.ok(inlinePrompt.includes(REAUTH_RESUME_BULLET),
+      'context.ts inline capabilities block must contain the SAME reauth resume bullet verbatim — keep both in sync');
+  });
+
+  it('is absent in omitStatic (lean) mode', async () => {
+    const result = await buildPrompt('hello', makeState(), undefined, undefined, undefined, { omitStatic: true });
+    assert.ok(!result.includes(REAUTH_RESUME_BULLET), 'reauth resume bullet must be absent in lean mode');
+  });
+
+  it('is absent in execution mode (pendingAction set)', async () => {
+    const result = await buildPrompt('yes', makeState(), undefined, undefined, 'send email to John', { omitStatic: false });
+    assert.ok(!result.includes(REAUTH_RESUME_BULLET), 'reauth resume bullet must be absent in execution mode');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PA_META question vocabulary (2026-09-02, handover Wave 1 SPEC §3.3) — the
+// closed-shape `question{text,options}` action must be taught on ALL THREE
+// prompt surfaces in the same commit (prompt-triangle convention). Bullet
+// text is FROZEN in the spec; the deployed bot-instructions.md is hand-synced
+// (gitignored — never rides git patches).
+// ---------------------------------------------------------------------------
+
+const QUESTION_TYPES_ROW = 'question{text,options}';
+const QUESTION_BULLET =
+  'you need the user to pick one of up to 4 options — the reply renders option buttons; their press is injected back into the topic as your answer. text (the question, <=500 chars), options (1-4 strings, <=40 chars each), taskId (optional, <=64 chars, links the answer to a queued task).';
+
+describe('PA_META question vocabulary present in all three surfaces', () => {
+  it('context.ts carries the Types-line entry and the frozen bullet', async () => {
+    // Tests run from dist/tests/ — the source file is two levels up, under src/.
+    const contextSource = await readFile(resolve(__dirname, '../../src/context.ts'), 'utf8');
+    assert.ok(contextSource.includes(QUESTION_TYPES_ROW),
+      'context.ts PA_META Types line must include question{text,options}');
+    assert.ok(contextSource.includes(`question = ${QUESTION_BULLET}`),
+      'context.ts PA_META prose must carry the frozen question bullet verbatim');
+  });
+
+  it('examples/bot-instructions.example.md carries the frozen bullet', async () => {
+    const exampleContent = await readFile(BOT_INSTRUCTIONS_EXAMPLE_PATH, 'utf8');
+    assert.ok(exampleContent.includes(QUESTION_TYPES_ROW),
+      'examples/bot-instructions.example.md must include question{text,options}');
+    assert.ok(exampleContent.includes(QUESTION_BULLET),
+      'examples/bot-instructions.example.md must contain the frozen question bullet verbatim');
+  });
+
+  it('deployed bot-instructions.md carries the frozen bullet (local, skip-guarded)', { skip: !BOT_INSTRUCTIONS_EXISTS && 'bot-instructions.md not present locally (public-clone default — see examples/bot-instructions.example.md)' }, async () => {
+    const botInstructionsContent = await readFile(BOT_INSTRUCTIONS_PATH, 'utf8');
+    assert.ok(botInstructionsContent.includes(QUESTION_TYPES_ROW),
+      'deployed bot-instructions.md must include question{text,options} — hand-sync on merge');
+    assert.ok(botInstructionsContent.includes(QUESTION_BULLET),
+      'deployed bot-instructions.md must contain the frozen question bullet verbatim — hand-sync on merge');
   });
 });
 
@@ -720,9 +905,11 @@ describe('buildPrompt: recall pointer line', () => {
 describe('integration: full prompt building flow', () => {
   it('builds complete prompt with all sections', async () => {
     const state = makeState({
+      // Fresh dispatches never carry turns (operator directive 2026-09-03) —
+      // these turns exist only to prove they do NOT leak into the history body.
       turns: [
-        { role: 'user', text: 'previous message', timestamp: '2026-04-16T10:00:00+05:30' },
-        { role: 'assistant', text: 'previous response', timestamp: '2026-04-16T10:01:00+05:30' },
+        { role: 'user', text: 'previous message', timestamp: new Date(Date.now() - 120_000).toISOString() },
+        { role: 'assistant', text: 'previous response', timestamp: new Date(Date.now() - 60_000).toISOString() },
       ],
     });
     const topicNames: TopicNameMap = new Map([
@@ -737,8 +924,9 @@ describe('integration: full prompt building flow', () => {
     assert.ok(result.includes('Topic: test-topic — Test description'), 'should have topic with description');
     assert.ok(result.includes('PA Skill Status'), 'should have skill status (triggered by keyword)');
     assert.ok(result.includes('## Conversation History'), 'should have history');
-    assert.ok(result.includes('previous message'), 'should have user turn in history');
-    assert.ok(result.includes('previous response'), 'should have assistant turn in history');
+    assert.ok(result.includes('Conversation turns are not injected'), 'should have the retrieval pointer, not turn text');
+    assert.ok(!result.includes('previous message'), 'turn text must not leak into the prompt');
+    assert.ok(!result.includes('previous response'), 'turn text must not leak into the prompt');
     assert.ok(result.includes('did the skill run?'), 'should have current message');
     assert.ok(result.includes('Capabilities & Rules'), 'should have capabilities');
     assert.ok(result.includes('[PA_META]'), 'should have PA_META');
@@ -1584,5 +1772,198 @@ rules:
       const noDescLine = lines.find(l => l.includes('no-desc'));
       assert.equal(noDescLine, '- no-desc', 'should render as "- name:" with no trailing colon-space');
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildPrompt — open items (unified topic store: tasks + notes, operator
+// directive 2026-09-03 — retires the per-topic SHORT-TERM.md markdown index)
+// ---------------------------------------------------------------------------
+// Both task and note fixtures are seeded through pa/dist's REAL store
+// functions (appendTask/addNote/closeNote) — the same store `pa topic-task`,
+// `pa topic-note` and the drain use — so a rendering deviation on either side
+// fails here (real producer, real consumer).
+
+const OPEN_ITEMS_HEADER = '## Open items (short-term)';
+const QUEUED_TASKS_LEAD = 'Queued tasks (dispatched automatically by the system — do not re-run them yourself):';
+
+describe('buildPrompt: open items (unified store)', () => {
+  const chatId = -1001234567890;
+  const threadId = 310;
+
+  it('queued tasks render from the store', async () => {
+    await appendTask(chatId, threadId, { title: 'Wave 1 dogfood', prompt: 'Report one line: drain works.', createdBy: 'test' });
+    const result = await buildPrompt('hello', makeState({ chat_id: chatId, thread_id: threadId }));
+    assert.ok(result.includes(OPEN_ITEMS_HEADER), 'section renders when a task is queued');
+    assert.ok(result.includes(QUEUED_TASKS_LEAD), 'frozen do-not-re-run lead line present');
+    assert.ok(
+      /- tt-[0-9a-f]{12} — Wave 1 dogfood \(queued \d{2}:\d{2} IST\)/.test(result),
+      'task line renders id, title and the queued HH:MM IST label from the store record'
+    );
+    assert.ok(!result.includes('Report one line'), 'the task prompt field is NOT rendered (title only)');
+  });
+
+  it('notes render from the store capped at 15', async () => {
+    for (let i = 1; i <= 17; i++) {
+      await addNote(chatId, threadId, { text: `Note number ${i}`, key: `note-${String(i).padStart(2, '0')}` });
+    }
+    const result = await buildPrompt('hello', makeState({ chat_id: chatId, thread_id: threadId }));
+    assert.ok(result.includes(OPEN_ITEMS_HEADER), 'section renders when notes exist');
+    const noteBullets = result.match(/^- note-\d{2} — Note number \d+$/gm) || [];
+    assert.equal(noteBullets.length, 15, 'exactly 15 OPEN notes render');
+    assert.ok(result.includes('(+2 more — pa topic-note list)'), 'overflow line present');
+    assert.ok(!result.includes('Note number 16'), 'note 16 must not render');
+    assert.ok(!result.includes('Note number 17'), 'note 17 must not render');
+    assert.ok(!result.includes(QUEUED_TASKS_LEAD), 'no queued-tasks block when the task store is empty');
+  });
+
+  it('notes render key and text; DONE notes never render', async () => {
+    await addNote(chatId, threadId, { text: 'Buy milk before Friday', key: 'milk-run' });
+    await addNote(chatId, threadId, { text: 'Renew insurance', key: 'renew-ins', expires: '2026-09-30' });
+    await addNote(chatId, threadId, { text: 'Already closed', key: 'old-note' });
+    await closeNote(chatId, threadId, 'old-note');
+    const result = await buildPrompt('hello', makeState({ chat_id: chatId, thread_id: threadId }));
+    assert.ok(result.includes('Notes:'), 'Notes block header present');
+    assert.ok(result.includes('- milk-run — Buy milk before Friday'), 'OPEN note renders as key — text');
+    assert.ok(result.includes('- renew-ins — Renew insurance (expires 2026-09-30)'), 'expires suffix round-trips through render');
+    assert.ok(!result.includes('Already closed'), 'DONE note must not render');
+  });
+
+  it('open-items section absent when both empty', async () => {
+    const result = await buildPrompt('hello', makeState({ chat_id: chatId, thread_id: threadId }));
+    assert.ok(!result.includes('Open items'), 'no section with an empty task and note store');
+  });
+
+  // Push-gate regression guard (2026-09-03): a fresh PA_HOME (mkdtemp'd in the
+  // file-level beforeEach above) never creates ~/.pa/topic-tasks/ until a
+  // mutating call (appendTask/addNote) does — listNotes/listTasks/listRunningTasks
+  // read a directory that plain does not exist yet. Pins that renderOpenItems'
+  // fail-to-absent contract (readNotesTolerant/readQueueTolerant/readRunningTolerant
+  // in pa/src/lib/topic-tasks.ts catch and return [], and renderOpenItems's own
+  // try/catch is belt-and-braces on top) means buildPrompt still completes and
+  // renders the rest of the prompt — never throws, never aborts the dispatch —
+  // when the topic store directory is entirely absent.
+  it('buildPrompt with a PA_HOME that has no topic store still builds and renders an empty Open items section', async () => {
+    assert.equal(
+      existsSync(join(tempDir, 'topic-tasks')),
+      false,
+      'fixture precondition: no topic-tasks dir exists yet in this fresh PA_HOME'
+    );
+    const result = await buildPrompt('hello there', makeState({ chat_id: chatId, thread_id: threadId }));
+    assert.ok(result.includes('hello there'), 'buildPrompt completed and rendered the user message');
+    assert.ok(!result.includes('Open items'), 'no Open items section when the store directory is entirely absent');
+  });
+
+  it('open-items section absent when only DONE notes exist', async () => {
+    await addNote(chatId, threadId, { text: 'Already closed', key: 'old-note' });
+    await closeNote(chatId, threadId, 'old-note');
+    const result = await buildPrompt('hello', makeState({ chat_id: chatId, thread_id: threadId }));
+    assert.ok(!result.includes('Open items'), 'a DONE-only note store renders no section');
+  });
+
+  it('open items absent in omitStatic (lean) mode', async () => {
+    await appendTask(chatId, threadId, { title: 'Lean mode task', prompt: 'p', createdBy: 'test' });
+    await addNote(chatId, threadId, { text: 'Lean note', key: 'lean' });
+    const result = await buildPrompt('hello', makeState({ chat_id: chatId, thread_id: threadId }), undefined, undefined, undefined, { omitStatic: true });
+    assert.ok(!result.includes(OPEN_ITEMS_HEADER), 'lean mode must not include open items');
+  });
+
+  it('open items absent in execution mode (pendingAction set)', async () => {
+    await appendTask(chatId, threadId, { title: 'Exec mode task', prompt: 'p', createdBy: 'test' });
+    await addNote(chatId, threadId, { text: 'Exec note', key: 'exec' });
+    const result = await buildPrompt('yes', makeState({ chat_id: chatId, thread_id: threadId }), undefined, undefined, 'send email to John');
+    assert.ok(!result.includes(OPEN_ITEMS_HEADER), 'execution mode must not include open items');
+  });
+
+  it('buildResumedPrompt never includes open items', async () => {
+    await appendTask(chatId, threadId, { title: 'Resumed task', prompt: 'p', createdBy: 'test' });
+    await addNote(chatId, threadId, { text: 'Resumed note', key: 'resumed' });
+    const result = await buildResumedPrompt('hello');
+    assert.ok(!result.includes(OPEN_ITEMS_HEADER), 'buildResumedPrompt must never include open items');
+  });
+
+  it('in-flight siblings render in open items', async () => {
+    // Wave-2 tier-2 attribution: a CLAIMED record (real store chain) renders under
+    // the in-flight lead line with its live status + attempt counter.
+    await appendTask(chatId, threadId, { title: 'In-flight sibling', prompt: 'p', createdBy: 'test' });
+    const claimed = await claimNextTask(chatId, threadId);
+    assert.ok(claimed);
+    const result = await buildPrompt('hello', makeState({ chat_id: chatId, thread_id: threadId }));
+    const inflightLead = 'In-flight tasks (answers to their questions route automatically when you reply to their messages):';
+    assert.ok(result.includes(inflightLead), 'tier-2 lead line present for a claimed task');
+    assert.ok(
+      new RegExp(`- ${claimed.id} — In-flight sibling \\(running, attempt 1/${TOPIC_TASK_MAX_ATTEMPTS}\\)`).test(result),
+      'sibling line renders id, title, status and attempt counter from the store record'
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fresh dispatches never carry turns (supersedes AI-188's recency window,
+// operator directive 2026-09-03)
+// ---------------------------------------------------------------------------
+
+describe('buildPrompt: fresh dispatch never carries turns (operator directive 2026-09-03)', () => {
+  const iso = (msAgo: number): string => new Date(Date.now() - msAgo).toISOString();
+  const H = 3_600_000;
+
+  it('fresh dispatch carries the pointer and zero turns', async () => {
+    // Whether the topic has no history at all, recent history, or hours-old
+    // history, buildPrompt renders the SAME two-line retrieval pointer and
+    // injects no turn text — there is no window to be inside or outside of.
+    const recentTurns = Array.from({ length: 12 }, (_, i) => ({
+      role: (i % 2 === 0 ? 'user' : 'assistant') as 'user' | 'assistant',
+      text: `turn ${i + 1}`,
+      timestamp: iso((12 - i) * 60_000),
+    }));
+    const staleTurns = [
+      { role: 'user' as const, text: 'morning question', timestamp: iso(3 * H + 60_000) },
+      { role: 'assistant' as const, text: 'morning answer', timestamp: iso(3 * H) },
+    ];
+    const expected =
+      `(Conversation turns are not injected into this prompt.)\n` +
+      'Use the topic brain above and `pa recall "<terms>" --thread 29 --json` for this topic\'s history.';
+
+    for (const turns of [[], recentTurns, staleTurns]) {
+      const result = await buildPrompt('hello', makeState({ turns }));
+      assert.ok(
+        result.includes(`## Conversation History\n${expected}\n`),
+        'history body is exactly the frozen two-line retrieval pointer regardless of turn history'
+      );
+    }
+    const resultRecent = await buildPrompt('hello', makeState({ turns: recentTurns }));
+    assert.ok(!resultRecent.includes('turn 1\n') && !resultRecent.includes('turn 12'), 'recent turn text must not render');
+    const resultStale = await buildPrompt('hello', makeState({ turns: staleTurns }));
+    assert.ok(!resultStale.includes('morning question') && !resultStale.includes('morning answer'), 'stale turn text must not render');
+  });
+
+  it('buildResumedPrompt never carries turns', async () => {
+    // buildResumedPrompt has no state/history section at all — structurally
+    // turn-free, independent of this gate's retirement.
+    const result = await buildResumedPrompt('hello', 'reply anchor text');
+    assert.ok(!result.includes('## Conversation History'), 'resumed path never carries a history section');
+    assert.ok(!result.includes('(no prior conversation)'), 'no empty-history placeholder on the resumed path');
+    assert.ok(result.includes('reply anchor text'), 'reply-to anchors still ride the resumed path');
+  });
+
+  it('reply-to anchor still resolves mechanically, independent of the pointer', async () => {
+    const state = makeState({
+      turns: [
+        { role: 'user', text: 'stale window turn', timestamp: iso(3 * H), message_id: 555 },
+        { role: 'assistant', text: 'stale window answer', timestamp: iso(3 * H - 30_000) },
+      ],
+    });
+    const resolved = await resolveReplyContext(
+      { reply_to_message: { message_id: 999 } },
+      state,
+      { archiveLookup: async () => 'archived old message text' }
+    );
+    assert.equal(resolved, 'archived old message text', 'a replied message still resolves via the archive fallback');
+    // Contrast pin: the same state's buildPrompt still renders the pointer, not
+    // the turns — the anchor path and the history section are independent.
+    const result = await buildPrompt('hello', state);
+    assert.ok(result.includes('Conversation turns are not injected'), 'buildPrompt still renders the pointer for this state');
+    assert.ok(!result.includes('stale window turn'), 'turns do not leak into the prompt');
+    assert.ok(!result.includes('archived old message text'), 'buildPrompt never inlines archive content');
   });
 });

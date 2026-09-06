@@ -1,5 +1,5 @@
 /**
- * WP7 (plan: plans/2026-08-04-telegram-voice-transcription.md) — end-to-end
+ * WP7 (plan: the voice-transcription design, 2026-08-04, internal) — end-to-end
  * poll-loop coverage for the voice-note wiring in main.ts. A new file rather
  * than an addition to poll-loop.test.ts (2400+ lines, owned by other
  * packages) per the plan's own file-ownership split.
@@ -552,7 +552,7 @@ describe('runPollLoop: voice notes', { concurrency: 1 }, () => {
 
   // -------------------------------------------------------------------
   // Cases 14-16: transcript echo (2026-09-01,
-  // plans/2026-09-01-voice-transcript-echo-SPEC.md) — the "🎙 Heard" mirror
+  // voice-transcript-echo design, internal) — the "🎙 Heard" mirror
   // sent back to the topic before worker dispatch.
   // -------------------------------------------------------------------
 

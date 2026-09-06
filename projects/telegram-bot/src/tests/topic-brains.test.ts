@@ -214,3 +214,12 @@ ${stampWithFold}
     assert.equal(result!.covers, '2026-08-21T18:03:11.000Z', 'should parse covers');
   });
 });
+
+// Notes moved off this file's SHORT-TERM.md reader into the unified topic
+// store (operator directive 2026-09-03) — the store's own record shape,
+// validation and lifecycle are pa/tests/topic-tasks.test.ts's job, the CLI
+// writer's behavior is pa/tests/topic-cli.test.ts's job, and "rendered from
+// the store" for the bot prompt is pinned in
+// projects/telegram-bot/src/tests/context.test.ts. Nothing note-related is
+// exported from topic-brains.ts any more, so there is nothing left to pin
+// here.

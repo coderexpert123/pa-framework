@@ -135,7 +135,7 @@ export async function runReviewConflictButtons(
 
 /**
  * review-conflict-buttons (2026-08-24 buttons program,
- * plans/2026-08-24-buttons-program-SPEC.md P9 / §3.7 / WP-P3).
+ * the buttons-program spec P9 / §3.7 / WP-P3).
  *
  * Daily: read ~/.pa/review-digest-pending.jsonl (written by
  * memory_consolidation.py's write_conflicts) and post ONE notifyUser message

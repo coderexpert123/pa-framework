@@ -5,10 +5,14 @@ import {
   dequeueUpdate,
   drainQueuedText,
   drainQueuedEntries,
+  peekQueuedBatch,
+  confirmQueuedBatch,
+  snapshotDrained,
   addHeldEntry,
   absorbHeldEntries,
   _clearQueueForTest,
   _clearHeldForTest,
+  _setLoggerForTest,
   type QueueEntry,
   type HeldItem,
 } from '../topic-queue.js';
@@ -17,6 +21,26 @@ beforeEach(() => {
   _clearQueueForTest();
   _clearHeldForTest();
 });
+
+const VOICE_RESULT: import('../voice.js').VoiceResult = {
+  ok: true,
+  text: 'transcript text',
+  engine: 'test',
+  mode: 'spawn',
+  audioPath: '/path.oga',
+  elapsedMs: 1000,
+  truncated: false,
+};
+
+/** Sets the full (AI-208 E1) voice field on an entry the way main.ts's enqueue block would. */
+function setVoice(
+  entry: QueueEntry,
+  promise: Promise<import('../voice.js').VoiceResult>,
+  media: import('../topic-queue.js').AudioMediaIdentity = { file_id: 'fid', file_unique_id: 'fuid', duration: 3 },
+  kind: 'voice' | 'audio' | 'video_note' = 'voice',
+): void {
+  entry.voice = { promise, descriptor: { kind: 'voice' }, media, kind };
+}
 
 describe('registerQueuedUpdate', () => {
   it('builds an entry with isCommand=false for plain text', () => {
@@ -207,7 +231,11 @@ describe('held entries', () => {
     addHeldEntry('1_0', 'third held');
 
     const held = await absorbHeldEntries('1_0');
-    assert.deepEqual(held, ['first held', 'second held', 'third held']);
+    assert.deepEqual(held, [
+      { text: 'first held' },
+      { text: 'second held' },
+      { text: 'third held' },
+    ]);
   });
 
   it('absorbHeldEntries is async and awaits promise items', async () => {
@@ -232,8 +260,41 @@ describe('held entries', () => {
 
     const held = await absorbHeldEntries('1_0');
     assert.equal(held.length, 2);
-    assert.equal(held[0], 'string item');
-    assert.ok(held[1].includes('async transcript'));
+    assert.equal(held[0].text, 'string item');
+    assert.ok(held[1].text.includes('async transcript'));
+  });
+
+  it('absorbHeldEntries carries updateId when the hold site provided one (fix-wave M1)', async () => {
+    addHeldEntry('1_0', 'plain');
+    addHeldEntry('1_0', {
+      promise: Promise.resolve(VOICE_RESULT),
+      descriptor: { kind: 'voice' },
+      updateId: 42,
+    });
+    addHeldEntry('1_0', {
+      promise: Promise.resolve(VOICE_RESULT),
+      descriptor: { kind: 'voice' },
+    });
+
+    const held = await absorbHeldEntries('1_0');
+    assert.deepEqual(held, [
+      { text: 'plain' },
+      { text: '[Voice message] transcript text', updateId: 42 },
+      { text: '[Voice message] transcript text' },
+    ]);
+    assert.equal(held[0].updateId, undefined);
+    assert.equal(held[2].updateId, undefined);
+  });
+
+  it('absorbHeldEntries carries updateId on text-object holds (FX-A addendum)', async () => {
+    addHeldEntry('1_0', { text: 'held text', updateId: 7 });
+    addHeldEntry('1_0', { text: 'no id' });
+
+    const held = await absorbHeldEntries('1_0');
+    assert.deepEqual(held, [
+      { text: 'held text', updateId: 7 },
+      { text: 'no id' },
+    ]);
   });
 
   it('absorbHeldEntries returns and clears the topic list', async () => {
@@ -241,7 +302,7 @@ describe('held entries', () => {
     addHeldEntry('1_0', 'second');
 
     const first = await absorbHeldEntries('1_0');
-    assert.deepEqual(first, ['first', 'second']);
+    assert.deepEqual(first, [{ text: 'first' }, { text: 'second' }]);
 
     const second = await absorbHeldEntries('1_0');
     assert.deepEqual(second, []);
@@ -254,8 +315,8 @@ describe('held entries', () => {
     const heldA = await absorbHeldEntries('1_0');
     const heldB = await absorbHeldEntries('2_0');
 
-    assert.deepEqual(heldA, ['topic A item']);
-    assert.deepEqual(heldB, ['topic B item']);
+    assert.deepEqual(heldA, [{ text: 'topic A item' }]);
+    assert.deepEqual(heldB, [{ text: 'topic B item' }]);
   });
 
   it('empty topic returns []', async () => {
@@ -274,5 +335,259 @@ describe('held entries', () => {
 
     assert.deepEqual(heldA, []);
     assert.deepEqual(heldB, []);
+  });
+
+  it('addHeldEntry logs each hold with its length and promise-ness (AI-208 E4)', () => {
+    const calls: Array<{ module: string; message: string; ctx?: Record<string, unknown> }> = [];
+    _setLoggerForTest({ info: (module, message, ctx) => calls.push({ module, message, ctx }) });
+    try {
+      addHeldEntry('1_0', 'plain text');
+      addHeldEntry('1_0', { promise: Promise.resolve(VOICE_RESULT), descriptor: { kind: 'voice' } });
+
+      assert.equal(calls.length, 2);
+      assert.equal(calls[0].module, 'steer-hold');
+      assert.equal(calls[0].message, 'held entry');
+      assert.equal(calls[0].ctx?.chars, 10);
+      assert.equal(calls[0].ctx?.isPromise, false);
+      assert.equal(calls[1].ctx?.isPromise, true);
+      assert.equal(calls[1].ctx?.topicKey, '1_0');
+    } finally {
+      _setLoggerForTest(null);
+    }
+  });
+});
+
+describe('snapshotDrained', () => {
+  it('resolves a voice entry to its transcript', async () => {
+    const e1 = registerQueuedUpdate('1_0', 1, '[Voice message]');
+    setVoice(e1, Promise.resolve(VOICE_RESULT));
+
+    const [snap] = snapshotDrained([e1]);
+    assert.equal(snap.updateId, 1);
+    // Through the shared formatter: the success shape is "[Voice message] <text>",
+    // byte-identical to what the turn path produces (voice.test.ts pins it).
+    assert.equal(await snap.textPromise, '[Voice message] transcript text');
+  });
+
+  it('falls back to the failure-formatted placeholder, never the bare literal', async () => {
+    const e1 = registerQueuedUpdate('1_0', 1, '[Voice message]');
+    setVoice(e1, Promise.reject(new Error('transcribe failed')));
+
+    const [snap] = snapshotDrained([e1]);
+    const text = await snap.textPromise;
+    // Fix-wave B1: the snapshot formats the rejection itself through the same
+    // formatter the success path uses — the fold never sees the bare
+    // `[Voice message]` literal (WP-2 case 4 forbids it) and never sees the
+    // enqueue-time placeholder text either.
+    assert.ok(text.startsWith('[Voice message — transcription failed'), `got: ${text}`);
+    assert.notEqual(text, '[Voice message]');
+  });
+
+  it('resolves a text entry verbatim', async () => {
+    const e1 = registerQueuedUpdate('1_0', 1, 'plain queued text');
+    const [snap] = snapshotDrained([e1]);
+    assert.equal(await snap.textPromise, 'plain queued text');
+  });
+});
+
+describe('drainQueuedEntries logging (AI-208 E2)', () => {
+  it('logs one line per drained entry and a zero-drain line', () => {
+    const calls: Array<{ module: string; message: string; ctx?: Record<string, unknown> }> = [];
+    _setLoggerForTest({ info: (module, message, ctx) => calls.push({ module, message, ctx }) });
+    try {
+      registerQueuedUpdate('1_0', 1, 'first');
+      registerQueuedUpdate('1_0', 2, '/reset');
+      registerQueuedUpdate('1_0', 3, 'second');
+
+      calls.length = 0;
+      const entries = drainQueuedEntries('1_0', 'steer');
+      assert.equal(entries.length, 2);
+
+      // One INFO line per collected entry, with the spec'd fields.
+      const perEntry = calls.filter(c => c.message === 'drained queued entry');
+      assert.equal(perEntry.length, 2);
+      assert.deepEqual(
+        perEntry.map(c => c.ctx?.updateId),
+        [1, 3],
+      );
+      assert.deepEqual(
+        perEntry.map(c => c.ctx?.textLen),
+        [5, 6],
+      );
+      for (const c of perEntry) {
+        assert.equal(c.module, 'steer-drain');
+        assert.equal(c.ctx?.topicKey, '1_0');
+        assert.equal(c.ctx?.reason, 'steer');
+        assert.equal(c.ctx?.hasVoice, false);
+        assert.equal(c.ctx?.cancelled, true);
+      }
+
+      // Summary line for the non-empty drain.
+      const summary = calls.filter(c => c.message === 'drained 2 entry(ies)');
+      assert.equal(summary.length, 1);
+      assert.equal(summary[0].ctx?.count, 2);
+
+      // Zero-drain must log too — this is the S1-vs-S2 decider.
+      calls.length = 0;
+      drainQueuedEntries('1_0', 'steer');
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0].message, 'drained 0 entry(ies)');
+      assert.equal(calls[0].ctx?.count, 0);
+      assert.equal(calls[0].ctx?.topicKey, '1_0');
+    } finally {
+      _setLoggerForTest(null);
+    }
+  });
+});
+
+describe('QueueEntry.voice media identity (AI-208 E1)', () => {
+  it('drained entry keeps media/kind on the voice field', () => {
+    const e1 = registerQueuedUpdate('1_0', 1, 'voice text');
+    setVoice(
+      e1,
+      Promise.resolve(VOICE_RESULT),
+      { file_id: 'FID', file_unique_id: 'UID', duration: 7 },
+      'audio',
+    );
+
+    const entries = drainQueuedEntries('1_0');
+    assert.equal(entries.length, 1);
+    assert.deepEqual(entries[0].voice?.media, { file_id: 'FID', file_unique_id: 'UID', duration: 7 });
+    assert.equal(entries[0].voice?.kind, 'audio');
+  });
+});
+
+describe('peekQueuedBatch (AI-209 WP-1)', () => {
+  it('T1: returns the leading non-command run in arrival order, stops at the first command, and mutates nothing', () => {
+    const e1 = registerQueuedUpdate('1_0', 1, 'a');
+    const e2 = registerQueuedUpdate('1_0', 2, 'b');
+    registerQueuedUpdate('1_0', 3, '/status');
+    registerQueuedUpdate('1_0', 4, 'after command');
+
+    const peeked = peekQueuedBatch('1_0');
+    assert.equal(peeked.length, 2);
+    assert.deepEqual(peeked.map(e => e.updateId), [1, 2]);
+    assert.equal(peeked[0], e1, 'peek returns the queue\'s own entry objects (identity)');
+    assert.equal(peeked[1], e2);
+
+    // Nothing was cancelled by the peek.
+    assert.equal(e1.cancelled, false);
+    assert.equal(e2.cancelled, false);
+
+    // Re-peek sees the same set — the peek left the queue intact.
+    const again = peekQueuedBatch('1_0');
+    assert.deepEqual(again.map(e => e.updateId), [1, 2]);
+    // And the queue still drains its non-command texts unchanged (commands
+    // are never returned by a drain — existing convention).
+    assert.deepEqual(drainQueuedText('1_0'), ['a', 'b', 'after command']);
+  });
+
+  it('T2: returns [] for an absent topic, an empty array, and a queue whose head is a command', () => {
+    assert.deepEqual(peekQueuedBatch('nonexistent_0'), []);
+
+    const only = registerQueuedUpdate('1_0', 1, 'only');
+    dequeueUpdate('1_0', only);
+    assert.deepEqual(peekQueuedBatch('1_0'), []);
+
+    registerQueuedUpdate('2_0', 2, '/reset');
+    registerQueuedUpdate('2_0', 3, 'behind the command');
+    assert.deepEqual(peekQueuedBatch('2_0'), []);
+  });
+
+  it('T5: logs count: 0 on an empty queue (AI-208 E2 evidence convention)', () => {
+    const calls: Array<{ module: string; message: string; ctx?: Record<string, unknown> }> = [];
+    _setLoggerForTest({ info: (module, message, ctx) => calls.push({ module, message, ctx }) });
+    try {
+      const peeked = peekQueuedBatch('1_0');
+      assert.deepEqual(peeked, []);
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0].module, 'batch-uptake');
+      assert.equal(calls[0].message, 'peeked batch');
+      assert.equal(calls[0].ctx?.topicKey, '1_0');
+      assert.equal(calls[0].ctx?.count, 0);
+    } finally {
+      _setLoggerForTest(null);
+    }
+  });
+});
+
+describe('confirmQueuedBatch (AI-209 WP-1)', () => {
+  it('T3: removes exactly the given entries (identity), marks them cancelled, leaves the rest in place', () => {
+    const e1 = registerQueuedUpdate('1_0', 1, 'head');
+    const e2 = registerQueuedUpdate('1_0', 2, 'folded follower');
+    const cmd = registerQueuedUpdate('1_0', 3, '/status');
+    const e4 = registerQueuedUpdate('1_0', 4, 'after command');
+
+    confirmQueuedBatch('1_0', [e1, e2]);
+
+    assert.equal(e1.cancelled, true);
+    assert.equal(e2.cancelled, true);
+    assert.equal(cmd.cancelled, false, 'command entry must never be cancelled');
+    assert.equal(e4.cancelled, false, 'post-command entry is not in the fold set');
+
+    // What remains: the post-command entry is still queued (and the command
+    // is never returned by a drain — existing convention).
+    const remaining = drainQueuedEntries('1_0');
+    assert.deepEqual(remaining.map(e => e.updateId), [4]);
+    // The command entry must still be dequeueable normally afterward.
+    dequeueUpdate('1_0', cmd);
+    assert.deepEqual(drainQueuedEntries('1_0'), [], 'topic should be empty after the command entry is dequeued too');
+  });
+
+  it('T3b: deletes the topic key when confirmation empties the array', () => {
+    const e1 = registerQueuedUpdate('1_0', 1, 'a');
+    const e2 = registerQueuedUpdate('1_0', 2, 'b');
+    confirmQueuedBatch('1_0', [e1, e2]);
+    // Array emptied and key deleted — the topic is untracked again.
+    assert.deepEqual(peekQueuedBatch('1_0'), []);
+    assert.deepEqual(drainQueuedEntries('1_0'), []);
+  });
+
+  it('T3c: confirm logs one line per confirmed entry with updateId and hasVoice', () => {
+    const e1 = registerQueuedUpdate('1_0', 1, 'plain');
+    const e2 = registerQueuedUpdate('1_0', 2, 'voice text');
+    setVoice(e2, Promise.resolve(VOICE_RESULT));
+
+    const calls: Array<{ module: string; message: string; ctx?: Record<string, unknown> }> = [];
+    _setLoggerForTest({ info: (module, message, ctx) => calls.push({ module, message, ctx }) });
+    try {
+      confirmQueuedBatch('1_0', [e1, e2]);
+      const confirmed = calls.filter(c => c.message === 'confirmed batch entry');
+      assert.equal(confirmed.length, 2);
+      assert.deepEqual(confirmed.map(c => c.ctx?.updateId), [1, 2]);
+      assert.deepEqual(confirmed.map(c => c.ctx?.hasVoice), [false, true]);
+      for (const c of confirmed) {
+        assert.equal(c.module, 'batch-uptake');
+        assert.equal(c.ctx?.topicKey, '1_0');
+      }
+    } finally {
+      _setLoggerForTest(null);
+    }
+  });
+});
+
+describe('registerQueuedUpdate messageId (AI-209 WP-1)', () => {
+  it('T4: carries messageId when provided; omitting it leaves the field undefined; isCommandOverride still wins', () => {
+    const withId = registerQueuedUpdate('1_0', 1, 'hello', undefined, 501);
+    assert.equal(withId.messageId, 501);
+
+    const withoutId = registerQueuedUpdate('1_0', 2, 'plain');
+    assert.equal(withoutId.messageId, undefined);
+
+    const override = registerQueuedUpdate('1_0', 3, '/reset', false, 503);
+    assert.equal(override.isCommand, false, 'isCommandOverride still wins with messageId present');
+    assert.equal(override.messageId, 503);
+  });
+});
+
+describe('dequeueUpdate with the additive messageId field (AI-209 WP-1 T6)', () => {
+  it('T6: still no-ops on a foreign entry object carrying messageId', () => {
+    assert.doesNotThrow(() =>
+      dequeueUpdate('nonexistent_0', { updateId: 1, text: 'x', isCommand: false, cancelled: false, messageId: 10 }),
+    );
+    const e1 = registerQueuedUpdate('1_0', 1, 'first');
+    dequeueUpdate('1_0', e1);
+    // Dequeuing the same (already-removed) entry again must not throw.
+    assert.doesNotThrow(() => dequeueUpdate('1_0', e1));
   });
 });

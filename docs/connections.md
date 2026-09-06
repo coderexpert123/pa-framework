@@ -91,7 +91,7 @@ Three rules the notify/census pipeline (`notify.ts`, `alert-census.ts`) depends 
 ## Data Pipelines
 
 ### Conversation → Archive → Memory
-Every bot turn is appended to `conversation-history.jsonl`; the `memory-consolidation` skill (replaced `ecosystem-kb` 2026-08-18, same 21:00 IST slot) reads it nightly — add-only fact extraction with temporal metadata, supersede-by-key, conflicts surfaced to the weekly digest (never auto-applied). (private; public: `topic-brain-distill` + `update-brain`) Spec: `plans/2026-08-18-unified-memory-consolidation-SPEC.md`.
+Every bot turn is appended to `conversation-history.jsonl`; the `memory-consolidation` skill (replaced `ecosystem-kb` 2026-08-18, same 21:00 IST slot) reads it nightly — add-only fact extraction with temporal metadata, supersede-by-key, conflicts surfaced to the weekly digest (never auto-applied). (private; public: `topic-brain-distill` + `update-brain`) Spec: the 2026-08-18 memory-consolidation design record.
 
 ### KB → Git Safety Net
 memory-consolidation (private) commits a pre-update snapshot before modifying any KB file.
@@ -118,7 +118,7 @@ Eleven callback prefixes (grammar + gate table in `projects/telegram-bot/CLAUDE.
 
 **Alert census as a third input (2026-08-23):** `self-improver.ts`'s nightly `main()` builds a 7-day `AlertCensus` (`pa/src/lib/alert-census.ts`) in-process — the same deterministic census the daily job writes to disk, fresh so the loop never waits on its schedule. Each family routes deterministically pre-LLM: `deterministic-defect` with a healthy-now owner → code-fix proposal (`censusProposals()`); `human-gated` → never a code draft; `repeat-unchanged` → "alert hygiene" line. The report always prints the census headline, even at zero proposals.
 
-Fully autonomous since 2026-07-11 (`plans/2026-07-11-autonomous-self-improver-full-autonomy.md`): `validator.ts`'s `isCriticalChange`/`hasRealSideEffects` no longer block — `gateAndApprove` records them as risk flags (`critical-skill`, `declares-secrets`) on the applied change instead.
+Fully autonomous since 2026-07-11 (per the self-improver full-autonomy design record): `validator.ts`'s `isCriticalChange`/`hasRealSideEffects` no longer block — `gateAndApprove` records them as risk flags (`critical-skill`, `declares-secrets`) on the applied change instead.
 
 Only `isProtected()` (`PROTECTED_SKILLS` — widened 2026-08-17 to the whole git-workflow family: self-improver, commit, push, push-public, investigate-flagged, update-brain; the loop must never rewrite the skills that gate its own commits) and the validation floor (a fix/new-skill that fails validation stays `pending`, never deploys broken) still gate a proposal.
 
@@ -128,7 +128,7 @@ Thrash control: duplicate-pending skip, 3-day per-target cooldown, 14-day stale-
 
 **Code fixes too** (`pa/src/code-fixer.ts`): cmd-target proposals route to a coding worker under floors F1–F6 (protected-diff inspection, test-integrity guard, same-run build+suite+bot-health verification with hard revert, clean-worktree precondition, per-run bounds — one attempt per target skill, disjoint files across a run's fixes, a wall-clock budget — PRIVATE-origin-only push); each fix is one commit, `git revert`-rolled-back on regression (a conflicted revert is audited `rollback-failed`).
 
-**Consolidation audit trail** (2026-08-18): `~/.pa/consolidation-audit.jsonl` records all memory-consolidation decisions (added/superseded/conflict/skipped) alongside the self-improver audit trail. Spec: `plans/2026-08-18-unified-memory-consolidation-SPEC.md`.
+**Consolidation audit trail** (2026-08-18): `~/.pa/consolidation-audit.jsonl` records all memory-consolidation decisions (added/superseded/conflict/skipped) alongside the self-improver audit trail. Spec: the 2026-08-18 memory-consolidation design record.
 
 ### Learn → Profile
 Profile learning has two paths:

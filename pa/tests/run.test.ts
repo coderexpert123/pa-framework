@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createTempPaHome, createTempSkill, createTempConfig, createTempSecrets, cleanup } from './helpers.js';
-import { runCommand, isSilentNoOp, describeSendFailure } from '../src/commands/run.js';
+import { runCommand, isSilentNoOp, describeSendFailure, extractKeyboardEnvelope } from '../src/commands/run.js';
 import { writeFile, mkdir, readFile, readdir } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -286,6 +286,39 @@ function stubFetchThrowing(message: string): { calls: string[]; restore: () => v
     throw new Error(message);
   };
   return { calls, restore: () => { (globalThis as any).fetch = original; } };
+}
+
+/** Like stubFetch but also records each request's parsed JSON body — the
+ *  [PA_KEYBOARD] tests assert on reply_markup and the delivered TEXT, not just
+ *  the URL. */
+function stubFetchCapturingBody(
+  response: { ok: boolean; status?: number; text?: string } = { ok: true },
+): { bodies: Array<Record<string, unknown>>; restore: () => void } {
+  const bodies: Array<Record<string, unknown>> = [];
+  const original = globalThis.fetch;
+  (globalThis as any).fetch = async (input: any, init: any) => {
+    bodies.push(init?.body ? JSON.parse(String(init.body)) : {});
+    return {
+      ok: response.ok,
+      status: response.status ?? (response.ok ? 200 : 400),
+      text: async () => response.text ?? '',
+      json: async () => ({ ok: response.ok }),
+    } as any;
+  };
+  return { bodies, restore: () => { (globalThis as any).fetch = original; } };
+}
+
+/** A cmd worker that writes `stdout` verbatim (JSON.stringify'd into the script
+ *  source, so arbitrary envelope payloads need no hand-escaping). */
+async function configureOutputWorker(name: string, stdout: string): Promise<void> {
+  const script = await writeScript(name, `process.stdout.write(${JSON.stringify(stdout)});`);
+  await createTempConfig(tempDir, [
+    { name: 'w1', command: 'node', args: [script], check: 'echo ok', priority: 1, rate_limit_patterns: [] },
+  ]);
+}
+
+function keyboardEnvelope(buttons: Array<{ text: string; callback_data: string }>): string {
+  return `[PA_KEYBOARD]: ${JSON.stringify({ buttons })}`;
 }
 
 describe('runCommand — silent no-op detection', () => {
@@ -578,5 +611,160 @@ describe('runCommand — rejected Telegram delivery', () => {
     assert.equal(result.success, true);
     const meta = await readRunMeta(tempDir, 'plain-skill');
     assert.equal(meta.status, 'success');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// [PA_KEYBOARD] envelope (Wave-1 WP-C, 2026-09-02, SPEC §3.4): a telegram_output
+// skill's SCRIPT may end its output with one `[PA_KEYBOARD]: {...}` line whose
+// inline keyboard is grammar-validated (callback-grammar.ts's
+// validateKeyboardRequest — the ONE grammar, shared with the bot) and attached to
+// the delivery's last chunk. Every failure mode must degrade to "deliver the text
+// without a keyboard" — the envelope must never fail the run — and a skill in
+// PROTECTED_SKILLS never gets one at all.
+// ---------------------------------------------------------------------------
+
+describe('runCommand — [PA_KEYBOARD] envelope', () => {
+  const OK_BUTTONS = [{ text: 'Run again', callback_data: 'sk:run:fitness-form-check' }];
+
+  it('PA_KEYBOARD envelope attaches keyboard to telegram_output send', async () => {
+    await createTempSecrets(tempDir, 'TELEGRAM_BOT_TOKEN=test-token\n');
+    await configureOutputWorker('kb-ok.js', `Daily briefing: all good\n${keyboardEnvelope(OK_BUTTONS)}`);
+    await createTempSkill(tempDir, 'kb-ok-skill', ['---', TELEGRAM_FRONTMATTER, '---', 'prompt'].join('\n'));
+
+    const stub = stubFetchCapturingBody();
+    const result = await runCommand('kb-ok-skill').finally(() => stub.restore());
+
+    assert.equal(result.success, true, 'a valid keyboard must not disturb the run verdict');
+    assert.equal(stub.bodies.length, 1, 'delivered exactly once');
+    const kb = stub.bodies[0].reply_markup as
+      | { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> }
+      | undefined;
+    assert.ok(kb, 'the validated keyboard must ride the send payload');
+    assert.deepEqual(kb.inline_keyboard, [OK_BUTTONS], 'one button per row, verbatim');
+  });
+
+  it('envelope stripped from delivered text', async () => {
+    await createTempSecrets(tempDir, 'TELEGRAM_BOT_TOKEN=test-token\n');
+    await configureOutputWorker('kb-strip.js', `Daily briefing: all good\n${keyboardEnvelope(OK_BUTTONS)}`);
+    await createTempSkill(tempDir, 'kb-strip-skill', ['---', TELEGRAM_FRONTMATTER, '---', 'prompt'].join('\n'));
+
+    const stub = stubFetchCapturingBody();
+    await runCommand('kb-strip-skill').finally(() => stub.restore());
+
+    assert.equal(stub.bodies.length, 1);
+    const text = String(stub.bodies[0].text);
+    assert.ok(!text.includes('PA_KEYBOARD'), 'the envelope marker must never reach Telegram');
+    assert.ok(!text.includes('callback_data'), 'the raw envelope JSON must never reach Telegram');
+    assert.ok(text.includes('Daily briefing'), 'the clean text is still delivered');
+  });
+
+  it('invalid callback_data strips keyboard and warns', async () => {
+    await createTempSecrets(tempDir, 'TELEGRAM_BOT_TOKEN=test-token\n');
+    await configureOutputWorker(
+      'kb-bad.js',
+      `Daily briefing: all good\n${keyboardEnvelope([{ text: 'Do it', callback_data: 'made-up-button' }])}`,
+    );
+    await createTempSkill(tempDir, 'kb-bad-skill', ['---', TELEGRAM_FRONTMATTER, '---', 'prompt'].join('\n'));
+
+    const stub = stubFetchCapturingBody();
+    const warns: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warns.push(args.map(String).join(' ')); };
+    let result;
+    try {
+      result = await runCommand('kb-bad-skill');
+    } finally {
+      console.warn = originalWarn;
+      stub.restore();
+    }
+
+    assert.equal(result.success, true, 'a rejected keyboard must NEVER fail the run');
+    assert.equal(stub.bodies.length, 1, 'the TEXT is still delivered');
+    assert.equal(stub.bodies[0].reply_markup, undefined, 'grammar-invalid callback_data → no keyboard');
+    assert.ok(
+      warns.some((w) => w.includes('PA_KEYBOARD rejected') && w.includes('callback grammar')),
+      'the rejection must be warned with the validator error',
+    );
+  });
+
+  it('protected skill keyboard is refused', async () => {
+    await createTempSecrets(tempDir, 'TELEGRAM_BOT_TOKEN=test-token\n');
+    await configureOutputWorker('kb-prot.js', `Briefing\n${keyboardEnvelope(OK_BUTTONS)}`);
+    // A PROTECTED_SKILLS member by name — the temp skill shadows nothing real;
+    // only the NAME drives the refusal (validator.ts's one set, no third mirror).
+    await createTempSkill(tempDir, 'commit', ['---', TELEGRAM_FRONTMATTER, '---', 'prompt'].join('\n'));
+
+    const stub = stubFetchCapturingBody();
+    const warns: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warns.push(args.map(String).join(' ')); };
+    let result;
+    try {
+      result = await runCommand('commit');
+    } finally {
+      console.warn = originalWarn;
+      stub.restore();
+    }
+
+    assert.equal(result.success, true, 'the refusal strips the keyboard, never fails the run');
+    assert.equal(stub.bodies.length, 1, 'the TEXT is still delivered');
+    assert.equal(stub.bodies[0].reply_markup, undefined, 'a protected skill never gets a keyboard');
+    assert.ok(warns.some((w) => w.includes('PA_KEYBOARD refused')), 'the refusal must be warned');
+  });
+
+  it('NO_OUTPUT sentinel still suppresses the send', async () => {
+    // §3.4 ordering: the envelope is stripped FIRST, then the sentinel check
+    // applies to the remainder — a keyboard on a suppressed send is a
+    // contradictory request and is dropped with it.
+    await createTempSecrets(tempDir, 'TELEGRAM_BOT_TOKEN=test-token\n');
+    await configureOutputWorker('kb-noop.js', `Some report\n${keyboardEnvelope(OK_BUTTONS)}\nNO_OUTPUT`);
+    await createTempSkill(tempDir, 'kb-noop-skill', ['---', TELEGRAM_FRONTMATTER, '---', 'prompt'].join('\n'));
+
+    const stub = stubFetchCapturingBody();
+    const result = await runCommand('kb-noop-skill').finally(() => stub.restore());
+
+    assert.equal(result.success, true, 'the sentinel stays the designed escape hatch');
+    assert.equal(stub.bodies.length, 0, 'nothing sends — keyboard included');
+  });
+});
+
+describe('extractKeyboardEnvelope', () => {
+  it('returns the output unchanged when no marker is present', () => {
+    const out = 'plain output\nmultiple lines\nNO_OUTPUT';
+    assert.deepEqual(extractKeyboardEnvelope(out, 'any-skill'), { text: out });
+  });
+
+  it('strips a non-JSON payload silently (parseMetadata parity)', () => {
+    const { text, keyboard } = extractKeyboardEnvelope('Report\n[PA_KEYBOARD]: not-json', 'any-skill');
+    assert.equal(text, 'Report');
+    assert.equal(keyboard, undefined);
+  });
+
+  it('parses a whole-output marker line (startsWith form)', () => {
+    const out = `[PA_KEYBOARD]: ${JSON.stringify({ buttons: [{ text: 'Go', callback_data: 'cf:y' }] })}`;
+    const { text, keyboard } = extractKeyboardEnvelope(out, 'any-skill');
+    assert.equal(text, '');
+    assert.deepEqual(keyboard, { inline_keyboard: [[{ text: 'Go', callback_data: 'cf:y' }]] });
+  });
+
+  it('uses the LAST marker occurrence when several are present', () => {
+    const first = `[PA_KEYBOARD]: ${JSON.stringify({ buttons: [{ text: 'Old', callback_data: 'cf:y' }] })}`;
+    const last = `[PA_KEYBOARD]: ${JSON.stringify({ buttons: [{ text: 'New', callback_data: 'rm:done' }] })}`;
+    const { text, keyboard } = extractKeyboardEnvelope(`Report\n${first}\nmore\n${last}`, 'any-skill');
+    // parseMetadata parity: only the LAST marker occurrence is stripped; a stale
+    // earlier envelope line stays in the delivered text exactly as a stale
+    // [PA_META] line does. The envelope contract is one envelope, at the end.
+    assert.equal(text, `Report\n${first}\nmore`);
+    assert.deepEqual(keyboard, { inline_keyboard: [[{ text: 'New', callback_data: 'rm:done' }]] });
+  });
+
+  it('keeps trailing content in the remainder after the envelope line', () => {
+    // §3.4 ordering depends on this: the payload is bounded at the LINE end, so a
+    // sentinel line after the envelope survives the strip and suppresses the send.
+    const env = `[PA_KEYBOARD]: ${JSON.stringify({ buttons: [{ text: 'Go', callback_data: 'cf:y' }] })}`;
+    const { text, keyboard } = extractKeyboardEnvelope(`Report\n${env}\nNO_OUTPUT`, 'any-skill');
+    assert.equal(text, 'Report\nNO_OUTPUT');
+    assert.deepEqual(keyboard, { inline_keyboard: [[{ text: 'Go', callback_data: 'cf:y' }]] });
   });
 });

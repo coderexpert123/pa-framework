@@ -3,7 +3,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { buildHITLKeyboard, buildDraftKeyboard } from '../src/lib/hitl-keyboard.js';
 
-// WP-P1 (2026-08-24, plans/2026-08-24-buttons-program-SPEC.md pre-work P5): pa's canonical
+// WP-P1 (2026-08-24, the buttons-program spec pre-work P5): pa's canonical
 // hitl-keyboard.ts is a verbatim move of the bot's projects/telegram-bot/src/logic.ts builder.
 // Its output must stay byte-identical to the bot's own — this file and the bot's
 // projects/telegram-bot/src/tests/hitl-buttons.test.ts assert the SAME exact callback strings

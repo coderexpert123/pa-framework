@@ -36,7 +36,7 @@ async function isInsideWorkTree(cwd: string): Promise<boolean> {
 
 /**
  * Single guard for "may a skill run git on the user's behalf?" —
- * plans/2026-08-31-public-readiness-program.md WP-B. Allowed only when BOTH:
+ * the 2026-08-31 public-readiness program, WP-B. Allowed only when BOTH:
  *   1. config opted in: `git_workflow.enabled` is true, or the block is absent
  *      (legacy configs predate the knob; only an explicit false opts out), and
  *   2. the target directory is inside a git work tree.

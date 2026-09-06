@@ -23,11 +23,33 @@ import {
   classifyOutcome,
   parseBotResource,
   skillFromResource,
+  taskRefFromResource,
   type TurnTraceV1,
 } from './lib/turn-trace.js';
 
 function sanitizeCmdline(cmdline: string): string {
   return cmdline.replace(/([?&](api_key|token|password|secret)=)[^\s&]*/gi, '$1<redacted>').slice(0, 200);
+}
+
+/**
+ * Raw-send guard (2026-09-04, plans/2026-09-04-raw-send-guard-SPEC.md WP2.1):
+ * pure detector over a run's collected tool commands. A command matches iff it
+ * contains `api.telegram.org` OR `telegramFetch(` — the two shapes the
+ * hand-written scratch send into pa-support used. Deterministic, no I/O;
+ * returns at most 3 matches, each truncated to 200 chars. Accepted
+ * false-positive class (alert-only, never blocking): dev commands that grep or
+ * edit source containing these strings.
+ */
+export function detectRawTelegramSends(commands: string[]): string[] {
+  const matches: string[] = [];
+  for (const c of commands) {
+    if (typeof c !== 'string') continue;
+    if (c.includes('api.telegram.org') || c.includes('telegramFetch(')) {
+      matches.push(c.slice(0, 200));
+      if (matches.length >= 3) break;
+    }
+  }
+  return matches;
 }
 
 export interface BgEntry {
@@ -103,6 +125,29 @@ function quoteArg(a: string): string {
   }
   // POSIX sh: wrap in single quotes, escape embedded single quotes via '\''
   return /[\s'"\\$`!|&;()<>]/.test(a) ? `'${a.replace(/'/g, "'\\''")}'` : a;
+}
+
+/**
+ * Remove configured flags for ONE run (RunOptions.stripArgs). Bare form drops
+ * the flag and the token AFTER it unconditionally — a stripped bare flag is
+ * assumed value-bearing, so '--flag --other x' also drops '--other'. '=form'
+ * drops only the token carrying it. Repeats all drop. A stripped flag at the
+ * end drops itself. Unset/empty strip ⇒ the input array is returned unchanged
+ * (byte-identical contents). extraArgs are never passed here and are appended
+ * after stripping — they are never stripped.
+ */
+export function stripConfiguredArgs(args: string[], strip: string[] | undefined): string[] {
+  if (!strip || strip.length === 0) return args;
+  const flags = new Set(strip);
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (flags.has(a)) { i++; continue; } // bare form: consume flag + following token
+    const eq = a.indexOf('=');
+    if (eq > 0 && flags.has(a.slice(0, eq))) continue; // =form: drop the token
+    out.push(a);
+  }
+  return out;
 }
 
 // agy and agyc are the SAME binary (agy.exe via the gemini-shim) emitting the
@@ -220,6 +265,7 @@ export async function executeWorker(
     // - arg mode: write prompt to temp file and substitute {prompt}/{prompt_file}
     let args: string[];
     const extraArgs = options.extraArgs || [];
+    const configuredArgs = stripConfiguredArgs(worker.args, options.stripArgs);
     if (useStdin) {
       // Codex uses a trailing bare '-' as its stdin marker, and (on resume)
       // subcommand syntax ('resume', no dashes) ahead of it. Anything appended
@@ -233,14 +279,14 @@ export async function executeWorker(
       // buildDispatchExtraArgs (telegram-bot/src/main.ts) already orders extraArgs
       // as [...baseArgs (e.g. resume args), ...tunableArgs], so no reordering is
       // needed here — the whole array goes in before the trailing '-' as-is.
-      if (extraArgs.length > 0 && worker.args[worker.args.length - 1] === '-') {
-        args = [...worker.args.slice(0, -1), ...extraArgs, '-'];
+      if (extraArgs.length > 0 && configuredArgs[configuredArgs.length - 1] === '-') {
+        args = [...configuredArgs.slice(0, -1), ...extraArgs, '-'];
       } else {
-        args = [...worker.args, ...extraArgs];
+        args = [...configuredArgs, ...extraArgs];
       }
     } else {
       promptFile = await writeTempPrompt(prompt);
-      const substitutedArgs = worker.args.map((a) => {
+      const substitutedArgs = configuredArgs.map((a) => {
         if (a === '{prompt}') return `@${promptFile}`;
         if (a === '{prompt_file}') return promptFile!;
         return a.replace('{prompt}', `@${promptFile}`).replace('{prompt_file}', promptFile!);
@@ -296,7 +342,12 @@ export async function executeWorker(
           error: r.error,
         });
         const bot = parseBotResource(options.resource);
+        const taskRef = taskRefFromResource(options.resource);
         const h = trace.harvest();
+        // Raw-send guard (2026-09-04): scan this run's collected tool commands
+        // for direct Telegram Bot API sends; attached to the result only when
+        // non-empty (optional field — the bot alerts pa-support, never blocks).
+        const rawSends = detectRawTelegramSends(h.commands);
         void appendTurnTrace({
           v: 1,
           run_id: runId,
@@ -306,6 +357,7 @@ export async function executeWorker(
           origin: classifyOrigin(options.resource),
           ...(bot ? { chat_id: bot.chatId, thread_id: bot.threadId } : {}),
           ...(options.updateId !== undefined ? { update_id: options.updateId } : {}),
+          ...(taskRef ? { task_ref: taskRef } : {}),
           ...(skillFromResource(options.resource) ? { skill: skillFromResource(options.resource) } : {}),
           worker: worker.name,
           ...(trace.model ? { model: trace.model } : {}),
@@ -322,7 +374,7 @@ export async function executeWorker(
           bytes_out: Buffer.byteLength(r.output ?? '', 'utf8'),
           truncated: h.truncated,
         } satisfies TurnTraceV1);
-        resolve({ teePath: r.teePath ?? teePath, runId, ...r });
+        resolve({ ...r, teePath: r.teePath ?? teePath, runId, ...(rawSends.length > 0 ? { rawTelegramSends: rawSends } : {}) });
       };
 
       let stdout = '';

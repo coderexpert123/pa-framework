@@ -3,6 +3,7 @@ import './test-env-guard.js';
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFile, mkdir, readFile, readdir } from 'fs/promises';
+import { readFileSync } from 'node:fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { createTempPaHome, createTempConfig, createTempSecrets, cleanup } from './helpers.js';
@@ -201,5 +202,34 @@ describe('worker-exec silent-site alerts', () => {
 
     assert.ok(entry, 'expected to observe the registered pid entry mid-run');
     assert.equal(entry!.harvestUntil, undefined, 'harvestUntil must be absent when harvestWindowMs is not set');
+  });
+});
+
+describe('stripArgs wiring source invariant', () => {
+  // timer-inventory's source-root pattern: this file lands at
+  // <pa>/dist/tests/worker-exec-silent-sites.test.js after build, so
+  // __dirname there is pa/dist/tests — walk back up to the pa/ package root
+  // to read the real source.
+  const PA_ROOT = join(__dirname, '..', '..');
+
+  it('worker-exec.ts keeps exactly ONE raw worker.args use — the strip call itself', () => {
+    const src = readFileSync(join(PA_ROOT, 'src', 'worker-exec.ts'), 'utf8');
+    const uses = src.match(/worker\.args/g)?.length ?? 0;
+    assert.equal(uses, 1,
+      `expected exactly 1 raw worker.args use in pa/src/worker-exec.ts (the stripConfiguredArgs call), found ${uses} — ` +
+      'any new use of configured args in argv assembly must route through stripConfiguredArgs, ' +
+      'or RunOptions.stripArgs silently stops applying at that site');
+    assert.ok(src.includes('stripConfiguredArgs(worker.args'),
+      'the single remaining configured-args use must BE the strip call: stripConfiguredArgs(worker.args, ...)');
+  });
+
+  it('workers.ts never re-assembles argv — failover candidates inherit stripArgs via the options spread', () => {
+    const src = readFileSync(join(PA_ROOT, 'src', 'workers.ts'), 'utf8');
+    const uses = src.match(/worker\.args/g)?.length ?? 0;
+    assert.equal(uses, 0,
+      `runWithFailover assembles no argv — expected 0 raw worker.args uses in pa/src/workers.ts, found ${uses}; ` +
+      'candidates must keep inheriting RunOptions (including stripArgs) via the options spread');
+    assert.ok(src.replace(/\s+/g, ' ').includes('executeWorker(worker, prompt, { ...options'),
+      'runWithFailover must keep spreading ...options into executeWorker so every failover candidate inherits stripArgs');
   });
 });

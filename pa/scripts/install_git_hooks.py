@@ -19,7 +19,7 @@ repo), override via the `PA_PUBLIC_DIR` env var or the `--public-dir` flag —
 as a genuinely SEPARATE git repository with its own independent clone/pull
 lifecycle — a symlink or hard link crossing that boundary would silently
 desync the moment either repo is re-cloned, which is now a normal, supported
-recovery path (see plans/2026-08-05-concurrent-session-safety.md). Re-running
+recovery path (see the 2026-08-05 multi-session safety plan). Re-running
 this installer after every edit to the source is the documented, expected
 workflow; the drift-check verdict below is what catches "forgot to re-run" —
 the same failure mode a stale symlink would have masked differently, not

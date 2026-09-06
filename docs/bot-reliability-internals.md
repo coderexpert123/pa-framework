@@ -18,8 +18,8 @@ retry now also runs in steady state. Same timer runs `compactDelivered()`; the p
 and session GC are shed under DEGRADED; the DLQ flush deliberately is NOT (it IS reply
 delivery, not housekeeping — shedding it for >24h would let queued replies expire at the
 DLQ TTL), and an in-flight guard keeps at most one flush queued on the dlq mutex during
-outages. (See `plans/2026-07-07-autonomous-scale-longevity-hardening.md` +
-`plans/2026-07-08-autonomous-deep-recheck-pass1-fixes.md`.)
+outages. (Per the internal design records: 2026-07-07 scale-longevity hardening,
+2026-07-08 deep-recheck pass 1.)
 
 **Quarantine contract (2026-08-17):** Each DLQ entry tracks `attempts` (failed flush count).
 At 5 failed attempts, the entry is marked `quarantined: true` and retry stops — it persists
@@ -106,7 +106,7 @@ stays prompt.
    align; offset comes from the real batch only), so the full normal path re-dispatches it.
    The requeue is a durable ladder — a failed requeued dispatch below `PA_REQUEUE_MAX`
    (default 2) parks (`requeueNotBefore`, `PA_REQUEUE_BACKOFF_MS` default 15 min) and the
-   `requeue-drain` maintenance job re-injects when due; a /stop during the window cancels
+   the `queue-drain` job's `requeue` source re-injects when due; a /stop during the window cancels
    the parked record. Three hard rules: the "retrying automatically" status line goes
    OUT-OF-BAND (raw `sendMessage` + `appendRefIdAndLog`) — a reply-path send would
    `markDelivered` the key and the retry's REAL reply would be dedup-skipped at
@@ -131,9 +131,9 @@ definition lands mid-run, inside the cascade where between-phase checks never ex
 the cancelled request got answered by the next worker instead (live incident 2026-08-02,
 thread 29, plus a false pa-alerts page). The bot's post-cascade bail is deliberately
 gated on `!result.success`, preserving the invariant that a worker which finished just
-before the kill keeps its real reply. `plans/2026-08-02-autonomous-stop-cancellation-cascade.md`.
+before the kill keeps its real reply (per the 2026-08-02 stop-cancellation-cascade internal design record).
 
-**2026-08-15 wave (voice prefetch + flush; plans/2026-08-15-voice-prefetch-stop-steer-flush*.md)**:
+**2026-08-15 wave (voice prefetch + flush, internal design record)**:
 
 - Voice/audio/video notes transcribe AT ARRIVAL (`voice-prefetch.ts`, started in the
   poll loop's enqueue block, AFTER the AI-095 placeholder write). The transcript becomes
@@ -215,3 +215,5 @@ do not "fix" either back.
    semantics above). `worker-exec.ts` additionally enforces machine-wide worker
    admission control via `PA_MAX_CONCURRENT_WORKERS` blackboard slots (evaluators
    exempt).
+
+---

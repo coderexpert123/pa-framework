@@ -1,5 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import { MAINTENANCE_JOBS, jobsForHost, findJob } from '../src/lib/maintenance/registry.js';
 import { validateRegistry } from '../src/lib/maintenance/policy.js';
 import { PRUNABLE_ARCHIVE_SUFFIXES } from '../src/lib/archive-files.js';
@@ -10,8 +12,8 @@ describe('MAINTENANCE_JOBS registry', () => {
     assert.doesNotThrow(() => validateRegistry([...MAINTENANCE_JOBS]));
   });
 
-  it('declares exactly 31 jobs (21 pa + 10 bot) with the expected names', () => {
-    assert.equal(MAINTENANCE_JOBS.length, 31);
+  it('registry declares 32 jobs (23 pa + 9 bot) with the expected names', () => {
+    assert.equal(MAINTENANCE_JOBS.length, 32);
     const names = MAINTENANCE_JOBS.map((j) => j.name).sort();
     assert.deepEqual(names, [
       'alert-census',
@@ -21,10 +23,11 @@ describe('MAINTENANCE_JOBS registry', () => {
       'blackboard-purge',
       'bot-log-rotation-check',
       'bot-self-restart',
+      'c-disk-floor-watchdog',
       'clobber-sentinel',
+      'daily-recon',
       'dashboard-refresh',
       'delivered-store-compact',
-      'dlq-flush',
       'grounding-check',
       'model-override-sweep',
       'orphan-worker-reap',
@@ -48,9 +51,9 @@ describe('MAINTENANCE_JOBS registry', () => {
     ]);
   });
 
-  it('splits jobs correctly by host (21 pa, 10 bot)', () => {
-    assert.equal(jobsForHost('pa').length, 21);
-    assert.equal(jobsForHost('bot').length, 10);
+  it('splits jobs correctly by host (23 pa, 9 bot)', () => {
+    assert.equal(jobsForHost('pa').length, 23);
+    assert.equal(jobsForHost('bot').length, 9);
     const botNames = jobsForHost('bot').map((j) => j.name).sort();
     assert.deepEqual(botNames, [
       'alert-digest',
@@ -58,12 +61,21 @@ describe('MAINTENANCE_JOBS registry', () => {
       'bot-self-restart',
       'dashboard-refresh',
       'delivered-store-compact',
-      'dlq-flush',
       'grounding-check',
       'model-override-sweep',
       'proxy-pool-refresh',
       'registry-content-watch',
     ]);
+  });
+
+  it('daily-recon registered for pa with 15m cadence', () => {
+    const job = findJob('daily-recon');
+    assert.ok(job, 'daily-recon should exist');
+    assert.equal(job!.host, 'pa');
+    assert.equal(resolveEvery(job!), 900_000);
+    assert.deepEqual(job!.targets, [], 'phase 1 is a read-only sweep — no retention targets');
+    assert.equal(job!.destructive, false);
+    assert.equal(job!.shedWhenDegraded, true);
   });
 
   it('recall-index is declared for host pa with a 10-minute cadence and no targets', () => {
@@ -172,7 +184,6 @@ describe('MAINTENANCE_JOBS registry', () => {
       'alert-state-gc',
       'archive-prune',
       'delivered-store-compact',
-      'dlq-flush',
       'orphan-worker-reap',
       'reservation-gc',
       'session-gc',
@@ -205,7 +216,32 @@ describe('MAINTENANCE_JOBS registry', () => {
 
   it('findJob resolves known names across both hosts and returns undefined for unknown ones', () => {
     assert.equal(findJob('session-gc')?.name, 'session-gc');
-    assert.equal(findJob('dlq-flush')?.name, 'dlq-flush');
+    assert.equal(findJob('alert-digest')?.name, 'alert-digest');
     assert.equal(findJob('nope'), undefined);
+  });
+
+  it('docs admission rule present in maintenance-jobs doc', () => {
+    // __dirname there is pa/dist/tests — walk back up to the repo root (the
+    // timer-inventory.test.ts pattern; pa tests run compiled from dist).
+    const docPath = join(__dirname, '..', '..', '..', 'docs', 'maintenance-jobs.md');
+    // Prose is line-wrapped — match against whitespace-normalized text so the
+    // needles survive re-wrapping.
+    const doc = readFileSync(docPath, 'utf8').replace(/\s+/g, ' ');
+    // The frozen admission rule (Wave-2 SPEC §3.2, landed by WP-C) — the doc
+    // is the rule's single home; this pin keeps it from silently drifting.
+    assert.ok(
+      doc.includes('extending a registry entry (a drain source, a recon phase) beats adding a job'),
+      'the admission rule sentence must stay in docs/maintenance-jobs.md',
+    );
+    // The counts line states the numbers' history in one line (SPEC §5,
+    // named edge 4): the current total plus what each growth step replaced.
+    assert.ok(
+      doc.includes('32 (23 pa + 9 bot)') && doc.includes('31 (22 pa + 9 bot)') && doc.includes('32 (22 pa + 10 bot)'),
+      'the counts line must carry the current total AND the replaced ones',
+    );
+    // The consolidated family has its own section naming every source.
+    for (const needle of ['`queue-drain`', '`requeue`', '`reminder-resume`', '`topic-task`', '`dlq`']) {
+      assert.ok(doc.includes(needle), `the queue-drain section must name '${needle}'`);
+    }
   });
 });

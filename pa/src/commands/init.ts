@@ -233,6 +233,17 @@ git_workflow:
 #   # is accepted but logs a config-load warning, since it will likely mistranscribe
 #   # or transliterate rather than fail outright. Leave unset (null) to auto-detect.
 #   language: null
+
+# === Voice inbox app (projects/voice-inbox) ===
+# Optional block. Omit it and only the voice-inbox app is unconfigured. The
+# app server refuses to start until inbox_topic names the topic that receives
+# new tasks. Env overrides: VOICE_INBOX_PORT, VOICE_INBOX_INBOX_TOPIC.
+# voice_inbox:
+#   inbox_topic: "CHATID_THREADID"  # REQUIRED "<chatId>_<threadId>" topic key
+#   port: 8787                      # binds 127.0.0.1 only
+#   max_upload_mb: 25
+#   session_ttl_hours: 168          # pairing session lifetime (7 days)
+#   pairing_ttl_minutes: 10         # one-time pairing-code lifetime
 `.trim();
 
 const DEFAULT_SECRETS = `
@@ -316,6 +327,15 @@ export async function initCommand(opts?: { notify?: typeof notifyUser }): Promis
   } catch {
     await writeFile(brainFilesPath, DEFAULT_BRAIN_FILES, 'utf8');
     console.log(`[+] Created brain-files.json (empty; opt-in for the update-brain sample skill)`);
+  }
+
+  const topicOwnershipRegistryPath = join(home, 'topic-ownership-registry.json');
+  try {
+    await access(topicOwnershipRegistryPath);
+    console.log(`[skip] topic-ownership-registry.json already exists.`);
+  } catch {
+    await writeFile(topicOwnershipRegistryPath, '{}', 'utf8');
+    console.log(`[+] Created topic-ownership-registry.json (empty; optional topic-ownership registry — see config.example.yaml)`);
   }
 
   const topicBrainsDir = join(home, 'topic-brains');

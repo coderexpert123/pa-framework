@@ -18,7 +18,6 @@ import { botLogRotationCheckJob } from './jobs/bot-log-rotation-check.js';
 import { modelOverrideSweepJob } from './jobs/model-override-sweep.js';
 import { deliveredStoreCompactJob } from './jobs/delivered-store-compact.js';
 import { proxyPoolRefreshJob } from './jobs/proxy-pool-refresh.js';
-import { dlqFlushJob } from './jobs/dlq-flush.js';
 import { groundingCheckJob } from './jobs/grounding-check.js';
 import { registryContentWatchJob } from './jobs/registry-content-watch.js';
 import { dashboardRefreshJob } from './jobs/dashboard-refresh.js';
@@ -28,8 +27,10 @@ import { skillEngagementAuditJob } from './jobs/skill-engagement-audit.js';
 import { sharedTmpSweepJob } from './jobs/shared-tmp-sweep.js';
 import { watchJobsRunnerJob } from './jobs/watch-jobs-runner.js';
 import { workerEditAuditSweepJob } from './jobs/worker-edit-audit-sweep.js';
+import { dailyReconJob } from './jobs/daily-recon.js';
 import { botSelfRestartJob } from './jobs/bot-self-restart.js';
 import { alertDigestJob } from './jobs/alert-digest.js';
+import { cDiskFloorWatchdogJob } from './jobs/c-disk-floor-watchdog.js';
 
 /** THE single declared table. Every declared maintenance job across pa and bot hosts
  *  lives under this array — that is the point of the construct. */
@@ -56,6 +57,8 @@ export const MAINTENANCE_JOBS: readonly MaintenanceJob[] = [
   sharedTmpSweepJob,
   watchJobsRunnerJob,
   workerEditAuditSweepJob,
+  dailyReconJob,
+  cDiskFloorWatchdogJob,
   // bot-host jobs
   botLogRotationCheckJob,
   modelOverrideSweepJob,
@@ -66,7 +69,6 @@ export const MAINTENANCE_JOBS: readonly MaintenanceJob[] = [
   dashboardRefreshJob,
   botSelfRestartJob,
   alertDigestJob,
-  dlqFlushJob,
 ];
 
 export function jobsForHost(host: MaintenanceHost): MaintenanceJob[] {

@@ -17,7 +17,10 @@ import type { AuditValidation } from './lib/improvement-audit.js';
 // now risk *flags* recorded alongside an applied change, not gates that prevent it.
 // Includes the git-workflow family (commit/push/push-public/investigate-flagged/update-brain; commit-and-push retired 2026-08-28, AI-148 D-b)
 // because the loop must not rewrite the skills that gate its own commits (2026-08-17 audit P1-1).
-const PROTECTED_SKILLS = new Set(['self-improver', 'commit', 'push', 'push-public', 'investigate-flagged', 'update-brain']);
+// Exported 2026-09-02 (Wave-1 WP-C): run.ts's [PA_KEYBOARD] envelope refuses a keyboard for
+// any skill in this set — the same "the loop must not rewrite its own gates" reasoning
+// extends to "its gates never carry improvised buttons". ONE set, no third mirror.
+export const PROTECTED_SKILLS = new Set(['self-improver', 'commit', 'push', 'push-public', 'investigate-flagged', 'update-brain']);
 
 /**
  * Hard block — the self-improvement loop must never modify or roll back this skill, no

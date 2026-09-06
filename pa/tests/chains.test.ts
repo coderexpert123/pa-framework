@@ -8,7 +8,7 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFile, mkdir } from 'fs/promises';
 import { join } from 'path';
-import { createTempPaHome, cleanup } from './helpers.js';
+import { createTempPaHome, createTempSecrets, cleanup } from './helpers.js';
 import {
   loadChain,
   executeChain,
@@ -333,6 +333,73 @@ report: stdout
       const result = await executeChain('fail-report', { spawnFn: seq.spawnFn });
       assert.equal(result.success, false);
       assert.ok(result.report.includes('2/3') || result.report.includes('1 failed'), `report mentions the failure: ${result.report}`);
+    });
+
+    // WP-D2 B.6 (2026-09-02): the telegram failure report carries the one-tap
+    // ch:r re-run keyboard; the success report carries none. Asserted through a
+    // stubbed globalThis.fetch (never a real host) the same way
+    // notify-reply-markup.test.ts pins NotifyOpts.replyMarkup.
+    function setupFetchMock(): Array<{ url: string; init?: RequestInit }> {
+      const calls: Array<{ url: string; init?: RequestInit }> = [];
+      (globalThis as Record<string, unknown>).fetch = async (url: string, init?: RequestInit) => {
+        calls.push({ url, init });
+        return { ok: true, status: 200, text: async () => '{}', json: async () => ({}) };
+      };
+      return calls;
+    }
+
+    async function withRealNotifyPath<T>(fn: () => Promise<T>): Promise<T> {
+      const prevFetch = globalThis.fetch;
+      const prevDisabled = process.env.PA_NOTIFY_DISABLED;
+      delete process.env.PA_NOTIFY_DISABLED; // the notifyUser guard returns early otherwise
+      try {
+        return await fn();
+      } finally {
+        globalThis.fetch = prevFetch;
+        if (prevDisabled === undefined) delete process.env.PA_NOTIFY_DISABLED;
+        else process.env.PA_NOTIFY_DISABLED = prevDisabled;
+      }
+    }
+
+    it('chain failure report carries retry keyboard', async () => {
+      const yaml = `
+steps:
+  - skill: step-one
+    on_failure: stop
+report: telegram
+`;
+      await writeFile(join(dir, 'chains', 'retry-kb.yaml'), yaml, 'utf8');
+      await createTempSecrets(dir, ['TELEGRAM_BOT_TOKEN=test-token', 'TELEGRAM_CHAT_ID=-100999'].join('\n'));
+      const seq = makeSpawnSequencer([{ success: false, output: 'FAILED' }]);
+      const calls = setupFetchMock();
+      await withRealNotifyPath(async () => {
+        const result = await executeChain('retry-kb', { spawnFn: seq.spawnFn });
+        assert.equal(result.success, false);
+      });
+      assert.equal(calls.length, 1, `exactly one telegram send, got ${calls.length}`);
+      const body = JSON.parse(calls[0].init!.body as string);
+      assert.deepEqual(body.reply_markup, {
+        inline_keyboard: [[{ text: '🔁 Re-run chain', callback_data: 'ch:r:retry-kb' }]],
+      });
+    });
+
+    it('chain success report carries no keyboard', async () => {
+      const yaml = `
+steps:
+  - skill: step-one
+report: telegram
+`;
+      await writeFile(join(dir, 'chains', 'success-kb.yaml'), yaml, 'utf8');
+      await createTempSecrets(dir, ['TELEGRAM_BOT_TOKEN=test-token', 'TELEGRAM_CHAT_ID=-100999'].join('\n'));
+      const seq = makeSpawnSequencer([{ success: true, output: 'A' }]);
+      const calls = setupFetchMock();
+      await withRealNotifyPath(async () => {
+        const result = await executeChain('success-kb', { spawnFn: seq.spawnFn });
+        assert.equal(result.success, true);
+      });
+      assert.equal(calls.length, 1);
+      const body = JSON.parse(calls[0].init!.body as string);
+      assert.equal('reply_markup' in body, false, 'success reports must not carry a keyboard');
     });
   });
 });

@@ -13,7 +13,7 @@
  * fastSleep, a URL-aware fetch mock, mkdtemp + PA_HOME, rmRetry cleanup,
  * waitForDrain() in afterEach.
  *
- * Spec: plans/2026-09-01-ai173-phase1-attachment-stage-SPEC.md §6 (B-T1..B-T4).
+ * Spec: the AI-173 attachment-stage design (2026-09-01, internal) §6 (B-T1..B-T4).
  */
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';

@@ -6,7 +6,9 @@ import {
   CONFIRMATION_PATTERN,
   PENDING_ACTION_TTL_MS,
   expirePendingAction,
+  expirePendingQuestion,
   resolveConfirmation,
+  resolveQuestionAnswer,
   resolvePendingDescription,
   buildWorkerResponse,
   formatWorkerReply,
@@ -64,6 +66,7 @@ import {
   INVESTIGATE_FLAGGED_PATTERN,
   type StatusCardArgs,
   workerReceivesStaticPromptFile,
+  guardUnknownCommand,
 } from '../logic.js';
 import type { PAMeta } from '../types.js';
 import type { ConversationState, BranchAncestry } from '../types.js';
@@ -1998,6 +2001,134 @@ describe('applyMetaActions', () => {
 });
 
 // ---------------------------------------------------------------------------
+// applyMetaActions — PA_META question action (2026-09-02, handover Wave 1 SPEC §3.3)
+// ---------------------------------------------------------------------------
+
+describe('applyMetaActions — PA_META question action', () => {
+  it('applyMetaActions arms pending_question from a valid question action', () => {
+    const state = makeState();
+    const { response } = applyMetaActions(
+      'Which route do you prefer?',
+      meta([{ type: 'question', text: 'Prefer A or B?', options: ['A — faster', 'B — safer'] }]),
+      state
+    );
+    assert.ok(state.pending_question, 'pending_question must be armed');
+    assert.equal(state.pending_question!.text, 'Prefer A or B?');
+    assert.deepEqual(state.pending_question!.options, ['A — faster', 'B — safer']);
+    assert.ok(!Number.isNaN(Date.parse(state.pending_question!.asked_at)), 'asked_at must be ISO');
+    assert.equal(state.pending_question!.task_id, undefined);
+    assert.equal(state.pending_action, undefined, 'no pending_action without a confirm action');
+    assert.ok(!response.includes('question rejected'), 'valid action must not append a rejection note');
+  });
+
+  it('rejects five options', () => {
+    const state = makeState();
+    const { response } = applyMetaActions(
+      'Pick one.',
+      meta([{ type: 'question', text: 'q', options: ['1', '2', '3', '4', '5'] }]),
+      state
+    );
+    assert.equal(state.pending_question, undefined);
+    assert.ok(response.includes('_(question rejected: options must be 1..4 strings of 1..40 chars)_'));
+  });
+
+  it('rejects question when pending_action armed', () => {
+    const state = withPending('I will send the email.');
+    const { response } = applyMetaActions('Pick one.', meta([{ type: 'question', text: 'q', options: ['a', 'b'] }]), state);
+    assert.equal(state.pending_question, undefined, 'question must not arm over a live pending_action');
+    assert.ok(state.pending_action, 'pending_action stays armed — confirm wins');
+    assert.ok(response.includes('_(question rejected: a pending_action confirmation is already active)_'));
+  });
+
+  it('rejects question when confirm_required rides the same envelope (confirm wins)', () => {
+    const state = makeState();
+    const { response } = applyMetaActions(
+      'I can do it now, or ask around.',
+      meta([{ type: 'question', text: 'q', options: ['a', 'b'] }, { type: 'confirm_required' }]),
+      state
+    );
+    assert.equal(state.pending_question, undefined);
+    assert.ok(state.pending_action, 'confirm_required arms pending_action');
+    assert.ok(response.includes('_(question rejected: confirm_required takes precedence in the same reply)_'));
+  });
+
+  it('rejects oversized text, empty option lists, and malformed taskId', () => {
+    const base = { type: 'question' } as const;
+    const long = makeState();
+    applyMetaActions('x', meta([{ ...base, text: 'y'.repeat(501), options: ['a'] }]), long);
+    assert.equal(long.pending_question, undefined, 'text over 500 chars rejected');
+
+    const noOptions = makeState();
+    const r2 = applyMetaActions('x', meta([{ ...base, text: 'q', options: [] }]), noOptions);
+    assert.equal(noOptions.pending_question, undefined);
+    assert.ok(r2.response.includes('_(question rejected: options must be 1..4 strings of 1..40 chars)_'));
+
+    const badTask = makeState();
+    applyMetaActions('x', meta([{ ...base, text: 'q', options: ['a'], task_id: 'bad id!' }]), badTask);
+    assert.equal(badTask.pending_question, undefined, 'taskId outside [A-Za-z0-9_-] rejected');
+
+    const goodTask = makeState();
+    applyMetaActions('x', meta([{ ...base, text: 'q', options: ['a'], task_id: 'tt-abc123' }]), goodTask);
+    assert.equal(goodTask.pending_question!.task_id, 'tt-abc123');
+  });
+
+  it('first question action wins if several ride the same envelope', () => {
+    const state = makeState();
+    applyMetaActions(
+      'x',
+      meta([
+        { type: 'question', text: 'first', options: ['a'] },
+        { type: 'question', text: 'second', options: ['b'] },
+      ]),
+      state
+    );
+    assert.equal(state.pending_question!.text, 'first');
+  });
+});
+
+describe('expirePendingQuestion', () => {
+  it('expirePendingQuestion clears after TTL', () => {
+    const state = makeState();
+    state.pending_question = {
+      text: 'q',
+      options: ['a'],
+      asked_at: new Date(Date.now() - (PENDING_ACTION_TTL_MS + 1000)).toISOString(),
+    };
+    expirePendingQuestion(state);
+    assert.equal(state.pending_question, undefined);
+  });
+
+  it('keeps a fresh question and tolerates an empty state', () => {
+    const fresh = makeState();
+    fresh.pending_question = { text: 'q', options: ['a'], asked_at: new Date().toISOString() };
+    expirePendingQuestion(fresh);
+    assert.ok(fresh.pending_question, 'fresh question must survive expiry');
+
+    const empty = makeState();
+    expirePendingQuestion(empty);
+    assert.equal(empty.pending_question, undefined);
+  });
+});
+
+describe('resolveQuestionAnswer', () => {
+  it('resolveQuestionAnswer matches option text', () => {
+    const state = makeState();
+    state.pending_question = { text: 'q', options: ['Prefer A', 'Prefer B'], asked_at: new Date().toISOString() };
+    const matched = resolveQuestionAnswer(state, '  prefer b  ');
+    assert.equal(matched, 'Prefer B', 'match is exact-after-trim, case-insensitive, returns the option');
+    assert.equal(state.pending_question, undefined, 'consumed on match');
+  });
+
+  it('leaves the question armed on a non-matching answer and on empty state', () => {
+    const state = makeState();
+    state.pending_question = { text: 'q', options: ['A'], asked_at: new Date().toISOString() };
+    assert.equal(resolveQuestionAnswer(state, 'something else entirely'), undefined);
+    assert.ok(state.pending_question, 'non-match must not consume the question');
+    assert.equal(resolveQuestionAnswer(makeState(), 'A'), undefined, 'no pending question → undefined');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // CODE_PATTERN
 // ---------------------------------------------------------------------------
 
@@ -2112,17 +2243,23 @@ describe('handleCodeCommand', () => {
   // The /code command's default fallback string uses BOT_CWD (env-driven).
   // Tests set both BOT_CWD and PA_REPOS_BASE to known values so the assertions
   // are deterministic regardless of where the test runner is invoked from.
-  // Note: REPOS_BASE is read at module load (logic.ts line 140), so changing
-  // PA_REPOS_BASE at runtime won't propagate — these tests don't exercise that path.
+  // Note: PA_REPOS_BASE is read per call (logic.ts reposBase()), so pinning it
+  // in before() propagates — the path-resolution tests below rely on that.
   const TEST_BOT_CWD = 'C:/test-project';
+  const TEST_REPOS_BASE = 'C:/fixture-repos';
   let originalBotCwd: string | undefined;
+  let originalReposBase: string | undefined;
   before(() => {
     originalBotCwd = process.env.BOT_CWD;
     process.env.BOT_CWD = TEST_BOT_CWD;
+    originalReposBase = process.env.PA_REPOS_BASE;
+    process.env.PA_REPOS_BASE = TEST_REPOS_BASE;
   });
   after(() => {
     if (originalBotCwd === undefined) delete process.env.BOT_CWD;
     else process.env.BOT_CWD = originalBotCwd;
+    if (originalReposBase === undefined) delete process.env.PA_REPOS_BASE;
+    else process.env.PA_REPOS_BASE = originalReposBase;
   });
 
   // --- no match ---
@@ -2208,22 +2345,34 @@ describe('handleCodeCommand', () => {
 
   // --- path resolution ---
 
-  // REPOS_BASE is loaded at module init from process.env.PA_REPOS_BASE.
-  // These tests use the live value (or skip if empty).
-  const reposBase = process.env.PA_REPOS_BASE || '';
+  // PA_REPOS_BASE is read per call (logic.ts reposBase()), so these tests pin
+  // the env via the describe-level hook above — always-on, hermetic (fixture
+  // base, never the operator's live repos), no skip.
 
-  it('/code short-name resolves under PA_REPOS_BASE', { skip: !reposBase && 'PA_REPOS_BASE not set — short-name resolution disabled' }, () => {
+  it('/code short-name resolves under PA_REPOS_BASE', () => {
     const state = makeState();
     const result = handleCodeCommand(state, '/code taste-arena');
     assert.equal(result.action, 'set');
-    assert.equal(result.path, `${reposBase}/taste-arena`);
+    assert.equal(result.path, `${TEST_REPOS_BASE}/taste-arena`);
   });
 
-  it('/code short-name with instruction resolves and preserves instruction', { skip: !reposBase && 'PA_REPOS_BASE not set' }, () => {
+  it('/code short-name with instruction resolves and preserves instruction', () => {
     const state = makeState();
     const result = handleCodeCommand(state, '/code taste-arena fix the tests');
-    assert.equal(result.path, `${reposBase}/taste-arena`);
+    assert.equal(result.path, `${TEST_REPOS_BASE}/taste-arena`);
     assert.equal(result.instruction, 'fix the tests');
+  });
+
+  it('/code short-name with PA_REPOS_BASE unset returns the raw name', () => {
+    delete process.env.PA_REPOS_BASE;
+    try {
+      const state = makeState();
+      const result = handleCodeCommand(state, '/code taste-arena');
+      assert.equal(result.action, 'set');
+      assert.equal(result.path, 'taste-arena');
+    } finally {
+      process.env.PA_REPOS_BASE = TEST_REPOS_BASE;
+    }
   });
 
   it('/code absolute path with spaces must be quoted', () => {
@@ -2454,15 +2603,15 @@ describe('formatWorkerReply', () => {
     }
   });
 
-  it('redacts secrets.env-shaped literals', () => {
+  it('keeps secret-shaped literals intact (AI-184: delivery is unredacted; scrub lives on persistence paths)', () => {
     // Concatenated so the literal never matches token-shape scans at rest;
-    // the runtime string is the full token the redaction path must catch.
+    // the runtime string is the full token the delivered reply must carry.
     const apiToken = 'sk-' + 'TESTSECRET123456abcdefghijklmn';
     const slackToken = 'xoxb-' + '1234567890abcdef';
     const output = `The API key is ${apiToken} and token is ${slackToken}`;
     const result = formatWorkerReply(output, 'claude');
-    assert.ok(!result.includes(apiToken), 'secret-like token must be redacted');
-    assert.ok(!result.includes(slackToken), 'Slack token must be redacted');
+    assert.ok(result.includes(apiToken), 'delivered reply must keep real text (AI-184)');
+    assert.ok(result.includes(slackToken), 'delivered reply must keep real text (AI-184)');
   });
 
   it('returns empty string for the NO_OUTPUT sentinel', () => {
@@ -2825,7 +2974,12 @@ describe('renderStatusCard', () => {
     const card = renderStatusCard({
       snapshot: buildModelStatusSnapshot({
         currentWorker: 'agy',
+        // Pinned so the card-formatting assertions below don't depend on the
+        // live KNOWN_CLI_DEFAULT_MODELS entries (the agy 3.7→3.8 bump on
+        // 2026-09-04 broke the Current line — gate-ai202-fix row 7).
+        currentLlm: 'gemini-3.7-flash-high',
         defaultWorker: 'zclaude',
+        defaultLlm: 'glm-5.3',
         reasonCode: 'user_override',
       }),
       keepAwake: { active: true, since: '2026-04-21T07:26:00.000Z' }
@@ -2878,6 +3032,21 @@ describe('renderStatusCard', () => {
     });
     assert.ok(card.includes('Default: agy (gemini-3.7-flash-high)'));
     assert.ok(card.includes('Current: claude (opusplan) [high]'));
+  });
+
+  it('status card tasks line renders counts', () => {
+    const snapshot = buildModelStatusSnapshot({ currentWorker: 'agy', defaultWorker: 'agy', reasonCode: 'default_active' });
+    const withTasks = renderStatusCard({
+      snapshot,
+      keepAwake: { active: false },
+      tasks: { running: 2, parked: 1, queued: 3 },
+    });
+    assert.ok(
+      withTasks.includes('Tasks: 2 running · 1 parked · 3 queued'),
+      'the executor-lane Tasks line renders running/parked/queued counts'
+    );
+    const withoutTasks = renderStatusCard({ snapshot, keepAwake: { active: false } });
+    assert.ok(!withoutTasks.includes('Tasks:'), 'no Tasks line when the counts are absent (empty executor lane)');
   });
 
   it('hydrateModelStatus resolves LLM and effort from workerConfig tunables and session/topic overrides', () => {
@@ -3356,6 +3525,182 @@ describe('workerReceivesStaticPromptFile', () => {
   it('returns false for undefined worker', () => {
     const result = workerReceivesStaticPromptFile(undefined);
     assert.strictEqual(result, false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Unknown-command guard
+// ---------------------------------------------------------------------------
+
+describe('guardUnknownCommand', () => {
+  it('guards single unknown token with reply + skipWorker', () => {
+    const result = guardUnknownCommand('/foo');
+    assert.ok(result);
+    assert.equal(result.skipWorker, true);
+    assert.ok(result.response.includes('Unknown command: /foo'));
+    assert.ok(result.response.includes('/help'));
+  });
+
+  it('guards single unknown token with @botname suffix', () => {
+    const result = guardUnknownCommand('/foo@mybot');
+    assert.ok(result);
+    assert.equal(result.skipWorker, true);
+    assert.ok(result.response.includes('Unknown command: /foo'));
+  });
+
+  it('does NOT guard known command with @botname suffix', () => {
+    const result = guardUnknownCommand('/retranscribe@example_pa_bot');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard multi-token /foo bar (allows LLM dispatch)', () => {
+    const result = guardUnknownCommand('/foo bar baz');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard bare non-slash text', () => {
+    const result = guardUnknownCommand('hello world');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard known command /status', () => {
+    const result = guardUnknownCommand('/status');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard known command /help@bot', () => {
+    const result = guardUnknownCommand('/help@bot');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard known command /retranscribe', () => {
+    const result = guardUnknownCommand('/retranscribe');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard known command /new (has optional arg)', () => {
+    const result = guardUnknownCommand('/new');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard known command /code (has optional arg)', () => {
+    const result = guardUnknownCommand('/code');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard multi-token known command /code path', () => {
+    const result = guardUnknownCommand('/code /some/path');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard known command /reset', () => {
+    const result = guardUnknownCommand('/reset');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard known command /commit', () => {
+    const result = guardUnknownCommand('/commit');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard known command /push', () => {
+    const result = guardUnknownCommand('/push');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard known command /push_public', () => {
+    const result = guardUnknownCommand('/push_public');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard known command /investigate_flagged', () => {
+    const result = guardUnknownCommand('/investigate_flagged');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard known command /update_brain', () => {
+    const result = guardUnknownCommand('/update_brain');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard known command /update-brain (hyphen variant)', () => {
+    const result = guardUnknownCommand('/update-brain');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard known command /auth <code>', () => {
+    const result = guardUnknownCommand('/auth abc123');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard known command /branch <name>', () => {
+    const result = guardUnknownCommand('/branch mytopic');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard known command /child-of <parent>', () => {
+    const result = guardUnknownCommand('/child-of parent');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard known command /merge', () => {
+    const result = guardUnknownCommand('/merge');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard known command /agent claude', () => {
+    const result = guardUnknownCommand('/agent claude');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard known command /agents agy (plural)', () => {
+    const result = guardUnknownCommand('/agents agy');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard known command /skills', () => {
+    const result = guardUnknownCommand('/skills');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard known command /keepawake', () => {
+    const result = guardUnknownCommand('/keepawake');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard known command /health', () => {
+    const result = guardUnknownCommand('/health');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard known command /ref <id>', () => {
+    const result = guardUnknownCommand('/ref abc123');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard known command /claims', () => {
+    const result = guardUnknownCommand('/claims');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard known command /reauth', () => {
+    const result = guardUnknownCommand('/reauth');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard known command /reauth <skill>', () => {
+    const result = guardUnknownCommand('/reauth fitness-sync');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard empty string', () => {
+    const result = guardUnknownCommand('');
+    assert.equal(result, undefined);
+  });
+
+  it('does NOT guard text without leading slash', () => {
+    const result = guardUnknownCommand('not a command');
+    assert.equal(result, undefined);
   });
 });
 

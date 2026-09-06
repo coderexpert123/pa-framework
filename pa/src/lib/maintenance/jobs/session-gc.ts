@@ -23,7 +23,7 @@ export const sessionGcJob: MaintenanceJob = {
       maxAgeMs: GC_RETENTION_MS,
       action: 'delete',
       ownership: 'external-no-retention',
-      evidence: 'Antigravity CLI ships no retention policy of its own (audit 2026-08-02); PA prunes at 30d — plans/2026-08-02-session-gc-scope-to-pa-spawned.md. UUID-anchored filter so index/state .pb artifacts in the same directory are never touched.',
+      evidence: 'Antigravity CLI ships no retention policy of its own (audit 2026-08-02); PA prunes at 30d — internal session-gc scoping plan (2026-08-02). UUID-anchored filter so index/state .pb artifacts in the same directory are never touched.',
     },
     {
       resolve: codexStateDbPath,

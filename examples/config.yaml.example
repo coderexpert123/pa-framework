@@ -141,7 +141,7 @@ workers:
         # Declared here (unusually for a model knob) precisely because the
         # effort suffix makes the vocabulary worth showing. Still a hint: an
         # unlisted id passes through, so a model that ships tomorrow works.
-        values: ["gemini-3.7-flash-high", "gemini-3.7-flash-medium", "gemini-3.7-flash-low", "gemini-3.6-flash-high", "gemini-3.6-flash-medium", "gemini-3.6-flash-low", "gemini-3.5-flash-high", "gemini-3.5-flash-medium", "gemini-3.5-flash-low", "gemini-3.1-pro-high", "gemini-3.1-pro-low", "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium"]
+        values: ["gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.8-flash-low", "gemini-3.7-flash-high", "gemini-3.7-flash-medium", "gemini-3.7-flash-low", "gemini-3.6-flash-high", "gemini-3.6-flash-medium", "gemini-3.6-flash-low", "gemini-3.5-flash-high", "gemini-3.5-flash-medium", "gemini-3.5-flash-low", "gemini-3.1-pro-high", "gemini-3.1-pro-low", "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium"]
         description: "Model for this CLI session (run `agy models` for the current list — from PowerShell/cmd, not Git Bash, where it hangs). Effort is embedded in the gemini names; a base name with no -high/-medium/-low suffix is rejected. There is deliberately NO effort knob on v1.1.13+ (a bare --effort is rejected — AI-155)."
 
   # === zclaude (priority 4 — example Claude-compatible wrapper CLI) ===
@@ -270,14 +270,15 @@ bg_tasks:
 # Price overrides for `pa costs` dollar estimates (per-million-token USD).
 # Worker-level fallbacks (agy, zclaude) price records that carry no model field.
 # Input/output/cache_read are per million tokens. Thinking bills at output rate.
-# Cache_read defaults to 0 when omitted. Values are list prices verified 2026-08-27.
+# Cache_read defaults to 0 when omitted. Values are list prices verified 2026-08-27 (gemini-3.8 verified 2026-09-04).
 # model_pricing:
-#   agy:                    { input: 0.75, output: 3.75, cache_read: 0.075 }  # = gemini-3.7-flash
+#   agy:                    { input: 0.75, output: 3.75, cache_read: 0.075 }  # = gemini-3.8-flash
 #   zclaude:                { input: 1.40, output: 4.40, cache_read: 0.26 }   # = glm-5.3
 #   claude-opus-4-6:        { input: 5,    output: 25,   cache_read: 0.50 }
 #   claude-sonnet-4-6:      { input: 3,    output: 15,   cache_read: 0.30 }
 #   claude-sonnet-5:        { input: 2,    output: 10,   cache_read: 0.20 }
 #   claude-haiku-4-5:       { input: 1,    output: 5,    cache_read: 0.10 }
+#   gemini-3.8-flash:       { input: 0.75, output: 3.75, cache_read: 0.075 }
 #   gemini-3.7-flash:       { input: 0.75, output: 3.75, cache_read: 0.075 }
 #   gemini-3.6-flash:       { input: 0.75, output: 3.75, cache_read: 0.075 }
 #   gemini-3.5-flash:       { input: 1.50, output: 9.00, cache_read: 0.15 }
@@ -355,4 +356,15 @@ git_workflow:
 #   # is accepted but logs a config-load warning, since it will likely mistranscribe
 #   # or transliterate rather than fail outright. Leave unset (null) to auto-detect.
 #   language: null
+
+# === Voice inbox app (projects/voice-inbox) ===
+# Optional block. Omit it and only the voice-inbox app is unconfigured. The
+# app server refuses to start until inbox_topic names the topic that receives
+# new tasks. Env overrides: VOICE_INBOX_PORT, VOICE_INBOX_INBOX_TOPIC.
+# voice_inbox:
+#   inbox_topic: "CHATID_THREADID"  # REQUIRED "<chatId>_<threadId>" topic key
+#   port: 8787                      # binds 127.0.0.1 only
+#   max_upload_mb: 25
+#   session_ttl_hours: 168          # pairing session lifetime (7 days)
+#   pairing_ttl_minutes: 10         # one-time pairing-code lifetime
 

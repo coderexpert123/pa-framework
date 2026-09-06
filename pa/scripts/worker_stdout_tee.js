@@ -15,7 +15,7 @@
  *
  * This script is invoked by the agy.cmd shim when AGY_TEE_OUT is set, enabling
  * the orphan reaper to recover sessionless workers' replies after a bot crash.
- * See plans/2026-08-15-agy-tee-recovery-SPEC.md §WP1.1
+ * See the 2026-08-15 agy-tee-recovery spec §WP1.1
  */
 
 const { spawn } = require('child_process');

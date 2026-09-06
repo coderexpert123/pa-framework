@@ -3,7 +3,7 @@
  *
  * Pure unit tests against runAttachmentStage with fully injected deps. No
  * runPollLoop involved, so no _setExitForTest needed.
- * Spec: plans/2026-09-01-ai173-phase1-attachment-stage-SPEC.md §6.
+ * Spec: the AI-173 attachment-stage design (2026-09-01, internal) §6.
  */
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -13,8 +13,9 @@ import { join, dirname } from 'path';
 import { tmpdir } from 'os';
 import { fileURLToPath } from 'url';
 import { waitForDrain } from './test-teardown-guard.js';
-import { runAttachmentStage } from '../attachment-stage.js';
-import type { AttachmentStageInput, AttachmentStageDeps } from '../attachment-stage.js';
+import { runAttachmentStage, matchVoiceCommand, liveRegisteredVoiceCommands } from '../attachment-stage.js';
+import type { AttachmentStageInput, AttachmentStageDeps, VoiceCommandMatch } from '../attachment-stage.js';
+import { guardUnknownCommand } from '../logic.js';
 import { voiceErrorMessage, formatFailedTranscriptUserText } from '../voice.js';
 import type { VoiceResult } from '../voice.js';
 
@@ -414,5 +415,343 @@ describe('runAttachmentStage', () => {
     const sourcePath = join(fileURLToPath(import.meta.url), '../../../src/attachment-stage.ts');
     const source = readFileSync(sourcePath, 'utf-8');
     assert.ok(!source.includes('require('), 'attachment-stage.ts must stay require-free (the bot is ESM)');
+  });
+});
+
+/**
+ * AI-208 WP-3 (2026-09-05): folded voice from a steer re-dispatch. WP-2 sets
+ * `(update as any).__foldedVoice` on the steer's update before the attachment
+ * stage runs; the stage must index each folded transcript (req 3, makes
+ * /retranscribe work) and echo one "🎙 Heard (steered)" line per transcript
+ * (req 2). Absent — every non-steer path — behaviour is unchanged.
+ */
+describe('AI-208: foldedVoice (steer re-dispatch)', () => {
+  const FOLDED = [
+    {
+      text: 'second voice transcript',
+      media: { file_id: 'fv2', file_unique_id: 'fuv2', duration: 7 },
+      kind: 'voice',
+      messageId: 12794,
+    },
+    {
+      text: 'third voice transcript',
+      media: { file_id: 'fv3', file_unique_id: 'fuv3', duration: 9 },
+      kind: 'audio',
+    },
+  ];
+
+  it('foldedVoice items are echoed with (steered) label', async () => {
+    const h = makeHarness();
+    const result = await runAttachmentStage(
+      baseInput({ update: { __foldedVoice: FOLDED }, userText: 'the steer text' }),
+      h.deps,
+    );
+    // userText is untouched — folded transcripts ride the prompt via the fold,
+    // not via the queue text.
+    assert.equal(result.userText, 'the steer text');
+    assert.equal(result.voiceTranscribed, false);
+    assert.equal(result.skipWorker, false);
+    assert.equal(h.sent.length, 2);
+    for (let i = 0; i < FOLDED.length; i++) {
+      const m = h.sent[i];
+      assert.equal(m.token, TOKEN);
+      assert.equal(m.chatId, CHAT_ID);
+      assert.equal(m.replyToMessageId, MESSAGE_ID);
+      assert.equal(m.threadId, THREAD_ID);
+      assert.ok(m.text.startsWith('🎙 Heard (steered):'), `text: ${m.text}`);
+      assert.ok(m.text.includes(FOLDED[i].text), `text: ${m.text}`);
+      assert.ok(/_Ref: /.test(m.text), `ref line appended: ${m.text}`);
+    }
+  });
+
+  it('AI-209 T10: via batch echoes (batched) and still indexes; via omitted stays (steered)', async () => {
+    // Batch source: item.via === 'batch' → the (batched) label; the audio index
+    // is written exactly as for a steer (record before mark, keyed by
+    // file_unique_id) so /retranscribe resolves folded batch notes too.
+    const h = makeHarness();
+    await runAttachmentStage(
+      baseInput({ update: { __foldedVoice: [{ ...FOLDED[0], via: 'batch' }] }, userText: 'batch head text' }),
+      h.deps,
+    );
+    assert.equal(h.sent.length, 1);
+    assert.ok(h.sent[0].text.startsWith('🎙 Heard (batched):'), `text: ${h.sent[0].text}`);
+    assert.ok(h.sent[0].text.includes(FOLDED[0].text), `text: ${h.sent[0].text}`);
+    assert.deepEqual(h.calls, ['recordAudio', 'markAudio', 'send']);
+    assert.equal(h.recordAudioArgs[0][2].messageId, 12794);
+    assert.equal(h.recordAudioArgs[0][2].kind, 'voice');
+    assert.deepEqual(h.recordAudioArgs[0][2].media, FOLDED[0].media);
+    assert.deepEqual(h.markAudioArgs[0], ['/fake-audio-root', CHAT_ID, 'fuv2', 'ok', undefined]);
+
+    // Omitted via (default 'steer'): byte-identical (steered) label, same index.
+    const h2 = makeHarness();
+    await runAttachmentStage(
+      baseInput({ update: { __foldedVoice: [FOLDED[0]] }, userText: 'steer head text' }),
+      h2.deps,
+    );
+    assert.equal(h2.sent.length, 1);
+    assert.ok(h2.sent[0].text.startsWith('🎙 Heard (steered):'), `text: ${h2.sent[0].text}`);
+    assert.deepEqual(h2.calls, ['recordAudio', 'markAudio', 'send']);
+  });
+
+  it('foldedVoice items are recorded in the audio index before the echo', async () => {
+    const h = makeHarness();
+    await runAttachmentStage(baseInput({ update: { __foldedVoice: FOLDED } }), h.deps);
+    // Per item, in order: record → mark → send. Record strictly before send.
+    assert.deepEqual(h.calls, [
+      'recordAudio', 'markAudio', 'send',
+      'recordAudio', 'markAudio', 'send',
+    ]);
+    // Item 1: explicit messageId wins over the update's own message id.
+    const [root1, chatId1, entry1] = h.recordAudioArgs[0];
+    assert.equal(root1, '/fake-audio-root');
+    assert.equal(chatId1, CHAT_ID);
+    assert.equal(entry1.messageId, 12794);
+    assert.equal(entry1.threadId, THREAD_ID);
+    assert.equal(entry1.kind, 'voice');
+    assert.deepEqual(entry1.media, FOLDED[0].media);
+    assert.equal(entry1.date, new Date('2026-09-01T12:00:00.000Z').toISOString());
+    // Item 2: no messageId on the item → falls back to the update's message id.
+    const entry2 = h.recordAudioArgs[1][2];
+    assert.equal(entry2.messageId, MESSAGE_ID);
+    assert.equal(entry2.kind, 'audio');
+    // markAudio: 'ok' (the transcript settled), keyed by file_unique_id.
+    assert.deepEqual(h.markAudioArgs[0], ['/fake-audio-root', CHAT_ID, 'fuv2', 'ok', undefined]);
+    assert.deepEqual(h.markAudioArgs[1], ['/fake-audio-root', CHAT_ID, 'fuv3', 'ok', undefined]);
+  });
+
+  it('foldedVoice absent → behaviour unchanged', async () => {
+    // Guards the pre-existing suite's assumptions: no __foldedVoice (and no
+    // input.foldedVoice) means zero extra side effects on every shape.
+    const h = makeHarness();
+    const result = await runAttachmentStage(baseInput({ userText: 'plain text' }), h.deps);
+    assert.deepEqual(result, {
+      userText: 'plain text',
+      voiceTranscribed: false,
+      response: '',
+      skipWorker: false,
+      audioAttachment: undefined,
+    });
+    assert.ok(!h.calls.includes('recordAudio'));
+    assert.ok(!h.calls.includes('markAudio'));
+    assert.ok(!h.calls.includes('send'));
+    // An update carrying only the OTHER normalizer markers stays unchanged too:
+    // __heldAbsorbed with a real transcript yields exactly the own-audio echo,
+    // never a steered one.
+    const h2 = makeHarness({ transcribeResult: okResult({ text: 'raw transcript' }) });
+    const r2 = await runAttachmentStage(
+      baseInput({ msg: { voice: { file_id: 'v1', file_unique_id: 'vu1', duration: 5 } }, update: { __heldAbsorbed: true }, userText: 'combined' }),
+      h2.deps,
+    );
+    assert.equal(r2.userText, 'combined');
+    assert.equal(h2.sent.length, 1);
+    assert.ok(!h2.sent[0].text.includes('(steered)'), h2.sent[0].text);
+  });
+
+  it('foldedVoice echo failure does not throw', async () => {
+    const h = makeHarness({ sendBehavior: 'reject', recordAudioBehavior: 'reject', markAudioBehavior: 'reject' });
+    const result = await runAttachmentStage(
+      baseInput({ update: { __foldedVoice: FOLDED }, userText: 'the steer text' }),
+      h.deps,
+    );
+    assert.equal(result.userText, 'the steer text');
+    assert.equal(result.skipWorker, false);
+    assert.equal(result.response, '');
+  });
+});
+
+/**
+ * AI-191 (2026-09-03): voice-invoked commands. A transcript that confidently
+ * invokes a registered command becomes that command's typed-equivalent text;
+ * everything else falls through as conversation. Matcher tests inject the
+ * closed set; integration tests drive runAttachmentStage; the seam tests
+ * assert the REAL interception machinery (logic.ts's patterns via
+ * guardUnknownCommand) recognizes everything voice produces.
+ */
+describe('AI-191: voice-invoked commands', () => {
+  /** Injected closed set — matchVoiceCommand's `isRegistered` gate. */
+  const reg = (...names: string[]) => (c: string) => names.includes(c);
+  /** The nine commands the SAFE_BARE list covers, as a deps-shaped set. */
+  const FULL_SAFE_SET = () => new Set(['status', 'health', 'help', 'skills', 'claims', 'agent', 'keepawake', 'retranscribe', 'update_brain']);
+  const FULL_SAFE = reg('status', 'health', 'help', 'skills', 'claims', 'agent', 'keepawake', 'retranscribe', 'update_brain');
+
+  describe('layer 1 — literal spoken slash form', () => {
+    it('V1: "slash status" → /status', () => {
+      assert.deepEqual(matchVoiceCommand('slash status', FULL_SAFE), { normalized: '/status', command: 'status', via: 'literal' });
+    });
+
+    it('V2: literal arguments ride verbatim: "slash retranscribe groq"', () => {
+      assert.deepEqual(matchVoiceCommand('slash retranscribe groq', FULL_SAFE), { normalized: '/retranscribe groq', command: 'retranscribe', via: 'literal' });
+    });
+
+    it('V3: literal destructive form is explicit speech, not inference: "Slash new."', () => {
+      assert.deepEqual(matchVoiceCommand('Slash new.', reg('new', 'status')), { normalized: '/new', command: 'new', via: 'literal' });
+    });
+
+    it('V4: engine transcribed the symbol: "/status" → /status', () => {
+      assert.deepEqual(matchVoiceCommand('/status', FULL_SAFE), { normalized: '/status', command: 'status', via: 'literal' });
+    });
+
+    it('V5: unknown word falls through: "slash foobar"', () => {
+      assert.equal(matchVoiceCommand('slash foobar', FULL_SAFE), undefined);
+    });
+
+    it('V6: gated on the registry: "slash new" without new registered', () => {
+      assert.equal(matchVoiceCommand('slash new', reg('status')), undefined);
+    });
+
+    it('V7: leading filler: "hey pa slash status"', () => {
+      assert.deepEqual(matchVoiceCommand('hey pa slash status', FULL_SAFE), { normalized: '/status', command: 'status', via: 'literal' });
+    });
+
+    it('V8: acceptance seam — an argument the pattern cannot accept falls through: "slash status please"', () => {
+      assert.equal(matchVoiceCommand('slash status place', FULL_SAFE), undefined);
+    });
+  });
+
+  describe('layer 2a — bare utterance is the command', () => {
+    it('V9: "status" and case/punct "Health."', () => {
+      assert.deepEqual(matchVoiceCommand('status', FULL_SAFE), { normalized: '/status', command: 'status', via: 'inferred' });
+      assert.deepEqual(matchVoiceCommand('Health.', FULL_SAFE), { normalized: '/health', command: 'health', via: 'inferred' });
+    });
+
+    it('V10: edge filler stripped: "please help" and "status please"', () => {
+      assert.deepEqual(matchVoiceCommand('please help', FULL_SAFE), { normalized: '/help', command: 'help', via: 'inferred' });
+      assert.deepEqual(matchVoiceCommand('status please', FULL_SAFE), { normalized: '/status', command: 'status', via: 'inferred' });
+    });
+  });
+
+  it('V11: spoken phrase alias: "update brain" → /update_brain', () => {
+    assert.deepEqual(matchVoiceCommand('update brain', FULL_SAFE), { normalized: '/update_brain', command: 'update_brain', via: 'inferred' });
+    assert.deepEqual(matchVoiceCommand('update brains', FULL_SAFE), { normalized: '/update_brain', command: 'update_brain', via: 'inferred' });
+  });
+
+  it('V12: destructive / git / stop commands are NEVER inferred bare', () => {
+    const everything = () => true;
+    assert.equal(matchVoiceCommand('new', everything), undefined);
+    assert.equal(matchVoiceCommand('reset', everything), undefined);
+    assert.equal(matchVoiceCommand('commit', everything), undefined);
+    assert.equal(matchVoiceCommand('push', everything), undefined);
+    assert.equal(matchVoiceCommand('stop', everything), undefined);
+    assert.equal(matchVoiceCommand('steer', everything), undefined);
+  });
+
+  describe('layer 2b — unambiguous verb + spoken object', () => {
+    it('V13: "debug that last message" with debug registered → /debug', () => {
+      assert.deepEqual(matchVoiceCommand('debug that last message', reg('debug', 'status')), { normalized: '/debug', command: 'debug', via: 'inferred' });
+    });
+
+    it('V14: debug stays dormant when not registered', () => {
+      assert.equal(matchVoiceCommand('debug that last message', reg('status')), undefined);
+    });
+
+    it('V15: "retranscribe that note" → bare /retranscribe (object resolves via reply-to)', () => {
+      assert.deepEqual(matchVoiceCommand('retranscribe that note', FULL_SAFE), { normalized: '/retranscribe', command: 'retranscribe', via: 'inferred' });
+      assert.deepEqual(matchVoiceCommand('re-transcribe the last one', FULL_SAFE), { normalized: '/retranscribe', command: 'retranscribe', via: 'inferred' });
+    });
+
+    it('V16: "debugging" (not the verb "debug") never matches', () => {
+      assert.equal(matchVoiceCommand('debugging this took hours', reg('debug')), undefined);
+    });
+  });
+
+  it('V17: conversational sentences fall through untouched', () => {
+    for (const t of [
+      'help me understand this error',
+      'status update on the farm project',
+      'could you check the status',
+      'what is my status',
+      'review this code for me',
+      'can you help with the deployment',
+      'stop doing that tomorrow',
+      'new plan for the kitchen',
+    ]) {
+      assert.equal(matchVoiceCommand(t, FULL_SAFE), undefined, `must stay conversational: "${t}"`);
+    }
+  });
+
+  it('V18: SEAM — the real unknown-command guard recognizes every normalized form', () => {
+    // Drives the REAL consumer (logic.ts's pattern machinery) over real
+    // producer output: whenever voice produces a command, the guard must
+    // recognize it (never "Unknown command", never a worker dispatch).
+    for (const t of [
+      'slash status', 'slash health', 'slash help', 'slash skills', 'slash claims',
+      'status', 'health.', 'please help', 'skills please', 'claims', 'agent', 'keepawake',
+      'update brain', 'update brains',
+      'retranscribe', 'retranscribe that note', 'slash retranscribe groq',
+    ]) {
+      const m: VoiceCommandMatch | undefined = matchVoiceCommand(t, FULL_SAFE);
+      assert.ok(m, `expected a match for "${t}"`);
+      assert.equal(guardUnknownCommand(m.normalized), undefined, `guard must recognize "${m.normalized}" (from "${t}")`);
+    }
+  });
+
+  it('V19: live-registry invariant — debug activates exactly when the live set has it', () => {
+    const live = liveRegisteredVoiceCommands();
+    const m = matchVoiceCommand('debug that last message', (c) => live.has(c));
+    assert.equal(m !== undefined, live.has('debug'));
+    if (m) {
+      assert.equal(m.normalized, '/debug');
+      assert.equal(m.via, 'inferred');
+      // The real consumer must accept it (AI-190's DEBUG_PATTERN in isKnownCommand).
+      assert.equal(guardUnknownCommand('/debug'), undefined);
+    }
+  });
+
+  describe('integration through runAttachmentStage', () => {
+    const media = { file_id: 'v1', file_unique_id: 'vu1', duration: 5 };
+
+    it('V20: "slash status" becomes /status and the echo shows the interpretation', async () => {
+      const h = makeHarness({ transcribeResult: okResult({ text: 'slash status' }) });
+      const result = await runAttachmentStage(
+        baseInput({ msg: { voice: media } }),
+        { ...h.deps, registeredCommands: FULL_SAFE_SET },
+      );
+      assert.equal(result.userText, '/status');
+      assert.equal(result.voiceTranscribed, true);
+      assert.equal(result.skipWorker, false);
+      assert.equal(h.sent.length, 1);
+      assert.ok(h.sent[0].text.includes('\n\n→ /status'), h.sent[0].text);
+      assert.ok(h.sent[0].text.includes('slash status'), h.sent[0].text);
+    });
+
+    it('V21: conversational transcript keeps the wrapped text, no interpretation', async () => {
+      const h = makeHarness({ transcribeResult: okResult({ text: 'hello there' }) });
+      const result = await runAttachmentStage(baseInput({ msg: { voice: media } }), { ...h.deps, registeredCommands: FULL_SAFE_SET });
+      assert.equal(result.userText, '[Voice message] hello there');
+      assert.ok(!h.sent[0].text.includes('→'), h.sent[0].text);
+    });
+
+    it('V22: a forwarded voice note never invokes a command', async () => {
+      const h = makeHarness({ transcribeResult: okResult({ text: 'slash status' }) });
+      const msg = { voice: media, forward_origin: { type: 'user', sender_user: { first_name: 'X' } } };
+      const result = await runAttachmentStage(baseInput({ msg }), { ...h.deps, registeredCommands: FULL_SAFE_SET });
+      // The forwarded-origin descriptor rides the wrapper; the transcript must
+      // remain conversational either way.
+      assert.equal(result.userText, '[Voice message, forwarded from X] slash status');
+      assert.ok(!h.sent[0].text.includes('→'), h.sent[0].text);
+    });
+
+    it('V23: held-absorbed combined text is never interpreted', async () => {
+      const h = makeHarness({ transcribeResult: okResult({ text: 'slash status' }) });
+      const result = await runAttachmentStage(
+        baseInput({ msg: { voice: media }, update: { __heldAbsorbed: true }, userText: 'earlier held text' }),
+        { ...h.deps, registeredCommands: FULL_SAFE_SET },
+      );
+      assert.equal(result.userText, 'earlier held text');
+      assert.ok(!h.sent[0].text.includes('→'), h.sent[0].text);
+    });
+
+    it('V24: live default deps — debug activation is conditional on the live registry', async () => {
+      const h = makeHarness({ transcribeResult: okResult({ text: 'debug that last message' }) });
+      const liveHasDebug = liveRegisteredVoiceCommands().has('debug');
+      const result = await runAttachmentStage(baseInput({ msg: { voice: media } }), h.deps);
+      if (liveHasDebug) {
+        assert.equal(result.userText, '/debug');
+        assert.ok(h.sent[0].text.includes('→ /debug'), h.sent[0].text);
+      } else {
+        assert.equal(result.userText, '[Voice message] debug that last message');
+        assert.ok(!h.sent[0].text.includes('→'), h.sent[0].text);
+      }
+    });
   });
 });

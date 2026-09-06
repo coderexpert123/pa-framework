@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Kick off (or rate-limit) delivery of a fresh Google OAuth reauth link.
 
-Why this exists (AI-147, WP-G, plans/2026-08-23-alerts-wave-SPEC.md)
+Why this exists (AI-147, WP-G, the 2026-08-23 alerts-wave spec)
 ----------------------------------------------------------------------
 Before this file, a skill that hit an expired-Google-token failure could only
 mint a reauth session and print the URL to its own log — nobody ever saw the

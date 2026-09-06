@@ -13,6 +13,7 @@ import {
   findTeePathByRegistry,
   placeholderKindAndCaption,
   TRANSCRIPT_QUIESCENT_MS,
+  _setNoticeLoggerForTest,
   type ReaperDeps,
 } from '../orphan-reaper.js';
 import {
@@ -173,7 +174,7 @@ function makeRecord(overrides: Partial<PendingDispatch> = {}): PendingDispatch {
     messageId: 321,
     userText: 'do the thing',
     startedAt: T0,
-    cwd: 'D:/Personal Assistant',
+    cwd: 'C:/pa-checkout',
     session: { session_id: 'sess-1', worker: 'claude', started_at: T0 },
     ...overrides,
   };
@@ -206,6 +207,60 @@ function makeFakeDeps(cfg: FakeDepsConfig): { deps: ReaperDeps; sent: Array<{ re
 }
 
 const FAR_DEADLINE = Date.now() + 60 * 60 * 1000;
+
+// AI-208 WP-4 E3: a held record (steer/stop drain held the transcript for the
+// topic's next dispatch) is not a dead dispatch — the reaper must leave it alone.
+describe('evaluatePendingDispatch — heldForTopic', () => {
+  it('heldForTopic record produces no death notice and no requeue', async () => {
+    // session: undefined would otherwise fall straight through to the death
+    // notice — the strongest shape to prove the held check runs first.
+    const rec = makeRecord({ session: undefined, heldForTopic: true, heldAt: new Date().toISOString() });
+    await addPendingDispatch(rec);
+    const requeued: PendingDispatch[] = [];
+    const { deps, sent } = makeFakeDeps({ requeueUpdate: (r) => requeued.push(r) });
+
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+
+    assert.equal(outcome, 'held');
+    assert.equal(sent.length, 0, 'no death notice / no untranscribed notice');
+    assert.deepEqual(requeued, [], 'never requeued as a failure');
+    assert.equal(await wasDelivered(deliveredKey(rec.chatId, rec.threadId, rec.updateId)), false);
+    // Still on disk and still held — the topic's next dispatch absorbs it
+    // (absorbHeldDispatchRecords) instead of the reaper burying it.
+    const listed = await listPendingDispatches();
+    assert.equal(listed.length, 1);
+    assert.equal(listed[0].heldForTopic, true);
+  });
+
+  it('held record notice logs once across two evaluations (fix-wave m3)', async () => {
+    const rec = makeRecord({ session: undefined, heldForTopic: true, heldAt: new Date().toISOString() });
+    await addPendingDispatch(rec);
+    const { deps } = makeFakeDeps({});
+    const notices: Array<{ module: string; message: string }> = [];
+    _setNoticeLoggerForTest({ info: (module, message) => notices.push({ module, message }) });
+    try {
+      const outcome1 = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+      assert.equal(outcome1, 'held');
+      assert.equal(notices.length, 1, 'first evaluation logs the notice');
+      assert.equal(notices[0].message, 'held record left for next dispatch');
+
+      // The notice is stamped on the record, best-effort.
+      const listed1 = await listPendingDispatches();
+      assert.ok(listed1[0]?.heldNotifiedAt, 'heldNotifiedAt set by the first evaluation');
+      assert.equal(listed1[0].heldForTopic, true, 'record stays held');
+
+      // Second pass: no repeat notice — the stamp suppresses it. The reaper
+      // always evaluates records as listed fresh from the store, so re-read.
+      const rec2 = (await listPendingDispatches()).find((r) => r.updateId === rec.updateId);
+      assert.ok(rec2);
+      const outcome2 = await evaluatePendingDispatch(rec2, deps, FAR_DEADLINE);
+      assert.equal(outcome2, 'held');
+      assert.equal(notices.length, 1, 'second evaluation does NOT log again');
+    } finally {
+      _setNoticeLoggerForTest(null);
+    }
+  });
+});
 
 describe('evaluatePendingDispatch', () => {
   it('drops a record whose reply was already delivered (no send)', async () => {
@@ -1146,7 +1201,7 @@ describe('evaluatePendingDispatch — tee-fallback (agy)', () => {
     });
   });
 
-  it('recovered reply is formatWorkerReply output: CommonMark normalized, secrets redacted, no prefix', async () => {
+  it('recovered reply is formatWorkerReply output: CommonMark normalized, delivered unredacted (AI-184), no prefix', async () => {
     const rec = makeRecord({ workerName: 'claude' });
     await addPendingDispatch(rec);
     const now = Date.now();
@@ -1161,7 +1216,9 @@ describe('evaluatePendingDispatch — tee-fallback (agy)', () => {
     assert.equal(sent.length, 1);
     assert.ok(sent[0].text.includes('*bold*'), 'CommonMark normalized (**bold** → *bold*)');
     assert.ok(sent[0].text.includes('*Header*'), 'CommonMark normalized (### Header → *Header*)');
-    assert.ok(!sent[0].text.includes('sk-TESTSECRET123456'), 'secrets redacted');
+    // AI-184: the delivered reply keeps real text; the scrub lives on the
+    // persistence/worker-read paths (conversation.ts addTurn, dlq.ts appendDlq).
+    assert.ok(sent[0].text.includes('sk-TESTSECRET123456'), 'delivered text unredacted (AI-184)');
     assert.ok(!sent[0].text.includes('♻️'), 'prefix removed');
     assert.ok(!sent[0].text.includes('Recovered reply'), 'prefix removed');
     assert.ok(!sent[0].text.includes('restarted'), 'prefix removed');
@@ -1196,5 +1253,62 @@ describe('findTeePathByRegistry', () => {
     writeEntry({ pid: 12345, spawnedBy: 1, worker: 'claude', skill: 'topic--100555_9', startedAt: T0 });
     const rec = makeRecord({ chatId: -100555, threadId: 9 });
     assert.equal(await findTeePathByRegistry(rec), null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AI-186: allowedChatIds quarantine + terminal death-notice classification
+// ---------------------------------------------------------------------------
+
+describe('AI-186: quarantine + terminal death-notice', () => {
+  it('T1: record outside allowedChatIds settles dead at round 0 — no send, no typing, no requeue, store drained', async () => {
+    const rec = makeRecord({ session: undefined, chatId: -100555, threadId: 9 });
+    await addPendingDispatch(rec);
+    const requeued: PendingDispatch[] = [];
+    let typingCalls = 0;
+    const { deps, sent } = makeFakeDeps({ requeueUpdate: (r) => requeued.push(r) });
+    deps.sendTyping = async () => { typingCalls++; };
+    await reapOrphanedDispatches('token', {
+      deps,
+      allowedChatIds: new Set([-100777]), // deliberately excludes -100555
+      pollMs: 1,
+      sleep: async () => {},
+    });
+    assert.equal(sent.length, 0, 'no death notice or recovery send of any kind');
+    assert.equal(requeued.length, 0, 'no requeue');
+    assert.equal(typingCalls, 0, 'no typing refresh for a quarantined record');
+    assert.deepEqual(await listPendingDispatches(), [], 'record settled (store drained)');
+    assert.equal(await wasDelivered(deliveredKey(rec.chatId, rec.threadId, rec.updateId)), true, 'finish() marks delivered so a re-run cannot resurrect it');
+    assert.equal(isTopicRecovering('-100555_9'), false, 'recovery gate cleared in the settling round');
+  });
+
+  it('T2: terminal sendDetailed failure settles dead and removes the just-written resend record', async () => {
+    const rec = makeRecord({ session: undefined, requeueCount: 2 }); // at PA_REQUEUE_MAX — mirrors the leaked 123:0:1 record
+    await addPendingDispatch(rec);
+    const requeued: PendingDispatch[] = [];
+    let detailedCalls = 0;
+    const { deps, sent } = makeFakeDeps({ requeueUpdate: (r) => requeued.push(r) });
+    deps.sendDetailed = async () => { detailedCalls++; return { delivered: false, terminal: true }; };
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(outcome, 'dead');
+    assert.equal(detailedCalls, 1, 'the death notice went through sendDetailed');
+    assert.equal(sent.length, 0, 'plain send untouched on the detailed path');
+    assert.equal(requeued.length, 0, 'no requeue attempt');
+    assert.equal(await takeResend(resendKey(rec.chatId, rec.threadId, rec.updateId)), null, 'the premature putResend record was taken and discarded');
+    assert.deepEqual(await listPendingDispatches(), [], 'record settled');
+    assert.equal(await wasDelivered(deliveredKey(rec.chatId, rec.threadId, rec.updateId)), true);
+  });
+
+  it('T3: non-terminal sendDetailed failure keeps waiting semantics — record and resend record retained', async () => {
+    const rec = makeRecord({ session: undefined, requeueCount: 2 });
+    await addPendingDispatch(rec);
+    const { deps, sent } = makeFakeDeps({});
+    deps.sendDetailed = async () => ({ delivered: false });
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(outcome, 'waiting');
+    assert.equal((await listPendingDispatches()).length, 1, 'record stays on disk for retry / next restart');
+    const stored = await takeResend(resendKey(rec.chatId, rec.threadId, rec.updateId));
+    assert.ok(stored, 'resend record retained (putResend already written) — pre-AI-186 behavior');
+    assert.equal(await wasDelivered(deliveredKey(rec.chatId, rec.threadId, rec.updateId)), false);
   });
 });

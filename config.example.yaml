@@ -100,6 +100,9 @@ workers:
       model:
         args: ["--model", "{value}"]
         values:
+          - "gemini-3.8-flash-high"
+          - "gemini-3.8-flash-medium"
+          - "gemini-3.8-flash-low"
           - "gemini-3.7-flash-high"
           - "gemini-3.7-flash-medium"
           - "gemini-3.7-flash-low"
@@ -161,14 +164,15 @@ maintenance:
 # Optional price overrides for `pa costs` dollar estimates. All keys are worker or model names.
 # Worker-level fallbacks (agy, zclaude) price records that carry no model field.
 # Input/output/cache_read are per million tokens. Thinking bills at output rate.
-# Cache_read defaults to 0 when omitted. Values are list prices verified 2026-08-27.
+# Cache_read defaults to 0 when omitted. Values are list prices verified 2026-08-27 (gemini-3.8 verified 2026-09-04).
 # model_pricing:
-#   agy:                    { input: 0.75, output: 3.75, cache_read: 0.075 }  # = gemini-3.7-flash
+#   agy:                    { input: 0.75, output: 3.75, cache_read: 0.075 }  # = gemini-3.8-flash
 #   zclaude:                { input: 1.40, output: 4.40, cache_read: 0.26 }   # = glm-5.3
 #   claude-opus-4-6:        { input: 5,    output: 25,   cache_read: 0.50 }
 #   claude-sonnet-4-6:      { input: 3,    output: 15,   cache_read: 0.30 }
 #   claude-sonnet-5:        { input: 2,    output: 10,   cache_read: 0.20 }
 #   claude-haiku-4-5:       { input: 1,    output: 5,    cache_read: 0.10 }
+#   gemini-3.8-flash:       { input: 0.75, output: 3.75, cache_read: 0.075 }
 #   gemini-3.7-flash:       { input: 0.75, output: 3.75, cache_read: 0.075 }
 #   gemini-3.6-flash:       { input: 0.75, output: 3.75, cache_read: 0.075 }
 #   gemini-3.5-flash:       { input: 1.50, output: 9.00, cache_read: 0.15 }
@@ -194,3 +198,31 @@ transcription:
   worker_mode: spawn
   cloud_order: [groq, openai, deepgram]
   language: null
+
+# === Voice inbox app (projects/voice-inbox) ===
+# Optional block. Omit it and only the voice-inbox app is unconfigured. The
+# app server refuses to start until inbox_topic names the topic that receives
+# new tasks. Env overrides: VOICE_INBOX_PORT, VOICE_INBOX_INBOX_TOPIC.
+# voice_inbox:
+#   inbox_topic: "CHATID_THREADID"  # REQUIRED "<chatId>_<threadId>" topic key
+#   port: 8787                      # binds 127.0.0.1 only
+#   max_upload_mb: 25
+#   session_ttl_hours: 168          # pairing session lifetime (7 days)
+#   pairing_ttl_minutes: 10         # one-time pairing-code lifetime
+
+# === Topic routing (optional) ===
+# support: the FALLBACK topic receiving land-or-discard triage for dirty
+# working-tree paths the daily-recon sweep cannot attribute to an owner.
+# Format "<chatId>_<threadId>", e.g. "310_5".
+#
+# Before falling back to `support`, resolution consults the optional
+# topic-ownership registry at ~/.pa/topic-ownership-registry.json — a JSON
+# object keyed "<chatId>_<threadId>"; each row may list repo-relative `owned`
+# path prefixes (segment-matched: the prefix itself or anything under it), and
+# at most one row may carry role: "catch-all". Resolution order everywhere:
+# registry catch-all row -> this `support` knob -> unset. A missing or corrupt
+# registry degrades to the `support` fallback (fail-to-empty). With neither
+# set: unattributed paths are counted in daily-recon.json's unknown_n (and
+# surfaced by the weekly ops digest) but no task is filed.
+topics:
+  support: "310_5"

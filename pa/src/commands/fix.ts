@@ -5,7 +5,7 @@ import { readFixLedger, appendFixRecord, type FixRecord } from '../lib/fix-ledge
 import { ALERT_CENSUS_FILE, type AlertCensus } from '../lib/alert-census.js';
 
 /**
- * `pa fix` CLI (2026-08-29, plans/2026-08-29-alert-suppression-SPEC.md).
+ * `pa fix` CLI (2026-08-29, the alert-suppression spec).
  *
  * Append-only fix ledger, written by the FIXER session, not the operator. A fix
  * record is what makes the census overlay stop surfacing a family. No delete,

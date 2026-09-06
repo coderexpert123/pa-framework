@@ -16,7 +16,7 @@ export const GC_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 // --- Cleanup ---
 //
 // Claude Code and Gemini CLI both manage their own transcript retention (30 days
-// each — see plans/2026-08-02-session-gc-scope-to-pa-spawned.md) and PA must not
+// each — see the 2026-08-02 session-gc scoping plan) and PA must not
 // touch their transcripts at all: an earlier version of this file's 24h GC swept
 // the operator's real interactive Claude Code sessions along with PA's own worker
 // transcripts, deleting 248 real conversations before it was caught. There is
@@ -72,7 +72,7 @@ export async function cleanupAgySessions(convDir: string, cutoffMs: number): Pro
  * a 30-day retention policy already, and PA has no way to distinguish its own
  * spawned worker transcripts from the operator's real interactive sessions, so
  * deleting either is out of scope. See
- * plans/2026-08-02-session-gc-scope-to-pa-spawned.md for the incident that
+ * the 2026-08-02 session-gc scoping plan for the incident that
  * established this (248 real Claude Code transcripts deleted). Antigravity and
  * Codex have no retention of their own, so PA prunes those at GC_RETENTION_MS
  * (30d) — NOT SESSION_TTL_MS, which governs resume eligibility, not GC.

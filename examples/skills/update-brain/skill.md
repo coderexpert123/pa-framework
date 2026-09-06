@@ -24,7 +24,7 @@ update are configured in `~/.pa/brain-files.json`:
 {
   "root": "${PA_FRAMEWORK_ROOT}",
   "files": [
-    {"path": "CLAUDE.md", "markers": ["<!-- AUTO:SKILL-INVENTORY -->", "<!-- AUTO:FILE-INVENTORY -->"]}
+    {"path": "CLAUDE.md", "markers": ["<!-- AUTO:FILE-INVENTORY -->"]}
   ]
 }
 ```
@@ -34,12 +34,12 @@ files into the auto-update pipeline.
 
 ## Execution
 
-1. **Pre-snapshot git commit (guarded)** — first run `node "$root/pa/dist/bin/pa.js" git-guard "$root"` and note its exit code (0 = git allowed, 1 = not allowed). If it exited 0: `cd "$root" && git add <the files from brain-files.json> && git commit -m "update-brain: pre-update snapshot"`. Allows post-hoc inspection of changes. Name the managed files explicitly; a blanket -A sweeps unrelated work into the snapshot. If it exited 1: git is not allowed for this deployment — skip this step AND step 3 entirely, proceed file-only, and add one line to your output: `git skipped: <the guard's printed reason>`.
+1. **Pre-snapshot git commit (guarded)** — first run `node "$root/pa/dist/bin/pa.js" git-guard "$root"` and note its exit code (0 = git allowed, 1 = not allowed). If it exited 0: `cd "$root" && git add <the files from brain-files.json> && git commit -m "update-brain: pre-update snapshot"`. Allows post-hoc inspection of changes. Name the managed files explicitly; a blanket -A sweeps unrelated work into the snapshot. **Per-owner attribution:** when the deployment keeps an orphan ledger (JSONL, default `$pa_home/orphan-ledger.jsonl`, newest record per path wins), group the dirty managed paths by their latest owner (`owner_session`, else `owner_topic`; deployments keeping a topic-ownership registry (a JSON object keyed `"<chatId>_<threadId>"` whose rows carry `owned` repo-relative path prefixes) attribute still-unrecorded paths to the first matching row's topic; else unattributed) and commit one group per owner as `update-brain: pre-update snapshot — <owner|unattributed>` before the remainder. If it exited 1: git is not allowed for this deployment — skip this step AND step 3 entirely, proceed file-only, and add one line to your output: `git skipped: <the guard's printed reason>`.
    - **Coordination:** if the project provides a reservation command, list active reservations first and skip the pre-snapshot commit for any managed file another session currently holds — defer that file, do not abort the refresh. A nightly sweep-commit that stages whatever happens to be dirty will eventually commit an operator's in-progress work.
 2. **For each file** in `brain-files.json`:
    - Read current content.
-   - For each marker (e.g., `<!-- AUTO:SKILL-INVENTORY -->`), find the auto-managed section between the marker and the next marker / EOF.
-   - Regenerate the section from live repo state (e.g., for SKILL-INVENTORY: run `pa list` and format the output).
+   - For each marker (e.g., `<!-- AUTO:FILE-INVENTORY -->`), find the auto-managed section between the marker and the next marker / EOF.
+   - Regenerate the section from live repo state (e.g., for FILE-INVENTORY: glob the source tree and format one bullet per file). Keep rosters that duplicate a CLI listing (e.g. a skill roster that `pa list` already prints) OUT of auto-loaded brain files — a pointer to the command is the budget-correct form.
    - **Safety gates**:
      - Refuse to write if any marker disappeared from the new content.
      - Refuse to write if new content is < 80% of old line count.
