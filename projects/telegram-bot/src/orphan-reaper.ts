@@ -34,12 +34,25 @@ import { buildResendKeyboard } from './callbacks.js';
 import { makeRefId } from './ref-id.js';
 import { markTopicRecovering, clearTopicRecovering } from './recovery-gate.js';
 import { isTopicStopped } from './worker-stop.js';
+import { ORPHAN_HARVEST_WINDOW_MS } from './task-executor.js';
 import { listWorkerPids, isProcessAlive } from '../../../pa/dist/src/worker-pids.js';
 import { getDescendantPids } from '../../../pa/dist/src/process-tree.js';
 import { executeWorker } from '../../../pa/dist/src/worker-exec.js';
 import { loadConfig } from '../../../pa/dist/src/config.js';
 import { logger } from '../../../pa/dist/src/lib/log.js';
 import { getKeepAwakeStatus } from './keepawake.js';
+
+/** Minimal structural logger so tests can observe the held-record notice via
+ *  `_setLoggerForTest` (AI-208 fix-wave m3). */
+type ReaperNoticeLogger = {
+  info: (module: string, message: string, ctx?: Record<string, unknown>) => void;
+};
+let noticeLog: ReaperNoticeLogger = logger;
+
+/** Test hook: injects a fake logger for the held-record notice (pass null to restore the real one). */
+export function _setNoticeLoggerForTest(fake: ReaperNoticeLogger | null): void {
+  noticeLog = fake ?? logger;
+}
 
 const CLAUDE_FAMILY = new Set(['claude', 'zclaude']);
 
@@ -49,9 +62,10 @@ export const TRANSCRIPT_QUIESCENT_MS = 90_000;
 export const REAP_MAX_WAIT_MS = 45 * 60 * 1000;
 export const REAP_POLL_MS = 20_000;
 export const TYPING_REFRESH_MS = 4_000;
-/** Same value as main.ts's ORPHAN_HARVEST_WINDOW_MS — protects the
- * re-dispatched worker from the per-minute orphan sweep. */
-const REDISPATCH_HARVEST_MS = 50 * 60 * 1000;
+/** Protects the re-dispatched worker from the per-minute orphan sweep — the
+ * same harvest window that guarded the original dispatch (single source:
+ * task-executor.ts; the "same value" restatement drifted once already). */
+const REDISPATCH_HARVEST_MS = ORPHAN_HARVEST_WINDOW_MS;
 
 // ---------------------------------------------------------------------------
 // Pure transcript parsing
@@ -447,7 +461,7 @@ async function reviveVoiceNote(record: PendingDispatch, token: string, secrets: 
 // Per-record evaluation (single step, no sleeping — the loop lives outside)
 // ---------------------------------------------------------------------------
 
-export type ReapOutcome = 'already-delivered' | 'recovered' | 'dead' | 'waiting' | 'requeued' | 'parked';
+export type ReapOutcome = 'already-delivered' | 'recovered' | 'dead' | 'waiting' | 'requeued' | 'parked' | 'held';
 
 function preview(text: string): string {
   const t = text.replace(/\s+/g, ' ').trim();
@@ -530,6 +544,28 @@ export async function evaluatePendingDispatch(
   deps: ReaperDeps,
   deadlineMs: number,
 ): Promise<ReapOutcome> {
+  // AI-208 WP-4 E3: a held record (drained by a /steer or /stop, transcript
+  // held for the topic's next dispatch instead of dispatched) is NOT a dead
+  // dispatch. It must never get a death notice and never be requeued as a
+  // failure — the next dispatch in the topic absorbs it (absorbHeldDispatchRecords)
+  // and the requeue ladder would only duplicate it. Skip it entirely — not
+  // 'waiting' — so it settles this round and the topic's recovery gate clears,
+  // letting that absorbing dispatch through. The record stays on disk.
+  // Fix-wave m3: the skip notice logs ONCE (first pass sets heldNotifiedAt on
+  // the record, best-effort) so a record held across many reaper passes
+  // doesn't spam the log.
+  if (record.heldForTopic === true) {
+    if (record.heldNotifiedAt === undefined) {
+      noticeLog.info('reaper', 'held record left for next dispatch',
+        { updateId: record.updateId, chatId: record.chatId, threadId: record.threadId });
+      await updatePendingDispatch(
+        pendingDispatchKey(record.chatId, record.threadId, record.updateId),
+        { heldNotifiedAt: new Date().toISOString() },
+      ).catch(() => {}); // best-effort: a failed write must not fail the evaluation
+    }
+    return 'held';
+  }
+
   // WP-C C2: a parked ladder record (requeueNotBefore set by main.ts's failure
   // suppression) belongs to the maintenance drain, not the reaper. Skipping it
   // entirely — not 'waiting' — lets the topic's gate clear this round so the

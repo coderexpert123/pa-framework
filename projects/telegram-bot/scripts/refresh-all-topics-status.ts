@@ -11,14 +11,15 @@ import { telegramFetch } from '../../../pa/dist/src/lib/telegram-proxy.js';
 import { listRunningTasks, listTasks } from '../../../pa/dist/src/lib/topic-tasks.js';
 import { resolveTopicKey } from '../../../pa/dist/src/lib/topic-events.js';
 import { addWatchJob } from '../../../pa/dist/src/lib/watch-jobs.js';
+import { logger } from '../../../pa/dist/src/lib/log.js';
 
 import { loadTopicState, saveTopicState, listTopicStateRefs } from '../dist/conversation.js';
 import { hydrateModelStatus, renderStatusCard } from '../dist/logic.js';
 import { sanitizeMdV2 } from '../dist/telegram.js';
 import { getKeepAwakeStatus } from '../dist/keepawake.js';
 // Preserve Control Card Keyboard:
-// Import buildControlCardKeyboard and currentCardKeyboard from ../src/callbacks.js (via dist at runtime)
-import { buildControlCardKeyboard, currentCardKeyboard } from '../dist/callbacks.js';
+// Import buildControlCardKeyboard, currentCardKeyboard and clearCardKeyboard from ../src/callbacks.js (via dist at runtime)
+import { buildControlCardKeyboard, currentCardKeyboard, clearCardKeyboard } from '../dist/callbacks.js';
 import type { ConversationState, ModelStatusSnapshot } from '../dist/types.js';
 
 export const USAGE = `Usage:
@@ -175,6 +176,21 @@ export function buildStatusCardPayload(
   return { pinText, sanitizedText, keyboard, editBody, sendBody };
 }
 
+export type PinOutcome = 'pinned' | 'kept-old' | 'failed';
+
+/**
+ * True when an apiCall failure means the card to edit no longer exists — the
+ * ONLY edit failure allowed to fall through to sending a replacement card.
+ * apiCall embeds the raw Telegram error description in its Error message, so
+ * classifying from the text is exact here; every other failure (rate limit
+ * after retries, network, parse) must leave the pinned card untouched —
+ * replacing on those is how a topic ends up with no pinned card at all.
+ */
+export function isEditNotFound(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return message.includes('message to edit not found');
+}
+
 export async function apiCall(
   token: string,
   method: string,
@@ -232,7 +248,14 @@ export async function apiCall(
 export async function runRefresh(
   flags: RefreshFlags,
   childArgsForAsync: string[] = []
-): Promise<{ updated: number; failed: number; total: number; exitCode: number }> {
+): Promise<{
+  updated: number;
+  failed: number;
+  total: number;
+  exitCode: number;
+  pinTotals: { pinned: number; keptOld: number; failed: number };
+  topicOutcomes: Array<{ topic: string; outcome?: PinOutcome }>;
+}> {
   const startTime = Date.now();
   const runId = process.env.PA_REFRESH_CARDS_RUN_ID || `${Date.now()}-${randomBytes(3).toString('hex')}`;
 
@@ -402,13 +425,16 @@ export async function runRefresh(
 
   let updatedCount = 0;
   let failedCount = 0;
+  const topicOutcomes: Array<{ topic: string; outcome?: PinOutcome }> = [];
+  const pinTotals: Record<PinOutcome, number> = { pinned: 0, 'kept-old': 0, failed: 0 };
 
   for (let i = 0; i < filteredRefs.length; i++) {
     const ref = filteredRefs[i];
     const prefix = `[${i + 1}/${filteredRefs.length}]`;
+    const topicKey = topicKeyFor(ref.chatId, ref.threadId);
+    let outcome: PinOutcome | undefined;
     try {
       const topicState = await loadTopicState(ref.chatId, ref.threadId);
-      const topicKey = topicKeyFor(ref.chatId, ref.threadId);
       const effectiveDefault = getEffectiveDefaultWorker(config, topicKey);
       const snapshot = hydrateModelStatus(topicState, effectiveDefault, config);
       syncModelStatusState(topicState, snapshot);
@@ -434,6 +460,11 @@ export async function runRefresh(
       }
 
       let success = false;
+      // Replace is only correct when there is no card to edit, or the old card
+      // is gone ("message to edit not found"). Every other edit failure leaves
+      // the pinned card alone.
+      let attemptReplace = !topicState.pinned_status_message_id;
+
       if (topicState.pinned_status_message_id) {
         try {
           await apiCall(token!, 'editMessageText', payload.editBody, flags.maxRetries);
@@ -443,37 +474,74 @@ export async function runRefresh(
             {
               chat_id: ref.chatId,
               message_id: topicState.pinned_status_message_id,
-              disable_notification: false,
+              disable_notification: true,
             },
             flags.maxRetries
-          ).catch((err) => console.warn(`pinChatMessage on ${ref.chatId}_${ref.threadId} returned: ${err.message}`));
+          ).catch((err: any) =>
+            // The edited message is already the pinned card, so a failed re-pin
+            // leaves the pin as it was. Log it; the content refresh still landed.
+            logger.warn('refresh-cards', 're-pin after in-place edit failed; card content updated, pin state unchanged', {
+              topic: topicKey,
+              messageId: topicState.pinned_status_message_id,
+              error: err?.message,
+            })
+          );
           success = true;
+          outcome = 'kept-old';
         } catch (err: any) {
-          if (err.message.includes('message to edit not found')) {
+          if (isEditNotFound(err)) {
             console.log(`Old pin message not found for ${ref.chatId}_${ref.threadId}, creating new...`);
+            attemptReplace = true;
           } else {
-            console.warn(`Edit failed for ${ref.chatId}_${ref.threadId}: ${err.message}`);
+            logger.warn('refresh-cards', 'in-place edit failed; skipping replace so the pinned card is kept', {
+              topic: topicKey,
+              error: err?.message,
+            });
+            outcome = 'failed';
           }
         }
       }
 
-      if (!success) {
+      if (!success && attemptReplace) {
         const sendRes = await apiCall(token!, 'sendMessage', payload.sendBody, flags.maxRetries);
         const pinMsgId = sendRes.result?.message_id;
+        const oldPinId = topicState.pinned_status_message_id;
+        let pinSucceeded = false;
         if (pinMsgId) {
-          const oldPinId = topicState.pinned_status_message_id;
-          await apiCall(
-            token!,
-            'pinChatMessage',
-            {
-              chat_id: ref.chatId,
-              message_id: pinMsgId,
-              disable_notification: false,
-            },
-            flags.maxRetries
-          ).catch((err) => console.warn(`pinChatMessage new on ${ref.chatId}_${ref.threadId} returned: ${err.message}`));
-          topicState.pinned_status_message_id = pinMsgId;
+          try {
+            await apiCall(
+              token!,
+              'pinChatMessage',
+              {
+                chat_id: ref.chatId,
+                message_id: pinMsgId,
+                disable_notification: true,
+              },
+              flags.maxRetries
+            );
+            pinSucceeded = true;
+          } catch (err: any) {
+            logger.error('refresh-cards', 'pin of new status card failed; keeping previous pinned id in state', {
+              topic: topicKey,
+              newMessageId: pinMsgId,
+              error: err?.message,
+            });
+          }
+        } else {
+          logger.error('refresh-cards', 'sendMessage returned no message_id; new status card left unpinned', {
+            topic: topicKey,
+          });
+        }
+
+        // Record the new id and unpin the old ONLY on pin success — a failed pin
+        // keeps the OLD id in state so the topic never reads healthy while its
+        // only card sits unpinned (the bot's replacePinnedStatusCard contract).
+        if (pinSucceeded) {
+          topicState.pinned_status_message_id = pinMsgId!;
           if (oldPinId && oldPinId !== pinMsgId) {
+            // The superseded card can never be pressed again, so its recorded
+            // submenu is dead weight — drop it alongside the unpin.
+            clearCardKeyboard(ref.chatId, oldPinId);
             await apiCall(
               token!,
               'unpinChatMessage',
@@ -482,9 +550,18 @@ export async function runRefresh(
                 message_id: oldPinId,
               },
               flags.maxRetries
-            ).catch(() => {});
+            ).catch((err: any) =>
+              logger.warn('refresh-cards', 'unpin of superseded status card failed', {
+                topic: topicKey,
+                messageId: oldPinId,
+                error: err?.message,
+              })
+            );
           }
           success = true;
+          outcome = 'pinned';
+        } else {
+          outcome = 'failed';
         }
       }
 
@@ -494,17 +571,31 @@ export async function runRefresh(
         console.log(
           `✓ ${prefix} Updated topic ${ref.chatId}_${ref.threadId} (agent: ${snapshot.current_worker}, model: ${snapshot.current_llm || 'default'})`
         );
+        logger.info('refresh-cards', 'status card refreshed', {
+          topic: topicKey,
+          outcome,
+          messageId: topicState.pinned_status_message_id,
+        });
       } else {
         failedCount++;
         console.warn(`✗ ${prefix} Failed to update topic ${ref.chatId}_${ref.threadId}`);
       }
-
-      if (flags.paceMs > 0 && i < filteredRefs.length - 1) {
-        await new Promise((r) => setTimeout(r, flags.paceMs));
-      }
     } catch (err: any) {
       failedCount++;
+      if (!flags.dryRun && outcome === undefined) {
+        outcome = 'failed';
+      }
       console.error(`Error processing topic ${ref.chatId}_${ref.threadId}:`, err.message);
+      logger.error('refresh-cards', 'topic refresh crashed', { topic: topicKey, error: err?.message });
+    } finally {
+      if (!flags.dryRun && outcome !== undefined) {
+        pinTotals[outcome]++;
+        topicOutcomes.push({ topic: topicKey, outcome });
+      }
+    }
+
+    if (flags.paceMs > 0 && i < filteredRefs.length - 1) {
+      await new Promise((r) => setTimeout(r, flags.paceMs));
     }
   }
 
@@ -513,6 +604,9 @@ export async function runRefresh(
     console.log(`Dry-run finished: ${updatedCount} topics simulated, 0 failed.`);
   } else {
     console.log(`Completed topic refresh: ${updatedCount} updated, ${failedCount} failed.`);
+    console.log(
+      `Pin outcomes: ${pinTotals.pinned} pinned, ${pinTotals['kept-old']} kept-old, ${pinTotals.failed} failed.`
+    );
   }
   console.log(`=============================================\n`);
 
@@ -529,6 +623,8 @@ export async function runRefresh(
         errorCount: failedCount,
         elapsedMs: Date.now() - startTime,
         total: filteredRefs.length,
+        pinTotals: { pinned: pinTotals.pinned, keptOld: pinTotals['kept-old'], failed: pinTotals.failed },
+        topicOutcomes,
       };
       writeFileSync(doneFile, JSON.stringify(summary, null, 2) + '\n', 'utf8');
       console.log(`Wrote completion sentinel: ${doneFile}`);
@@ -542,6 +638,8 @@ export async function runRefresh(
     failed: failedCount,
     total: filteredRefs.length,
     exitCode: failedCount > 0 ? 1 : 0,
+    pinTotals: { pinned: pinTotals.pinned, keptOld: pinTotals['kept-old'], failed: pinTotals.failed },
+    topicOutcomes,
   };
 }
 

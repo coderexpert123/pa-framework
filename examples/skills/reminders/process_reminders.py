@@ -5,6 +5,7 @@ Each reminder: {"due_at": "<ISO8601>", "message": "...", "chat_id": "...", "thre
 
 Reads TELEGRAM_BOT_TOKEN from env (injected by the skill's `secrets:` declaration).
 Uses urllib (Python stdlib) so no `pip install` is required.
+The framework's full reminder engine (projects/reminders in the pa-framework repo) adds conditional keyboards, executable resume dispatch, and ref-ID minting on top of this minimal sample.
 """
 import json
 import os

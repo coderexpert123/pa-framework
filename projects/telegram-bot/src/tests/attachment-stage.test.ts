@@ -419,6 +419,147 @@ describe('runAttachmentStage', () => {
 });
 
 /**
+ * AI-208 WP-3 (2026-09-05): folded voice from a steer re-dispatch. WP-2 sets
+ * `(update as any).__foldedVoice` on the steer's update before the attachment
+ * stage runs; the stage must index each folded transcript (req 3, makes
+ * /retranscribe work) and echo one "🎙 Heard (steered)" line per transcript
+ * (req 2). Absent — every non-steer path — behaviour is unchanged.
+ */
+describe('AI-208: foldedVoice (steer re-dispatch)', () => {
+  const FOLDED = [
+    {
+      text: 'second voice transcript',
+      media: { file_id: 'fv2', file_unique_id: 'fuv2', duration: 7 },
+      kind: 'voice',
+      messageId: 12794,
+    },
+    {
+      text: 'third voice transcript',
+      media: { file_id: 'fv3', file_unique_id: 'fuv3', duration: 9 },
+      kind: 'audio',
+    },
+  ];
+
+  it('foldedVoice items are echoed with (steered) label', async () => {
+    const h = makeHarness();
+    const result = await runAttachmentStage(
+      baseInput({ update: { __foldedVoice: FOLDED }, userText: 'the steer text' }),
+      h.deps,
+    );
+    // userText is untouched — folded transcripts ride the prompt via the fold,
+    // not via the queue text.
+    assert.equal(result.userText, 'the steer text');
+    assert.equal(result.voiceTranscribed, false);
+    assert.equal(result.skipWorker, false);
+    assert.equal(h.sent.length, 2);
+    for (let i = 0; i < FOLDED.length; i++) {
+      const m = h.sent[i];
+      assert.equal(m.token, TOKEN);
+      assert.equal(m.chatId, CHAT_ID);
+      assert.equal(m.replyToMessageId, MESSAGE_ID);
+      assert.equal(m.threadId, THREAD_ID);
+      assert.ok(m.text.startsWith('🎙 Heard (steered):'), `text: ${m.text}`);
+      assert.ok(m.text.includes(FOLDED[i].text), `text: ${m.text}`);
+      assert.ok(/_Ref: /.test(m.text), `ref line appended: ${m.text}`);
+    }
+  });
+
+  it('AI-209 T10: via batch echoes (batched) and still indexes; via omitted stays (steered)', async () => {
+    // Batch source: item.via === 'batch' → the (batched) label; the audio index
+    // is written exactly as for a steer (record before mark, keyed by
+    // file_unique_id) so /retranscribe resolves folded batch notes too.
+    const h = makeHarness();
+    await runAttachmentStage(
+      baseInput({ update: { __foldedVoice: [{ ...FOLDED[0], via: 'batch' }] }, userText: 'batch head text' }),
+      h.deps,
+    );
+    assert.equal(h.sent.length, 1);
+    assert.ok(h.sent[0].text.startsWith('🎙 Heard (batched):'), `text: ${h.sent[0].text}`);
+    assert.ok(h.sent[0].text.includes(FOLDED[0].text), `text: ${h.sent[0].text}`);
+    assert.deepEqual(h.calls, ['recordAudio', 'markAudio', 'send']);
+    assert.equal(h.recordAudioArgs[0][2].messageId, 12794);
+    assert.equal(h.recordAudioArgs[0][2].kind, 'voice');
+    assert.deepEqual(h.recordAudioArgs[0][2].media, FOLDED[0].media);
+    assert.deepEqual(h.markAudioArgs[0], ['/fake-audio-root', CHAT_ID, 'fuv2', 'ok', undefined]);
+
+    // Omitted via (default 'steer'): byte-identical (steered) label, same index.
+    const h2 = makeHarness();
+    await runAttachmentStage(
+      baseInput({ update: { __foldedVoice: [FOLDED[0]] }, userText: 'steer head text' }),
+      h2.deps,
+    );
+    assert.equal(h2.sent.length, 1);
+    assert.ok(h2.sent[0].text.startsWith('🎙 Heard (steered):'), `text: ${h2.sent[0].text}`);
+    assert.deepEqual(h2.calls, ['recordAudio', 'markAudio', 'send']);
+  });
+
+  it('foldedVoice items are recorded in the audio index before the echo', async () => {
+    const h = makeHarness();
+    await runAttachmentStage(baseInput({ update: { __foldedVoice: FOLDED } }), h.deps);
+    // Per item, in order: record → mark → send. Record strictly before send.
+    assert.deepEqual(h.calls, [
+      'recordAudio', 'markAudio', 'send',
+      'recordAudio', 'markAudio', 'send',
+    ]);
+    // Item 1: explicit messageId wins over the update's own message id.
+    const [root1, chatId1, entry1] = h.recordAudioArgs[0];
+    assert.equal(root1, '/fake-audio-root');
+    assert.equal(chatId1, CHAT_ID);
+    assert.equal(entry1.messageId, 12794);
+    assert.equal(entry1.threadId, THREAD_ID);
+    assert.equal(entry1.kind, 'voice');
+    assert.deepEqual(entry1.media, FOLDED[0].media);
+    assert.equal(entry1.date, new Date('2026-09-01T12:00:00.000Z').toISOString());
+    // Item 2: no messageId on the item → falls back to the update's message id.
+    const entry2 = h.recordAudioArgs[1][2];
+    assert.equal(entry2.messageId, MESSAGE_ID);
+    assert.equal(entry2.kind, 'audio');
+    // markAudio: 'ok' (the transcript settled), keyed by file_unique_id.
+    assert.deepEqual(h.markAudioArgs[0], ['/fake-audio-root', CHAT_ID, 'fuv2', 'ok', undefined]);
+    assert.deepEqual(h.markAudioArgs[1], ['/fake-audio-root', CHAT_ID, 'fuv3', 'ok', undefined]);
+  });
+
+  it('foldedVoice absent → behaviour unchanged', async () => {
+    // Guards the pre-existing suite's assumptions: no __foldedVoice (and no
+    // input.foldedVoice) means zero extra side effects on every shape.
+    const h = makeHarness();
+    const result = await runAttachmentStage(baseInput({ userText: 'plain text' }), h.deps);
+    assert.deepEqual(result, {
+      userText: 'plain text',
+      voiceTranscribed: false,
+      response: '',
+      skipWorker: false,
+      audioAttachment: undefined,
+    });
+    assert.ok(!h.calls.includes('recordAudio'));
+    assert.ok(!h.calls.includes('markAudio'));
+    assert.ok(!h.calls.includes('send'));
+    // An update carrying only the OTHER normalizer markers stays unchanged too:
+    // __heldAbsorbed with a real transcript yields exactly the own-audio echo,
+    // never a steered one.
+    const h2 = makeHarness({ transcribeResult: okResult({ text: 'raw transcript' }) });
+    const r2 = await runAttachmentStage(
+      baseInput({ msg: { voice: { file_id: 'v1', file_unique_id: 'vu1', duration: 5 } }, update: { __heldAbsorbed: true }, userText: 'combined' }),
+      h2.deps,
+    );
+    assert.equal(r2.userText, 'combined');
+    assert.equal(h2.sent.length, 1);
+    assert.ok(!h2.sent[0].text.includes('(steered)'), h2.sent[0].text);
+  });
+
+  it('foldedVoice echo failure does not throw', async () => {
+    const h = makeHarness({ sendBehavior: 'reject', recordAudioBehavior: 'reject', markAudioBehavior: 'reject' });
+    const result = await runAttachmentStage(
+      baseInput({ update: { __foldedVoice: FOLDED }, userText: 'the steer text' }),
+      h.deps,
+    );
+    assert.equal(result.userText, 'the steer text');
+    assert.equal(result.skipWorker, false);
+    assert.equal(result.response, '');
+  });
+});
+
+/**
  * AI-191 (2026-09-03): voice-invoked commands. A transcript that confidently
  * invokes a registered command becomes that command's typed-equivalent text;
  * everything else falls through as conversation. Matcher tests inject the

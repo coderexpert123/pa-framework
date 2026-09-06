@@ -575,9 +575,18 @@ export async function pinChatMessage(
     try {
       const res = await telegramFetch(`${BASE}/bot${token}/pinChatMessage`, opts);
       if (res.ok) return true;
-      console.error(`pinChatMessage failed (attempt ${attempt + 1}): ${res.status} ${await safeResponseText(res)}`);
+      logger.warn('telegram', `pinChatMessage failed (attempt ${attempt + 1})`, {
+        chatId,
+        messageId,
+        status: res.status,
+        error: await safeResponseText(res),
+      });
     } catch (err) {
-      console.error(`pinChatMessage network error (attempt ${attempt + 1}):`, err);
+      logger.warn('telegram', `pinChatMessage network error (attempt ${attempt + 1})`, {
+        chatId,
+        messageId,
+        error: String(err),
+      });
     }
   }
   return false;
@@ -594,9 +603,16 @@ export async function unpinChatMessage(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: chatId, message_id: messageId }),
     });
-    if (!res.ok) console.error(`unpinChatMessage failed: ${res.status} ${await safeResponseText(res)}`);
+    if (!res.ok) {
+      logger.warn('telegram', 'unpinChatMessage failed', {
+        chatId,
+        messageId,
+        status: res.status,
+        error: await safeResponseText(res),
+      });
+    }
   } catch (err) {
-    console.error('unpinChatMessage network error:', err);
+    logger.warn('telegram', 'unpinChatMessage network error', { chatId, messageId, error: String(err) });
   }
 }
 

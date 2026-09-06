@@ -8,6 +8,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { createTempPaHome, createTempSecrets, cleanup } from './helpers.js';
 import { executeWorker } from '../src/workers.js';
+import { stripConfiguredArgs } from '../src/worker-exec.js';
 import type { WorkerConfig } from '../src/types.js';
 
 // Regression guard for the 2026-07-22 command-injection fix in quoteArg()
@@ -148,5 +149,64 @@ describe('worker-exec argument injection (quoteArg security)', () => {
     const received = await readFile(resultFile, 'utf8').catch(() => '');
     assert.ok(received.includes('claude sonnet 4.6') || received.trim().length > 0,
       `expected the space-containing value to survive as one argument, got: ${JSON.stringify(received)}`);
+  });
+});
+
+describe('stripConfiguredArgs (RunOptions.stripArgs)', () => {
+  it('bare form drops the flag AND its following token', () => {
+    assert.deepEqual(stripConfiguredArgs(['--flag', 'value', 'x'], ['--flag']), ['x']);
+  });
+
+  it('=form drops only the token carrying it', () => {
+    assert.deepEqual(stripConfiguredArgs(['--flag=value', 'x'], ['--flag']), ['x']);
+  });
+
+  it('repeated occurrences all drop', () => {
+    assert.deepEqual(stripConfiguredArgs(['--flag', 'a', '--flag', 'b', 'x'], ['--flag']), ['x']);
+  });
+
+  it('a stripped flag at the end drops itself', () => {
+    assert.deepEqual(stripConfiguredArgs(['x', '--flag'], ['--flag']), ['x']);
+  });
+
+  it('unset/empty strip ⇒ args pass through byte-identical', () => {
+    assert.deepEqual(stripConfiguredArgs(['--a', 'b'], undefined), ['--a', 'b']);
+    assert.deepEqual(stripConfiguredArgs(['--a', 'b'], []), ['--a', 'b']);
+  });
+
+  it('next token looking like a flag is ALSO consumed (bare form is unconditional — documented)', () => {
+    assert.deepEqual(stripConfiguredArgs(['--flag', '--other', 'x'], ['--flag']), ['x']);
+  });
+
+  it('a non-flag =-bearing token is preserved', () => {
+    assert.deepEqual(stripConfiguredArgs(['-c', 'm=x', 'k'], ['--flag']), ['-c', 'm=x', 'k']);
+  });
+
+  it('end-to-end through executeWorker: configured flag stripped, extraArgs survive', async () => {
+    const resultFile = join(scriptDir, 'result-strip.txt');
+    const stubPath = await writeArgvDumpStub('claude', resultFile);
+
+    const worker = makeWorker({
+      name: 'claude',
+      command: stubPath,
+      args: ['--append-system-prompt-file', 'C:/x/bi.md', '{prompt}'],
+      input_mode: 'arg',
+    });
+    const result = await executeWorker(worker, 'test prompt', {
+      timeout: 10,
+      stripArgs: ['--append-system-prompt-file'],
+      extraArgs: ['--resume', 's1'],
+    });
+
+    assert.equal(result.exitCode, 0, `stub should have run cleanly: ${JSON.stringify(result)}`);
+    const received = await readFile(resultFile, 'utf8').catch(() => '');
+    assert.ok(!received.includes('--append-system-prompt-file'),
+      `stripped flag must NOT reach argv, got: ${JSON.stringify(received)}`);
+    assert.ok(!received.includes('C:/x/bi.md') && !received.includes('bi.md'),
+      `stripped flag's value must NOT reach argv, got: ${JSON.stringify(received)}`);
+    assert.ok(received.includes('--resume') && received.includes('s1'),
+      `extraArgs must be appended untouched AFTER stripping, got: ${JSON.stringify(received)}`);
+    assert.ok(received.includes('@'),
+      `the substituted {prompt} marker must survive stripping, got: ${JSON.stringify(received)}`);
   });
 });

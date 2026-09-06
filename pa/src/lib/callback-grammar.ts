@@ -18,7 +18,7 @@
  * longer, malformed, or over-length in a field):
  *   reauth:google[:skill≤50]                       chat-gated
  *   cf:y | cf:n                                    chat-gated   (pending_action confirmation)
- *   cc:menu|agent|model|effort|back|new|stop|ka    chat-gated   (control card navigation/actions)
+ *   cc:menu|agent|model|effort|back|new|stop|ka|submit|discard  chat-gated   (control card navigation/actions)
  *   cc:set:agent:<≤16> | cc:set:model:<≤40> | cc:set:effort:<≤16>
  *   wf:retry | wf:switch:<worker≤16> | wf:revert:<worker≤16>
  *   pm:<auditId≤40>:approve|reject|diff            operator-gated
@@ -71,7 +71,7 @@ export type CallbackGate = 'chat' | 'operator';
 export type ParsedCallback =
   | { prefix: 'reauth'; provider: 'google'; skill?: string; raw: string }
   | { prefix: 'cf'; answer: 'y' | 'n'; raw: string }
-  | { prefix: 'cc'; action: 'menu' | 'agent' | 'model' | 'effort' | 'back' | 'new' | 'stop' | 'ka'; raw: string }
+  | { prefix: 'cc'; action: 'menu' | 'agent' | 'model' | 'effort' | 'back' | 'new' | 'stop' | 'ka' | 'submit' | 'discard'; raw: string }
   | { prefix: 'cc'; action: 'set'; setting: 'agent' | 'model' | 'effort'; value: string; raw: string }
   | { prefix: 'wf'; action: 'retry'; raw: string }
   | { prefix: 'wf'; action: 'switch' | 'revert'; worker: string; raw: string }
@@ -97,7 +97,7 @@ export type ParsedCallback =
 // 64-byte `callback_data` limit.
 export const REAUTH_CALLBACK_PATTERN = /^reauth:(google)(?::([a-z0-9-]{1,50}))?$/;
 const CF_RE = /^cf:(y|n)$/;
-const CC_SIMPLE_RE = /^cc:(menu|agent|model|effort|back|new|stop|ka)$/;
+const CC_SIMPLE_RE = /^cc:(menu|agent|model|effort|back|new|stop|ka|submit|discard)$/;
 const CC_SET_RE = /^cc:set:(agent|model|effort):([\s\S]{1,64})$/;
 export const CC_SET_CAPS: Record<'agent' | 'model' | 'effort', number> = { agent: 16, model: 40, effort: 16 };
 const WF_RETRY_RE = /^wf:retry$/;
@@ -176,7 +176,7 @@ export function parseCallbackData(data: string | undefined): ParsedCallback | nu
   if ((m = CC_SIMPLE_RE.exec(data))) {
     return {
       prefix: 'cc',
-      action: m[1] as 'menu' | 'agent' | 'model' | 'effort' | 'back' | 'new' | 'stop' | 'ka',
+      action: m[1] as 'menu' | 'agent' | 'model' | 'effort' | 'back' | 'new' | 'stop' | 'ka' | 'submit' | 'discard',
       raw: data,
     };
   }

@@ -913,10 +913,12 @@ describe('runPollLoop: model expiry sweep', { concurrency: 1 }, () => {
     const state = makeState(123, -1);
 
     const calledUrls: string[] = [];
+    const pinBodies: string[] = [];
     let getUpdatesCount = 0;
 
-    (globalThis as Record<string, unknown>).fetch = async (url: string) => {
+    (globalThis as Record<string, unknown>).fetch = async (url: string, opts?: any) => {
       calledUrls.push(url as string);
+      if ((url as string).includes('/pinChatMessage') && opts?.body) pinBodies.push(String(opts.body));
 
       if ((url as string).includes('getUpdates')) {
         getUpdatesCount++;
@@ -949,15 +951,22 @@ describe('runPollLoop: model expiry sweep', { concurrency: 1 }, () => {
     // A pin already exists (pinned_status_message_id: 42), so refreshPinnedStatusCardInPlace
     // edits it in place rather than unpin+repin — deliberate since the 2026-08-25 "bp-retry"
     // fix (main.ts, refreshPinnedStatusCardInPlace) that stopped stranding users mid-navigation
-    // through a control-card submenu on the same message id. unpin/pin only fire when there is
-    // no existing pin (covered separately by the AI-026 failover test).
+    // through a control-card submenu on the same message id. unpin and the fresh-card send+pin
+    // fire only when there is no existing pin (covered separately by the AI-026 failover test);
+    // the in-place path's own pin call is the self-heal re-assert asserted below.
     const editCalls = calledUrls.filter(u => u.includes('/editMessageText'));
     const unpinCalls = calledUrls.filter(u => u.includes('unpinChatMessage'));
     const pinCalls = calledUrls.filter(u => u.includes('/pinChatMessage'));
 
     assert.strictEqual(editCalls.length, 1, 'should edit the existing pin in place with the midnight-reset status');
     assert.strictEqual(unpinCalls.length, 0, 'an in-place edit must not unpin the existing indicator');
-    assert.strictEqual(pinCalls.length, 0, 'an in-place edit must not create a new pin');
+    // Pin self-heal (2026-09-06, internal): topic pins are write-only in the Bot API, so a
+    // successful in-place edit fire-and-forget re-asserts pinChatMessage on the SAME message
+    // id — idempotent healing, never a new card.
+    assert.strictEqual(pinCalls.length, 1, 'the in-place edit re-asserts the existing pin exactly once');
+    assert.strictEqual(pinBodies.length, 1, 'the re-assert is a single pin call');
+    const pinBody = JSON.parse(pinBodies[0] ?? '{}') as { message_id?: number };
+    assert.strictEqual(pinBody.message_id, 42, 'the re-assert must re-pin the EXISTING pinned id (42), never a new card');
 
     const saved = JSON.parse(await readFile(topicStateFile, 'utf8')) as ConversationState;
     assert.equal(saved.preferred_worker, undefined);

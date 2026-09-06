@@ -119,10 +119,17 @@ topic_defaults:
     // pinned_status_message_id already exists, falling back to unpin+send+pin only if the
     // edit fails — it never fails here (mock always returns ok:true), so both the ambient
     // startup model-expiry sweep's own refresh AND /default's refresh edit message 100
-    // in place; neither unpin/pin/fresh-send ever fires.
+    // in place; neither unpin nor fresh-send ever fires. Pin self-heal (2026-09-06,
+    // internal): every successful in-place edit fire-and-forget re-asserts pinChatMessage
+    // on the SAME id (topic pins are write-only in the Bot API) — two successful edits
+    // fire here (sweep refresh + /default refresh), so exactly two re-asserts, each on
+    // the existing message 100.
     assert.ok(editCalls.some(c => c.includes('Topic Status')), 'should edit the existing status card in place');
     assert.equal(unpinCalls.length, 0, 'edit-in-place must never unpin the existing card');
-    assert.equal(pinCalls.length, 0, 'edit-in-place must never pin a new card');
+    assert.equal(pinCalls.length, 2, 'each successful in-place edit re-asserts the existing pin (sweep refresh + /default refresh)');
+    for (const call of pinCalls) {
+      assert.match(call, /"message_id":100(?!\d)/, 'every re-assert re-pins the EXISTING pinned id 100, never a new card');
+    }
 
     const saved = JSON.parse(await readFile(topicStateFile, 'utf8')) as ConversationState;
     assert.equal(saved.model_status?.current_worker, 'agy');

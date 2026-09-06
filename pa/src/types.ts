@@ -272,6 +272,18 @@ export interface RunOptions {
   priorAttempts?: string[]; // workers that already failed before runWithFailover was invoked
   contextId?: string; // execution-context UUID; allows nested same-context blackboard lock re-entrancy
   getExtraArgs?: (worker: WorkerConfig) => string[] | undefined; // dynamic extraArgs resolver per failover candidate
+  // Flag names removed from the worker's CONFIGURED args for THIS run only
+  // (stripConfiguredArgs in worker-exec.ts). Bare form ('--flag value') drops
+  // the flag AND its following token unconditionally; '--flag=value' drops the
+  // token; repeated occurrences all drop; a stripped flag at the end of args
+  // drops itself. Unset/empty ⇒ args pass through byte-identical. NEVER touches
+  // extraArgs/getExtraArgs output — those are appended AFTER stripping. Applied
+  // at executeWorker's single args-assembly site; runWithFailover candidates
+  // inherit it through the options spread. Consumer (2026-09-06): the bot's
+  // spawned-thread dispatches strip '--append-system-prompt-file' from
+  // claude/zclaude so a thread does not receive the operator's static
+  // bot-instructions file.
+  stripArgs?: string[];
   // AI-114: when set, stamps a harvestUntil deadline (now + this) onto the
   // worker-pids registry entry, protecting it from cleanupOrphanedWorkers'
   // periodic sweep (every 60s via `pa catchup`, no excludeSkills of its own)

@@ -268,6 +268,33 @@ describe('buildReport', () => {
     assert.match(report, /Alert census unavailable: not built/);
   });
 
+  describe('task-lane report line (AI-197)', () => {
+    it('emits the task-lane line immediately after the census top line and before the blank line', () => {
+      const census = makeCensus({ topLine: '548 alerts / 22 families in 7d — top: restore-drill 180' });
+      const report = buildReport([], [], 0, 0, census, undefined, 'Task lane (14d): 2 task(s) across 1 topic(s) — 1 completed, 1 failed.');
+      const lines = report.split('\n');
+      const censusIdx = lines.findIndex((l) => l.includes('548 alerts'));
+      assert.ok(censusIdx !== -1, 'census top line must be present');
+      assert.equal(lines[censusIdx + 1], 'Task lane (14d): 2 task(s) across 1 topic(s) — 1 completed, 1 failed.');
+      assert.equal(lines[censusIdx + 2], '');
+    });
+
+    it('emits the task-lane line after the census-unavailable line when the census failed to build', () => {
+      const report = buildReport([], [], 0, 0, undefined, 'census boom', 'Task lane (14d): 1 task(s) across 1 topic(s) — 0 completed, 1 failed.');
+      const lines = report.split('\n');
+      const idx = lines.findIndex((l) => l.startsWith('Alert census unavailable:'));
+      assert.ok(idx !== -1, 'census-unavailable line must be present');
+      assert.equal(lines[idx + 1], 'Task lane (14d): 1 task(s) across 1 topic(s) — 0 completed, 1 failed.');
+      assert.equal(lines[idx + 2], '');
+    });
+
+    it('leaves the report unchanged when no task-lane line is given (byte-compat guard)', () => {
+      const report = buildReport([], []);
+      assert.match(report, /Nothing to report/);
+      assert.ok(!report.includes('Task lane ('), 'a param-absent report must not contain a task-lane line');
+    });
+  });
+
   describe('census-derived report sections (2026-08-23 alerts wave)', () => {
     it('renders Operator action needed for human-gated families (family/owner/age/error), omitted when there are none', () => {
       const generatedAt = new Date().toISOString();

@@ -272,6 +272,7 @@ Each `(chat_id, thread_id)` pair has its own state file at `~/.pa/telegram-bot-t
   "turns": [/* rolling 20-turn history */],
   "session": {"worker": "claude", "session_id": "..."},
   "cwd_override": "/home/me/code/myproject",
+  "sources": [{"path": "/home/me/code/myproject/NOTES.md", "label": "notes"}],
   "preferred_worker": "claude",
   "pending_action": "send email to alice@example.com"
 }
@@ -280,6 +281,7 @@ Each `(chat_id, thread_id)` pair has its own state file at `~/.pa/telegram-bot-t
 - `turns`: rolling window of (user message, bot response) pairs
 - `session.session_id`: lets the worker resume conversation context
 - `cwd_override`: set via `/code <path>` — overrides the default `BOT_CWD`
+- `sources`: declared per-topic grounding files, set via `/sources <path> [label]` — read fresh and injected into every fresh dispatch prompt (`/sources reset` clears)
 - `preferred_worker`: set via `/agent <name>` — pins this topic to one agent
 - `pending_action`: set by `confirm_required` PA_META — user's next "yes"/"no" resolves
 
@@ -296,6 +298,9 @@ Defined in `projects/telegram-bot/src/commands.ts`. Common ones:
 - `/auth <code> <state>` — complete the Telegram/mobile Google OAuth flow
 - `/code <path>` — set the working directory for this topic
 - `/code reset` — clear working-directory override
+- `/sources` — list declared per-topic grounding sources
+- `/sources <path> [label]` — declare a grounding source; its content is read fresh and injected into every fresh dispatch (inline ≤4000 chars per source, larger ones become must-read pointers; explicit UNAVAILABLE lines when a declared file can't be read)
+- `/sources remove <n|path>` / `/sources reset` — remove one declaration / clear all
 - `/branch <name>` — create a branched conversation (child topic in supergroups)
 - `/keepawake` — toggle machine-wide sleep prevention (Windows: `SetThreadExecutionState` via PS; macOS: `caffeinate -s`; Linux: `systemd-inhibit`)
 - `/deep-plan`, `/deep-recheck`, `/update-brain`, etc. — pass-through to corresponding pa skills

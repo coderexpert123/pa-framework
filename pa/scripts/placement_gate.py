@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Placement registry -> public-path projection -> public-sync gate (placement Phase 3, P1).
 
-One script, two subcommands:
+One script, three subcommands:
 
-  gen --registry <path> --out <path>
+  gen --registry <path> --out <path> [--gitignore <path> [--scan-repo <dir>]]
       Parse the registry's census tables (12-cell rows under `##` headings) and derive
       the public-path projection: ALLOW globs (R1 every PUBLIC row, R2 every
       public-tracked-boundary row even when SPLIT, R3 every uncovered SPLIT surface as
@@ -11,6 +11,18 @@ One script, two subcommands:
       (exact-file PRIVATE surfaces only; dir/glob PRIVATE surfaces never deny). Written
       atomically (tmp + os.replace). Success line:
       PLACEMENT-PROJECTION OK rows=%d allow=%d deny=%d assumed=%d -> <out>
+      With --gitignore: the registry's N3 feature cells (`L<lineno>:<exact gitignore
+      line>`) are projected verbatim, in registry file order, under a fixed
+      2-comment-line header, and the result is refused (exit 4, nothing written) when
+      any SPLIT surface is assumed-public, when the emitted set lacks the
+      `!/.gitignore-public` self re-include, or when real `git check-ignore` run in a
+      throwaway repo disagrees with the projection over the tracked universe in a hard
+      direction: DENY-PUBLIC (a path the projection denies would ship), or ALLOW-DENIED
+      with an exact-file allowing row (a declared-public file locked out). An
+      ALLOW-DENIED whose every allowing row is directory-grained (glob or dir surface)
+      is a legitimate carve-out: one PLACEMENT-BOUNDARY-CARVE-OUT line per example
+      (first 15) plus a PLACEMENT-BOUNDARY-WARNING count, then success. Second line:
+      PLACEMENT-BOUNDARY OK lines=%d -> <gitignore>
 
   check --registry <path> --projection <path> --public-repo <dir> [--flags-file <path>]
       Freshness-check the projection against the current registry sha256 (exit 3 on
@@ -20,7 +32,22 @@ One script, two subcommands:
       for the same file already exists (then PLACEMENT-FLAG-EXISTS: <file>).
       PLACEMENT-GATE OK new=<n> (exit 0) or PLACEMENT-GATE REFUSED files=<n> (exit 2).
 
-Exit codes: 0 ok | 2 refusal | 3 stale projection | 4 usage/parse. Nothing else.
+  compare --registry <path> --generated <path> [--live <path>] [--scan-repo <dir>]
+          [--public-repo <dir>]
+      Steady state (no --live): regenerate the boundary in memory and byte-compare it
+      against --generated — PLACEMENT-BOUNDARY VERIFIED generated=<path> matches
+      registry derivation (exit 0), or PLACEMENT-BOUNDARY DRIFT generated=<path> does
+      not match the registry derivation — regenerate and commit (exit 3; the
+      staleness gate the public-sync skill runs). Migration (--live <path>): the
+      pre-migration boundary is not generated, so the byte stage is skipped; the
+      tracked universe (tracked files of both repos, star-free exact-file projection
+      globs, and synthetic `.pa-boundary-probe` files under every directory prefix) is
+      evaluated under BOTH files with real git. EXPOSED (live denies, generated
+      allows) and LOCKED-OUT (live allows, generated denies) must both be empty
+      (exit 0); otherwise up to 15 per bucket are listed, then
+      PLACEMENT-BOUNDARY MISMATCH exposed=%d locked-out=%d (exit 2).
+
+Exit codes: 0 ok | 2 refusal/mismatch | 3 stale/drift | 4 usage/parse. Nothing else.
 (argparse's own error exit is overridden to 4 so it cannot collide with refusal's 2.)
 
 Flag-schema join contract: each appended flag is one JSON line with keys in exactly
@@ -32,7 +59,9 @@ key, so neither field may ever change format.
 Coupling note: the registry's 12-cell table grammar is shared with
 scratch/placement-audit/check_completeness.py — a schema change must move both
 parsers; the projection's registry_sha256 freshness check turns drift into exit 3,
-never silent mismatch.
+never silent mismatch; and check_completeness.py's A4 compares the N3 line-texts
+with the generated boundary's meaningful lines (content identity, no physical line
+numbers) — a schema or emission change must move both.
 
 Engineering rules: stdlib only; git spawns carry creationflags=CREATE_NO_WINDOW on
 win32; the registry path arrives only via --registry (this file is public-tracked and
@@ -47,8 +76,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from collections import namedtuple
 from datetime import datetime, timezone
 
@@ -313,25 +344,335 @@ def utc_z(now=None):
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def write_projection(out_path, proj, registry_path, reg_bytes):
+    """Atomic projection write (tmp + os.replace) — readers never see a torn file."""
+    payload = proj.to_dict(registry=registry_path, registry_sha256=sha256_hex(reg_bytes),
+                           generated_at=utc_z())
+    out_dir = os.path.dirname(os.path.abspath(out_path))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    tmp_path = out_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(payload, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    os.replace(tmp_path, out_path)
+
+
 def cmd_gen(args):
     reg_bytes = read_bytes(args.registry)
     rows = parse_registry_rows(reg_bytes.decode("utf-8").splitlines())
     proj = derive(rows)
     for warning in proj.warnings:
         print(warning, file=sys.stderr)
-    payload = proj.to_dict(registry=args.registry, registry_sha256=sha256_hex(reg_bytes),
-                           generated_at=utc_z())
-    out_dir = os.path.dirname(os.path.abspath(args.out))
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-    tmp_path = args.out + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8", newline="\n") as fh:
-        json.dump(payload, fh, indent=2, ensure_ascii=False)
-        fh.write("\n")
-    os.replace(tmp_path, args.out)  # atomic write: readers never see a torn projection
+    if args.gitignore:
+        return cmd_gen_boundary(args, rows, proj, reg_bytes)
+    write_projection(args.out, proj, args.registry, reg_bytes)
     print("PLACEMENT-PROJECTION OK rows=%d allow=%d deny=%d assumed=%d -> %s"
           % (proj.rows, len(proj.allow), len(proj.deny), proj.assumed, args.out))
     return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# boundary generation: the public boundary is GENERATED output of the registry's
+# Boundary lines (N3) census — a verbatim projection, never a synthesis
+# ---------------------------------------------------------------------------
+
+HEADER_LINES = [
+    "# pa-framework public boundary - GENERATED file; do not edit by hand.",
+    "# Source of truth: the placement registry's Boundary lines (N3) section; "
+    "regenerate with pa/scripts/placement_gate.py gen --gitignore.",
+    "",
+]
+
+SELF_REINCLUDE_LINE = "!/.gitignore-public"
+
+
+def render_boundary(lines):
+    """The exact generated file bytes: fixed 3-line header, then the pattern lines,
+    LF, trailing newline. No timestamps, no digest — the byte-compare stage IS the
+    staleness check."""
+    return "\n".join(list(HEADER_LINES) + list(lines)) + "\n"
+
+
+def emit_boundary_lines(rows):
+    """Project every N3 row's `L<lineno>:<line-text>` feature cell verbatim, in
+    registry file order. No re-anchoring, no glob rewriting, no dedupe (a duplicate
+    line is a registry defect the completeness checker's set-parity surfaces). The
+    line texts ARE gitignore lines, so git itself is the only negation engine —
+    applied at validation/compare time in a throwaway repo."""
+    lines = []
+    for row in rows:
+        if row.census != "N3":
+            continue
+        m = re.match(r"^(L\d+):(.+)$", row.feature)
+        if not m:
+            raise PlacementGateError(
+                "N3 row %r (registry line %d) is not keyed L<lineno>:<line-text>"
+                % (row.feature, row.lineno))
+        lines.append(m.group(2).strip())
+    return lines
+
+
+class TempRepoPool(object):
+    """Fresh throwaway git-repo dirs for check_ignore_set (one per batch, from
+    repo_factory); removed on close() — the caller owns the cleanup."""
+
+    def __init__(self):
+        self.dirs = []
+
+    def new_repo(self):
+        d = tempfile.mkdtemp(prefix="pa-boundary-git-")
+        self.dirs.append(d)
+        return d
+
+    def close(self):
+        for d in self.dirs:
+            shutil.rmtree(d, True)
+        self.dirs = []
+
+
+def _run_git(cmd, input_text=None):
+    kwargs = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = CREATE_NO_WINDOW
+    try:
+        return subprocess.run(cmd, input=input_text, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=120, **kwargs)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise PlacementGateError("%s failed (%s: %s)"
+                                 % (" ".join(cmd[:3]), type(exc).__name__, exc))
+
+
+def git_ls_files(repo):
+    """Tracked files of a checkout: root-relative, forward-slash paths. -z keeps the
+    output unquoted, so non-ASCII paths stay literal."""
+    proc = _run_git(["git", "-C", repo, "ls-files", "-z"])
+    if proc.returncode != 0:
+        tail = (proc.stderr or "").strip().splitlines()[-1:] or ["rc=%d" % proc.returncode]
+        raise PlacementGateError("git ls-files failed in %s (%s)" % (repo, tail[0]))
+    return [s for s in proc.stdout.split("\0") if s.strip()]
+
+
+_ABSOLUTE_PATH_RE = re.compile(r"^[A-Za-z]:[/\\]|^[/\\]")
+
+
+def _repo_relative(path):
+    """True when real git can evaluate the path inside a throwaway repo: gitignore
+    patterns and check-ignore queries are repo-relative, so drive-letter and other
+    absolute surfaces are inert in a boundary and cannot be validated there (they
+    stay in the emitted file untouched — emission is a projection, never a filter)."""
+    return not _ABSOLUTE_PATH_RE.match(path)
+
+
+def resolve_scan_repo(explicit):
+    """--scan-repo, defaulting to the repo that owns the cwd; unusable cwd => exit 4."""
+    if explicit:
+        return explicit
+    proc = _run_git(["git", "rev-parse", "--show-toplevel"])
+    if proc.returncode != 0 or not (proc.stdout or "").strip():
+        raise PlacementGateError("cannot resolve the scan repo from cwd; pass --scan-repo")
+    return proc.stdout.strip()
+
+
+def boundary_universe(proj, scan_repo, public_repo=None, n3_lines=()):
+    """Every path the boundary's semantics must be proven over, sorted and deduped:
+    tracked files of the scan repo, tracked files of the public mirror when given,
+    literal probe paths for every exact-file projection glob, and a synthetic
+    `<dir>/.pa-boundary-probe` under every directory prefix of any of those paths or
+    of any N3 line text. Probes are what catch the untracked+unprojected residual
+    (the default-open class): a removed carve-out with nothing tracked beneath it
+    still flips a probe."""
+    universe = set(git_ls_files(scan_repo))
+    if public_repo:
+        universe.update(git_ls_files(public_repo))
+    for entry in proj.allow + proj.deny:
+        if is_exact_file(entry["glob"]) and _repo_relative(entry["glob"]):
+            universe.add(entry["glob"])
+    seeds = set(universe)
+    for line in n3_lines:
+        cleaned = line.lstrip("!").lstrip("/").rstrip("/")
+        if cleaned and _repo_relative(cleaned):
+            seeds.add(cleaned)
+    for path in seeds:
+        parts = path.split("/")
+        for i in range(1, len(parts)):
+            universe.add("/".join(parts[:i]) + "/.pa-boundary-probe")
+    return sorted(universe)
+
+
+def check_ignore_set(text, universe, repo_factory):
+    """The REAL negation engine: write the boundary text into a fresh throwaway repo
+    (repo_factory hands out the dir; the pool cleans it up), `git init -q`, then ONE
+    `check-ignore --stdin -z` batch over all universe paths, NUL-separated. exit 0 =>
+    the ignored set; exit 1 => nothing ignored; anything else => error. A
+    fnmatch-vs-gitignore divergence surfaces here mechanically as a validation
+    mismatch, never silently."""
+    if not universe:
+        return set()
+    repo_dir = repo_factory()
+    with open(os.path.join(repo_dir, ".gitignore"), "w", encoding="utf-8",
+              newline="\n") as fh:
+        fh.write(text)
+    init = _run_git(["git", "-C", repo_dir, "init", "-q"])
+    if init.returncode != 0:
+        tail = (init.stderr or "").strip().splitlines()[-1:] or ["rc=%d" % init.returncode]
+        raise PlacementGateError("git init failed in %s (%s)" % (repo_dir, tail[0]))
+    proc = _run_git(["git", "-C", repo_dir, "check-ignore", "--stdin", "-z"],
+                    input_text="".join(p + "\0" for p in universe))
+    if proc.returncode == 0:
+        return set(s for s in proc.stdout.split("\0") if s)
+    if proc.returncode == 1:
+        return set()
+    tail = (proc.stderr or "").strip().splitlines()[-1:] or ["rc=%d" % proc.returncode]
+    raise PlacementGateError("git check-ignore failed in %s (%s)" % (repo_dir, tail[0]))
+
+
+def validate_boundary(lines, proj, scan_repo):
+    """Asymmetric rule per universe path u (adjudicated 2026-09-05): expected_public
+    = (an allow entry matches u) and (no deny entry matches u); expected_private =
+    not expected_public. The boundary must ignore expected-private and NOT ignore
+    expected-public, as decided by real git. The two mismatch directions are NOT
+    symmetric:
+      - DENY-PUBLIC (expected-private but boundary-public) is always hard: the
+        silent-exposure direction.
+      - ALLOW-DENIED (expected-public but boundary-ignored) splits by the grain of
+        the ALLOWING rows: any exact-file allowing row means a declared-public file
+        is locked out — hard; every allowing row directory-grained (glob or dir
+        surface) means a legitimate carve-out (a PUBLIC tree with private children)
+        — one PLACEMENT-BOUNDARY-CARVE-OUT example line each (first 15) plus a
+        PLACEMENT-BOUNDARY-WARNING count line, then success.
+    Any hard mismatch prints its lines to stderr and raises (exit 4) with NOTHING
+    written."""
+    if SELF_REINCLUDE_LINE not in lines:
+        line = ("PLACEMENT-BOUNDARY-MISMATCH: SELF-REINCLUDE generated boundary does "
+                "not re-include .gitignore-public — extraction could never update the "
+                "mirror copy")
+        print(line, file=sys.stderr)
+        raise PlacementGateError(line)
+    text = render_boundary(lines)
+    universe = boundary_universe(proj, scan_repo, n3_lines=lines)
+    pool = TempRepoPool()
+    try:
+        ignored = check_ignore_set(text, universe, pool.new_repo)
+    finally:
+        pool.close()
+    allow_denied = []   # exact-file grain: a declared-public file locked out
+    carve_outs = []     # directory-grained only: legitimate carve-out
+    deny_public = []
+    for u in universe:
+        allowing = [e for e in proj.allow if glob_match(e["glob"], u)]
+        denied = any(glob_match(e["glob"], u) for e in proj.deny)
+        expected_public = bool(allowing) and not denied
+        if expected_public and u in ignored:
+            if any(is_exact_file(e["glob"]) for e in allowing):
+                allow_denied.append(u)
+            else:
+                carve_outs.append(u)
+        elif not expected_public and u not in ignored:
+            deny_public.append(u)
+    for u in carve_outs[:15]:
+        print("PLACEMENT-BOUNDARY-CARVE-OUT: %s" % u, file=sys.stderr)
+    if carve_outs:
+        print("PLACEMENT-BOUNDARY-WARNING: %d allowed-path denial(s) are "
+              "directory-grained carve-outs (every allowing row is a glob or dir "
+              "surface) — warning only, generation continues" % len(carve_outs),
+              file=sys.stderr)
+    if allow_denied or deny_public:
+        for u in allow_denied:
+            print("PLACEMENT-BOUNDARY-MISMATCH: ALLOW-DENIED %s" % u, file=sys.stderr)
+        for u in deny_public:
+            print("PLACEMENT-BOUNDARY-MISMATCH: DENY-PUBLIC %s" % u, file=sys.stderr)
+        raise PlacementGateError(
+            "boundary validation failed: %d exact-file allowed-path denial(s), %d "
+            "public-path leak(s)" % (len(allow_denied), len(deny_public)))
+
+
+def cmd_gen_boundary(args, rows, proj, reg_bytes):
+    """The --gitignore branch, exact order: (a) refuse any assumed surface, (b)
+    project the N3 cells, (c) validate with real git over the tracked universe, (d)
+    atomic-write the boundary, and only then (e) the projection write plus both
+    success lines. Every refusal leaves the filesystem untouched."""
+    if proj.assumed > 0:
+        for entry in proj.allow:
+            if entry.get("assumed"):
+                print("PLACEMENT-BOUNDARY-ASSUMED: %s %s"
+                      % (entry["feature"], entry["glob"]), file=sys.stderr)
+        print("PLACEMENT-BOUNDARY REFUSED assumed=%d — every boundary line must have "
+              "an owning registry row" % proj.assumed, file=sys.stderr)
+        return EXIT_USAGE
+    scan_repo = resolve_scan_repo(args.scan_repo)
+    lines = emit_boundary_lines(rows)
+    validate_boundary(lines, proj, scan_repo)
+    text = render_boundary(lines)
+    out_dir = os.path.dirname(os.path.abspath(args.gitignore))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    tmp_path = args.gitignore + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text)
+    os.replace(tmp_path, args.gitignore)
+    write_projection(args.out, proj, args.registry, reg_bytes)
+    print("PLACEMENT-PROJECTION OK rows=%d allow=%d deny=%d assumed=%d -> %s"
+          % (proj.rows, len(proj.allow), len(proj.deny), proj.assumed, args.out))
+    print("PLACEMENT-BOUNDARY OK lines=%d -> %s" % (len(lines), args.gitignore))
+    return EXIT_OK
+
+
+def read_text(path):
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        return fh.read()
+
+
+def cmd_compare(args):
+    reg_bytes = read_bytes(args.registry)
+    rows = parse_registry_rows(reg_bytes.decode("utf-8").splitlines())
+    proj = derive(rows)
+    for warning in proj.warnings:
+        print(warning, file=sys.stderr)
+    if proj.assumed > 0:
+        # A registry in this state has no valid generated file at all.
+        for entry in proj.allow:
+            if entry.get("assumed"):
+                print("PLACEMENT-BOUNDARY-ASSUMED: %s %s"
+                      % (entry["feature"], entry["glob"]), file=sys.stderr)
+        return EXIT_USAGE
+    if not args.live:
+        lines = emit_boundary_lines(rows)
+        with open(args.generated, "rb") as fh:
+            actual = fh.read()
+        if actual == render_boundary(lines).encode("utf-8"):
+            print("PLACEMENT-BOUNDARY VERIFIED generated=%s matches registry derivation"
+                  % args.generated)
+            return EXIT_OK
+        print("PLACEMENT-BOUNDARY DRIFT generated=%s does not match the registry "
+              "derivation — regenerate and commit" % args.generated)
+        return EXIT_STALE
+    generated_text = read_text(args.generated)
+    live_text = read_text(args.live)
+    scan_repo = resolve_scan_repo(args.scan_repo)
+    universe = boundary_universe(proj, scan_repo, public_repo=args.public_repo,
+                                 n3_lines=emit_boundary_lines(rows))
+    pool = TempRepoPool()
+    try:
+        ignored_generated = check_ignore_set(generated_text, universe, pool.new_repo)
+        ignored_live = check_ignore_set(live_text, universe, pool.new_repo)
+    finally:
+        pool.close()
+    exposed = sorted(u for u in universe
+                     if u in ignored_live and u not in ignored_generated)
+    locked_out = sorted(u for u in universe
+                        if u in ignored_generated and u not in ignored_live)
+    if not exposed and not locked_out:
+        print("PLACEMENT-BOUNDARY VERIFIED universe=%d agreed=%d exposed=0 locked-out=0"
+              % (len(universe), len(universe)))
+        return EXIT_OK
+    for u in exposed[:15]:
+        print("PLACEMENT-BOUNDARY EXPOSED: %s" % u)
+    for u in locked_out[:15]:
+        print("PLACEMENT-BOUNDARY LOCKED-OUT: %s" % u)
+    print("PLACEMENT-BOUNDARY MISMATCH exposed=%d locked-out=%d"
+          % (len(exposed), len(locked_out)))
+    return EXIT_REFUSED
 
 
 # ---------------------------------------------------------------------------
@@ -477,7 +818,30 @@ def build_parser():
     gen = sub.add_parser("gen", help="derive the public-path projection from the registry")
     gen.add_argument("--registry", required=True, help="path to the placement registry md")
     gen.add_argument("--out", required=True, help="projection JSON output path")
+    gen.add_argument("--gitignore", default=None,
+                     help="also emit the generated public boundary file from the "
+                          "registry's N3 line cells")
+    gen.add_argument("--scan-repo", default=None,
+                     help="repo whose tracked universe validates the emitted boundary "
+                          "(default: the repo owning cwd)")
     gen.set_defaults(func=cmd_gen)
+
+    compare = sub.add_parser(
+        "compare", help="verify a boundary file against the registry derivation")
+    compare.add_argument("--registry", required=True,
+                         help="path to the placement registry md")
+    compare.add_argument("--generated", required=True,
+                         help="generated boundary file to verify")
+    compare.add_argument("--live", default=None,
+                         help="pre-migration boundary to prove semantic equivalence "
+                              "against (skips the byte stage)")
+    compare.add_argument("--scan-repo", default=None,
+                         help="repo whose tracked universe joins the migration "
+                              "comparison (default: the repo owning cwd)")
+    compare.add_argument("--public-repo", default=None,
+                         help="public mirror checkout whose tracked files join the "
+                              "migration comparison")
+    compare.set_defaults(func=cmd_compare)
 
     check = sub.add_parser("check", help="gate mirror-new files against the projection")
     check.add_argument("--registry", required=True, help="path to the placement registry md")

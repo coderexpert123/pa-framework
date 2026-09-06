@@ -127,8 +127,10 @@ instead. Full record: the private planning archive (dated 2026-07-21).
     into `pa-public/`'s own directory (`git -C <pa-public>`) — use them for public-repo
     status/add/commit/push operations instead of hand-rolled invocations. They no longer
     use `--git-dir`/`--work-tree` (see historical note above).
--   **Whitelist boundary**: `.gitignore-public` is the source of truth for what ships to
-    the public framework repo, and it filters the sync itself, not just staging (since
+-   **Whitelist boundary**: `.gitignore-public` — GENERATED from the placement registry's
+    Boundary lines section (`pa/scripts/placement_gate.py gen --gitignore`); never
+    hand-edited — is the enforcement point for what ships to the public framework
+    repo, and it filters the sync itself, not just staging (since
     2026-09-03): `pa public-sync` consults the boundary through the mirror repo's own
     `git check-ignore` — the same oracle `push-public` Step 2 uses at staging — and
     extracts only rule-public paths. The boundary is wired in as

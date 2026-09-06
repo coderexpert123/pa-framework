@@ -26,6 +26,7 @@ import {
   extractAudioAttachment,
   voiceAttachmentPath,
   type AudioAttachment,
+  type AudioAttachmentKind,
   type VoiceDeps,
   type VoiceResult,
 } from './voice.js';
@@ -34,6 +35,7 @@ import {
   recordAudioMessage,
   markAudioResult,
 } from './audio-index.js';
+import type { AudioMediaIdentity } from './topic-queue.js';
 import { logger } from '../../../pa/dist/src/lib/log.js';
 
 // --- AI-191 (2026-09-03): voice-invoked commands --------------------------
@@ -216,6 +218,22 @@ export interface AttachmentStageInput {
   runtimeEnv: NodeJS.ProcessEnv;
   /** config.transcription; may be undefined. */
   transcription?: VoiceDeps['transcription'];
+  /** AI-208 WP-3 (2026-09-05), extended by AI-209 (2026-09-06): transcripts
+   *  folded into a re-dispatch from either source — a /steer drain (WP-2 builds
+   *  this as `(update as any).__foldedVoice`) or an AI-209 batch fold. Each
+   *  item is one queued voice note the fold absorbed: echo it and index it so
+   *  /retranscribe works. `via` names the fold source; it changes ONLY the echo
+   *  label. Absent on every non-fold path — behaviour is then byte-identical
+   *  to before. */
+  foldedVoice?: Array<{
+    text: string;
+    media: AudioMediaIdentity;
+    kind: AudioAttachmentKind;
+    messageId?: number;
+    /** Fold source: 'steer' (default) keeps the byte-identical
+     *  "🎙 Heard (steered)" label; 'batch' echoes "🎙 Heard (batched)". */
+    via?: 'steer' | 'batch';
+  }>;
 }
 
 /** Every side effect the stage performs, injectable. Defaults bind the real
@@ -407,6 +425,56 @@ export async function runAttachmentStage(
         log.warn('attachments', 'attachment download failed', { error: err?.message ?? String(err), fileName });
         userText = userText ? `${userText}\n\n[Attachment ${fileName} failed to download — see pa-alerts log.]` : `[Attachment ${fileName} failed to download — see pa-alerts log.]`;
       }
+    }
+  }
+
+  // AI-208 WP-3 (2026-09-05), extended by AI-209 (2026-09-06): folded voice
+  // from either fold source — a /steer re-dispatch's drain or an AI-209 batch
+  // fold (the item's `via` field names which). Runs on EVERY shape of update
+  // (a fold source is usually plain text, so this must not sit inside the
+  // audioAttachment branch). Per item, in order:
+  //   1. record into the durable audio index BEFORE the echo (same order and
+  //      best-effort contract as the own-audio path above) so the folded note
+  //      is /retranscribe-recoverable even if the echo send fails — req 3;
+  //   2. mark it 'ok' (the transcript settled — that is what the text field IS);
+  //   3. echo one "🎙 Heard (steered)" line per steered transcript or one
+  //      "🎙 Heard (batched)" line per batched transcript, AFTER the own-audio
+  //      echo block above — req 2. A failed send never breaks the turn.
+  const foldedVoice = input.foldedVoice
+    ?? ((update as any).__foldedVoice as AttachmentStageInput['foldedVoice'] | undefined);
+  if (foldedVoice && foldedVoice.length > 0) {
+    for (const item of foldedVoice) {
+      // m4 (AI-208 fix-wave): item.media is AudioMediaIdentity, which carries
+      // the required duration — the index's TelegramAudioLike input accepts it
+      // structurally, so no cast.
+      recordAudio(audioRoot(), chatId, {
+        messageId: item.messageId ?? messageId,
+        threadId: threadId || null,
+        kind: item.kind,
+        media: item.media,
+        date: now().toISOString(),
+      }).catch(() => {});
+      // Engine "when known": the fixed WP-2 item shape carries no engine field,
+      // so read it defensively and omit the extra when absent.
+      const engine = (item as { engine?: string }).engine;
+      markAudio(audioRoot(), chatId, item.media.file_unique_id, 'ok', engine ? { engine } : undefined).catch(() => {});
+      // AI-209: the label names the fold source. The steer text is unchanged
+      // byte-for-byte (the shipped pins depend on it); only a batch fold —
+      // `via === 'batch'` — echoes the (batched) label.
+      // Fix-wave A1 correction (2026-09-06): both frozen labels carry a single
+      // trailing colon (SPEC §4.4; the shipped pins assert the single-colon
+      // prefix). An earlier same-day edit stripped the colons on the false
+      // premise that the constants already ended in one — that composed a
+      // colon-less echo and reddened T6 + the unit pins. Constants carry the
+      // single trailing colon for BOTH sources; the template adds none.
+      const heardLabel = item.via === 'batch' ? '🎙 Heard (batched):' : '🎙 Heard (steered):';
+      await send(
+        token,
+        chatId,
+        appendRefIdAndLog(`${heardLabel}\n\n${item.text}`, { kind: 'system', chatId, threadId }),
+        messageId,
+        threadId,
+      ).catch(() => {});
     }
   }
 

@@ -34,7 +34,7 @@ export const TRACE_CAPS = {
   errorChars: 300,
 } as const;
 
-export type TraceOrigin = 'bot' | 'skill' | 'self-improver' | 'other';
+export type TraceOrigin = 'bot' | 'skill' | 'self-improver' | 'task' | 'other';
 export type TraceOutcome = 'ok' | 'error' | 'timeout' | 'killed' | 'failover';
 
 export interface TurnTraceToolCall {
@@ -55,6 +55,8 @@ export interface TurnTraceV1 {
   chat_id?: number;
   thread_id?: number;
   update_id?: number;
+  task_ref?: string;           // set only when the dispatch resource was 'task-<ref>';
+                               // the topic-events -> trace join key; AI-197
   skill?: string;              // skill name for origin 'skill'
   worker: string;              // worker.name
   model?: string;
@@ -77,6 +79,8 @@ export interface TurnTraceV1 {
  * 'skill-'          -> 'skill'    (commands/run.ts:595,631 `skill-${skillName}`)
  * 'self-improver'   -> 'self-improver' (prefix match; code-fixer.ts:872
  *                      `self-improver-code-fix-${proposal.name}`)
+ * 'task-'           -> 'task'     (AI-197; the bot's task-executor dispatches
+ *                      with `task-${task.id}`; ref extracted by taskRefFromResource)
  * anything else / undefined -> 'other'
  */
 export function classifyOrigin(resource: string | undefined): TraceOrigin {
@@ -84,6 +88,7 @@ export function classifyOrigin(resource: string | undefined): TraceOrigin {
   if (resource.startsWith('topic-')) return 'bot';
   if (resource.startsWith('skill-')) return 'skill';
   if (resource.startsWith('self-improver')) return 'self-improver';
+  if (resource.startsWith('task-')) return 'task';
   return 'other';
 }
 
@@ -103,6 +108,15 @@ const SKILL_RESOURCE_RE = /^skill-(.+)$/;
 export function skillFromResource(resource: string | undefined): string | undefined {
   if (resource === undefined) return undefined;
   const m = SKILL_RESOURCE_RE.exec(resource);
+  return m ? m[1] : undefined;
+}
+
+const TASK_RESOURCE_RE = /^task-(.+)$/;
+
+/** /^task-(.+)$/ -> group 1; the topic-events `ref` the dispatch resource carries. */
+export function taskRefFromResource(resource: string | undefined): string | undefined {
+  if (resource === undefined) return undefined;
+  const m = TASK_RESOURCE_RE.exec(resource);
   return m ? m[1] : undefined;
 }
 

@@ -41,6 +41,26 @@ class TestCheckTarget(unittest.TestCase):
         self.assertEqual(name, "skills")
         self.assertEqual(code, 0)
 
+    def test_codex_skills_target_routes_to_mirror_with_codex_dir(self):
+        with mock.patch.object(ccp.scp, "run_skill_mirror", return_value=0) as mock_mirror, \
+             mock.patch.object(ccp.scp, "run") as mock_run:
+            name, code, report, error = ccp.check_target("codex-skills")
+        mock_run.assert_not_called()
+        mock_mirror.assert_called_once()
+        self.assertEqual(
+            mock_mirror.call_args.kwargs["shared_skills_dir"],
+            ccp.scp.MIRROR_TARGETS["codex-skills"],
+        )
+        self.assertEqual(name, "codex-skills")
+
+    def test_codex_brain_target_routes_to_run_not_mirror(self):
+        with mock.patch.object(ccp.scp, "run", return_value=0) as mock_run, \
+             mock.patch.object(ccp.scp, "run_skill_mirror") as mock_mirror:
+            name, code, report, error = ccp.check_target("codex")
+        mock_mirror.assert_not_called()
+        self.assertEqual(mock_run.call_args[0][0], "codex")
+        self.assertEqual(name, "codex")
+
     def test_exception_is_captured_not_raised(self):
         with mock.patch.object(ccp.scp, "run", side_effect=FileNotFoundError("no such file")):
             name, code, report, error = ccp.check_target("gemini")
@@ -78,6 +98,8 @@ class TestRun(unittest.TestCase):
         self.assertIn("[agy] DRIFT", text)
         self.assertIn("[gemini] clean", text)
         self.assertIn("[skills] clean", text)
+        self.assertIn("[codex] clean", text)
+        self.assertIn("[codex-skills] clean", text)
         self.assertIn("Drift detected in: agy", text)
 
     def test_multiple_drifted_targets_all_named(self):
@@ -87,7 +109,10 @@ class TestRun(unittest.TestCase):
             code = ccp.run(out=out)
         self.assertEqual(code, 1)
         text = out.getvalue()
-        self.assertIn("Drift detected in: gemini, agy, skills", text)
+        self.assertEqual(
+            text.strip().splitlines()[-2],
+            "Drift detected in: gemini, agy, skills, codex, codex-skills",
+        )
 
     def test_error_in_one_target_reported_and_treated_as_drift(self):
         out = io.StringIO()
@@ -105,7 +130,7 @@ class TestRun(unittest.TestCase):
         self.assertIn("[gemini] DRIFT", text)
         self.assertIn("ERROR: boom", text)
 
-    def test_run_checks_all_three_targets_by_default(self):
+    def test_run_checks_every_registered_target_by_default(self):
         seen = []
 
         def fake_run(target_name, apply, out=sys.stdout):
@@ -115,8 +140,13 @@ class TestRun(unittest.TestCase):
         with mock.patch.object(ccp.scp, "run", side_effect=fake_run), \
              mock.patch.object(ccp.scp, "run_skill_mirror", return_value=0) as mock_mirror:
             ccp.run(out=io.StringIO())
-        self.assertEqual(sorted(seen), ["agy", "gemini"])
-        mock_mirror.assert_called_once()
+        self.assertEqual(sorted(seen), ["agy", "codex", "gemini"])
+        self.assertEqual(mock_mirror.call_count, 2)
+        self.assertEqual(
+            sorted(c.kwargs["shared_skills_dir"] for c in mock_mirror.call_args_list),
+            sorted(ccp.scp.MIRROR_TARGETS.values()),
+        )
+        self.assertEqual(ccp.TARGETS, ["gemini", "agy", "skills", "codex", "codex-skills"])
 
 
 class TestMain(unittest.TestCase):

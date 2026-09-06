@@ -35,8 +35,12 @@ const SECRETS_EXAMPLE_MISSING_REASON =
   'examples/secrets.env.example is not present in this checkout (gitignored in the private repo)';
 
 /** Extract the commented `# transcription:` sub-block from a config scaffold's
- *  text, starting at the anchor line and running to the end of the file (both
- *  scaffolds place this block last). Returns the raw lines, still `#`-prefixed. */
+ *  text, starting at the anchor line and running to the next `# ===` section
+ *  header or the first non-comment line — whichever comes first. (The block
+ *  used to run to end-of-file on a "transcription is last" assumption the
+ *  voice-inbox scaffold section broke: it follows this block as more comments,
+ *  and swallowing it made the uncomment transform emit a bare `=== ... ===`
+ *  heading inside the parsed YAML.) Returns the raw lines, `#`-prefixed. */
 function extractTranscriptionCommentLines(text: string): string[] {
   const lines = text.split(/\r?\n/);
   const startIdx = lines.findIndex((l) => l.trim() === '# transcription:');
@@ -44,6 +48,7 @@ function extractTranscriptionCommentLines(text: string): string[] {
   const block: string[] = [];
   for (let i = startIdx; i < lines.length; i++) {
     const line = lines[i];
+    if (i > startIdx && /^#\s*===/.test(line)) break; // next section header ends the block
     if (line.trim() === '' || line.startsWith('#')) {
       block.push(line);
     } else {

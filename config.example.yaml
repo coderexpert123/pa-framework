@@ -199,11 +199,30 @@ transcription:
   cloud_order: [groq, openai, deepgram]
   language: null
 
+# === Voice inbox app (projects/voice-inbox) ===
+# Optional block. Omit it and only the voice-inbox app is unconfigured. The
+# app server refuses to start until inbox_topic names the topic that receives
+# new tasks. Env overrides: VOICE_INBOX_PORT, VOICE_INBOX_INBOX_TOPIC.
+# voice_inbox:
+#   inbox_topic: "CHATID_THREADID"  # REQUIRED "<chatId>_<threadId>" topic key
+#   port: 8787                      # binds 127.0.0.1 only
+#   max_upload_mb: 25
+#   session_ttl_hours: 168          # pairing session lifetime (7 days)
+#   pairing_ttl_minutes: 10         # one-time pairing-code lifetime
+
 # === Topic routing (optional) ===
-# support: which topic receives land-or-discard triage for dirty working-tree
-# paths the daily-recon sweep cannot attribute to an owner (no record in
-# ~/.pa/orphan-ledger.jsonl). Format "<chatId>_<threadId>", e.g. "310_5".
-# Unset/invalid: unattributed paths are counted in daily-recon.json's
-# unknown_n (and surfaced by the weekly ops digest) but no task is filed.
+# support: the FALLBACK topic receiving land-or-discard triage for dirty
+# working-tree paths the daily-recon sweep cannot attribute to an owner.
+# Format "<chatId>_<threadId>", e.g. "310_5".
+#
+# Before falling back to `support`, resolution consults the optional
+# topic-ownership registry at ~/.pa/topic-ownership-registry.json — a JSON
+# object keyed "<chatId>_<threadId>"; each row may list repo-relative `owned`
+# path prefixes (segment-matched: the prefix itself or anything under it), and
+# at most one row may carry role: "catch-all". Resolution order everywhere:
+# registry catch-all row -> this `support` knob -> unset. A missing or corrupt
+# registry degrades to the `support` fallback (fail-to-empty). With neither
+# set: unattributed paths are counted in daily-recon.json's unknown_n (and
+# surfaced by the weekly ops digest) but no task is filed.
 topics:
   support: "310_5"

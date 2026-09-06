@@ -56,7 +56,10 @@ that pattern for your own deployment.) In this setup:
   uncommitted private content can never reach the public mirror by construction.
 - `git-public.ps1` / `git-public.cmd` are thin aliases resolving into `pa-public/`'s
   own directory — the supported interface for public-repo status/add/commit/push.
-- `.gitignore-public` is the whitelist boundary for what `pa public-sync` extracts.
+- `.gitignore-public` is the whitelist boundary for what `pa public-sync` extracts; it
+  is generated from the placement registry's Boundary lines section
+  (`placement_gate.py gen --gitignore`) — change the registry and regenerate, never
+  hand-edit.
 - Private brain files (`CLAUDE.md`, `AGENTS.md`, `BACKLOG.md`, `plans/`, etc.) simply
   never get extracted into `pa-public/` — there's no shared filesystem for them to leak
   across.
@@ -99,9 +102,9 @@ CLAUDE.md" community guidance assumes — a line budget is the wrong unit here.
 | Class | Soft | Hard | Action at hard |
 |---|---|---|---|
 | Root `CLAUDE.md` (auto-loaded every session) | 40,000 chars | 48,000 chars | run `/shorten-brain`, extract a topic file |
-| Directory-scoped `CLAUDE.md` (auto-loads on demand, stacks on root) | 8,000 chars | 12,000 chars | extract to `docs/` or a subsystem file |
+| Directory-scoped `CLAUDE.md` (auto-loads on demand, stacks on root) | 8,000 chars | 12,000 chars (15,000 for `projects/telegram-bot` — raised 2026-09-06 when one night added five real subsystem sections: command router, topic sources, voice-inbox bridge, pin self-heal, orchestrator threads) | extract to `docs/` or a subsystem file |
 | On-demand topic file (`docs/*.md` and the private inventory files) — content a reader holds in mind while working | 12,000 chars | 16,000 chars | split along a natural fault line |
-| Auto-managed glob-derived inventory file (a private inventory file the `update-brain` skill rewrites wholesale from one `glob()` pattern) | 12,000 chars | 23,000 chars | see note below before splitting — raised 18k→20k 2026-08-30, 20k→23k 2026-09-03 (handover waves' new lib modules; per-module legitimate growth) |
+| Auto-managed glob-derived inventory file (a private inventory file the `update-brain` skill rewrites wholesale from one `glob()` pattern) | 12,000 chars | 26,000 chars | see note below before splitting — raised 18k→20k 2026-08-30, 20k→23k 2026-09-03 (handover waves' new lib modules; per-module legitimate growth); raised 23k→26k in code 2026-09-06 (`f9b069a`, the AI-209 landing) — this row documents the code |
 | Router/index file (a file that replaced a monolith with pointers) | — | 4,000 chars | it stopped being a router; re-split |
 | Evergreen audience-facing guide (the 9 evergreen `UPPERCASE.md` guides under `docs/`) | — | 24,000 chars | separate class from operational-detail docs |
 | Knobs catalog (`docs/CONFIGURATION.md`) — one row per shipped knob, grows monotonically with the code | — | 25,000 chars | documented raise-class (same as the job catalog): raise per-knob growth, trim nothing (24k→25k 2026-09-04, `PA_CDISK_*` rows) |
@@ -213,7 +216,7 @@ These never live at the root and are caught by `.gitignore`:
 | `/notes-actions.md`, `/notes-preferences.md`, etc. | External knowledge-base files | `<your-kb-root>/` (outside the repo) |
 | `/message_to_user.md`, `/output.json`, `/output.md`, `/skill_proposals.json`, `/error_log.txt`, `/oracle_output.txt`, `**/glm-[0-9]*` | LLM worker "going agentic" — writes its response (or its error) to a file at cwd instead of returning text; `glm-*` is zclaude naming the file after its own model (glm-4.7, glm-5.2[1m]), in whatever subdir its cwd was | delete; not a real output path for any script (confirmed via full-repo grep) |
 
-The last row keeps growing because the failure mode keeps resurfacing under new filenames — `/output.md` and `/error_log.txt` were added on 2026-07-21, `/oracle_output.txt` on 2026-08-08 (the `oracle` skill's step 1 script prints raw profile+briefing data to stdout by design for its worker to synthesize per step 6 — the worker dumped that raw stdout to a file instead of returning the synthesized text), and `**/glm-[0-9]*` on 2026-08-13 (zclaude's model-named dumps, root AND subdirs — the first instance of the class that is a glob, not a fixed filename, because the name tracks whatever model zclaude runs). When you find a new one, add it to `.gitignore`, `.gitignore-public`, this table, and the private brain's hygiene section in the same edit. A partial update is how the pattern list falls behind reality.
+The last row keeps growing because the failure mode keeps resurfacing under new filenames — `/output.md` and `/error_log.txt` were added on 2026-07-21, `/oracle_output.txt` on 2026-08-08 (the `oracle` skill's step 1 script prints raw profile+briefing data to stdout by design for its worker to synthesize per step 6 — the worker dumped that raw stdout to a file instead of returning the synthesized text), and `**/glm-[0-9]*` on 2026-08-13 (zclaude's model-named dumps, root AND subdirs — the first instance of the class that is a glob, not a fixed filename, because the name tracks whatever model zclaude runs). When you find a new one, add it to `.gitignore`, a `.gitignore-public` Boundary-lines registry row (then `placement_gate.py gen --gitignore`), this table, and the private brain's hygiene section in the same edit. A partial update is how the pattern list falls behind reality.
 
 ### Patterns auto-gitignored everywhere (any depth)
 

@@ -31,6 +31,11 @@ import {
 import type { WorkerConfig } from '../../../pa/dist/src/types.js';
 import { BOT_COMMANDS } from './commands.js';
 import { DEBUG_PATTERN } from './debug-command.js';
+import { PAIR_PATTERN } from './voice-inbox-bridge.js';
+import type { ThreadRecord } from './topic-threads.js';
+// removeTopicSource (remove action) + the inline-cap const for the list
+// footer — legal: sources.ts imports only types.js, so no cycle.
+import { removeTopicSource, TOPIC_SOURCE_INLINE_MAX_CHARS } from './sources.js';
 import { validateWatchInput } from '../../../pa/dist/src/lib/watch-jobs.js';
 import type { WatchInput } from '../../../pa/dist/src/lib/watch-jobs.js';
 
@@ -46,6 +51,7 @@ export const AGENT_BARE_PATTERN = /^\/agents?(?:@\w+)?$/i;
 export const MODEL_SWITCH_PATTERN = /^\/models?(?:@\w+)?\s+(claude|zclaude|codex|agyc|agy)\b/i;
 export const DEFAULT_SWITCH_PATTERN = /^\/default(?:@\w+)?(?:\s+(?:agent\s+)?(claude|zclaude|codex|agyc|agy))?$/i;
 export const CODE_PATTERN = /^\/code(?:@\w+)?(?:\s+(.+))?$/i;
+export const SOURCES_PATTERN = /^\/sources(?:@\w+)?(?:\s+(.+))?$/i;
 export const RESET_PATTERN = /^\/reset(?:@\w+)?$/i;
 // [\s\S] (not .) so multi-line instructions (quoted ref + question) match — . never matches \n.
 export const NEW_PATTERN = /^\/new(?:@\w+)?(?:\s+([\s\S]+))?$/i;
@@ -89,6 +95,12 @@ export const INVESTIGATE_FLAGGED_PATTERN = /^\/investigate_flagged(?:@\w+)?\s*$/
 // Pattern (logic.ts, exported): /^\/update[-_]brain(?:@\w+)?(?:\s+([\s\S]+))?$/i
 // — bare, with optional guidance text, both slash forms, optional @botname.
 export const UPDATE_BRAIN_PATTERN = /^\/update[-_]brain(?:@\w+)?(?:\s+([\s\S]+))?$/i;
+
+// AI-203: /orchestrator — per-topic orchestrator mode toggle + status
+// (on|off|status). Definition lives here beside isKnownCommand; orchestrator.ts
+// re-exports it so main.ts's interception imports from this module family
+// (grep obligation: consumers import, none restates).
+export const ORCHESTRATOR_PATTERN = /^\/orchestrator(?:@\w+)?(?:\s+(on|off|status))?$/i;
 
 // PA_META run_skill authorization (2026-08-17 audit P1-2). These skills may only be
 // invoked by explicit human commands (/commit, /push, etc.) — never via PA_META
@@ -430,6 +442,123 @@ export function handleCodeCommand(
   };
 }
 
+export interface SourcesCommandResult {
+  matched: boolean;
+  action: 'none' | 'show' | 'reset' | 'remove' | 'add';
+  response: string;  // ready-to-send response for 'show', 'reset' and 'remove'
+  path?: string;     // parsed (still-unresolved) path for 'add' — caller resolves + stats
+  label?: string;    // optional label for 'add' (defaults to basename at addTopicSource time)
+}
+
+/**
+ * Parse a /sources argument into a path and optional trailing label. Verbatim
+ * copy of parseCodeArgs (quoted-path support), kept as a separate function so
+ * /sources parsing does not couple to /code's path+instruction contract.
+ */
+export function parseSourceArgs(arg: string): { path: string; rest: string } {
+  if (arg.startsWith('"')) {
+    const closeQuote = arg.indexOf('"', 1);
+    if (closeQuote > 1) {
+      return {
+        path: arg.slice(1, closeQuote),
+        rest: arg.slice(closeQuote + 1).trim(),
+      };
+    }
+  }
+  const spaceIdx = arg.indexOf(' ');
+  if (spaceIdx === -1) return { path: arg, rest: '' };
+  return { path: arg.slice(0, spaceIdx), rest: arg.slice(spaceIdx + 1).trim() };
+}
+
+/**
+ * Handle the /sources command — declare, list, or remove per-topic grounding
+ * sources (grounding v2, 2026-09-06, internal design).
+ *
+ * /sources                  → show declared sources (or the empty-state hint)
+ * /sources reset            → clear all declarations
+ * /sources remove <n|path>  → remove one (1-based index or exact folded path)
+ * /sources <path> [label]   → action:'add', returned UNAPPLIED — the caller
+ *                             (main.ts) resolves + stats the path and applies
+ *                             via addTopicSource, mirroring /code's split
+ *                             (pure handler; stat validation left to the caller).
+ */
+export function handleSourcesCommand(state: ConversationState, userText: string): SourcesCommandResult {
+  const match = SOURCES_PATTERN.exec(userText);
+  if (!match) return { matched: false, action: 'none', response: '' };
+
+  const arg = match[1]?.trim();
+
+  // /sources with no args: list what this topic declares
+  if (!arg) {
+    if (!state.sources || state.sources.length === 0) {
+      return {
+        matched: true,
+        action: 'show',
+        response: '📚 No grounding sources declared for this topic. Add one with /sources <path>.',
+      };
+    }
+    const rows = state.sources.map((s, i) => `${i + 1}. \`${s.path}\` — ${s.label?.trim() || s.path}`);
+    return {
+      matched: true,
+      action: 'show',
+      response: `📚 Grounding sources for this topic:\n${rows.join('\n')}\n\nRe-read fresh at every dispatch. Inline ≤${TOPIC_SOURCE_INLINE_MAX_CHARS} chars each; larger ones become must-read pointers. Manage: /sources remove <n|path>, /sources reset.`,
+    };
+  }
+
+  // /sources reset: explicit removal path (declarations otherwise survive /new and /reset)
+  if (arg.toLowerCase() === 'reset') {
+    const had = state.sources?.length ?? 0;
+    state.sources = [];
+    return {
+      matched: true,
+      action: 'reset',
+      response: had > 0
+        ? `🗑 Cleared ${had} grounding source(s) for this topic.`
+        : '📚 No grounding sources to clear.',
+    };
+  }
+
+  // /sources remove <n|path>
+  if (arg.toLowerCase() === 'remove' || arg.toLowerCase().startsWith('remove ')) {
+    const token = parseSourceArgs(arg.slice(6).trim()).path;
+    // Resolve the 1-based position with the same rules removeTopicSource
+    // applies (numeric index, else exact case-sensitive folded path) so the
+    // ok line can name the ordinal even for path-removals.
+    const folded = token.trim().replace(/\\/g, '/');
+    let pos = -1;
+    if (/^\d+$/.test(token.trim())) {
+      const i = parseInt(token.trim(), 10) - 1;
+      if (i >= 0 && i < (state.sources?.length ?? 0)) pos = i;
+    } else if (state.sources) {
+      pos = state.sources.findIndex((s) => s.path.replace(/\\/g, '/') === folded);
+    }
+    const removed = removeTopicSource(state, token);
+    if (!removed || pos === -1) {
+      return {
+        matched: true,
+        action: 'remove',
+        response: `⚠️ No source matches \`${token}\`. Use /sources to see the numbered list.`,
+      };
+    }
+    const left = state.sources?.length ?? 0;
+    return {
+      matched: true,
+      action: 'remove',
+      response: `🗑 Removed source ${pos + 1}: \`${removed.path}\` — ${left > 0 ? `${left} left` : 'none left'}.`,
+    };
+  }
+
+  // /sources <path> [label] — returned UNAPPLIED; caller validates + applies
+  const { path, rest } = parseSourceArgs(arg);
+  return {
+    matched: true,
+    action: 'add',
+    response: '',
+    path,
+    label: rest ? rest.slice(0, 80) : undefined,
+  };
+}
+
 /**
  * Handle the /update_brain command — deterministic interception + worker-executed staging.
  *
@@ -480,9 +609,18 @@ export function isKnownCommand(command: string): boolean {
     PUSH_PUBLIC_PATTERN,
     INVESTIGATE_FLAGGED_PATTERN,
     UPDATE_BRAIN_PATTERN,
+    // AI-203: /orchestrator is intercepted in processUpdate; known here so the
+    // unknown-command guard (which runs earlier) does not eat it.
+    ORCHESTRATOR_PATTERN,
     // AI-190: /debug is intercepted in processUpdate; known here so the
     // unknown-command guard (which runs earlier) does not eat it.
     DEBUG_PATTERN,
+    // AI-201: /pair is intercepted in processUpdate; known here for the same
+    // reason — the unknown-command guard runs before any handler.
+    PAIR_PATTERN,
+    // AI-110: /sources is intercepted in processUpdate; known here for the same
+    // reason — the unknown-command guard runs before any handler.
+    SOURCES_PATTERN,
     MODEL_TUNABLE_PATTERN,
     LLM_PATTERN,
     EFFORT_PATTERN,
@@ -518,6 +656,55 @@ export function guardUnknownCommand(userText: string): { response: string; skipW
   return {
     response: `Unknown command: ${singleCommand}\n\nTry /help for available commands.`,
     skipWorker: true,
+  };
+}
+
+/** Age label for a thread's updatedAt: `<m>m` under an hour, else `<h>h`.
+ *  Unparseable/negative ⇒ '0m'. */
+function threadAgeLabel(updatedAt: string): string {
+  const ms = Date.now() - Date.parse(updatedAt);
+  if (!Number.isFinite(ms) || ms < 0) return '0m';
+  const min = Math.floor(ms / 60000);
+  return min < 60 ? `${min}m` : `${Math.floor(min / 60)}h`;
+}
+
+/**
+ * AI-203: /orchestrator — per-topic orchestrator-mode command (pure state
+ * mutation + frozen §4.7 reply texts). `on` arms the mode; `off` disarms it;
+ * bare/`status` renders the thread list without touching the flag. The caller
+ * (main.ts) performs the actual session clear when clearSession is true.
+ */
+
+export function handleOrchestratorCommand(
+  userText: string,
+  topicState: ConversationState,
+  threads: ThreadRecord[]
+): { response: string; clearSession: boolean } {
+  const match = ORCHESTRATOR_PATTERN.exec(userText);
+  if (!match) return { response: '', clearSession: false };
+  const arg = (match[1] ?? '').toLowerCase();
+  if (arg === 'on') {
+    topicState.orchestrator_enabled = true;
+    return {
+      response: '🧭 Orchestrator mode ON. This conversation now routes work instead of executing it; execution happens in spawned threads. Conversation context reset.',
+      clearSession: true,
+    };
+  }
+  if (arg === 'off') {
+    delete topicState.orchestrator_enabled;
+    return {
+      response: '🧭 Orchestrator mode OFF. Back to normal execution in this topic. Conversation context reset.',
+      clearSession: true,
+    };
+  }
+  const lines = threads.map((t) =>
+    `- ${t.id} — ${t.title} (${t.status}) · updated ${threadAgeLabel(t.updatedAt)}` +
+    (t.pendingInput.length > 0 ? ` · +${t.pendingInput.length} queued` : '')
+  );
+  const mode = topicState.orchestrator_enabled === true ? 'ON' : 'OFF';
+  return {
+    response: `🧭 Orchestrator mode: ${mode}.\n${lines.length > 0 ? lines.join('\n') : 'No threads.'}`,
+    clearSession: false,
   };
 }
 

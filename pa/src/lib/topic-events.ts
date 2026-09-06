@@ -16,7 +16,12 @@ import { paHome } from '../paths.js';
 import { log } from './log.js';
 
 /** Closed enum — Wave 1 emits task_queued/note_added (CLI); Wave 2 adds the
- *  executor-lane kinds (task_parked/task_resumed/task_completed; SPEC §3.1 A.2). */
+ *  executor-lane kinds (task_parked/task_resumed/task_completed); the 2026-09-06
+ *  orchestrator-threads increment adds the thread lifecycle kinds
+ *  (thread_spawned/thread_steered/thread_completed/thread_failed/
+ *  thread_cancelled, bot-emitted). `ref` for a thread kind is the thread id
+ *  `t-<n>`. Thread kinds are deliberately NOT task-lane activity —
+ *  task-lane-activity's ACTIVITY_KINDS excludes them (pinned by test). */
 export const TOPIC_EVENT_KINDS = [
   'task_queued',
   'task_started',
@@ -28,6 +33,11 @@ export const TOPIC_EVENT_KINDS = [
   'question_answered',
   'note_added',
   'wave_done',
+  'thread_spawned',
+  'thread_steered',
+  'thread_completed',
+  'thread_failed',
+  'thread_cancelled',
 ] as const;
 
 export type TopicEventKind = (typeof TOPIC_EVENT_KINDS)[number];

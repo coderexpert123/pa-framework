@@ -74,7 +74,7 @@ export function buildLockDisabled(): boolean {
 }
 
 /** Session label an npm script claims under: `npm-<pkg>-<pid>`. */
-export function buildLockLabel(pkg: 'pa' | 'bot'): string {
+export function buildLockLabel(pkg: 'pa' | 'bot' | 'voice-inbox'): string {
   return `npm-${pkg}-${process.pid}`;
 }
 
@@ -340,7 +340,7 @@ export const ALLOW_STALE_DIST_ENV = 'PA_ALLOW_STALE_DIST';
 
 export interface DistFreshOptions {
   /** Which package's compiled output to verify. */
-  pkg: 'pa' | 'bot';
+  pkg: 'pa' | 'bot' | 'voice-inbox';
   /** The REPO root the runner already computed for its loadBuildLock — the
    * stamp, the src roots and the `git rev-parse` all resolve under it. */
   repoRoot: string;
@@ -381,11 +381,25 @@ async function defaultRevParseShortHead(repoRoot: string): Promise<string | null
 
 /** Package layout the runners and compilers already agree on: dist output and
  * the src roots whose mtimes must never outrun the build stamp. */
-function distLayout(pkg: 'pa' | 'bot', repoRoot: string): { distDir: string; srcRoots: string[] } {
+function distLayout(
+  pkg: 'pa' | 'bot' | 'voice-inbox',
+  repoRoot: string
+): { distDir: string; srcRoots: string[] } {
   if (pkg === 'bot') {
     return {
       distDir: join(repoRoot, 'projects', 'telegram-bot', 'dist'),
       srcRoots: [join(repoRoot, 'projects', 'telegram-bot', 'src')],
+    };
+  }
+  if (pkg === 'voice-inbox') {
+    // Same shape as the bot: a projects/<name> package with a single src root
+    // (tsconfig rootDir ./src) compiled to dist. Before this arm existed an
+    // unknown pkg fell through to PA's layout below, so a package wrapper
+    // passing its own label was judged against PA's dist stamp and spuriously
+    // refused — which is why this package's runner had to skip the guard.
+    return {
+      distDir: join(repoRoot, 'projects', 'voice-inbox', 'dist'),
+      srcRoots: [join(repoRoot, 'projects', 'voice-inbox', 'src')],
     };
   }
   return {
@@ -430,8 +444,8 @@ function newerFilesUnder(roots: string[], cutoffMs: number, limit: number): stri
  *   2. `git rev-parse --short HEAD` at `repoRoot` cannot be determined;
  *   3. the stamp's sha differs from HEAD (dist predates the last commit);
  *   4. any src mtime under the package's compiled roots (pa bin/src/tests,
- *      bot src) is strictly newer than the stamp's builtAt (src edited since
- *      the last build).
+ *      bot src, voice-inbox src) is strictly newer than the stamp's builtAt
+ *      (src edited since the last build).
  * One-line Error naming stamp sha/builtAt vs HEAD. Resolves (possibly after a
  * warning) when the dist is fresh or PA_ALLOW_STALE_DIST=1. NO auto-build —
  * the caller rebuilds; there is deliberately no holder-liveness check at

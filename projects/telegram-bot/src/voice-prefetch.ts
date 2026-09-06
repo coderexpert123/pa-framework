@@ -28,7 +28,14 @@ function prefetchKey({ topicKey, updateId }: PrefetchKey): string {
   return `${topicKey}|${updateId}`;
 }
 
-const prefetchMap = new Map<string, Promise<VoiceResult>>();
+/** Map value (fix-wave M2): the promise AND the descriptor it formats with, so
+ *  a recovery path can re-format a result without fabricating a descriptor. */
+interface PrefetchEntry {
+  promise: Promise<VoiceResult>;
+  descriptor: VoicePrefetchDescriptor;
+}
+
+const prefetchMap = new Map<string, PrefetchEntry>();
 
 /**
  * Fire-and-forget. Stores the promise in an internal map keyed
@@ -63,7 +70,7 @@ export function startPrefetch(
     }
   })();
 
-  prefetchMap.set(key, promise);
+  prefetchMap.set(key, { promise, descriptor });
 }
 
 /**
@@ -74,6 +81,24 @@ export function lookupPrefetch(
   topicKey: string,
   updateId: number,
 ): Promise<VoiceResult> | undefined {
+  return lookupPrefetchEntry(topicKey, updateId)?.promise;
+}
+
+/**
+ * Returns the descriptor the prefetch was started with (fix-wave M2), or
+ * undefined if no prefetch exists. Does NOT consume the entry.
+ */
+export function lookupPrefetchDescriptor(
+  topicKey: string,
+  updateId: number,
+): VoicePrefetchDescriptor | undefined {
+  return lookupPrefetchEntry(topicKey, updateId)?.descriptor;
+}
+
+function lookupPrefetchEntry(
+  topicKey: string,
+  updateId: number,
+): PrefetchEntry | undefined {
   const key = prefetchKey({ topicKey, updateId });
   return prefetchMap.get(key);
 }
@@ -87,11 +112,11 @@ export function consumePrefetch(
   updateId: number,
 ): Promise<VoiceResult> | undefined {
   const key = prefetchKey({ topicKey, updateId });
-  const promise = prefetchMap.get(key);
-  if (promise !== undefined) {
+  const entry = prefetchMap.get(key);
+  if (entry !== undefined) {
     prefetchMap.delete(key);
   }
-  return promise;
+  return entry?.promise;
 }
 
 /**

@@ -251,6 +251,15 @@ export async function lookupTraceByUpdate(threadId: number, updateId: number): P
   return scanTraces((entry) => entry.thread_id === threadId && entry.update_id === updateId);
 }
 
+/**
+ * Last matching line of ~/.pa/turn-traces.jsonl by the TASK-LANE join key
+ * (`task_ref`, stamped from the dispatch resource `task-<ref>`). Returns null
+ * on any failure — consumer renders 'not joined'.
+ */
+export async function lookupTraceByTaskRef(taskRef: string): Promise<TraceLine | null> {
+  return scanTraces((entry) => entry.task_ref === taskRef);
+}
+
 async function scanTraces(pred: (entry: TraceLine) => boolean): Promise<TraceLine | null> {
   try {
     const path = turnTracesPath();

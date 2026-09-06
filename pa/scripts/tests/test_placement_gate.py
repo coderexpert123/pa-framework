@@ -71,6 +71,20 @@ class GateTestBase(unittest.TestCase):
     def registry_text(self, census_id, rows, extra_tail=None):
         return "\n".join(census_table(census_id, rows, extra_tail)) + "\n"
 
+    def two_table_registry(self, census_a, rows_a, census_b, rows_b):
+        """A registry carrying two census sections (e.g. N1 projection rows + an N3
+        boundary-lines table) — the shape gen --gitignore fixtures need."""
+        lines = census_table(census_a, rows_a) + [""] + census_table(census_b, rows_b)
+        return "\n".join(lines) + "\n"
+
+    def n3_only_registry(self, n3_rows):
+        """An N3 table whose rows carry PRIVATE + prose surfaces, so the boundary
+        cells are exercised without projection noise (nothing allows, nothing
+        denies, nothing is assumed)."""
+        return self.registry_text("N3", [
+            row(f, "fixture prose surface", "private-excluded", "PRIVATE")
+            for f in n3_rows])
+
     def run_gate(self, argv):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -368,6 +382,409 @@ class TimestampTests(GateTestBase):
     def test_utc_z_fixed_clock(self):
         fixed = datetime(2026, 9, 4, 12, 0, 0, tzinfo=timezone.utc)
         self.assertEqual(placement_gate.utc_z(fixed), "2026-09-04T12:00:00Z")
+
+
+class EmitTests(GateTestBase):
+    def test_emit_lines_project_n3_features(self):
+        # Boundary cells are projected VERBATIM, in registry order, under the fixed
+        # header; no transformation, no dedupe.
+        self.init_repo()
+        reg = self.write("registry.md", self.n3_only_registry([
+            "L4:/*",
+            "L7:!/.gitignore",
+            "L8:!/.gitignore-public",
+            "L9:pkg/dir/",
+            "L10:pkg/*.log",
+        ]))
+        gi = os.path.join(self.tmp, "boundary.gitignore")
+        out_path = os.path.join(self.tmp, "projection.json")
+        rc, out, err = self.run_gate(
+            ["gen", "--registry", reg, "--out", out_path,
+             "--gitignore", gi, "--scan-repo", self.repo])
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(err, "")
+        self.assertEqual(out.splitlines(), [
+            "PLACEMENT-PROJECTION OK rows=5 allow=0 deny=0 assumed=0 -> %s" % out_path,
+            "PLACEMENT-BOUNDARY OK lines=5 -> %s" % gi,
+        ])
+        with open(gi, "r", encoding="utf-8", newline="") as fh:
+            written = fh.read()
+        self.assertEqual(written, "\n".join([
+            "# pa-framework public boundary - GENERATED file; do not edit by hand.",
+            "# Source of truth: the placement registry's Boundary lines (N3) section; "
+            "regenerate with pa/scripts/placement_gate.py gen --gitignore.",
+            "",
+            "/*",
+            "!/.gitignore",
+            "!/.gitignore-public",
+            "pkg/dir/",
+            "pkg/*.log",
+        ]) + "\n")
+        self.assertFalse(os.path.exists(gi + ".tmp"))
+        self.assertFalse(os.path.exists(out_path + ".tmp"))  # atomic: no stray tmp
+
+    def test_emit_rejects_non_l_keyed_boundary_row(self):
+        reg = self.write("registry.md", self.n3_only_registry(["boundary-line"]))
+        gi = os.path.join(self.tmp, "boundary.gitignore")
+        rc, out, err = self.run_gate(
+            ["gen", "--registry", reg, "--out", os.path.join(self.tmp, "p.json"),
+             "--gitignore", gi, "--scan-repo", self.repo])
+        self.assertEqual(rc, 4)
+        self.assertIn("not keyed L<lineno>", err)
+        self.assertFalse(os.path.exists(gi))
+
+    def test_emit_refuses_assumed_surfaces(self):
+        # An uncovered SPLIT surface can never reach the generated boundary.
+        reg = self.write("registry.md", self.registry_text("N1", [
+            row("split-a", "feat/orphan.ts", "mixed", "SPLIT"),
+        ]))
+        gi = os.path.join(self.tmp, "boundary.gitignore")
+        rc, out, err = self.run_gate(
+            ["gen", "--registry", reg, "--out", os.path.join(self.tmp, "p.json"),
+             "--gitignore", gi, "--scan-repo", self.repo])
+        self.assertEqual(rc, 4)
+        self.assertIn("PLACEMENT-BOUNDARY-ASSUMED: split-a feat/orphan.ts", err)
+        self.assertIn("PLACEMENT-BOUNDARY REFUSED assumed=1 — every boundary line "
+                      "must have an owning registry row", err)
+        self.assertFalse(os.path.exists(gi))
+
+    def test_emit_requires_self_reinclude(self):
+        reg = self.write("registry.md", self.n3_only_registry([
+            "L4:/*",
+            "L7:!/.gitignore",
+        ]))
+        gi = os.path.join(self.tmp, "boundary.gitignore")
+        rc, out, err = self.run_gate(
+            ["gen", "--registry", reg, "--out", os.path.join(self.tmp, "p.json"),
+             "--gitignore", gi, "--scan-repo", self.repo])
+        self.assertEqual(rc, 4)
+        self.assertIn("SELF-REINCLUDE", err)
+        self.assertFalse(os.path.exists(gi))
+
+    def test_gen_gitignore_validates_projection(self):
+        self.init_repo()
+        self.write_repo_file("pkg/pub.py")
+        self.write_repo_file("pkg/secret.py")
+        self.git("add", ".")
+        self.git("commit", "-m", "fixture")
+        # The boundary re-includes pkg/ wholesale, so the projection's PUBLIC row
+        # must carry the pkg/ dir surface for the directory-prefix probe to classify
+        # expected-public under the uniform rule.
+        reg = self.write("registry.md", self.two_table_registry(
+            "N1", [
+                row("pub-a", "pkg/pub.py;pkg/", "public-tracked", "PUBLIC"),
+                row("priv-a", "pkg/secret.py", "private-excluded", "PRIVATE"),
+            ],
+            "N3", [
+                row("L7:!pkg/", "the package carve-out", "private-excluded", "PRIVATE"),
+                row("L8:pkg/secret.py", "the private file", "private-excluded",
+                    "PRIVATE"),
+                row("L9:!/.gitignore-public", "self re-include", "private-excluded",
+                    "PRIVATE"),
+            ]))
+        gi = os.path.join(self.tmp, "boundary.gitignore")
+        out_path = os.path.join(self.tmp, "projection.json")
+        rc, out, err = self.run_gate(
+            ["gen", "--registry", reg, "--out", out_path,
+             "--gitignore", gi, "--scan-repo", self.repo])
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(err, "")
+        self.assertEqual(out.splitlines(), [
+            "PLACEMENT-PROJECTION OK rows=5 allow=2 deny=1 assumed=0 -> %s" % out_path,
+            "PLACEMENT-BOUNDARY OK lines=3 -> %s" % gi,
+        ])
+        with open(gi, "r", encoding="utf-8", newline="") as fh:
+            self.assertEqual([ln for ln in fh.read().splitlines()[3:]],
+                             ["!pkg/", "pkg/secret.py", "!/.gitignore-public"])
+
+    def test_gen_gitignore_flags_allow_denied(self):
+        self.init_repo()
+        self.write_repo_file("pkg/pub.py")
+        self.write_repo_file("pkg/secret.py")
+        self.git("add", ".")
+        self.git("commit", "-m", "fixture")
+        reg = self.write("registry.md", self.two_table_registry(
+            "N1", [
+                row("pub-a", "pkg/pub.py;pkg/", "public-tracked", "PUBLIC"),
+                row("priv-a", "pkg/secret.py", "private-excluded", "PRIVATE"),
+            ],
+            "N3", [
+                row("L7:!pkg/", "the package carve-out", "private-excluded", "PRIVATE"),
+                row("L8:pkg/pub.py", "deny covers the public file", "private-excluded",
+                    "PRIVATE"),
+                row("L9:!/.gitignore-public", "self re-include", "private-excluded",
+                    "PRIVATE"),
+            ]))
+        gi = os.path.join(self.tmp, "boundary.gitignore")
+        rc, out, err = self.run_gate(
+            ["gen", "--registry", reg, "--out", os.path.join(self.tmp, "p.json"),
+             "--gitignore", gi, "--scan-repo", self.repo])
+        self.assertEqual(rc, 4)
+        self.assertIn("PLACEMENT-BOUNDARY-MISMATCH: ALLOW-DENIED pkg/pub.py", err)
+        self.assertFalse(os.path.exists(gi))
+
+    def test_gen_gitignore_flags_deny_public(self):
+        self.init_repo()
+        self.write_repo_file("pkg/secret.py")
+        self.git("add", ".")
+        self.git("commit", "-m", "fixture")
+        reg = self.write("registry.md", self.two_table_registry(
+            "N1", [
+                row("priv-a", "pkg/secret.py", "private-excluded", "PRIVATE"),
+            ],
+            "N3", [
+                row("L7:!pkg/", "the package carve-out", "private-excluded", "PRIVATE"),
+                row("L9:!/.gitignore-public", "self re-include", "private-excluded",
+                    "PRIVATE"),
+            ]))
+        gi = os.path.join(self.tmp, "boundary.gitignore")
+        rc, out, err = self.run_gate(
+            ["gen", "--registry", reg, "--out", os.path.join(self.tmp, "p.json"),
+             "--gitignore", gi, "--scan-repo", self.repo])
+        self.assertEqual(rc, 4)
+        self.assertIn("PLACEMENT-BOUNDARY-MISMATCH: DENY-PUBLIC pkg/secret.py", err)
+        self.assertFalse(os.path.exists(gi))
+
+    def test_gen_gitignore_carve_out_denial_warns_not_fails(self):
+        # 2026-09-05 adjudication: a boundary denial of a path allowed ONLY by
+        # directory-grained rows is a legitimate carve-out — stderr warning with the
+        # example line and the count, exit 0, boundary WRITTEN.
+        self.init_repo()
+        self.write_repo_file("pkg/pub.py")
+        self.write_repo_file("pkg/secret.py")
+        self.git("add", ".")
+        self.git("commit", "-m", "fixture")
+        reg = self.write("registry.md", self.two_table_registry(
+            "N1", [
+                row("pub-a", "pkg/", "public-tracked", "PUBLIC"),
+            ],
+            "N3", [
+                row("L7:!pkg/", "the package carve-out", "private-excluded",
+                    "PRIVATE"),
+                row("L8:pkg/secret.py", "carve-out denies one child",
+                    "private-excluded", "PRIVATE"),
+                row("L9:!/.gitignore-public", "self re-include", "private-excluded",
+                    "PRIVATE"),
+            ]))
+        gi = os.path.join(self.tmp, "boundary.gitignore")
+        out_path = os.path.join(self.tmp, "p.json")
+        rc, out, err = self.run_gate(
+            ["gen", "--registry", reg, "--out", out_path,
+             "--gitignore", gi, "--scan-repo", self.repo])
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(out.splitlines(), [
+            "PLACEMENT-PROJECTION OK rows=4 allow=1 deny=0 assumed=0 -> %s" % out_path,
+            "PLACEMENT-BOUNDARY OK lines=3 -> %s" % gi,
+        ])
+        self.assertIn("PLACEMENT-BOUNDARY-CARVE-OUT: pkg/secret.py", err)
+        self.assertIn("PLACEMENT-BOUNDARY-WARNING: 1 allowed-path denial(s) are "
+                      "directory-grained carve-outs", err)
+        self.assertNotIn("PLACEMENT-BOUNDARY-MISMATCH", err)
+        with open(gi, "r", encoding="utf-8", newline="") as fh:
+            self.assertEqual([ln for ln in fh.read().splitlines()[3:]],
+                             ["!pkg/", "pkg/secret.py", "!/.gitignore-public"])
+
+    def test_gen_gitignore_glob_allow_carve_out_also_warns(self):
+        # The carve-out grain test is on the ALLOWING row: a glob surface counts as
+        # directory-grained exactly like a dir surface does (the boundary denies a
+        # second glob-covered file while re-including the first).
+        self.init_repo()
+        self.write_repo_file("pkg/one.pub.md")
+        self.write_repo_file("pkg/two.pub.md")
+        self.git("add", ".")
+        self.git("commit", "-m", "fixture")
+        reg = self.write("registry.md", self.two_table_registry(
+            "N1", [
+                row("pub-a", "pkg/*.pub.md", "public-tracked", "PUBLIC"),
+            ],
+            "N3", [
+                row("L7:pkg/*", "children-level base deny (a `<dir>/` base could "
+                    "never be re-included under)", "private-excluded", "PRIVATE"),
+                row("L8:!pkg/one.pub.md", "single carve-out", "private-excluded",
+                    "PRIVATE"),
+                row("L9:!/.gitignore-public", "self re-include", "private-excluded",
+                    "PRIVATE"),
+            ]))
+        gi = os.path.join(self.tmp, "boundary.gitignore")
+        out_path = os.path.join(self.tmp, "p.json")
+        rc, out, err = self.run_gate(
+            ["gen", "--registry", reg, "--out", out_path,
+             "--gitignore", gi, "--scan-repo", self.repo])
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("PLACEMENT-BOUNDARY-CARVE-OUT: pkg/two.pub.md", err)
+        self.assertIn("PLACEMENT-BOUNDARY-WARNING: 1 allowed-path denial(s) are "
+                      "directory-grained carve-outs", err)
+        self.assertNotIn("PLACEMENT-BOUNDARY-MISMATCH", err)
+        self.assertTrue(os.path.exists(gi))
+
+
+class CompareTests(GateTestBase):
+    def emit_boundary(self, reg, gi):
+        self.init_repo()
+        rc, out, err = self.run_gate(
+            ["gen", "--registry", reg, "--out", os.path.join(self.tmp, "p.json"),
+             "--gitignore", gi, "--scan-repo", self.repo])
+        self.assertEqual(rc, 0, out + err)
+
+    def test_compare_steady_state_ok(self):
+        reg = self.write("registry.md", self.n3_only_registry([
+            "L4:/*",
+            "L7:!/.gitignore",
+            "L8:!/.gitignore-public",
+            "L9:pkg/dir/",
+            "L10:pkg/*.log",
+        ]))
+        gi = os.path.join(self.tmp, "boundary.gitignore")
+        self.emit_boundary(reg, gi)
+        rc, out, err = self.run_gate(
+            ["compare", "--registry", reg, "--generated", gi,
+             "--scan-repo", self.repo])
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(
+            out, "PLACEMENT-BOUNDARY VERIFIED generated=%s matches registry "
+                 "derivation\n" % gi)
+
+    def test_compare_drift_detected(self):
+        reg = self.write("registry.md", self.n3_only_registry([
+            "L4:/*",
+            "L7:!/.gitignore",
+            "L8:!/.gitignore-public",
+        ]))
+        gi = os.path.join(self.tmp, "boundary.gitignore")
+        self.emit_boundary(reg, gi)
+        with open(gi, "a", encoding="utf-8", newline="\n") as fh:
+            fh.write("# a stray hand edit\n")
+        rc, out, err = self.run_gate(
+            ["compare", "--registry", reg, "--generated", gi,
+             "--scan-repo", self.repo])
+        self.assertEqual(rc, 3)
+        self.assertTrue(out.startswith("PLACEMENT-BOUNDARY DRIFT"))
+
+    def test_compare_migration_semantic_equivalence(self):
+        self.init_repo()
+        self.write_repo_file("keep/pub.md")
+        self.git("add", ".")
+        self.git("commit", "-m", "fixture")
+        reg = self.write("registry.md", self.registry_text("N1", [
+            row("pub-a", "keep/", "public-tracked", "PUBLIC"),
+        ]))
+        gi = os.path.join(self.tmp, "generated.boundary")
+        with open(gi, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join([
+                "# pa-framework public boundary - GENERATED file; do not edit by hand.",
+                "# Source of truth: the placement registry's Boundary lines (N3) "
+                "section; regenerate with pa/scripts/placement_gate.py gen --gitignore.",
+                "",
+                "/*",
+                "!/.gitignore",
+                "!/.gitignore-public",
+                "!keep/",
+            ]) + "\n")
+        live = os.path.join(self.tmp, "pre-migration.boundary")
+        with open(live, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join([
+                "",
+                "# legacy hand-written boundary",
+                "",
+                "/*",
+                "",
+                "!/.gitignore",
+                "!/.gitignore-public",
+                "!keep/",
+                "# trailing note",
+            ]) + "\n")
+        rc, out, err = self.run_gate(
+            ["compare", "--registry", reg, "--generated", gi, "--live", live,
+             "--scan-repo", self.repo])
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("exposed=0 locked-out=0", out)
+        self.assertRegex(out, r"PLACEMENT-BOUNDARY VERIFIED universe=\d+ agreed=\d+ "
+                              r"exposed=0 locked-out=0")
+
+    def test_compare_migration_exposed_and_locked_out(self):
+        self.init_repo()
+        self.write_repo_file("x/secret.bin")
+        self.write_repo_file("y/pub.md")
+        self.git("add", ".")
+        self.git("commit", "-m", "fixture")
+        reg = self.write("registry.md", self.registry_text("N1", [
+            row("priv-a", "fixture prose surface", "private-excluded", "PRIVATE"),
+        ]))
+        gi = os.path.join(self.tmp, "generated.boundary")
+        with open(gi, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join([
+                "# generated header stands in here",
+                "# second header line",
+                "",
+                "/*",
+                "!/.gitignore",
+                "!/.gitignore-public",
+                "!x/",
+                "x/*",
+                "!x/secret.bin",
+                "!y/",
+                "y/pub.md",
+            ]) + "\n")
+        live = os.path.join(self.tmp, "pre-migration.boundary")
+        with open(live, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join([
+                "/*",
+                "!/.gitignore",
+                "!/.gitignore-public",
+                "!x/",
+                "x/*",
+                "!y/",
+            ]) + "\n")
+        rc, out, err = self.run_gate(
+            ["compare", "--registry", reg, "--generated", gi, "--live", live,
+             "--scan-repo", self.repo])
+        self.assertEqual(rc, 2)
+        lines = out.splitlines()
+        self.assertEqual(lines.count("PLACEMENT-BOUNDARY EXPOSED: x/secret.bin"), 1)
+        self.assertEqual(lines.count("PLACEMENT-BOUNDARY LOCKED-OUT: y/pub.md"), 1)
+        self.assertEqual(lines[-1],
+                         "PLACEMENT-BOUNDARY MISMATCH exposed=1 locked-out=1")
+
+    def test_compare_probe_catches_carveout_removal(self):
+        # Nothing is tracked under proj/, so the tracked universe alone would agree;
+        # the directory-prefix probe flips anyway. This pins why probes exist.
+        self.init_repo()
+        reg = self.write("registry.md", self.n3_only_registry([
+            "L4:/*",
+            "L7:!/.gitignore",
+            "L8:!/.gitignore-public",
+            "L20:proj/*",
+            "L21:!proj/keep.md",
+            "L22:!proj/",
+        ]))
+        gi = os.path.join(self.tmp, "generated.boundary")
+        with open(gi, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join([
+                "# generated header stands in here",
+                "# second header line",
+                "",
+                "/*",
+                "!/.gitignore",
+                "!/.gitignore-public",
+                "!proj/",
+            ]) + "\n")
+        live = os.path.join(self.tmp, "pre-migration.boundary")
+        with open(live, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join([
+                "/*",
+                "!/.gitignore",
+                "!/.gitignore-public",
+                "proj/*",
+                "!proj/keep.md",
+            ]) + "\n")
+        rc, out, err = self.run_gate(
+            ["compare", "--registry", reg, "--generated", gi, "--live", live,
+             "--scan-repo", self.repo])
+        self.assertEqual(rc, 2)
+        lines = out.splitlines()
+        self.assertIn("PLACEMENT-BOUNDARY EXPOSED: proj/.pa-boundary-probe", lines)
+        self.assertEqual(lines[-1],
+                         "PLACEMENT-BOUNDARY MISMATCH exposed=1 locked-out=0")
 
 
 if __name__ == "__main__":

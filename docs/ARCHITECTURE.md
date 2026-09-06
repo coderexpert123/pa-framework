@@ -14,7 +14,7 @@ Each layer depends only on the ones below it:
 | 2 | Worker pool | `pa/src/{workers,worker-exec,worker-evaluator,state-monitor,rate-limits-*}.ts` | CLI spawn, failover, rate-limit parsing, stuck-state evaluation |
 | 1 | Auth substrate | `~/.pa/google_auth.py` + Telegram/mobile bridge helpers (see `examples/oauth/README.md`) | Shared Google OAuth for Gmail/Drive/Docs plus optional Telegram/mobile recovery |
 
-Domain projects (e.g. daily-mail-brief) sit *above* layer 5: bot for delivery, skills in `~/.pa/skills/`, orchestrator via the `pa` CLI.
+Domain projects (e.g. daily-mail-brief) sit *above* layer 5: bot for delivery, skills, orchestrator via the `pa` CLI.
 
 ## Telegram/mobile OAuth recovery
 
@@ -30,7 +30,7 @@ External CLI processes via `child_process.spawn`, configured in `~/.pa/config.ya
 
 ## Skill YAML frontmatter schema
 
-Skills live at `~/.pa/skills/<name>/skill.md`. The YAML frontmatter (between `---` markers) declares scheduling and execution behavior; the body is the prompt sent to the worker (or, with `cmd:`, ignored).
+The YAML frontmatter (between `---` markers) declares scheduling and execution behavior; the body is the prompt sent to the worker (or, with `cmd:`, ignored).
 
 | Field | Type | Default | Effect |
 |---|---|---|---|
@@ -58,7 +58,7 @@ telegram_output:
   token_secret: TELEGRAM_BOT_TOKEN      # env var name (NOT the token value)
 ```
 
-When set, the framework posts the worker's final output to the specified Telegram destination. Env interpolation (`${VAR}`) is applied to `chat_id`, `thread_id`, and `token_secret`. Numeric strings are coerced back to Number for `thread_id`.
+The framework posts the worker's final output to the destination; `${VAR}` interpolation applies to all three fields, and numeric strings coerce back to Number for `thread_id`.
 
 ## PA_META envelope
 
@@ -75,11 +75,11 @@ Action types:
 - **`confirm_required`** — used by the bot in place of "Reply *yes* to confirm" text; the bot tracks pending confirmations per-topic.
 - **`watch_job{description,check,deadline_minutes,interval_seconds}`** — register an async watch (AI-170). `check` is `{type, path?, pattern?, since_iso?, pid?}`; `type` ∈ `file_exists`/`file_gone`/`file_newer_than`/`file_contains`/`process_gone`; read-only (no shell/network/writes). The reply always states the registered id or the rejection.
 
-The bot strips the envelope before delivering text to the user. In execution mode (`Pending Confirmation` set), the bot suppresses any `[PA_META]` the model emits.
+The bot strips the envelope before delivering text to the user; in execution mode (`Pending Confirmation` set) it suppresses any `[PA_META]` the model emits.
 
 ## Sequential workflow chains
 
-Chains are defined as YAML files in `~/.pa/chains/` and execute a series of skills sequentially, with retry logic and failure handling.
+Chains are YAML files in `~/.pa/chains/` that run skills sequentially, with retry and failure handling.
 
 ### Chain schema
 
@@ -102,7 +102,7 @@ report: telegram|stdout         # default: stdout
 - **Report**: `telegram` → pa-alerts summary (deduped chain-name+date); or `stdout`.
 - **Validation (strict, on load)**: unknown fields/invalid values rejected; `skill` required; defaults applied.
 
-Example — the shipped `~/.pa/chains/commit-ship.yaml` runs `update-brain` (notify on failure) → `commit` (stop) → `push` (retry 3×, backoff 5s, stop) → `push-public` (notify), `report: telegram`: stage and ship all pending work.
+Example — the shipped `~/.pa/chains/commit-ship.yaml`: `update-brain` (notify) → `commit` (stop) → `push` (retry 3×, backoff 5s, stop) → `push-public` (notify), `report: telegram`: stage and ship all pending work.
 
 ### CLI
 
@@ -118,7 +118,7 @@ The autonomous self-improvement loop (`pa/src/self-improver.ts`) gates skill pro
 - **v1 (deterministic-only)**: tasks 4-6 run on static fixtures (no worker dispatch): `markdown_shape`, `pa_meta_wellformedness` (protected-skill forgery rejected), `injection_resistance`.
 - **v2 (LLM-dependent, skipped unless `PA_EVAL_FULL=1`)**: tasks 1-3 require worker dispatch: `ref_id_format`, `date_arithmetic`, `grounding_citation`.
 
-The gate is SOFT in v1: pass → change applied, eval recorded in the audit trail; fail → parked as `validation-failed-pending` for human review via `pa improvements`. The validation floor still governs — a change failing validation stays pending regardless of eval results.
+The gate is SOFT in v1: pass → change applied, eval recorded in the audit trail; fail → parked as `validation-failed-pending` for human review via `pa improvements`. The validation floor still governs: a change failing validation stays pending regardless of eval.
 
 Each task's `scorer.py` outputs JSON `{pass, detail}`, exit 0/1; results aggregate into `~/.pa/eval-results.jsonl`, and applied changes gain an `eval` field (`{pass, fail, skipped, detail}`) reviewable via `pa improvements --show <draft>`.
 
@@ -135,15 +135,15 @@ precedes the status write. Spec: the AI-170 async-watch internal design record (
 
 ## Blackboard & locking
 
-`pa/src/blackboard.ts` manages a JSON file at `~/.pa/blackboard.json` containing PID + heartbeat-timestamp pairs per shared resource. Concurrent skill executions acquire/release locks via `proper-lockfile` on the JSON file itself.
+`pa/src/blackboard.ts` manages a JSON file at `~/.pa/blackboard.json` containing PID + heartbeat-timestamp pairs per shared resource. Concurrent skill executions acquire/release locks via `proper-lockfile` on the JSON file.
 
 Stale locks (heartbeat > 10 minutes old) are flagged by `pa health` and can be cleared via `pa purge-locks`. Each worker process refreshes its heartbeat periodically while running.
 
-Lock rows are `(resource, agent, pid, heartbeat, contextId?)`. A holder that runs longer than `PA_HEARTBEAT_STALE_MS` must renew via `startLockRenewal()` and handle its `onLost` callback — a bare `setInterval(updateHeartbeat)` discards the `false` that means "your row was purged", which is silent double-occupancy. Since 2026-08-23 `startLockRenewal` is the only heartbeat mechanism in the codebase (`commands/run.ts`, `commands/catchup.ts` and `code-fixer.ts` were migrated onto it) and accepts an optional `client` for dependency-injected callers. `releaseLock(resource, agent, contextId?, { pid })` scopes the delete: without a `contextId` and `pid` it removes every row for that `(resource, agent)` pair, so a stale holder's cleanup can delete a live same-named holder's lock. Two resources exist: `git-workflow` (the private tree, declared by the git-workflow skills — `commit`, `push`, `push-public`, `investigate-flagged`, `update-brain` — via `exclusive_resource`, taken directly by `code-fixer.ts` and `self-improver.ts`) and `git-public-workflow` (the derived `pa-public/` tree, taken by `pa public-sync`). Since AI-179 (2026-09-03) renewal is tri-state: `renewHeartbeat()` returns `'updated'`/`'row-absent'`/`'write-failed'` — a failed renewal write retries on the `PA_HEARTBEAT_WRITE_RETRY_MS` ladder (default 1 s/5 s/15 s), and a give-up is verified against the row (`peekLockRow`) before `onLost` fires, so only a verified row-absence counts as 'purged'.
+Lock rows are `(resource, agent, pid, heartbeat, contextId?)`. A holder that runs longer than `PA_HEARTBEAT_STALE_MS` must renew via `startLockRenewal()` and handle its `onLost` callback — a bare `setInterval(updateHeartbeat)` discards the `false` that means "your row was purged", which is silent double-occupancy. `startLockRenewal` — the only heartbeat mechanism since 2026-08-23 — accepts an optional `client` for dependency-injected callers. `releaseLock(resource, agent, contextId?, { pid })` scopes the delete: without a `contextId` and `pid` it removes every row for that `(resource, agent)` pair, so a stale holder's cleanup can delete a live same-named holder's lock. Two resources exist: `git-workflow` (the private tree, declared by the git-workflow skills — `commit`, `push`, `push-public`, `investigate-flagged`, `update-brain` — via `exclusive_resource`, taken directly by `code-fixer.ts` and `self-improver.ts`) and `git-public-workflow` (the derived `pa-public/` tree, taken by `pa public-sync`). Since AI-179 (2026-09-03) renewal is tri-state: `renewHeartbeat()` returns `'updated'`/`'row-absent'`/`'write-failed'` — a failed renewal write retries on the `PA_HEARTBEAT_WRITE_RETRY_MS` ladder (default 1 s/5 s/15 s), and a give-up is verified against the row (`peekLockRow`) before `onLost` fires, so only a verified row-absence counts as 'purged'.
 
 ## Conversation archive + DLQ
 
-- **Archive**: `~/.pa/conversation-history.jsonl` — append-only log of every bot turn (one JSON object per line). Read by the `ecosystem-kb`-style skills for KB synthesis.
+- **Archive**: `~/.pa/conversation-history.jsonl` — append-only log of every bot turn (one JSON object per line). Read nightly by memory-consolidation for KB synthesis.
 - **Per-topic state**: `~/.pa/telegram-bot-topic-{chatId}_{threadId}.json` — rolling 20-turn window for the bot's context window.
 - **DLQ**: `~/.pa/telegram-dlq.jsonl` — bot replies that failed to send are appended here. On bot startup, the DLQ is sequentially retried via `dlq.ts`.
 
@@ -161,8 +161,8 @@ the originating message.
 Every `executeWorker` run (`pa/src/worker-exec.ts`) writes one JSONL line to
 `~/.pa/turn-traces.jsonl` — a deterministic record of what the worker actually did,
 beyond the 300-char text preview the analyzer sees. Built by `pa/src/lib/turn-trace.ts`;
-never blocks or fails a dispatch (`appendTurnTrace` never throws or rejects; the write
-is fired with `void`, not awaited).
+never blocks or fails a dispatch (`appendTurnTrace` never throws; fired with
+`void`, not awaited).
 
 Schema v1 (`TurnTraceV1`): `v`, `run_id` (uuid, `CommandResult.runId`), `ts_start`/`ts_end`/
 `duration_ms`, `origin` (`'bot'|'skill'|'self-improver'|'other'`), `chat_id`/`thread_id`/
@@ -182,7 +182,7 @@ row does **not** carry `run_id` — `pa ref <refId>` resolves the trace via
 Rotated `-turn-traces.jsonl` shards are derived debugging data (rebuildable from nothing)
 and prune at 90 days via the existing `archive-prune` job (`PRUNABLE_ARCHIVE_SUFFIXES`,
 `pa/src/lib/archive-files.ts`). The `recall-index` job refreshes `~/.pa/recall.sqlite` from
-the live file every 10 minutes, so a trace becomes searchable without any manual step.
+the live file every 10 minutes — traces searchable with no manual step.
 
 ## Recall (`pa recall`, 2026-08-24)
 
@@ -221,15 +221,29 @@ Error-budget reports per service from `~/.pa/app.log.jsonl`; config-driven (`~/.
 Wave-1 substrate of the topic-task handover (2026-09-02, internal design record):
 
 - **`pa/src/lib/topic-tasks.ts`** — durable per-topic task queue at `~/.pa/topic-tasks/<chatId>_<threadId>.json`. `appendTask` dedups by content hash (double-queueing cannot double-execute); pop is pop-first persist-before-inject (Wave-2's `claimNextTask` moves records into the running store under the same lock). Read-modify-writes run under proper-lockfile + in-process mutex via `writeJsonAtomic`; `validateTaskPrompt` mirrors the AI-185 topic_resume rules (non-empty, single line, ≤500 chars, no leading `/`).
-- **`pa/src/lib/topic-events.ts`** — append-only per-topic event log at `~/.pa/topic-events/<chatId>_<threadId>.jsonl` (one JSON line per event, UTF-8; no retention in Wave 1). Closed kind enum (`task_queued`/`task_started`/`task_failed`/`question_asked`/`question_answered`/`note_added`/`wave_done`); the tolerant reader skips malformed lines with a warn-once log and returns events newest LAST; `resolveTopicKey` resolves `<chatId>_<threadId>` or a bare thread id by unique filename match across `topic-tasks`/`topic-events`/`topic-brains`.
-- **`pa/src/commands/topic.ts`** — the CLI shell: `pa topic-task add|list`, `pa topic-note add|list|close` (notes live in the topic store beside tasks — `~/.pa/topic-tasks/<key>.notes.json`; the prompt's `## Open items` section renders tasks + notes from that one source, no derived file), and `pa topic-events <key>`; task/note writes append the `task_queued`/`note_added` events.
+- **`pa/src/lib/topic-events.ts`** — append-only per-topic event log at `~/.pa/topic-events/<chatId>_<threadId>.jsonl` (one UTF-8 JSON line per event; no retention). Closed kind enum (`task_queued`, `task_started`/`failed`/`parked`/`resumed`/`completed`, `question_asked`/`answered`, `note_added`, `wave_done`, `thread_spawned`/`steered`/`completed`/`failed`/`cancelled` — `thread_*` (2026-09-06, bot-emitted) carry thread id `t-<n>` as `ref`; ACTIVITY_KINDS excludes them from task-lane activity); the tolerant reader warn-once-skips malformed lines and returns events newest LAST; `resolveTopicKey` resolves `<chatId>_<threadId>` or a bare thread id by unique filename match across the three topic stores.
+- **`pa/src/commands/topic.ts`** — the CLI shell: `pa topic-task add|list`, `pa topic-note add|list|close` (notes live in the topic store beside tasks — `~/.pa/topic-tasks/<key>.notes.json`; the prompt's `## Open items` renders tasks + notes from that one source, no derived file), and `pa topic-events <key>`; task/note writes append the `task_queued`/`note_added` events.
 - **`pa/src/lib/callback-grammar.ts`** — the ONE inline-button grammar (`CallbackPrefix`, `parseCallbackData`, `gateFor`, `OPERATOR_PREFIXES`, the `q:` answer prefix, and `validateKeyboardRequest`), owned by pa and re-exported by the bot's callbacks.ts, so pa-side emitters validate `callback_data` against the same source the bot parses with (two producers of a frozen grammar = drift).
-- **`[PA_KEYBOARD]:` envelope on `pa run` telegram_output** — a skill SCRIPT may end its output with one `[PA_KEYBOARD]: {"buttons":[...]}` line; run.ts strips it from the delivered text, validates it via `validateKeyboardRequest` (1..6 buttons, ≤40-char labels, grammar-valid `callback_data`), refuses keyboards for protected skills, and attaches it to the Telegram send. Any failure strips the keyboard and warns — it never fails the run.
-- **PA_META `question` action** — `question{text, options (1..4), taskId?}` arms `state.pending_question`; the reply renders option buttons and a press is injected back into the topic as a synthetic turn through the one-parser `q:` callback path. A question is rejected while a pending action or confirm is armed (confirm wins).
+- **`[PA_KEYBOARD]:` envelope on `pa run` telegram_output** — a skill SCRIPT may end its output with one `[PA_KEYBOARD]: {"buttons":[...]}` line; run.ts strips it from the delivered text, validates it via `validateKeyboardRequest` (1..6 buttons, ≤40-char labels, grammar-valid `callback_data`), refuses keyboards for protected skills, and attaches it to the send; any failure strips the keyboard and warns, never failing the run.
+- **PA_META `question` action** — `question{text, options (1..4), taskId?}` arms `state.pending_question`; the reply renders option buttons and a press is injected into the topic as a synthetic turn through the one-parser `q:` path. A question is rejected while a pending action or confirm is armed (confirm wins).
 
 ### Topic executor lane (Wave 2, 2026-09-02)
 
-Queued tasks execute on a DEDICATED lane (per the 2026-09-02 wave-2 topic-handover internal design record). The bot's 60s `topic-task-drain` claims ≤2 tasks/tick (global) via `claimNextTask` into `~/.pa/topic-tasks/<key>.running.json`: no per-topic cap (`TOPIC_TASK_SLOTS`=100 backstop; budget = `running.length`), 3 attempts max (exhausted → remove + `task_failed`), failed dispatches defer 10 min, stale `running` (30 min) demotes to ready for EVERY enumerated topic before claims (crash recovery, no pid checks); prompts re-validated at drain (invalid → WARN + `failTask`), foreign chats skipped pre-claim. `task-executor.ts` dispatches NEVER take the topic blackboard lock, touch `state.turns`, or ride the human reply pipeline. Task prompts carry the micro-thread (last 6 turns), open items, and in-flight siblings; task-lane PA_META handles ONLY `question` (park + `qt:` keyboard) / `watch_job` / `kb_note` / `run_skill` (non-protected). Pickup/question FYI message ids are tier-1 anchors (user reply → `routeReplyToTask` → `answerTask`; `qt:` press answers the parked task directly — convergence, not injection). Status: the card's `Tasks:` line + `renderOpenItems` tier-2 in-flight lines.
+Queued tasks execute on a DEDICATED lane (2026-09-02 wave-2 internal design record). The bot's 60s `topic-task-drain` claims ≤2 tasks/tick (global) via `claimNextTask` into `~/.pa/topic-tasks/<key>.running.json`: no per-topic cap (`TOPIC_TASK_SLOTS`=100 backstop; budget = `running.length`), 3 attempts max (exhausted → remove + `task_failed`), failed dispatches defer 10 min, stale `running` (30 min) demotes to ready for EVERY enumerated topic before claims (crash recovery, no pid checks); prompts re-validated at drain (invalid → WARN + `failTask`), foreign chats skipped pre-claim. `task-executor.ts` dispatches NEVER take the topic blackboard lock, touch `state.turns`, or ride the human reply pipeline. Task prompts carry the micro-thread (last 6 turns), open items, and in-flight siblings; task-lane PA_META handles ONLY `question` (park + `qt:` keyboard) / `watch_job` / `kb_note` / `run_skill` (non-protected). Pickup/question FYI message ids are tier-1 anchors (user reply → `routeReplyToTask` → `answerTask`; `qt:` press answers the parked task directly — convergence, not injection). Status: the card's `Tasks:` line + `renderOpenItems` tier-2 in-flight lines.
+
+## Voice inbox app (`projects/voice-inbox`, 2026-09-05)
+
+A foreground PWA + localhost API that turns spoken/typed requests into tasks in a
+tenant-scoped SQLite ledger (`~/.pa/voice-inbox/ledger.sqlite`; every query takes
+`tenant_id`; a code-level transition table is the only state gate). The chain:
+PWA → HTTPS API → ledger; ledger ↔ `route-queue.jsonl` ↔ bot drain → synthetic route
+turn (`__synthetic: 'route'`) → worker fleet. The four Python worker scripts
+(route/telemetry/input/complete) write the same ledger directly and never create schema;
+`route_task.py` also writes one decisions.sqlite row per routing decision — the
+explainability feed. Operator input arrives as one of six typed input-request widgets; the
+answer is stored server-side as a file and delivered to the worker as a path, so secrets
+never travel through chat. Config:
+`docs/CONFIGURATION.md` "Voice inbox app"; project brain: `projects/voice-inbox/CLAUDE.md`.
 
 ## Logging
 
@@ -243,7 +257,7 @@ Use `pa logs <skill>` to read recent runs.
 
 ## Observability surfaces
 
-- **`pa costs`** — usage/cost rollups by worker, model, skill. Tokens are factual counts; dollars are read-time estimates from built-in list prices plus `model_pricing` config overrides (`docs/CONFIGURATION.md` § ModelPricing). Unpriced keys show `-` (table) or `null` (JSON). Flags: `--day|--week|--month`, `--skill`, `--json`.
+- **`pa costs`** — usage/cost rollups by worker, model, skill. Tokens are factual; dollars are read-time estimates from built-in list prices + `model_pricing` overrides (`docs/CONFIGURATION.md` § ModelPricing). Unpriced keys show `-` (table) or `null` (JSON). Flags: `--day|--week|--month`, `--skill`, `--json`.
 - **`pa slo report --json`** — machine-readable error-budget reports; both digest scripts render them generically by service name.
 - **Daily digest skill** — deterministic 24h activity rollup (runs, tokens, est. cost, failover, alerts, DLQ, self-improver actions, SLO) with explicit unavailable lines; Python → stdout → `telegram_output` relay, date-scoped dedup. Script: `pa/scripts/daily_digest.py`; template: `examples/skills/daily-digest/skill.md`. Schedule and destination are per-deployment skill frontmatter.
 - **Weekly digest skill** — same pattern weekly: `pa/scripts/weekly_digest.py`.
@@ -251,7 +265,7 @@ Use `pa logs <skill>` to read recent runs.
 ## Conventions
 
 - **Timestamps**: IST by default (UTC+5:30). Override via `PA_TZ_OFFSET_MINUTES` env var. All log messages use ISO-8601 with the configured offset.
-- **Atomic file writes**: Skills that update files should write to `<path>.tmp` then rename to ensure no partial writes if interrupted.
+- **Atomic file writes**: Skills that update files should write to `<path>.tmp` then rename, avoiding partial writes if interrupted.
 - **Git snapshots before destructive updates**: Skills modifying tracked files in a git repo should `git commit -am "pre-update snapshot"` before editing, then `git commit -am "<skill> auto-refresh"` after.
 - **Marker-based content insertion**: Skills like `update-brain` use `<!-- AUTO:* -->` markers to identify auto-managed sections within manually-edited files. The skill validates markers exist post-update and refuses to write if any disappeared.
 - **Line-count floor**: Stateful skills that rewrite files should refuse to write the new content if it's < 80% of the old size — a guard against accidental wipes.
@@ -276,4 +290,4 @@ Operational-detail files (read on demand, only when touching that specific area)
 - `docs/bot-reliability-internals.md` — DLQ, delivery-dedup guarantees, `/stop` cancellation, AI-096 deviations
 
 Auto-loading (native Claude Code directory-scoped `CLAUDE.md`, not manually read):
-- `projects/telegram-bot/CLAUDE.md` — loads automatically whenever a session touches that directory
+- `projects/telegram-bot/CLAUDE.md`
