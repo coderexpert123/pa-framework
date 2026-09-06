@@ -22,8 +22,21 @@ def now_ist():
     # IST is UTC + 5:30
     return datetime.now(timezone(timedelta(hours=5, minutes=30)))
 
+def requires_user_decision(r: dict) -> bool:
+    """Whether this reminder's send should carry the Done / 1 h / Tomorrow
+    keyboard. Legacy default (AI-207 reminder-delivery wave, 2026-09-05): a
+    record without the `requires_user_decision` key renders the keyboard when
+    it is text-only and does NOT when it is executable — every live record at
+    spec time was text-only, so deploy-day delivery is unchanged."""
+    v = r.get("requires_user_decision")
+    if v is None:
+        return r.get("resume_action") is None
+    return bool(v)
+
+
 def build_reminder_keyboard() -> dict:
-    """The Done / 1 h / Tomorrow keyboard attached to every reminder send."""
+    """The Done / 1 h / Tomorrow keyboard, attached by callers only when
+    requires_user_decision(r) is true."""
     return {
         "inline_keyboard": [[
             {"text": "✅ Done", "callback_data": "rm:done"},
@@ -147,7 +160,9 @@ def process_reminders():
             if r.get("resume_action"):
                 # AI-185: queue the executable payload for the bot first, then
                 # send a notice WITHOUT the keyboard. Queue-append failure falls
-                # back to today's full text send so delivery is never lost.
+                # back to today's full text send so delivery is never lost; the
+                # fallback keyboard renders only when the record requires a
+                # user decision (AI-207).
                 try:
                     append_resume_record(r)
                 except Exception as e:
@@ -156,7 +171,7 @@ def process_reminders():
                         reminder_message_text(msg),
                         chat_id=chat_id,
                         thread_id=thread_id,
-                        reply_markup=build_reminder_keyboard(),
+                        reply_markup=build_reminder_keyboard() if requires_user_decision(r) else None,
                     )
                     print(f"[Reminders] Sent: {msg}")
                     continue
@@ -171,7 +186,7 @@ def process_reminders():
                     reminder_message_text(msg),
                     chat_id=chat_id,
                     thread_id=thread_id,
-                    reply_markup=build_reminder_keyboard(),
+                    reply_markup=build_reminder_keyboard() if requires_user_decision(r) else None,
                 )
                 print(f"[Reminders] Sent: {msg}")
         except SystemExit:

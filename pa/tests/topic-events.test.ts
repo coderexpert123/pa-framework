@@ -59,6 +59,27 @@ describe('topic-events', () => {
       assert.equal(events[0].ref, null);
       assert.equal(events[0].detail.length, TOPIC_EVENT_MAX_DETAIL_CHARS);
     });
+
+    it('thread lifecycle kinds round-trip (2026-09-06 orchestrator-threads increment)', async () => {
+      const kinds = [
+        'thread_spawned',
+        'thread_steered',
+        'thread_completed',
+        'thread_failed',
+        'thread_cancelled',
+      ] as const;
+      for (const kind of kinds) {
+        await appendTopicEvent(123, 310, { kind, ref: 't-1', detail: 'Sweep logs' });
+      }
+
+      const events = await readTopicEvents(123, 310);
+      assert.deepEqual(
+        events.map((e) => e.kind),
+        ['thread_spawned', 'thread_steered', 'thread_completed', 'thread_failed', 'thread_cancelled'],
+      );
+      assert.ok(events.every((e) => e.ref === 't-1'));
+      assert.equal(events[0].detail, 'Sweep logs');
+    });
   });
 
   describe('readTopicEvents', () => {

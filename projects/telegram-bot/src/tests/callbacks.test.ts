@@ -68,11 +68,18 @@ describe('parseCallbackData — valid examples (one per §3.2 row)', () => {
     assert.deepEqual(parseCallbackData('cf:n'), { prefix: 'cf', answer: 'n', raw: 'cf:n' });
   });
 
-  it('cc:menu (and the other 7 simple cc actions)', () => {
-    for (const action of ['menu', 'agent', 'model', 'effort', 'back', 'new', 'stop', 'ka']) {
+  it('cc:menu (and the other 9 simple cc actions)', () => {
+    for (const action of ['menu', 'agent', 'model', 'effort', 'back', 'new', 'stop', 'ka', 'submit', 'discard']) {
       const p = parseCallbackData(`cc:${action}`);
       assert.deepEqual(p, { prefix: 'cc', action, raw: `cc:${action}` });
     }
+  });
+
+  it('cc:submit / cc:discard parse as simple actions; extra segments are rejected (AI-210)', () => {
+    assert.deepEqual(parseCallbackData('cc:submit'), { prefix: 'cc', action: 'submit', raw: 'cc:submit' });
+    assert.deepEqual(parseCallbackData('cc:discard'), { prefix: 'cc', action: 'discard', raw: 'cc:discard' });
+    assert.equal(parseCallbackData('cc:submit:x'), null);
+    assert.equal(parseCallbackData('cc:discard:y'), null);
   });
 
   it('cc:set:agent|model|effort:<value>', () => {
@@ -175,6 +182,8 @@ describe('gateFor', () => {
     ['reauth:google', 'chat'],
     ['cf:y', 'chat'],
     ['cc:menu', 'chat'],
+    ['cc:submit', 'chat'],
+    ['cc:discard', 'chat'],
     ['wf:retry', 'chat'],
     ['rm:done', 'chat'],
     ['pm:t1:approve', 'operator'],
@@ -278,6 +287,11 @@ describe('syntheticTextFor', () => {
     assert.equal(syntheticTextFor({ prefix: 'mc', conflictId: 'c', action: 'a', raw: '' }), null);
     assert.equal(syntheticTextFor({ prefix: 'dq', index: 1, confirmed: false, raw: '' }), null);
   });
+
+  it('cc:submit / cc:discard synthesize nothing (AI-210: submit injects from the recorded staged selection)', () => {
+    assert.equal(syntheticTextFor({ prefix: 'cc', action: 'submit', raw: 'cc:submit' }), null);
+    assert.equal(syntheticTextFor({ prefix: 'cc', action: 'discard', raw: 'cc:discard' }), null);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -342,14 +356,15 @@ describe('keyboard builders stay within the 64-byte callback_data budget', () =>
 });
 
 describe('buildValuePickerKeyboard', () => {
-  it('drops an over-long value and always ends with a cc:back row', () => {
+  it('drops an over-long value and always ends with the Submit/Discard row', () => {
     const kb = buildValuePickerKeyboard('model', ['ok', 'x'.repeat(41)], 'ok');
     const buttons = allButtons(kb);
     assert.ok(buttons.includes('cc:set:model:ok'));
     assert.ok(!buttons.some((d) => d.startsWith('cc:set:model:x')), 'the over-long value must be dropped');
     const lastRow = kb.inline_keyboard[kb.inline_keyboard.length - 1];
-    assert.equal(lastRow.length, 1);
-    assert.equal(lastRow[0].callback_data, 'cc:back');
+    assert.equal(lastRow.length, 2);
+    assert.equal(lastRow[0].callback_data, 'cc:submit');
+    assert.equal(lastRow[1].callback_data, 'cc:discard');
   });
 
   it('lays out 1 per row for 6 or fewer values', () => {
@@ -358,10 +373,13 @@ describe('buildValuePickerKeyboard', () => {
     const dataRows = kb.inline_keyboard.slice(0, -1);
     assert.equal(dataRows.length, values.length);
     for (const row of dataRows) assert.equal(row.length, 1);
-    assert.equal(kb.inline_keyboard[kb.inline_keyboard.length - 1][0].callback_data, 'cc:back');
+    const lastRow = kb.inline_keyboard[kb.inline_keyboard.length - 1];
+    assert.equal(lastRow.length, 2);
+    assert.equal(lastRow[0].callback_data, 'cc:submit');
+    assert.equal(lastRow[1].callback_data, 'cc:discard');
   });
 
-  it('lays out 2 per row once more than 6 values survive, preserving order, back row last', () => {
+  it('lays out 2 per row once more than 6 values survive, preserving order, Submit/Discard row last', () => {
     const values = ['m1', 'm2', 'm3', 'm4', 'm5', 'm6', 'm7', 'clear']; // 8 values
     const kb = buildValuePickerKeyboard('model', values);
     const dataRows = kb.inline_keyboard.slice(0, -1);
@@ -370,8 +388,32 @@ describe('buildValuePickerKeyboard', () => {
     const flatData = dataRows.flat().map((b) => b.callback_data);
     assert.deepEqual(flatData, values.map((v) => `cc:set:model:${v}`), 'declared order must be preserved across rows');
     const lastRow = kb.inline_keyboard[kb.inline_keyboard.length - 1];
-    assert.equal(lastRow.length, 1);
-    assert.equal(lastRow[0].callback_data, 'cc:back');
+    assert.equal(lastRow.length, 2);
+    assert.equal(lastRow[0].callback_data, 'cc:submit');
+    assert.equal(lastRow[1].callback_data, 'cc:discard');
+  });
+});
+
+// AI-210 (2026-09-06): both pickers end with [✅ Submit][↩ Discard] instead of ◀ Back.
+describe('AI-210 — both pickers end with the Submit/Discard row', () => {
+  it('buildAgentPickerKeyboard ends with Submit/Discard and no cc:back remains', () => {
+    const kb = buildAgentPickerKeyboard(['agy', 'claude'], 'agy');
+    const lastRow = kb.inline_keyboard[kb.inline_keyboard.length - 1];
+    assert.deepEqual(lastRow, [
+      { text: '✅ Submit', callback_data: 'cc:submit' },
+      { text: '↩ Discard', callback_data: 'cc:discard' },
+    ]);
+    assert.ok(!allButtons(kb).includes('cc:back'));
+  });
+
+  it('buildValuePickerKeyboard ends with Submit/Discard and no cc:back remains', () => {
+    const kb = buildValuePickerKeyboard('model', ['m1'], 'm1');
+    const lastRow = kb.inline_keyboard[kb.inline_keyboard.length - 1];
+    assert.deepEqual(lastRow, [
+      { text: '✅ Submit', callback_data: 'cc:submit' },
+      { text: '↩ Discard', callback_data: 'cc:discard' },
+    ]);
+    assert.ok(!allButtons(kb).includes('cc:back'));
   });
 });
 
@@ -698,7 +740,9 @@ describe('handleCallbackQuery', () => {
       assert.deepEqual(flat, [...declared, 'clear'].map((v) => `cc:set:model:${v}`));
       for (const row of dataRows) assert.ok(row.length <= 2, '2 per row once > 6 values');
       const lastRow = editCalls[0].body.reply_markup.inline_keyboard.slice(-1)[0];
-      assert.equal(lastRow[0].callback_data, 'cc:back');
+      assert.equal(lastRow.length, 2);
+      assert.equal(lastRow[0].callback_data, 'cc:submit');
+      assert.equal(lastRow[1].callback_data, 'cc:discard');
     });
 
     it('an observed value already in the declared list is not duplicated; an observed-only value appears after declared', async () => {
@@ -1334,7 +1378,7 @@ describe('AI-192 — control-card keyboard survives presses', () => {
     assert.equal(editCalls[0].body.reply_markup, undefined, 'no submenu recorded → keyboard strips');
   });
 
-  it('a cc: set press adds NO echo line and does not strip the picker keyboard', async () => {
+  it('a cc: set press STAGES: no injection, re-renders with ▸, records the selection', async () => {
     const deps = makeDeps();
     // Open the picker first (records the submenu), then press a value.
     await handleCallbackQuery(makeCb('cc:agent'), deps);
@@ -1348,20 +1392,28 @@ describe('AI-192 — control-card keyboard survives presses', () => {
     );
     assert.equal(echoEdits.length, 0, 'the selected-value echo is suppressed for cc: presses');
 
-    // The toast carries the feedback the echo used to.
+    // The toast carries the feedback — and names the confirmation step.
     const toast = fetchStub.calls.find((c) => c.url.includes('answerCallbackQuery'));
-    assert.equal(toast?.body.text, 'Agent → agy');
+    assert.equal(toast?.body.text, 'Agent → agy · Submit to apply');
 
-    // The typed command is still injected — button and typing cannot diverge.
-    assert.equal(deps.injected.length, 1);
-    assert.equal(deps.injected[0].message.text, '/agent agy');
+    // NOTHING is injected — the press only stages.
+    assert.equal(deps.injected.length, 0);
 
-    // The press is complete: nothing left to protect from the sweep's rewrite.
-    assert.equal(currentCardKeyboard(555, 100), undefined);
-    // And no stripping edit happened — the picker stays visually attached until
-    // the injected command's dispatch refresh rewrites the card.
-    const anyEdit = fetchStub.calls.filter((c) => c.url.includes('editMessageText'));
-    assert.equal(anyEdit.length, 0);
+    // The same picker re-renders with the tapped value staged (▸).
+    const editCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageReplyMarkup'));
+    assert.equal(editCalls.length, 1);
+    const buttons = editCalls[0].body.reply_markup.inline_keyboard.flat();
+    const staged = buttons.find((b: any) => b.callback_data === 'cc:set:agent:agy');
+    assert.ok(staged, 'the tapped value is still on the keyboard');
+    assert.equal(staged.text, '▸ agy');
+
+    // The selection is recorded on the card keyboard index (Submit will read it).
+    const recorded = currentCardKeyboard(555, 100);
+    assert.ok(recorded, 'the staged picker is recorded');
+    assert.ok(
+      recorded!.inline_keyboard.flat().some((b) => b.callback_data === 'cc:set:agent:agy'),
+      'the recorded keyboard includes the staged value'
+    );
   });
 
   it('a cc: new press adds no echo and still injects /new', async () => {
@@ -1376,6 +1428,223 @@ describe('AI-192 — control-card keyboard survives presses', () => {
     assert.equal(deps.injected[0].message.text, '/new');
     const toast = fetchStub.calls.find((c) => c.url.includes('answerCallbackQuery'));
     assert.equal(toast?.body.text, 'New topic');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AI-210 (2026-09-06) — picker stage-then-apply: a cc:set press stages (▸, no
+// injection), cc:submit injects EXACTLY the typed command the press used to inject,
+// cc:discard reverts. The staged selection lives in the in-memory card keyboard
+// index; tests that depend on their own recorded entry use the 7000x chat family.
+// ---------------------------------------------------------------------------
+
+describe('AI-210 — picker stage-then-apply (cc:submit / cc:discard)', () => {
+  let fetchStub: ReturnType<typeof stubFetch>;
+
+  function makeCardCb(data: string, chatId: number, messageId: number): CallbackQuery {
+    return makeCb(data, {
+      message: {
+        message_id: messageId,
+        chat: { id: chatId, type: 'supergroup' },
+        date: Math.floor(Date.now() / 1000),
+        text: 'card',
+        message_thread_id: 0,
+      },
+    });
+  }
+
+  /** Opens the picker (bare record) then stages one value, both on 555/100. */
+  async function stageSelection(
+    deps: CallbackDeps & { injected: any[] },
+    setting: 'agent' | 'model',
+    value: string
+  ): Promise<void> {
+    await handleCallbackQuery(makeCb(`cc:${setting}`), deps);
+    await handleCallbackQuery(makeCb(`cc:set:${setting}:${value}`), deps);
+  }
+
+  function lastReplyMarkup(): any {
+    const editCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageReplyMarkup'));
+    return editCalls[editCalls.length - 1]?.body.reply_markup;
+  }
+
+  function toastText(): string | undefined {
+    return fetchStub.calls.find((c) => c.url.includes('answerCallbackQuery'))?.body.text;
+  }
+
+  function topLevelData(markup: any): string[] {
+    return markup.inline_keyboard.flat().map((b: any) => b.callback_data);
+  }
+
+  const TOP_LEVEL_DATA = ['cc:agent', 'cc:model', 'cc:effort', 'cc:new', 'cc:stop', 'cc:ka'];
+
+  beforeEach(() => {
+    fetchStub = stubFetch();
+    _resetCardKeyboardIndexForTest();
+  });
+
+  afterEach(() => {
+    fetchStub.restore();
+    _resetCardKeyboardIndexForTest();
+  });
+
+  it('cc:submit applies the staged selection — injects exactly the typed command', async () => {
+    const deps = makeDeps({
+      loadTopicState: async () => ({ chat_id: 555, last_update_id: 0, thread_id: 0, turns: [], preferred_worker: 'agy' }),
+      declaredValues: async (w, s) => (w === 'agy' && s === 'model' ? ['m1', 'm2'] : []),
+      observedValues: async () => [],
+    });
+    await stageSelection(deps, 'model', 'm2');
+    fetchStub.calls.length = 0; // scope the assertions to the submit press
+
+    const outcome = await handleCallbackQuery(makeCb('cc:submit'), deps);
+    assert.equal(outcome, 'cc:submit');
+    assert.equal(deps.injected.length, 1);
+    const expected = syntheticTextFor({ prefix: 'cc', action: 'set', setting: 'model', value: 'm2', raw: '' });
+    assert.equal(deps.injected[0].message.text, '/model m2');
+    assert.equal(deps.injected[0].message.text, expected, 'byte-identity with the typed command');
+    assert.equal(toastText(), 'Applying model → m2…');
+    const editCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageReplyMarkup'));
+    assert.equal(editCalls.length, 1);
+    assert.deepEqual(topLevelData(editCalls[0].body.reply_markup), TOP_LEVEL_DATA, 'top-level control card restored');
+    assert.equal(currentCardKeyboard(555, 100), undefined, 'entry cleared after submit');
+  });
+
+  it('cc:submit with no staged selection answers "No change" and injects nothing', async () => {
+    const deps = makeDeps();
+    const outcome = await handleCallbackQuery(makeCardCb('cc:submit', 70004, 100), deps);
+    assert.equal(outcome, 'cc:submit:no-change');
+    assert.equal(deps.injected.length, 0);
+    assert.equal(toastText(), 'No change');
+    const editCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageReplyMarkup'));
+    assert.equal(editCalls.length, 1);
+    assert.deepEqual(topLevelData(editCalls[0].body.reply_markup), TOP_LEVEL_DATA);
+    assert.equal(currentCardKeyboard(70004, 100), undefined);
+  });
+
+  it('cc:discard with a staged selection discards it — nothing injected', async () => {
+    const deps = makeDeps({
+      loadTopicState: async () => ({ chat_id: 555, last_update_id: 0, thread_id: 0, turns: [], preferred_worker: 'agy' }),
+      declaredValues: async (w, s) => (w === 'agy' && s === 'model' ? ['m1', 'm2'] : []),
+      observedValues: async () => [],
+    });
+    await stageSelection(deps, 'model', 'm2');
+    fetchStub.calls.length = 0;
+
+    const outcome = await handleCallbackQuery(makeCb('cc:discard'), deps);
+    assert.equal(outcome, 'cc:discard');
+    assert.equal(deps.injected.length, 0);
+    assert.equal(toastText(), 'Discarded — model unchanged');
+    const editCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageReplyMarkup'));
+    assert.equal(editCalls.length, 1);
+    assert.deepEqual(topLevelData(editCalls[0].body.reply_markup), TOP_LEVEL_DATA, 'top-level control card restored');
+    assert.equal(currentCardKeyboard(555, 100), undefined);
+  });
+
+  it('cc:discard with no staged selection still answers and restores the top-level card', async () => {
+    const deps = makeDeps();
+    const outcome = await handleCallbackQuery(makeCardCb('cc:discard', 70007, 100), deps);
+    assert.equal(outcome, 'cc:discard');
+    assert.equal(deps.injected.length, 0);
+    assert.equal(toastText(), 'Discarded');
+    const editCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageReplyMarkup'));
+    assert.deepEqual(topLevelData(editCalls[0].body.reply_markup), TOP_LEVEL_DATA);
+  });
+
+  it('a staged selection keeps the entry fresh for 10 minutes and records the staged keyboard', async () => {
+    const chatId = 70005;
+    const deps = makeDeps({
+      loadTopicState: async () => ({ chat_id: chatId, last_update_id: 0, thread_id: 0, turns: [], preferred_worker: 'agy' }),
+      declaredValues: async (w, s) => (w === 'agy' && s === 'model' ? ['m1', 'm2'] : []),
+      observedValues: async () => [],
+    });
+    await handleCallbackQuery(makeCardCb('cc:model', chatId, 100), deps);
+    await handleCallbackQuery(makeCardCb('cc:set:model:m2', chatId, 100), deps);
+    assert.deepEqual(currentCardKeyboard(chatId, 100), lastReplyMarkup(), 'recorded keyboard === rendered keyboard');
+    assert.ok(currentCardKeyboard(chatId, 100, Date.now() + 3 * 60 * 1000), '+3 min: fresh (10-min staged window)');
+    assert.equal(currentCardKeyboard(chatId, 100, Date.now() + 11 * 60 * 1000), undefined, '+11 min: dropped');
+  });
+
+  it('a bare submenu keeps the 2-minute window', async () => {
+    const chatId = 70006;
+    const deps = makeDeps({
+      loadTopicState: async () => ({ chat_id: chatId, last_update_id: 0, thread_id: 0, turns: [], preferred_worker: 'agy' }),
+    });
+    await handleCallbackQuery(makeCardCb('cc:agent', chatId, 100), deps);
+    assert.ok(currentCardKeyboard(chatId, 100), 'fresh: still returned');
+    assert.equal(currentCardKeyboard(chatId, 100, Date.now() + 3 * 60 * 1000), undefined, '+3 min: dropped (2-min bare window)');
+  });
+
+  it('a second tap replaces the staged selection; submit applies the latest', async () => {
+    const chatId = 70008;
+    const deps = makeDeps({
+      loadTopicState: async () => ({ chat_id: chatId, last_update_id: 0, thread_id: 0, turns: [], preferred_worker: 'agy' }),
+      declaredValues: async (w, s) => (w === 'agy' && s === 'model' ? ['m1', 'm2', 'm3'] : []),
+      observedValues: async () => [],
+    });
+    await handleCallbackQuery(makeCardCb('cc:model', chatId, 100), deps);
+    await handleCallbackQuery(makeCardCb('cc:set:model:m2', chatId, 100), deps);
+    await handleCallbackQuery(makeCardCb('cc:set:model:m3', chatId, 100), deps);
+    const rendered = lastReplyMarkup().inline_keyboard.flat();
+    assert.ok(rendered.some((b: any) => b.text === '▸ m3'), 'the latest tap is staged');
+    assert.ok(!rendered.some((b: any) => b.text === '▸ m2'), 'the earlier tap is replaced');
+    fetchStub.calls.length = 0;
+
+    const outcome = await handleCallbackQuery(makeCardCb('cc:submit', chatId, 100), deps);
+    assert.equal(outcome, 'cc:submit');
+    assert.equal(deps.injected.length, 1);
+    assert.equal(deps.injected[0].message.text, '/model m3');
+    assert.equal(toastText(), 'Applying model → m3…');
+  });
+
+  it('staging the applied value marks it staged (▸ wins over •)', async () => {
+    const chatId = 70009;
+    const deps = makeDeps({
+      loadTopicState: async () => ({ chat_id: chatId, last_update_id: 0, thread_id: 0, turns: [] }),
+      listWorkerNames: async () => ['agy', 'claude'],
+      effectiveDefaultWorker: async () => 'agy',
+    });
+    await handleCallbackQuery(makeCardCb('cc:agent', chatId, 100), deps);
+    const openRendered = lastReplyMarkup().inline_keyboard.flat();
+    assert.ok(openRendered.some((b: any) => b.text === '• agy'), 'precondition: applied value rendered with •');
+    await handleCallbackQuery(makeCardCb('cc:set:agent:agy', chatId, 100), deps);
+    const staged = lastReplyMarkup().inline_keyboard.flat();
+    assert.ok(staged.some((b: any) => b.text === '▸ agy'), 'staged wins');
+    assert.ok(!staged.some((b: any) => b.text === '• agy'), 'no • remains for the staged value');
+  });
+
+  it('an unrelated cf: ack re-attaches the staged picker keyboard', async () => {
+    const deps = makeDeps();
+    await handleCallbackQuery(makeCb('cc:agent'), deps); // open the picker (555/100)
+    await handleCallbackQuery(makeCb('cc:set:agent:agy'), deps); // stage
+    fetchStub.calls.length = 0;
+
+    await handleCallbackQuery(makeCb('cf:y'), deps);
+    const editCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageText'));
+    assert.equal(editCalls.length, 1);
+    const buttons = editCalls[0].body.reply_markup.inline_keyboard.flat();
+    assert.ok(
+      buttons.some((b: any) => b.callback_data === 'cc:set:agent:agy' && b.text === '▸ agy'),
+      'the staged picker survives the ack'
+    );
+  });
+
+  it('legacy cc:back still works after staging — nothing injected, top-level restored', async () => {
+    const deps = makeDeps({
+      loadTopicState: async () => ({ chat_id: 555, last_update_id: 0, thread_id: 0, turns: [], preferred_worker: 'agy' }),
+      declaredValues: async (w, s) => (w === 'agy' && s === 'model' ? ['m1', 'm2'] : []),
+      observedValues: async () => [],
+    });
+    await stageSelection(deps, 'model', 'm2');
+    fetchStub.calls.length = 0;
+
+    const outcome = await handleCallbackQuery(makeCb('cc:back'), deps);
+    assert.equal(outcome, 'cc:back');
+    assert.equal(deps.injected.length, 0);
+    const editCalls = fetchStub.calls.filter((c) => c.url.includes('editMessageReplyMarkup'));
+    assert.equal(editCalls.length, 1);
+    assert.deepEqual(topLevelData(editCalls[0].body.reply_markup), TOP_LEVEL_DATA, 'top-level control card restored');
+    assert.equal(currentCardKeyboard(555, 100), undefined);
   });
 });
 

@@ -225,12 +225,18 @@ sibling jobs (see the admission rule above). Phase 1, the orphan sweep: runs
 `git status --porcelain` read-only, skips paths under active reservations, stands the
 whole tick down while a git-workflow/@build/catchup lock is held (clobber-sentinel
 idiom — a stood-down tick does not stamp the once-per-day marker), attributes the
-survivors via `~/.pa/orphan-ledger.jsonl` (newest record per path wins) and files
-land-or-discard topic tasks to the owning topics (Wave-1 `topic-tasks` store, ≤6 paths
-per prompt, ≤500 chars). Unattributed paths route to `topics.support` when set —
-otherwise they are only counted in `~/.pa/daily-recon.json`'s `unknown_n` for the
-weekly ops digest. NEVER mutates the tree (coordination Rule 9). Producers: the orphan
-ledger is written by worker-edit-audit's `closeWindow` (source `dispatch-close`).
-Design per the topic-handover wave-2 internal design record (2026-09-02).
+survivors via `~/.pa/orphan-ledger.jsonl` (newest record per path wins) FIRST, then
+via the topic-ownership registry `~/.pa/topic-ownership-registry.json` (repo-relative
+`owned` path prefixes, segment-matched) for paths the ledger leaves unattributed (no
+record, or a latest record with a null owner), and files land-or-discard topic tasks to
+the owning topics (Wave-1 `topic-tasks` store, ≤6 paths per prompt, ≤500 chars).
+Unattributed paths route to the registry's `role: "catch-all"` row, falling back to
+`topics.support` when set — otherwise they are only counted in `~/.pa/daily-recon.json`'s
+`unknown_n` for the weekly ops digest. The state file records provenance: `registry_rows`
+(valid registry rows loaded), `catch_all` (resolved catch-all key or null), and each
+group's `source` (`ledger` | `registry`). NEVER mutates the tree (coordination Rule 9).
+Producers: the orphan ledger is written by worker-edit-audit's `closeWindow` (source
+`dispatch-close`). Design per the topic-handover wave-2 internal design record
+(2026-09-02); registry-fed attribution per the 2026-09-05 topic-ownership wave.
 
 **`cDiskFloorWatchdogJob` (AI-198, 2026-09-03):** every 30 min, OBSERVE-ONLY machine guard: reads C: free bytes via a `(Get-PSDrive C).Free` one-liner (process-tree exec conventions). On the crossing BELOW the configured floor it pages pa-alerts once per crossing — transition state in `~/.pa/c-disk-floor-watchdog.json` (durable; a missing/corrupt state reads as "was above" — state loss costs one extra alert, never a missed one), dedup key `c-disk-floor`, `escalate:false`. The floor, consumer-scan root and scan budget are env knobs with deployment-convention defaults (`PA_CDISK_FLOOR_BYTES` 5 GiB, `PA_CDISK_SCAN_ROOT` the deployment's conventional scratch root, `PA_CDISK_SCAN_BUDGET_MS` 2 s — see `docs/CONFIGURATION.md`). The alert names the top 3 scan-root consumers (best-effort scan, junctions skipped; budget exhausted → "sweep manually"). Above the floor: silent. A failed/unparseable query THROWS into the AI-098 backoff ladder (never silent-skip). Admission rule: nearest job is `shared-tmp-sweep` — observe-vs-act distinguishes them. Evidence: the 2026-09-03 push-gate contention investigation record (private archive). `pa/src/lib/maintenance/jobs/c-disk-floor-watchdog.ts`.

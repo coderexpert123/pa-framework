@@ -322,13 +322,20 @@ function formatToolCalls(trace: Record<string, unknown>): string {
     .join(', ');
 }
 
-function formatTraceSummary(fallbackRunId: string | undefined, trace: Record<string, unknown>): string {
+function formatTraceSummary(
+  fallbackRunId: string | undefined,
+  trace: Record<string, unknown>,
+  fallbackSessionId?: string,
+): string {
   const runId = typeof trace.run_id === 'string' ? trace.run_id : (fallbackRunId ?? 'unknown');
   const toolsStr = formatToolCalls(trace);
   const commands = Array.isArray((trace as any).commands) ? ((trace as any).commands as unknown[]).slice(0, 5) : [];
   const files = Array.isArray((trace as any).files) ? ((trace as any).files as unknown[]).slice(0, 5) : [];
   const outcome = typeof (trace as any).outcome === 'string' ? (trace as any).outcome : 'unknown';
-  return `Trace for this run (run_id ${runId}): tools=${toolsStr}; commands=${commands.join(', ') || 'none'}; files=${files.join(', ') || 'none'}; outcome=${outcome}`;
+  // The worker conversation that executed the run (AI-197): the trace's captured
+  // session_id, else the occurrence turn's archived copy, else unknown.
+  const sid = typeof trace.session_id === 'string' ? trace.session_id : (fallbackSessionId ?? 'unknown');
+  return `Trace for this run (run_id ${runId}): tools=${toolsStr}; commands=${commands.join(', ') || 'none'}; files=${files.join(', ') || 'none'}; outcome=${outcome}; session=${sid}`;
 }
 
 /**
@@ -342,13 +349,14 @@ export function buildProposalPrompt(
   occurrences: Array<{ turn: EvidenceTurn; assistantReply?: string; trace?: Record<string, unknown> }>,
   existingSkills: string[],
   existingDrafts: string[],
+  taskLaneSection?: string,
 ): string {
   const top = occurrences.slice(0, 5);
 
   const occurrenceBlocks = top
     .map((occ, i) => {
       const userText = (occ.turn.text ?? '').slice(0, ANALYZER_TURN_CHARS);
-      const traceLine = occ.trace ? formatTraceSummary(occ.turn.run_id, occ.trace) : 'no trace recorded';
+      const traceLine = occ.trace ? formatTraceSummary(occ.turn.run_id, occ.trace, occ.turn.session_id) : 'no trace recorded';
       const lines = [
         `### Occurrence ${i + 1} (${occ.turn.timestamp})`,
         `User: ${userText}`,
@@ -372,7 +380,7 @@ Seen on ${candidate.days.length} different days.
 
 ## Occurrences (newest first, up to 5)
 
-${occurrenceBlocks || '(no occurrences)'}
+${occurrenceBlocks || '(no occurrences)'}${taskLaneSection ? `\n\n${taskLaneSection}` : ''}
 
 ## Existing Skills and Drafts (do NOT re-propose these)
 ${exclusionList}
@@ -469,6 +477,7 @@ async function runAnalysisPasses(opts: {
   runner: typeof runWithFailover;
   advanceWatermark: boolean;
   traceLookup: TraceLookup;
+  taskLaneSection?: string;
 }): Promise<DraftProposal[]> {
   const turns = await readTurnsSince(opts.since, opts.days);
 
@@ -574,7 +583,7 @@ async function runAnalysisPasses(opts: {
       occurrences.push({ turn, trace: trace ?? undefined });
     }
 
-    const prompt = buildProposalPrompt(candidate, occurrences, existingSkillNames, existingDraftNames);
+    const prompt = buildProposalPrompt(candidate, occurrences, existingSkillNames, existingDraftNames, opts.taskLaneSection);
     const { result } = await opts.runner(prompt, {
       resource: 'skill-learner-proposal',
       timeout: 300,
@@ -640,11 +649,15 @@ async function runAnalysisPasses(opts: {
  * no watermark exists yet (first-run backfill, D3.1) — once analyzer-state.json
  * has a `covers_through`, `days` is ignored and every turn since the watermark
  * is processed. Signature is byte-identical to the pre-wave export (C22):
- * self-improver.ts:530's existing call needs no edit.
+ * self-improver.ts:530's existing call needs no edit. The optional
+ * `taskLaneSection` (AI-197) is caller-formatted async-evidence context for the
+ * Pass-2 proposal prompt — purely additive: when absent, the prompt is
+ * byte-identical to the pre-AI-197 one.
  */
 export async function analyzeConversationPatterns(
   days: number = 14,
-  runner: typeof runWithFailover = runWithFailover
+  runner: typeof runWithFailover = runWithFailover,
+  taskLaneSection?: string
 ): Promise<DraftProposal[]> {
   const state = await loadAnalyzerState();
   return runAnalysisPasses({
@@ -653,6 +666,7 @@ export async function analyzeConversationPatterns(
     runner,
     advanceWatermark: true,
     traceLookup: getTraceLookup(),
+    taskLaneSection,
   });
 }
 
@@ -660,11 +674,14 @@ export async function analyzeConversationPatterns(
  * The non-advancing sibling for `pa learn` (D3.6). Same two passes over an
  * EXPLICIT `days` window, writing the candidate ledger but NEVER reading or
  * writing analyzer-state.json — an on-demand run can never move the nightly
- * watermark.
+ * watermark. The optional `taskLaneSection` (AI-197) is caller-formatted
+ * async-evidence context for the Pass-2 proposal prompt — purely additive:
+ * when absent, the prompt is byte-identical to the pre-AI-197 one.
  */
 export async function analyzeConversationWindow(
   days: number = 14,
-  runner: typeof runWithFailover = runWithFailover
+  runner: typeof runWithFailover = runWithFailover,
+  taskLaneSection?: string
 ): Promise<DraftProposal[]> {
   return runAnalysisPasses({
     since: null,
@@ -672,5 +689,6 @@ export async function analyzeConversationWindow(
     runner,
     advanceWatermark: false,
     traceLookup: getTraceLookup(),
+    taskLaneSection,
   });
 }

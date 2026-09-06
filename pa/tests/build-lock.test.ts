@@ -497,6 +497,7 @@ describe('build-lock: withBuildLock', () => {
   it('buildLockLabel("pa") matches npm-pa-<pid>', () => {
     assert.match(buildLockLabel('pa'), /^npm-pa-\d+$/);
     assert.match(buildLockLabel('bot'), /^npm-bot-\d+$/);
+    assert.match(buildLockLabel('voice-inbox'), /^npm-voice-inbox-\d+$/);
   });
 
   it('real end-to-end against the suite temp PA_HOME: a genuine @build reservation is visible during fn and gone after', async () => {
@@ -691,6 +692,48 @@ describe('build-lock: assertDistFresh (AI-180)', () => {
       await assert.rejects(
         () => assertDistFresh({ pkg: 'bot', repoRoot: root, revParseFn: async () => 'b0b1234' }),
         /DIST STALE \(bot\)/
+      );
+    } finally {
+      await cleanupSandbox({ root, distDir, srcDir, testsDir: distDir, stampPath: '' });
+    }
+  });
+
+  it("voice-inbox layout: verifies projects/voice-inbox/{dist,src}, not PA's dist paths", async () => {
+    const root = await mkdtemp(join(tmpdir(), 'pa-dist-vi-'));
+    const distDir = join(root, 'projects', 'voice-inbox', 'dist');
+    const srcDir = join(root, 'projects', 'voice-inbox', 'src');
+    await mkdir(distDir, { recursive: true });
+    await mkdir(srcDir, { recursive: true });
+    try {
+      await writeFile(join(srcDir, 'server.ts'), '// fresh\n');
+      const old = new Date(STALE_DATE);
+      await utimes(join(srcDir, 'server.ts'), old, old); // deterministic: strictly older than builtAt
+      await writeFile(
+        join(distDir, '.build-stamp'),
+        JSON.stringify({ builtAt: new Date().toISOString(), sha: 'v1c1234', pkg: 'voice-inbox' }) + '\n',
+        'utf8'
+      );
+      // Fresh: resolves. This is the misroute regression proof: before the
+      // 'voice-inbox' arm existed, distLayout fell through to PA's layout and
+      // this exact call refused with stamp-missing (the sandbox has no
+      // pa/dist at all), so the package runner had to omit the guard.
+      await assertDistFresh({ pkg: 'voice-inbox', repoRoot: root, revParseFn: async () => 'v1c1234' });
+
+      // Then a src edit newer than the build refuses against THIS package's
+      // src root, same policy as pa/bot. The mtime is set EXPLICITLY past the
+      // stamp: same-tick writes quantize to the same file-system timestamp,
+      // and the guard compares strictly >.
+      const builtAt = new Date();
+      await writeFile(
+        join(distDir, '.build-stamp'),
+        JSON.stringify({ builtAt: builtAt.toISOString(), sha: 'v1c1234', pkg: 'voice-inbox' }) + '\n',
+        'utf8'
+      );
+      const afterBuild = new Date(builtAt.getTime() + 60_000);
+      await utimes(join(srcDir, 'server.ts'), afterBuild, afterBuild);
+      await assert.rejects(
+        () => assertDistFresh({ pkg: 'voice-inbox', repoRoot: root, revParseFn: async () => 'v1c1234' }),
+        /DIST STALE \(voice-inbox\)/
       );
     } finally {
       await cleanupSandbox({ root, distDir, srcDir, testsDir: distDir, stampPath: '' });

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { lookupRefId, lookupTrace, lookupTraceByUpdate } from '../src/lib/ref-lookup.js';
+import { lookupRefId, lookupTrace, lookupTraceByTaskRef, lookupTraceByUpdate } from '../src/lib/ref-lookup.js';
 
 let tempDir: string;
 let originalPaHome: string | undefined;
@@ -436,6 +436,38 @@ describe('lookupTrace / lookupTraceByUpdate — turn-traces.jsonl sidecar lookup
       { run_id: 'r-a', thread_id: 100, update_id: 500, outcome: 'ok' },
     ]);
     assert.equal(await lookupTraceByUpdate(999, 500), null);
+  });
+
+  it('lookupTraceByTaskRef matches the task_ref line', async () => {
+    await writeTraces([
+      { run_id: 'r-a', outcome: 'ok' }, // legacy line (pre-AI-197): no task_ref
+      { run_id: 'r-b', task_ref: 'tt-abc123', outcome: 'ok', worker: 'agy' },
+    ]);
+    const result = await lookupTraceByTaskRef('tt-abc123');
+    assert.ok(result);
+    assert.equal(result!.run_id, 'r-b');
+  });
+
+  it('lookupTraceByTaskRef returns the tail-most of two same-ref lines', async () => {
+    await writeTraces([
+      { run_id: 'r-1', task_ref: 'tt-dup', outcome: 'ok', ts_start: 'a' },
+      { run_id: 'r-2', task_ref: 'tt-dup', outcome: 'error', ts_start: 'b' },
+    ]);
+    const result = await lookupTraceByTaskRef('tt-dup');
+    assert.ok(result);
+    assert.equal(result!.run_id, 'r-2', 'returns the LAST matching line');
+  });
+
+  it('lookupTraceByTaskRef returns null on a miss — a legacy line with no task_ref still parses and never matches', async () => {
+    await writeTraces([
+      { run_id: 'r-legacy', outcome: 'ok' }, // pre-AI-197 trace: no task_ref field
+      { run_id: 'r-other', task_ref: 'tt-other', outcome: 'ok' },
+    ]);
+    assert.equal(await lookupTraceByTaskRef('tt-abc123'), null);
+  });
+
+  it('lookupTraceByTaskRef returns null when the file is missing', async () => {
+    assert.equal(await lookupTraceByTaskRef('tt-anything'), null);
   });
 });
 

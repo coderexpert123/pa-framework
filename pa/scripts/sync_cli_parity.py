@@ -1,7 +1,7 @@
 """
 Sync the portable "CLI-PARITY" regions of the global Claude Code brain file
-(~/.claude/CLAUDE.md) into Gemini CLI's and Antigravity's own global rule
-files, without touching either file's live-appended memory section.
+(~/.claude/CLAUDE.md) into the other CLI harnesses' own global rule files,
+without touching any file's live-appended memory or its native sections.
 
 Why not a symlink: Gemini CLI's save_memory tool appends facts to exactly
 these files under a "## Gemini Added Memories" heading, loaded as context in
@@ -22,15 +22,25 @@ On first run (no CLI-PARITY markers yet in the target), each region is
 spliced in by matching the target's OWN existing heading span (migrating an
 already-hand-ported copy in place) and falls back to inserting right after
 "## Gemini Added Memories" only if that heading doesn't exist in the target
-at all. Once markers exist, subsequent syncs replace only the marked content.
+at all. The first run then deletes any REMAINING unmarked copy of a heading
+the canonical region itself carries, so a target whose native sections are
+interleaved with the ported ones (~/.codex/instructions.md keeps "## Codex
+Harness" between "## Working Principles" and "## Brain Bootstrap") does not
+end up with the tail half of the region duplicated. Once markers exist,
+subsequent syncs replace only the marked content and never delete anything.
 
 Usage:
   python sync_cli_parity.py --check <target>   # print diff, exit 1 if drift
   python sync_cli_parity.py --apply <target>   # write target file(s)
 
 <target> is one of:
-  gemini   ~/.gemini/GEMINI.md (classic Gemini CLI)
-  agy      ~/.gemini/antigravity-cli/GEMINI.md AND AGY.md (Antigravity)
+  brain files
+    gemini        ~/.gemini/GEMINI.md (classic Gemini CLI)
+    agy           ~/.gemini/antigravity-cli/GEMINI.md AND AGY.md (Antigravity)
+    codex         ~/.codex/instructions.md (Codex CLI)
+  skill catalogs (mirrors of the portable subset of ~/.claude/skills/)
+    skills        ~/.gemini/config/skills/   (shared: Gemini CLI + Antigravity)
+    codex-skills  ~/.codex/skills/           (Codex CLI)
 """
 import argparse
 import difflib
@@ -42,10 +52,12 @@ CLAUDE_MD_PATH = os.path.expanduser("~/.claude/CLAUDE.md")
 GEMINI_MD_PATH = os.path.expanduser("~/.gemini/GEMINI.md")
 AGY_DIR = os.path.expanduser("~/.gemini/antigravity-cli")
 AGY_TARGET_PATHS = [os.path.join(AGY_DIR, "GEMINI.md"), os.path.join(AGY_DIR, "AGY.md")]
+CODEX_INSTRUCTIONS_PATH = os.path.expanduser("~/.codex/instructions.md")
 
 TARGETS = {
     "gemini": [GEMINI_MD_PATH],
     "agy": AGY_TARGET_PATHS,
+    "codex": [CODEX_INSTRUCTIONS_PATH],
 }
 
 CLAUDE_SKILLS_DIR = os.path.expanduser("~/.claude/skills")
@@ -53,6 +65,10 @@ CLAUDE_SKILLS_DIR = os.path.expanduser("~/.claude/skills")
 # scope across Gemini CLI, Antigravity IDE, and Antigravity CLI — one mirror
 # target covers both `gemini` and `agy`, unlike the brain files above.
 SHARED_SKILLS_DIR = os.path.expanduser("~/.gemini/config/skills")
+# Codex CLI reads its own skills from ~/.codex/skills/. The mirror is
+# ADDITIVE per skill name: it replaces the allowlisted directories wholesale
+# and never touches Codex-native skills sitting beside them.
+CODEX_SKILLS_DIR = os.path.expanduser("~/.codex/skills")
 
 # Reviewed 2026-07-29 against ~/.claude/skills/ (22 skills total):
 # - claude-sync EXCLUDED unconditionally — syncs Claude Code's own files by
@@ -65,6 +81,9 @@ SHARED_SKILLS_DIR = os.path.expanduser("~/.gemini/config/skills")
 #   slash-command reference in Antigravity's catalog.
 # Everything below scanned clean (no Claude-only tool names, no dependency
 # on an excluded skill).
+# NOTE: ~/.local/bin/codex-sync.ps1 carries a copy of this list as
+# $derivedSkills so its push can exclude derived skills from the CodexSettings
+# snapshot. gate_c_allowlist.py fails if the two lists ever disagree.
 SKILL_MIRROR_ALLOWLIST = [
     "cloudflare", "cloudflare-email-service", "cloudflare-one",
     "cloudflare-one-migrations", "durable-objects", "sandbox-sdk",
@@ -72,6 +91,12 @@ SKILL_MIRROR_ALLOWLIST = [
     "turnstile-spin", "transcription", "itr-tax-docs",
     "ultrathink", "check-brain",
 ]
+
+# Mirror targets: one CLI-visible target name per destination catalog.
+MIRROR_TARGETS = {
+    "skills": SHARED_SKILLS_DIR,
+    "codex-skills": CODEX_SKILLS_DIR,
+}
 
 # end_heading=None means "to the next top-level '## ' heading, or EOF".
 REGIONS = [
@@ -85,6 +110,8 @@ END_MARKER = "<!-- CLI-PARITY:END:{name} -->"
 MEMORIES_HEADING = "## Gemini Added Memories"
 
 _NEXT_H2_RE = re.compile(r"^## ", re.MULTILINE)
+_H2_LINE_RE = re.compile(r"^## .+$", re.MULTILINE)
+_ANY_BEGIN_MARKER_RE = re.compile(r"<!-- CLI-PARITY:BEGIN:([A-Za-z0-9_-]+) -->")
 
 
 def _find_heading_span(text, start_heading, end_heading):
@@ -145,32 +172,135 @@ def extract_region(claude_text, region):
     return claude_text[start:end_idx].rstrip("\n")
 
 
-# Neither Gemini CLI nor Antigravity IS Claude Code (unlike zclaude, which
-# literally is the Claude Code binary) — verbatim Claude-Code-flavored
-# phrasing would regress the generalization the 2026-06-25 antigravity-cli
-# hand-port already did by hand (e.g. "managed by the agent" instead of
-# "managed by Claude Code"). Matches CLAUDE.md whether backtick-wrapped or
-# bare; skips anything already expanded (idempotent re-apply).
-# Two fixed-backtick alternatives rather than independently-optional
-# backticks — an optional-on-both-ends pattern lets the regex engine
-# backtrack past the negative lookahead by simply not consuming the closing
-# backtick, silently defeating idempotency.
-_CLAUDE_MD_RE = re.compile(r"`CLAUDE\.md`(?!/`AGY\.md`/`GEMINI\.md`)|(?<!`)CLAUDE\.md(?!`)(?!/AGY\.md/GEMINI\.md)")
+# No other harness IS Claude Code (unlike zclaude, which literally is the
+# Claude Code binary) — verbatim Claude-Code-flavored phrasing would regress
+# the generalization the 2026-06-25 antigravity-cli hand-port already did by
+# hand (e.g. "managed by the agent" instead of "managed by Claude Code").
+#
+# The substitutions are PER TARGET: each harness names its own project brain
+# file (Antigravity reads AGY.md/GEMINI.md, Codex reads AGENTS.md) and its own
+# bootstrap marker. The agy/gemini profile reproduces the pre-2026-09-04
+# hard-coded strings byte for byte — see
+# test_agy_profile_pattern_is_the_historic_literal.
+GENERALIZE_PROFILES = {
+    "gemini": {"brain_files": ["AGY.md", "GEMINI.md"],
+               "needs_brain": [".gemini-needs-brain", ".agy-needs-brain"]},
+    "agy": {"brain_files": ["AGY.md", "GEMINI.md"],
+            "needs_brain": [".gemini-needs-brain", ".agy-needs-brain"]},
+    "codex": {"brain_files": ["AGENTS.md"],
+              "needs_brain": [".codex-needs-brain"]},
+}
+DEFAULT_GENERALIZE_PROFILE = GENERALIZE_PROFILES["agy"]
+
+
+def _claude_md_re(brain_files):
+    """Match CLAUDE.md whether backtick-wrapped or bare; skip anything
+    already expanded (idempotent re-apply). Two fixed-backtick alternatives
+    rather than independently-optional backticks — an optional-on-both-ends
+    pattern lets the regex engine backtrack past the negative lookahead by
+    simply not consuming the closing backtick, silently defeating
+    idempotency."""
+    backticked = "/".join("`%s`" % name for name in brain_files)
+    bare = "/".join(brain_files)
+    pattern = (
+        r"`CLAUDE\.md`(?!" + re.escape("/" + backticked) + r")"
+        + r"|(?<!`)CLAUDE\.md(?!`)(?!" + re.escape("/" + bare) + r")"
+    )
+    return re.compile(pattern)
+
+
+def _expand_claude_md(m, brain_files):
+    if m.group(0).startswith("`"):
+        return "`CLAUDE.md`/" + "/".join("`%s`" % name for name in brain_files)
+    return "CLAUDE.md/" + "/".join(brain_files)
+
+
+def _needs_brain_replacement(needs_brain):
+    return "`.claude-needs-brain` (or " + ", ".join("`%s`" % name for name in needs_brain) + ")"
+
+
 _NEEDS_BRAIN_RE = re.compile(r"`\.claude-needs-brain`(?!\s*\(or)")
 _MANAGED_BY_RE = re.compile(r"\bmanaged by Claude Code\b")
 
 
-def _expand_claude_md(m):
-    return "`CLAUDE.md`/`AGY.md`/`GEMINI.md`" if m.group(0).startswith("`") else "CLAUDE.md/AGY.md/GEMINI.md"
-
-
-def generalize_for_non_claude(content):
+def generalize_for_non_claude(content, profile=None):
     """Applied to extracted CLAUDE.md content before splicing into any
-    non-Claude-Code target. Pure function — no I/O."""
-    content = _CLAUDE_MD_RE.sub(_expand_claude_md, content)
-    content = _NEEDS_BRAIN_RE.sub("`.claude-needs-brain` (or `.gemini-needs-brain`, `.agy-needs-brain`)", content)
+    non-Claude-Code target. Pure function — no I/O. `profile` defaults to the
+    agy/gemini profile so existing callers keep their exact output."""
+    if profile is None:
+        profile = DEFAULT_GENERALIZE_PROFILE
+    brain_files = profile["brain_files"]
+    content = _claude_md_re(brain_files).sub(
+        lambda m: _expand_claude_md(m, brain_files), content)
+    needs_brain_text = _needs_brain_replacement(profile["needs_brain"])
+    content = _NEEDS_BRAIN_RE.sub(lambda _m: needs_brain_text, content)
     content = _MANAGED_BY_RE.sub("managed by the agent", content)
     return content
+
+
+def _owned_headings(region_content):
+    """Every top-level '## ' heading the canonical region content itself
+    defines, in order, de-duplicated. On the first-run migration path these
+    are exactly the target's own sections that the marked block now
+    supersedes."""
+    seen = []
+    for m in _H2_LINE_RE.finditer(region_content):
+        heading = m.group(0).rstrip()
+        if heading not in seen:
+            seen.append(heading)
+    return seen
+
+
+def _marked_ranges(text):
+    """(start, end) offsets of every COMPLETE CLI-PARITY BEGIN..END pair.
+    Content inside these is never treated as a stale copy."""
+    ranges = []
+    for m in _ANY_BEGIN_MARKER_RE.finditer(text):
+        end_marker = END_MARKER.format(name=m.group(1))
+        e = text.find(end_marker, m.end())
+        if e != -1:
+            ranges.append((m.start(), e + len(end_marker)))
+    return ranges
+
+
+def _find_unmarked_heading_span(text, heading):
+    """First occurrence of `heading` that sits OUTSIDE every marker pair,
+    as a (start, end) span running to the next top-level '## ' heading, the
+    start of the next marker pair, or EOF — whichever comes first. None when
+    every occurrence is inside a marked block (or there is none)."""
+    protected = _marked_ranges(text)
+    pos = 0
+    while True:
+        start = text.find(heading, pos)
+        if start == -1:
+            return None
+        if any(a <= start < b for a, b in protected):
+            pos = start + len(heading)
+            continue
+        after_start_line = text.find("\n", start) + 1
+        if after_start_line == 0:
+            after_start_line = len(text)
+        end = len(text)
+        m = _NEXT_H2_RE.search(text, after_start_line)
+        if m:
+            end = m.start()
+        for a, b in protected:
+            if start < a < end:
+                end = min(end, a)
+        return (start, end)
+
+
+def _remove_stale_heading_sections(text, headings):
+    """Delete the target's own unmarked copies of `headings`. Pure function —
+    no I/O. Called ONLY on the first-run (no markers yet) migration path, so a
+    section a user later adds by hand next to the markers is never eaten."""
+    for heading in headings:
+        while True:
+            span = _find_unmarked_heading_span(text, heading)
+            if span is None:
+                break
+            text = text[:span[0]] + text[span[1]:]
+    return text
 
 
 def splice_region_into_target(target_text, region, region_content):
@@ -189,42 +319,50 @@ def splice_region_into_target(target_text, region, region_content):
     span = _find_heading_span(target_text, region["start_heading"], region["end_heading"])
     if span is not None:
         start, end = span
-        return target_text[:start] + wrapped + "\n\n" + target_text[end:]
+        migrated = target_text[:start] + wrapped + "\n\n" + target_text[end:]
+    else:
+        # Heading doesn't exist in target at all — insert right after the
+        # CLI's own memory section so that stays the first thing it reads.
+        mem_span = _find_heading_span(target_text, MEMORIES_HEADING, None)
+        if mem_span is not None:
+            insert_at = mem_span[1]
+            migrated = target_text[:insert_at] + "\n\n" + wrapped + "\n" + target_text[insert_at:]
+        else:
+            # No memories heading either — insert after any CLI-PARITY
+            # block(s) already spliced in earlier in this same call
+            # (preserves region order when multiple regions all hit this
+            # fallback), else at the very top.
+            last_end = -1
+            marker = "<!-- CLI-PARITY:END:"
+            idx = target_text.find(marker)
+            while idx != -1:
+                close = target_text.find("-->", idx)
+                if close != -1:
+                    last_end = close + len("-->")
+                idx = target_text.find(marker, close if close != -1 else idx + 1)
+            if last_end == -1:
+                migrated = wrapped + "\n\n" + target_text
+            else:
+                migrated = target_text[:last_end] + "\n\n" + wrapped + target_text[last_end:]
 
-    # Heading doesn't exist in target at all — insert right after the
-    # CLI's own memory section so that stays the first thing it reads.
-    mem_span = _find_heading_span(target_text, MEMORIES_HEADING, None)
-    if mem_span is not None:
-        insert_at = mem_span[1]
-        return target_text[:insert_at] + "\n\n" + wrapped + "\n" + target_text[insert_at:]
-
-    # No memories heading either — insert after any CLI-PARITY block(s)
-    # already spliced in earlier in this same call (preserves region order
-    # when multiple regions all hit this fallback), else at the very top.
-    last_end = -1
-    marker = "<!-- CLI-PARITY:END:"
-    idx = target_text.find(marker)
-    while idx != -1:
-        close = target_text.find("-->", idx)
-        if close != -1:
-            last_end = close + len("-->")
-        idx = target_text.find(marker, close if close != -1 else idx + 1)
-    if last_end == -1:
-        return wrapped + "\n\n" + target_text
-    return target_text[:last_end] + "\n\n" + wrapped + target_text[last_end:]
+    # The target's end_heading may be absent (e.g. ~/.codex/instructions.md
+    # has no "## Machine Notes"), in which case the heading-span match above
+    # only consumed the region's FIRST section and the rest of the ported
+    # copy is still sitting further down the file. Sweep those away now.
+    return _remove_stale_heading_sections(migrated, _owned_headings(region_content))
 
 
-def sync_all_regions(claude_text, target_text):
+def sync_all_regions(claude_text, target_text, profile=None):
     """Apply all REGIONS in order. Pure function — no I/O."""
     for region in REGIONS:
         content = extract_region(claude_text, region)
-        content = generalize_for_non_claude(content)
+        content = generalize_for_non_claude(content, profile=profile)
         target_text = splice_region_into_target(target_text, region, content)
     return target_text
 
 
-def has_drift(claude_text, target_text):
-    return sync_all_regions(claude_text, target_text) != target_text
+def has_drift(claude_text, target_text, profile=None):
+    return sync_all_regions(claude_text, target_text, profile=profile) != target_text
 
 
 def _dirs_equal(a, b):
@@ -255,8 +393,10 @@ def mirror_skill_catalog(claude_skills_dir=CLAUDE_SKILLS_DIR, shared_skills_dir=
     each allowlisted skill's whole directory tree from claude_skills_dir into
     shared_skills_dir. Wholesale replace per skill on re-run (remove then
     copy), not a file-by-file merge, so a stale mirrored file left over from
-    a shrunk source skill doesn't linger. Returns a list of
-    (name, changed, note) tuples; note is None unless the source is missing."""
+    a shrunk source skill doesn't linger. Names outside the allowlist are
+    never read, written or deleted, so a harness's own native skills survive
+    beside the mirrored ones. Returns a list of (name, changed, note) tuples;
+    note is None unless the source is missing."""
     import shutil
 
     results = []
@@ -286,14 +426,18 @@ def _write(path, text):
         f.write(text)
 
 
-def run(target_name, apply, claude_md_path=CLAUDE_MD_PATH, targets=TARGETS, out=sys.stdout):
+def run(target_name, apply, claude_md_path=CLAUDE_MD_PATH, targets=TARGETS, out=sys.stdout,
+        profile=None):
     """Returns exit code: 0 if no drift (or successfully applied), 1 if
-    --check found drift."""
+    --check found drift. `profile` defaults to the generalization profile
+    registered for target_name, then to the agy/gemini profile."""
+    if profile is None:
+        profile = GENERALIZE_PROFILES.get(target_name, DEFAULT_GENERALIZE_PROFILE)
     claude_text = _read(claude_md_path)
     exit_code = 0
     for path in targets[target_name]:
         target_text = _read(path)
-        new_text = sync_all_regions(claude_text, target_text)
+        new_text = sync_all_regions(claude_text, target_text, profile=profile)
         if new_text == target_text:
             print(f"{path}: no drift", file=out)
             continue
@@ -321,10 +465,10 @@ def main(argv=None):
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check", action="store_true")
     mode.add_argument("--apply", action="store_true")
-    parser.add_argument("target", choices=sorted(TARGETS) + ["skills"])
+    parser.add_argument("target", choices=sorted(TARGETS) + sorted(MIRROR_TARGETS))
     args = parser.parse_args(argv)
-    if args.target == "skills":
-        return run_skill_mirror(args.apply)
+    if args.target in MIRROR_TARGETS:
+        return run_skill_mirror(args.apply, shared_skills_dir=MIRROR_TARGETS[args.target])
     return run(args.target, args.apply)
 
 

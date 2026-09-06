@@ -1,6 +1,7 @@
 import type { ConversationState } from './types.js';
 import type { TopicNameMap } from './topic-names.js';
 import { getTopicBrainInfo } from './topic-brains.js';
+import { renderTopicSourcesSection } from './sources.js';
 
 // Import pa modules from compiled output
 import { listSkills } from '../../../pa/dist/src/skills.js';
@@ -315,6 +316,7 @@ export async function buildPrompt(
 - When a CLI tool offer appears mid-turn saying a command was sent to the background and "YOU MUST TAKE ONE OF THE FOLLOWING TWO ACTIONS" (A) do other work or (B) update the user and end the turn: option B is FORBIDDEN here. There is no human watching a terminal; any text you emit ends the turn and is posted to Telegram as your final answer. Choose A: keep working inside this same turn, poll or re-check the command's output with a normal tool call until you have the result, then answer with the result. If the command will outlive this turn, emit a \`watch_job\` PA_META action instead and state that the watch is registered — never state that you will report back later.
 - Blocked on Google auth mid-task: mint a resumable reauth link instead of exiting — run python <repo>/pa/scripts/start_google_telegram_reauth.py --redirect-uri <GOOGLE_AUTH_REDIRECT_URI from ~/.pa/secrets.env> --chat-id <chat> --thread-id <thread> (IDs from your Telegram Metadata section; <repo> from your Working Directory section) --resume-action-json '{"type":"topic_resume","prompt":"<the waiting work, one line, <=500 chars>"}'. The link posts to that chat/thread, and once the user completes /auth the bot re-dispatches your prompt into the topic automatically as a system turn. For a skill-shaped blockage prefer telling the user to run /reauth <skill-name>. Never mint a mid-task reauth link without a resume payload.
 - Cross-topic delivery goes through the sanctioned path only: run \`pa notify --topic-thread <id>\` and file the topic note it asks for. NEVER call the Telegram Bot API directly — no api.telegram.org calls, no sendMessage, no bot-token fetches; no scratch scripts, no curl, no SDK. Raw sends bypass ref-minting, app logging, and the target topic's queue/history (the target never sees them as updates).
+- Scheduled reminders: run python <repo>/projects/reminders/add_reminder.py "<iso_time>" "<message>" <chat_id> [thread_id] (<repo> from your Working Directory section; processed every minute). Reminder messages are operator-facing: \`message\` must be plain language a person can act on, never an instruction for a future assistant session. Schedule work for a future session with \`--resume-action-json\` instead — it dispatches into the topic queue, and pass \`--no-keyboard\` for system-executed work: buttons render only when a human decision is genuinely required.
 ${kbSourcesLine}
 - Shared working tree: other sessions, skills and agents write this repo at the same time you do.
 - Before editing a tracked file, run \`pa claims\`; if your path appears under an active reservation or in the recently-modified list, say so and pick different work rather than editing over it.
@@ -402,12 +404,20 @@ ${kbSourcesLine}
     ? `\n## Topic\n${topicDesc}${brainPointerLine}${recallPointerLine}${decisionPointerLine}\n`
     : '';
 
+  // Per-topic grounding sources (grounding v2, 2026-09-06, internal design):
+  // read FRESH per prompt (no cache — deliberate contrast with skillStatusCache
+  // above) and rendered after the Topic section. Renders '' when the topic
+  // declares none, so prompts stay byte-identical for topics that never ran
+  // /sources. Deliberately NOT gated on omitStatic/pendingAction — declared
+  // grounding is dynamic per-topic content, like the topic-brain pointer.
+  const sourcesSection = await renderTopicSourcesSection(state);
+
   const telegramMeta = `\n## Telegram Metadata\nChat ID: ${state.chat_id}\nThread ID: ${state.thread_id}\n`;
 
   const capabilitiesSection = capabilities ? `\n${capabilities}` : '';
 
   return `${identity}Today is ${today}. Current time (IST): ${now}.
-${cwdSection}${skillStatusSection}${topicSection}${openItemsSection}${standingRulesSection}${telegramMeta}
+${cwdSection}${skillStatusSection}${topicSection}${sourcesSection}${openItemsSection}${standingRulesSection}${telegramMeta}
 ## Conversation History
 ${historySection}
 ${priorContextSection}

@@ -26,6 +26,10 @@
  */
 import { randomUUID } from 'crypto';
 import { analyzeConversationPatterns } from './analyzer.js';
+import { runWithFailover } from './workers.js';
+import { readTaskLaneActivity, enrichTaskLaneActivity, formatTaskLanePromptSection, formatTaskLaneReportLine } from './lib/task-lane-activity.js';
+import type { TaskLaneActivity } from './lib/task-lane-activity.js';
+import { lookupTraceByTaskRef } from './lib/ref-lookup.js';
 import { analyzeFailurePatterns, checkForRollbacks, readRecentFailures, censusProposals } from './failure-analyzer.js';
 import type { FailureRecord } from './failure-analyzer.js';
 import { attemptCodeFix, CHURN_PATHSPEC_ARGS, isChurnPath, parsePorcelainPaths, popChurn, stashChurn, GIT_WORKFLOW_RESOURCE, GIT_LOCK_WAIT_MS } from './code-fixer.js';
@@ -544,9 +548,9 @@ interface GeneratedProposals {
  * tagged sourceType 'failure' (decision (h) — they ARE failure evidence; a new sourceType
  * union member would ripple into types.ts/drafts.ts/improvement-audit.ts for no gain).
  */
-async function generateProposals(census?: AlertCensus): Promise<GeneratedProposals> {
+async function generateProposals(census?: AlertCensus, taskLane?: TaskLaneActivity): Promise<GeneratedProposals> {
   const [conversationProposals, failureProposals, feedbackProposals] = await Promise.all([
-    analyzeConversationPatterns(ANALYSIS_DAYS),
+    analyzeConversationPatterns(ANALYSIS_DAYS, runWithFailover, formatTaskLanePromptSection(taskLane)),
     analyzeFailurePatterns(ANALYSIS_DAYS),
     analyzeFeedbackPatterns(ANALYSIS_DAYS),
   ]);
@@ -909,6 +913,7 @@ export function buildReport(
   purgedCount: number = 0,
   census?: AlertCensus,
   censusError?: string,
+  taskLaneLine?: string | null,
 ): string {
   const applied = entries.filter((e) => e.outcome === 'approved-new-skill' || e.outcome === 'applied-fix' || e.outcome === 'applied-code-fix');
   const pending = entries.filter((e) => e.outcome === 'validation-failed-pending');
@@ -924,6 +929,9 @@ export function buildReport(
   // alerts/day fired is exactly the failure this line exists to make impossible (2026-08-23,
   // the 2026-08-23 alerts-week review §4).
   lines.push(census ? census.topLine : `Alert census unavailable: ${censusError ?? 'not built'}`);
+  // AI-197: one task-lane activity line, only when there WAS activity (a
+  // task-lane-zero night is the normal state and stays silent).
+  if (taskLaneLine) lines.push(taskLaneLine);
   lines.push('');
 
   if (rollbackLines.length > 0) {
@@ -1302,10 +1310,14 @@ async function main() {
     censusError = String(err?.message ?? err);
     return undefined;
   });
-  const { toGate, skipped } = await generateProposals(census);
+  // AI-197: task-lane activity (the topic-event log) as the fifth analyzer input —
+  // same never-abort discipline as the census above: a read or trace-join failure
+  // degrades to an unrendered prompt section / no report line, never a failed run.
+  const taskLane = await readTaskLaneActivity({ days: ANALYSIS_DAYS }).then((a) => enrichTaskLaneActivity(a, lookupTraceByTaskRef)).catch(() => undefined);
+  const { toGate, skipped } = await generateProposals(census, taskLane);
   const gateEntries = await gateAndApprove(toGate, { regenerateProposalFn: regenerateProposal });
   const entries = [...skipped, ...gateEntries];
-  const report = buildReport(rollbackLines, entries, staleCount, purgedCount, census, censusError);
+  const report = buildReport(rollbackLines, entries, staleCount, purgedCount, census, censusError, formatTaskLaneReportLine(taskLane));
 
   // Local visibility only (captured in this run's own .log file) — NOT what gets delivered
   // to Telegram. See the file header for why: the skill has no telegram_output, precisely so

@@ -357,3 +357,14 @@ git_workflow:
 #   # or transliterate rather than fail outright. Leave unset (null) to auto-detect.
 #   language: null
 
+# === Voice inbox app (projects/voice-inbox) ===
+# Optional block. Omit it and only the voice-inbox app is unconfigured. The
+# app server refuses to start until inbox_topic names the topic that receives
+# new tasks. Env overrides: VOICE_INBOX_PORT, VOICE_INBOX_INBOX_TOPIC.
+# voice_inbox:
+#   inbox_topic: "CHATID_THREADID"  # REQUIRED "<chatId>_<threadId>" topic key
+#   port: 8787                      # binds 127.0.0.1 only
+#   max_upload_mb: 25
+#   session_ttl_hours: 168          # pairing session lifetime (7 days)
+#   pairing_ttl_minutes: 10         # one-time pairing-code lifetime
+

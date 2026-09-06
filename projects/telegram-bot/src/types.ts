@@ -138,6 +138,12 @@ export interface ModelStatusSnapshot {
   default_effort?: string;
 }
 
+export interface TopicSource {
+  path: string;      // absolute, backslashes folded to '/', trimmed
+  label?: string;    // short display label; defaults to basename(path) at add time
+  added_at?: string; // ISO — stored for audit; NOT rendered in v1
+}
+
 export interface ConversationState {
   chat_id: number;
   last_update_id: number;         // only meaningful in the global state file; 0 in per-topic files
@@ -149,6 +155,15 @@ export interface ConversationState {
   preferred_worker?: string;      // 'agy' | 'claude' | 'zclaude' | 'codex' — overrides config priority order
   preferred_worker_set_at?: string; // ISO timestamp when preferred_worker was set — cleared at IST midnight
   cwd_override?: string;          // absolute path — overrides BOT_CWD for all worker dispatches in this topic
+  sources?: TopicSource[]; // per-topic grounding sources (/sources) — read
+                           // fresh and injected into every fresh dispatch
+                           // prompt (grounding v2, 2026-09-06)
+  // AI-203: per-topic orchestrator mode (first increment). true = the topic's
+  // non-command messages dispatch to the ORCHESTRATOR conversation (same
+  // `session` slot, routing role) instead of the execution session; the
+  // /orchestrator command sets/clears it and clears `session` on every role
+  // switch so the two roles never share a CLI conversation.
+  orchestrator_enabled?: boolean;
   // --- Worker tunables (/llm, /effort) -------------------------------------
   // Both stores are WORKER-SCOPED (worker -> setting -> value). Keying by worker
   // is what makes `/model gemini-3.7-flash-high` unable to inherit agy's effort setting: only
@@ -195,6 +210,13 @@ export interface PAMetaAction {
   text?: string;      // the question, <=500 chars
   options?: string[]; // 1..4 strings, <=40 chars each
   task_id?: string;   // optional, <=64 chars [A-Za-z0-9_-]* — links the answer to a queued task
+  // AI-203 orchestrator actions (first increment): spawn_thread{title,prompt} and
+  // steer_thread{thread_id,message} — same optional-field pattern as above;
+  // validated in orchestrator.ts before any store write.
+  title?: string;     // for spawn_thread: thread title, 1..80 chars
+  prompt?: string;    // for spawn_thread: self-contained thread goal, 1..4000 chars
+  thread_id?: string; // for steer_thread: `t-<n>` matching a store record
+  message?: string;   // for steer_thread: the steer text, 1..4000 chars
 }
 
 export interface PAMeta {

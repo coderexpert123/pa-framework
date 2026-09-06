@@ -23,6 +23,8 @@ _deprecated/
 
 # Claude Code
 .claude/settings.local.json
+# Machine-local MCP client config (implicit-eval brain server)
+.mcp.json
 
 # Python
 __pycache__/

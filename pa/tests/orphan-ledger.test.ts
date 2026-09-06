@@ -4,6 +4,7 @@ import { readFile } from 'fs/promises';
 import { createTempPaHome, cleanup } from './helpers.js';
 import type { GitRunner } from '../src/lib/tree-drift.js';
 import type { OrphanLedgerRecord } from '../src/lib/orphan-ledger.js';
+import type { TopicOwnershipRegistry, TopicOwnershipRow } from '../src/lib/topic-ownership.js';
 import type { DailyReconDeps } from '../src/lib/maintenance/jobs/daily-recon.js';
 import { exclusiveLockKey } from '../src/commands/run.js';
 import { BUILD_LOCK_RESOURCE } from '../src/lib/build-lock.js';
@@ -27,6 +28,14 @@ function ledgerRec(paths: string[], ownerTopic: string | null, ts = '2026-09-02T
     source: 'dispatch-close',
     released_at: null,
   };
+}
+
+/** Synthetic ids only — the bot test-fixture rule (never real chat/thread
+ *  ids in fixtures). */
+const CHAT = '-1001234567890';
+
+function registryOf(...rows: Array<[string, TopicOwnershipRow]>): TopicOwnershipRegistry {
+  return new Map(rows);
 }
 
 interface AppendCall {
@@ -82,12 +91,19 @@ function makeDeps(overrides: Partial<DailyReconDeps> = {}): {
     appendTaskFn: append.fn,
     repoRootFn: async () => 'C:/fake/repo',
     loadSupportTopicFn: async () => undefined,
+    loadRegistryFn: async () => registryOf(),
     ...overrides,
   };
   return { deps, git, append };
 }
 
-async function readStateFile(): Promise<{ ran_at: string; groups: Array<{ owner: string; paths_n: number; filed: boolean }>; unknown_n: number } | null> {
+async function readStateFile(): Promise<{
+  ran_at: string;
+  groups: Array<{ owner: string; paths_n: number; filed: boolean; source?: 'ledger' | 'registry' }>;
+  unknown_n: number;
+  registry_rows?: number;
+  catch_all?: string | null;
+} | null> {
   const { dailyReconStatePath } = await import('../src/lib/maintenance/jobs/daily-recon.js');
   try {
     return JSON.parse(await readFile(dailyReconStatePath(), 'utf8'));
@@ -335,7 +351,7 @@ describe('orphan-ledger', () => {
       assert.equal(call.task.createdBy, 'session:daily-recon');
 
       const state = await readStateFile();
-      assert.deepEqual(state?.groups, [{ owner: '7366_42', paths_n: 2, filed: true }]);
+      assert.deepEqual(state?.groups, [{ owner: '7366_42', paths_n: 2, filed: true, source: 'ledger' }]);
       assert.equal(state?.unknown_n, 1, 'the never-ledgered untracked file lands in the unknown lane');
     });
 
@@ -408,7 +424,115 @@ describe('orphan-ledger', () => {
       assert.equal(result.touched, 1, 'the group still counts as touched work');
       assert.deepEqual(append.calls, []);
       const state = await readStateFile();
-      assert.deepEqual(state?.groups, [{ owner: 'not-a-topic-key', paths_n: 1, filed: false }]);
+      assert.deepEqual(state?.groups, [{ owner: 'not-a-topic-key', paths_n: 1, filed: false, source: 'ledger' }]);
+    });
+
+    it('registry attributes a dirty path with no ledger record to its owning topic', async () => {
+      const { runDailyRecon } = await import('../src/lib/maintenance/jobs/daily-recon.js');
+      const { deps, append } = makeDeps({
+        gitRunner: sweepGitRunner(' M projects/fitness-data-sync/scripts/a.py\n').fn,
+        loadRegistryFn: async () => registryOf([`${CHAT}_5002`, { owned: ['projects/fitness-data-sync'] }]),
+      });
+      const result = await runDailyRecon(deps);
+      assert.equal(result.touched, 1);
+      assert.equal(append.calls.length, 1);
+      assert.equal(append.calls[0].chatId, -1001234567890);
+      assert.equal(append.calls[0].threadId, 5002);
+      const state = await readStateFile();
+      assert.equal(state?.groups[0]?.source, 'registry');
+    });
+
+    it('ledger wins over the registry for the same path', async () => {
+      // Adjudication A: the ledger (who MADE the change) beats the registry
+      // (who OWNS the area) even when both name the same path.
+      const { runDailyRecon } = await import('../src/lib/maintenance/jobs/daily-recon.js');
+      const { deps, append } = makeDeps({
+        gitRunner: sweepGitRunner(' M proj/a.ts\n').fn,
+        readLedgerFn: async () => [ledgerRec(['proj/a.ts'], `${CHAT}_5001`)],
+        loadRegistryFn: async () => registryOf([`${CHAT}_5002`, { owned: ['proj'] }]),
+      });
+      await runDailyRecon(deps);
+      assert.equal(append.calls.length, 1);
+      assert.equal(append.calls[0].chatId, -1001234567890);
+      assert.equal(append.calls[0].threadId, 5001, 'the LEDGER topic wins, not the registry row');
+      const state = await readStateFile();
+      assert.equal(state?.groups[0]?.owner, `${CHAT}_5001`);
+      assert.equal(state?.groups[0]?.source, 'ledger');
+    });
+
+    it('registry attributes a path whose latest ledger record has a null owner', async () => {
+      // The null-record gap is exactly the registry's filling case: a
+      // null-owner latest record is no attribution, so the registry's next.
+      const { runDailyRecon } = await import('../src/lib/maintenance/jobs/daily-recon.js');
+      const { deps, append } = makeDeps({
+        gitRunner: sweepGitRunner(' M proj/a.ts\n').fn,
+        readLedgerFn: async () => [
+          ledgerRec(['proj/a.ts'], `${CHAT}_5001`, '2026-09-01T10:00:00.000Z'),
+          ledgerRec(['proj/a.ts'], null, '2026-09-02T10:00:00.000Z'),
+        ],
+        loadRegistryFn: async () => registryOf([`${CHAT}_5002`, { owned: ['proj'] }]),
+      });
+      await runDailyRecon(deps);
+      assert.equal(append.calls.length, 1);
+      assert.equal(append.calls[0].threadId, 5002);
+      const state = await readStateFile();
+      assert.equal(state?.groups[0]?.source, 'registry');
+    });
+
+    it('unknown lane routes to the registry catch-all via loadSupportTopic', async () => {
+      // Real consumer over real producer: the registry file lives on disk in
+      // the temp PA_HOME, loadRegistryFn AND loadSupportTopicFn are left at
+      // their REAL defaults, and the dirty path (owned by nothing) must reach
+      // the catch-all row through the actual loadSupportTopic seam.
+      const { runDailyRecon } = await import('../src/lib/maintenance/jobs/daily-recon.js');
+      const { writeFile } = await import('fs/promises');
+      const { topicOwnershipRegistryPath } = await import('../src/lib/topic-ownership.js');
+      await writeFile(
+        topicOwnershipRegistryPath(),
+        JSON.stringify({ [`${CHAT}_5002`]: { role: 'catch-all' } }),
+        'utf8',
+      );
+      const { deps, append } = makeDeps({
+        gitRunner: sweepGitRunner('?? scratch/who-owns-this.ts\n').fn,
+      });
+      delete deps.loadSupportTopicFn;
+      const result = await runDailyRecon(deps);
+      assert.equal(result.touched, 0);
+      assert.equal(append.calls.length, 1);
+      assert.equal(append.calls[0].chatId, -1001234567890);
+      assert.equal(append.calls[0].threadId, 5002);
+    });
+
+    it('no catch-all and no topics.support leaves unknown paths unfiled with the registry-aware warn', async () => {
+      const { runDailyRecon } = await import('../src/lib/maintenance/jobs/daily-recon.js');
+      const { deps, append } = makeDeps({
+        gitRunner: sweepGitRunner('?? scratch/who-owns-this.ts\n').fn,
+        loadRegistryFn: async () => registryOf([`${CHAT}_5001`, { owned: ['pa/src'] }]),
+      });
+      const result = await runDailyRecon(deps);
+      assert.equal(result.touched, 0);
+      assert.deepEqual(append.calls, []);
+      const state = await readStateFile();
+      assert.equal(state?.unknown_n, 1, 'behavior is identical to the pre-registry unset-knob case');
+    });
+
+    it('state records registry_rows, catch_all and per-group source', async () => {
+      const { runDailyRecon } = await import('../src/lib/maintenance/jobs/daily-recon.js');
+      const { deps, append } = makeDeps({
+        gitRunner: sweepGitRunner(' M ledger/a.ts\n M reg/b.ts\n?? scratch/unclaimed.ts\n').fn,
+        readLedgerFn: async () => [ledgerRec(['ledger/a.ts'], `${CHAT}_5001`)],
+        loadRegistryFn: async () =>
+          registryOf([`${CHAT}_5002`, { owned: ['reg'], role: 'catch-all' }]),
+      });
+      await runDailyRecon(deps);
+      assert.equal(append.calls.length, 2, 'the ledger group and the registry group each file one task');
+      const state = await readStateFile();
+      assert.equal(state?.registry_rows, 1);
+      assert.equal(state?.catch_all, `${CHAT}_5002`);
+      assert.equal(state?.unknown_n, 1, 'the unclaimed path stays in the unknown lane (support unset)');
+      const byOwner = new Map((state?.groups ?? []).map((g) => [g.owner, g.source]));
+      assert.equal(byOwner.get(`${CHAT}_5001`), 'ledger');
+      assert.equal(byOwner.get(`${CHAT}_5002`), 'registry');
     });
   });
 
@@ -502,7 +626,7 @@ describe('orphan-ledger', () => {
       assert.equal(tasks[0].created_by, 'session:daily-recon');
 
       const state = JSON.parse(await readF(dailyReconStatePath(), 'utf8'));
-      assert.deepEqual(state.groups, [{ owner: '7366_42', paths_n: 1, filed: true }]);
+      assert.deepEqual(state.groups, [{ owner: '7366_42', paths_n: 1, filed: true, source: 'ledger' }]);
       assert.equal(state.unknown_n, 0);
     });
   });

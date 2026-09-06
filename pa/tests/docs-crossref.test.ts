@@ -238,14 +238,25 @@ describe('docs cross-reference checker', () => {
     if (!existsSync(PROJECTS_DIR)) return;
 
     const failures: string[] = [];
+    // Named raise-class exceptions to the default 12k (documented in
+    // docs/CONVENTIONS.md's size-budget section). telegram-bot raised to
+    // 15,000 (2026-09-06): the backlog-blitz night added five real subsystem
+    // sections in one wave set (command router, topic sources, voice-inbox
+    // bridge + pin self-heal, orchestrator threads) — growth matched by
+    // capability, not prose drift, the same raise-class as the job/knob
+    // catalogs. An initial 14,000 estimate predated the orchestrator rows.
+    const projectClaudeBudgets: Record<string, number> = {
+      'telegram-bot': 15000,
+    };
     for (const entry of readdirSync(PROJECTS_DIR, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
       const claudeMdPath = join(PROJECTS_DIR, entry.name, 'CLAUDE.md');
       const content = readIfExists(claudeMdPath);
       if (content === null) continue;
       const len = budgetLength(content);
-      if (len > 12000) {
-        failures.push(`${claudeMdPath} is ${len} chars, over the 12,000-char budget`);
+      const budget = projectClaudeBudgets[entry.name] ?? 12000;
+      if (len > budget) {
+        failures.push(`${claudeMdPath} is ${len} chars, over the ${budget}-char budget`);
       }
     }
     assert.deepEqual(failures, [], failures.join('\n'));
@@ -311,6 +322,9 @@ describe('docs cross-reference checker', () => {
       // Budget raised 20,000 -> 23,000 (2026-09-03): the handover waves' new lib
       // modules (topic-tasks/-events/-executor, orphan-ledger, daily-recon, grammars)
       // pushed pa-lib and telegram-bot past 20k on legitimate per-module growth.
+      // Budget raised 23,000 -> 26,000 (2026-09-06): the backlog-blitz night added
+      // five bot modules in one wave set (command-router, orchestrator,
+      // thread-executor, session-capture, topic-threads) — same per-module class.
       // Budget raised to 110,000 for placement-registry.md only (2026-09-03,
       // placement wave-1): it is an every-item-exactly-once census index — 263
       // 12-column machine-checkable rows validated by the placement completeness
@@ -318,7 +332,7 @@ describe('docs cross-reference checker', () => {
       // Splitting it would break the checker's single-file contract; growth is
       // bounded by census re-gates (~4 bytes/char per row), not prose drift.
       const isPlacementRegistry = f === 'placement-registry.md';
-      const budget = isPlacementRegistry ? 110000 : isAutoManaged ? 23000 : 16000;
+      const budget = isPlacementRegistry ? 110000 : isAutoManaged ? 26000 : 16000;
       const len = budgetLength(content);
       if (len > budget) {
         failures.push(`inventory/${f} is ${len} chars, over its ${budget.toLocaleString()}-char budget`);
@@ -340,12 +354,15 @@ describe('docs cross-reference checker', () => {
     const content = readIfExists(join(REPO_ROOT, 'backlog', 'completed-index.md'));
     if (content === null) return; // absent in the public mirror and pre-Phase-4 checkouts
     const len = budgetLength(content);
+    // Budget raised 24,000 -> 25,000 (2026-09-06, backlog-blitz): three
+    // verified bug closures (AI-202/206/208) in one night — one row each,
+    // same monotone-lookup-table class.
     // Budget raised 21,000 -> 24,000 (2026-09-04, placement Phase-3): 16 DONE
     // items pruned from BACKLOG.md (back under its 12k gate) landed as index
     // rows; same monotone-lookup-table class as the 16k->20k raise.
     assert.ok(
-      len <= 24000,
-      `backlog/completed-index.md is ${len} chars, over the 24,000-char budget -- it's a lookup table, not an archive, and should stay scannable`
+      len <= 25000,
+      `backlog/completed-index.md is ${len} chars, over the 25,000-char budget -- it's a lookup table, not an archive, and should stay scannable`
     );
   });
 

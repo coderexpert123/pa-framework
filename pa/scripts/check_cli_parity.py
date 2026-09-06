@@ -1,7 +1,8 @@
 """
 On-demand drift checker for CLI brain/skill parity — a thin combined-report
-wrapper around sync_cli_parity.py's three --check targets (gemini, agy,
-skills). Not wired into any schedule/skill trigger in this pass (per
+wrapper around sync_cli_parity.py's --check targets (gemini, agy, codex for
+the brain files; skills, codex-skills for the mirrored skill catalogs). Not
+wired into any schedule/skill trigger in this pass (per
 the 2026-07-29 CLI/brain parity plan, Phase 4) — manual/
 on-demand only. A natural fit for the update-brain nightly cadence later,
 once proven stable unattended (brain-recheck's own cadence was folded into
@@ -20,7 +21,10 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sync_cli_parity as scp
 
-TARGETS = ["gemini", "agy", "skills"]
+# Order is the report order. Brain-file targets first, then the two skill
+# catalogs — a mirror target is dispatched by membership in
+# sync_cli_parity.MIRROR_TARGETS, never by hard-coded name.
+TARGETS = ["gemini", "agy", "skills", "codex", "codex-skills"]
 
 
 def check_target(name, out=sys.stdout):
@@ -31,8 +35,9 @@ def check_target(name, out=sys.stdout):
     than crashing the whole combined report."""
     buf = io.StringIO()
     try:
-        if name == "skills":
-            code = scp.run_skill_mirror(apply=False, out=buf)
+        if name in scp.MIRROR_TARGETS:
+            code = scp.run_skill_mirror(
+                apply=False, shared_skills_dir=scp.MIRROR_TARGETS[name], out=buf)
         else:
             code = scp.run(name, apply=False, out=buf)
         return (name, code, buf.getvalue(), None)

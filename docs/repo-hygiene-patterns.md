@@ -33,7 +33,7 @@ The root `.gitignore` is the source of truth. These patterns are auto-gitignored
 - `/oracle_output.txt` — oracle outputs
 
 ### LLM Worker Scratch Files
-- `**/glm-[0-9]*` — an LLM worker "goes agentic" and writes its response — or its error — to a file at cwd instead of returning text. `run_brief.py` documents this failure mode inline. The `glm-*` form is zclaude naming the dump after its own model, anywhere in the tree. When a new pattern appears, add it to `.gitignore` + `.gitignore-public` + `docs/CONVENTIONS.md` + root CLAUDE.md in one edit.
+- `**/glm-[0-9]*` — an LLM worker "goes agentic" and writes its response — or its error — to a file at cwd instead of returning text. `run_brief.py` documents this failure mode inline. The `glm-*` form is zclaude naming the dump after its own model, anywhere in the tree. When a new pattern appears, add it to `.gitignore` + a `.gitignore-public` Boundary-lines registry row (then `placement_gate.py gen --gitignore`) + `docs/CONVENTIONS.md` + root CLAUDE.md in one edit.
 
 **Note**: Personal-name patterns (e.g. medical .md reports at root) are intentionally NOT in `.gitignore` because the file ships to the public mirror — relies on agent discipline + file-type patterns instead; if one slips through, move it to `~/Documents/personal-imports/` manually.
 
@@ -71,7 +71,7 @@ These patterns apply recursively throughout the repository:
 
 ## When Adding New Patterns
 
-**When a new class of file appears repeatedly** at the root (a new export format, a new agent output, a new tool's artifacts): add the pattern to `.gitignore` + `.gitignore-public` + `docs/CONVENTIONS.md` + root CLAUDE.md in one edit. Don't accept "we'll just remember" — encode it.
+**When a new class of file appears repeatedly** at the root (a new export format, a new agent output, a new tool's artifacts): add the pattern to `.gitignore` + a `.gitignore-public` Boundary-lines registry row (then `placement_gate.py gen --gitignore`) + `docs/CONVENTIONS.md` + root CLAUDE.md in one edit. Don't accept "we'll just remember" — encode it.
 
 **For files the system GENERATES during daily working** (caches, state, per-run artifacts): `docs/CONVENTIONS.md` § "Generated / runtime files — decision tree" is the governing rule. The two load-bearing clauses are:
 - The ignore entry ships in the same change as the writer

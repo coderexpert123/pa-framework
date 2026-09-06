@@ -51,7 +51,7 @@ def parse_resume_action_json(resume_action_json):
     return resume_action
 
 
-def add_reminder(due_at_iso, message, chat_id, thread_id=None, resume_action=None):
+def add_reminder(due_at_iso, message, chat_id, thread_id=None, resume_action=None, requires_user_decision=None):
     # Validate BEFORE any file write, so a rejected resume action leaves
     # reminders.json untouched (same ERROR/exit-1 style as the ISO path below).
     if resume_action is not None:
@@ -62,6 +62,14 @@ def add_reminder(due_at_iso, message, chat_id, thread_id=None, resume_action=Non
         if reason:
             print(f"ERROR: Invalid resume action: {reason}", file=sys.stderr)
             sys.exit(1)
+    # AI-207 reminder-delivery wave (2026-09-05): a mint whose message merely
+    # duplicates the executable prompt would deliver the raw instruction as the
+    # operator-facing label. Rejected before any file write.
+    if resume_action is not None and message.strip() == str(resume_action.get("prompt", "")).strip():
+        print("ERROR: message must be a plain-language operator label, not the executable "
+              "instruction — put the instruction in --resume-action-json and a person-readable "
+              "summary in message", file=sys.stderr)
+        sys.exit(1)
 
     if not os.path.exists(REMINDERS_FILE):
         reminders = []
@@ -94,6 +102,10 @@ def add_reminder(due_at_iso, message, chat_id, thread_id=None, resume_action=Non
     # executable instruction (AI-185 §3.1).
     if resume_action is not None:
         new_reminder["resume_action"] = resume_action
+    # AI-207: stored ONLY when the minter passed --no-keyboard (or an explicit
+    # value) — a flagless mint leaves the key absent, the backward-compat pin.
+    if requires_user_decision is not None:
+        new_reminder["requires_user_decision"] = requires_user_decision
 
     reminders.append(new_reminder)
 
@@ -115,9 +127,13 @@ if __name__ == "__main__":
             sys.exit(1)
         resume_action_json = argv[idx + 1]
         argv = argv[:idx] + argv[idx + 2:]
+    # AI-207: presence flag — strip it, then translate to the explicit-false
+    # record key. No "force true" flag exists (text-only defaults to keyboard).
+    no_keyboard = "--no-keyboard" in argv
+    argv = [a for a in argv if a != "--no-keyboard"]
 
     if len(argv) < 3:
-        print("Usage: python add_reminder.py <due_at_iso> <message> <chat_id> [thread_id] [--resume-action-json <json>]", file=sys.stderr)
+        print("Usage: python add_reminder.py <due_at_iso> <message> <chat_id> [thread_id] [--resume-action-json <json>] [--no-keyboard]", file=sys.stderr)
         sys.exit(1)
 
     due_at = argv[0]
@@ -127,4 +143,4 @@ if __name__ == "__main__":
 
     resume_action = parse_resume_action_json(resume_action_json) if resume_action_json is not None else None
 
-    add_reminder(due_at, msg, chat, thread, resume_action)
+    add_reminder(due_at, msg, chat, thread, resume_action, requires_user_decision=False if no_keyboard else None)

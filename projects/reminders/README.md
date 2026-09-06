@@ -9,12 +9,12 @@ The reminders system manages due reminders stored in `~/.pa/reminders.json` and 
 ## Architecture
 
 1. **`add_reminder.py`**: Adds a new reminder with atomic write (`reminders.json.tmp` -> `os.replace`).
-2. **`process_reminders.py`**: Evaluates due items against current timestamp, deletes them from `reminders.json` first, then delivers each one through the shared `pa/src/telegram_notify.py` sender (`send_text`). Every reminder now carries a ref-ID and a **Done / 1 h / Tomorrow** keyboard, and one failed send no longer blocks the rest of the batch.
+2. **`process_reminders.py`**: Evaluates due items against current timestamp, deletes them from `reminders.json` first, then delivers each one through the shared `pa/src/telegram_notify.py` sender (`send_text`). Every reminder carries a ref-ID, and the **Done / 1 h / Tomorrow** keyboard renders only when the record requires a user decision (see Buttons); one failed send no longer blocks the rest of the batch.
 3. **Scheduler Integration**: Polled every minute via `pa catchup` or Task Scheduler (`PA-Catchup-Reminders` / cron `* * * * *`).
 
 ## Buttons
 
-Each delivered reminder carries three inline buttons:
+A reminder that requires a user decision carries three inline buttons. The keyboard renders only when the record sets `requires_user_decision`; with the key absent, text-only reminders render it and executable reminders do not.
 
 - **Done** — acknowledges the reminder; nothing is re-created, since the due entry is already gone.
 - **1 h** — re-adds the same message one hour from now.
@@ -26,19 +26,20 @@ A tap re-creates the reminder through the unchanged `add_reminder.py` atomic wri
 
 ### Add a reminder
 ```bash
-python projects/reminders/add_reminder.py <due_at_iso> <message> <chat_id> [thread_id] [--resume-action-json <json>]
+python projects/reminders/add_reminder.py <due_at_iso> <message> <chat_id> [thread_id] [--resume-action-json <json>] [--no-keyboard]
 ```
 - Example:
   ```bash
   python projects/reminders/add_reminder.py "2026-08-21T18:00:00+05:30" "Call doctor" "-1001234567890" 123
   ```
+- `--no-keyboard` stores `requires_user_decision: false` on the record, suppressing the Done / 1 h / Tomorrow buttons for system-executed work.
 
 ### Add an executable reminder (AI-185)
 ```bash
 python projects/reminders/add_reminder.py <due_at_iso> <message> <chat_id> [thread_id] \
   --resume-action-json '{"type": "topic_resume", "prompt": "<single-line instruction>"}'
 ```
-The prompt is validated at mint time (closed `topic_resume` shape: exactly the keys `type` + `prompt`; single line, <=500 chars, must not start with `/`) and stored on the record as `resume_action`; `message` remains the human label. At fire time the payload is appended to `~/.pa/pending-reminder-resume.json` for the bot's `reminder-resume-drain` job to inject as a system turn, and the operator receives a `⏰ *Reminder (dispatched to worker):*` notice with **no** inline keyboard (snoozing after the prompt is queued would be misleading). If the queue append fails, delivery is never lost: the reminder falls back to the plain text send with the Done / 1 h / Tomorrow keyboard.
+The prompt is validated at mint time (closed `topic_resume` shape: exactly the keys `type` + `prompt`; single line, <=500 chars, must not start with `/`) and stored on the record as `resume_action`; `message` remains the human label. At fire time the payload is appended to `~/.pa/pending-reminder-resume.json` for the bot's `reminder-resume-drain` job to inject as a system turn, and the operator receives a `⏰ *Reminder (dispatched to worker):*` notice with **no** inline keyboard (snoozing after the prompt is queued would be misleading). If the queue append fails, delivery is never lost: the reminder falls back to the plain text send, with the keyboard only when the record `requires_user_decision`.
 
 ### Process due reminders
 ```bash
@@ -56,3 +57,4 @@ python projects/reminders/process_reminders.py
   }
 ]
 ```
+`requires_user_decision` is an optional key: `"requires_user_decision": false` suppresses the Done / 1 h / Tomorrow keyboard for system-executed work. When the key is absent, text-only reminders render the keyboard and executable reminders do not; all pre-AI-207 records keep that legacy default.

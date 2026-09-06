@@ -235,6 +235,58 @@ describe('analyzer', () => {
       assert.match(prompt, /Trace for this run \(run_id turn-run-id\):/);
     });
 
+    it('appends ; session=<id> from the trace when the trace carries session_id', () => {
+      const candidate = makeCandidate();
+      const trace = { run_id: 'r1', tool_calls: [], commands: [], files: [], outcome: 'ok', session_id: 'sess-9' };
+      const prompt = buildProposalPrompt(candidate, [{ turn: makeEvidenceTurn(), trace }], [], []);
+      assert.match(prompt, /outcome=ok; session=sess-9/);
+    });
+
+    it('falls back to the occurrence turn\'s session_id when the trace has none', () => {
+      const candidate = makeCandidate();
+      const trace = { run_id: 'r1', tool_calls: [], commands: [], files: [], outcome: 'ok' };
+      const prompt = buildProposalPrompt(candidate, [{ turn: makeEvidenceTurn({ session_id: 'sess-turn' }), trace }], [], []);
+      assert.match(prompt, /session=sess-turn/);
+    });
+
+    it('renders session=unknown when neither the trace nor the turn carries a session id', () => {
+      const candidate = makeCandidate();
+      const trace = { run_id: 'r1', tool_calls: [], commands: [], files: [], outcome: 'ok' };
+      const prompt = buildProposalPrompt(candidate, [{ turn: makeEvidenceTurn(), trace }], [], []);
+      assert.match(prompt, /outcome=ok; session=unknown/);
+    });
+
+    it('inserts a passed task-lane section verbatim between the occurrences block and the Existing Skills heading', () => {
+      const candidate = makeCandidate();
+      const section = [
+        '## Async task-lane activity (last 14 days)',
+        '',
+        'Task-lane executions with their conversation (<chatId>_<threadId> = topic thread). A task\'s',
+        'session is the worker conversation that executed it.',
+        '- 123_45: Summarize unread email — started 2x, outcome: completed, worker agy, session sess-123',
+      ].join('\n');
+      const prompt = buildProposalPrompt(
+        candidate,
+        [{ turn: makeEvidenceTurn({ text: 'last occurrence marker' }) }],
+        [],
+        [],
+        section,
+      );
+      const lastOccurrence = prompt.indexOf('User: last occurrence marker');
+      const heading = prompt.indexOf('## Existing Skills and Drafts');
+      const at = prompt.indexOf(section);
+      assert.ok(lastOccurrence !== -1 && heading !== -1, 'fixture anchors must both be present');
+      assert.ok(at > lastOccurrence && at < heading, 'section must sit between the last occurrence and the heading');
+      // Verbatim, with exactly one blank line between the section and the heading.
+      assert.ok(prompt.startsWith(`${section}\n\n## Existing Skills and Drafts`, at));
+    });
+
+    it('omits the task-lane section entirely when the param is absent (byte-compat guard)', () => {
+      const candidate = makeCandidate();
+      const prompt = buildProposalPrompt(candidate, [{ turn: makeEvidenceTurn() }], [], []);
+      assert.ok(!prompt.includes('Async task-lane activity'));
+    });
+
     it('labels the assistant reply as context only, NOT evidence', () => {
       const candidate = makeCandidate();
       const prompt = buildProposalPrompt(candidate, [{ turn: makeEvidenceTurn(), assistantReply: 'Here are your emails.' }], [], []);

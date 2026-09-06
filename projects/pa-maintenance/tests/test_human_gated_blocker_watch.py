@@ -474,9 +474,9 @@ class TestGoogleAuthScan(unittest.TestCase):
         self.assertEqual(got[0]["severity"], hgb.ERROR)
 
     def test_skills_and_reason_are_carried(self):
-        self._write_marker(3, skills=("daily-mail-brief", "hemir-invoice"), reason="token expired")
+        self._write_marker(3, skills=("daily-mail-brief", "test-invoice"), reason="token expired")
         got = hgb.scan_google_auth(self.marker, self.token, NOW)
-        self.assertEqual(got[0]["skills"], ["daily-mail-brief", "hemir-invoice"])
+        self.assertEqual(got[0]["skills"], ["daily-mail-brief", "test-invoice"])
         self.assertEqual(got[0]["reason"], "token expired")
 
     def test_token_refreshed_after_first_seen_resolves_and_deletes_marker(self):

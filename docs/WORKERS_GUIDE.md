@@ -9,7 +9,7 @@ A "worker" is an external CLI process that the framework spawns to handle an LLM
 | What | Details |
 |---|---|
 | **Stdin** | Receives prompt as text or NDJSON, depending on `input_mode` |
-| **Args** | Receives arguments per `WorkerConfig.args`, with `{prompt}` and `{prompt_file}` substituted |
+| **Args** | Receives arguments per `WorkerConfig.args`, with `{prompt}` and `{prompt_file}` substituted. A dispatch may pass `RunOptions.stripArgs` (flag names) to remove configured flags for that one run: bare form drops the flag and its following token, `=` form drops the token, repeats all drop; `extraArgs`/`getExtraArgs` output is never stripped. |
 | **Stdout** | Plain text OR NDJSON events (when `output_format: stream-json`) |
 | **Stderr** | Used for rate-limit pattern matching and error diagnostics |
 | **Exit code** | 0 = success, non-zero = failure (logged + alerted) |
@@ -239,7 +239,7 @@ Codex's `/skill-name` slash-command syntax conflicts with pa's natural prompt sy
 
 The list of recognized skill names lives in `~/.pa/codex-skill-translations.json` (scaffolded by `pa init`). Modify it to add custom skills you want auto-translated.
 
-The same list is also used by the bot's `PASS_THROUGH_PATTERN` in `projects/telegram-bot/src/logic.ts` to recognize commands that should not be routed to LLMs (e.g., `/deep-plan` should reach the deep-plan skill, not be interpreted as bot conversation).
+The same list is also used by the bot's `PASS_THROUGH_PATTERN` in `projects/telegram-bot/src/logic.ts` to recognize commands that should not be routed to LLMs. For example, `/deep-plan` should reach the deep-plan skill, not be interpreted as bot conversation.
 
 ## MCP integration
 
@@ -276,12 +276,23 @@ Run `pa mcp manifest` to print the manifest and registration instructions for yo
 pa mcp manifest
 ```
 
-**Claude (claude mcp add):**
+**Claude (`claude mcp add`):**
 ```bash
-claude mcp add pa-mcp --stdio pa mcp serve
+claude mcp add pa-mcp -- pa mcp serve
 ```
 
-**Codex (~/.codex/config.json):**
+`--` separates the server name from the launch command. Stdio is the default transport, so no transport flag is needed (use `--transport http` only for URL servers). The `-s` scope flag chooses where the entry lands: `local` (default) writes `~/.claude.json` under the current project's entry, `user` makes it available in every project, and `project` writes a `.mcp.json` at the project root.
+
+**Codex (`~/.codex/config.toml` — TOML, one `[mcp_servers.<name>]` table per server):**
+```toml
+[mcp_servers.pa-mcp]
+command = "node"
+args = ["<repo-root>/pa/mcp/server.mjs"]
+```
+
+Optional `[mcp_servers.<name>.env]` and `[mcp_servers.<name>.tools.<tool>]` (e.g. an `approval_mode` override) tables sit alongside. There is no `~/.codex/config.json` — Codex reads only the TOML file.
+
+**agy (`~/.gemini/settings.json` — top-level `mcpServers` object):**
 ```json
 {
   "mcpServers": {
@@ -293,15 +304,11 @@ claude mcp add pa-mcp --stdio pa mcp serve
 }
 ```
 
-**agy (~/.agy/config.yaml):**
-```yaml
-mcp:
-  servers:
-    pa-mcp:
-      command: node
-      args:
-        - <repo-root>/pa/mcp/server.mjs
-```
+Entries use the same `{command, args, env, cwd}` stdio shape as Claude (plus `timeout` and `trust`). There is no `~/.agy/config.yaml` — agy's MCP servers are configured in `~/.gemini/settings.json` (a per-project `.gemini/settings.json` works the same way).
+
+**Project-root `.mcp.json` (project-scope and external servers):**
+
+A repo can declare MCP servers at its root in a `.mcp.json` using the same `mcpServers` shape, with a per-entry `cwd` so the server runs from its own checkout. Claude Code picks these up per project and records the approval state in `~/.claude.json` (`enabledMcpjsonServers` / `disabledMcpjsonServers`). This deployment's repo carries one as a working precedent: it registers an external `brain` knowledge-store server — a `python -m` module run from that server's own checkout, selected via `cwd`, with an `--agent-id` argument scoping it to this deployment.
 
 The manifest file at `~/.pa/mcp.json` contains the full tool definitions for reference.
 

@@ -89,10 +89,17 @@ async function mcpManifestCommand(): Promise<void> {
   console.log('## Registration Instructions\n');
   console.log('### Claude (claude mcp add)\n');
   console.log('```bash');
-  console.log('claude mcp add pa-mcp --stdio pa mcp serve');
+  console.log('claude mcp add pa-mcp -- pa mcp serve');
   console.log('```\n');
-  console.log('### Codex (~/.codex/config.json)\n');
-  console.log('Add to mcpServers:\n');
+  console.log("`--` separates the server name from the launch command. Stdio is the default transport, so no transport flag is needed (use `--transport http` only for URL servers). The `-s` scope flag chooses where the entry lands: `local` (default) writes `~/.claude.json` under the current project's entry, `user` makes it available in every project, and `project` writes a `.mcp.json` at the project root.\n");
+  console.log('### Codex (~/.codex/config.toml — TOML, one [mcp_servers.<name>] table per server)\n');
+  console.log('```toml');
+  console.log('[mcp_servers.pa-mcp]');
+  console.log('command = "node"');
+  console.log(`args = ["${mcpServerPath}"]`);
+  console.log('```\n');
+  console.log('Optional `[mcp_servers.<name>.env]` and `[mcp_servers.<name>.tools.<tool>]` (e.g. an `approval_mode` override) tables sit alongside. There is no `~/.codex/config.json` — Codex reads only the TOML file.\n');
+  console.log('### agy (~/.gemini/settings.json — top-level mcpServers object)\n');
   console.log('```json');
   console.log('{');
   console.log('  "mcpServers": {');
@@ -103,15 +110,7 @@ async function mcpManifestCommand(): Promise<void> {
   console.log('  }');
   console.log('}');
   console.log('```\n');
-  console.log('### agy (~/.agy/config.yaml)\n');
-  console.log('```yaml');
-  console.log('mcp:');
-  console.log('  servers:');
-  console.log('    pa-mcp:');
-  console.log('      command: node');
-  console.log('      args:');
-  console.log(`        - ${mcpServerPath}`);
-  console.log('```\n');
+  console.log('Entries use the same `{command, args, env, cwd}` stdio shape as Claude (plus `timeout` and `trust`). There is no `~/.agy/config.yaml` — agy\'s MCP servers are configured in `~/.gemini/settings.json` (a per-project `.gemini/settings.json` works the same way).\n');
 }
 
 const USAGE = `

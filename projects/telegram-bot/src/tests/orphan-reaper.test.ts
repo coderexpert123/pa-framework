@@ -13,6 +13,7 @@ import {
   findTeePathByRegistry,
   placeholderKindAndCaption,
   TRANSCRIPT_QUIESCENT_MS,
+  _setNoticeLoggerForTest,
   type ReaperDeps,
 } from '../orphan-reaper.js';
 import {
@@ -206,6 +207,60 @@ function makeFakeDeps(cfg: FakeDepsConfig): { deps: ReaperDeps; sent: Array<{ re
 }
 
 const FAR_DEADLINE = Date.now() + 60 * 60 * 1000;
+
+// AI-208 WP-4 E3: a held record (steer/stop drain held the transcript for the
+// topic's next dispatch) is not a dead dispatch — the reaper must leave it alone.
+describe('evaluatePendingDispatch — heldForTopic', () => {
+  it('heldForTopic record produces no death notice and no requeue', async () => {
+    // session: undefined would otherwise fall straight through to the death
+    // notice — the strongest shape to prove the held check runs first.
+    const rec = makeRecord({ session: undefined, heldForTopic: true, heldAt: new Date().toISOString() });
+    await addPendingDispatch(rec);
+    const requeued: PendingDispatch[] = [];
+    const { deps, sent } = makeFakeDeps({ requeueUpdate: (r) => requeued.push(r) });
+
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+
+    assert.equal(outcome, 'held');
+    assert.equal(sent.length, 0, 'no death notice / no untranscribed notice');
+    assert.deepEqual(requeued, [], 'never requeued as a failure');
+    assert.equal(await wasDelivered(deliveredKey(rec.chatId, rec.threadId, rec.updateId)), false);
+    // Still on disk and still held — the topic's next dispatch absorbs it
+    // (absorbHeldDispatchRecords) instead of the reaper burying it.
+    const listed = await listPendingDispatches();
+    assert.equal(listed.length, 1);
+    assert.equal(listed[0].heldForTopic, true);
+  });
+
+  it('held record notice logs once across two evaluations (fix-wave m3)', async () => {
+    const rec = makeRecord({ session: undefined, heldForTopic: true, heldAt: new Date().toISOString() });
+    await addPendingDispatch(rec);
+    const { deps } = makeFakeDeps({});
+    const notices: Array<{ module: string; message: string }> = [];
+    _setNoticeLoggerForTest({ info: (module, message) => notices.push({ module, message }) });
+    try {
+      const outcome1 = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+      assert.equal(outcome1, 'held');
+      assert.equal(notices.length, 1, 'first evaluation logs the notice');
+      assert.equal(notices[0].message, 'held record left for next dispatch');
+
+      // The notice is stamped on the record, best-effort.
+      const listed1 = await listPendingDispatches();
+      assert.ok(listed1[0]?.heldNotifiedAt, 'heldNotifiedAt set by the first evaluation');
+      assert.equal(listed1[0].heldForTopic, true, 'record stays held');
+
+      // Second pass: no repeat notice — the stamp suppresses it. The reaper
+      // always evaluates records as listed fresh from the store, so re-read.
+      const rec2 = (await listPendingDispatches()).find((r) => r.updateId === rec.updateId);
+      assert.ok(rec2);
+      const outcome2 = await evaluatePendingDispatch(rec2, deps, FAR_DEADLINE);
+      assert.equal(outcome2, 'held');
+      assert.equal(notices.length, 1, 'second evaluation does NOT log again');
+    } finally {
+      _setNoticeLoggerForTest(null);
+    }
+  });
+});
 
 describe('evaluatePendingDispatch', () => {
   it('drops a record whose reply was already delivered (no send)', async () => {

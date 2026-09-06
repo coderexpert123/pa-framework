@@ -53,6 +53,8 @@ export const TIMER_ALLOWLIST: TimerAllowlistEntry[] = [
     reason: 'In-flight only: the 4s typing keep-alive for ONE voice transcription, cleared in a finally on every exit path. Mirrors the dispatch typing keep-alive already allowlisted for main.ts. Writes no durable state.' },
   { file: 'projects/telegram-bot/src/task-executor.ts', pattern: 'setInterval', count: 1,
     reason: 'task-executor pending-dispatch activity pump: scoped to one in-flight dispatch, interval cleared in the dispatch\'s finally; the durable lastActivityAt write IS the feature (activity-gated demotion), not outliving side work; added retroactively when the full pa suite first ran it (5435153).' },
+  { file: 'projects/telegram-bot/src/thread-executor.ts', pattern: 'setInterval', count: 1,
+    reason: 'thread-executor pending-dispatch activity pump: scoped to one in-flight thread run, cleared in the run\'s finally; mirrors the task-executor pump entry (AI-203 first increment).' },
 ];
 
 function walk(dir: string, out: string[]): void {

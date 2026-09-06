@@ -356,6 +356,46 @@ describe('Shared working tree protocol block', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Reminder-discipline teaching sync (AI-207 reminder-delivery wave,
+// 2026-09-05): the two anchor sentences below must stay byte-identical
+// across the three teaching surfaces — context.ts's inline capabilities
+// block (agy/codex never receive bot-instructions.md), examples/
+// bot-instructions.example.md (tracked, CI-enforced half) and the
+// gitignored local bot-instructions.md (skip-guarded half). Same
+// prompt-triangle pattern as the anchor sentences above.
+// ---------------------------------------------------------------------------
+
+const REMINDER_ANCHOR_1 = 'Reminder messages are operator-facing: `message` must be plain language a person can act on, never an instruction for a future assistant session.';
+
+const REMINDER_ANCHOR_2 = 'Schedule work for a future session with `--resume-action-json` instead — it dispatches into the topic queue, and pass `--no-keyboard` for system-executed work: buttons render only when a human decision is genuinely required.';
+
+describe('Reminder discipline sync (AI-207)', () => {
+  it('matches examples/bot-instructions.example.md verbatim', async () => {
+    const exampleContent = await readFile(BOT_INSTRUCTIONS_EXAMPLE_PATH, 'utf8');
+    assert.ok(exampleContent.includes(REMINDER_ANCHOR_1),
+      'examples/bot-instructions.example.md must contain the Reminder ANCHOR_1 sentence verbatim');
+    assert.ok(exampleContent.includes(REMINDER_ANCHOR_2),
+      'examples/bot-instructions.example.md must contain the Reminder ANCHOR_2 sentence verbatim');
+  });
+
+  it('appears in the inline capabilities block verbatim', async () => {
+    const inlinePrompt = await buildPrompt('hello', makeState(), undefined, undefined, undefined, { omitStatic: false });
+    assert.ok(inlinePrompt.includes(REMINDER_ANCHOR_1),
+      'context.ts inline capabilities block must contain the Reminder ANCHOR_1 sentence verbatim');
+    assert.ok(inlinePrompt.includes(REMINDER_ANCHOR_2),
+      'context.ts inline capabilities block must contain the Reminder ANCHOR_2 sentence verbatim');
+  });
+
+  it('matches bot-instructions.md verbatim (local, skip-guarded)', { skip: !BOT_INSTRUCTIONS_EXISTS && 'bot-instructions.md not present locally (public-clone default — see examples/bot-instructions.example.md)' }, async () => {
+    const botInstructionsContent = await readFile(BOT_INSTRUCTIONS_PATH, 'utf8');
+    assert.ok(botInstructionsContent.includes(REMINDER_ANCHOR_1),
+      'bot-instructions.md must contain the Reminder ANCHOR_1 sentence verbatim');
+    assert.ok(botInstructionsContent.includes(REMINDER_ANCHOR_2),
+      'bot-instructions.md must contain the Reminder ANCHOR_2 sentence verbatim');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // No-LaTeX rule (added 2026-08-24, commit 55c2d2c) — Telegram has no LaTeX
 // renderer, so raw delimiters/formulas render unformatted. This is the same
 // byte-identical-across-three-files sync pattern as the Shared working tree

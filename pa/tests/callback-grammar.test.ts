@@ -55,6 +55,24 @@ describe('gateFor', () => {
   });
 });
 
+// AI-210 (2026-09-06): picker Submit/Discard — two new chat-gated cc simple actions.
+describe('cc:submit / cc:discard — picker stage-then-apply (AI-210)', () => {
+  it('parses both as simple cc actions', () => {
+    assert.deepEqual(parseCallbackData('cc:submit'), { prefix: 'cc', action: 'submit', raw: 'cc:submit' });
+    assert.deepEqual(parseCallbackData('cc:discard'), { prefix: 'cc', action: 'discard', raw: 'cc:discard' });
+  });
+
+  it('rejects extra segments (anchored simple form, like cc:back)', () => {
+    assert.equal(parseCallbackData('cc:submit:x'), null);
+    assert.equal(parseCallbackData('cc:discard:y'), null);
+  });
+
+  it('both are chat-gated (same class as cc:back)', () => {
+    assert.equal(gateFor(parseCallbackData('cc:submit')!), 'chat');
+    assert.equal(gateFor(parseCallbackData('cc:discard')!), 'chat');
+  });
+});
+
 describe('parseReauthCallback (moved from the bot logic.ts — re-exported there)', () => {
   it('parses provider and optional skill', () => {
     assert.deepEqual(parseReauthCallback('reauth:google'), { provider: 'google', skill: undefined });

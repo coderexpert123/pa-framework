@@ -4,6 +4,7 @@ Unit tests for projects/reminders (add_reminder.py & process_reminders.py)
 import os
 import sys
 import json
+import subprocess
 import tempfile
 import pytest
 from datetime import datetime, timezone, timedelta
@@ -348,10 +349,11 @@ def test_process_falls_back_to_text_on_queue_failure(temp_pa_home, monkeypatch, 
 
     process_reminders.process_reminders()
 
-    # Fallback is today's FULL text send WITH keyboard; no queue file appeared.
+    # AI-207: the legacy executable fallback is the plain text send WITHOUT a
+    # keyboard (buttons on system-executed work were the defect); no queue file.
     call_args, call_kwargs = mock_send_text.call_args
     assert call_args[0] == "⏰ *Reminder:* Gate F check"
-    assert call_kwargs["reply_markup"] == process_reminders.build_reminder_keyboard()
+    assert "reply_markup" not in call_kwargs or call_kwargs["reply_markup"] is None
     assert not os.path.exists(os.path.join(temp_pa_home, "pending-reminder-resume.json"))
 
     out = capsys.readouterr().out
@@ -379,3 +381,138 @@ def test_process_text_only_unchanged(temp_pa_home, monkeypatch):
     assert call_args[0] == "⏰ *Reminder:* Plain task"
     assert call_kwargs["reply_markup"] == process_reminders.build_reminder_keyboard()
     assert not os.path.exists(os.path.join(temp_pa_home, "pending-reminder-resume.json"))
+
+
+# --- AI-207: reminder delivery — conditional keyboard + mint guard ---
+
+def test_requires_user_decision_helper_defaults():
+    # Legacy default is pinned: absent flag -> keyboard for a text-only
+    # reminder, none for an executable one; an explicit value always wins.
+    assert process_reminders.requires_user_decision({"message": "x"}) is True
+    assert process_reminders.requires_user_decision(
+        {"message": "x", "resume_action": {"type": "topic_resume", "prompt": "p"}}) is False
+    assert process_reminders.requires_user_decision({"requires_user_decision": True}) is True
+    assert process_reminders.requires_user_decision({"requires_user_decision": False}) is False
+
+
+def test_process_text_only_no_keyboard_when_suppressed(temp_pa_home, monkeypatch):
+    now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+    _write_reminder(temp_pa_home, {
+        "due_at": (now - timedelta(minutes=10)).isoformat(),
+        "message": "Suppressed task",
+        "chat_id": "-1001234567890",
+        "thread_id": 10,
+        "requires_user_decision": False,
+    })
+
+    mock_send_text = MagicMock(return_value="s-abc123")
+    monkeypatch.setattr(process_reminders, "send_text", mock_send_text)
+
+    process_reminders.process_reminders()
+
+    assert mock_send_text.call_count == 1
+    call_args, call_kwargs = mock_send_text.call_args
+    assert call_args[0] == "⏰ *Reminder:* Suppressed task"
+    assert "reply_markup" not in call_kwargs or call_kwargs["reply_markup"] is None
+
+
+def test_process_text_only_keyboard_when_explicitly_required(temp_pa_home, monkeypatch):
+    now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+    _write_reminder(temp_pa_home, {
+        "due_at": (now - timedelta(minutes=10)).isoformat(),
+        "message": "Explicit task",
+        "chat_id": "-1001234567890",
+        "thread_id": 10,
+        "requires_user_decision": True,
+    })
+
+    mock_send_text = MagicMock(return_value="s-abc123")
+    monkeypatch.setattr(process_reminders, "send_text", mock_send_text)
+
+    process_reminders.process_reminders()
+
+    assert mock_send_text.call_count == 1
+    call_args, call_kwargs = mock_send_text.call_args
+    assert call_args[0] == "⏰ *Reminder:* Explicit task"
+    assert call_kwargs["reply_markup"] == process_reminders.build_reminder_keyboard()
+
+
+def test_process_executable_fallback_legacy_has_no_keyboard(temp_pa_home, monkeypatch):
+    now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+    _write_reminder(temp_pa_home, _executable_reminder(now))  # no flag: legacy default
+
+    def boom(reminder):
+        raise RuntimeError("queue file unwritable")
+
+    monkeypatch.setattr(process_reminders, "append_resume_record", boom)
+    mock_send_text = MagicMock(return_value="s-abc123")
+    monkeypatch.setattr(process_reminders, "send_text", mock_send_text)
+
+    process_reminders.process_reminders()
+
+    call_args, call_kwargs = mock_send_text.call_args
+    assert call_args[0] == "⏰ *Reminder:* Gate F check"
+    assert "reply_markup" not in call_kwargs or call_kwargs["reply_markup"] is None
+
+
+def test_process_executable_fallback_keyboard_when_required(temp_pa_home, monkeypatch):
+    now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+    _write_reminder(temp_pa_home, _executable_reminder(now, requires_user_decision=True))
+
+    def boom(reminder):
+        raise RuntimeError("queue file unwritable")
+
+    monkeypatch.setattr(process_reminders, "append_resume_record", boom)
+    mock_send_text = MagicMock(return_value="s-abc123")
+    monkeypatch.setattr(process_reminders, "send_text", mock_send_text)
+
+    process_reminders.process_reminders()
+
+    call_args, call_kwargs = mock_send_text.call_args
+    assert call_args[0] == "⏰ *Reminder:* Gate F check"
+    assert call_kwargs["reply_markup"] == process_reminders.build_reminder_keyboard()
+
+
+def test_add_reminder_no_keyboard_flag_stores_false(temp_pa_home):
+    add_reminder.add_reminder("2026-09-05T18:00:00+05:30", "Silent task", "-1001234567890", 10,
+                              requires_user_decision=False)
+
+    with open(os.path.join(temp_pa_home, "reminders.json"), "r", encoding="utf-8") as f:
+        data = json.load(f)
+    assert data[0]["requires_user_decision"] is False
+
+
+def test_add_reminder_without_flags_omits_requires_user_decision_key(temp_pa_home):
+    add_reminder.add_reminder("2026-09-05T18:00:00+05:30", "Plain task", "-1001234567890", 10)
+
+    with open(os.path.join(temp_pa_home, "reminders.json"), "r", encoding="utf-8") as f:
+        data = json.load(f)
+    assert "requires_user_decision" not in data[0]
+
+
+def test_add_reminder_rejects_prompt_as_message(temp_pa_home, capsys):
+    prompt = "Run Gate F verification"
+    with pytest.raises(SystemExit) as exc:
+        add_reminder.add_reminder("2026-09-05T18:00:00+05:30", prompt, "-1001234567890", 310,
+                                  resume_action={"type": "topic_resume", "prompt": prompt})
+    assert exc.value.code == 1
+    assert "plain-language operator label" in capsys.readouterr().err
+
+    # A rejected mint must not leave a reminder behind.
+    assert not os.path.exists(os.path.join(temp_pa_home, "reminders.json"))
+
+
+def test_cli_no_keyboard_flag_stores_false(temp_pa_home):
+    # The CLI seam is what agents actually call: run the real script with the
+    # fixture's temp PA_HOME inherited.
+    script = os.path.join(PROJECT_DIR, "add_reminder.py")
+    result = subprocess.run(
+        [sys.executable, script, "2026-09-05T18:00:00+05:30", "CLI task", "-1001234567890", "10",
+         "--no-keyboard"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+    with open(os.path.join(temp_pa_home, "reminders.json"), "r", encoding="utf-8") as f:
+        data = json.load(f)
+    assert data[0]["requires_user_decision"] is False
