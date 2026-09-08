@@ -580,6 +580,17 @@ describe('registerQueuedUpdate messageId (AI-209 WP-1)', () => {
   });
 });
 
+describe('registerQueuedUpdate replyToMessageId (AI-203 increment 3)', () => {
+  it('T-Q1: carries replyToMessageId when provided; omitting the sixth arg leaves it undefined', () => {
+    const reply = registerQueuedUpdate('1_0', 7, 'hi', undefined, 42, 41);
+    assert.equal(reply.replyToMessageId, 41);
+    assert.equal(reply.messageId, 42);
+
+    const nonReply = registerQueuedUpdate('1_0', 8, 'plain');
+    assert.equal(nonReply.replyToMessageId, undefined);
+  });
+});
+
 describe('dequeueUpdate with the additive messageId field (AI-209 WP-1 T6)', () => {
   it('T6: still no-ops on a foreign entry object carrying messageId', () => {
     assert.doesNotThrow(() =>

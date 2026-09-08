@@ -12,7 +12,15 @@
  *          runSeq bump), frozen footer.
  * - T3     a promise WITHOUT an envelope is suppressed into the worker-error
  *          path (AI-202 composes) — never delivered as the answer.
- * - T5     the 2-running cap rejects with its frozen footer; store unchanged.
+ * - T5     the 10-running cap parks the 11th spawn as 'queued' with its
+ *          frozen footer (no rejection — increment 4); no executor fire.
+ * - T-INT  a mode:"interrupt" steer restarts the running thread with the
+ *          fold consumed and the dead session dropped (killed=0 here — the
+ *          store + footer are the pin, the real kill is unit-pinned in
+ *          worker-stop.test.ts).
+ * - T-WAKE the poll-tick reconcile drain revives a queued thread once a
+ *          slot is free and runs it to done (restart backstop).
+ * - T-CANCEL /stop cancels running AND queued threads (truthful count).
  * - T6     /stop cancels running threads (count in the reply) and the
  *          executor's ownership gate discards the result — no done FYI.
  * - T7     /orchestrator on: mode armed, role-boundary session clear.
@@ -22,6 +30,7 @@
 import { describe, it, before, after, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, readFile } from 'fs/promises';
+import { readFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import type { ConversationState } from '../types.js';
@@ -55,7 +64,7 @@ after(async () => {
 const { runPollLoop, _setExitForTest } = await import('../main.js');
 _setExitForTest(() => {});
 const { createThread, getThread, listThreads, updateThread } = await import('../topic-threads.js');
-const { _waitForThreadExecutionsForTest } = await import('../thread-executor.js');
+const { _waitForThreadExecutionsForTest, _resetThreadQueueReconcileForTest } = await import('../thread-executor.js');
 const { _clearStoppedForTest } = await import('../worker-stop.js');
 const { _resetPendingDispatchesForTest } = await import('../pending-dispatches.js');
 const { _resetDeliveredCacheForTest } = await import('../delivered-store.js');
@@ -104,6 +113,55 @@ async function writeWorker(dir: string, script: string): Promise<void> {
   }), 'utf8');
 }
 
+/** Capture variant (batch-uptake-dispatch.test.ts idiom): every dispatched
+ *  prompt is appended GOTPROMPTSTART…GOTPROMPTEND to a file, so a test counts
+ *  turns and pins the presence/absence of prompt scaffolding. The script is a
+ *  .cjs FILE, never an inline multi-line `-e` (the Windows spawn path's
+ *  quoting mangles embedded newlines — the same hazard workerScript's b64
+ *  wrap exists for); the output is still base64-wrapped. */
+async function writeCaptureWorker(dir: string, output: string, opts: { holdMs?: number } = {}): Promise<string> {
+  const capturePath = join(dir, 'prompt-capture.txt');
+  const workerScriptPath = join(dir, 'capture-worker.cjs');
+  const b64 = Buffer.from(output, 'utf8').toString('base64');
+  await writeFile(workerScriptPath, [
+    "const fs = require('node:fs');",
+    "let d = '';",
+    "process.stdin.on('data', c => { d += c; });",
+    "process.stdin.on('end', () => {",
+    `  fs.appendFileSync(${JSON.stringify(capturePath)}, 'GOTPROMPTSTART' + d + 'GOTPROMPTEND');`,
+    `  process.stdout.write(Buffer.from(${JSON.stringify(b64)}, 'base64').toString('utf8'));`,
+    opts.holdMs ? `  setTimeout(() => process.exit(0), ${opts.holdMs});` : '  process.exitCode = 0;',
+    '});',
+    '',
+  ].join('\n'), 'utf8');
+  const posixWorker = workerScriptPath.replace(/\\/g, '/');
+  await writeFile(join(dir, 'config.yaml'), JSON.stringify({
+    workers: [{
+      name: 'fake',
+      command: 'node',
+      args: [posixWorker],
+      input_mode: 'stdin-text',
+      output_format: 'text',
+      check: 'echo ok',
+      rate_limit_patterns: [],
+      priority: 1,
+      state_dir: '/nonexistent/path',
+      state_pattern: '*.jsonl',
+    }],
+  }), 'utf8');
+  return capturePath;
+}
+
+function captureBlocks(capturePath: string): string[] {
+  try {
+    return readFileSync(capturePath, 'utf8')
+      .split('GOTPROMPTEND')
+      .filter((b) => b.includes('GOTPROMPTSTART'));
+  } catch {
+    return [];
+  }
+}
+
 async function seedTopicState(threadId: number, extra: Record<string, unknown> = {}): Promise<string> {
   const topicKey = `${CHAT_ID}_${threadId}`;
   await writeFile(
@@ -118,13 +176,14 @@ async function readTopicState(threadId: number): Promise<any> {
   return JSON.parse(await readFile(join(process.env.PA_HOME!, `telegram-bot-topic-${CHAT_ID}_${threadId}.json`), 'utf8'));
 }
 
-interface OneUpdate { update_id: number; text: string; }
+interface OneUpdate { update_id: number; text: string; replyTo?: { message_id: number; text?: string } }
 
 /** Feed updates through the real poll loop; collect every sendMessage body.
  *  Accepts either a flat update list (one getUpdates batch) or explicit
  *  per-call batches (T6's spawn-then-/stop sequence). The mock stays installed
  *  until afterEach so thread FYIs sent after the loop exits (the executor lane
- *  is fire-and-forget) still land in the captured list. */
+ *  is fire-and-forget) still land in the captured list. `replyTo` puts a
+ *  reply_to_message on the message (AI-203 increment 3 anchor cases). */
 async function runOne(
   batches: OneUpdate[] | OneUpdate[][],
   threadId: number,
@@ -152,6 +211,7 @@ async function runOne(
           message_thread_id: threadId,
           date: Math.floor(Date.now() / 1000),
           text: b.text,
+          ...(b.replyTo ? { reply_to_message: b.replyTo } : {}),
         },
       }));
       const body = { ok: true, result: updates };
@@ -184,6 +244,8 @@ const SPAWN_ENVELOPE = `${SPAWN_ACK}\n\n[PA_META]: {"actions":[{"type":"spawn_th
 const STEER_ACK = 'Routing your message to thread t-1 now.';
 const STEER_ENVELOPE = `${STEER_ACK}\n\n[PA_META]: {"actions":[{"type":"steer_thread","thread_id":"t-1","message":"now also check the stderr logs"}]}`;
 const PROMISE_ONLY = 'I have launched the sweep and will report back when it completes.';
+const INTERRUPT_ACK = 'Killing that run — redoing it with the new scope now.';
+const INTERRUPT_ENVELOPE = `${INTERRUPT_ACK}\n\n[PA_META]: {"actions":[{"type":"steer_thread","thread_id":"t-1","message":"redo it for the failures log instead","mode":"interrupt"}]}`;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -207,6 +269,9 @@ describe('orchestrator dispatch wiring (AI-203 WP-5, end-to-end)', () => {
     await _waitForThreadExecutionsForTest().catch(() => {});
     await waitForDrain();
     (globalThis as Record<string, unknown>).fetch = savedFetch;
+    // The reconcile drain's 60 s throttle is module state — reset it per test
+    // so T-WAKE's poll-tick backstop is live in every test's own window.
+    _resetThreadQueueReconcileForTest();
     _clearStoppedForTest();
     _resetPendingDispatchesForTest();
     _resetDeliveredCacheForTest();
@@ -270,10 +335,21 @@ describe('orchestrator dispatch wiring (AI-203 WP-5, end-to-end)', () => {
     assert.ok(reply.includes('_(Routed to thread t-1'), `footer missing from: ${reply}`);
 
     // The executor woke the done thread: input drained, runSeq bumped, and the
-    // record observed RUNNING while its dispatch was in flight.
+    // record shows the resumed run. `running` is a TRANSIENT the observer can
+    // miss entirely on a fast host: the whole resumed lifecycle (pickup FYI,
+    // dispatch, the 1.2 s worker hold, completion) can close before runOne
+    // returns and this poller's first read (seen on CI-linux, where the
+    // completion FYI landed while the poll loop was still tearing down; the
+    // pin card mid-window even showed "Threads: 1 running"). The settled
+    // end-state is therefore accepted as the SAME evidence: runSeq is bumped
+    // by the executor's dispatch loop alone and lastResult only by its
+    // completion write, so a done record whose seeded result ('it worked',
+    // line ~314) was overwritten proves the executor ran the thread to
+    // completion.
     const woke = await pollFor(async () => {
       const rec = await getThread(topicKey, 't-1');
-      return !!rec && rec.runSeq >= 1 && rec.status === 'running' && rec.pendingInput.length === 0;
+      if (!rec || rec.runSeq < 1 || rec.pendingInput.length > 0) return false;
+      return rec.status === 'running' || (rec.status === 'done' && rec.lastResult !== 'it worked');
     });
     assert.ok(woke, 'the executor must resume the thread: running, runSeq bumped, input drained');
   });
@@ -292,20 +368,73 @@ describe('orchestrator dispatch wiring (AI-203 WP-5, end-to-end)', () => {
     assert.equal(await listThreads(topicKey).then((l) => l.length), 0, 'no thread may spawn from a suppressed turn');
   });
 
-  it('T5: the running cap rejects the spawn with its frozen footer; store unchanged', async () => {
+  it('T5: the 10-running cap parks the spawn as queued with its frozen footer; no executor fire', async () => {
     await seedTopicState(threadId, { orchestrator_enabled: true });
-    const first = await createThread(topicKey, { title: 'one', goal: 'g', workdir: currentTestDir });
-    const second = await createThread(topicKey, { title: 'two', goal: 'g', workdir: currentTestDir });
-    assert.ok(first.ok && second.ok);
-    await writeWorker(currentTestDir, workerScript(SPAWN_ENVELOPE));
+    for (let i = 1; i <= 10; i++) {
+      const seeded = await createThread(topicKey, { title: `r${i}`, goal: 'g', workdir: currentTestDir });
+      assert.ok(seeded.ok);
+    }
+    const capturePath = await writeCaptureWorker(currentTestDir, SPAWN_ENVELOPE);
 
     const sent = await runOne([{ update_id: 1, text: 'spawn another one' }], threadId);
     const L = () => sent.map(plain);
 
     const reply = L().find((t) => t.includes(SPAWN_ACK));
     assert.ok(reply, 'the ack must still be delivered');
-    assert.ok(reply.includes('_(thread spawn rejected: 2 threads already running'), `cap footer missing from: ${reply}`);
-    assert.equal(await listThreads(topicKey).then((l) => l.length), 2, 'the store must be unchanged by a rejected spawn');
+    assert.ok(reply.includes('_(Thread t-11 queued — starts when one finishes.)_'), `parked footer missing from: ${reply}`);
+    const parked = await getThread(topicKey, 't-11');
+    assert.equal(parked?.status, 'queued', 'the 11th spawn must be parked as queued, not rejected');
+    assert.equal(await listThreads(topicKey).then((l) => l.length), 11, 'no rejection — the record exists');
+    assert.equal(
+      captureBlocks(capturePath).length,
+      1,
+      'only the orchestrator turn may dispatch — no 11th executor fire'
+    );
+  });
+
+  it('T-INT: a mode:"interrupt" steer restarts the running thread with the fold consumed', async () => {
+    await seedTopicState(threadId, { orchestrator_enabled: true });
+    const created = await createThread(topicKey, { title: 'Sweep logs', goal: 'sweep the logs', workdir: currentTestDir });
+    assert.ok(created.ok); // createThread seeds status 'running'
+    await updateThread(topicKey, 't-1', {
+      session: { session_id: 's-int', worker: 'fake', started_at: new Date().toISOString() },
+    });
+    await writeWorker(currentTestDir, workerScript(INTERRUPT_ENVELOPE));
+
+    const sent = await runOne([{ update_id: 1, text: 'no — redo it for the failures log instead' }], threadId);
+    const L = () => sent.map(plain);
+
+    const reply = L().find((t) => t.includes('_(Interrupted thread t-1 — restarting with your message.)_'));
+    assert.ok(reply, `interrupt footer missing from: ${JSON.stringify(L())}`);
+
+    // The restart consumed the fold as its first turn and the kill-drop
+    // cleared the dead session. killed=0 is expected here (no registered
+    // pids) — the real kill is unit-pinned in worker-stop.test.ts; the
+    // STORE and FOOTER are the pin, never the kill.
+    await _waitForThreadExecutionsForTest();
+    const rec = await getThread(topicKey, 't-1');
+    assert.deepEqual(rec?.pendingInput, [], 'the restart must consume the folded message');
+    assert.equal(rec?.session, undefined, 'the interrupt must drop the dead session');
+  });
+
+  it('T-WAKE: the poll-tick reconcile drain revives a queued thread and runs it to done', async () => {
+    await seedTopicState(threadId, { orchestrator_enabled: true });
+    const a = await createThread(topicKey, { title: 'Thread A', goal: 'count the running widgets', workdir: currentTestDir });
+    const b = await createThread(topicKey, { title: 'Thread B', goal: 'tally the B figures', workdir: currentTestDir });
+    assert.ok(a.ok && b.ok);
+    await updateThread(topicKey, 't-2', { status: 'queued' }); // parked; the drain must revive it
+    const capturePath = await writeCaptureWorker(currentTestDir, 'WAKE_TURN_BODY');
+
+    const sent = await runOne([{ update_id: 1, text: 'status check' }], threadId);
+    const L = () => sent.map(plain);
+
+    const drained = await pollFor(async () => (await getThread(topicKey, 't-2'))?.status === 'done');
+    assert.ok(drained, `the drain must start the queued thread and run it to done; t-2=${JSON.stringify(await getThread(topicKey, 't-2'))}`);
+    assert.ok(
+      captureBlocks(capturePath).some((b) => b.includes('tally the B figures')),
+      'the capture list must show B goal text (its dispatch happened)'
+    );
+    assert.ok(L().some((t) => t.includes('✅ Thread t-2 done: Thread B')), 'the completion FYI must arrive');
   });
 
   it('T6: /stop cancels the running thread (truthful count) and the runSeq gate discards its result', async () => {
@@ -340,6 +469,31 @@ describe('orchestrator dispatch wiring (AI-203 WP-5, end-to-end)', () => {
     assert.equal(rec?.status, 'cancelled');
   });
 
+  it('T-CANCEL: /stop cancels running AND queued threads (truthful count)', async () => {
+    await seedTopicState(threadId, { orchestrator_enabled: true });
+    const first = await createThread(topicKey, { title: 'one', goal: 'g', workdir: currentTestDir });
+    const second = await createThread(topicKey, { title: 'two', goal: 'g', workdir: currentTestDir });
+    assert.ok(first.ok && second.ok);
+    await updateThread(topicKey, 't-2', { status: 'queued' });
+    // Holds long enough that a drain-fired t-2 cannot settle before /stop
+    // lands — parked or mid-run, both states must be caught by the cancel.
+    await writeWorker(currentTestDir, workerScript('busy', { holdMs: 2500 }));
+
+    const sent = await runOne([{ update_id: 1, text: '/stop' }], threadId);
+    const L = () => sent.map(plain);
+
+    const stopReply = L().find((t) => t.includes('cancelled 2 thread(s)'));
+    assert.ok(stopReply, `the stop reply must count running + queued; got: ${JSON.stringify(L())}`);
+    assert.ok(stopReply.includes('their results will be discarded'));
+    await _waitForThreadExecutionsForTest();
+    const one = await getThread(topicKey, 't-1');
+    const two = await getThread(topicKey, 't-2');
+    assert.equal(one?.status, 'cancelled');
+    assert.equal(two?.status, 'cancelled');
+    assert.ok(!L().some((t) => t.includes('✅ Thread t-1 done')), 'a cancelled thread must never post its result');
+    assert.ok(!L().some((t) => t.includes('✅ Thread t-2 done')), 'a cancelled thread must never post its result');
+  });
+
   it('T7: /orchestrator on arms the mode and clears the session (role boundary)', async () => {
     await seedTopicState(threadId, {
       session: { session_id: 's-orch', worker: 'fake', started_at: new Date().toISOString() },
@@ -365,5 +519,176 @@ describe('orchestrator dispatch wiring (AI-203 WP-5, end-to-end)', () => {
     assert.ok(L().some((t) => t.includes(SPAWN_ACK)), 'the cleaned reply is delivered as today');
     assert.ok(!L().some((t) => t.includes('Thread t-1 spawned')), 'no thread footer on the human lane');
     assert.equal(await listThreads(topicKey).then((l) => l.length), 0, 'no thread store file may be created for a non-orchestrator topic');
+  });
+
+  // --- AI-203 increment 3: the reply-to-FYI anchor steer (T-A1..T-A6) ---
+  // All assertions are on the DELIVERED reply text and the STORE — never on
+  // module internals.
+
+  it('T-A1: a reply to a done FYI steers the thread directly — lead, routed footer, real executor drain', async () => {
+    // T7's mechanism: the topic is armed through the loop, not by seeding.
+    await writeCaptureWorker(currentTestDir, 'ANCHOR_ACK_BODY_A1');
+    const created = await createThread(topicKey, { title: 'Sweep logs', goal: 'sweep the logs', workdir: currentTestDir });
+    assert.ok(created.ok);
+    await updateThread(topicKey, 't-1', { status: 'done', lastResult: 'counts: 42' });
+
+    const sent = await runOne([
+      [{ update_id: 1, text: '/orchestrator on' }],
+      [{
+        update_id: 2,
+        text: 'also check the failures log',
+        replyTo: { message_id: 555, text: '✅ Thread t-1 done: Sweep logs\n\n<result text>\n\n_Ref: s-000000000000_' },
+      }],
+    ], threadId);
+    const L = () => sent.map(plain);
+
+    // Affirmative: the frozen lead + the frozen routed footer in ONE reply — an
+    // anchor that silently fell through to a normal orchestrator turn (no lead)
+    // is a DEFECT, not a pass.
+    const reply = L().find((t) => t.includes('➡️ Follow-up for thread t-1 (Sweep logs):'));
+    assert.ok(reply, `the anchor lead must be delivered; got: ${JSON.stringify(L())}`);
+    assert.ok(reply.includes('_(Routed to thread t-1'), `routed footer missing from: ${reply}`);
+
+    // The routed fire consumed the steer through the REAL executor path: the
+    // thread ran again and drained its input. The thread's OWN routed dispatch
+    // also invokes the fake worker asynchronously, so the capture list is not
+    // the pin here — the store state after the drain is.
+    await _waitForThreadExecutionsForTest();
+    const rec = await getThread(topicKey, 't-1');
+    assert.equal(rec?.status, 'done');
+    assert.deepEqual(rec?.pendingInput, []);
+
+    // The ack path ran NO worker: the archived assistant turn must carry
+    // worker 'local' — a fallback-chain worker name here lies in the
+    // conversation archive and defeats the closeWindow null sentinel.
+    const ackTurn = (await readTopicState(threadId)).turns
+      .find((t: any) => t.role === 'assistant' && t.text.includes('➡️ Follow-up for thread t-1'));
+    assert.ok(ackTurn, `the anchor ack turn is archived; turns: ${JSON.stringify((await readTopicState(threadId)).turns)}`);
+    assert.equal(ackTurn.worker, 'local', 'the ack turn must not fake a worker');
+  });
+
+  it('T-A2: a reply to an FYI of a RUNNING thread queues the input behind the frozen lead', async () => {
+    await seedTopicState(threadId, { orchestrator_enabled: true });
+    await writeCaptureWorker(currentTestDir, 'ANCHOR_ACK_BODY_A2');
+    const created = await createThread(topicKey, { title: 'Sweep logs', goal: 'sweep the logs', workdir: currentTestDir });
+    assert.ok(created.ok); // createThread seeds status 'running'
+
+    const sent = await runOne([{
+      update_id: 1,
+      text: 'also check the failures log',
+      replyTo: { message_id: 555, text: '✅ Thread t-1 done: Sweep logs\n\n<result text>\n\n_Ref: s-000000000000_' },
+    }], threadId);
+    const L = () => sent.map(plain);
+
+    const reply = L().find((t) => t.includes('➡️ Follow-up for thread t-1 (Sweep logs):'));
+    assert.ok(reply, `the anchor lead must be delivered; got: ${JSON.stringify(L())}`);
+    assert.ok(reply.includes('_(Queued for thread t-1'), `queued footer missing from: ${reply}`);
+    const rec = await getThread(topicKey, 't-1');
+    assert.deepEqual(rec?.pendingInput, ['also check the failures log']);
+  });
+
+  it('T-A3: a reply to a PLAIN message is a normal orchestrator turn — no anchor lead', async () => {
+    await seedTopicState(threadId, { orchestrator_enabled: true });
+    const capturePath = await writeCaptureWorker(currentTestDir, 'PLAIN_TURN_BODY_A3');
+
+    const sent = await runOne([{
+      update_id: 1,
+      text: 'what did that note mean?',
+      replyTo: { message_id: 556, text: 'earlier note' },
+    }], threadId);
+    const L = () => sent.map(plain);
+
+    assert.ok(!L().some((t) => t.includes('➡️')), `no anchor lead on a plain reply; got: ${JSON.stringify(L())}`);
+    assert.ok(L().some((t) => t.includes('PLAIN_TURN_BODY_A3')), 'the normal orchestrator turn ran and its reply was delivered');
+    assert.equal(captureBlocks(capturePath).length, 1, 'the fake worker dispatched exactly once (the orchestrator turn)');
+  });
+
+  it('T-A4: an armed pending_action outranks the anchor — the reply is the confirmation turn', async () => {
+    await seedTopicState(threadId, {
+      orchestrator_enabled: true,
+      // confirm-gate.test.ts fixture shape, set on the topic state directly.
+      pending_action: { description: 'spawn the sweep thread', proposed_at: new Date().toISOString() },
+    });
+    await writeCaptureWorker(currentTestDir, 'CONFIRM_TURN_BODY_A4');
+    const created = await createThread(topicKey, { title: 'Sweep logs', goal: 'sweep the logs', workdir: currentTestDir });
+    assert.ok(created.ok);
+    await updateThread(topicKey, 't-1', { status: 'done', lastResult: 'counts: 42' });
+
+    const sent = await runOne([{
+      update_id: 1,
+      text: 'also check the failures log',
+      replyTo: { message_id: 555, text: '✅ Thread t-1 done: Sweep logs\n\n<result text>\n\n_Ref: s-000000000000_' },
+    }], threadId);
+    const L = () => sent.map(plain);
+
+    assert.ok(!L().some((t) => t.includes('➡️ Follow-up for thread')), `pending_action must outrank the anchor; got: ${JSON.stringify(L())}`);
+    assert.ok(L().some((t) => t.includes('CONFIRM_TURN_BODY_A4')), 'the normal orchestrator turn ran');
+    const rec = await getThread(topicKey, 't-1');
+    assert.deepEqual(rec?.pendingInput, [], 'nothing was steered into the thread');
+  });
+
+  it('T-A5: an FYI-shaped reply naming an ABSENT thread dispatches normally — no anchor lead', async () => {
+    await seedTopicState(threadId, { orchestrator_enabled: true });
+    await writeCaptureWorker(currentTestDir, 'ABSENT_THREAD_BODY_A5');
+
+    const sent = await runOne([{
+      update_id: 1,
+      text: 'also check the failures log',
+      replyTo: { message_id: 555, text: '✅ Thread t-99 done: Sweep logs\n\n<result text>\n\n_Ref: s-000000000000_' },
+    }], threadId);
+    const L = () => sent.map(plain);
+
+    assert.ok(!L().some((t) => t.includes('➡️')), `no anchor lead for an absent thread; got: ${JSON.stringify(L())}`);
+    assert.ok(L().some((t) => t.includes('ABSENT_THREAD_BODY_A5')), 'the normal orchestrator turn ran');
+  });
+
+  it('T-A6: a reply-shaped head + a queued plain follower — head anchors alone, follower takes its own turn', async () => {
+    await seedTopicState(threadId, { orchestrator_enabled: true });
+    const capturePath = await writeCaptureWorker(currentTestDir, 'ORCH_TURN_BODY_A6', { holdMs: 2500 });
+    const created = await createThread(topicKey, { title: 'Sweep logs', goal: 'sweep the logs', workdir: currentTestDir });
+    assert.ok(created.ok);
+    await updateThread(topicKey, 't-1', { status: 'done', lastResult: 'counts: 42' });
+
+    const sent = await runOne([
+      [{ update_id: 1, text: 'WARMUP_A6 hold this turn' }],
+      [
+        {
+          update_id: 2,
+          text: 'also check the failures log',
+          replyTo: { message_id: 555, text: '✅ Thread t-1 done: Sweep logs\n\n<result text>\n\n_Ref: s-000000000000_' },
+        },
+        { update_id: 3, text: 'plain follower message' },
+      ],
+    ], threadId, {
+      gate: async (call) => {
+        if (call !== 1) return;
+        // Hold the [head, follower] batch until the warmup turn is verifiably
+        // IN FLIGHT, so the head's turn-start compile sees a genuinely queued
+        // follower (an idle-topic same-batch pair never queues).
+        await pollFor(() => captureBlocks(capturePath).length >= 1);
+      },
+    });
+
+    const L = () => sent.map(plain);
+    const lead = await pollFor(() => L().some((t) => t.includes('➡️ Follow-up for thread t-1 (Sweep logs):')));
+    assert.ok(lead, `the head's anchor steer must fire; got: ${JSON.stringify(L())}`);
+
+    // The follower stayed queued and took its OWN turn: exactly two
+    // orchestrator-lane dispatches (warmup + follower) — the head never
+    // dispatched and never folded — and no prompt carries batch scaffolding.
+    await _waitForThreadExecutionsForTest();
+    const settled = await pollFor(() => {
+      const blocks = captureBlocks(capturePath);
+      const orchestratorTurns = blocks.filter((b) => b.includes('You are the orchestrator'));
+      return orchestratorTurns.length >= 2 && blocks.every((b) => !b.includes('[Batched:'));
+    });
+    assert.ok(settled, 'the follower turn must settle without batch scaffolding');
+    const blocks = captureBlocks(capturePath);
+    assert.equal(
+      blocks.filter((b) => b.includes('You are the orchestrator')).length,
+      2,
+      `exactly the warmup + the follower's own turn may dispatch; got: ${blocks.length} block(s)`
+    );
+    assert.ok(blocks.every((b) => !b.includes('[Batched:')), `no prompt may carry batch scaffolding: ${JSON.stringify(blocks.map((b) => b.slice(0, 120)))}`);
   });
 });

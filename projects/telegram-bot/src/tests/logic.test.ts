@@ -3049,6 +3049,54 @@ describe('renderStatusCard', () => {
     assert.ok(!withoutTasks.includes('Tasks:'), 'no Tasks line when the counts are absent (empty executor lane)');
   });
 
+  it('status card threads line renders counts (AI-203 increment 3 T-L1)', () => {
+    const snapshot = buildModelStatusSnapshot({ currentWorker: 'agy', defaultWorker: 'agy', reasonCode: 'default_active' });
+    const card = renderStatusCard({
+      snapshot,
+      keepAwake: { active: false },
+      threads: { running: 1, queued: 0, done: 2, failed: 1, cancelled: 0 },
+    });
+    assert.ok(
+      card.includes('Threads: 1 running · 2 done · 1 failed'),
+      'the Threads line renders in the fixed segment order with the zero segment omitted'
+    );
+  });
+
+  it('status card threads line omitted when all counts are zero (T-L2)', () => {
+    const snapshot = buildModelStatusSnapshot({ currentWorker: 'agy', defaultWorker: 'agy', reasonCode: 'default_active' });
+    const card = renderStatusCard({
+      snapshot,
+      keepAwake: { active: false },
+      threads: { running: 0, queued: 0, done: 0, failed: 0, cancelled: 0 },
+    });
+    assert.ok(!card.includes('Threads:'), 'an all-zero count renders no line, never "Threads: 0 running"');
+  });
+
+  it('status card threads line renders the queued segment after running (T-L4, increment 4)', () => {
+    const snapshot = buildModelStatusSnapshot({ currentWorker: 'agy', defaultWorker: 'agy', reasonCode: 'default_active' });
+    const card = renderStatusCard({
+      snapshot,
+      keepAwake: { active: false },
+      threads: { running: 1, queued: 2, done: 0, failed: 0, cancelled: 0 },
+    });
+    assert.ok(
+      card.includes('Threads: 1 running · 2 queued'),
+      'the increment-4 queued segment renders between running and done'
+    );
+    assert.ok(!card.includes('done'), 'a zero segment stays omitted');
+  });
+
+  it('status card without a threads arg renders byte-identically to today (T-L3)', () => {
+    const snapshot = buildModelStatusSnapshot({ currentWorker: 'agy', defaultWorker: 'agy', reasonCode: 'default_active' });
+    const card = renderStatusCard({
+      snapshot,
+      keepAwake: { active: false },
+      tasks: { running: 2, parked: 1, queued: 3 },
+    });
+    assert.ok(card.includes('Tasks: 2 running · 1 parked · 3 queued'), 'the existing pinned card shape still renders');
+    assert.ok(!card.includes('Threads:'), 'no threads line when the counts are not computed');
+  });
+
   it('hydrateModelStatus resolves LLM and effort from workerConfig tunables and session/topic overrides', () => {
     const workers: WorkerConfig[] = [
       {

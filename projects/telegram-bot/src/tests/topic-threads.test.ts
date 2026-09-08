@@ -12,7 +12,10 @@ import {
   bumpRunSeq,
   updateThread,
   cancelRunningThreads,
+  claimThreadStarts,
+  listStoreKeys,
   activeThreadCount,
+  countThreads,
   _clearThreadsForTest,
   _setStoreDirForTest,
   MAX_RUNNING_THREADS_PER_TOPIC,
@@ -86,20 +89,20 @@ describe('createThread', () => {
     assert.equal(raw['t-2'].goal, 'Download the CSV.');
   });
 
-  it('enforces the 2-running cap and frees a slot when one finishes', async () => {
-    const a = await createThread(KEY, { title: 'A', goal: 'g', workdir: 'C:/pa-checkout' });
-    const b = await createThread(KEY, { title: 'B', goal: 'g', workdir: 'C:/pa-checkout' });
-    assert.ok(a.ok && b.ok);
-    const third = await createThread(KEY, { title: 'C', goal: 'g', workdir: 'C:/pa-checkout' });
-    assert.ok(!third.ok);
-    if (third.ok) return;
-    assert.ok(third.reason.includes(`${MAX_RUNNING_THREADS_PER_TOPIC} threads already running`));
-    assert.equal(await activeThreadCount(KEY), 2);
-    await updateThread(KEY, 't-1', { status: 'done' });
-    const fourth = await createThread(KEY, { title: 'D', goal: 'g', workdir: 'C:/pa-checkout' });
-    assert.ok(fourth.ok);
-    if (!fourth.ok) return;
-    assert.equal(fourth.thread.id, 't-3');
+  it('T-cap: parks the overflow create as queued instead of rejecting (increment 4)', async () => {
+    for (let i = 0; i < MAX_RUNNING_THREADS_PER_TOPIC; i++) {
+      const r = await createThread(KEY, { title: `T${i}`, goal: 'g', workdir: 'C:/pa-checkout' });
+      assert.ok(r.ok, `create ${i} should succeed`);
+      if (!r.ok) return;
+      assert.equal(r.thread.status, 'running');
+    }
+    assert.equal(await activeThreadCount(KEY), MAX_RUNNING_THREADS_PER_TOPIC);
+    const eleventh = await createThread(KEY, { title: 'Overflow', goal: 'g', workdir: 'C:/pa-checkout' });
+    assert.ok(eleventh.ok); // "no rejections, ever" — the cap parks, it does not reject
+    if (!eleventh.ok) return;
+    assert.equal(eleventh.thread.id, `t-${MAX_RUNNING_THREADS_PER_TOPIC + 1}`);
+    assert.equal(eleventh.thread.status, 'queued');
+    assert.equal(await activeThreadCount(KEY), MAX_RUNNING_THREADS_PER_TOPIC); // queued never counts as running
   });
 
   it('prunes the oldest terminal record past 20 and never prunes a running one', async () => {
@@ -114,6 +117,99 @@ describe('createThread', () => {
     assert.equal(Object.keys(raw).length, 20);
     assert.ok(!raw['t-2']); // oldest terminal (lowest n among done) dropped
     assert.equal(raw['t-1'].status, 'running'); // running is never pruned, even though oldest
+  });
+
+  it('T-prune: queued and running records are never pruned; the store may exceed 20 with no terminal victim', async () => {
+    // 10 running + 5 queued + 6 terminal: the create prunes only the two
+    // lowest-n terminal records to get back to 20.
+    const seeded: ThreadRecord[] = [];
+    for (let n = 1; n <= 10; n++) seeded.push(mkRec(`t-${n}`, n, 'running', 60));
+    for (let n = 11; n <= 15; n++) seeded.push(mkRec(`t-${n}`, n, 'queued', 60));
+    for (let n = 16; n <= 21; n++) seeded.push(mkRec(`t-${n}`, n, 'done', 60 - n));
+    seedFile(KEY, seeded);
+    const next = await createThread(KEY, { title: 'One more', goal: 'g', workdir: 'C:/pa-checkout' });
+    assert.ok(next.ok);
+    if (!next.ok) return;
+    assert.equal(next.thread.status, 'queued'); // cap full — parks
+    const raw = JSON.parse(readFileSync(join(home, `${KEY}.json`), 'utf8')) as Record<string, ThreadRecord>;
+    assert.equal(Object.keys(raw).length, 20);
+    for (let n = 1; n <= 10; n++) assert.equal(raw[`t-${n}`]?.status, 'running'); // never pruned
+    for (let n = 11; n <= 15; n++) assert.equal(raw[`t-${n}`]?.status, 'queued'); // never pruned
+    assert.ok(!raw['t-16'] && !raw['t-17']); // the only pruned records are terminal
+    assert.ok(raw['t-18'] && raw['t-21'] && raw['t-22']);
+
+    // No terminal victim anywhere: the store is allowed to exceed 20 rather
+    // than delete waiting work.
+    const allLive: ThreadRecord[] = [];
+    for (let n = 1; n <= 10; n++) allLive.push(mkRec(`t-${n}`, n, 'running', 60));
+    for (let n = 11; n <= 21; n++) allLive.push(mkRec(`t-${n}`, n, 'queued', 60));
+    seedFile(KEY, allLive);
+    const parked = await createThread(KEY, { title: 'Parked', goal: 'g', workdir: 'C:/pa-checkout' });
+    assert.ok(parked.ok); // no throw
+    if (!parked.ok) return;
+    assert.equal(parked.thread.status, 'queued');
+    const raw2 = JSON.parse(readFileSync(join(home, `${KEY}.json`), 'utf8')) as Record<string, ThreadRecord>;
+    assert.equal(Object.keys(raw2).length, 22); // 21 live + 1 parked, oversize by design
+    for (let n = 11; n <= 21; n++) assert.equal(raw2[`t-${n}`]?.status, 'queued'); // queued survived
+  });
+});
+
+describe('claimThreadStarts (increment 4 FIFO claim)', () => {
+  it('T-claim-1: a full cap claims nothing — queued records stay queued', async () => {
+    for (let i = 0; i < MAX_RUNNING_THREADS_PER_TOPIC + 2; i++) {
+      const r = await createThread(KEY, { title: `T${i}`, goal: 'g', workdir: 'C:/pa-checkout' });
+      assert.ok(r.ok);
+      if (!r.ok) return;
+    }
+    assert.deepEqual(await claimThreadStarts(KEY), []);
+    assert.equal((await getThread(KEY, 't-11'))?.status, 'queued');
+    assert.equal((await getThread(KEY, 't-12'))?.status, 'queued');
+  });
+
+  it('T-claim-2: freed slots claim exactly the queued records, lowest-n first, with fresh updatedAt', async () => {
+    for (let i = 0; i < MAX_RUNNING_THREADS_PER_TOPIC + 2; i++) {
+      await createThread(KEY, { title: `T${i}`, goal: 'g', workdir: 'C:/pa-checkout' });
+    }
+    // Free 3 slots (t-1..t-3 done); 2 queued ≤ 3 free — both start.
+    await updateThread(KEY, 't-1', { status: 'done' });
+    await updateThread(KEY, 't-2', { status: 'done' });
+    await updateThread(KEY, 't-3', { status: 'done' });
+    const before = await getThread(KEY, 't-11');
+    const claimed = await claimThreadStarts(KEY);
+    assert.deepEqual(claimed.map((r) => r.id), ['t-11', 't-12']); // lowest-n first
+    assert.ok(claimed.every((r) => r.status === 'running'));
+    assert.ok(before && claimed.every((r) => new Date(r.updatedAt).getTime() >= new Date(before.updatedAt).getTime()));
+    // The flip is persisted, not just returned.
+    assert.equal((await getThread(KEY, 't-11'))?.status, 'running');
+    assert.equal((await getThread(KEY, 't-12'))?.status, 'running');
+    assert.equal(await activeThreadCount(KEY), MAX_RUNNING_THREADS_PER_TOPIC - 3 + 2);
+  });
+
+  it('T-claim-3: one free slot claims exactly the lowest-n queued record', async () => {
+    for (let i = 0; i < MAX_RUNNING_THREADS_PER_TOPIC + 3; i++) {
+      await createThread(KEY, { title: `T${i}`, goal: 'g', workdir: 'C:/pa-checkout' });
+    }
+    await updateThread(KEY, 't-1', { status: 'done' }); // exactly one free slot
+    const claimed = await claimThreadStarts(KEY);
+    assert.deepEqual(claimed.map((r) => r.id), ['t-11']);
+    assert.equal((await getThread(KEY, 't-12'))?.status, 'queued');
+    assert.equal((await getThread(KEY, 't-13'))?.status, 'queued');
+  });
+
+  it('T-claim-4: done/failed records with pendingInput are not claimable — only explicit queued status is', async () => {
+    await createThread(KEY, { title: 'Done', goal: 'g', workdir: 'C:/pa-checkout' });
+    await createThread(KEY, { title: 'Failed', goal: 'g', workdir: 'C:/pa-checkout' });
+    await createThread(KEY, { title: 'Parked', goal: 'g', workdir: 'C:/pa-checkout' });
+    await updateThread(KEY, 't-1', { status: 'done' });
+    await updateThread(KEY, 't-2', { status: 'failed' });
+    await queueThreadInput(KEY, 't-1', 'wake me?');
+    await queueThreadInput(KEY, 't-2', 'wake me too?');
+    await updateThread(KEY, 't-3', { status: 'queued' }); // park-before-claim (handleSteer's contract)
+    const claimed = await claimThreadStarts(KEY);
+    assert.deepEqual(claimed.map((r) => r.id), ['t-3']);
+    assert.equal((await getThread(KEY, 't-1'))?.status, 'done');
+    assert.equal((await getThread(KEY, 't-2'))?.status, 'failed');
+    assert.equal((await getThread(KEY, 't-1'))?.pendingInput.length, 1); // pendingInput alone never makes a record startable
   });
 });
 
@@ -197,6 +293,19 @@ describe('lazy stale demotion on read', () => {
     const threads = await listThreads(KEY);
     assert.equal(threads[0].status, 'running');
   });
+
+  it('T-demote: a stale queued record is NOT demoted — no executor, no pump; revival is the drain\'s job (increment 4)', async () => {
+    seedFile(KEY, [mkRec('t-1', 1, 'queued', 31), mkRec('t-2', 2, 'running', 31)]);
+    const threads = await listThreads(KEY);
+    const queued = threads.find((t) => t.id === 't-1');
+    const running = threads.find((t) => t.id === 't-2');
+    assert.equal(queued?.status, 'queued'); // healthy waiting work stays queued
+    assert.ok(!queued?.lastError);
+    assert.equal(running?.status, 'failed'); // existing behavior pinned: running at the same age still demotes
+    const raw = JSON.parse(readFileSync(join(home, `${KEY}.json`), 'utf8')) as Record<string, ThreadRecord>;
+    assert.equal(raw['t-1'].status, 'queued');
+    assert.equal(raw['t-2'].status, 'failed');
+  });
 });
 
 describe('cancelRunningThreads', () => {
@@ -210,6 +319,26 @@ describe('cancelRunningThreads', () => {
     assert.equal(raw['t-3'].status, 'done');
     assert.equal(await activeThreadCount(KEY), 0);
     assert.equal(await cancelRunningThreads(KEY), 0); // second pass: nothing left running
+  });
+
+  it('T-cancel: queued records flip too but emit no topic event (increment 4)', async () => {
+    await createThread(KEY, { title: 'A', goal: 'g', workdir: 'C:/pa-checkout' });
+    await createThread(KEY, { title: 'B', goal: 'g', workdir: 'C:/pa-checkout' });
+    await createThread(KEY, { title: 'Parked', goal: 'g', workdir: 'C:/pa-checkout' });
+    await updateThread(KEY, 't-3', { status: 'queued' });
+    const count = await cancelRunningThreads(KEY);
+    assert.equal(count, 3);
+    const raw = JSON.parse(readFileSync(join(home, `${KEY}.json`), 'utf8')) as Record<string, ThreadRecord>;
+    assert.equal(raw['t-1'].status, 'cancelled');
+    assert.equal(raw['t-2'].status, 'cancelled');
+    assert.equal(raw['t-3'].status, 'cancelled');
+    // Exactly the two records that were RUNNING emitted; the queued record
+    // never started, so no event for it.
+    const events = readFileSync(join(process.env.PA_HOME!, 'topic-events', `${KEY}.jsonl`), 'utf8');
+    const lines = events.trim().split('\n').map((l) => JSON.parse(l) as { kind: string });
+    assert.equal(lines.length, 2);
+    assert.ok(lines.every((e) => e.kind === 'thread_cancelled'));
+    assert.equal(await cancelRunningThreads(KEY), 0); // second pass: nothing left running or queued
   });
 });
 
@@ -307,5 +436,57 @@ describe('takePendingInput (atomic take)', () => {
     const k = await cancelRunningThreads(KEY);
     assert.equal(k, 0);
     assert.equal(existsSync(join(process.env.PA_HOME!, 'topic-events', `${KEY}.jsonl`)), false);
+  });
+});
+
+describe('countThreads (AI-203 increment 3)', () => {
+  it('T-S1: tallies one topic by status across createThread + updateThread', async () => {
+    // Each thread is moved to its terminal status before the next one is
+    // created so the running tally ends at exactly one; the two queued
+    // records are parked explicitly via updateThread (createThread only
+    // parks past the cap — increment 4).
+    const r1 = await createThread(KEY, { title: 'Running', goal: 'g', workdir: 'C:/pa-checkout' });
+    const d1 = await createThread(KEY, { title: 'Done 1', goal: 'g', workdir: 'C:/pa-checkout' });
+    assert.ok(r1.ok && d1.ok);
+    await updateThread(KEY, d1.thread.id, { status: 'done' });
+    const d2 = await createThread(KEY, { title: 'Done 2', goal: 'g', workdir: 'C:/pa-checkout' });
+    assert.ok(d2.ok);
+    await updateThread(KEY, d2.thread.id, { status: 'done' });
+    const f1 = await createThread(KEY, { title: 'Failed', goal: 'g', workdir: 'C:/pa-checkout' });
+    assert.ok(f1.ok);
+    await updateThread(KEY, f1.thread.id, { status: 'failed' });
+    const c1 = await createThread(KEY, { title: 'Cancelled', goal: 'g', workdir: 'C:/pa-checkout' });
+    assert.ok(c1.ok);
+    await updateThread(KEY, c1.thread.id, { status: 'cancelled' });
+    const q1 = await createThread(KEY, { title: 'Queued 1', goal: 'g', workdir: 'C:/pa-checkout' });
+    const q2 = await createThread(KEY, { title: 'Queued 2', goal: 'g', workdir: 'C:/pa-checkout' });
+    assert.ok(q1.ok && q2.ok);
+    await updateThread(KEY, q1.thread.id, { status: 'queued' });
+    await updateThread(KEY, q2.thread.id, { status: 'queued' });
+    assert.deepEqual(await countThreads(KEY), { running: 1, queued: 2, done: 2, failed: 1, cancelled: 1 });
+  });
+
+  it('T-S2: unknown key tallies an all-zero five-field shape without throwing, and the read demotes a 31-min-stale running record', async () => {
+    assert.deepEqual(await countThreads('unknown_0'), { running: 0, queued: 0, done: 0, failed: 0, cancelled: 0 });
+    seedFile(KEY, [mkRec('t-1', 1, 'running', 31)]);
+    const counts = await countThreads(KEY);
+    assert.deepEqual(counts, { running: 0, queued: 0, done: 0, failed: 1, cancelled: 0 });
+    const rec = await getThread(KEY, 't-1');
+    assert.equal(rec?.status, 'failed');
+  });
+});
+
+describe('listStoreKeys (increment 4)', () => {
+  it('T-keys: returns seeded keys sans .json; absent dir ⇒ [] with no throw', async () => {
+    await createThread(KEY, { title: 'T', goal: 'g', workdir: 'C:/pa-checkout' });
+    await createThread('999_42', { title: 'Other', goal: 'g', workdir: 'C:/pa-checkout' }); // synthetic fixture id family
+    assert.deepEqual((await listStoreKeys()).sort(), ['999_42', '-1001234567890_5001'].sort());
+    // Absent store dir: ENOENT is swallowed to [] — never a throw.
+    _setStoreDirForTest(join(home, 'no-such-dir'));
+    assert.deepEqual(await listStoreKeys(), []);
+    // A non-dir store path also fails safe ([]).
+    writeFileSync(join(home, 'not-a-dir'), 'x');
+    _setStoreDirForTest(join(home, 'not-a-dir'));
+    assert.deepEqual(await listStoreKeys(), []);
   });
 });

@@ -154,6 +154,23 @@ describe('enqueue-normalizer', () => {
     assert.equal(rec?.voiceFileId, undefined);
   });
 
+  it('EN register-args (AI-203 inc 3): a reply update registers replyToMessageId; a non-reply leaves it undefined', async () => {
+    const reply: any = { update_id: 5004, message: msg({ text: 'also check failures', reply_to_message: { message_id: 41 } }) };
+    const replyRes = await enqueueUpdateForDispatch(
+      { update: reply, allowedChatIds: ALLOWED, topicKey: KEY, steerContexts: new Map() },
+      { token: 'tok', repoRoot: '/repo', env: {} as NodeJS.ProcessEnv },
+    );
+    assert.equal(replyRes.queueEntry?.replyToMessageId, 41);
+    assert.equal(replyRes.queueEntry?.messageId, 42);
+
+    const nonReply: any = { update_id: 5005, message: msg({ text: 'plain' }) };
+    const nonReplyRes = await enqueueUpdateForDispatch(
+      { update: nonReply, allowedChatIds: ALLOWED, topicKey: KEY, steerContexts: new Map() },
+      { token: 'tok', repoRoot: '/repo', env: {} as NodeJS.ProcessEnv },
+    );
+    assert.equal(nonReplyRes.queueEntry?.replyToMessageId, undefined);
+  });
+
   it('EN-T6: resolved voice promise sets __voiceResult', async () => {
     const vr = okVr('transcribed words');
     const update: any = { update_id: 6001, message: msg({ voice: VOICE }) };

@@ -134,6 +134,50 @@ export async function stopTopicWorkers(
   return killed;
 }
 
+/**
+ * Kill every live worker (wrapper + descendants) serving ONE thread's
+ * resource key (AI-203 increment 4 interrupt). Exact equality on
+ * `topic-<chatId>_<threadId>-th<threadN>` — never a prefix — so the topic's
+ * own resource (`topic-<key>`), its OTHER threads, task-lane resources and
+ * every non-thread dispatch are structurally unreachable from here. Returns
+ * the number of PIDs killed; 0 means nothing was registered (an interrupt
+ * whose run already finished still proceeds — the runSeq bump already
+ * orphaned it). Mirrors stopTopicWorkers body-for-body with only the match
+ * string differing.
+ */
+export async function stopThreadWorker(
+  chatId: number,
+  threadId: number,
+  threadN: number,
+  deps: StopDeps = defaultDeps,
+): Promise<number> {
+  const resource = `topic-${chatId}_${threadId}-th${threadN}`;
+  let killed = 0;
+  let entries;
+  try {
+    entries = await deps.list();
+  } catch {
+    return 0;
+  }
+  for (const entry of entries) {
+    if (entry.skill !== resource) continue;
+    const pids = [entry.pid, ...(entry.descendants ?? [])];
+    for (const pid of pids) {
+      if (deps.alive(pid)) {
+        try {
+          deps.kill(pid);
+          killed++;
+        } catch { /* already gone */ }
+      }
+    }
+    await deps.removeEntry(entry.pid).catch(() => {});
+  }
+  if (killed > 0) {
+    logger.info('worker-stop', `killed ${killed} pid(s) for ${resource}`, { chatId, threadId, threadN });
+  }
+  return killed;
+}
+
 // --- Command parsing (exported for tests) -----------------------------------
 
 export const STOP_PATTERN = /^\/stop(?:@\w+)?\s*$/i;

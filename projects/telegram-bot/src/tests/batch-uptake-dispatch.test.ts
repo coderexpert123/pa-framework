@@ -152,6 +152,15 @@ function steerUpdate(updateId: number, messageId: number, text: string, replyToM
   };
 }
 
+/** A plain text update that REPLIES to another message (AI-203 inc 3): the
+ *  reply_to_message carries only the id — no FYI text — so the anchor misses
+ *  and the W4 shapes are what the test exercises. */
+function replyShapeUpdate(updateId: number, messageId: number, text: string, replyToMessageId: number): unknown {
+  const base = textUpdate(updateId, messageId, text) as { message: Record<string, unknown> };
+  base.message.reply_to_message = { message_id: replyToMessageId };
+  return base;
+}
+
 function voiceUpdate(updateId: number, messageId: number, fileId: string, fuid: string): unknown {
   return {
     update_id: updateId,
@@ -673,5 +682,75 @@ describe('batch-uptake dispatch seam (AI-209 WP-3, end-to-end)', { concurrency: 
     assert.ok(!captureBlocks(capturePath).some((b) => b.includes('/status')), 'the spoken command must never be folded as text into any prompt');
     // The withheld note's own later turn yields the status reply — nothing dropped.
     assert.ok(sent.some((t) => t.includes('Topic Status')), `the withheld note must still produce its own /status reply. Sent: ${JSON.stringify(sent)}`);
+  });
+
+  it('T-BD1 (W4 head gate, AI-203 inc 3): a reply-shaped head dispatches ALONE; the follower stays queued for its own turn', async () => {
+    const { capturePath } = await writeDispatchFixture(tempDir);
+    await seedTopicState(tempDir);
+
+    const sent: string[] = [];
+    await runScenario(
+      [
+        { updates: [textUpdate(111, 1011, 'WARMUP_ELEVEN_111')] },
+        {
+          updates: [
+            replyShapeUpdate(112, 1012, 'ELEVEN_REPLY_HEAD_112', 1011),
+            textUpdate(113, 1013, 'ELEVEN_QUEUED_TAIL_113'),
+          ],
+          proceed: () => blockContaining(capturePath, 'WARMUP_ELEVEN_111') !== undefined,
+        },
+      ],
+      () =>
+        blockContaining(capturePath, 'ELEVEN_REPLY_HEAD_112') !== undefined &&
+        blockContaining(capturePath, 'ELEVEN_QUEUED_TAIL_113') !== undefined,
+      sent,
+      { dispatchStartedAt: 0 },
+    );
+
+    // The reply-shaped head NEVER compiles: its prompt carries its own text with
+    // no batch header, and the follower's text is absent from it.
+    const headPrompt = promptIn(capturePath, 'ELEVEN_REPLY_HEAD_112');
+    assert.ok(!headPrompt.includes('[Batched'), `a reply-shaped head must never fold. Prompt: ${headPrompt}`);
+    assert.ok(!headPrompt.includes('ELEVEN_QUEUED_TAIL_113'), 'the follower must not ride the head dispatch');
+    // The follower remained queued and got its own later turn, alone.
+    const tailPrompt = promptIn(capturePath, 'ELEVEN_QUEUED_TAIL_113');
+    assert.ok(!tailPrompt.includes('[Batched'), `the queued follower dispatches alone afterwards. Prompt: ${tailPrompt}`);
+    assert.ok(!tailPrompt.includes('ELEVEN_REPLY_HEAD_112'), 'each message dispatches with its OWN text');
+  });
+
+  it('T-BD2 (W4 follower e2e, AI-203 inc 3): a reply-shaped follower is withheld from the fold, then dispatches alone with its own text', async () => {
+    const { capturePath } = await writeDispatchFixture(tempDir);
+    await seedTopicState(tempDir);
+
+    const sent: string[] = [];
+    await runScenario(
+      [
+        { updates: [textUpdate(121, 1021, 'WARMUP_TWELVE_121')] },
+        {
+          updates: [
+            textUpdate(122, 1022, 'TWELVE_HEAD_122'),
+            replyShapeUpdate(123, 1023, 'TWELVE_REPLY_FOLLOWER_123', 1021),
+            textUpdate(124, 1024, 'TWELVE_TAIL_124'),
+          ],
+          proceed: () => blockContaining(capturePath, 'WARMUP_TWELVE_121') !== undefined,
+        },
+      ],
+      () =>
+        blockContaining(capturePath, '[Batched: 2 messages, in the order they were sent]') !== undefined &&
+        blockContaining(capturePath, 'TWELVE_REPLY_FOLLOWER_123') !== undefined,
+      sent,
+      { dispatchStartedAt: 0 },
+    );
+
+    // The fold RAN — head + plain tail combined (affirmative header) — with the
+    // reply-shaped follower WITHHELD from it.
+    const batchPrompt = promptIn(capturePath, '[Batched: 2 messages, in the order they were sent]');
+    assert.ok(batchPrompt.includes('TWELVE_HEAD_122') && batchPrompt.includes('TWELVE_TAIL_124'), `the plain pair folded. Prompt: ${batchPrompt}`);
+    assert.ok(!batchPrompt.includes('TWELVE_REPLY_FOLLOWER_123'), 'the reply-shaped follower must be withheld from the fold');
+    // The withheld follower reached processUpdate with its own update intact —
+    // its own turn, own text, no batch header, never re-texted by a compile.
+    const ownPrompt = promptIn(capturePath, 'TWELVE_REPLY_FOLLOWER_123');
+    assert.ok(!ownPrompt.includes('[Batched'), `the reply-shaped follower dispatches alone with its reply_to_message intact. Prompt: ${ownPrompt}`);
+    assert.ok(ownPrompt.includes('TWELVE_REPLY_FOLLOWER_123'), 'its own text reached the dispatch unchanged');
   });
 });

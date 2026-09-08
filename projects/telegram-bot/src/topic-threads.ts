@@ -13,7 +13,7 @@
  * atomic, never torn). Corrupt/unreadable files fail to empty with a logged
  * warning — a wedged store must never take the topic down with it.
  */
-import { mkdir, readFile } from 'fs/promises';
+import { mkdir, readdir, readFile } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
 import { appendTopicEvent } from '../../../pa/dist/src/lib/topic-events.js';
@@ -21,7 +21,8 @@ import { writeFileAtomic } from '../../../pa/dist/src/lib/atomic-write.js';
 import { logger } from '../../../pa/dist/src/lib/log.js';
 import type { SessionInfo } from './types.js';
 
-export const MAX_RUNNING_THREADS_PER_TOPIC = 2;
+// increment 4: overflow queues (createThread parks as 'queued'); the claim is the only queued→running transition
+export const MAX_RUNNING_THREADS_PER_TOPIC = 10;
 export const MAX_THREADS_PER_TOPIC = 20; // prune oldest terminal at create; never prune running
 export const MAX_PENDING_INPUT_PER_THREAD = 5;
 export const TOPIC_THREAD_STALE_MS = 30 * 60 * 1000; // lazy demotion on read
@@ -33,7 +34,7 @@ export interface ThreadRecord {
   n: number;
   title: string; // 1..80 chars
   goal: string; // the original spawn prompt, 1..4000 chars (re-spawn after session expiry/restart)
-  status: 'running' | 'done' | 'failed' | 'cancelled';
+  status: 'running' | 'queued' | 'done' | 'failed' | 'cancelled'; // queued = record exists, executor not fired, waiting for a free slot (FIFO by n)
   createdAt: string; // ISO
   updatedAt: string; // ISO — bumped by the activity pump; drives lazy stale demotion
   workdir: string; // absolute; resolved topic workdir captured at spawn
@@ -114,7 +115,12 @@ async function persist(key: string, map: Map<string, ThreadRecord>): Promise<voi
   await writeFileAtomic(storePath(key), JSON.stringify(Object.fromEntries(map), null, 2));
 }
 
-/** Running records wedged past TOPIC_THREAD_STALE_MS demote to `failed` (lazy, on read). */
+/**
+ * Running records wedged past TOPIC_THREAD_STALE_MS demote to `failed` (lazy,
+ * on read). Queued records are exempt — no executor means no pump, and a
+ * healthy queued record is revived by the reconcile drain (increment 4),
+ * never demoted.
+ */
 function demoteStale(map: Map<string, ThreadRecord>): boolean {
   const now = Date.now();
   let changed = false;
@@ -147,9 +153,10 @@ export async function createThread(
     const map = await load(key);
     let running = 0;
     for (const rec of map.values()) if (rec.status === 'running') running++;
-    if (running >= MAX_RUNNING_THREADS_PER_TOPIC) {
-      return { ok: false, reason: `${MAX_RUNNING_THREADS_PER_TOPIC} threads already running` };
-    }
+    // increment 4: the cap parks instead of rejecting ("no rejections, ever") —
+    // claimThreadStarts is the only path that flips a parked record to running.
+    const status: ThreadRecord['status'] =
+      running >= MAX_RUNNING_THREADS_PER_TOPIC ? 'queued' : 'running';
     let maxN = 0;
     for (const rec of map.values()) if (rec.n > maxN) maxN = rec.n;
     const n = maxN + 1;
@@ -159,7 +166,7 @@ export async function createThread(
       n,
       title,
       goal,
-      status: 'running',
+      status,
       createdAt: now,
       updatedAt: now,
       workdir: init.workdir,
@@ -169,14 +176,16 @@ export async function createThread(
     };
     map.set(thread.id, thread);
     // Cap total records: prune lowest-n terminal first (n is per-topic
-    // monotonic, so lowest n = oldest); running records are never pruned.
+    // monotonic, so lowest n = oldest); running and queued records are never
+    // pruned (queued is waiting work — increment 4).
     while (map.size > MAX_THREADS_PER_TOPIC) {
       let victim: ThreadRecord | null = null;
       for (const rec of map.values()) {
         if (rec.status === 'running') continue;
+        if (rec.status === 'queued') continue;
         if (!victim || rec.n < victim.n) victim = rec;
       }
-      if (!victim) break; // all running — cannot happen past the running cap, kept safe anyway
+      if (!victim) break; // no terminal victim (all running/queued) — keep the store oversize, never delete waiting work
       map.delete(victim.id);
     }
     await persist(key, map);
@@ -295,7 +304,43 @@ export async function touchThread(key: string, id: string): Promise<void> {
   });
 }
 
-/** Mark every running thread `cancelled`; returns how many flipped. */
+/**
+ * FIFO spawn-queue claim (AI-203 increment 4). Under the per-key lock: lazy
+ * stale demotion first (frees slots), then flip the lowest-n `queued`
+ * records to `running` while slots remain, and return them for firing. The
+ * ONLY queued→running transition in the system — every start (spawn claim,
+ * steer wake, executor terminal wake, poll-tick reconcile) goes through
+ * here, so the running cap binds every entry into execution, not just
+ * createThread. Returns [] when nothing is startable.
+ */
+export async function claimThreadStarts(key: string): Promise<ThreadRecord[]> {
+  return withKeyLock(key, async () => {
+    const map = await load(key);
+    if (demoteStale(map)) await persist(key, map);
+    let running = 0;
+    for (const rec of map.values()) if (rec.status === 'running') running++;
+    const startable = [...map.values()]
+      .filter((rec) => rec.status === 'queued')
+      .sort((a, b) => a.n - b.n);
+    const claimed: ThreadRecord[] = [];
+    const now = new Date().toISOString();
+    for (const rec of startable) {
+      if (running >= MAX_RUNNING_THREADS_PER_TOPIC) break;
+      rec.status = 'running';
+      rec.updatedAt = now;
+      running++;
+      claimed.push(rec);
+    }
+    if (claimed.length > 0) await persist(key, map);
+    return claimed;
+  });
+}
+
+/**
+ * Mark every running or queued thread `cancelled`; returns how many flipped.
+ * Queued records cancel too — they never started, so no topic event is
+ * emitted for them.
+ */
 export async function cancelRunningThreads(key: string): Promise<number> {
   return withKeyLock(key, async () => {
     const map = await load(key);
@@ -306,11 +351,12 @@ export async function cancelRunningThreads(key: string): Promise<number> {
     // count are unaffected).
     const parsed = /^(-?\d+)_(\d+)$/.exec(key);
     for (const rec of map.values()) {
-      if (rec.status !== 'running') continue;
+      if (rec.status !== 'running' && rec.status !== 'queued') continue;
+      const wasRunning = rec.status === 'running';
       rec.status = 'cancelled';
       rec.updatedAt = now;
       count++;
-      if (!parsed) continue;
+      if (!parsed || !wasRunning) continue;
       try {
         await appendTopicEvent(Number(parsed[1]), Number(parsed[2]), {
           kind: 'thread_cancelled',
@@ -335,6 +381,43 @@ export async function activeThreadCount(key: string): Promise<number> {
   let count = 0;
   for (const rec of map.values()) if (rec.status === 'running') count++;
   return count;
+}
+
+export interface ThreadCounts {
+  running: number;
+  queued: number;
+  done: number;
+  failed: number;
+  cancelled: number;
+}
+
+/**
+ * Tally one topic's thread records by status. Reads through listThreads, so
+ * the lazy stale-demotion side effect runs first — a count is also a keep-alive
+ * for the demotion clock. Fail-to-empty (unknown key, unreadable file) via the
+ * same path listThreads uses; never throws.
+ */
+export async function countThreads(key: string): Promise<ThreadCounts> {
+  const threads = await listThreads(key);
+  const counts: ThreadCounts = { running: 0, queued: 0, done: 0, failed: 0, cancelled: 0 };
+  for (const t of threads) counts[t.status]++;
+  return counts;
+}
+
+/**
+ * Every topic key with a store file (`.json` stripped), for the poll-tick
+ * reconcile drain. Absent dir ⇒ []. Never throws.
+ */
+export async function listStoreKeys(): Promise<string[]> {
+  try {
+    const files = await readdir(storeDir());
+    return files.filter((f) => f.endsWith('.json')).map((f) => f.slice(0, -5));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+      logger.warn('topic-threads', `listStoreKeys failed: ${(err as Error).message}`);
+    }
+    return [];
+  }
 }
 
 /** Test hook: drop the per-key mutex chains so a test starts with no inherited serialization. */

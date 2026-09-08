@@ -148,7 +148,7 @@ export async function enqueueUpdateForDispatch(input: EnqueueInput, deps: Enqueu
     // AI-209: the message_id rides the queue entry so the batch compile
     // can label `[msg <id>]` blocks and write foldedFrom provenance
     // (SPEC §1/§4.1 - the entry field is dead without this argument).
-    queueEntry = registerQueuedUpdate(topicKey, update.update_id, userText, isCommandOverride, m.message_id);
+    queueEntry = registerQueuedUpdate(topicKey, update.update_id, userText, isCommandOverride, m.message_id, m.reply_to_message?.message_id);
     // Attach steerContext from the side map if present.
     const steerCtx = steerContexts.get(update.update_id);
     if (steerCtx) {

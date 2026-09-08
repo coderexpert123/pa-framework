@@ -28,7 +28,9 @@ import { runWithFailover } from '../../../pa/dist/src/workers.js';
 import type { CommandResult, RunOptions } from '../../../pa/dist/src/types.js';
 import {
   bumpRunSeq,
+  claimThreadStarts,
   getThread,
+  listStoreKeys,
   takePendingInput,
   updateThread,
   touchThread,
@@ -58,7 +60,6 @@ export interface ExecuteTopicThreadArgs {
   topicCtx: { chatId: number; threadId: number; topicName: string };
   secrets: Record<string, string>;
   token: string;
-  workdir: { dir: string };
   /** Test seam — default is the real Telegram send with the ref-id footer. */
   sendFyi?: ThreadFyiSender;
   /** Test seam — default is the real runWithFailover cascade. */
@@ -67,6 +68,7 @@ export interface ExecuteTopicThreadArgs {
 
 /** Executor-owned constants (AI-203 spec §4.1; store-side constants live in
  *  topic-threads.ts). */
+// per-chain chunk bound — an over-cap backlog parks the record as 'queued'; the next wake restarts a fresh chain, so spend stays proportional to queued input
 export const MAX_AUTO_RESUMES_PER_CHAIN = 5;
 export const THREAD_RESPONSE_CAP_CHARS = 3_500;
 export const THREAD_RESULT_EXCERPT_CHARS = 400;
@@ -155,8 +157,73 @@ export async function _waitForThreadExecutionsForTest(): Promise<void> {
   }
 }
 
+/** ThreadTopicContext from the `<chatId>_<threadId>` store key. chatId may be
+ *  NEGATIVE (supergroups: -100...) — split on the LAST underscore only, never
+ *  on '-'. */
+export function topicCtxFromKey(topicKey: string, topicName: string): ThreadTopicContext | undefined {
+  const parts = topicKey.split('_');
+  const threadId = Number(parts.pop());
+  const chatId = Number(parts.join('_'));
+  if (!Number.isFinite(chatId) || !Number.isFinite(threadId)) return undefined;
+  return { chatId, threadId, topicName };
+}
+
+/** Fire-and-forget executor start for ONE record, tracked in
+ *  activeThreadExecutions (moved from orchestrator.ts, increment 4 — the
+ *  claim-based wake needs it from three callers). */
+export function fireThreadExecution(
+  thread: ThreadRecord,
+  ctx: ThreadTopicContext,
+  secrets: Record<string, string>,
+  token: string
+): void {
+  // workdir rides the RECORD (executeTopicThread reads rec.workdir for cwd).
+  const exec = executeTopicThread({ thread, topicCtx: ctx, secrets, token });
+  activeThreadExecutions.add(exec);
+  void exec.finally(() => activeThreadExecutions.delete(exec));
+}
+
+/** Fire every claimed record of one topic (claimThreadStarts callers). The
+ *  key is parsed with the LAST-underscore rule (chatId may be negative).
+ *  topicName may be '' (unresolvable) — the prompt header tolerates it. */
+export function fireClaimedThreads(
+  topicKey: string,
+  claimed: ThreadRecord[],
+  deps: { secrets: Record<string, string>; token: string; topicName: string }
+): void {
+  const ctx = topicCtxFromKey(topicKey, deps.topicName);
+  if (!ctx) {
+    logger.warn('thread-executor', 'claimed threads but topic key malformed; they will not execute', { topicKey, count: claimed.length });
+    return;
+  }
+  for (const rec of claimed) fireThreadExecution(rec, ctx, deps.secrets, deps.token);
+}
+
 function threadKey(chatId: number, threadId: number): string {
   return `${chatId}_${threadId}`;
+}
+
+/**
+ * Resource-keyed interrupt signals (increment 4): resource → the runSeq that
+ * was current when the interrupt fired. The killed run's own dispatch closure
+ * ORs this into isCancelled so its cascade ABORTS instead of respawning the
+ * next worker on a dead prompt (pa/src/workers.ts polls per candidate and
+ * after a failed attempt). The value-scoped comparison means a LATER run on
+ * the same resource — a new capturedRunSeq — is never cancelled by a stale
+ * signal; the entry is deleted lazily when a newer run captures ownership.
+ * In-process only: the kill is the durable act, the signal only steers the
+ * dying cascade.
+ */
+const interruptSignals = new Map<string, number>();
+export function signalThreadInterrupt(resource: string, runSeq: number): void {
+  interruptSignals.set(resource, runSeq);
+}
+
+/** Test hook: clear all interrupt signals (the map is module-level and keyed
+ *  by the tests' shared fixture resource; without a reset one test's signal
+ *  cancels the next test's first run). */
+export function _resetThreadInterruptsForTest(): void {
+  interruptSignals.clear();
 }
 
 // Pending inputs are taken atomically via the store's takePendingInput (see the
@@ -184,6 +251,21 @@ export async function executeTopicThread(args: ExecuteTopicThreadArgs): Promise<
       await sendFyi(text, kind);
     } catch (err) {
       logger.warn('thread-executor', `${kind} FYI failed: ${(err as Error).message}`, { id, key });
+    }
+  }
+
+  // Queue wake (increment 4): a terminal settle freed a slot — start the
+  // FIFO queue's next record(s). Awaited so the fired executors register in
+  // activeThreadExecutions before this one settles (test-drain determinism);
+  // the fires themselves stay fire-and-forget.
+  async function wakeQueue(): Promise<void> {
+    try {
+      const claimed = await claimThreadStarts(key);
+      if (claimed.length > 0) {
+        fireClaimedThreads(key, claimed, { secrets: args.secrets, token: args.token, topicName });
+      }
+    } catch (err) {
+      logger.warn('thread-executor', `queue wake failed: ${(err as Error).message}`, { id, key });
     }
   }
 
@@ -219,6 +301,10 @@ export async function executeTopicThread(args: ExecuteTopicThreadArgs): Promise<
       logger.warn('thread-executor', 'stale run discarded', { id, key, phase: 'bump' });
       return;
     }
+    // A stale interrupt signal (for a runSeq this run has superseded) is
+    // garbage — drop it so the map never outlives the interrupt.
+    const pending = interruptSignals.get(resource);
+    if (pending !== undefined && pending !== capturedRunSeq) interruptSignals.delete(resource);
     rec = (await getThread(key, id).catch(() => undefined)) ?? rec;
 
     // Build the prompt for THIS dispatch.
@@ -266,7 +352,7 @@ export async function executeTopicThread(args: ExecuteTopicThreadArgs): Promise<
       // prompt file, so a spawned thread runs the prompt it was given.
       requireNonEmptyOutput: true,
       harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS,
-      isCancelled: () => mirrorStatus !== 'running',
+      isCancelled: () => mirrorStatus !== 'running' || interruptSignals.get(resource) === capturedRunSeq,
       // Suppression (increment-2 roadmap item, now built): strip the operator's
       // static bot-instructions file from claude/zclaude thread spawns — a
       // spawned thread must run the prompt it was given, not a static "run
@@ -329,6 +415,7 @@ export async function executeTopicThread(args: ExecuteTopicThreadArgs): Promise<
         logger.warn('thread-executor', `thread_failed event failed: ${(err as Error).message}`, { id, key });
       }
       await sendFyiBestEffort(`❌ Thread ${id} failed: ${after.title}\n\n${reason}`, 'thread-failed');
+      await wakeQueue();
       return;
     }
 
@@ -355,14 +442,13 @@ export async function executeTopicThread(args: ExecuteTopicThreadArgs): Promise<
       ? normalized.slice(0, THREAD_RESPONSE_CAP_CHARS) + '…'
       : normalized;
     await sendFyiBestEffort(
-      `✅ Thread ${id} done: ${after.title}\n\n${capped}${notices.length > 0 ? `\n\n${notices.join('\n')}` : ''}`,
+      `✅ Thread ${id} done: ${after.title}\n\n${capped}${notices.length > 0 ? `\n\n${notices.join('\n')}` : ''}\n\n_(Reply to this message to continue the thread.)_`,
       'thread-done'
     );
 
     // Pending-input drain: after a completed run, deliver queued steer(s) as
-    // the thread's next turn. Over MAX_AUTO_RESUMES_PER_CHAIN: stop, log,
-    // leave the inputs queued (the next steer after the operator reads the
-    // topic resumes them).
+    // the thread's next turn. Over MAX_AUTO_RESUMES_PER_CHAIN: park the
+    // record as 'queued' and wake the queue (a fresh chain drains the rest).
     const afterRun = await getThread(key, id).catch(() => undefined);
     if (!afterRun || afterRun.status === 'cancelled') return;
     // Cap guard FIRST: a take after the cap check would silently destroy inputs.
@@ -375,17 +461,60 @@ export async function executeTopicThread(args: ExecuteTopicThreadArgs): Promise<
       continue;
     }
     if (afterRun.pendingInput.length > 0) {
-      logger.warn('thread-executor', 'auto-resume cap reached; steer inputs left queued', {
+      await updateThread(key, id, { status: 'queued' }).catch(() => {});
+      logger.warn('thread-executor', 'auto-resume cap reached; steer inputs left queued; record parked as queued for the next wake', {
         id,
         key,
         queued: afterRun.pendingInput.length,
         cap: MAX_AUTO_RESUMES_PER_CHAIN,
       });
+      await wakeQueue();
+      return;
     }
+    await wakeQueue();
     return;
   }
 
   function ctxOf(rec: ThreadRecord): ThreadTopicContext {
     return { chatId, threadId, topicName };
   }
+}
+
+/** Minimum interval between reconcile passes (AI-203 increment 4). The
+ *  primary wakes are in-band (executor terminals, spawn/steer handlers);
+ *  this throttle only paces the poll-tick backstop that revives a queue a
+ *  restart or a missed wake left parked while slots are free. */
+export const THREAD_QUEUE_RECONCILE_MIN_INTERVAL_MS = 60_000;
+let lastReconcileAt = 0;
+
+export interface ThreadQueueReconcileDeps {
+  secrets: Record<string, string>;
+  token: string;
+  topicNameFromKey: (key: string) => string;
+}
+
+/**
+ * Reconcile pass over EVERY topic's store: claim startable queued records
+ * and fire them. No-op (and no store read beyond the dir listing) while the
+ * throttle holds. Returns the number of records fired. Never throws.
+ */
+export async function reconcileThreadQueues(deps: ThreadQueueReconcileDeps): Promise<number> {
+  const now = Date.now();
+  if (now - lastReconcileAt < THREAD_QUEUE_RECONCILE_MIN_INTERVAL_MS) return 0;
+  lastReconcileAt = now;
+  let fired = 0;
+  const keys = await listStoreKeys().catch(() => [] as string[]);
+  for (const key of keys) {
+    const claimed = await claimThreadStarts(key).catch(() => []);
+    if (claimed.length > 0) {
+      fireClaimedThreads(key, claimed, { secrets: deps.secrets, token: deps.token, topicName: deps.topicNameFromKey(key) });
+      fired += claimed.length;
+    }
+  }
+  return fired;
+}
+
+/** Test hook: reset the reconcile throttle. */
+export function _resetThreadQueueReconcileForTest(): void {
+  lastReconcileAt = 0;
 }

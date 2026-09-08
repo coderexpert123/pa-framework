@@ -28,17 +28,24 @@ import {
   getThread,
   listThreads,
   queueThreadInput,
+  claimThreadStarts,
+  bumpRunSeq,
+  updateThread,
   MAX_PENDING_INPUT_PER_THREAD,
-  MAX_RUNNING_THREADS_PER_TOPIC,
 } from './topic-threads.js';
 import { getTopicBrainInfo } from './topic-brains.js';
 import { buildTopicDescription } from './context.js';
+// Increment 4: the fire/claim helpers and the interrupt signal live in
+// thread-executor.ts (single-sourced — three callers fire, not just this
+// module); the thread-scoped kill lives in worker-stop.ts.
 import {
-  executeTopicThread,
-  activeThreadExecutions,
+  fireThreadExecution,
+  fireClaimedThreads,
+  signalThreadInterrupt,
+  topicCtxFromKey,
   THREAD_RESULT_EXCERPT_CHARS,
-  type ThreadTopicContext,
 } from './thread-executor.js';
+import { stopThreadWorker } from './worker-stop.js';
 // The shared dispatch cascade (dispatch.ts) owns the stop probe, session
 // validity, resume args, harvest windows and capture; this module keeps only
 // the tail's next-worker suggestion.
@@ -84,11 +91,17 @@ export function validateSpawnThreadAction(
   return { ok: true, title, prompt };
 }
 
-/** §4.4 — steer_thread validation against the CURRENT store records (pure). */
+export type SteerMode = 'queue' | 'interrupt';
+
+/** §4.4 — steer_thread validation against the CURRENT store records (pure).
+ *  Increment 4: mode is orchestrator-classified per message; absent/empty ⇒
+ *  'queue'. queued now means "the input waits for delivery" — true for a
+ *  RUNNING thread (waits for the run) and for a QUEUED thread (waits for a
+ *  slot); false only for an immediately startable terminal thread. */
 export function validateSteerThreadAction(
   a: PAMetaAction,
   threads: ThreadRecord[]
-): { ok: true; thread: ThreadRecord; queued: boolean } | { ok: false; reason: string } {
+): { ok: true; thread: ThreadRecord; queued: boolean; mode: SteerMode } | { ok: false; reason: string } {
   const threadId = typeof a.thread_id === 'string' ? a.thread_id.trim() : '';
   if (!/^t-\d+$/.test(threadId)) return { ok: false, reason: 'thread_id must look like t-3' };
   const thread = threads.find((t) => t.id === threadId);
@@ -99,8 +112,37 @@ export function validateSteerThreadAction(
   if (thread.pendingInput.length >= MAX_PENDING_INPUT_PER_THREAD) {
     return { ok: false, reason: `pending input is full (${MAX_PENDING_INPUT_PER_THREAD} max)` };
   }
-  // queued === (status === 'running') — frozen equivalence (§4.4).
-  return { ok: true, thread, queued: thread.status === 'running' };
+  const mode: SteerMode | null =
+    a.mode === undefined || a.mode === '' ? 'queue'
+    : a.mode === 'queue' ? 'queue'
+    : a.mode === 'interrupt' ? 'interrupt'
+    : null;
+  if (mode === null) return { ok: false, reason: 'mode must be "queue" or "interrupt"' };
+  return { ok: true, thread, queued: thread.status === 'running' || thread.status === 'queued', mode };
+}
+
+/** Anchored on the FIRST LINE of the four frozen thread FYIs (program SPEC
+ *  §4.7: pickup/retry/done/failed — thread-executor.ts is their only producer;
+ *  the ref footer follows after a blank line, so ^ holds on the sent text). A
+ *  reply whose raw anchor matches steers the captured thread directly
+ *  (increment 3) — no orchestrator turn. thread-executor.test.ts pins this
+ *  pattern against the REAL captured FYI texts (cross-module drift guard). */
+export const THREAD_FYI_ANCHOR_PATTERN =
+  /^(?:🧵|⏳|✅|❌) Thread (t-\d+) (?:started:|hit a snag|done:|failed:)/;
+
+/** Direct replies only: the RAW reply_to_message text is the one surface
+ *  consulted — quote text, topic turns and archive lookups never match, so a
+ *  QUOTE of an FYI stays a normal orchestrator turn. Returns the thread id or
+ *  null. Existence is the caller's check (getThread): a user-crafted
+ *  FYI-shaped text naming a live thread steers it — deliberate; the steer
+ *  validator still applies. */
+export function resolveThreadFyiAnchor(msg: {
+  reply_to_message?: { text?: string; caption?: string };
+}): string | null {
+  const raw = msg.reply_to_message?.text || msg.reply_to_message?.caption;
+  if (!raw) return null;
+  const m = THREAD_FYI_ANCHOR_PATTERN.exec(raw);
+  return m ? m[1] : null;
 }
 
 /** §4.2 — orchestrator mode gate. */
@@ -130,6 +172,9 @@ export function renderThreadsSection(threads: ThreadRecord[]): string {
       lines.push(`- ${t.id} — ${t.title} (failed: ${(t.lastError ?? '').slice(0, THREAD_ERROR_EXCERPT_CHARS)})`);
     } else if (t.status === 'cancelled') {
       lines.push(`- ${t.id} — ${t.title} (cancelled)`);
+    } else if (t.status === 'queued') {
+      const queuedSuffix = t.pendingInput.length > 0 ? `, +${t.pendingInput.length} queued` : '';
+      lines.push(`- ${t.id} — ${t.title} (queued${queuedSuffix})`);
     } else {
       const queuedSuffix = t.pendingInput.length > 0 ? `, +${t.pendingInput.length} queued` : '';
       lines.push(`- ${t.id} — ${t.title} (running${queuedSuffix})`);
@@ -198,17 +243,17 @@ Thread ID: ${state.thread_id}
   - Pure conversation, questions, opinions, planning: answer directly from your own knowledge.
   - Work that needs tools (commands, files, downloads, research on disk): spawn a thread.
   - A follow-up, correction, or new instruction for work already in a thread: steer that thread.
-- spawn_thread: the thread starts a FRESH CLI conversation and does NOT see this chat. Write its prompt self-contained: the goal, relevant absolute file paths, constraints, and what "done" looks like.
-- steer_thread: the message becomes that thread's next turn. If it is mid-run, delivery happens when the current run finishes. The thread keeps its own conversation context, so you can steer a finished thread to continue it.
+- spawn_thread: the thread starts a FRESH CLI conversation and does NOT see this chat. Write its prompt self-contained: the goal, relevant absolute file paths, constraints, and what "done" looks like. If all threads are busy, the spawn parks and starts automatically when one finishes.
+- steer_thread: pick mode per message. "interrupt" kills the thread's current run and restarts it right away with your message folded in — use it when the message redirects, corrects, or invalidates what the thread is doing. "queue" delivers your message as the thread's next turn after the current run finishes — use it when the message adds to or builds on the running work. When both readings fit, pick interrupt (redoing partial work costs less than finishing obsolete work). The thread keeps its own conversation context, so you can steer a finished thread to continue it.
 - When you spawn or steer, your reply says so plainly with the thread id (e.g. "Spawning a thread to sweep the logs (t-3)"), and states that the result will arrive in this topic — that is true here; the system delivers it.
 - Consequential work (modifying tracked files, sending email or messages, spending money, destructive operations): do NOT spawn immediately. Describe the plan in one short paragraph and arm confirm_required; when the user confirms, spawn in your next turn.
 - Thread status questions: answer from the Execution threads section only. Finished threads' results appear there as excerpts; summarize them, never re-execute them.
 
 ## PA_META (optional last line, single-line JSON, nothing after it):
 [PA_META]: {"actions":[{"type":"T",...}]}
-Types available to you: spawn_thread{title,prompt} | steer_thread{thread_id,message} | confirm_required | question{text,options} | watch_job{description,check,deadline_minutes} | kb_note{domain,note} | run_skill{skill}
+Types available to you: spawn_thread{title,prompt} | steer_thread{thread_id,message,mode} | confirm_required | question{text,options} | watch_job{description,check,deadline_minutes} | kb_note{domain,note} | run_skill{skill}
 - spawn_thread: title <=80 chars; prompt <=4000 chars, self-contained.
-- steer_thread: thread_id like "t-3"; message <=4000 chars.
+- steer_thread: thread_id like "t-3"; message <=4000 chars; mode "queue"|"interrupt" (optional, default "queue").
 - question: you need the user to pick one of up to 4 options (each <=40 chars, text <=500 chars) — the reply renders option buttons.
 - confirm_required: arms a yes/no confirmation; the user's answer arrives as your next turn.
 - watch_job / kb_note / run_skill: platform-default meaning (read-only completion watch; KB Sources.md note; trigger a pa skill after your response).
@@ -273,11 +318,17 @@ export interface OrchestratorTurnArgs {
   failover?: (prompt: string, opts: RunOptions) => Promise<{ worker: string; result: CommandResult }>;
   capture?: (worker: string, result: CommandResult, resource: string) => Promise<SessionInfo | undefined>;
 }
+/** One validated routing action from an orchestrator turn (increment 4
+ *  fan-out: a single reply may carry N spawns + N steers, in envelope
+ *  order, so a folded batch routes each sub-message to its right target). */
+export type OrchestratorRoute =
+  | { kind: 'spawn'; title: string; prompt: string }
+  | { kind: 'steer'; thread: ThreadRecord; message: string; queued: boolean; mode: SteerMode };
+
 export interface OrchestratorTurnResult {
   response: string; // parseMetadata-cleaned, spawn/steer stripped, rejections appended
   meta: PAMeta | null; // spawn/steer REMOVED — downstream applyMetaActions never sees them
-  spawn: { title: string; prompt: string } | null; // FIRST validated spawn_thread, else null
-  steer: { thread: ThreadRecord; message: string; queued: boolean } | null; // FIRST validated steer_thread
+  routes: OrchestratorRoute[]; // validated, in envelope order; [] when none
   session: SessionInfo | undefined;
   dispatchedWorker?: string;
   workerError?: boolean;
@@ -344,7 +395,7 @@ export async function dispatchOrchestratorTurn(args: OrchestratorTurnArgs): Prom
     pendingDesc: args.pendingDesc,
   });
   if (outcome.kind === 'cancelled') {
-    return { response: '', meta: null, spawn: null, steer: null, session: outcome.session, workerError: true };
+    return { response: '', meta: null, routes: [], session: outcome.session, workerError: true };
   }
 
   const { result, worker: workerName, session: capturedSession } = outcome;
@@ -366,8 +417,7 @@ export async function dispatchOrchestratorTurn(args: OrchestratorTurnArgs): Prom
     return {
       response: buildWorkerErrorResponse({ worker: workerName, emptyResponse: true, suggestedWorker }),
       meta: null,
-      spawn: null,
-      steer: null,
+      routes: [],
       session: state.session,
       workerError: true,
       suggestedWorker,
@@ -375,33 +425,32 @@ export async function dispatchOrchestratorTurn(args: OrchestratorTurnArgs): Prom
   }
 
   // Strip spawn/steer from the envelope downstream applyMetaActions sees, and
-  // validate the FIRST of each; validation failures downgrade to a rejected
-  // line appended to the response (§4.5).
+  // validate EVERY routing action into the fan-out routes list (increment 4);
+  // validation failures downgrade to rejected lines appended to the response
+  // (§4.5). One store read per turn — all actions validate against the SAME
+  // snapshot; handleSteer re-validates fresh by contract.
   const meta = stripOrchestratorActions(rawMeta);
-  let spawn: OrchestratorTurnResult['spawn'] = null;
-  let steer: OrchestratorTurnResult['steer'] = null;
+  const routes: OrchestratorRoute[] = [];
   let rejections = '';
-  const spawnAction = rawMeta?.actions.find((a) => a.type === 'spawn_thread');
-  if (spawnAction) {
-    const v = validateSpawnThreadAction(spawnAction);
-    if (v.ok) spawn = { title: v.title, prompt: v.prompt };
-    else rejections += `\n\n_(thread spawn rejected: ${v.reason})_`;
-  }
-  const steerAction = rawMeta?.actions.find((a) => a.type === 'steer_thread');
-  if (steerAction) {
-    const v = validateSteerThreadAction(steerAction, await listThreads(key));
-    // The validator's frozen ok-shape carries thread+queued only (§4.4); the
-    // trimmed message comes from the action it just validated.
-    const steerMsg = typeof steerAction.message === 'string' ? steerAction.message.trim() : '';
-    if (v.ok) steer = { thread: v.thread, message: steerMsg, queued: v.queued };
-    else rejections += `\n\n_(steer rejected: ${v.reason})_`;
+  const hasRouting = (rawMeta?.actions ?? []).some((a) => a.type === 'spawn_thread' || a.type === 'steer_thread');
+  const threads = hasRouting ? await listThreads(key) : [];
+  for (const action of rawMeta?.actions ?? []) {
+    if (action.type === 'spawn_thread') {
+      const v = validateSpawnThreadAction(action);
+      if (v.ok) routes.push({ kind: 'spawn', title: v.title, prompt: v.prompt });
+      else rejections += `\n\n_(thread spawn rejected: ${v.reason})_`;
+    } else if (action.type === 'steer_thread') {
+      const v = validateSteerThreadAction(action, threads);
+      const steerMsg = typeof action.message === 'string' ? action.message.trim() : '';
+      if (v.ok) routes.push({ kind: 'steer', thread: v.thread, message: steerMsg, queued: v.queued, mode: v.mode });
+      else rejections += `\n\n_(steer rejected: ${v.reason})_`;
+    }
   }
 
   return {
     response: buildWorkerResponse({ ...result, output: deliverable }, workerName) + rejections,
     meta,
-    spawn,
-    steer,
+    routes,
     session: capturedSession,
     dispatchedWorker: result.success ? workerName : undefined,
     workerError: result.success ? undefined : true,
@@ -412,17 +461,6 @@ export async function dispatchOrchestratorTurn(args: OrchestratorTurnArgs): Prom
 // ---------------------------------------------------------------------------
 // §4.5 spawn/steer handlers (store write + executor fire + frozen footers)
 // ---------------------------------------------------------------------------
-
-/** ThreadTopicContext from the `<chatId>_<threadId>` store key. chatId may be
- *  NEGATIVE (supergroups: -100...) — split on the LAST underscore only, never
- *  on '-'. */
-function topicCtxFromKey(topicKey: string, topicName: string): ThreadTopicContext | undefined {
-  const parts = topicKey.split('_');
-  const threadId = Number(parts.pop());
-  const chatId = Number(parts.join('_'));
-  if (!Number.isFinite(chatId) || !Number.isFinite(threadId)) return undefined;
-  return { chatId, threadId, topicName };
-}
 
 /** Best-effort topic-event emission for the spawn/steer routing surface
  *  (callbacks.ts question_answered precedent: a failed audit line never fails
@@ -443,20 +481,6 @@ export async function emitThreadEvent(
   }
 }
 
-/** Fire-and-forget executor start, tracked in activeThreadExecutions (same
- *  add/delete pattern as main.ts's task-lane wiring). */
-function fireThreadExecution(
-  thread: ThreadRecord,
-  ctx: ThreadTopicContext,
-  secrets: Record<string, string>,
-  token: string,
-  workdir: string
-): void {
-  const exec = executeTopicThread({ thread, topicCtx: ctx, secrets, token, workdir: { dir: workdir } });
-  activeThreadExecutions.add(exec);
-  void exec.finally(() => activeThreadExecutions.delete(exec));
-}
-
 export interface HandleSpawnArgs {
   topicKey: string;
   topicName: string;
@@ -466,73 +490,142 @@ export interface HandleSpawnArgs {
   workdir: string;
 }
 
-/** Perform the store write + fire the executor; RETURN the frozen footer for
- *  main.ts to append to the reply (§4.5 footer table). */
+/** Perform the store write; the FIFO claim decides fire-vs-park; RETURN the
+ *  frozen footer for main.ts to append to the reply (§4.5 footer table).
+ *  Increment 4: no rejections for the cap — an 11th spawn parks as 'queued'
+ *  and starts automatically when a slot frees. */
 export async function handleSpawn(args: HandleSpawnArgs): Promise<string> {
   const v = validateSpawnThreadAction({ type: 'spawn_thread', title: args.spawn.title, prompt: args.spawn.prompt });
   if (!v.ok) return `\n\n_(thread spawn rejected: ${v.reason})_`;
   const created = await createThread(args.topicKey, { title: v.title, goal: v.prompt, workdir: args.workdir });
-  if (!created.ok) {
-    if (created.reason === `${MAX_RUNNING_THREADS_PER_TOPIC} threads already running`) {
-      return `\n\n_(thread spawn rejected: ${MAX_RUNNING_THREADS_PER_TOPIC} threads already running — steer one or wait.)_`;
-    }
-    return `\n\n_(thread spawn rejected: ${created.reason})_`;
-  }
+  if (!created.ok) return `\n\n_(thread spawn rejected: ${created.reason})_`;
   const ctx = topicCtxFromKey(args.topicKey, args.topicName);
   if (!ctx) {
     logger.warn('orchestrator', 'thread spawned but topic key malformed; it will not execute', {
       topicKey: args.topicKey,
       thread: created.thread.id,
     });
+  } else if (created.thread.status === 'running') {
+    fireThreadExecution(created.thread, ctx, args.secrets, args.token);
   } else {
-    fireThreadExecution(created.thread, ctx, args.secrets, args.token, args.workdir);
+    const claimed = await claimThreadStarts(args.topicKey).catch(() => []);
+    if (claimed.length > 0) {
+      fireClaimedThreads(args.topicKey, claimed, { secrets: args.secrets, token: args.token, topicName: args.topicName });
+    }
   }
   await emitThreadEvent(args.topicKey, { kind: 'thread_spawned', ref: created.thread.id, detail: created.thread.title });
-  return `\n\n_(Thread ${created.thread.id} spawned: ${created.thread.title} — its result arrives in this topic when it finishes.)_`;
+  // Footer is selected by the record's state AFTER the claim attempt: a
+  // free-slot create fired directly above (spawned footer); a parked create
+  // either started just now via the claim (spawned footer) or is genuinely
+  // waiting (queued footer).
+  const after = (await getThread(args.topicKey, created.thread.id).catch(() => undefined)) ?? created.thread;
+  return after.status === 'queued'
+    ? `\n\n_(Thread ${created.thread.id} queued — starts when one finishes.)_`
+    : `\n\n_(Thread ${created.thread.id} spawned: ${created.thread.title} — its result arrives in this topic when it finishes.)_`;
 }
 
 export interface HandleSteerArgs {
   topicKey: string;
   topicName: string;
-  steer: { thread: ThreadRecord; message: string; queued: boolean };
+  steer: { thread: ThreadRecord; message: string; queued: boolean; mode: SteerMode };
   secrets: Record<string, string>;
   token: string;
   workdir: string;
 }
 
-/** Fresh store read → validate → queue the input → (idle thread) fire the
- *  executor; RETURN the frozen footer (§4.5 footer table). */
+/** Fresh store read → validate → queue the input → route by mode and state;
+ *  RETURN the frozen footer (§4.5 footer table). Increment 4: INTERRUPT
+ *  kills the in-flight run and restarts with the message folded in; a
+ *  terminal-thread wake parks as 'queued' and goes through the FIFO claim
+ *  like every other start — no direct fire, so the running cap binds every
+ *  entry into execution. */
 export async function handleSteer(args: HandleSteerArgs): Promise<string> {
   const threads = await listThreads(args.topicKey);
   const v = validateSteerThreadAction(
-    { type: 'steer_thread', thread_id: args.steer.thread.id, message: args.steer.message },
+    { type: 'steer_thread', thread_id: args.steer.thread.id, message: args.steer.message, mode: args.steer.mode },
     threads
   );
   if (!v.ok) return `\n\n_(steer rejected: ${v.reason})_`;
   const queuedResult = await queueThreadInput(args.topicKey, v.thread.id, args.steer.message);
   if (!queuedResult.ok) return `\n\n_(steer rejected: ${queuedResult.reason})_`;
-  if (v.queued) {
-    await emitThreadEvent(args.topicKey, {
-      kind: 'thread_steered',
-      ref: v.thread.id,
-      detail: `queued: ${v.thread.title.slice(0, 120)}`,
-    });
+  const ctx = topicCtxFromKey(args.topicKey, args.topicName);
+
+  // INTERRUPT (mode=interrupt, thread running): the fold is durable (queued
+  // above); orphan the in-flight run, kill-drop its session (cancel-path
+  // semantics: never resume a conversation that died mid-run), signal the
+  // dying cascade, kill exactly this thread's process tree, fire the restart.
+  // The executor's wake path delivers the fold as the restart's first turn.
+  if (v.mode === 'interrupt' && v.thread.status === 'running' && ctx) {
+    const seq = await bumpRunSeq(args.topicKey, v.thread.id);
+    const fresh = seq === undefined ? undefined : await getThread(args.topicKey, v.thread.id).catch(() => undefined);
+    if (seq !== undefined && fresh && fresh.status === 'running') {
+      await updateThread(args.topicKey, v.thread.id, { session: undefined }).catch(() => {});
+      signalThreadInterrupt(`topic-${args.topicKey}-th${v.thread.n}`, seq);
+      await stopThreadWorker(ctx.chatId, ctx.threadId, v.thread.n).catch(() => 0);
+      const rec = (await getThread(args.topicKey, v.thread.id).catch(() => undefined)) ?? v.thread;
+      fireThreadExecution(rec, ctx, args.secrets, args.token);
+      await emitThreadEvent(args.topicKey, { kind: 'thread_steered', ref: v.thread.id, detail: `interrupted: ${v.thread.title.slice(0, 120)}` });
+      return `\n\n_(Interrupted thread ${v.thread.id} — restarting with your message.)_`;
+    }
+    // The run finished on its own between validation and the bump — nothing
+    // to kill; fall through and route the message normally.
+  }
+
+  // Queue-mode steer to a LIVE run: the input rides pendingInput (unchanged).
+  if (v.thread.status === 'running') {
+    await emitThreadEvent(args.topicKey, { kind: 'thread_steered', ref: v.thread.id, detail: `queued: ${v.thread.title.slice(0, 120)}` });
     return `\n\n_(Queued for thread ${v.thread.id} — delivered when its current run finishes.)_`;
   }
-  const ctx = topicCtxFromKey(args.topicKey, args.topicName);
-  if (!ctx) {
-    logger.warn('orchestrator', 'steer accepted but topic key malformed; it will not execute', {
-      topicKey: args.topicKey,
-      thread: v.thread.id,
-    });
-  } else {
-    const rec = (await getThread(args.topicKey, v.thread.id)) ?? v.thread;
-    fireThreadExecution(rec, ctx, args.secrets, args.token, args.workdir);
+
+  // Wake path (terminal or already-queued thread): park terminal records as
+  // 'queued' so the claim owns the start, then let the FIFO claim decide.
+  const parked = await getThread(args.topicKey, v.thread.id).catch(() => undefined);
+  if (parked && (parked.status === 'done' || parked.status === 'failed')) {
+    await updateThread(args.topicKey, v.thread.id, { status: 'queued' }).catch(() => {});
   }
-  await emitThreadEvent(args.topicKey, {
-    kind: 'thread_steered',
-    ref: v.thread.id,
-    detail: `routed: ${v.thread.title.slice(0, 120)}`,
+  const claimed = ctx ? await claimThreadStarts(args.topicKey).catch(() => []) : [];
+  if (claimed.length > 0 && ctx) {
+    fireClaimedThreads(args.topicKey, claimed, { secrets: args.secrets, token: args.token, topicName: args.topicName });
+  }
+  const after = (await getThread(args.topicKey, v.thread.id).catch(() => undefined)) ?? parked;
+  if (after && after.status === 'running') {
+    await emitThreadEvent(args.topicKey, { kind: 'thread_steered', ref: v.thread.id, detail: `routed: ${v.thread.title.slice(0, 120)}` });
+    return `\n\n_(Routed to thread ${v.thread.id} — it is running your message now.)_`;
+  }
+  await emitThreadEvent(args.topicKey, { kind: 'thread_steered', ref: v.thread.id, detail: `queued: ${v.thread.title.slice(0, 120)}` });
+  return `\n\n_(Queued for thread ${v.thread.id} — starts when a thread finishes.)_`;
+}
+
+export interface HandleAnchorSteerArgs {
+  topicKey: string;
+  topicName: string;
+  thread: ThreadRecord;
+  message: string;
+  secrets: Record<string, string>;
+  token: string;
+  workdir: string;
+}
+
+/** Reply-to-FYI direct steer (increment 3): validate the anchor's thread
+ *  FRESH, then route through handleSteer so the store write, the executor
+ *  fire and the frozen footer stay single-sourced. A rejected anchor returns
+ *  the frozen rejection footer ALONE — no lead line may precede a rejection.
+ *  Accepted anchors return a lead naming thread id + title, then the footer:
+ *  `➡️ Follow-up for thread t-<n> (<title>):` + footer. */
+export async function handleAnchorSteerReply(args: HandleAnchorSteerArgs): Promise<string> {
+  const threads = await listThreads(args.topicKey);
+  const v = validateSteerThreadAction(
+    { type: 'steer_thread', thread_id: args.thread.id, message: args.message },
+    threads
+  );
+  if (!v.ok) return `_(steer rejected: ${v.reason})_`;
+  const footer = await handleSteer({
+    topicKey: args.topicKey,
+    topicName: args.topicName,
+    steer: { thread: v.thread, message: args.message, queued: v.queued, mode: 'queue' },
+    secrets: args.secrets,
+    token: args.token,
+    workdir: args.workdir,
   });
-  return `\n\n_(Routed to thread ${v.thread.id} — it is running your message now.)_`;
+  return `➡️ Follow-up for thread ${v.thread.id} (${v.thread.title}):${footer}`;
 }
