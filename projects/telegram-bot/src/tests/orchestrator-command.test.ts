@@ -104,6 +104,17 @@ describe('handleOrchestratorCommand', () => {
     assert.ok(r.response.includes('- t-2 — Research (done) · updated 0m'));
     assert.ok(!r.response.includes('Research (done) · updated 0m · +'));
   });
+
+  it('T-C5b: a queued record renders the generic status interpolation, no +k suffix when input is empty (increment 4)', () => {
+    const state = makeState({ orchestrator_enabled: true });
+    const now = new Date().toISOString();
+    const threads = [
+      { id: 't-1', n: 1, title: 'Sweep logs', goal: 'g', status: 'queued', createdAt: now, updatedAt: now, workdir: 'C:/w', runSeq: 0, attempts: 0, pendingInput: [] },
+    ] as const;
+    const r = handleOrchestratorCommand('/orchestrator status', state, threads as any);
+    assert.ok(r.response.includes('- t-1 — Sweep logs (queued) · updated 0m'), `got: ${r.response}`);
+    assert.ok(!r.response.includes('+0 queued'));
+  });
 });
 
 describe('unknown-command guard integration', () => {

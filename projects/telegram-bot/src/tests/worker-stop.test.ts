@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   parseStopSteer,
   stopTopicWorkers,
+  stopThreadWorker,
   markTopicStopped,
   unmarkTopicStopped,
   isTopicStopped,
@@ -141,5 +142,39 @@ describe('stopTopicWorkers', () => {
     );
     await stopTopicWorkers(1, 2, deps);
     assert.deepEqual(killed, [10]);
+  });
+});
+
+describe('stopThreadWorker (increment 4 thread-scoped kill)', () => {
+  it('T-K1: kills ONLY the exact -th<n> entry (pid + descendants), removes only its own entry', async () => {
+    const { deps, killed, removed } = makeDeps(
+      [
+        { pid: 10, skill: 'topic-1_5' },        // the topic's own resource — unreachable
+        { pid: 20, skill: 'topic-1_5-th2', descendants: [21, 22] }, // the target thread
+        { pid: 30, skill: 'topic-1_5-th3' },    // a sibling thread — unreachable
+        { pid: 40, skill: 'task-x' },           // a task-lane resource — unreachable
+      ],
+      new Set([10, 20, 21, 22, 30, 40]),
+    );
+    assert.equal(await stopThreadWorker(1, 5, 2, deps), 3);
+    assert.deepEqual(killed, [20, 21, 22]);
+    assert.deepEqual(removed, [20]);
+  });
+
+  it('T-K2: no matching entry ⇒ 0 kills, no removals; a throwing list ⇒ 0 (same swallow as stopTopicWorkers)', async () => {
+    // `-th22` proves the match is exact equality, never a `-th2` prefix match.
+    const { deps, killed, removed } = makeDeps(
+      [{ pid: 10, skill: 'topic-1_5' }, { pid: 20, skill: 'topic-1_5-th22' }],
+      new Set([10, 20]),
+    );
+    assert.equal(await stopThreadWorker(1, 5, 2, deps), 0);
+    assert.deepEqual(killed, []);
+    assert.deepEqual(removed, []);
+
+    const throwing: StopDeps = {
+      ...deps,
+      list: async () => { throw new Error('registry unreadable'); },
+    };
+    assert.equal(await stopThreadWorker(1, 5, 2, throwing), 0);
   });
 });

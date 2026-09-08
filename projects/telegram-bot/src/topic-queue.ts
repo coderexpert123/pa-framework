@@ -83,6 +83,13 @@ export interface QueueEntry {
    *  label blocks and write provenance without a listPendingDispatches
    *  round-trip. */
   messageId?: number;
+  /** Telegram message_id this update REPLIES to, when present (AI-203 inc 3).
+   *  Same name and semantics as the dlq entry field. The batch compile
+   *  withholds reply-shaped entries (W4) and the compile gate skips
+   *  reply-shaped heads: a fold would lose the reply_to_message shape the
+   *  thread-FYI anchor resolves from, and a reply-shaped head would steer its
+   *  thread with the whole combined text. */
+  replyToMessageId?: number;
 }
 
 const queues = new Map<string, QueueEntry[]>();
@@ -93,6 +100,7 @@ const queues = new Map<string, QueueEntry[]>();
  * @param isCommandOverride When provided, it wins over the regex derivation.
  * @param messageId Telegram message_id, when available (AI-209); set on the
  *   entry when provided, left undefined otherwise.
+ * @param replyToMessageId The replied-to message_id, when the update is a reply (AI-203 inc 3); set on the entry when provided.
  */
 export function registerQueuedUpdate(
   topicKey: string,
@@ -100,6 +108,7 @@ export function registerQueuedUpdate(
   text: string,
   isCommandOverride?: boolean,
   messageId?: number,
+  replyToMessageId?: number,
 ): QueueEntry {
   const entry: QueueEntry = {
     updateId,
@@ -108,6 +117,7 @@ export function registerQueuedUpdate(
     cancelled: false,
   };
   if (messageId !== undefined) entry.messageId = messageId;
+  if (replyToMessageId !== undefined) entry.replyToMessageId = replyToMessageId;
   const arr = queues.get(topicKey);
   if (arr) arr.push(entry);
   else queues.set(topicKey, [entry]);

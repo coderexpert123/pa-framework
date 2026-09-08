@@ -129,9 +129,12 @@ import {
   dispatchOrchestratorTurn,
   handleSpawn,
   handleSteer,
+  resolveThreadFyiAnchor,
+  handleAnchorSteerReply,
   ORCHESTRATOR_PATTERN,
 } from './orchestrator.js';
-import { cancelRunningThreads, listThreads } from './topic-threads.js';
+import { reconcileThreadQueues } from './thread-executor.js';
+import { cancelRunningThreads, listThreads, countThreads, getThread } from './topic-threads.js';
 // Session-capture consolidation (WP-4/WP-5): the definitions of the exclusion
 // set, the resource parser, the post-dispatch capture block and the
 // empty-response helper moved verbatim into session-capture.ts — the dispatch
@@ -264,6 +267,43 @@ async function topicTaskCounts(
   }
 }
 
+/** AI-203 increment 3: resolve an FYI anchor to a live thread and build the
+ *  dispatch-result ack for it. Undefined when the thread does not exist — the
+ *  update then dispatches normally. The ack carries the exact field set the
+ *  downstream block reads off `dr` (dispatchedWorker INCLUDED, as undefined:
+ *  the union member must declare it or dr.dispatchedWorker at the card-refresh
+ *  and teePath reads is a TS2339). No worker ran: session passes through
+ *  untouched, and the card/teePath/failover paths all skip on the undefined
+ *  dispatchedWorker. */
+async function steerFromThreadAnchor(
+  topicKey: string,
+  anchorThreadId: string,
+  message: string,
+  topicState: ConversationState,
+  ctx: { topicName: string; secrets: Record<string, string>; token: string; workdir: string }
+): Promise<{
+  response: string;
+  meta: null;
+  session: ConversationState['session'];
+  workerError: false;
+  suggestedWorker: null;
+  dispatchedWorker: undefined;
+} | undefined> {
+  const rec = await getThread(topicKey, anchorThreadId).catch(() => undefined);
+  if (!rec) return undefined;
+  return {
+    response: await handleAnchorSteerReply({
+      topicKey, topicName: ctx.topicName, thread: rec, message,
+      secrets: ctx.secrets, token: ctx.token, workdir: ctx.workdir,
+    }),
+    meta: null,
+    session: topicState.session,
+    workerError: false,
+    suggestedWorker: null,
+    dispatchedWorker: undefined,
+  };
+}
+
 async function replacePinnedStatusCard(
   token: string,
   chatId: number,
@@ -272,7 +312,11 @@ async function replacePinnedStatusCard(
   snapshot: ModelStatusSnapshot,
   keepAwake = getKeepAwakeStatus()
 ): Promise<{ delivered: boolean; pinned: boolean; messageId: number | null }> {
-  const pinText = renderStatusCard({ snapshot, keepAwake, tasks: await topicTaskCounts(chatId, threadId) });
+  const pinText = renderStatusCard({
+    snapshot, keepAwake,
+    tasks: await topicTaskCounts(chatId, threadId),
+    threads: await countThreads(`${chatId}_${threadId}`),
+  });
   const oldPinId = state.pinned_status_message_id;
   const pinMsgId = await sendMessageWithId(token, chatId, appendRefIdAndLog(pinText, { kind: 'pin', chatId, threadId }), threadId || undefined, buildControlCardKeyboard());
 
@@ -308,7 +352,11 @@ async function refreshPinnedStatusCardInPlace(
   const snapshot = hydrateModelStatus(state, effectiveDefault, config);
   syncModelStatusState(state, snapshot);
 
-  const pinText = renderStatusCard({ snapshot, keepAwake, tasks: await topicTaskCounts(chatId, threadId) });
+  const pinText = renderStatusCard({
+    snapshot, keepAwake,
+    tasks: await topicTaskCounts(chatId, threadId),
+    threads: await countThreads(`${chatId}_${threadId}`),
+  });
   if (state.pinned_status_message_id) {
     // bp-retry (2026-08-25): this sweep used to unconditionally rewrite the card's
     // keyboard back to the top-level menu, silently stranding a user mid-navigation
@@ -1078,8 +1126,16 @@ async function processUpdate(
     // pending_action so a second "yes" (typed, tapped, or 👍'd) inside the 5-minute TTL
     // cannot re-run the same confirmed action.
     let confirmedDescription: string | undefined;
+    // AI-203 increment 3: resolveConfirmation clears an armed action for any
+    // unrelated text and consumeConfirmation clears it for a yes — both BEFORE
+    // the dispatch block — so the anchor guard below could never observe the
+    // arm. Snapshot it AFTER TTL expiry but BEFORE that consume: an armed
+    // pending_action outranks the thread-FYI anchor (the reply is the
+    // confirmation turn, never a steer).
+    let pendingActionArmed = false;
     if (!skipWorker) {
       expirePendingAction(topicState);
+      pendingActionArmed = !!topicState.pending_action;
       if (topicState.pending_action) {
         const resolved = resolveConfirmation(topicState, userText);
         response = resolved.response; skipWorker = resolved.skipWorker;
@@ -1185,28 +1241,48 @@ async function processUpdate(
 
       const editWindow: DispatchWindow | null = await openWindow({ resource: resourceId });
       try {
-        // AI-203: an orchestrator-mode topic routes every non-command message
-        // through the orchestrator conversation (interpret → route → report);
-        // everything downstream reads the superset result shape unchanged.
-        // isCancelled is NOT passed — the orchestrator cascade derives the
-        // byte-identical stop-marker predicate from (resource, updateId)
-        // internally, exactly like dispatchMessage does.
-        const dr = isOrchestratorMode(topicState)
-          ? await dispatchOrchestratorTurn({
-              userText, replyContext,
-              pendingDesc: confirmedDescription ?? topicState.pending_action?.description,
-              topicState, secrets, resourceId, chatId, threadId,
-              defaultWorker: effectiveDefault, onNotify,
-              updateId: update.update_id, workdir, contextId, topicNames,
+        // AI-203 increment 3: a plain message REPLYING to a thread FYI steers
+        // that thread directly (tier-1 anchor — no orchestrator turn). Guard
+        // order is load-bearing: (1) an armed pending_action outranks the
+        // anchor (the reply is the confirmation turn) — read through the
+        // pendingActionArmed snapshot taken before the confirmation consume;
+        // (2) empty-text replies never steer (media-only replies keep today's
+        // dispatch); (3) the thread must exist (checked inside the helper).
+        // Not gated on orchestrator mode: a post-`/orchestrator off` topic may
+        // still steer live threads. Batched uptake never hands this branch a
+        // combined text — reply-shaped heads are gated out of the compile and
+        // reply-shaped followers are withheld (E6).
+        const anchorThreadId = pendingActionArmed || !userText.trim()
+          ? null
+          : resolveThreadFyiAnchor(msg);
+        const anchorAck = anchorThreadId
+          ? await steerFromThreadAnchor(`${chatId}_${threadId}`, anchorThreadId, userText, topicState, {
+              topicName: getTopicName(topicNames, chatId, threadId) ?? '',
+              secrets, token, workdir: workdir.dir,
             })
-          : await dispatchMessage(userText, replyContext, confirmedDescription ?? topicState.pending_action?.description, topicState, secrets, resourceId, effectiveDefault, topicNames, onNotify, update.update_id, workdir, contextId);
+          : undefined;
+        const dr = anchorAck
+          ?? (isOrchestratorMode(topicState)
+            ? await dispatchOrchestratorTurn({
+                userText, replyContext,
+                pendingDesc: confirmedDescription ?? topicState.pending_action?.description,
+                topicState, secrets, resourceId, chatId, threadId,
+                defaultWorker: effectiveDefault, onNotify,
+                updateId: update.update_id, workdir, contextId, topicNames,
+              })
+            : await dispatchMessage(userText, replyContext, confirmedDescription ?? topicState.pending_action?.description, topicState, secrets, resourceId, effectiveDefault, topicNames, onNotify, update.update_id, workdir, contextId));
         response = dr.response; topicState.session = dr.session;
         workerErrored = !!dr.workerError;
         // WP-D1 (A.3): carry the empty-output suggestion out of dispatchMessage's
         // scope — the reply-send cascade (outside this block) reads the module let.
         drSuggestedWorker = dr.suggestedWorker ?? null;
-        // AI-151: capture the actual worker that handled this dispatch
-        assistantWorker = dr.dispatchedWorker || topicState.session?.worker || topicState.preferred_worker || effectiveDefault;
+        // AI-151: capture the actual worker that handled this dispatch. The
+        // anchor-ack path ran no worker — 'local' keeps the archived turn and
+        // the closeWindow null sentinel truthful; it must win HERE, after the
+        // fallback chain, not before it.
+        assistantWorker = anchorAck
+          ? 'local'
+          : dr.dispatchedWorker || topicState.session?.worker || topicState.preferred_worker || effectiveDefault;
         // B9 rev 3 (a): HOIST stoppedKind consumption before applyMetaActions (V22)
         const topicKey = `${chatId}_${threadId}`;
         const stoppedKind = consumeTopicStopped(topicKey, update.update_id);
@@ -1237,22 +1313,27 @@ async function processUpdate(
         if (!parkedNow) {
           const { response: processedResponse, skillToRun, restartBot: metaRestartBot, kbNote, watchJob } = applyMetaActions(response, dr.meta, topicState);
           response = processedResponse; restartBot = metaRestartBot;
-          // AI-203: the orchestrator's validated routing actions become
+          // AI-203 increment 4: the orchestrator's validated routing actions
+          // (fan-out — N spawns + N steers per reply, envelope order) become
           // thread-store writes + executor fires here, so the reply that
-          // promised the spawn/steer carries the frozen confirmation footer.
-          // ('x' in dr narrows the dispatch-result union — the human lane's
-          // dispatchMessage result has neither field.)
-          if ('spawn' in dr && dr.spawn) {
-            response += await handleSpawn({
-              topicKey, topicName: getTopicName(topicNames, chatId, threadId) ?? '',
-              spawn: dr.spawn, secrets, token, workdir: workdir.dir,
-            });
-          }
-          if ('steer' in dr && dr.steer) {
-            response += await handleSteer({
-              topicKey, topicName: getTopicName(topicNames, chatId, threadId) ?? '',
-              steer: dr.steer, secrets, token, workdir: workdir.dir,
-            });
+          // promised them carries the frozen confirmation footers. ('routes'
+          // in dr narrows the dispatch-result union — the human lane's
+          // dispatchMessage result and the increment-3 anchor ack have no
+          // routes field.)
+          if ('routes' in dr && dr.routes.length > 0) {
+            for (const route of dr.routes) {
+              if (route.kind === 'spawn') {
+                response += await handleSpawn({
+                  topicKey, topicName: getTopicName(topicNames, chatId, threadId) ?? '',
+                  spawn: route, secrets, token, workdir: workdir.dir,
+                });
+              } else {
+                response += await handleSteer({
+                  topicKey, topicName: getTopicName(topicNames, chatId, threadId) ?? '',
+                  steer: route, secrets, token, workdir: workdir.dir,
+                });
+              }
+            }
           }
           if (skillToRun) {
             spawn('pa', ['run', skillToRun, '--worker', topicState.preferred_worker || effectiveDefault], { cwd: BOT_CWD, detached: true, stdio: 'ignore', shell: true, windowsHide: true }).unref();
@@ -1927,6 +2008,19 @@ export async function runPollLoop(
   // above but invoked once per poll tick below — the route queue promises
   // one-poll-tick latency, not the queue-drain family's per-source cadence.
   const routeQueueDrain = () => drainVoiceInboxRoutes({ injectFn: injectUpdate, nextId: nextSyntheticUpdateId });
+  // AI-203 increment 4: queued-thread reconcile drain — the FIFO spawn
+  // queue's restart/missed-wake backstop. Primary wakes are in-band
+  // (executor terminals, spawn/steer handlers); this poll-tick closure
+  // revives a queue a restart left parked while slots are free (route-queue
+  // precedent: one-poll-tick family, internal 60 s throttle, no store read
+  // beyond the dir listing while throttled).
+  const threadQueueDrain = () => reconcileThreadQueues({
+    secrets, token,
+    topicNameFromKey: (key) => {
+      const i = key.lastIndexOf('_');
+      return i > 0 ? getTopicName(topicNames, Number(key.slice(0, i)), Number(key.slice(i + 1))) ?? '' : '';
+    },
+  });
   // Read ONCE: a config.yaml read on every <=30s iteration is not free on this
   // disk. Changing config.maintenance for a bot job needs a bot restart.
   let maintenanceOverrides: Record<string, { enabled?: boolean; everyMs?: number }> | undefined;
@@ -2063,6 +2157,8 @@ export async function runPollLoop(
       // this tick ride this same batch through the shared injection queue.
       await routeQueueDrain().catch((err: unknown) =>
         logger.warn('voice-inbox', `route drain failed: ${(err as Error).message}`));
+      await threadQueueDrain().catch((err: unknown) =>
+        logger.warn('main', `thread queue drain failed: ${err instanceof Error ? err.message : String(err)}`));
       // Injected synthetic updates are drained AFTER the offset above is computed from
       // the real batch only (§3.1, risk R1) — see drainInjectedUpdates()'s own comment.
       const injected = drainInjectedUpdates();
@@ -2396,7 +2492,9 @@ export async function runPollLoop(
               // byte-identical to today. Statement order inside `if (plan)` is
               // LOAD-BEARING: the message rewrite + markers must land BEFORE the
               // follower-record removals (M1 rule 3 - proven materialization).
+              // W4 counterpart (AI-203 inc 3): a reply-shaped HEAD never compiles a batch — its anchor must reach processUpdate with its OWN text.
               if (queueEntry && !queueEntry.isCommand && !queueEntry.steerContext
+                  && queueEntry.replyToMessageId === undefined
                   && update.message && !extractAudioAttachment(update.message)) {
                 try {
                   const bChatId = update.message?.chat.id;

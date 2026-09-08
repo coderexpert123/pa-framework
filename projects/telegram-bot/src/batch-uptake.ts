@@ -112,6 +112,15 @@ export async function compileBatchFold(input: BatchFoldInput): Promise<BatchFold
       logger.warn('batch-uptake', 'withheld steer entry from batch', { topicKey, updateId: entry.updateId });
       continue;
     }
+    // W4 (AI-203 increment 3) — a reply-shaped entry carries the thread-FYI
+    // anchor; folding it would lose the reply shape the anchor resolves from,
+    // and letting a reply-shaped HEAD fold would steer its thread with the
+    // whole combined text. Withheld — dispatches alone, byte-identically.
+    if (entry.replyToMessageId !== undefined) {
+      withheldIds.push(entry.updateId);
+      logger.warn('batch-uptake', 'withheld reply anchor from batch', { topicKey, updateId: entry.updateId });
+      continue;
+    }
     // W1 (F7 amendment, 2026-09-06) — a command-initial entry must never fold
     // as plain text; the anchor depends on entry kind. A VOICE entry's resolved
     // text is label-prefixed by userTextFromVoiceResult (so "[Voice message]

@@ -67,6 +67,8 @@ keeps date + topic without the path.
     failed/cancelled, ref=t-<n>; NOT task-lane activity); `takePendingInput` makes steer drain
     atomic (persist-failure-safe); thread dispatches strip `--append-system-prompt-file`
     (RunOptions.stripArgs); `/orchestrator status` shows updated-age + queued counts.
+  - Increment 3 (2026-09-06): replying to a thread FYI steers that thread (raw reply anchor; pending_action outranks via pre-consume snapshot; ack archives worker 'local' after the fallback chain); AI-209 batches withhold/gate reply-shaped entries (W4); pin card Threads line; done-FYI reply hint; stop-hold lane keeps no reply shape (anchor loss there = next-increment candidate).
+  - Increment 4 (2026-09-07): cap 10/topic with a FIFO spawn queue (status 'queued'; claim is the only start — steer-wakes included); steer_thread gains mode queue|interrupt — interrupt kills the in-flight run (runSeq signal + thread-scoped kill) and restarts with the message folded in; one reply may fan out N spawns+steers in envelope order (dr.routes).
 - **Voice-inbox bridge: `/pair` (allowed chats only) mints an 8-char pairing code and
   writes `~/.pa/voice-inbox/pairing-codes.json` (bare JSON array — copy
   `projects/voice-inbox/scripts/mint_pairing.mjs` verbatim, schema canonical there;
@@ -110,11 +112,7 @@ keeps date + topic without the path.
   appending the id or rejection — never silent. Read-only, no shell; read the
   async-watch design record before touching this path.
 - **Multi-chat**: `TELEGRAM_CHAT_ID` comma-separate — supergroups negative, DMs positive; parse by sign.
-- **Test rule**: send bodies MdV2-escaped (strip `\`); gates fail-closed on stale dist — build first (`PA_ALLOW_STALE_DIST=1` escape). Never latch
-  (trackPendingWork) a test-side fire-and-forget where REAL `process.exit` can fire (poll-loop-callbacks) — the latch turns the no-op drain into a
-  real wait and darkens the file; latch only in exit-neutered files (AI-172). Frozen-string pins assert
-  EXACT equality, never startsWith/includes — a prefix pin can't count colons and passed an inherited `label::` defect (AI-209, 2026-09-06).
-- Test fixtures use the synthetic id family (-1001234567890, threads 5001/5002), never real chat/thread ids or repo paths — the public mirror tracks src/tests.
+- **Test rules** (7 rules: .ts-only src/tests; MdV2 bodies + stale-dist fail-closed + never latch where process.exit can fire + EXACT-equality pins; settled-end-state for fire-and-forget lanes; synthetic-id fixtures): extracted to `docs/bot-test-rules.md` (2026-09-07 split, budget-pressure contract response — same shape as the orchestrator-threads extraction).
 - **Output cleaning**: `workers.ts` trims Gemini stdout; `logic.ts` strips
   thought-block/planning-header markers.
 - **Premature-async-reply guard (AI-202, 2026-09-04)**: `isPrematureAsyncReply`

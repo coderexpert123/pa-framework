@@ -217,6 +217,7 @@ export interface PAMetaAction {
   prompt?: string;    // for spawn_thread: self-contained thread goal, 1..4000 chars
   thread_id?: string; // for steer_thread: `t-<n>` matching a store record
   message?: string;   // for steer_thread: the steer text, 1..4000 chars
+  mode?: string;      // for steer_thread: "queue" | "interrupt" (optional — the orchestrator classifies per message)
 }
 
 export interface PAMeta {

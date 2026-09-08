@@ -150,6 +150,10 @@ export interface StatusCardArgs {
    *  that don't compute them (and every pre-Wave-2 test/byte pin) render exactly
    *  as before; a zero line renders nothing, never "0 running · 0 parked · 0 queued". */
   tasks?: { running: number; parked: number; queued: number };
+  /** AI-203 increment 3: orchestrator-thread counts for this topic. Optional —
+   *  callers that don't compute them render exactly as before; an all-zero
+   *  count renders no line, never "Threads: 0 running" (Tasks-line rule). */
+  threads?: { running: number; queued: number; done: number; failed: number; cancelled: number };
 }
 
 const FALLBACK_DEFAULT_WORKER = 'claude';
@@ -305,6 +309,17 @@ export function renderStatusCard(args: StatusCardArgs): string {
   ];
   if (args.tasks && (args.tasks.running > 0 || args.tasks.parked > 0 || args.tasks.queued > 0)) {
     lines.push(`Tasks: ${args.tasks.running} running · ${args.tasks.parked} parked · ${args.tasks.queued} queued`);
+  }
+  if (args.threads && (args.threads.running > 0 || args.threads.queued > 0 || args.threads.done > 0
+    || args.threads.failed > 0 || args.threads.cancelled > 0)) {
+    const parts = [
+      ...(args.threads.running > 0 ? [`${args.threads.running} running`] : []),
+      ...(args.threads.queued > 0 ? [`${args.threads.queued} queued`] : []),
+      ...(args.threads.done > 0 ? [`${args.threads.done} done`] : []),
+      ...(args.threads.failed > 0 ? [`${args.threads.failed} failed`] : []),
+      ...(args.threads.cancelled > 0 ? [`${args.threads.cancelled} cancelled`] : []),
+    ];
+    lines.push(`Threads: ${parts.join(' · ')}`);
   }
   return lines.join('\n');
 }

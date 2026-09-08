@@ -39,6 +39,15 @@ async function seedReal(chatId: number, threadId: number, events: SeedEvent[]): 
   }
 }
 
+/** A fast runner can complete two sequential `appendTopicEvent` writes
+ *  within the same millisecond (Date.now() resolution) — ties are broken
+ *  by the aggregator's stable sort falling back to Map insertion order,
+ *  not by wall-clock intent. Where a test asserts lastSeenAt-desc ordering
+ *  across two tasks, force a millisecond gap between their event groups. */
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /** Window-edge cases need explicit past timestamps — write raw jsonl lines. */
 async function writeRawEvents(chatId: number, threadId: number, lines: string[]): Promise<void> {
   const dir = topicEventsDir();
@@ -76,6 +85,16 @@ describe('readTaskLaneActivity', () => {
       { kind: 'task_started', ref: 'tt-a', detail: 'Deploy the service' },
       { kind: 'task_completed', ref: 'tt-a', detail: 'Deploy the service' },
       { kind: 'question_asked', ref: null, detail: 'operator question' },
+    ]);
+    // Forced gap: tt-b's group must land in a later millisecond than tt-a's
+    // last event so the lastSeenAt-desc assertion below isn't a tie. A bare
+    // sleepMs(5) is NOT enough on runners with coarse Date.now() granularity
+    // (CI-macOS red, 2026-09-07): the sleep can elapse inside one coarse
+    // clock tick, both groups stamp the same millisecond, and the tie falls
+    // back to insertion order. Wait until the CLOCK confirms the gap.
+    const gapFrom = Date.now();
+    while (Date.now() - gapFrom < 20) await sleepMs(5);
+    await seedReal(123, 456, [
       { kind: 'task_started', ref: 'tt-b', detail: 'Back up photos' },
       { kind: 'task_failed', ref: 'tt-b', detail: 'disk full' },
     ]);

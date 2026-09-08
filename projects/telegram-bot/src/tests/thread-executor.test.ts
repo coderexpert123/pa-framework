@@ -20,6 +20,7 @@ import {
   queueThreadInput,
   updateThread,
   cancelRunningThreads,
+  claimThreadStarts,
   THREAD_ACTIVITY_THROTTLE_MS,
   _clearThreadsForTest,
   _setStoreDirForTest,
@@ -29,12 +30,18 @@ import {
   executeTopicThread,
   buildThreadPrompt,
   buildThreadResumedTurnPrompt,
+  signalThreadInterrupt,
+  reconcileThreadQueues,
+  _resetThreadQueueReconcileForTest,
+  _resetThreadInterruptsForTest,
   _setActivityPumpIntervalForTest,
+  _waitForThreadExecutionsForTest,
   type ExecuteTopicThreadArgs,
   type ThreadDispatchFn,
   type ThreadFyiSender,
   type ThreadTopicContext,
 } from '../thread-executor.js';
+import { THREAD_FYI_ANCHOR_PATTERN } from '../orchestrator.js';
 import { cwdToClaudeProjectDir } from '../session.js';
 import { waitForDrain } from './test-teardown-guard.js';
 
@@ -54,6 +61,8 @@ beforeEach(() => {
   process.env.PA_HOME = home;
   _setStoreDirForTest(storeDir);
   _setActivityPumpIntervalForTest(THREAD_ACTIVITY_THROTTLE_MS);
+  _resetThreadQueueReconcileForTest();
+  _resetThreadInterruptsForTest();
 });
 
 afterEach(async () => {
@@ -115,11 +124,74 @@ function makeArgs(
     topicCtx: CTX,
     secrets: {},
     token: 'test-token',
-    workdir: { dir: workdir },
     sendFyi: fyi.sendFyi,
     dispatch,
     ...overrides,
   };
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Real-dispatch harness (orchestrator-dispatch.test.ts capture-worker idiom)
+ * for executions fired by the PRODUCTION wake/reconcile paths — fireClaimedThreads
+ * calls executeTopicThread with no seams, so its dispatches ride the REAL
+ * runWithFailover. A fake worker configured in the test's temp PA_HOME appends
+ * every dispatched prompt (GOTPROMPTSTART…GOTPROMPTEND) to a capture file and
+ * holds `holdMs` before replying, so a fired record stays 'running' while the
+ * test asserts. Returns the capture file path.
+ */
+function writeFakeWorker(output: string, opts: { holdMs?: number } = {}): string {
+  const capturePath = join(home, 'prompt-capture.txt');
+  const workerPath = join(home, 'capture-worker.cjs');
+  const b64 = Buffer.from(output, 'utf8').toString('base64');
+  writeFileSync(workerPath, [
+    "const fs = require('node:fs');",
+    "let d = '';",
+    "process.stdin.on('data', c => { d += c; });",
+    "process.stdin.on('end', () => {",
+    `  fs.appendFileSync(${JSON.stringify(capturePath)}, 'GOTPROMPTSTART' + d + 'GOTPROMPTEND');`,
+    `  process.stdout.write(Buffer.from(${JSON.stringify(b64)}, 'base64').toString('utf8'));`,
+    opts.holdMs ? `  setTimeout(() => process.exit(0), ${opts.holdMs});` : '  process.exitCode = 0;',
+    '});',
+    '',
+  ].join('\n'), 'utf8');
+  writeFileSync(join(home, 'config.yaml'), JSON.stringify({
+    workers: [{
+      name: 'fake',
+      command: 'node',
+      args: [workerPath.replace(/\\/g, '/')],
+      input_mode: 'stdin-text',
+      output_format: 'text',
+      check: 'echo ok',
+      rate_limit_patterns: [],
+      priority: 1,
+      state_dir: '/nonexistent/path',
+      state_pattern: '*.jsonl',
+    }],
+  }), 'utf8');
+  return capturePath;
+}
+
+/** Read the REAL app.log.jsonl the ref-id/logger seams wrote under PA_HOME. */
+async function readAppLog(): Promise<string> {
+  try {
+    return await readFile(join(home, 'app.log.jsonl'), 'utf8');
+  } catch {
+    return ''; // not created yet
+  }
+}
+
+/** Poll the app log until it contains `needle` (logger appends are async — a
+ *  single immediate read races the flush). Returns the last read content. */
+async function waitForLog(needle: string): Promise<string> {
+  let log = '';
+  for (let i = 0; i < 30; i++) {
+    log = await readAppLog();
+    if (log.includes(needle)) return log;
+    await sleep(100);
+  }
+  return log;
 }
 
 // ---------------------------------------------------------------------------
@@ -178,6 +250,15 @@ describe('executeTopicThread happy path', () => {
     assert.equal(events[0].kind, 'thread_completed');
     assert.equal(events[0].ref, 't-1');
     assert.equal(events[0].detail, 'Sweep logs');
+
+    // Increment 3: the done FYI teaches the reply-to-continue gesture, and the
+    // anchor pattern in orchestrator.ts must match the REAL texts this module
+    // sends (first-line drift would silently kill the anchor steer).
+    const capturedPickup = fyi.calls[0].text;
+    const capturedDone = fyi.calls[1].text;
+    assert.ok(capturedDone.endsWith('_(Reply to this message to continue the thread.)_'));
+    assert.ok(THREAD_FYI_ANCHOR_PATTERN.test(capturedPickup));
+    assert.ok(THREAD_FYI_ANCHOR_PATTERN.test(capturedDone));
   });
 });
 
@@ -359,7 +440,7 @@ describe('pending-input drain', () => {
     assert.deepEqual(stored?.pendingInput, []);
   });
 
-  it('auto-resume cap stops the chain with inputs left queued', async () => {
+  it('T-WAKE2: drain-cap parks the record as queued; the next wake restarts a fresh chain (chunk bound)', async () => {
     const thread = await makeThread();
     const fyi = makeFyiRecorder();
     // Seed the pending queue to its cap (5); a 6th is rejected by the store.
@@ -370,6 +451,19 @@ describe('pending-input drain', () => {
     const sixth = await queueThreadInput(KEY, 't-1', 'seed 6');
     assert.ok(!sixth.ok, 'store caps pendingInput at 5');
 
+    // Fill every running slot so the cap path's own wake CANNOT re-claim the
+    // just-parked record — this is what lets the test observe it resting at
+    // 'queued' (with a free slot the park is transient: the claim immediately
+    // flips it back to running and fires a restart).
+    for (let i = 2; i <= 10; i++) {
+      const holder = await createThread(KEY, { title: `Holder ${i}`, goal: 'hold', workdir });
+      assert.ok(holder.ok);
+    }
+    const parkedEleventh = await createThread(KEY, { title: 'Eleventh', goal: 'hold', workdir });
+    assert.ok(parkedEleventh.ok);
+    assert.equal(parkedEleventh.thread.status, 'queued', 'the 11th create parks (cap 10)');
+    await updateThread(KEY, parkedEleventh.thread.id, { status: 'running' });
+
     let n = 0;
     const rec = makeDispatchRecorder(async () => {
       n++;
@@ -379,12 +473,38 @@ describe('pending-input drain', () => {
     await executeTopicThread(makeArgs(thread, fyi, rec.dispatch));
 
     // 1 fresh dispatch + MAX_AUTO_RESUMES_PER_CHAIN (5) resumed turns, then the
-    // chain STOPS with the input queued during the last run still pending.
+    // chain STOPS with the input queued during the last run still pending —
+    // and the record is PARKED as queued (not done), warn logged.
     assert.equal(n, 6);
     assert.equal(fyi.calls.filter((c) => c.kind === 'thread-done').length, 6);
     const stored = await getThread(KEY, 't-1');
-    assert.equal(stored?.status, 'done');
+    assert.equal(stored?.status, 'queued');
     assert.deepEqual(stored?.pendingInput, ['more 6']);
+    const log = await waitForLog('record parked as queued for the next wake');
+    assert.ok(log.includes('auto-resume cap reached'), 'the cap warn is logged');
+    assert.ok(log.includes('record parked as queued for the next wake'));
+
+    // Free a slot and wake: the FIFO claim restarts the record and the fresh
+    // chain consumes the whole ≤5 backlog as ONE joined turn.
+    await updateThread(KEY, 't-2', { status: 'done' });
+    for (let i = 7; i <= 10; i++) {
+      const queued = await queueThreadInput(KEY, 't-1', `more ${i}`);
+      assert.ok(queued.ok, `backlog fill ${i} accepted`);
+    }
+    const claimed = await claimThreadStarts(KEY);
+    assert.equal(claimed.length, 1);
+    assert.equal(claimed[0].id, 't-1');
+    assert.equal(claimed[0].status, 'running');
+
+    const fyi2 = makeFyiRecorder();
+    const rec2 = makeDispatchRecorder(async () => ({ worker: 'claude', result: okResult('restart done', 'sess-r1') }));
+    await executeTopicThread(makeArgs(claimed[0], fyi2, rec2.dispatch));
+
+    assert.equal(rec2.calls.length, 1, 'the restart is ONE fresh chain');
+    assert.ok(rec2.calls[0].prompt.includes('## Current Message\nmore 6\n\nmore 7\n\nmore 8\n\nmore 9\n\nmore 10'));
+    const final = await getThread(KEY, 't-1');
+    assert.equal(final?.status, 'done');
+    assert.deepEqual(final?.pendingInput, []);
   });
 });
 
@@ -409,5 +529,130 @@ describe('activity pump', () => {
     assert.ok(stored?.updatedAt, 'record still present');
     assert.ok(Date.parse(stored!.updatedAt!) > Date.parse(preRun), 'pump heartbeat advanced updatedAt past the dispatch-start stamp');
     assert.ok(Date.now() - Date.parse(stored!.updatedAt!) < 10_000, 'heartbeat landed late in the run, not at its start');
+  });
+});
+
+describe('interrupt signal (increment 4)', () => {
+  it('T-SIG1: isCancelled is true ONLY for a signal naming the captured runSeq', async () => {
+    const thread = await makeThread();
+    const fyi = makeFyiRecorder();
+    const resource = `topic-${KEY}-th${thread.n}`;
+    const rec = makeDispatchRecorder(async (prompt, opts) => {
+      const cur = await getThread(KEY, 't-1');
+      const capturedSeq = cur!.runSeq;
+      assert.equal(opts.isCancelled?.(), false, 'no signal ⇒ false');
+      signalThreadInterrupt(resource, capturedSeq + 100);
+      assert.equal(opts.isCancelled?.(), false, 'a different runSeq ⇒ false (later runs are immune)');
+      signalThreadInterrupt(resource, capturedSeq);
+      assert.equal(opts.isCancelled?.(), true, 'the captured runSeq ⇒ the dying cascade aborts');
+      return { worker: 'claude', result: okResult('settled') };
+    });
+    await executeTopicThread(makeArgs(thread, fyi, rec.dispatch));
+
+    assert.equal(rec.calls.length, 1);
+    assert.equal((await getThread(KEY, 't-1'))?.status, 'done');
+  });
+
+  it('T-SIG2: a newer run’s capture deletes the stale signal entry (lazy cleanup)', async () => {
+    const thread = await makeThread();
+    const fyi = makeFyiRecorder();
+    const resource = `topic-${KEY}-th${thread.n}`;
+    let seenCancelled: boolean | undefined;
+    let n = 0;
+    const rec = makeDispatchRecorder(async (prompt, opts) => {
+      n++;
+      if (n === 1) {
+        const cur = await getThread(KEY, 't-1');
+        signalThreadInterrupt(resource, cur!.runSeq); // signal for the CURRENT run
+        return { worker: 'claude', result: okResult('run one') };
+      }
+      seenCancelled = opts.isCancelled?.();
+      return { worker: 'claude', result: okResult('run two') };
+    });
+    await executeTopicThread(makeArgs(thread, fyi, rec.dispatch));
+
+    // A second execution on the SAME resource: its capture must find the stale
+    // entry (run 1's seq) and delete it — the new run is never cancelled.
+    await queueThreadInput(KEY, 't-1', 'second turn');
+    const fresh = await getThread(KEY, 't-1');
+    await executeTopicThread(makeArgs(fresh!, fyi, rec.dispatch));
+
+    assert.equal(seenCancelled, false, 'the new run superseded (and deleted) the stale entry');
+    assert.equal((await getThread(KEY, 't-1'))?.status, 'done');
+  });
+});
+
+describe('terminal queue wake (increment 4)', () => {
+  it('T-WAKE1: A settles done → B claimed from the queue, fired on the REAL cascade, settles done', { timeout: 120_000 }, async () => {
+    const capturePath = writeFakeWorker('B output');
+    const threadA = await makeThread('A', 'Goal A text.');
+    const createdB = await createThread(KEY, { title: 'B', goal: 'Goal B text.', workdir });
+    assert.ok(createdB.ok);
+    await updateThread(KEY, createdB.thread.id, { status: 'queued' });
+
+    let releaseA: () => void = () => {};
+    const gate = new Promise<void>((resolve) => { releaseA = resolve; });
+    const fyi = makeFyiRecorder();
+    const recA = makeDispatchRecorder(async () => {
+      await gate; // A's run hangs until the test releases it
+      return { worker: 'claude', result: okResult('A done', 'sess-a1') };
+    });
+    const execA = executeTopicThread(makeArgs(threadA, fyi, recA.dispatch));
+    for (let i = 0; i < 150 && recA.calls.length === 0; i++) await sleep(20);
+    assert.equal(recA.calls.length, 1, 'A reached its dispatch seam');
+    assert.equal((await getThread(KEY, createdB.thread.id))?.status, 'queued', 'no wake while A runs');
+
+    releaseA();
+    await execA; // A settles — its wakeQueue await included
+    await _waitForThreadExecutionsForTest(); // B's FIRED executor settles
+
+    const storedB = await getThread(KEY, createdB.thread.id);
+    assert.equal(storedB?.status, 'done');
+    assert.equal(storedB?.lastResult, 'B output');
+    // B's dispatch was FIRED: its goal reached the REAL cascade's worker.
+    const captured = await readFile(capturePath, 'utf8');
+    assert.ok(captured.includes('Goal B text.'));
+    assert.ok(!captured.includes('Goal A text.'), 'A rode the seam, never the fake worker');
+    // B's pickup FYI went through the REAL sender path (ref-id log evidence).
+    const log = await waitForLog(`Thread ${createdB.thread.id} started: B`);
+    assert.ok(log.includes(`Thread ${createdB.thread.id} started: B`));
+  });
+});
+
+describe('reconcile drain (increment 4)', () => {
+  it('T-REC1: claims and fires queued records across ALL stores, throttled to one pass per interval', { timeout: 120_000 }, async () => {
+    const capturePath = writeFakeWorker('reconciled output', { holdMs: 1500 });
+    const first = await makeThread('Reconcile me', 'Backlog goal text.');
+    await updateThread(KEY, first.id, { status: 'queued' });
+
+    const fired1 = await reconcileThreadQueues({ secrets: {}, token: 'test-token', topicNameFromKey: () => 'Test Topic' });
+    assert.equal(fired1, 1);
+    assert.equal((await getThread(KEY, first.id))?.status, 'running');
+
+    // A second queued record inside the throttle window is NOT served.
+    const second = await makeThread('Second queued', 'Second goal.');
+    await updateThread(KEY, second.id, { status: 'queued' });
+    assert.equal(await reconcileThreadQueues({ secrets: {}, token: 'test-token', topicNameFromKey: () => 'Test Topic' }), 0);
+    assert.equal((await getThread(KEY, second.id))?.status, 'queued');
+
+    // After the throttle resets, the parked record is revived.
+    _resetThreadQueueReconcileForTest();
+    assert.equal(await reconcileThreadQueues({ secrets: {}, token: 'test-token', topicNameFromKey: () => 'Test Topic' }), 1);
+
+    // Both fired dispatches reached the REAL cascade (worker prompt capture).
+    await _waitForThreadExecutionsForTest();
+    const captured = await readFile(capturePath, 'utf8');
+    assert.ok(captured.includes('Backlog goal text.'));
+    assert.ok(captured.includes('Second goal.'));
+  });
+
+  it('T-REC2: absent store dir ⇒ 0, no throw', async () => {
+    _resetThreadQueueReconcileForTest();
+    _setStoreDirForTest(join(home, 'no-such-store-dir'));
+    try {
+      assert.equal(await reconcileThreadQueues({ secrets: {}, token: 'test-token', topicNameFromKey: () => '' }), 0);
+    } finally {
+      _setStoreDirForTest(storeDir);
+    }
   });
 });

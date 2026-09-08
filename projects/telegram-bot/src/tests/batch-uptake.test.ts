@@ -292,4 +292,22 @@ describe('batch-uptake (AI-209 WP-2)', { concurrency: 1 }, () => {
     assert.equal(plan.combinedText, expected, 'unlabelled block renders as bare text');
     assert.deepEqual(plan.foldedFrom, [{ updateId: 2 }]);
   });
+
+  it('T-B1 (W4, AI-203 inc 3): a reply-shaped follower is withheld and stays queued for its own turn', async () => {
+    const replyEntry = registerQueuedUpdate(TOPIC, 2, 'also check failures', undefined, 12, 41);
+    const plain = registerQueuedUpdate(TOPIC, 3, 'plain follower', undefined, 13);
+
+    const plan = await compileBatchFold(makeInput());
+    assert.ok(plan, 'the plain follower still folds, so a plan exists');
+    assert.deepEqual(plan.withheldIds, [2], 'the reply-shaped entry is withheld (W4)');
+    assert.deepEqual(plan.foldedFrom, [{ updateId: 3, messageId: 13 }], 'the reply entry is NOT in the fold set');
+    assert.ok(!plan.combinedText.includes('[msg 12]'), 'the reply text must not ride the combined text');
+    assert.equal(replyEntry.cancelled, false, 'the reply entry stays queued, un-cancelled');
+    assert.equal(plain.cancelled, true, 'the folded follower was confirmed');
+    assert.deepEqual(
+      peekQueuedBatch(TOPIC).map((e) => e.updateId),
+      [2],
+      'the reply-shaped entry STAYS queued per peekQueuedBatch after the compile'
+    );
+  });
 });
