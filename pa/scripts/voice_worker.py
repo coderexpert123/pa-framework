@@ -663,6 +663,17 @@ def serve(*, env=None, idle_ms=None, handler_fn=None, ready_cb=None, socket_fact
     if claim == 'defer':
         return 0  # a competing process published a live worker while we waited
 
+    # Re-verify under the held lock: the entry check above ran BEFORE lock
+    # acquisition, so a competitor that published and released while our
+    # O_EXCL was contended leaves us 'own' with a live worker already
+    # answering — binding anyway produced a second listener (macOS CI
+    # thread-race fail, 2026-09-21: ports 49256/49257). Same TOCTOU covers
+    # the force-reclaim claim path in _claim_or_defer.
+    existing = read_state(path)
+    if existing is not None and is_pid_alive(existing.get('pid')) and _ping_existing(existing):
+        _release_start_lock(path)
+        return 0  # a live, answering worker owns this state file now
+
     try:
         try:
             listener = socket_factory()

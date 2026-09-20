@@ -280,7 +280,9 @@ def add_reminder(due_at_iso, message, chat_id, thread_id=None, resume_action=Non
 
     # Basic ISO validation/normalization (before taking the store lock)
     try:
-        dt = datetime.fromisoformat(due_at_iso)
+        # .replace("Z","+00:00"): Python <3.11 fromisoformat rejects the bare
+        # UTC 'Z' suffix (stock macOS python3 is 3.9 — leg-2 fail, 2026-09-21).
+        dt = datetime.fromisoformat(due_at_iso.replace("Z", "+00:00"))
         # Ensure it has TZ info
         if dt.tzinfo is None:
             # PA_TZ_OFFSET_MINUTES env, or loud UTC default (was silent IST, WB-54)
