@@ -6,7 +6,7 @@
 import './test-env-guard.js';
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import {
@@ -34,14 +34,15 @@ import {
 } from '../../../../pa/dist/src/lib/topic-tasks.js';
 import { readTopicEvents } from '../../../../pa/dist/src/lib/topic-events.js';
 import { flushLog } from '../../../../pa/dist/src/lib/log.js';
-import type { CommandResult } from '../../../../pa/dist/src/types.js';
+import { _resetSkillRosterCache } from '../context.js';
+import type { CommandResult, RunOptions, WorkerConfig } from '../../../../pa/dist/src/types.js';
 
 const CHAT_ID = -1001234567890;
 const THREAD_ID = 5001;
 
 /** REAL producer chain: queue via appendTask, claim into the running store. */
-async function claimedTask(title = 'T', prompt = 'do things', worker?: string): Promise<RunningTask> {
-  await appendTask(CHAT_ID, THREAD_ID, { title, prompt, createdBy: 'cli', ...(worker ? { worker } : {}) });
+async function claimedTask(title = 'T', prompt = 'do things', worker?: string, model?: string): Promise<RunningTask> {
+  await appendTask(CHAT_ID, THREAD_ID, { title, prompt, createdBy: 'cli', ...(worker ? { worker } : {}), ...(model ? { model } : {}) });
   const claimed = await claimNextTask(CHAT_ID, THREAD_ID);
   assert.ok(claimed, 'fixture claim must succeed');
   return claimed;
@@ -97,6 +98,7 @@ describe('buildTaskPrompt', () => {
     originalPaHome = process.env.PA_HOME;
     process.env.PA_HOME = tempDir;
     _resetTopicTasksForTest();
+    _resetSkillRosterCache();
   });
 
   afterEach(async () => {
@@ -151,6 +153,91 @@ describe('buildTaskPrompt', () => {
       'one line per sibling with id, title, status'
     );
     assert.ok(!section.includes(task.id), 'the executing task never lists itself in the SIBLINGS section');
+  });
+
+  it('carries the topic pointer lines + ## Live reservations before ## Your task', async () => {
+    // Real fixtures under the temp PA_HOME (the task lane calls the shared
+    // renderers bare — no DI seam on buildTaskPrompt).
+    const brainDir = join(tempDir, 'topic-brains', `${CHAT_ID}_${THREAD_ID}`);
+    await mkdir(brainDir, { recursive: true });
+    await writeFile(
+      join(brainDir, 'BRAIN.md'),
+      '# T\n\n<!-- topic-brain: consolidated=2026-09-10T12:00:00+05:30 covers=2026-09-09T18:00:00.000Z -->\n',
+      'utf8'
+    );
+    await writeFile(
+      join(tempDir, 'reservations.json'),
+      JSON.stringify({
+        reservations: [
+          {
+            id: 'r-feedface',
+            paths: ['pa/src/foo.ts'],
+            session: 'other-session',
+            note: 'holding foo',
+            claimedAt: new Date().toISOString(),
+            expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+          },
+        ],
+      }),
+      'utf8'
+    );
+
+    const task = await claimedTask('Ship the report', 'write it');
+    const prompt = await buildTaskPrompt(task, { chatId: CHAT_ID, threadId: THREAD_ID, topicName: 'Handover Sandbox' });
+
+    const yourTaskIdx = prompt.indexOf('## Your task');
+    assert.ok(prompt.indexOf('Topic brain:') > 0 && prompt.indexOf('Topic brain:') < yourTaskIdx, 'brain pointer before ## Your task');
+    assert.ok(prompt.indexOf(`Recall: \`pa recall "<terms>" --thread ${THREAD_ID}`) > 0, 'recall pointer present');
+    assert.ok(prompt.indexOf('Precedent:') > 0, 'decisions pointer present');
+    assert.ok(prompt.indexOf('## Live reservations') > 0 && prompt.indexOf('## Live reservations') < yourTaskIdx, 'reservations section before ## Your task');
+    assert.ok(prompt.includes('r-feedface'), 'live reservation row present');
+  });
+
+  it('renders ## Topic sources from the topic state file (one inline + one missing) before ## Your task', async () => {
+    const realFile = join(tempDir, 'real-source.md');
+    await writeFile(realFile, 'grounding body', 'utf8');
+    await writeFile(
+      join(tempDir, `telegram-bot-topic-${CHAT_ID}_${THREAD_ID}.json`),
+      JSON.stringify({
+        chat_id: CHAT_ID, thread_id: THREAD_ID, turns: [],
+        sources: [{ path: realFile, label: 'real-src' }, { path: join(tempDir, 'gone.md'), label: 'gone-src' }],
+      }),
+      'utf8'
+    );
+
+    const task = await claimedTask('Ship the report', 'write it');
+    const prompt = await buildTaskPrompt(task, { chatId: CHAT_ID, threadId: THREAD_ID, topicName: 'Handover Sandbox' });
+
+    const yourTaskIdx = prompt.indexOf('## Your task');
+    const sourcesIdx = prompt.indexOf('## Topic sources');
+    assert.ok(sourcesIdx > 0 && sourcesIdx < yourTaskIdx, '## Topic sources lands in the insert region before ## Your task');
+    assert.ok(prompt.includes('grounding body'), 'the inline-able source content renders');
+    assert.ok(prompt.includes('gone'), 'the missing source renders as a named line, never silence');
+  });
+
+  it('renders ## Skills you can trigger (this lane offers run_skill) before ## Your task', async () => {
+    const skillDir = join(tempDir, 'skills', 'fixture-task-skill');
+    await mkdir(skillDir, { recursive: true });
+    await writeFile(join(skillDir, 'skill.md'), ['---', 'description: "fixture capability"', '---', 'Body.'].join('\n'), 'utf8');
+
+    const task = await claimedTask('Ship the report', 'write it');
+    const prompt = await buildTaskPrompt(task, { chatId: CHAT_ID, threadId: THREAD_ID, topicName: 'Handover Sandbox' });
+    const yourTaskIdx = prompt.indexOf('## Your task');
+    const rosterIdx = prompt.indexOf('## Skills you can trigger');
+    assert.ok(rosterIdx > 0 && rosterIdx < yourTaskIdx, 'roster lands in the insert region');
+    assert.ok(prompt.includes('[fixture-task-skill] fixture capability'));
+  });
+
+  it('no brain + empty store → brain pointer absent, reservations render as "none."', async () => {
+    const task = await claimedTask('Ship the report', 'write it');
+    const prompt = await buildTaskPrompt(task, { chatId: CHAT_ID, threadId: THREAD_ID, topicName: 'Handover Sandbox' });
+    assert.ok(!prompt.includes('Topic brain:'), 'no brain pointer without a brain file');
+    // readActive auto-creates an empty store, so the section always renders —
+    // as the "none." line, not absent.
+    assert.ok(prompt.includes('## Live reservations\n- Active reservations right now: none.'), 'empty store renders the none. line');
+    // Recall/decisions are unconditional pointer lines (always render on this lane).
+    assert.ok(prompt.includes('Recall: `pa recall'), 'recall pointer is unconditional');
+    assert.ok(prompt.includes('Precedent:'), 'decisions pointer is unconditional');
   });
 });
 
@@ -300,6 +387,54 @@ describe('executeTopicTask', () => {
     assert.ok(notBefore <= after + TOPIC_TASK_RETRY_NOT_BEFORE_MS + 1000);
     const events = await readTopicEvents(CHAT_ID, THREAD_ID);
     assert.equal(events.filter((e) => e.kind === 'task_failed').length, 0, 'not terminal yet');
+  });
+
+  it('AI-255 B4: a terminal complete releases reservations tagged with this taskId; defer does not', async () => {
+    const { claim, readActive } = await import('../../../../pa/dist/src/lib/reservations.js');
+    const pollGone = async (taskId: string, withinMs = 3000): Promise<boolean> => {
+      const deadline = Date.now() + withinMs;
+      while (Date.now() < deadline) {
+        const active = await readActive();
+        if (!active.some((r) => r.taskId === taskId)) return true;
+        await new Promise((r) => setTimeout(r, 40));
+      }
+      return false;
+    };
+
+    // Completion path: the taskId claim must be released.
+    const doneTask = await claimedTask('finish me', 'p');
+    await claim({ paths: ['pa/src/done-scope.ts'], session: 'w', note: 'x', taskId: doneTask.id });
+    await executeTopicTask(makeArgs(doneTask, { dispatch: okDispatch('done'), sendFyi: makeSendFyi([]) }));
+    assert.ok(await pollGone(doneTask.id), 'completion must release taskId-tagged reservations');
+
+    // Defer path (non-terminal): the taskId claim must SURVIVE — the task still
+    // owns the work across its retry.
+    const retryTask = await claimedTask('retry me', 'p');
+    await claim({ paths: ['pa/src/retry-scope.ts'], session: 'w', note: 'x', taskId: retryTask.id });
+    await executeTopicTask(makeArgs(retryTask, { dispatch: failDispatch('boom'), sendFyi: makeSendFyi([]) }));
+    await new Promise((r) => setTimeout(r, 150));
+    const still = await readActive();
+    assert.ok(still.some((r) => r.taskId === retryTask.id), 'a deferred task keeps its reservations — not terminal');
+  });
+
+  it('AI-255 B4: a terminal fail (attempts exhausted) releases taskId reservations', async () => {
+    const { claim, readActive } = await import('../../../../pa/dist/src/lib/reservations.js');
+    const task = await claimedTask('doomed', 'p');
+    await claim({ paths: ['pa/src/fail-scope.ts'], session: 'w', note: 'x', taskId: task.id });
+    // The defer-vs-terminal gate reads task.attempts (bumped by claimNextTask
+    // on each promotion, not by deferTask) — pinning it to the cap makes this
+    // failure terminal without replaying the whole ladder.
+    task.attempts = TOPIC_TASK_MAX_ATTEMPTS;
+    const capture: FyiCapture = [];
+    await executeTopicTask(makeArgs(task, { dispatch: failDispatch('boom'), sendFyi: makeSendFyi(capture) }));
+    assert.equal(capture[0].kind, 'task-failed', 'the capped attempt is terminal');
+    const deadline = Date.now() + 3000;
+    let gone = false;
+    while (Date.now() < deadline) {
+      if (!(await readActive()).some((r) => r.taskId === task.id)) { gone = true; break; }
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    assert.ok(gone, 'terminal fail must release taskId-tagged reservations');
   });
 
   it('empty output on a successful exit is a failure (requireNonEmptyOutput semantics)', async () => {
@@ -710,5 +845,274 @@ describe('routeReplyToTask (tier-1 attribution)', () => {
       sendReply: async () => { replies.push('sent'); },
     });
     assert.equal(emptyText, null, 'empty text is a guard, not a route');
+  });
+});
+
+describe('attention channel wiring (2026-09-11, vi-6018671b5f37)', () => {
+  let tempDir: string;
+  let originalPaHome: string | undefined;
+
+  beforeEach(async () => {
+    await flushLog();
+    tempDir = await mkdtemp(join(tmpdir(), 'task-executor-attention-'));
+    originalPaHome = process.env.PA_HOME;
+    process.env.PA_HOME = tempDir;
+    _resetTopicTasksForTest();
+  });
+
+  afterEach(async () => {
+    _resetTopicTasksForTest();
+    await flushLog();
+    if (originalPaHome === undefined) delete process.env.PA_HOME;
+    else process.env.PA_HOME = originalPaHome;
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  type AttentionCapture = Array<{ subject: string; body: string }>;
+
+  function makeAttention(capture: AttentionCapture) {
+    return async (subject: string, body: string): Promise<void> => {
+      capture.push({ subject, body });
+    };
+  }
+
+  it('completion fires one attention page carrying the task title and response', async () => {
+    const task = await claimedTask('Paged done', 'work it');
+    const pages: AttentionCapture = [];
+    await executeTopicTask(makeArgs(task, {
+      dispatch: okDispatch('finished body'),
+      sendFyi: makeSendFyi([]),
+      attention: makeAttention(pages),
+    }));
+    assert.equal(pages.length, 1);
+    assert.equal(pages[0].subject, 'Task done — Paged done');
+    assert.ok(pages[0].body.includes('finished body'));
+  });
+
+  it('PA_META question parks AND pages with the question text', async () => {
+    const task = await claimedTask('Paged question', 'needs a pick');
+    const pages: AttentionCapture = [];
+    await executeTopicTask(makeArgs(task, {
+      dispatch: okDispatch(metaOutput('', [{ type: 'question', task_id: task.id, text: 'Which one?', options: ['A', 'B'] }])),
+      sendFyi: makeSendFyi([]),
+      attention: makeAttention(pages),
+    }));
+    assert.equal(pages.length, 1, 'exactly one page (the question)');
+    assert.equal(pages[0].subject, 'Question — Paged question');
+    assert.ok(pages[0].body.includes('Which one?'));
+  });
+
+  it('terminal failure (attempts exhausted) pages with the redacted reason', async () => {
+    const task = await claimedTask('Paged failure', 'will break');
+    const pages: AttentionCapture = [];
+    await executeTopicTask(makeArgs(task, {
+      task: { ...task, attempts: TOPIC_TASK_MAX_ATTEMPTS },
+      dispatch: failDispatch('boom reason'),
+      sendFyi: makeSendFyi([]),
+      attention: makeAttention(pages),
+    }));
+    assert.equal(pages.length, 1);
+    assert.equal(pages[0].subject, 'Task failed — Paged failure');
+    assert.ok(pages[0].body.includes('boom reason'));
+  });
+
+  it('retryable failure does NOT page (the retry ladder owns it)', async () => {
+    const task = await claimedTask('Retry only', 'first try');
+    const pages: AttentionCapture = [];
+    await executeTopicTask(makeArgs(task, {
+      dispatch: failDispatch('transient'),
+      sendFyi: makeSendFyi([]),
+      attention: makeAttention(pages),
+    }));
+    assert.equal(pages.length, 0, 'a deferred retry is not an operator event');
+  });
+
+  it('an attention throw never breaks the terminal transition', async () => {
+    const task = await claimedTask('Throwing page', 'still completes');
+    await executeTopicTask(makeArgs(task, {
+      dispatch: okDispatch('done anyway'),
+      sendFyi: makeSendFyi([]),
+      attention: async () => { throw new Error('page exploded'); },
+    }));
+    assert.deepEqual(await listRunningTasks(CHAT_ID, THREAD_ID), [], 'record still left the running store');
+  });
+});
+
+describe('WP-7 topic-tier tunables on the task lane (OD-4)', () => {
+  let tempDir: string;
+  let originalPaHome: string | undefined;
+
+  const modelWorker = (name: string): WorkerConfig =>
+    ({ name, tunables: { model: { args: ['--model', '{value}'] } } }) as unknown as WorkerConfig;
+
+  beforeEach(async () => {
+    await flushLog();
+    tempDir = await mkdtemp(join(tmpdir(), 'task-exec-tunables-'));
+    originalPaHome = process.env.PA_HOME;
+    process.env.PA_HOME = tempDir;
+    _resetTopicTasksForTest();
+    _resetSkillRosterCache();
+  });
+
+  afterEach(async () => {
+    _resetTopicTasksForTest();
+    await flushLog();
+    if (originalPaHome === undefined) delete process.env.PA_HOME;
+    else process.env.PA_HOME = originalPaHome;
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it('task.model reaches the real dispatch options via getExtraArgs', async () => {
+    const task = await claimedTask('Pinned model', 'do things', undefined, 'flash-y');
+    const captured: RunOptions[] = [];
+    await executeTopicTask(makeArgs(task, {
+      dispatch: okDispatch('done'),
+      captureOpts: (o) => captured.push(o),
+    }));
+    assert.equal(captured.length, 1, 'the executor must build exactly one RunOptions');
+    assert.deepEqual(captured[0].getExtraArgs?.(modelWorker('agy')), ['--model', 'flash-y'],
+      'the record model pin must arrive as the worker-spec tunable args');
+  });
+
+  it('a topic tunable_default reaches the task dispatch — per-worker slice only', async () => {
+    await writeFile(
+      join(tempDir, `telegram-bot-topic-${CHAT_ID}_${THREAD_ID}.json`),
+      JSON.stringify({
+        chat_id: CHAT_ID, thread_id: THREAD_ID, turns: [],
+        tunable_defaults: { claude: { model: 'sonnet-x' } },
+      }),
+      'utf8'
+    );
+    const task = await claimedTask('Topic default', 'do things');
+    const captured: RunOptions[] = [];
+    await executeTopicTask(makeArgs(task, {
+      dispatch: okDispatch('done'),
+      captureOpts: (o) => captured.push(o),
+    }));
+    assert.equal(captured.length, 1);
+    assert.deepEqual(captured[0].getExtraArgs?.(modelWorker('claude')), ['--model', 'sonnet-x'],
+      'the claude-scoped default lands on claude');
+    assert.equal(captured[0].getExtraArgs?.(modelWorker('codex')), undefined,
+      'a claude-scoped default must never leak onto another worker');
+  });
+
+  it('task.model overrides the topic default on the same worker', async () => {
+    await writeFile(
+      join(tempDir, `telegram-bot-topic-${CHAT_ID}_${THREAD_ID}.json`),
+      JSON.stringify({
+        chat_id: CHAT_ID, thread_id: THREAD_ID, turns: [],
+        tunable_defaults: { agy: { model: 'topic-model' } },
+      }),
+      'utf8'
+    );
+    const task = await claimedTask('Override pin', 'do things', undefined, 'record-model');
+    const captured: RunOptions[] = [];
+    await executeTopicTask(makeArgs(task, {
+      dispatch: okDispatch('done'),
+      captureOpts: (o) => captured.push(o),
+    }));
+    // resolveTunables picks ONE value per setting — the record pin sits in the
+    // overrides slot (above topic), so the topic value never reaches the args.
+    assert.deepEqual(captured[0].getExtraArgs?.(modelWorker('agy')), ['--model', 'record-model'],
+      'the record pin replaces the topic default for the model setting');
+  });
+
+  it('neither tunables nor model set ⇒ getExtraArgs key absent (byte-identical RunOptions)', async () => {
+    const task = await claimedTask('Plain task', 'do things');
+    const captured: RunOptions[] = [];
+    await executeTopicTask(makeArgs(task, {
+      dispatch: okDispatch('done'),
+      captureOpts: (o) => captured.push(o),
+    }));
+    assert.equal(captured.length, 1);
+    assert.ok(!('getExtraArgs' in captured[0]),
+      'no settings ⇒ the key must be absent entirely, preserving the pre-WP-7 dispatch shape');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WS3 provenance env (2026-09-18, per-hop revision): the dispatch's getEnv hook
+// stamps what task_telemetry.py records into the ledger's worker_cli/
+// worker_model/worker_effort columns — evaluated per failover hop with that
+// hop's WorkerConfig, so the recorded worker is the one that actually ran.
+// ---------------------------------------------------------------------------
+
+describe('WS3 provenance env on the task lane', () => {
+  let tempDir: string;
+  let originalPaHome: string | undefined;
+
+  beforeEach(async () => {
+    await flushLog();
+    tempDir = await mkdtemp(join(tmpdir(), 'task-exec-prov-'));
+    originalPaHome = process.env.PA_HOME;
+    process.env.PA_HOME = tempDir;
+    _resetTopicTasksForTest();
+  });
+
+  afterEach(async () => {
+    _resetTopicTasksForTest();
+    await flushLog();
+    if (originalPaHome === undefined) delete process.env.PA_HOME;
+    else process.env.PA_HOME = originalPaHome;
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  const tuningWorker = (name: string): WorkerConfig =>
+    ({
+      name,
+      tunables: {
+        model: { args: ['--model', '{value}'] },
+        effort: { args: ['--effort', '{value}'] },
+      },
+    }) as unknown as WorkerConfig;
+
+  it('getEnv stamps PA_TASK_ID + PA_WORKER_CLI/_MODEL per hop; the record pin wins; static env keeps only secrets', async () => {
+    const task = await claimedTask('Provenance task', 'do things', 'agy', 'pin-model');
+    const captured: RunOptions[] = [];
+    await executeTopicTask(makeArgs(task, {
+      secrets: { SECRET_ONE: 'value-one' },
+      captureOpts: (o) => captured.push(o),
+      dispatch: okDispatch('done'),
+    }));
+    assert.equal(captured.length, 1, 'the executor must build exactly one RunOptions');
+    // Static env carries ONLY secrets — every non-secret key (PA_TASK_ID, the
+    // provenance stamp) rides the per-hop hook because runWithFailover's
+    // secret_allowlist filter drops non-allowlisted static-env keys.
+    assert.deepEqual(captured[0].env, { SECRET_ONE: 'value-one' },
+      'only the secrets bag stays static; PA_TASK_ID + provenance moved to getEnv');
+    assert.equal(typeof captured[0].getEnv, 'function', 'the per-hop env hook must be set');
+    // Simulate two hops of one cascade — each gets its own identity.
+    const firstHop = captured[0].getEnv!(tuningWorker('agy')) ?? {};
+    const failoverHop = captured[0].getEnv!(tuningWorker('claude')) ?? {};
+    assert.equal(firstHop.PA_TASK_ID, task.id, 'the AI-255 B4 tag rides getEnv — the allowlist filter drops it from static env');
+    assert.equal(firstHop.PA_WORKER_CLI, 'agy');
+    assert.equal(firstHop.PA_WORKER_MODEL, 'pin-model', 'the record model pin rides the overrides slot');
+    assert.equal(failoverHop.PA_WORKER_CLI, 'claude', 'a failover hop stamps ITS OWN identity');
+    assert.equal(failoverHop.PA_TASK_ID, task.id);
+    assert.notEqual(failoverHop.PA_WORKER_CLI, firstHop.PA_WORKER_CLI);
+  });
+
+  it('a topic tunable_default slice reaches the getEnv stamp for its own worker only', async () => {
+    await writeFile(
+      join(tempDir, `telegram-bot-topic-${CHAT_ID}_${THREAD_ID}.json`),
+      JSON.stringify({
+        chat_id: CHAT_ID, thread_id: THREAD_ID, turns: [],
+        tunable_defaults: { agy: { model: 'topic-model', effort: 'high' } },
+      }),
+      'utf8'
+    );
+    const task = await claimedTask('Slice task', 'do things');
+    const captured: RunOptions[] = [];
+    await executeTopicTask(makeArgs(task, {
+      captureOpts: (o) => captured.push(o),
+      dispatch: okDispatch('done'),
+    }));
+    const agyStamp = captured[0].getEnv!(tuningWorker('agy')) ?? {};
+    assert.equal(agyStamp.PA_WORKER_CLI, 'agy');
+    assert.equal(agyStamp.PA_WORKER_MODEL, 'topic-model', 'the agy-scoped default stamps on the agy hop');
+    assert.equal(agyStamp.PA_WORKER_EFFORT, 'high');
+    const codexStamp = captured[0].getEnv!(tuningWorker('codex')) ?? {};
+    assert.equal(codexStamp.PA_WORKER_CLI, 'codex');
+    assert.notEqual(codexStamp.PA_WORKER_MODEL, 'topic-model', 'a foreign slice never leaks onto another hop');
   });
 });

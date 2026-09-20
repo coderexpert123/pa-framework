@@ -94,6 +94,100 @@ class TestGeneralizeForNonClaude(unittest.TestCase):
         self.assertIn(".agy-needs-brain", result)
 
 
+class TestOpencodeProfile(unittest.TestCase):
+    def test_profile_registered(self):
+        self.assertIn("opencode", scp.TARGETS)
+        self.assertIn("opencode", scp.BUS_DOC_TARGETS)
+        self.assertIn("opencode", scp.GENERALIZE_PROFILES)
+        self.assertIn("opencode", scp.TARGET_MEMORIES_HEADINGS)
+        self.assertEqual(
+            scp.TARGETS["opencode"],
+            [os.path.expanduser("~/.config/opencode/AGENTS.md")],
+        )
+        self.assertEqual(
+            scp.BUS_DOC_TARGETS["opencode"],
+            os.path.expanduser("~/.config/opencode/bus.md"),
+        )
+
+    def test_expands_backticked_claude_md_to_agents(self):
+        profile = scp.GENERALIZE_PROFILES["opencode"]
+        out = scp.generalize_for_non_claude(
+            "a project that has no `CLAUDE.md` means trouble", profile=profile)
+        self.assertIn("`CLAUDE.md`/`AGENTS.md`", out)
+
+    def test_expands_bare_claude_md_to_agents(self):
+        profile = scp.GENERALIZE_PROFILES["opencode"]
+        out = scp.generalize_for_non_claude(
+            "promoted to project CLAUDE.md (project-universal)", profile=profile)
+        self.assertIn("CLAUDE.md/AGENTS.md", out)
+        self.assertNotIn("project CLAUDE.md (", out)
+
+    def test_idempotent_does_not_double_expand(self):
+        profile = scp.GENERALIZE_PROFILES["opencode"]
+        once = scp.generalize_for_non_claude("no `CLAUDE.md` here", profile=profile)
+        twice = scp.generalize_for_non_claude(once, profile=profile)
+        self.assertEqual(once, twice)
+        self.assertEqual(once.count("AGENTS.md"), 1)
+
+    def test_expands_needs_brain_marker(self):
+        profile = scp.GENERALIZE_PROFILES["opencode"]
+        out = scp.generalize_for_non_claude(
+            "If `.claude-needs-brain` exists", profile=profile)
+        self.assertIn("`.claude-needs-brain` (or `.opencode-needs-brain`)", out)
+
+    def test_generalizes_managed_by_claude_code(self):
+        profile = scp.GENERALIZE_PROFILES["opencode"]
+        out = scp.generalize_for_non_claude(
+            "MEMORY.md (managed by Claude Code at the project level)",
+            profile=profile)
+        self.assertIn("managed by the agent", out)
+        self.assertNotIn("Claude Code", out)
+
+    def test_sync_all_regions_uses_opencode_wording(self):
+        profile = scp.GENERALIZE_PROFILES["opencode"]
+        source = CLAUDE_MD_FIXTURE.replace(
+            "## Brain Bootstrap\n\nBootstrap procedure text.",
+            "## Brain Bootstrap\n\nIf `.claude-needs-brain` exists, promote to project CLAUDE.md, "
+            "and MEMORY.md (managed by Claude Code) helps.",
+        )
+        target = "## Opencode Notes\n- Native preamble.\n"
+        result = scp.sync_all_regions(
+            source, target, profile=profile,
+            memories_heading=scp.TARGET_MEMORIES_HEADINGS["opencode"])
+        self.assertNotIn("managed by Claude Code", result)
+        self.assertIn(".opencode-needs-brain", result)
+        self.assertIn("CLAUDE.md/AGENTS.md", result)
+        self.assertIn("- Native preamble.", result)
+
+    def test_opencode_run_apply_then_clean(self):
+        import io
+        tmpdir = tempfile.mkdtemp()
+        try:
+            claude_path = os.path.join(tmpdir, "CLAUDE.md")
+            target_path = os.path.join(tmpdir, "AGENTS.md")
+            with open(claude_path, "w", encoding="utf-8") as f:
+                f.write(CLAUDE_MD_FIXTURE)
+            with open(target_path, "w", encoding="utf-8") as f:
+                f.write("## Opencode Notes\n- Native preamble.\n")
+            targets = {"opencode": [target_path]}
+            code = scp.run(
+                "opencode", apply=True, claude_md_path=claude_path,
+                targets=targets, out=io.StringIO(),
+            )
+            self.assertEqual(code, 0)
+            with open(target_path, "r", encoding="utf-8") as f:
+                written = f.read()
+            self.assertIn("No sycophancy", written)
+            self.assertIn("- Native preamble.", written)
+            code2 = scp.run(
+                "opencode", apply=False, claude_md_path=claude_path,
+                targets=targets, out=io.StringIO(),
+            )
+            self.assertEqual(code2, 0)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 class TestExtractRegion(unittest.TestCase):
     def test_marker_present_in_source_excludes_trailing_content_after_end_marker(self):
         region = {"name": "injection", "start_heading": "## Prompt Injection Awareness", "end_heading": None}
@@ -523,9 +617,10 @@ class TestCodexTargets(unittest.TestCase):
                         or scp.CODEX_INSTRUCTIONS_PATH.endswith(".codex/instructions.md"))
 
     def test_mirror_targets_map(self):
-        self.assertEqual(sorted(scp.MIRROR_TARGETS), ["codex-skills", "skills"])
+        self.assertEqual(sorted(scp.MIRROR_TARGETS), ["codex-skills", "devin-skills", "skills"])
         self.assertEqual(scp.MIRROR_TARGETS["skills"], scp.SHARED_SKILLS_DIR)
         self.assertEqual(scp.MIRROR_TARGETS["codex-skills"], scp.CODEX_SKILLS_DIR)
+        self.assertEqual(scp.MIRROR_TARGETS["devin-skills"], scp.DEVIN_SKILLS_DIR)
 
     def test_main_routes_codex_skills_to_mirror_dir(self):
         from unittest import mock
@@ -590,6 +685,180 @@ class TestRunProfileSelection(unittest.TestCase):
             self.assertIn("## Codex Harness", written)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+DEVIN_AGENTS_FIXTURE = """# Devin
+
+Devin's own preamble.
+
+## Devin CLI Notes
+
+- Native Devin-specific note that must survive.
+
+## Some Other Section
+
+Unrelated content.
+"""
+
+
+class TestDevinTarget(unittest.TestCase):
+    """The devin brain-file target: %APPDATA%/devin/AGENTS.md gets the
+    AGENTS.md generalization profile, and its fallback insertion anchor is
+    the native '## Devin CLI Notes' heading (not the Gemini memory section,
+    which a Devin file never carries)."""
+
+    def test_devin_target_registered(self):
+        self.assertIn("devin", scp.TARGETS)
+        self.assertEqual(scp.TARGETS["devin"], [scp.DEVIN_AGENTS_MD])
+        self.assertTrue(
+            scp.DEVIN_AGENTS_MD.replace("\\", "/").endswith("devin/AGENTS.md"))
+
+    def test_devin_profile_expands_to_agents_md(self):
+        prof = scp.GENERALIZE_PROFILES["devin"]
+        out = scp.generalize_for_non_claude(
+            "no `CLAUDE.md` and bare CLAUDE.md here", profile=prof)
+        self.assertIn("`CLAUDE.md`/`AGENTS.md`", out)
+        self.assertIn("CLAUDE.md/AGENTS.md", out)
+        self.assertNotIn("AGY.md", out)
+        self.assertNotIn("GEMINI.md", out)
+
+    def test_devin_profile_needs_brain_marker(self):
+        prof = scp.GENERALIZE_PROFILES["devin"]
+        out = scp.generalize_for_non_claude(
+            "If `.claude-needs-brain` exists", profile=prof)
+        self.assertEqual(
+            out, "If `.claude-needs-brain` (or `.devin-needs-brain`) exists")
+
+    def test_devin_memories_heading_is_devin_notes(self):
+        self.assertEqual(
+            scp.TARGET_MEMORIES_HEADINGS["devin"], scp.DEVIN_NOTES_HEADING)
+        self.assertEqual(scp.DEVIN_NOTES_HEADING, "## Devin CLI Notes")
+
+    def test_run_devin_inserts_after_devin_notes_with_devin_profile(self):
+        """End-to-end: a Devin-shaped target with no region headings gets both
+        regions spliced right after '## Devin CLI Notes' (region order kept),
+        generalized through the devin profile."""
+        import io
+        tmpdir = tempfile.mkdtemp()
+        try:
+            claude_path = os.path.join(tmpdir, "CLAUDE.md")
+            target_path = os.path.join(tmpdir, "AGENTS.md")
+            with open(claude_path, "w", encoding="utf-8") as f:
+                f.write(CLAUDE_MD_FIXTURE.replace(
+                    "- **No sycophancy.** Be blunt.",
+                    "- **No sycophancy.** Be blunt. See `CLAUDE.md` and `.claude-needs-brain`.",
+                ))
+            with open(target_path, "w", encoding="utf-8") as f:
+                f.write(DEVIN_AGENTS_FIXTURE)
+
+            code = scp.run("devin", apply=True, claude_md_path=claude_path,
+                           targets={"devin": [target_path]}, out=io.StringIO())
+            self.assertEqual(code, 0)
+            with open(target_path, encoding="utf-8") as f:
+                written = f.read()
+            self.assertIn("`CLAUDE.md`/`AGENTS.md`", written)
+            self.assertIn("`.devin-needs-brain`", written)
+            self.assertNotIn("AGY.md", written)
+            # The native notes section survives and the regions land after it,
+            # in canonical order (principles then injection).
+            self.assertIn("Native Devin-specific note that must survive.", written)
+            notes_idx = written.index("## Devin CLI Notes")
+            p_idx = written.index("<!-- CLI-PARITY:BEGIN:principles -->")
+            i_idx = written.index("<!-- CLI-PARITY:BEGIN:injection -->")
+            other_idx = written.index("## Some Other Section")
+            self.assertTrue(notes_idx < p_idx < i_idx < other_idx)
+            # Second run is clean (markers steady-state).
+            code2 = scp.run("devin", apply=False, claude_md_path=claude_path,
+                            targets={"devin": [target_path]}, out=io.StringIO())
+            self.assertEqual(code2, 0)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestDevinSkillMirror(unittest.TestCase):
+    """The devin-skills catalog: same allowlist minus TARGET_SKILL_EXCLUDES —
+    'loop' is dropped because Devin has a native /loop it must not shadow."""
+
+    def test_devin_skills_exclude_loop(self):
+        self.assertEqual(scp.TARGET_SKILL_EXCLUDES["devin-skills"], {"loop"})
+        self.assertIn("loop", scp.SKILL_MIRROR_ALLOWLIST)
+
+    def test_main_routes_devin_skills_to_mirror_dir_minus_excludes(self):
+        from unittest import mock
+        with mock.patch.object(scp, "run_skill_mirror", return_value=0) as mock_mirror, \
+             mock.patch.object(scp, "run") as mock_run:
+            code = scp.main(["--check", "devin-skills"])
+        self.assertEqual(code, 0)
+        mock_run.assert_not_called()
+        mock_mirror.assert_called_once()
+        self.assertEqual(mock_mirror.call_args.kwargs["shared_skills_dir"], scp.DEVIN_SKILLS_DIR)
+        allowlist = mock_mirror.call_args.kwargs["allowlist"]
+        self.assertNotIn("loop", allowlist)
+        self.assertEqual(
+            allowlist,
+            [n for n in scp.SKILL_MIRROR_ALLOWLIST
+             if n not in scp.TARGET_SKILL_EXCLUDES["devin-skills"]])
+
+    def test_main_other_skill_targets_keep_loop(self):
+        """The exclusion is per-target: the shared (gemini/agy) catalog still
+        mirrors loop — only devin-skills drops it."""
+        from unittest import mock
+        with mock.patch.object(scp, "run_skill_mirror", return_value=0) as mock_mirror:
+            code = scp.main(["--check", "skills"])
+        self.assertEqual(code, 0)
+        allowlist = mock_mirror.call_args.kwargs["allowlist"]
+        self.assertIn("loop", allowlist)
+
+
+class TestTierMapPointer(unittest.TestCase):
+    """generalize_for_non_claude replaces the dangling
+    '§ Claude Code model & effort settings' pointer sentence with each
+    profile's own CLI-specific tier map."""
+
+    POINTER_SENTENCE = (
+        "Where each setting lives is CLI-specific — for Claude Code see "
+        "§ Claude Code model & effort settings."
+    )
+
+    def test_each_profile_replaces_pointer_with_its_tier_map(self):
+        for name, profile in scp.GENERALIZE_PROFILES.items():
+            with self.subTest(profile=name):
+                src = "Some preceding text. " + self.POINTER_SENTENCE + " Some trailing text."
+                out = scp.generalize_for_non_claude(src, profile=profile)
+                self.assertIn("In this CLI: " + profile["tier_map"], out)
+                self.assertNotIn("§ Claude Code model & effort settings", out)
+
+    def test_default_profile_also_has_tier_map(self):
+        out = scp.generalize_for_non_claude(self.POINTER_SENTENCE, profile=scp.DEFAULT_GENERALIZE_PROFILE)
+        self.assertIn("In this CLI: " + scp.DEFAULT_GENERALIZE_PROFILE["tier_map"], out)
+        self.assertNotIn("§ Claude Code model & effort settings", out)
+
+    def test_idempotent(self):
+        for name, profile in scp.GENERALIZE_PROFILES.items():
+            with self.subTest(profile=name):
+                once = scp.generalize_for_non_claude(self.POINTER_SENTENCE, profile=profile)
+                twice = scp.generalize_for_non_claude(once, profile=profile)
+                self.assertEqual(once, twice)
+
+    def test_absent_sentence_leaves_content_unchanged(self):
+        for name, profile in scp.GENERALIZE_PROFILES.items():
+            with self.subTest(profile=name):
+                src = "No pointer sentence here at all."
+                out = scp.generalize_for_non_claude(src, profile=profile)
+                self.assertEqual(out, src)
+
+    def test_drifted_pointer_sentence_raises(self):
+        no_period = self.POINTER_SENTENCE[:-1]
+        em_dash_replaced = self.POINTER_SENTENCE.replace("—", "-")
+        for name, profile in scp.GENERALIZE_PROFILES.items():
+            with self.subTest(profile=name, variant="no_period"):
+                src = "Some preceding text. " + no_period + " Some trailing text."
+                with self.assertRaises(ValueError):
+                    scp.generalize_for_non_claude(src, profile=profile)
+            with self.subTest(profile=name, variant="em_dash_replaced"):
+                src = "Some preceding text. " + em_dash_replaced + " Some trailing text."
+                with self.assertRaises(ValueError):
+                    scp.generalize_for_non_claude(src, profile=profile)
 
 
 if __name__ == "__main__":

@@ -790,6 +790,12 @@ describe('build-lock: run-tests.mjs guard wiring (AI-180 — real runner over a 
       join(LIVE_REPO_ROOT, 'pa', 'scripts', 'run-tests.mjs'),
       join(s.root, 'pa', 'scripts', 'run-tests.mjs')
     );
+    // AI-255 split the guard check into pa/scripts/dist-guard.mjs — the runner
+    // imports it, so the sandbox needs the real module beside the script.
+    await cp(
+      join(LIVE_REPO_ROOT, 'pa', 'scripts', 'dist-guard.mjs'),
+      join(s.root, 'pa', 'scripts', 'dist-guard.mjs')
+    );
     // A no-op preload (the real test-env-setup redirects PA_HOME etc.; the
     // sandbox smoke test needs none of that) + one real runnable smoke test.
     await writeFile(join(s.testsDir, 'test-env-setup.js'), '// AI-180 sandbox fixture: deliberate no-op preload.\n', 'utf8');
@@ -844,7 +850,10 @@ describe('build-lock: run-tests.mjs guard wiring (AI-180 — real runner over a 
   it('refuses a stale dist and never runs a test — EVEN under PA_BUILD_LOCK=0 (the guard is not lock-exempt)', async () => {
     const s = await makeRunnerSandbox();
     try {
-      const out = await runRunner(s, [], {});
+      // PA_NO_AUTOBUILD=1: this test asserts the REFUSE path; AI-255's default
+      // is a managed inline rebuild, which a minimal sandbox cannot satisfy
+      // (no real build.mjs/src tree) — pin refuse-fast explicitly.
+      const out = await runRunner(s, [], { PA_NO_AUTOBUILD: '1' });
       assert.equal(
         out.code,
         1,

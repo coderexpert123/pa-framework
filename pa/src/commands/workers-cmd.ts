@@ -63,10 +63,12 @@ async function workerPinCommand(workerName: string): Promise<void> {
     .filter(line => !line.trim().startsWith('worker_pin:'))
     .join('\n');
 
-  // Add new worker_pin line
+  // Add new worker_pin line — TOP-LEVEL beside `workers:`, never inside the
+  // block: an indented pin under `workers:` changes that mapping's shape, and
+  // a config consumer reading top-level keys sees no pin at all (WB-1).
   const pinLine = `worker_pin: "${workerName}"`;
-  const withNewPin = updated.includes('\nworkers:')
-    ? updated.replace(/(\nworkers:)/, `$1\n  ${pinLine}`)
+  const withNewPin = /^workers:/m.test(updated)
+    ? updated.replace(/^(workers:)/m, `${pinLine}\n$1`)
     : updated + `\n${pinLine}`;
 
   await writeFile(path, withNewPin.trim() + '\n', 'utf8');

@@ -162,7 +162,7 @@ def group_entries(entries: list[dict]) -> list[dict]:
     return sorted(groups.values(), key=lambda g: (-g["count"], g["worker"], g["reason"]))
 
 
-def render_report(groups: list[dict], malformed: int, rotated: bool) -> str:
+def render_report(groups: list[dict], malformed: int, rotated: bool, heal_lines: list[str] | None = None) -> str:
     """Compact Markdown report. sendToTelegram handles MarkdownV2 escaping."""
     total = sum(g["count"] for g in groups)
     lines = [f"*Rate-limit parser misses — {total} new entr{'y' if total == 1 else 'ies'}*"]
@@ -176,6 +176,9 @@ def render_report(groups: list[dict], malformed: int, rotated: bool) -> str:
     if malformed:
         lines.append("")
         lines.append(f"⚠️ {malformed} malformed line(s) skipped.")
+    for hl in heal_lines or []:
+        lines.append("")
+        lines.append(hl)
     lines.append("")
     lines.append("Action: file as backlog if the pattern is novel; ignore if transient.")
     report = "\n".join(lines)
@@ -210,9 +213,21 @@ def load_cursor(path: Path) -> dict | None:
 
 
 def save_cursor(path: Path, processed: int, now: datetime) -> None:
+    """Write the cursor, PRESERVING sibling keys written by other tools —
+    rate_limit_parser_heal.py records `healedClusters` in this same file, and
+    a wholesale {"processedLines", "updatedAt"} payload would silently drop
+    them on the next digest run."""
+    prior: dict = {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            prior = loaded
+    except (OSError, json.JSONDecodeError):
+        pass
+    prior["processedLines"] = processed
+    prior["updatedAt"] = now.isoformat()
     tmp = path.with_suffix(path.suffix + ".tmp")
-    payload = {"processedLines": processed, "updatedAt": now.isoformat()}
-    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    tmp.write_text(json.dumps(prior), encoding="utf-8")
     os.replace(tmp, path)
 
 
@@ -244,6 +259,20 @@ def main(argv=None) -> int:
         entries = within_window(entries, now, args.first_run_window_hours)
         malformed = 0  # historical noise, not something to page about on adoption
 
+    # Self-heal (operator directive 2026-09-13): a >=2-entry time-hint cluster
+    # in the NEW entries feeds rate_limit_parser_heal.py, which template-fits,
+    # generates the parser case + fixture, gates through build + scoped tests,
+    # and pathspec-commits on green. Never runs under --no-advance (tests /
+    # manual inspection must not mutate the tree). A healer failure is a
+    # report line, never a lost digest.
+    heal_lines: list[str] = []
+    if not args.no_advance and entries:
+        try:
+            from rate_limit_parser_heal import heal_clusters
+            heal_lines = heal_clusters(entries, cursor_path, now)
+        except Exception as exc:  # noqa: BLE001 — report, never crash the digest
+            heal_lines = [f"⚠️ self-heal error: {exc}"]
+
     if not args.no_advance:
         try:
             save_cursor(cursor_path, len(lines), now)
@@ -252,10 +281,13 @@ def main(argv=None) -> int:
             print(f"[rate-limit-digest] cursor write failed: {e}", file=sys.stderr)
 
     if not entries and not malformed:
+        if heal_lines:
+            print("\n".join(heal_lines))
+            return 0
         print("NO_OUTPUT")
         return 0
 
-    print(render_report(group_entries(entries), malformed, rotated))
+    print(render_report(group_entries(entries), malformed, rotated, heal_lines))
     return 0
 
 

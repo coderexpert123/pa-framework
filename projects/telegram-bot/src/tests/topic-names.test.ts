@@ -336,6 +336,23 @@ describe('loadTopicNames: backward compatibility', () => {
     const loaded = await loadTopicNames();
     assert.equal(loaded.get('-1001234567890')?.get(29)?.description, 'Test desc');
   });
+
+  it('loadTopicNames keeps legacy entries name-only and object entries with description and guide id', async () => {
+    await writeFile(
+      join(tempDir, 'telegram-topic-names.json'),
+      JSON.stringify({
+        '-1': { '0': 'General', '5': { name: 'health', description: 'd', guide_message_id: 42 }, '6': { name: 'x' } },
+      }),
+      'utf8'
+    );
+    const map = await loadTopicNames();
+    const inner = map.get('-1');
+    assert.ok(inner);
+    assert.deepEqual(inner.get(0), { name: 'General' });
+    assert.deepEqual(inner.get(5), { name: 'health', description: 'd', guide_message_id: 42 });
+    assert.deepEqual(inner.get(6), { name: 'x', description: undefined, guide_message_id: undefined });
+    assert.deepEqual(Object.keys(inner.get(0)!), ['name']);
+  });
 });
 
 // ---------------------------------------------------------------------------

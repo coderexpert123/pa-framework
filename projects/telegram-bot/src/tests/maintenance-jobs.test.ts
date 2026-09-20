@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, mkdir, writeFile, readdir, readFile } from 'fs/promises';
-import { existsSync, readFileSync, writeFileSync, rmSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, rmSync, statSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createBotMaintenanceJobs, watchdogStaleJobs, checkRegistryContentInvariants, sweepExpiredPendingActions, DRAIN_SOURCE_SPECS, type BotMaintenanceDeps, type RegistryContentViolation } from '../maintenance-jobs.js';
@@ -12,8 +12,10 @@ import { registryContentWatchJob as registryContentWatchStub } from '../../../..
 import { RUNTIME_ARCHIVE_MAX_BYTES } from '../../../../pa/dist/src/lib/archive-files.js';
 import { flushLog } from '../../../../pa/dist/src/lib/log.js';
 import { loadJobState, updateJobState } from '../../../../pa/dist/src/lib/maintenance/state.js';
+import { repoRootFromModule } from '../../../../pa/dist/src/lib/git-root.js';
 import type { TopicNameMap } from '../topic-names.js';
 import { waitForDrain } from './test-teardown-guard.js';
+import { SELF_RESTART_GRACE_MS } from '../self-restart.js';
 
 /**
  * Config-shaped rule fixtures matching ~/.pa/registry-content-rules.json format.
@@ -502,6 +504,51 @@ describe('createBotMaintenanceJobs', () => {
       const job = jobs.find((j) => j.name === 'grounding-check')!;
       await assert.doesNotReject(() => job.run({ now: Date.now(), everyMs: 21_600_000 }));
     });
+
+    it('declared sources: one missing path + one real file => exactly one issue, one page on the grounding-check-sources dedup key', async () => {
+      const realFile = join(tempDir, 'real-source.md');
+      await writeFile(realFile, 'grounding content', 'utf-8');
+      const missing = join(tempDir, 'gone-source.md');
+      // topic 100_200: one missing + one present; topic 100_300: one present
+      await writeFile(join(tempDir, 'telegram-bot-topic-100_200.json'),
+        JSON.stringify({ chat_id: 100, thread_id: 200, turns: [], sources: [{ path: missing }, { path: realFile, label: 'real' }] }), 'utf-8');
+      await writeFile(join(tempDir, 'telegram-bot-topic-100_300.json'),
+        JSON.stringify({ chat_id: 100, thread_id: 300, turns: [], sources: [{ path: realFile }] }), 'utf-8');
+
+      const jobs = createBotMaintenanceJobs(stubDeps());
+      const job = jobs.find((j) => j.name === 'grounding-check')!;
+      const result = await job.run({ now: Date.now(), everyMs: 21_600_000 });
+
+      assert.equal(result.touched, 1);
+      const issues = result.detail!.sourceIssues as Array<{ topicKey: string; path: string; reason: string }>;
+      assert.equal(issues.length, 1);
+      assert.equal(issues[0].topicKey, '100_200');
+      assert.equal(issues[0].path, missing);
+      assert.equal(issues[0].reason, 'missing/unreadable');
+
+      await flushLog();
+      const raw = await readFile(join(tempDir, 'app.log.jsonl'), 'utf8');
+      const attempts = raw.split('\n').filter((l) => l.includes('Declared topic source missing') && l.includes('attempting'));
+      assert.equal(attempts.length, 1, 'one page for the sources half');
+      assert.ok(attempts[0].includes('grounding-check-sources'), 'page rides its own dedup key, never masked by the clobber page');
+    });
+
+    it('declared sources: all present and readable => no issue, no page', async () => {
+      const realFile = join(tempDir, 'real-source.md');
+      await writeFile(realFile, 'grounding content', 'utf-8');
+      await writeFile(join(tempDir, 'telegram-bot-topic-100_200.json'),
+        JSON.stringify({ chat_id: 100, thread_id: 200, turns: [], sources: [{ path: realFile }] }), 'utf-8');
+
+      const jobs = createBotMaintenanceJobs(stubDeps());
+      const job = jobs.find((j) => j.name === 'grounding-check')!;
+      const result = await job.run({ now: Date.now(), everyMs: 21_600_000 });
+
+      assert.equal(result.touched, 0);
+      await flushLog();
+      let raw = '';
+      try { raw = await readFile(join(tempDir, 'app.log.jsonl'), 'utf8'); } catch { /* no log file yet */ }
+      assert.equal(raw.includes('Declared topic source missing'), false, 'no sources page when everything resolves');
+    });
   });
 
   describe('watchdogStaleJobs (P2-3)', () => {
@@ -594,6 +641,70 @@ describe('createBotMaintenanceJobs', () => {
       assert.equal(result.detail?.reason, 'no-sentinel');
       const after = await readdir(tempDir);
       assert.deepEqual(after, before);
+    });
+
+    it('pollLoopInFlight blocks the sentinel write; without it, the same idle state restarts (2026-09-16 in-flight-turn race)', async () => {
+      // Drive the job into the one real "would restart" state it has: a dist
+      // build-stamp newer than the process start, past grace, with every
+      // durable busy signal at 0 (all read from this test's empty temp
+      // PA_HOME). procStartMs is computed inside run() from the REAL
+      // process.uptime() against the REAL repo build-stamp files (no dep
+      // seam for either) — mocking process.uptime() is the only lever that
+      // reaches this state without touching the live repo's build-stamp
+      // files, which the production bot's own self-restart tick polls on
+      // this same shared tree.
+      const repoRoot = await repoRootFromModule(import.meta.url);
+      const stampPaths = [
+        join(repoRoot, 'pa', 'dist', '.build-stamp'),
+        join(repoRoot, 'projects', 'telegram-bot', 'dist', '.build-stamp'),
+      ];
+      // run() re-reads these same shared files itself (no dep seam for either —
+      // see the comment above) — several sessions build this tree concurrently
+      // (root CLAUDE.md's multi-session protocol), so a rebuild landing between
+      // our read here and run()'s own internal read would silently invalidate
+      // nowMs's "past grace" assumption against the NEW mtime. Re-check after
+      // each run() and fail with a named cause instead of a bare touched/reason
+      // mismatch that would misread as a self-restart logic bug.
+      const readStampMtimeMs = (): number | null => {
+        let m: number | null = null;
+        for (const p of stampPaths) {
+          try {
+            const s = statSync(p).mtimeMs;
+            if (m === null || s > m) m = s;
+          } catch { /* not present at this path */ }
+        }
+        return m;
+      };
+      const stampMtimeMs = readStampMtimeMs();
+      assert.ok(stampMtimeMs !== null, 'a real dist build-stamp must exist (run a build first) for this test to reach stamp-newer');
+
+      const uptimeSecs = (Date.now() - stampMtimeMs!) / 1000 + 3600; // 1h buffer before the stamp
+      const uptimeMock = mock.method(process, 'uptime', () => uptimeSecs);
+      try {
+        const nowMs = stampMtimeMs! + SELF_RESTART_GRACE_MS + 5_000; // past grace
+
+        // Control: no pollLoopInFlight dep (defaults to 0) -> idle -> restarts.
+        const sentinelA = join(tempDir, 'sentinel-a.stop');
+        const jobsA = createBotMaintenanceJobs(stubDeps({ sentinelPath: sentinelA }));
+        const jobA = jobsA.find((j) => j.name === 'bot-self-restart')!;
+        const resultA = await jobA.run({ now: nowMs, everyMs: 60_000 });
+        assert.equal(readStampMtimeMs(), stampMtimeMs, 'the shared repo build-stamp changed mid-test (a concurrent build) — rerun; not a self-restart logic failure');
+        assert.equal(resultA.touched, 1, 'control: idle with pollLoopInFlight absent restarts');
+        assert.equal(resultA.detail?.reason, 'stamp-newer-and-idle');
+        assert.ok(existsSync(sentinelA), 'control: sentinel written');
+
+        // pollLoopInFlight: () => 1 -> busy -> no sentinel write.
+        const sentinelB = join(tempDir, 'sentinel-b.stop');
+        const jobsB = createBotMaintenanceJobs(stubDeps({ sentinelPath: sentinelB, pollLoopInFlight: () => 1 }));
+        const jobB = jobsB.find((j) => j.name === 'bot-self-restart')!;
+        const resultB = await jobB.run({ now: nowMs, everyMs: 60_000 });
+        assert.equal(readStampMtimeMs(), stampMtimeMs, 'the shared repo build-stamp changed mid-test (a concurrent build) — rerun; not a self-restart logic failure');
+        assert.equal(resultB.touched, 0, 'a turn still in flight in the poll loop blocks the restart');
+        assert.equal(resultB.detail?.reason, 'busy');
+        assert.equal(existsSync(sentinelB), false, 'no sentinel written while a turn is in flight');
+      } finally {
+        uptimeMock.mock.restore();
+      }
     });
   });
 

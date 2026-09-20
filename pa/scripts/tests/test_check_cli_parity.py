@@ -111,7 +111,7 @@ class TestRun(unittest.TestCase):
         text = out.getvalue()
         self.assertEqual(
             text.strip().splitlines()[-2],
-            "Drift detected in: gemini, agy, skills, codex, codex-skills",
+            "Drift detected in: gemini, agy, skills, codex, codex-skills, devin, devin-skills",
         )
 
     def test_error_in_one_target_reported_and_treated_as_drift(self):
@@ -140,13 +140,20 @@ class TestRun(unittest.TestCase):
         with mock.patch.object(ccp.scp, "run", side_effect=fake_run), \
              mock.patch.object(ccp.scp, "run_skill_mirror", return_value=0) as mock_mirror:
             ccp.run(out=io.StringIO())
-        self.assertEqual(sorted(seen), ["agy", "codex", "gemini"])
-        self.assertEqual(mock_mirror.call_count, 2)
+        self.assertEqual(sorted(seen), ["agy", "codex", "devin", "gemini"])
+        self.assertEqual(mock_mirror.call_count, 3)
+        # The checker covers its own registered list — a curated subset of
+        # sync_cli_parity's targets, so compare against the mirror targets
+        # ccp.TARGETS actually names, never all MIRROR_TARGETS.
+        expected_mirror_dirs = [
+            ccp.scp.MIRROR_TARGETS[name] for name in ccp.TARGETS
+            if name in ccp.scp.MIRROR_TARGETS
+        ]
         self.assertEqual(
             sorted(c.kwargs["shared_skills_dir"] for c in mock_mirror.call_args_list),
-            sorted(ccp.scp.MIRROR_TARGETS.values()),
+            sorted(expected_mirror_dirs),
         )
-        self.assertEqual(ccp.TARGETS, ["gemini", "agy", "skills", "codex", "codex-skills"])
+        self.assertEqual(ccp.TARGETS, ["gemini", "agy", "skills", "codex", "codex-skills", "devin", "devin-skills"])
 
 
 class TestMain(unittest.TestCase):

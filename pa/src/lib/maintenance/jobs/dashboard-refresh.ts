@@ -6,8 +6,8 @@ import type { MaintenanceJob } from '../types.js';
  * which needs the bot's live `telegram.ts` `editMessageText` and the dashboard's state
  * file at `~/.pa/telegram-dashboard.json`. This stub exists only so `pa maintenance list`
  * and the registry (`MAINTENANCE_JOBS`) know the job exists at all — before 2026-08-28,
- * the dashboard refreshed only at startup and on keep-awake toggle (2026-08-24 feature), with
- * no recurring cadence. Mirrors `jobs/registry-content-watch.ts'` shape exactly (same unbound-stub
+ * the dashboard refreshed only at startup and on the since-removed sleep-inhibit toggle,
+ * with no recurring cadence. Mirrors `jobs/registry-content-watch.ts'` shape exactly (same unbound-stub
  * pattern, same host/cadence/destructive/shedWhenDegraded contract).
  */
 export const dashboardRefreshJob: MaintenanceJob = {

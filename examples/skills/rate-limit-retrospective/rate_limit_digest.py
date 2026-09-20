@@ -34,7 +34,7 @@ cursor still advances past everything. A cursor file that exists but is corrupt
 (bad JSON, wrong shape, non-int or negative `processedLines`) is treated as no
 cursor at all — same window-guarded adoption, never a crash.
 
-Usage:  python rate_limit_digest.py
+Usage:  python3 rate_limit_digest.py   # (Windows: python rate_limit_digest.py)
 """
 from __future__ import annotations
 

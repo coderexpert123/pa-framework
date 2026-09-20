@@ -9,12 +9,13 @@
 
 import { appendFile, mkdir, writeFile } from 'fs/promises';
 import { homedir } from 'os';
-import { dirname, join, resolve } from 'path';
+import { basename, dirname, join, resolve } from 'path';
 import lockfile from 'proper-lockfile';
 import { safeLockOptions } from './safe-lock.js';
 import { paHome } from '../paths.js';
 import { rotateFileIfNeeded } from './archive-files.js';
 import { redactSecrets } from './redact.js';
+import { withBoundedQueue, waitForQueueDrain } from './stall.js';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
@@ -61,7 +62,8 @@ function getLogFile(): string {
   return resolved;
 }
 
-let appendQueue: Promise<void> = Promise.resolve();
+/** In-process serializer key for app-log appends (lib/stall.ts). Exported for tests. */
+export const APP_LOG_QUEUE_KEY = 'app-log';
 
 // Count of primary (locked) write failures — incremented whenever
 // appendLogInner rejects (lock-retry exhaustion, ensureLogFile failure,
@@ -133,13 +135,15 @@ function appendLog(entry: LogEntry): void {
   // production forensic log. An entry belongs to the PA_HOME that was in
   // effect when it was created.
   const logFile = getLogFile();
-  appendQueue = appendQueue
-    .catch(() => {})
-    .then(() => appendLogInner(logFile, line))
-    .catch(() => appendLogFallback(logFile, line, entry));
-  // appendLogFallback never rejects (it wraps its own try/catch), so this
-  // chain — and therefore flushLog() — still never rejects and never throws
-  // back to the caller, matching the pre-existing swallow contract.
+  // Bounded FIFO (lib/stall.ts, 2026-09-16): a hung append detaches its
+  // successors after PA_STORE_WAIT_MAX_MS instead of silencing every later
+  // log() for the life of the process. appendLogFallback never rejects, and the
+  // trailing catch keeps log() a fire-and-forget that never throws.
+  void withBoundedQueue(
+    APP_LOG_QUEUE_KEY,
+    () => appendLogInner(logFile, line).catch(() => appendLogFallback(logFile, line, entry)),
+    { store: 'app-log', target: basename(logFile) },
+  ).catch(() => {});
 }
 
 /**
@@ -151,9 +155,16 @@ function appendLog(entry: LogEntry): void {
  * Tests must also await it before removing a temp PA_HOME: queued entries are
  * pinned to the PA_HOME captured at enqueue time (see appendLog), so draining
  * after the directory is gone just loses them to a swallowed ENOENT.
+ *
+ * Bounded (2026-09-16): a flush behind a hung append waits at most
+ * PA_STORE_WAIT_MAX_MS after that append started, then records a stall.
+ * Implemented as a queue DRAIN rather than a queued no-op entry (AI-315):
+ * detached predecessors propagate early-starts to their successors, so a
+ * queued flush could return while a detached append's write was still in
+ * flight; waiting on the tail's settled preserves the drain contract.
  */
 export function flushLog(): Promise<void> {
-  return appendQueue.catch(() => {});
+  return waitForQueueDrain(APP_LOG_QUEUE_KEY).catch(() => {});
 }
 
 /**

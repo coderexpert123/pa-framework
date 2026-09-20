@@ -48,11 +48,68 @@ WARN_TTL_SECONDS = 86400
 
 WARNING_TEMPLATE = (
     '[pa reservation-guard] {rel} is inside an ACTIVE reservation: {id} held by session '
-    '"{session}" (note: "{note}") until {expiresAt}. If that reservation is yours, continue. '
+    '"{session}"{bus} (note: "{note}") until {expiresAt}. If that reservation is yours, continue. '
     'If it is not, stop and coordinate before editing: run `pa claims`, message the holding '
-    'session, and use `pa claim --force` only after you agree who yields. This guard warns '
+    'session{bus_hint}, and use `pa claim --force` only after you agree who yields. This guard warns '
     'once per reservation per session and never blocks.'
 )
+
+# AI-255: planned rows are declared intent, not locks — a different warning,
+# not silence: an editor about to start overlapping work deserves the heads-up
+# but must not be told to "yield" to a row that doesn't block anything.
+PLANNED_TEMPLATE = (
+    '[pa reservation-guard] {rel} overlaps PLANNED work: {id} declared by session '
+    '"{session}"{bus} (note: "{note}") until {expiresAt}. Planned reservations do not '
+    'block — but if you are starting work here, check `pa claims` and coordinate{bus_hint} '
+    'first so two sessions do not do the same work twice. Warns once per reservation '
+    'per session and never blocks.'
+)
+
+# AI-255 B5: shared surfaces are the collision-prone paths — an edit here with
+# NO reservation covering it at all is how two sessions silently write the same
+# file (the evangelism incident). Advisory like everything else, once per
+# session per path. `projects/*/CLAUDE.md`/`AGENTS.md` = exactly three segments.
+SHARED_SURFACE_FILES = {'CLAUDE.md', 'AGENTS.md', 'BACKLOG.md', 'FILE_INVENTORY.md'}
+SHARED_SURFACE_PREFIXES = ('docs/', 'inventory/', 'plans/')
+
+UNCLAIMED_TEMPLATE = (
+    '[pa reservation-guard] {rel} is a shared surface with NO active reservation '
+    'covering it — claim it first (`pa claim {rel} --session <you> --note "<what>"`) '
+    'or expect a rebase from whoever edits it concurrently. Warns once per session '
+    'per path and never blocks.'
+)
+
+
+def _is_shared_surface(rel: str) -> bool:
+    if rel in SHARED_SURFACE_FILES:
+        return True
+    if rel.startswith(SHARED_SURFACE_PREFIXES):
+        return True
+    parts = rel.split('/')
+    return len(parts) == 3 and parts[0] == 'projects' and parts[2] in SHARED_SURFACE_FILES
+
+
+def _append_unclaimed_log(pa_home: Path, rel: str, hook_session_id: str) -> None:
+    """Worker-context telemetry (AI-255 B5): a dispatch that writes a shared
+    surface unclaimed gets a log line, not a context emit — a worker cannot
+    claim mid-flight usefully. Same top-level spread so coordinationStats()
+    parses it without changes."""
+    try:
+        entry = {
+            'timestamp': _iso_now(),
+            'level': 'warn',
+            'module': 'reservations',
+            'message': 'unclaimed write',
+            'refId': 's-' + secrets.token_hex(6),
+            'path': rel,
+            'dispatchId': os.environ.get('PA_WORKER_DISPATCH_ID'),
+            'hookSessionId': hook_session_id,
+        }
+        pa_home.mkdir(parents=True, exist_ok=True)
+        with open(pa_home / 'app.log.jsonl', 'a', encoding='utf-8', newline='\n') as f:
+            f.write(json.dumps(entry) + '\n')
+    except Exception:
+        pass
 
 
 def _pa_home() -> Path:
@@ -92,6 +149,8 @@ def _append_log(pa_home: Path, reservation: dict, rel: str, tool_name: str, hook
             'refId': 's-' + secrets.token_hex(6),
             'reservationId': reservation.get('id'),
             'holder': reservation.get('session'),
+            'holderBus': reservation.get('bus'),
+            'kind': reservation.get('kind') or 'active',
             'path': rel,
             'toolName': tool_name,
             'hookSessionId': hook_session_id,
@@ -103,20 +162,23 @@ def _append_log(pa_home: Path, reservation: dict, rel: str, tool_name: str, hook
         pass
 
 
-def _build_context(matches: list, rel: str) -> str:
+def _build_context(matches: list, rel: str, template: str, more_label: str) -> str:
     rows = []
     for r in matches[:MAX_ROWS]:
-        rows.append(WARNING_TEMPLATE.format(
+        bus_addr = r.get('bus')
+        rows.append(template.format(
             rel=rel,
             id=r.get('id'),
             session=r.get('session'),
+            bus=f' (bus {bus_addr})' if bus_addr else '',
+            bus_hint=f' via `pa bus send {bus_addr}`' if bus_addr else '',
             note=r.get('note'),
             expiresAt=r.get('expiresAt'),
         ))
     text = '\n'.join(rows)
     remaining = len(matches) - MAX_ROWS
     if remaining > 0:
-        text += f'\n(+{remaining} more active reservations overlap this path — run `pa claims`.)'
+        text += f'\n(+{remaining} more {more_label} reservations overlap this path — run `pa claims`.)'
     return text[:MAX_CONTEXT_CHARS]
 
 
@@ -146,7 +208,14 @@ def _run() -> None:
     root_str = os.path.normcase(str(REPO_ROOT))
     if not (p_str == root_str or p_str.startswith(root_str + os.sep)):
         return
-    rel = p.relative_to(REPO_ROOT).as_posix()
+    # WB-208: membership and the slice length agree on the normcased strings,
+    # so a case-variant root can never raise ValueError out of a case-sensitive
+    # relative_to (main()'s unconditional except would swallow that into
+    # silence). The rel itself is sliced from the ORIGINAL-cased strings —
+    # normcase is length-preserving — because everything below (the shared
+    # surface set, the once-per-path suppression caches) is case-SENSITIVE on
+    # the rel value.
+    rel = (str(p)[len(str(REPO_ROOT)):].lstrip('/\\') or '.').replace('\\', '/')
 
     pa_home = _pa_home()
 
@@ -161,7 +230,7 @@ def _run() -> None:
         return
 
     now = datetime.now(timezone.utc)
-    active = []
+    live = []
     for r in reservations:
         if not isinstance(r, dict):
             continue
@@ -175,24 +244,75 @@ def _run() -> None:
         if expires.tzinfo is None:
             expires = expires.replace(tzinfo=timezone.utc)
         if expires > now:
-            active.append(r)
+            live.append(r)
 
     # Overlap, mirroring pa/src/lib/reservations.ts's pathsOverlap exactly:
     # equal, or a path-prefix at a '/' boundary in either direction. Logical
     # `@`-prefixed resources (e.g. "@build") never match a file path.
-    matches = []
-    for r in active:
-        paths = r.get('paths')
-        if not isinstance(paths, list):
-            continue
-        for rp in paths:
-            if not isinstance(rp, str) or rp.startswith('@'):
+    def _overlapping(rows: list) -> list:
+        out = []
+        for r in rows:
+            paths = r.get('paths')
+            if not isinstance(paths, list):
                 continue
-            if rel == rp or rel.startswith(rp + '/') or rp.startswith(rel + '/'):
-                matches.append(r)
-                break
+            for rp in paths:
+                if not isinstance(rp, str) or rp.startswith('@'):
+                    continue
+                if rel == rp or rel.startswith(rp + '/') or rp.startswith(rel + '/'):
+                    out.append(r)
+                    break
+        return out
 
+    # AI-255: planned rows (kind == 'planned') are advisory intent — they get
+    # the softer PLANNED_TEMPLATE, and only when no ACTIVE row already matches
+    # (an active claim is the stronger signal and subsumes a planned overlap).
+    active_rows = [r for r in live if r.get('kind') != 'planned']
+    matches = _overlapping(active_rows)
+    template, more_label = WARNING_TEMPLATE, 'active'
     if not matches:
+        matches = _overlapping([r for r in live if r.get('kind') == 'planned'])
+        template, more_label = PLANNED_TEMPLATE, 'planned'
+
+    # AI-255 B5: nothing covers this path at all — if it is a shared surface,
+    # that absence IS the finding. Worker context (PA_WORKER_DISPATCH_ID): the
+    # writer cannot claim mid-flight usefully, so emit only a telemetry line
+    # for the post-hoc audit. Headed sessions get the advisory context, once
+    # per session per path (the cache key carries no reservation id).
+    if not matches:
+        if not _is_shared_surface(rel):
+            return
+        session_id = str(payload.get('session_id') or '')
+        dispatch_id = os.environ.get('PA_WORKER_DISPATCH_ID')
+        # Once per (writer, path) either way — a dispatch's multi-edit pass on
+        # one file would otherwise append identical telemetry lines.
+        warned_path = pa_home / 'hook-warned.json'
+        try:
+            with open(warned_path, encoding='utf-8') as f:
+                warned = json.load(f)
+            if not isinstance(warned, dict):
+                warned = {}
+        except Exception:
+            warned = {}
+        writer_key = dispatch_id or session_id
+        cache_key = f"{writer_key}|unclaimed|{rel}"
+        if cache_key in warned:
+            return
+        now_epoch = now.timestamp()
+        pruned = {
+            k: v for k, v in warned.items()
+            if isinstance(v, (int, float)) and (now_epoch - v) < WARN_TTL_SECONDS
+        }
+        pruned[cache_key] = now_epoch
+        _write_cache_atomic(warned_path, pruned)
+        if dispatch_id:
+            _append_unclaimed_log(pa_home, rel, session_id)
+            return
+        print(json.dumps({
+            'hookSpecificOutput': {
+                'hookEventName': 'PreToolUse',
+                'additionalContext': UNCLAIMED_TEMPLATE.format(rel=rel)[:MAX_CONTEXT_CHARS],
+            }
+        }))
         return
 
     # Warn-once per (session_id, reservation_id) — W-C9.
@@ -222,7 +342,7 @@ def _run() -> None:
     for r in new_matches:
         _append_log(pa_home, r, rel, tool, session_id)
 
-    text = _build_context(new_matches, rel)
+    text = _build_context(new_matches, rel, template, more_label)
     print(json.dumps({
         'hookSpecificOutput': {
             'hookEventName': 'PreToolUse',

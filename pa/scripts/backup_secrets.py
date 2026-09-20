@@ -5,8 +5,9 @@ The one durability gap git can't close: `~/.pa/secrets.env`, the Google
 OAuth token/credentials, `pii-tripwires.txt`, the learn-agent profile pair
 (`~/.pa/data/profile.json` + `profile-history-archive.jsonl` — repo-external
 since AI-089, 2026-07-27; the archive is the only durable copy of evicted
-profile facts), and the `D:/gemini-shim` wrappers are single-copy on local
-disk and (correctly) never committed to any repo. This bundles them, encrypts with AES-256-GCM (scrypt-derived key,
+profile facts), and the CLI wrapper shims (directory set via
+`PA_GEMINI_SHIM_DIR`, if any) are single-copy on local disk and (correctly)
+never committed to any repo. This bundles them, encrypts with AES-256-GCM (scrypt-derived key,
 pure `cryptography` — no external binary), and uploads to Drive.
 
 Threat model — honest about what this does and doesn't do:
@@ -111,8 +112,18 @@ def build_manifest() -> list:
         if p.is_file():
             entries.append((p, f"pa/{name}"))
 
-    shim = Path(os.environ.get("PA_GEMINI_SHIM_DIR", "D:/gemini-shim"))
-    if shim.is_dir():
+    # WB-51: the shim dir is machine-specific, so it is never defaulted — a
+    # stale hardcoded path either backed up the wrong machine's files or
+    # silently contributed nothing. Configured-but-missing is a LOUD error
+    # naming the override; unset means no shim exists and the section skips.
+    shim_dir = os.environ.get("PA_GEMINI_SHIM_DIR")
+    if shim_dir:
+        shim = Path(shim_dir)
+        if not shim.is_dir():
+            raise RuntimeError(
+                f"PA_GEMINI_SHIM_DIR={shim_dir} is set but the directory does "
+                "not exist - fix the path or unset it if no shim is installed"
+            )
         for p in sorted(shim.iterdir()):
             if p.is_file():
                 entries.append((p, f"gemini-shim/{p.name}"))

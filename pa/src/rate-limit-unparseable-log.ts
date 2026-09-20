@@ -9,7 +9,7 @@ export interface UnparseableRateLimitEntry {
   raw: string;
   session_id?: string;
   classification?: string;
-  reason: 'no-session-evidence' | 'minutes-zero' | 'other';
+  reason: 'no-session-evidence' | 'minutes-zero' | 'time-hint-unparsed' | 'unknown-pattern' | 'other';
 }
 
 export async function appendUnparseableRateLimit(entry: UnparseableRateLimitEntry): Promise<void> {

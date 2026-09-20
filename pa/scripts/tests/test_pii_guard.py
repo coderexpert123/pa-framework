@@ -699,6 +699,7 @@ class TestPushScanCoverage(unittest.TestCase):
              patch.object(guard.sys, "argv", ["pre-push-pii-guard", "origin", "git@x:y.git"]), \
              patch.object(guard, "collect_diff", side_effect=fake_collect), \
              patch.object(guard, "load_tripwires", return_value=list(tripwires)), \
+             patch.object(guard, "run_separation_checks", return_value=None), \
              patch.object(guard, "agy_check", return_value=agy) as gc, \
              patch.object(guard, "zclaude_check", return_value=(True, "", False)), \
              contextlib.redirect_stderr(buf):
@@ -769,6 +770,7 @@ class TestPushScanCoverage(unittest.TestCase):
         render a verdict) — what changed is main()'s RESPONSE to that, not
         whether the banner fires."""
         rc, err, _ = self._main(added=["x = 1"], touched_paths=["a.py"],
+                                tripwires=[r"NEVER_MATCH_SENTINEL_\d{9}"],
                                 agy=(True, "", False))
         self.assertEqual(rc, 1, "fail-CLOSED since 2026-07-22 — an infra failure must not wave a push through")
         self.assertIn("FAIL-OPEN", err, "the layer-skip banner still fires; main()'s reaction to it is what changed")
@@ -826,6 +828,7 @@ class TestPushModeFailClosed(unittest.TestCase):
              patch.object(guard.sys, "argv", ["pre-push-pii-guard", "origin", "git@x:y.git"]), \
              patch.object(guard, "collect_diff", side_effect=fake_collect), \
              patch.object(guard, "load_tripwires", return_value=["Secretname"]), \
+             patch.object(guard, "run_separation_checks", return_value=None), \
              patch.object(guard, "agy_check", return_value=agy), \
              patch.object(guard, "zclaude_check", return_value=(True, "", False)), \
              contextlib.redirect_stderr(buf):
@@ -933,6 +936,7 @@ class TestReviewRecordHandoff(unittest.TestCase):
              patch.object(guard.sys, "argv", ["pre-push-pii-guard", "origin", "git@x:y.git"]), \
              patch.object(guard, "collect_diff", side_effect=fake_collect), \
              patch.object(guard, "load_tripwires", return_value=list(tripwires)), \
+             patch.object(guard, "run_separation_checks", return_value=None), \
              patch.object(guard, "agy_check", return_value=agy) as gc, \
              patch.object(guard, "zclaude_check", return_value=(True, "", False)), \
              contextlib.redirect_stderr(buf):
@@ -1085,6 +1089,7 @@ class TestZclaudeFallback(unittest.TestCase):
             patch.object(guard.sys, "argv", ["pre-push-pii-guard", "origin", "git@x:y.git"]),
             patch.object(guard, "collect_diff", side_effect=fake_collect),
             patch.object(guard, "load_tripwires", return_value=list(tripwires)),
+            patch.object(guard, "run_separation_checks", return_value=None),
             patch.object(guard, "agy_check", return_value=agy),
         ]
         if zclaude is not None:

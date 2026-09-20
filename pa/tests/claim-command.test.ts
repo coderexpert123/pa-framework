@@ -170,7 +170,18 @@ describe('releaseCommand — ownership hardening (D9)', () => {
     const result = await claim({ paths: ['pa/src/owned-c.ts'], session: 'owner-session', note: 'work' });
     assert.equal(result.ok, true);
 
-    const exitCode = await releaseCommand([result.reservation!.id]);
+    // releaseCommand falls back to process.env.PA_SESSION — clear it so the
+    // no-identity path is what runs even when the suite inherits an exported
+    // PA_SESSION from the caller's shell.
+    const savedSession = process.env.PA_SESSION;
+    delete process.env.PA_SESSION;
+    let exitCode: number;
+    try {
+      exitCode = await releaseCommand([result.reservation!.id]);
+    } finally {
+      if (savedSession === undefined) delete process.env.PA_SESSION;
+      else process.env.PA_SESSION = savedSession;
+    }
     assert.equal(exitCode, 0);
 
     const active = await readActive();
@@ -181,6 +192,113 @@ describe('releaseCommand — ownership hardening (D9)', () => {
     const { releaseCommand } = await import('../src/commands/claim.js');
     const exitCode = await releaseCommand(['--unknown-flag']);
     assert.equal(exitCode, 2);
+  });
+});
+
+// AI-255 WP-C CLI surface: --planned/--bus/--task/--pid flags, the
+// planned-overlap note, and env auto-fill (PA_TASK_ID/PA_WORKER_DISPATCH_ID).
+describe('claimCommand — AI-255 identity + planned flags', () => {
+  let dir: string;
+  let logLines: string[];
+  let origLog: typeof console.log;
+
+  beforeEach(async () => {
+    dir = await createTempPaHome();
+    logLines = [];
+    origLog = console.log;
+    console.log = (...a: unknown[]) => { logLines.push(a.join(' ')); };
+  });
+
+  afterEach(async () => {
+    console.log = origLog;
+    delete process.env.PA_TASK_ID;
+    delete process.env.PA_WORKER_DISPATCH_ID;
+    await cleanup(dir);
+  });
+
+  it('pa claim --planned stores kind=planned and prints "Planned"', async () => {
+    const { claimCommand } = await import('../src/commands/claim.js');
+    const { readPlanned } = await import('../src/lib/reservations.js');
+
+    const exitCode = await claimCommand(['pa/src/plan.ts', '--session', 'planner', '--note', 'future work', '--planned']);
+    assert.equal(exitCode, 0);
+    assert.ok(logLines.some((l) => l.startsWith('Planned r-')), `expected a "Planned r-…" line, got ${JSON.stringify(logLines)}`);
+    const planned = await readPlanned();
+    assert.equal(planned.length, 1);
+    assert.equal(planned[0].kind, 'planned');
+  });
+
+  it('pa claim over another session\'s planned row succeeds and prints the overlap note', async () => {
+    const { claim } = await import('../src/lib/reservations.js');
+    const { claimCommand } = await import('../src/commands/claim.js');
+
+    await claim({ paths: ['pa/src/shared.ts'], session: 'planner', note: 'scoped', kind: 'planned' });
+    const exitCode = await claimCommand(['pa/src/shared.ts', '--session', 'me', '--note', 'real work']);
+    assert.equal(exitCode, 0);
+    assert.ok(logLines.some((l) => l.includes('overlapping planned work')), `expected the planned-overlap note, got ${JSON.stringify(logLines)}`);
+  });
+
+  it('PA_TASK_ID and PA_WORKER_DISPATCH_ID envs auto-fill taskId/dispatchId on the stored row', async () => {
+    process.env.PA_TASK_ID = 'task-77';
+    process.env.PA_WORKER_DISPATCH_ID = 'd-feed42';
+    const { claimCommand } = await import('../src/commands/claim.js');
+    const { readActive } = await import('../src/lib/reservations.js');
+
+    const exitCode = await claimCommand(['pa/src/env.ts', '--session', 'worker-sess', '--note', 'dispatched']);
+    assert.equal(exitCode, 0);
+    const [row] = await readActive();
+    assert.equal(row.taskId, 'task-77');
+    assert.equal(row.dispatchId, 'd-feed42');
+  });
+
+  it('explicit --task/--bus/--pid flags land on the stored row', async () => {
+    const { claimCommand } = await import('../src/commands/claim.js');
+    const { readActive } = await import('../src/lib/reservations.js');
+
+    const exitCode = await claimCommand([
+      'pa/src/flags.ts', '--session', 'me', '--note', 'flags',
+      '--task', 't-3', '--bus', 'devin@personal-assistant#7', '--pid', '4321',
+    ]);
+    assert.equal(exitCode, 0);
+    const [row] = await readActive();
+    assert.equal(row.taskId, 't-3');
+    assert.equal(row.bus, 'devin@personal-assistant#7');
+    assert.equal(row.pid, 4321);
+  });
+
+  it('AI-260: a headed claim outside a dispatch records NO pid (the ppid is a transient shell, dead within seconds)', async () => {
+    // PA_BUS_PROVIDER=cli → the ancestor walk hunts cli@…#* registry children,
+    // of which none exist, so ident.pid is deterministically absent and the
+    // only remaining source is the process.ppid fallback this fix removes.
+    const prior = process.env.PA_BUS_PROVIDER;
+    process.env.PA_BUS_PROVIDER = 'cli';
+    try {
+      const { claimCommand } = await import('../src/commands/claim.js');
+      const { readActive } = await import('../src/lib/reservations.js');
+      const exitCode = await claimCommand(['pa/src/headed.ts', '--session', 'me', '--note', 'no dispatch']);
+      assert.equal(exitCode, 0);
+      const [row] = await readActive();
+      assert.equal(row.pid, undefined, 'no pid ⇒ dead-owner sweep skips the row; TTL bounds it instead');
+    } finally {
+      if (prior === undefined) delete process.env.PA_BUS_PROVIDER; else process.env.PA_BUS_PROVIDER = prior;
+    }
+  });
+
+  it('AI-260: under PA_WORKER_DISPATCH_ID the ppid IS the dispatch host and still records', async () => {
+    const priorProvider = process.env.PA_BUS_PROVIDER;
+    process.env.PA_BUS_PROVIDER = 'cli';
+    process.env.PA_WORKER_DISPATCH_ID = 'd-ai260';
+    try {
+      const { claimCommand } = await import('../src/commands/claim.js');
+      const { readActive } = await import('../src/lib/reservations.js');
+      const exitCode = await claimCommand(['pa/src/dispatched.ts', '--session', 'w', '--note', 'in dispatch']);
+      assert.equal(exitCode, 0);
+      const [row] = await readActive();
+      assert.equal(row.pid, process.ppid, 'the worker host pid keeps the dead-owner belt for dispatch claims');
+    } finally {
+      delete process.env.PA_WORKER_DISPATCH_ID;
+      if (priorProvider === undefined) delete process.env.PA_BUS_PROVIDER; else process.env.PA_BUS_PROVIDER = priorProvider;
+    }
   });
 });
 
@@ -244,5 +362,46 @@ describe('recentActivity — real git repo instrument (C18)', () => {
     const recent = await recentActivity();
 
     assert.ok(!recent.includes('tracked.md'), `expected 'tracked.md' to be excluded as stale, got ${JSON.stringify(recent)}`);
+  });
+});
+
+// AI-255 WP-E: the unclaimed-write telemetry line (reservation-guard.py,
+// worker context) must roll up in `pa claims --stats` — post-hoc visibility
+// was the whole point of emitting it.
+describe('claimsCommand — --stats counts unclaimed writes', () => {
+  let dir: string;
+  let logLines: string[];
+  let origLog: typeof console.log;
+
+  beforeEach(async () => {
+    dir = await createTempPaHome();
+    logLines = [];
+    origLog = console.log;
+    console.log = (...a: unknown[]) => { logLines.push(a.join(' ')); };
+  });
+
+  afterEach(async () => {
+    console.log = origLog;
+    await cleanup(dir);
+  });
+
+  it('counts module:reservations "unclaimed write" lines and renders the row', async () => {
+    const { claimsCommand } = await import('../src/commands/claim.js');
+    const entry = {
+      timestamp: new Date().toISOString(),
+      level: 'warn',
+      module: 'reservations',
+      message: 'unclaimed write',
+      refId: 's-aaaabbbbcccc',
+      path: 'docs/x.md',
+      dispatchId: 'd-1',
+    };
+    await writeFile(join(dir, 'app.log.jsonl'), JSON.stringify(entry) + '\n', 'utf8');
+
+    const exitCode = await claimsCommand(['--stats', '--json']);
+
+    assert.equal(exitCode, 0);
+    const stats = JSON.parse(logLines.join('\n'));
+    assert.equal(stats.unclaimedWrites, 1);
   });
 });

@@ -9,12 +9,21 @@ import {
   extractTeeResult,
   evaluatePendingDispatch,
   reapOrphanedDispatches,
-  isTopicWorkerAliveByRegistry,
+  reapOrphanedThreads,
+  evaluateOrphanedThread,
+  isTopicWorkerAliveOnMachine,
+  isThreadWorkerAliveOnMachine,
+  dispatchCmdlineNeedles,
   findTeePathByRegistry,
+  findThreadTeePathByRegistry,
   placeholderKindAndCaption,
   TRANSCRIPT_QUIESCENT_MS,
+  THREAD_HARVEST_LOOKBACK_MS,
+  THREAD_ORPHAN_CLOSED_TASK_NOTE,
   _setNoticeLoggerForTest,
   type ReaperDeps,
+  type ThreadReaperDeps,
+  type AdoptedThread,
 } from '../orphan-reaper.js';
 import {
   addPendingDispatch,
@@ -22,6 +31,17 @@ import {
   _resetPendingDispatchesForTest,
   type PendingDispatch,
 } from '../pending-dispatches.js';
+import {
+  listStoreKeys,
+  listThreads,
+  getThread,
+  touchThread,
+  settleOrphanedThread,
+  bumpRunSeq,
+  cancelOneThread,
+  _clearThreadsForTest,
+  type ThreadRecord,
+} from '../topic-threads.js';
 import { deliveredKey, wasDelivered, markDelivered, _resetDeliveredCacheForTest } from '../delivered-store.js';
 import { isTopicRecovering, _resetRecoveryGateForTest } from '../recovery-gate.js';
 import { markTopicStopped, _clearStoppedForTest } from '../worker-stop.js';
@@ -37,6 +57,7 @@ beforeEach(() => {
   _resetDeliveredCacheForTest();
   _resetRecoveryGateForTest();
   _resetResendStoreForTest();
+  _clearThreadsForTest();
 });
 
 afterEach(async () => {
@@ -46,6 +67,7 @@ afterEach(async () => {
   _resetDeliveredCacheForTest();
   _resetRecoveryGateForTest();
   _resetResendStoreForTest();
+  _clearThreadsForTest();
   try { rmSync(home, { recursive: true, force: true }); } catch {}
 });
 
@@ -604,10 +626,10 @@ describe('evaluatePendingDispatch', () => {
 });
 
 // ---------------------------------------------------------------------------
-// isTopicWorkerAliveByRegistry — wrapper-dead / descendant-alive gap
+// isTopicWorkerAliveOnMachine — OS-truth liveness (AI-241, t-31 design)
 // ---------------------------------------------------------------------------
 
-describe('isTopicWorkerAliveByRegistry', () => {
+describe('isTopicWorkerAliveOnMachine', () => {
   const { mkdirSync, writeFileSync: wf } = fsSync;
 
   function writeEntry(entry: Record<string, unknown>): void {
@@ -616,23 +638,124 @@ describe('isTopicWorkerAliveByRegistry', () => {
     wf(join(dir, `${entry.pid}.json`), JSON.stringify(entry), 'utf8');
   }
 
-  it('false when no registry entry matches the topic', async () => {
-    assert.equal(await isTopicWorkerAliveByRegistry(makeRecord()), false);
+  /** Hermetic reads: no real process-table queries. */
+  function fakeReads(overrides: {
+    alive?: number[];
+    descendants?: Array<{ pid: number; parentPid: number }>;
+    cmdlineHits?: Record<string, Array<{ pid: number; cmdline: string }>>;
+    scanCalls?: string[];
+  } = {}) {
+    const aliveSet = new Set(overrides.alive ?? []);
+    const scanCalls = overrides.scanCalls ?? [];
+    return {
+      reads: {
+        areProcessesAlive: async (pids: number[]) =>
+          new Map(pids.map((p) => [p, aliveSet.has(p)])),
+        getDescendantPids: async () => overrides.descendants ?? [],
+        scanCommandLines: async (needle: string) => {
+          scanCalls.push(needle);
+          return overrides.cmdlineHits?.[needle] ?? [];
+        },
+      },
+      scanCalls,
+    };
+  }
+
+  it('false when no registry entry matches the topic and no cmdline evidence', async () => {
+    const { reads } = fakeReads();
+    assert.equal(await isTopicWorkerAliveOnMachine(makeRecord(), reads), false);
   });
 
   it('true when the registered wrapper pid is alive', async () => {
-    writeEntry({ pid: process.pid, spawnedBy: 1, worker: 'claude', skill: 'topic--100555_9', startedAt: T0 });
-    assert.equal(await isTopicWorkerAliveByRegistry(makeRecord()), true);
+    writeEntry({ pid: 555001, spawnedBy: 1, worker: 'claude', skill: 'topic--100555_9', startedAt: T0 });
+    const { reads } = fakeReads({ alive: [555001] });
+    assert.equal(await isTopicWorkerAliveOnMachine(makeRecord(), reads), true);
   });
 
   it('true when the wrapper is dead but a descendant is alive (2026-07-04 gap)', async () => {
-    writeEntry({ pid: 999998, spawnedBy: 1, worker: 'claude', skill: 'topic--100555_9', startedAt: T0, descendants: [999997, process.pid] });
-    assert.equal(await isTopicWorkerAliveByRegistry(makeRecord()), true);
+    writeEntry({ pid: 999998, spawnedBy: 1, worker: 'claude', skill: 'topic--100555_9', startedAt: T0, descendants: [999997, 555002] });
+    const { reads } = fakeReads({ alive: [555002] });
+    assert.equal(await isTopicWorkerAliveOnMachine(makeRecord(), reads), true);
   });
 
-  it('false when wrapper and all descendants are dead', async () => {
+  it('false when wrapper and all descendants are dead and no cmdline evidence', async () => {
     writeEntry({ pid: 999998, spawnedBy: 1, worker: 'claude', skill: 'topic--100555_9', startedAt: T0, descendants: [999997, 999996] });
-    assert.equal(await isTopicWorkerAliveByRegistry(makeRecord()), false);
+    const { reads } = fakeReads();
+    assert.equal(await isTopicWorkerAliveOnMachine(makeRecord(), reads), false);
+  });
+
+  // --- AI-241: the registry-lie directions ---------------------------------
+
+  it('true when the registry entry is GONE but a live process carries the session id (entry-gone lie)', async () => {
+    // No writeEntry call — the registry lost the row entirely (bot restart,
+    // catchup sweep) while the worker survived. The dead-dispatch arm must
+    // not conclude "dead" from registry absence alone.
+    const rec = makeRecord({ session: { session_id: 'sess-uuid-1', worker: 'claude', started_at: T0 } });
+    const { reads } = fakeReads({
+      cmdlineHits: { 'sess-uuid-1': [{ pid: 4242, cmdline: 'node claude --resume sess-uuid-1' }] },
+    });
+    assert.equal(await isTopicWorkerAliveOnMachine(rec, reads), true);
+  });
+
+  it('true when the registry entry is gone but a live process carries the tee path basename (agy tee helper)', async () => {
+    const rec = makeRecord({
+      session: undefined,
+      teePath: 'C:/pa-home/logs/worker-tee/ctx-abc123.out',
+    });
+    const { reads } = fakeReads({
+      cmdlineHits: { 'ctx-abc123.out': [{ pid: 4343, cmdline: 'node worker_stdout_tee.js C:\\pa-home\\logs\\worker-tee\\ctx-abc123.out -- agy' }] },
+    });
+    assert.equal(await isTopicWorkerAliveOnMachine(rec, reads), true);
+  });
+
+  it('true when listWorkerPids throws but the cmdline scan finds the worker (registry unreadable lie)', async () => {
+    // Registry read failure is the same lie family — absence of data is not
+    // evidence of death. Simulate by pointing PA_HOME at a path whose
+    // worker-pids dir is a FILE (readdir throws).
+    const dir = join(home, 'worker-pids');
+    wf(dir, 'not a dir', 'utf8');
+    const rec = makeRecord({ session: { session_id: 'sess-uuid-2', worker: 'claude', started_at: T0 } });
+    const { reads } = fakeReads({
+      cmdlineHits: { 'sess-uuid-2': [{ pid: 4545, cmdline: 'claude --resume sess-uuid-2' }] },
+    });
+    assert.equal(await isTopicWorkerAliveOnMachine(rec, reads), true);
+  });
+
+  it('false when the registry entry lingers with all-dead pids and no cmdline evidence (entry-lingers lie)', async () => {
+    writeEntry({ pid: 999998, spawnedBy: 1, worker: 'claude', skill: 'topic--100555_9', startedAt: T0, descendants: [999997] });
+    const { reads } = fakeReads(); // nothing alive, no hits
+    assert.equal(await isTopicWorkerAliveOnMachine(makeRecord(), reads), false);
+  });
+
+  it('does not run the cmdline scan when a registered pid is already alive (ordering)', async () => {
+    writeEntry({ pid: 555003, spawnedBy: 1, worker: 'claude', skill: 'topic--100555_9', startedAt: T0 });
+    const { reads, scanCalls } = fakeReads({ alive: [555003] });
+    assert.equal(await isTopicWorkerAliveOnMachine(makeRecord(), reads), true);
+    assert.deepEqual(scanCalls, []);
+  });
+
+  it('tree-walks the snapshot when the entry has no descendants recorded (heartbeat gap)', async () => {
+    writeEntry({ pid: 600001, spawnedBy: 1, worker: 'claude', skill: 'topic--100555_9', startedAt: T0 });
+    const { reads } = fakeReads({
+      descendants: [{ pid: 600002, parentPid: 600001 }],
+      alive: [600002],
+    });
+    assert.equal(await isTopicWorkerAliveOnMachine(makeRecord(), reads), true);
+  });
+});
+
+describe('dispatchCmdlineNeedles', () => {
+  it('emits session id and tee basename, never the lane resource', () => {
+    const rec = makeRecord({
+      session: { session_id: 'sess-x', worker: 'claude', started_at: T0 },
+      teePath: 'C:\\pa-home\\logs\\worker-tee\\ctx-9.out',
+    });
+    assert.deepEqual(dispatchCmdlineNeedles(rec).sort(), ['ctx-9.out', 'sess-x']);
+  });
+
+  it('emits nothing when the record carries no session and no tee', () => {
+    const rec = makeRecord({ session: undefined, teePath: undefined });
+    assert.deepEqual(dispatchCmdlineNeedles(rec), []);
   });
 });
 
@@ -1310,5 +1433,555 @@ describe('AI-186: quarantine + terminal death-notice', () => {
     const stored = await takeResend(resendKey(rec.chatId, rec.threadId, rec.updateId));
     assert.ok(stored, 'resend record retained (putResend already written) — pre-AI-186 behavior');
     assert.equal(await wasDelivered(deliveredKey(rec.chatId, rec.threadId, rec.updateId)), false);
+  });
+});
+
+// AI-214 backend redesign: Step -1 of evaluatePendingDispatch — a voice-inbox
+// task the operator cancelled (or that already finished) must never be
+// re-dispatched. The dep is optional (fails open / skipped when absent), so
+// every hand-built ReaperDeps fixture elsewhere in this file is unaffected.
+describe('evaluatePendingDispatch — voice-inbox terminal guard (Step -1)', () => {
+  it('every named task id terminal: settles "terminal", record removed, no send, no requeueUpdate', async () => {
+    const rec = makeRecord({ session: undefined, userText: '[Voice inbox task vi-1234567890ab] do the thing' });
+    await addPendingDispatch(rec);
+    const requeued: PendingDispatch[] = [];
+    const { deps, sent } = makeFakeDeps({ requeueUpdate: (r) => requeued.push(r) });
+    deps.voiceInboxTerminalTaskIds = async (ids) => new Set(ids);
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(outcome, 'terminal');
+    assert.equal(sent.length, 0, 'no death notice or recovery send');
+    assert.equal(requeued.length, 0, 'never requeued');
+    assert.deepEqual(await listPendingDispatches(), [], 'record removed');
+  });
+
+  it('empty terminal set: the record follows today\'s path (worker alive, no result yet — "waiting")', async () => {
+    const rec = makeRecord({ userText: '[Voice inbox task vi-1234567890ab] do the thing' });
+    await addPendingDispatch(rec);
+    const { deps } = makeFakeDeps({ workerAlive: true });
+    deps.voiceInboxTerminalTaskIds = async () => new Set<string>();
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(outcome, 'waiting');
+  });
+
+  it('dep absent: existing behavior unchanged (guard skipped entirely)', async () => {
+    const rec = makeRecord({ userText: '[Voice inbox task vi-1234567890ab] do the thing' });
+    await addPendingDispatch(rec);
+    const { deps } = makeFakeDeps({ workerAlive: true });
+    assert.equal(deps.voiceInboxTerminalTaskIds, undefined);
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(outcome, 'waiting');
+  });
+
+  it('two named ids, only one terminal: NOT guarded (never settles "terminal")', async () => {
+    const rec = makeRecord({
+      session: undefined,
+      userText: '[Voice inbox task vi-1234567890ab] and [Voice inbox task vi-abcdefabcdef] batched',
+    });
+    await addPendingDispatch(rec);
+    const { deps } = makeFakeDeps({ sendResult: true });
+    deps.voiceInboxTerminalTaskIds = async (ids) => new Set([ids[0]]);
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.notEqual(outcome, 'terminal');
+  });
+
+  it('no named task id: NOT guarded, and the dep is never even called', async () => {
+    const rec = makeRecord({ session: undefined, userText: 'plain text, no voice-inbox task id' });
+    await addPendingDispatch(rec);
+    const { deps } = makeFakeDeps({ workerAlive: false });
+    let called = false;
+    deps.voiceInboxTerminalTaskIds = async () => { called = true; return new Set<string>(); };
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(called, false);
+    assert.notEqual(outcome, 'terminal');
+  });
+
+  it('a rejecting dep is treated as "not terminal" (fail-open — never suppresses recovery)', async () => {
+    const rec = makeRecord({ userText: '[Voice inbox task vi-1234567890ab] do the thing' });
+    await addPendingDispatch(rec);
+    const { deps } = makeFakeDeps({ workerAlive: true });
+    deps.voiceInboxTerminalTaskIds = async () => { throw new Error('ledger unreadable'); };
+    const outcome = await evaluatePendingDispatch(rec, deps, FAR_DEADLINE);
+    assert.equal(outcome, 'waiting');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AI-228 — orphaned THREAD records (the topic-threads store's startup pass)
+// ---------------------------------------------------------------------------
+
+const THREAD_KEY = '-1001234567890_5001'; // synthetic fixture family
+const THREAD_KEY_2 = '-1001234567890_5002';
+
+function mkThreadRec(overrides: Partial<ThreadRecord> = {}): ThreadRecord {
+  return {
+    id: 't-1',
+    n: 1,
+    title: 'orphaned thread',
+    goal: 'do the orphaned thing',
+    status: 'running',
+    createdAt: new Date(Date.now() - 20 * 60_000).toISOString(),
+    updatedAt: new Date(Date.now() - 10 * 60_000).toISOString(), // fresh — under the 30-min demote window
+    workdir: 'C:/pa-checkout',
+    runSeq: 2,
+    attempts: 0,
+    pendingInput: [],
+    ...overrides,
+  };
+}
+
+/** Seed the REAL topic-threads store (default dir = $PA_HOME/topic-threads). */
+function seedThreadStore(key: string, records: ThreadRecord[]): void {
+  const dir = join(home, 'topic-threads');
+  fsSync.mkdirSync(dir, { recursive: true });
+  fsSync.writeFileSync(join(dir, `${key}.json`), JSON.stringify(Object.fromEntries(records.map((r) => [r.id, r])), null, 2));
+}
+
+interface FakeThreadDepsConfig {
+  alive?: () => boolean;
+  teePath?: string | null;
+  teeContent?: string | null;
+  transcript?: { content: string; mtimeMs: number } | null;
+  /** 'absent' leaves the dep off; 'throw' makes it reject; a Set is returned. */
+  terminalVoiceIds?: Set<string> | 'absent' | 'throw';
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+  /** Wraps the real getThread — e.g. mutate the record mid-pass then delegate. */
+  getThreadWrap?: (key: string, id: string, real: typeof getThread) => Promise<ThreadRecord | undefined>;
+}
+
+function makeThreadDeps(cfg: FakeThreadDepsConfig = {}) {
+  const fyi: Array<{ key: string; text: string; kind: string }> = [];
+  const events: Array<{ key: string; ev: { kind: string; ref?: string | null; detail?: string } }> = [];
+  const touches: Array<{ key: string; id: string }> = [];
+  const deps: ThreadReaperDeps = {
+    listStoreKeys,
+    listThreads,
+    getThread: cfg.getThreadWrap
+      ? (key, id) => cfg.getThreadWrap!(key, id, getThread)
+      : getThread,
+    touchThread: async (key, id) => { touches.push({ key, id }); return touchThread(key, id); },
+    settleOrphanedThread,
+    isThreadWorkerAlive: async () => cfg.alive?.() ?? false,
+    readTeeForThread: async () => cfg.teePath ?? null,
+    readTranscriptForThread: async () => cfg.transcript ?? null,
+    readFile: async () => {
+      if (cfg.teeContent === undefined || cfg.teeContent === null) throw new Error('ENOENT: no tee');
+      return cfg.teeContent;
+    },
+    sendThreadFyi: async (key, text, kind) => { fyi.push({ key, text, kind }); return 1; },
+    appendThreadEvent: async (key, ev) => { events.push({ key, ev }); },
+    voiceInboxTerminalTaskIds: cfg.terminalVoiceIds === 'absent' || cfg.terminalVoiceIds === undefined
+      ? undefined
+      : async () => {
+          if (cfg.terminalVoiceIds === 'throw') throw new Error('ledger unreadable');
+          return cfg.terminalVoiceIds as Set<string>;
+        },
+    now: cfg.now ?? (() => Date.now()),
+    sleep: cfg.sleep ?? (async () => {}),
+  };
+  return { deps, fyi, events, touches };
+}
+
+function adoptedOf(rec: ThreadRecord, key = THREAD_KEY): AdoptedThread {
+  return {
+    key,
+    id: rec.id,
+    runSeq: rec.runSeq,
+    afterIso: new Date(Date.parse(rec.updatedAt) - THREAD_HARVEST_LOOKBACK_MS).toISOString(),
+  };
+}
+
+describe('evaluateOrphanedThread', () => {
+  it('dead orphan, no result, no voice tasks → requeued: queued + restart-parked + ~5m stamp; attempts/parks/input untouched', async () => {
+    const rec = mkThreadRec({ attempts: 1, unavailableParks: 2, pendingInput: ['queued steer'] });
+    seedThreadStore(THREAD_KEY, [rec]);
+    const { deps } = makeThreadDeps({ alive: () => false });
+    const outcome = await evaluateOrphanedThread(adoptedOf(rec), deps);
+    assert.equal(outcome, 'requeued');
+    const after = await getThread(THREAD_KEY, 't-1');
+    assert.equal(after?.status, 'queued');
+    assert.equal(after?.lastError, 'restart-parked: bot restarted mid-run — auto-requeued');
+    const parked = Date.parse(after!.parkedUntil!);
+    assert.ok(parked > Date.now(), 'parkedUntil is future');
+    assert.ok(parked <= Date.now() + 6 * 60_000, 'the ~5-minute grace, not a wall-park ladder value');
+    // A crash is not an attempt outcome; queued steer input survives the demote.
+    assert.equal(after?.attempts, 1);
+    assert.equal(after?.unavailableParks, 2);
+    assert.deepEqual(after?.pendingInput, ['queued steer']);
+  });
+
+  it('dead orphan + tee result → done + lastResult + thread_completed event + ✅ FYI', async () => {
+    const rec = mkThreadRec();
+    seedThreadStore(THREAD_KEY, [rec]);
+    const { deps, fyi, events } = makeThreadDeps({
+      alive: () => false,
+      teePath: 'C:/pa-home/logs/worker-tee/ctx-th1.out',
+      teeContent: '{"type":"assistant","message":"working"}\n{"type":"result","result":"the tee answer"}\n',
+    });
+    const outcome = await evaluateOrphanedThread(adoptedOf(rec), deps);
+    assert.equal(outcome, 'done');
+    const after = await getThread(THREAD_KEY, 't-1');
+    assert.equal(after?.status, 'done');
+    assert.equal(after?.lastResult, 'the tee answer');
+    assert.deepEqual(events.map((e) => e.ev.kind), ['thread_completed']);
+    assert.equal(events[0].ev.ref, 't-1');
+    assert.equal(fyi.length, 1);
+    assert.equal(fyi[0].kind, 'thread-done');
+    assert.ok(fyi[0].text.startsWith('✅ Thread t-1 done: orphaned thread'));
+    assert.ok(fyi[0].text.includes('the tee answer'));
+    assert.ok(fyi[0].text.includes('_(Reply to this message to continue the thread.)_'));
+  });
+
+  it('dead orphan + quiescent claude transcript result (resumed run) → done', async () => {
+    const rec = mkThreadRec({ session: { session_id: 'sess-th-1', worker: 'claude', started_at: '2026-09-14T00:00:00Z' } });
+    seedThreadStore(THREAD_KEY, [rec]);
+    const now = Date.now();
+    const { deps } = makeThreadDeps({
+      alive: () => false,
+      transcript: {
+        // After the anchor (updatedAt − 60 s ≈ now−11 min): this run's answer.
+        content: assistantLine('the transcript answer', new Date(now - 5 * 60_000).toISOString()),
+        mtimeMs: now - TRANSCRIPT_QUIESCENT_MS - 1000,
+      },
+    });
+    const outcome = await evaluateOrphanedThread(adoptedOf(rec), deps);
+    assert.equal(outcome, 'done');
+    assert.equal((await getThread(THREAD_KEY, 't-1'))?.lastResult, 'the transcript answer');
+  });
+
+  it('transcript whose last text PREDATES the lookback anchor is NOT harvested → demote', async () => {
+    const rec = mkThreadRec({ session: { session_id: 'sess-th-1', worker: 'claude', started_at: '2026-09-14T00:00:00Z' } });
+    seedThreadStore(THREAD_KEY, [rec]);
+    const now = Date.now();
+    const { deps, fyi } = makeThreadDeps({
+      alive: () => false,
+      transcript: {
+        // The previous turn's answer — before updatedAt−60 s, never this run's.
+        content: assistantLine('the OLD turn answer', new Date(now - 20 * 60_000).toISOString()),
+        mtimeMs: now - TRANSCRIPT_QUIESCENT_MS - 1000,
+      },
+    });
+    const outcome = await evaluateOrphanedThread(adoptedOf(rec), deps);
+    assert.equal(outcome, 'requeued');
+    assert.equal((await getThread(THREAD_KEY, 't-1'))?.status, 'queued');
+    assert.equal(fyi.length, 0, 'no done FYI for a harvested-previous-turn');
+  });
+
+  it('a premature-async stub is NOT settled done (AI-202 guard) → demote', async () => {
+    const rec = mkThreadRec({ session: { session_id: 'sess-th-1', worker: 'claude', started_at: '2026-09-14T00:00:00Z' } });
+    seedThreadStore(THREAD_KEY, [rec]);
+    const now = Date.now();
+    const { deps } = makeThreadDeps({
+      alive: () => false,
+      transcript: {
+        content: assistantLine('I launched the job and will report back once it completes.', new Date(now - 5 * 60_000).toISOString()),
+        mtimeMs: now - TRANSCRIPT_QUIESCENT_MS - 1000,
+      },
+    });
+    const outcome = await evaluateOrphanedThread(adoptedOf(rec), deps);
+    assert.equal(outcome, 'requeued');
+    const after = await getThread(THREAD_KEY, 't-1');
+    assert.equal(after?.status, 'queued');
+    assert.equal(after?.lastResult, undefined);
+  });
+
+  it('a non-quiescent transcript on a dead worker WAITS a round, then settles done once quiescent', async () => {
+    const rec = mkThreadRec({ session: { session_id: 'sess-th-1', worker: 'claude', started_at: '2026-09-14T00:00:00Z' } });
+    seedThreadStore(THREAD_KEY, [rec]);
+    const now = Date.now();
+    const transcript = {
+      content: assistantLine('still-moving answer', new Date(now - 5 * 60_000).toISOString()),
+      mtimeMs: now, // still inside the quiescence window — not provably final
+    };
+    const { deps, touches, fyi } = makeThreadDeps({ alive: () => false, transcript });
+    // Round 1: a usable post-anchor reply exists but the mtime is fresh —
+    // wait (never demote under finished work), keep the pump touching.
+    assert.equal(await evaluateOrphanedThread(adoptedOf(rec), deps), 'waiting');
+    assert.equal(touches.length, 1);
+    assert.equal((await getThread(THREAD_KEY, 't-1'))?.status, 'running');
+    // Round 2: quiescent now → harvest → done.
+    transcript.mtimeMs = now - TRANSCRIPT_QUIESCENT_MS - 1000;
+    assert.equal(await evaluateOrphanedThread(adoptedOf(rec), deps), 'done');
+    assert.equal((await getThread(THREAD_KEY, 't-1'))?.lastResult, 'still-moving answer');
+    assert.equal(fyi.length, 1);
+  });
+
+  it('live orphan → waiting + touchThread pump, no settle write', async () => {
+    const rec = mkThreadRec();
+    seedThreadStore(THREAD_KEY, [rec]);
+    const { deps, fyi, events, touches } = makeThreadDeps({ alive: () => true });
+    const outcome = await evaluateOrphanedThread(adoptedOf(rec), deps);
+    assert.equal(outcome, 'waiting');
+    assert.deepEqual(touches, [{ key: THREAD_KEY, id: 't-1' }], 'the dead pump is replaced every round');
+    assert.equal((await getThread(THREAD_KEY, 't-1'))?.status, 'running');
+    assert.equal(fyi.length, 0);
+    assert.equal(events.length, 0);
+  });
+
+  it('live orphan that already produced quiescent output settles done EARLY (before its exit)', async () => {
+    const rec = mkThreadRec({ session: { session_id: 'sess-th-1', worker: 'claude', started_at: '2026-09-14T00:00:00Z' } });
+    seedThreadStore(THREAD_KEY, [rec]);
+    const now = Date.now();
+    const { deps, touches } = makeThreadDeps({
+      alive: () => true, // still alive — output complete, exit pending
+      transcript: {
+        content: assistantLine('finished while still running', new Date(now - 5 * 60_000).toISOString()),
+        mtimeMs: now - TRANSCRIPT_QUIESCENT_MS - 1000,
+      },
+    });
+    const outcome = await evaluateOrphanedThread(adoptedOf(rec), deps);
+    assert.equal(outcome, 'done');
+    assert.equal((await getThread(THREAD_KEY, 't-1'))?.status, 'done');
+    assert.equal(touches.length, 0, 'settled — the pump stops with the record');
+  });
+
+  it('all carried voice tasks already terminal + no result → done with the honest note, NO FYI', async () => {
+    const rec = mkThreadRec({ voiceTaskIds: ['vi-aaaaaaaaaaaa', 'vi-bbbbbbbbbbbb'] });
+    seedThreadStore(THREAD_KEY, [rec]);
+    const { deps, fyi, events } = makeThreadDeps({
+      alive: () => false,
+      terminalVoiceIds: new Set(['vi-aaaaaaaaaaaa', 'vi-bbbbbbbbbbbb']),
+    });
+    const outcome = await evaluateOrphanedThread(adoptedOf(rec), deps);
+    assert.equal(outcome, 'done');
+    const after = await getThread(THREAD_KEY, 't-1');
+    assert.equal(after?.status, 'done');
+    assert.equal(after?.lastResult, THREAD_ORPHAN_CLOSED_TASK_NOTE);
+    assert.deepEqual(events.map((e) => e.ev.kind), ['thread_completed']);
+    assert.equal(fyi.length, 0, 'the task card already settled — nothing new to post');
+  });
+
+  it('a PARTIALLY-terminal voice task set demotes instead (open work must not be buried)', async () => {
+    const rec = mkThreadRec({ voiceTaskIds: ['vi-aaaaaaaaaaaa', 'vi-bbbbbbbbbbbb'] });
+    seedThreadStore(THREAD_KEY, [rec]);
+    const { deps } = makeThreadDeps({
+      alive: () => false,
+      terminalVoiceIds: new Set(['vi-aaaaaaaaaaaa']), // the other still open
+    });
+    const outcome = await evaluateOrphanedThread(adoptedOf(rec), deps);
+    assert.equal(outcome, 'requeued');
+  });
+
+  it('dep ABSENT → guard skipped → demote (fail-open pin)', async () => {
+    const rec = mkThreadRec({ voiceTaskIds: ['vi-aaaaaaaaaaaa'] });
+    seedThreadStore(THREAD_KEY, [rec]);
+    const { deps } = makeThreadDeps({ alive: () => false, terminalVoiceIds: 'absent' });
+    assert.equal(deps.voiceInboxTerminalTaskIds, undefined);
+    const outcome = await evaluateOrphanedThread(adoptedOf(rec), deps);
+    assert.equal(outcome, 'requeued');
+  });
+
+  it('a THROWING ledger dep is treated as not-terminal → demote (fail-open pin)', async () => {
+    const rec = mkThreadRec({ voiceTaskIds: ['vi-aaaaaaaaaaaa'] });
+    seedThreadStore(THREAD_KEY, [rec]);
+    const { deps } = makeThreadDeps({ alive: () => false, terminalVoiceIds: 'throw' });
+    const outcome = await evaluateOrphanedThread(adoptedOf(rec), deps);
+    assert.equal(outcome, 'requeued');
+    assert.equal((await getThread(THREAD_KEY, 't-1'))?.status, 'queued');
+  });
+
+  it('record /stop-cancelled mid-pass → dropped, no write, no FYI', async () => {
+    const rec = mkThreadRec();
+    seedThreadStore(THREAD_KEY, [rec]);
+    const { deps, fyi, events } = makeThreadDeps({
+      alive: () => false,
+      getThreadWrap: async (key, id, real) => {
+        await cancelOneThread(key, id); // the operator's /stop lands mid-pass
+        return real(key, id);
+      },
+    });
+    const outcome = await evaluateOrphanedThread(adoptedOf(rec), deps);
+    assert.equal(outcome, 'dropped');
+    assert.equal((await getThread(THREAD_KEY, 't-1'))?.status, 'cancelled');
+    assert.equal(fyi.length, 0);
+    assert.equal(events.length, 0);
+  });
+
+  it('runSeq advanced mid-pass (a claim took it) → dropped, no write', async () => {
+    const rec = mkThreadRec();
+    seedThreadStore(THREAD_KEY, [rec]);
+    const { deps, fyi } = makeThreadDeps({
+      alive: () => false,
+      getThreadWrap: async (key, id, real) => {
+        await bumpRunSeq(key, id); // a new owner captured runSeq first
+        return real(key, id);
+      },
+    });
+    const outcome = await evaluateOrphanedThread(adoptedOf(rec), deps);
+    assert.equal(outcome, 'dropped');
+    const after = await getThread(THREAD_KEY, 't-1');
+    assert.equal(after?.status, 'running');
+    assert.equal(after?.runSeq, 3, 'the new owner’s bump is intact — never clobbered');
+    assert.equal(fyi.length, 0);
+  });
+});
+
+describe('reapOrphanedThreads — pass orchestration', () => {
+  it('empty store dir → clean no-op', async () => {
+    const { deps, fyi, events } = makeThreadDeps();
+    await reapOrphanedThreads({ deps });
+    assert.equal(fyi.length, 0);
+    assert.equal(events.length, 0);
+  });
+
+  it('queued/terminal records are never adopted; only still-running records settle', async () => {
+    seedThreadStore(THREAD_KEY, [
+      mkThreadRec({ id: 't-1', n: 1, status: 'queued' }),
+      mkThreadRec({ id: 't-2', n: 2, status: 'done' }),
+      mkThreadRec({ id: 't-3', n: 3, status: 'running', runSeq: 7 }),
+    ]);
+    const { deps } = makeThreadDeps({ alive: () => false });
+    await reapOrphanedThreads({ deps, pollMs: 1 });
+    assert.equal((await getThread(THREAD_KEY, 't-1'))?.status, 'queued', 'queued record untouched by the reaper');
+    assert.equal((await getThread(THREAD_KEY, 't-1'))?.lastError, undefined);
+    assert.equal((await getThread(THREAD_KEY, 't-2'))?.status, 'done');
+    const t3 = await getThread(THREAD_KEY, 't-3');
+    assert.equal(t3?.status, 'queued');
+    assert.ok(t3?.lastError?.includes('restart-parked'));
+  });
+
+  it('multi-topic enumeration: orphans in every store settle independently', async () => {
+    seedThreadStore(THREAD_KEY, [mkThreadRec()]);
+    seedThreadStore(THREAD_KEY_2, [mkThreadRec({ id: 't-9', n: 9 })]);
+    const { deps, fyi } = makeThreadDeps({ alive: () => false });
+    await reapOrphanedThreads({ deps, pollMs: 1 });
+    assert.equal((await getThread(THREAD_KEY, 't-1'))?.status, 'queued');
+    assert.equal((await getThread(THREAD_KEY_2, 't-9'))?.status, 'queued');
+    assert.equal(fyi.length, 0);
+  });
+
+  it('polls a live orphan until it dies, then settles', async () => {
+    seedThreadStore(THREAD_KEY, [mkThreadRec()]);
+    let alive = true;
+    let polls = 0;
+    const { deps, touches } = makeThreadDeps({
+      alive: () => alive,
+      sleep: async () => { polls++; if (polls >= 2) alive = false; },
+    });
+    await reapOrphanedThreads({ deps, pollMs: 1 });
+    assert.ok(touches.length >= 2, `pumped each live round (${touches.length})`);
+    assert.equal((await getThread(THREAD_KEY, 't-1'))?.status, 'queued', 'dies-empty → restart-parked requeue');
+  });
+
+  it('second pass over a settled store is a clean no-op (idempotent)', async () => {
+    seedThreadStore(THREAD_KEY, [mkThreadRec()]);
+    const { deps, fyi, events } = makeThreadDeps({ alive: () => false });
+    await reapOrphanedThreads({ deps, pollMs: 1 });
+    const settledRaw = fsSync.readFileSync(join(home, 'topic-threads', `${THREAD_KEY}.json`), 'utf8');
+    await reapOrphanedThreads({ deps, pollMs: 1 });
+    assert.equal(fsSync.readFileSync(join(home, 'topic-threads', `${THREAD_KEY}.json`), 'utf8'), settledRaw,
+      'a second pass writes nothing — the adoption set is empty');
+  });
+
+  it('give-up hands still-live orphans to the detached watcher, which settles on death', async () => {
+    seedThreadStore(THREAD_KEY, [mkThreadRec()]);
+    let alive = true;
+    let fakeNow = Date.now();
+    const { deps, touches } = makeThreadDeps({
+      alive: () => alive,
+      now: () => fakeNow,
+      sleep: async () => { fakeNow += 1000; }, // each poll jumps 1 s of fake time
+    });
+    // maxWaitMs 0 + pollMs 1 → give-up after ~10 fake-second polls.
+    await reapOrphanedThreads({ deps, pollMs: 1, maxWaitMs: 0, watcherPollMs: 5 });
+    // The pass returned with the record still running — the watcher owns it now.
+    assert.equal((await getThread(THREAD_KEY, 't-1'))?.status, 'running');
+    assert.ok(touches.length >= 1, 'the live pass pumped while it ran');
+    alive = false;
+    // The unref'd watcher settles the dead orphan on a real 5 ms cadence.
+    let settled: ThreadRecord | undefined;
+    for (let i = 0; i < 400; i++) {
+      settled = await getThread(THREAD_KEY, 't-1');
+      if (settled?.status !== 'running') break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.equal(settled?.status, 'queued', 'the watcher demoted the orphan after death');
+    assert.ok(settled?.lastError?.includes('restart-parked'));
+  });
+
+  it('the detached watcher drops a record a /stop cancelled — never rewrites it', async () => {
+    seedThreadStore(THREAD_KEY, [mkThreadRec()]);
+    let fakeNow = Date.now();
+    const { deps } = makeThreadDeps({
+      alive: () => true,
+      now: () => fakeNow,
+      sleep: async () => { fakeNow += 1000; },
+    });
+    await reapOrphanedThreads({ deps, pollMs: 1, maxWaitMs: 0, watcherPollMs: 5 });
+    await cancelOneThread(THREAD_KEY, 't-1');
+    // Give the watcher a few real ticks to observe the cancel.
+    await new Promise((r) => setTimeout(r, 50));
+    const after = await getThread(THREAD_KEY, 't-1');
+    assert.equal(after?.status, 'cancelled', 'a new owner is never clobbered');
+  });
+});
+
+describe('isThreadWorkerAliveOnMachine', () => {
+  function writeWorkerEntry(entry: Record<string, unknown>): void {
+    const dir = join(home, 'worker-pids');
+    fsSync.mkdirSync(dir, { recursive: true });
+    fsSync.writeFileSync(join(dir, `${entry.pid}.json`), JSON.stringify(entry), 'utf8');
+  }
+
+  function fakeReads(overrides: {
+    alive?: number[];
+    cmdlineHits?: Record<string, Array<{ pid: number; cmdline: string }>>;
+    scanCalls?: string[];
+  } = {}) {
+    const aliveSet = new Set(overrides.alive ?? []);
+    const scanCalls = overrides.scanCalls ?? [];
+    return {
+      reads: {
+        areProcessesAlive: async (pids: number[]) => new Map(pids.map((p) => [p, aliveSet.has(p)])),
+        getDescendantPids: async () => [],
+        scanCommandLines: async (needle: string) => {
+          scanCalls.push(needle);
+          return overrides.cmdlineHits?.[needle] ?? [];
+        },
+      },
+      scanCalls,
+    };
+  }
+
+  it('true when the registered wrapper pid for the th resource is alive', async () => {
+    writeWorkerEntry({ pid: 555011, spawnedBy: 1, worker: 'agy', skill: `topic-${THREAD_KEY}-th1`, startedAt: T0 });
+    const { reads } = fakeReads({ alive: [555011] });
+    assert.equal(await isThreadWorkerAliveOnMachine(THREAD_KEY, mkThreadRec(), reads), true);
+  });
+
+  it('a bare TOPIC-lane entry never matches the thread resource (cross-lane isolation)', async () => {
+    writeWorkerEntry({ pid: 555012, spawnedBy: 1, worker: 'agy', skill: `topic-${THREAD_KEY}`, startedAt: T0 });
+    const { reads } = fakeReads({ alive: [555012] });
+    assert.equal(await isThreadWorkerAliveOnMachine(THREAD_KEY, mkThreadRec(), reads), false);
+  });
+
+  it('a DIFFERENT thread number on the same topic never matches', async () => {
+    writeWorkerEntry({ pid: 555013, spawnedBy: 1, worker: 'agy', skill: `topic-${THREAD_KEY}-th2`, startedAt: T0 });
+    const { reads } = fakeReads({ alive: [555013] });
+    assert.equal(await isThreadWorkerAliveOnMachine(THREAD_KEY, mkThreadRec({ n: 1 }), reads), false);
+  });
+
+  it('true when the registry entry is gone but a live process carries the resumed session id', async () => {
+    const rec = mkThreadRec({ session: { session_id: 'sess-th-uuid', worker: 'claude', started_at: T0 } });
+    const { reads } = fakeReads({
+      cmdlineHits: { 'sess-th-uuid': [{ pid: 4242, cmdline: 'claude --resume sess-th-uuid' }] },
+    });
+    assert.equal(await isThreadWorkerAliveOnMachine(THREAD_KEY, rec, reads), true);
+  });
+
+  it('true via the matching entry’s teePath basename needle (agy tee helper survives registry pid death)', async () => {
+    // Entry exists but all its pids are dead; the tee basename on a live
+    // cmdline is the evidence — pulled from the same entry prong 1 listed.
+    writeWorkerEntry({ pid: 999998, spawnedBy: 1, worker: 'agy', skill: `topic-${THREAD_KEY}-th1`, startedAt: T0, descendants: [999997], teePath: 'C:/pa-home/logs/worker-tee/ctx-th9.out' });
+    const { reads } = fakeReads({
+      cmdlineHits: { 'ctx-th9.out': [{ pid: 4343, cmdline: 'node worker_stdout_tee.js C:\\pa-home\\logs\\worker-tee\\ctx-th9.out -- agy' }] },
+    });
+    assert.equal(await isThreadWorkerAliveOnMachine(THREAD_KEY, mkThreadRec(), reads), true);
+  });
+
+  it('fresh-run claude orphan with NO registry entry and no session → false (the documented needle-less hole)', async () => {
+    const { reads, scanCalls } = fakeReads();
+    assert.equal(await isThreadWorkerAliveOnMachine(THREAD_KEY, mkThreadRec(), reads), false);
+    assert.deepEqual(scanCalls, [], 'no needles → no scan — a miss is no evidence, never proof of death');
   });
 });

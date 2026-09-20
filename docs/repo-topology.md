@@ -69,8 +69,7 @@ Every Node `child_process.spawn` using `shell: true`, or spawning a real console
 — this was silently missing everywhere except the two spots `voice.ts`/
 `voice-worker-client.ts` already got it right during the voice-transcription work. Fixed
 in `worker-exec.ts` (the actual worker CLI spawn — every skill/chat dispatch),
-`workers.ts` (health checks), `run.ts` (`cmd:`-based skill spawn), `keepawake.ts` (the
-`powershell.exe` SetThreadExecutionState spawn), and `main.ts`'s three spawns
+`workers.ts` (health checks), `run.ts` (`cmd:`-based skill spawn), and `main.ts`'s three spawns
 (`dispatchGitWorkflowSkill`, the chat-dispatch `pa run`, the OAuth code-exchange Python
 call). Any NEW spawn call in this codebase needs `windowsHide: true` too unless it's
 deliberately interactive/foreground (the one exception: `approve.ts`'s editor-open
@@ -161,7 +160,10 @@ instead. Full record: the private planning archive (dated 2026-07-21).
     "public-only" paths; as of 2026-08-06 the private repo tracks these too (strict
     superset of public), so this caveat no longer applies to new files under those
     paths.
--   **Pre-push PII guard**: `pa/scripts/git-hooks/pre-push-pii-guard`, installed at
+-   **Pre-push PII guard** (gates the PUBLIC mirror ONLY — verified 2026-09-18: the
+    private repo's own `.git/hooks/pre-push` is a git-LFS stub, so ordinary `/push` to
+    `origin/main` runs NO PII check; the guard + CI backstop exist only on the
+    push-public path): `pa/scripts/git-hooks/pre-push-pii-guard`, installed at
     `pa-public/.git/hooks/pre-push` (a COPY, not a link — re-run
     `python pa/scripts/install_git_hooks.py` after any source edit; copy-only since
     2026-08-06, the public mirror is a genuinely separate repo with its own clone
@@ -171,6 +173,21 @@ instead. Full record: the private planning archive (dated 2026-07-21).
     invocation shape, the fail-closed(push)/fail-open(`--full`) policy split, the
     new-branch merge-base fix (2026-07-23), the CI server-side backstop, and every
     do-not-regress reliability invariant (encoding, tree-kill, word-boundary matching).
+-   **Separation-checker layer (AI-264 Wave A, 2026-09-17)**: an independent audit
+    engine (`pa/scripts/public_separation_check.py`, modes `contents|paths|history`)
+    now backs the guard: the push path re-scans the touched-path set with a dedicated
+    operator-identifier pattern file (separate from the content-PII tripwires — the
+    two private pattern files are unioned by tools, never combined), the checker itself
+    never suppresses a match, and a checker execution failure blocks the push fail-closed.
+    A MISSING patterns file is the one fail-open case: layer-not-configured (same
+    convention as layer 2's tripwire loader — CI and fresh clones have no operator
+    identifier file; blocking would wedge every push), printed as a loud banner, never
+    a clean verdict.
+    Full-history blob/message scanning deliberately does NOT ride the push (cost) — it
+    rides the weekly `pii-audit` skill's `--mode history` run. Known gaps recorded in
+    the wave verdict: the audit engine is stricter about pattern-file formatting than
+    the guard's own loader, and identifier-shape patterns (rather than pinned real
+    values) flood synthetic test data — the Wave C pattern refinement owns both.
     Headline facts worth knowing unprompted: DO NOT TRUST THE GUARD ALONE (it's a local
     hook — uninstalled, stale, or bypassed leaves zero coverage, which is why the CI
     backstop exists independently); a layer-3 (agy) infra failure now blocks the push by

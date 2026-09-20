@@ -5,6 +5,8 @@ never touches the network or a real Telegram chat.
 
 Run: python -m pytest pa/scripts/tests/test_start_google_telegram_reauth.py -q
 """
+import contextlib
+import io
 import json
 import os
 import sys
@@ -172,6 +174,51 @@ class TestReusePending(BaseCliTest):
         pending = json.loads(self.state_file.read_text())
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0]["auth_url"], FAKE_AUTH_URL)
+
+
+class TestStateSurfacedInStdout(BaseCliTest):
+    """AI-220 auth broker Phase A: the JSON stdout line must carry the same
+    `state` value the pending row persists, on BOTH the fresh-mint and the
+    --reuse-pending paths — that value is the ONLY thing the new
+    /api/v1/auth/callback endpoint can correlate a Google redirect against,
+    and this script is the only place that ever learns it (a caller has no
+    other way to observe google-auth-oauthlib's internal Flow state)."""
+
+    def test_fresh_mint_stdout_state_matches_the_persisted_pending_row(self):
+        sys.argv = self._argv("--no-send")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            start.main()
+        printed = json.loads(buf.getvalue().strip().splitlines()[-1])
+        pending = json.loads(self.state_file.read_text())
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(printed["state"], "fake-state")  # FakeFlow.authorization_url's state
+        self.assertEqual(printed["state"], pending[0]["state"])
+
+    def test_reuse_pending_stdout_state_matches_the_stored_row(self):
+        existing = {
+            "auth_id": "existing123",
+            "state": "s1",
+            "code_verifier": "v1",
+            "redirect_uri": "https://example.com/bridge",
+            "scopes": start.DEFAULT_SCOPES,
+            "chat_id": "-100123",
+            "thread_id": None,
+            "resume_action": None,
+            "retry_action": None,
+            "created_at": int(time.time()),
+            "expires_at": int(time.time()) + 43200,
+            "auth_url": "https://accounts.google.com/o/oauth2/auth?stored=1",
+        }
+        self.state_file.write_text(json.dumps([existing]), encoding="utf-8")
+
+        sys.argv = self._argv("--reuse-pending", "--no-send")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            start.main()
+        printed = json.loads(buf.getvalue().strip().splitlines()[-1])
+        self.assertEqual(printed["reused"], True)
+        self.assertEqual(printed["state"], "s1")
 
 
 class TestResumeSkill(BaseCliTest):

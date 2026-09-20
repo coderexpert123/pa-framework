@@ -112,4 +112,55 @@ describe('reconcileCommand (CLI layer)', () => {
       `expected a "path escapes the repo root" stderr line, got: ${JSON.stringify(consoleErrors)}`
     );
   });
+
+  it('--check --range base on a range with a committed reversion -> exitCode 1, pushed-file line printed', async () => {
+    // v0
+    await writeFile(join(repo, 'drift.txt'), 'v0\n', 'utf8');
+    await git('git add -A');
+    await git('git commit -q -m v0');
+    // v1, then pin the range start here
+    await writeFile(join(repo, 'drift.txt'), 'v1\n', 'utf8');
+    await git('git add -A');
+    await git('git commit -q -m v1');
+    await git('git branch base');
+    // v2
+    await writeFile(join(repo, 'drift.txt'), 'v2\n', 'utf8');
+    await git('git add -A');
+    await git('git commit -q -m v2');
+    // A reversion to older-than-base content lands as a real commit in the range.
+    await writeFile(join(repo, 'drift.txt'), 'v0\n', 'utf8');
+    await git('git add -A');
+    await git('git commit -q -m revert-to-v0');
+
+    await reconcileCommand(['--check', '--range', 'base']);
+    assert.equal(process.exitCode, 1);
+    assert.ok(consoleOutput.some((l) => l.includes('pushed file(s) reverted to pre-range history')), 'the pushed-file header should be printed');
+    assert.ok(consoleOutput.some((l) => l.includes('drift.txt')), 'the reverted path should be printed');
+  });
+
+  it('--check --range base on a clean forward-only range -> No range drift detected, exitCode unset', async () => {
+    await writeFile(join(repo, 'drift.txt'), 'v0\n', 'utf8');
+    await git('git add -A');
+    await git('git commit -q -m v0');
+    await git('git branch base');
+    await writeFile(join(repo, 'drift.txt'), 'v1-new\n', 'utf8');
+    await git('git add -A');
+    await git('git commit -q -m v1');
+
+    await reconcileCommand(['--check', '--range', 'base']);
+    assert.equal(process.exitCode, undefined);
+    assert.ok(consoleOutput.some((l) => l.includes('No range drift detected')));
+  });
+
+  it('--max-commits abc -> usage on stdout, exitCode 2', async () => {
+    await reconcileCommand(['--check', '--max-commits', 'abc']);
+    assert.equal(process.exitCode, 2);
+    assert.ok(consoleOutput.some((l) => l.includes('Usage: pa reconcile')));
+  });
+
+  it('--range x --restore y -> usage on stdout, exitCode 2', async () => {
+    await reconcileCommand(['--range', 'x', '--restore', 'y']);
+    assert.equal(process.exitCode, 2);
+    assert.ok(consoleOutput.some((l) => l.includes('Usage: pa reconcile')));
+  });
 });

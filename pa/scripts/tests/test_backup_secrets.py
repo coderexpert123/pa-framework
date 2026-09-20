@@ -97,6 +97,21 @@ class TestManifestAndPack(unittest.TestCase):
         self.assertIn("pa/secrets.env", arcs)
         self.assertNotIn("pa/google-token.json", arcs)  # never created
 
+    def test_shim_env_set_but_missing_dir_is_loud(self):
+        # WB-51: a configured shim dir that does not exist must be a LOUD
+        # error naming the env override, never a silently-empty hash set.
+        os.environ["PA_GEMINI_SHIM_DIR"] = str(Path(self.tmp) / "no-such-shim")
+        with self.assertRaises(RuntimeError) as ctx:
+            bs.build_manifest()
+        self.assertIn("PA_GEMINI_SHIM_DIR", str(ctx.exception))
+
+    def test_shim_env_unset_skips_section(self):
+        # WB-51: no shim configured → the section skips (no hardcoded
+        # operator default). No error, no shim entries.
+        del os.environ["PA_GEMINI_SHIM_DIR"]
+        arcs = [a for _, a in bs.build_manifest()]
+        self.assertFalse([a for a in arcs if a.startswith("gemini-shim/")])
+
     def test_build_blob_refuses_without_secrets_env(self):
         # Only a stray non-core file present → no secrets.env → must refuse.
         (Path(os.environ["PA_HOME"]) / "pii-tripwires.txt").write_text("x", encoding="utf-8")

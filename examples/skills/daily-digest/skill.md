@@ -3,7 +3,7 @@ name: daily-digest
 description: Daily activity digest — runs, tokens, est. cost, failover, alerts, DLQ and SLO for the last 24h
 cron: "15 16 * * *"
 cwd: "${PA_FRAMEWORK_ROOT}"
-cmd: python "${PA_FRAMEWORK_ROOT}/pa/scripts/daily_digest.py"
+cmd: python3 "${PA_FRAMEWORK_ROOT}/pa/scripts/daily_digest.py" || python "${PA_FRAMEWORK_ROOT}/pa/scripts/daily_digest.py"
 timeout: 300
 telegram_output:
   chat_id: '${TELEGRAM_CHAT_ID}'

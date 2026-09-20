@@ -14,6 +14,8 @@ import os
 
 import re
 
+import sqlite3
+
 import sys
 
 import tempfile
@@ -1199,6 +1201,113 @@ class TestWeeklyDigest(unittest.TestCase):
         """BUDGET_START module constant is defined."""
         assert hasattr(weekly_digest, "BUDGET_START")
         assert weekly_digest.BUDGET_START == "2026-09-01"
+
+
+class TestRawHtmlShapes(unittest.TestCase):
+    """The raw-html lane graduation census (2026-09-14): read_raw_html_shapes
+    groups last-week :::raw-html answers by first-tag/class signature. Ledger
+    fixtures seed RELATIVE timestamps (rolling-window fixtures computed from
+    now, never literal dates)."""
+
+    def _seed_ledger(self, pa_home: str, rows: list) -> str:
+        os.makedirs(os.path.join(pa_home, "voice-inbox"), exist_ok=True)
+        db_path = os.path.join(pa_home, "voice-inbox", "ledger.sqlite")
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute(
+                "CREATE TABLE tasks (task_id TEXT PRIMARY KEY, result_summary TEXT, updated_at TEXT)"
+            )
+            conn.executemany("INSERT INTO tasks VALUES (?, ?, ?)", rows)
+            conn.commit()
+        finally:
+            conn.close()
+        return db_path
+
+    @staticmethod
+    def _iso(days_ago: float) -> str:
+        ts = datetime.now(timezone.utc) - timedelta(days=days_ago)
+        return ts.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+    def test_raw_html_signature_first_tag_and_class(self):
+        self.assertEqual(weekly_digest.raw_html_signature('<table class="price matrix">'), "table.price")
+        self.assertEqual(weekly_digest.raw_html_signature("<div id='x'>"), "div")
+        self.assertEqual(weekly_digest.raw_html_signature("plain text, no tags"), "(no markup)")
+
+    def test_read_raw_html_shapes_groups_by_signature_in_window(self):
+        old_home = os.environ.get("PA_HOME")
+        tmp = tempfile.mkdtemp(prefix="vi-rawhtml-")
+        os.environ["PA_HOME"] = tmp
+        try:
+            self._seed_ledger(tmp, [
+                ("vi-1", "Chart:\n:::raw-html\n<table class=\"price\"><tr><td>1</td></tr></table>\n:::", self._iso(1)),
+                ("vi-2", ":::raw-html\n<div class=\"grid\">x</div>\n:::", self._iso(2)),
+                # outside the 7-day window — excluded
+                ("vi-3", ":::raw-html\n<table class=\"price\"><tr><td>9</td></tr></table>\n:::", self._iso(9)),
+                # no marker at all — excluded by the LIKE prefilter
+                ("vi-4", "plain answer", self._iso(1)),
+            ])
+            data = weekly_digest.read_raw_html_shapes(days=7)
+            self.assertIsNotNone(data)
+            self.assertEqual(data["answers"], 2)
+            self.assertEqual(data["signatures"], {"table.price": 1, "div.grid": 1})
+        finally:
+            if old_home:
+                os.environ["PA_HOME"] = old_home
+            else:
+                os.environ.pop("PA_HOME", None)
+
+    def test_read_raw_html_shapes_counts_unterminated_opener(self):
+        old_home = os.environ.get("PA_HOME")
+        tmp = tempfile.mkdtemp(prefix="vi-rawhtml-")
+        os.environ["PA_HOME"] = tmp
+        try:
+            self._seed_ledger(tmp, [
+                ("vi-9", ":::raw-html\n<p>never closed", self._iso(0)),
+            ])
+            data = weekly_digest.read_raw_html_shapes(days=7)
+            self.assertEqual(data["answers"], 1)
+            self.assertEqual(data["signatures"], {"p": 1})
+        finally:
+            if old_home:
+                os.environ["PA_HOME"] = old_home
+            else:
+                os.environ.pop("PA_HOME", None)
+
+    def test_read_raw_html_shapes_returns_none_when_ledger_absent(self):
+        old_home = os.environ.get("PA_HOME")
+        tmp = tempfile.mkdtemp(prefix="vi-rawhtml-")
+        os.environ["PA_HOME"] = tmp
+        try:
+            self.assertIsNone(weekly_digest.read_raw_html_shapes(days=7))
+        finally:
+            if old_home:
+                os.environ["PA_HOME"] = old_home
+            else:
+                os.environ.pop("PA_HOME", None)
+
+    def test_render_raw_html_section_never_silent(self):
+        unavailable = weekly_digest.render_raw_html_section(None)
+        self.assertIn("## Custom answer shapes (7d)", unavailable)
+        self.assertIn("unavailable", "\n".join(unavailable))
+        empty = weekly_digest.render_raw_html_section({"answers": 0, "signatures": {}})
+        self.assertIn("No raw-html answers", "\n".join(empty))
+        ranked = weekly_digest.render_raw_html_section(
+            {"answers": 3, "signatures": {"table.price": 2, "div": 1}})
+        text = "\n".join(ranked)
+        self.assertIn("3 raw-html answer(s)", text)
+        self.assertIn("graduation candidates", text)
+        self.assertIn("`table.price` (2)", text)
+
+    def test_compose_digest_carries_the_raw_html_section(self):
+        original = weekly_digest.read_raw_html_shapes
+        weekly_digest.read_raw_html_shapes = lambda days=7: {
+            "answers": 2, "signatures": {"table.price": 2}}
+        try:
+            result = weekly_digest.compose_digest([], {}, [], None)
+            self.assertIn("## Custom answer shapes (7d)", result)
+            self.assertIn("`table.price` (2)", result)
+        finally:
+            weekly_digest.read_raw_html_shapes = original
 
 
 if __name__ == '__main__':

@@ -41,6 +41,33 @@ export const DEPLOYMENT_ENV_SCRUB: readonly string[] = [
   'PA_USER_NAME',
   // context.ts KB pointer injection.
   'PA_KB_SOURCES_PATH',
+  // typesafe-client.ts resolveTypeSafeApiKey — an inherited real key would let
+  // a test reach the live TypeSafe API; tests pass their own apiKey.
+  'TYPESAFE_API_KEY',
+  // typesafe-client.ts typeSafeBaseUrl — a test-only stub-server seam.
+  'TYPESAFE_BASE_URL',
+  // Session-identity markers (2026-09-17): detectBusProvider reads these to
+  // pick the provider — a suite launched inside a real session inherits them
+  // and every `pa claim`/`whoami` then resolves an image provider, paying a
+  // full Get-CimInstance process snapshot per call (claim-command's
+  // non-numeric --wait test ran 2-4.6s vs its 2s budget under load). CI never
+  // has them; tests that need one set it in-process.
+  'CHISEL_SESSION_DB',   // detectBusProvider → 'devin'
+  'CLAUDECODE',        // detectBusProvider → 'claude'
+  'KGCLAUDE_SESSION',  // detectBusProvider → 'kgclaude' (outranks CLAUDECODE)
+  'ANTIGRAVITY_AGENT', // detectBusProvider → 'agy'
+  'CODEX_CLI_PATH',    // detectBusProvider → 'codex'
+  'OPENCODE',          // detectBusProvider → 'opencode'
+  'GEMINI_SESSION_ID', // detectBusProvider → 'gemini' (deprecated CLI, still read)
+  'GEMINI_CLI_PATH',   // detectBusProvider → 'gemini'
+  'PA_WORKER',         // detectBusProvider provider override + worker exec env
+  'PA_BUS_PROVIDER',   // detectBusProvider top-of-chain override
+  'PA_BUS_ADDRESS',    // resolveSessionBusAddress pin
+  'PA_BUS_SESSION',    // resolveSessionBusAddress session key
+  'PA_BUS_REPO',       // resolveSessionBusAddress repo override
+  'PA_SESSION',        // claim.ts session fallback + bus session key
+  'PA_WORKER_DISPATCH_ID', // claim.ts dispatchId/pid auto-fill
+  'PA_TASK_ID',        // claim.ts taskId auto-fill
 ];
 
 /** Return a copy of `env` with every deployment-config variable removed. */

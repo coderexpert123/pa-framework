@@ -31,6 +31,14 @@ import { dailyReconJob } from './jobs/daily-recon.js';
 import { botSelfRestartJob } from './jobs/bot-self-restart.js';
 import { alertDigestJob } from './jobs/alert-digest.js';
 import { cDiskFloorWatchdogJob } from './jobs/c-disk-floor-watchdog.js';
+import { orphanEditWatchJob } from './jobs/orphan-edit-watch.js';
+import { voiceInboxFallbackJob } from './jobs/voice-inbox-fallback.js';
+import { authAnswerReapJob } from './jobs/auth-answer-reap.js';
+import { nonpagedPoolWatchJob } from './jobs/nonpaged-pool-watch.js';
+import { backlogFragmentsDrainJob } from './jobs/backlog-fragments-drain.js';
+import { busDrainJob } from './jobs/bus-drain.js';
+import { busPruneJob } from './jobs/bus-prune.js';
+import { modelRouterCooldownNormalizeJob } from './jobs/model-router-cooldown-normalize.js';
 
 /** THE single declared table. Every declared maintenance job across pa and bot hosts
  *  lives under this array — that is the point of the construct. */
@@ -59,6 +67,14 @@ export const MAINTENANCE_JOBS: readonly MaintenanceJob[] = [
   workerEditAuditSweepJob,
   dailyReconJob,
   cDiskFloorWatchdogJob,
+  orphanEditWatchJob,
+  voiceInboxFallbackJob,
+  authAnswerReapJob,
+  nonpagedPoolWatchJob,
+  backlogFragmentsDrainJob,
+  busDrainJob,
+  busPruneJob,
+  modelRouterCooldownNormalizeJob,
   // bot-host jobs
   botLogRotationCheckJob,
   modelOverrideSweepJob,

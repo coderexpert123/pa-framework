@@ -36,8 +36,8 @@ import { parsePorcelainPaths } from '../../git-status.js';
 import { pathsOverlap, readActive } from '../../reservations.js';
 import { repoRootFromModule } from '../../git-root.js';
 import { blackboard } from '../../../blackboard.js';
-import { exclusiveLockKey } from '../../../commands/run.js';
 import { BUILD_LOCK_RESOURCE } from '../../build-lock.js';
+import { hasTreeChurnLock } from '../../orphan-watch.js';
 import { appendTask } from '../../topic-tasks.js';
 import { readOrphanLedger, type OrphanLedgerRecord } from '../../orphan-ledger.js';
 import {
@@ -82,7 +82,7 @@ export interface DailyReconDeps {
   now?: number;
   gitRunner?: GitRunner;
   readActiveFn?: () => Promise<Array<{ paths: string[] }>>;
-  getActiveLocksFn?: () => Promise<Array<{ resource: string }>>;
+  getActiveLocksFn?: () => Promise<Array<{ resource: string; pid?: number }>>;
   readLedgerFn?: (limit?: number) => Promise<OrphanLedgerRecord[]>;
   appendTaskFn?: typeof appendTask;
   repoRootFn?: () => Promise<string>;
@@ -163,16 +163,14 @@ export async function runDailyRecon(deps: DailyReconDeps = {}): Promise<Maintena
 
   // Stand the whole tick down while a tree-churn holder is live (clobber
   // -sentinel's skip idiom): a git-workflow/public-sync exclusive lock, the
-  // @build gate, or any catchup tick. Reservation-covered PATHS are skipped
-  // per-path below instead.
+  // @build gate, or any FOREIGN catchup tick. Reservation-covered PATHS are
+  // skipped per-path below instead. Shares orphan-watch's hasTreeChurnLock
+  // (verbatim in shape, now fixed there) rather than a second inline copy —
+  // this job is invoked in-process from `runDueJobs` inside `pa catchup`'s
+  // OWN lock region, so an unfixed check here would see that same lock and
+  // self-skip every tick forever, exactly as it did for 6 days.
   const active = await readActiveDep();
-  const locks = await getActiveLocksDep();
-  const held = new Set(locks.map((l) => l.resource));
-  const hasGuardLock =
-    held.has(exclusiveLockKey('git-workflow')) ||
-    held.has(exclusiveLockKey('git-public-workflow')) ||
-    held.has(BUILD_LOCK_RESOURCE) ||
-    [...held].some((r) => r === 'catchup' || r.startsWith('catchup:'));
+  const hasGuardLock = await hasTreeChurnLock(getActiveLocksDep);
   const hasBuildReservation = active.some((r) => r.paths.some((p) => p === BUILD_LOCK_RESOURCE));
   if (hasGuardLock || hasBuildReservation) {
     log('info', 'daily-recon', 'skipped: a git-workflow/@build/catchup holder is live');

@@ -67,6 +67,7 @@ import {
   type StatusCardArgs,
   workerReceivesStaticPromptFile,
   guardUnknownCommand,
+  sanitizeSpawnDependsOn,
 } from '../logic.js';
 import type { PAMeta } from '../types.js';
 import type { ConversationState, BranchAncestry } from '../types.js';
@@ -1472,6 +1473,115 @@ describe('parseMetadata', () => {
     } finally {
       console.warn = consoleWarnSpy;
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseMetadata — lone-backslash repair (2026-09-09 incident, topic 13052:
+// a worker echoed an absolute Windows path verbatim into a spawn_thread
+// prompt string — "D:\Personal Assistant\projects\..." — and JSON.parse
+// rejected it with "Invalid \escape". Fixtures below reproduce the SAME
+// DEFECT CLASS with synthetic paths/ids (never the real production text —
+// this suite is public-mirrored).
+// ---------------------------------------------------------------------------
+
+describe('parseMetadata: lone-backslash repair (2026-09-09 incident class)', () => {
+  it('repairs a lone backslash from a verbatim Windows path and parses the envelope', () => {
+    const output = 'Doing the thing.\n[PA_META]: {"actions":[{"type":"spawn_thread","title":"T","prompt":"Open C:\\synthetic\\logs\\output.txt and read it."}]}';
+    const { cleaned, meta, repaired, parseError } = parseMetadata(output);
+    assert.equal(cleaned, 'Doing the thing.');
+    assert.equal(repaired, true, 'a lone-backslash-only defect must be flagged as repaired');
+    assert.equal(parseError, undefined, 'a successfully repaired envelope carries no parseError');
+    assert.ok(meta !== null, 'the repaired JSON must parse into actions');
+    assert.equal(meta!.actions[0].type, 'spawn_thread');
+    // The repaired value must be byte-identical to what the worker wrote —
+    // repair only fixes the ESCAPING, never the content.
+    assert.equal(meta!.actions[0].prompt, 'Open C:\\synthetic\\logs\\output.txt and read it.');
+  });
+
+  it('does not flag repaired when there was nothing to repair (plain envelope)', () => {
+    const output = 'Text.\n[PA_META]: {"actions":[{"type":"confirm_required"}]}';
+    const { meta, repaired } = parseMetadata(output);
+    assert.ok(meta !== null);
+    assert.equal(repaired, undefined);
+  });
+
+  it('reports parseError + rawExcerpt for an envelope still unparseable AFTER the repair attempt (incident-class compound defect: lone backslash + a genuinely malformed extra brace — repair must not paper over a real structural defect)', () => {
+    const output = 'Spawning a thread to handle this (t-1).\n[PA_META]: {"actions":[{"type":"spawn_thread","title":"Do the thing","prompt":"Run C:\\synthetic\\project\\script.py and report back."}}]}';
+    const { cleaned, meta, parseError, rawExcerpt, repaired } = parseMetadata(output);
+    assert.equal(meta, null, 'a compound defect must still fail closed, not be guessed at');
+    assert.equal(cleaned, output, 'existing WP3 contract: envelope preserved verbatim on total parse failure');
+    assert.equal(repaired, undefined, 'repair attempt happened but never succeeded, so it is not reported as repaired');
+    assert.ok(typeof parseError === 'string' && parseError.length > 0, 'a caller needs SOMETHING to log — this is exactly where the 2026-09-09 incident vanished silently');
+    assert.ok(typeof rawExcerpt === 'string' && rawExcerpt.length > 0 && rawExcerpt.length <= 120);
+    assert.ok(rawExcerpt!.startsWith('{"actions":['));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseMetadata — lenient salvage (2026-09-11/13 orchestrator-turn deaths,
+// "Bad escaped character" class: workers emit envelopes poisoned with raw
+// control characters and/or lone backslashes; a retry cannot fix a
+// deterministic parse failure, so the parser itself gets one sanitize-and-
+// reparse second chance after every other attempt fails. Fixtures below
+// reproduce the SAME DEFECT CLASS with synthetic text — raw control chars
+// are built via String.fromCharCode so this source file itself stays free
+// of raw control bytes; never the real production text — this suite is
+// public-mirrored).
+// ---------------------------------------------------------------------------
+
+describe('parseMetadata: lenient salvage after sanitize (2026-09-11/13 incident class)', () => {
+  // Raw backspace inside a string literal: unparseable JSON on its own, and
+  // the lone-backslash repair does NOT touch it — exactly the compound shape
+  // that survived the 2026-09-09 fix.
+  const ctrl = String.fromCharCode(8);
+
+  it('salvages a control-char + lone-backslash envelope into the correct parsed object', () => {
+    const promptRaw = 'Open C:\\synthetic\\logs and run.' + ctrl + 'Then report.';
+    const output = 'Spawned.\n[PA_META]: {"actions":[{"type":"spawn_thread","title":"T","prompt":"' + promptRaw + '"}]}';
+    const { cleaned, meta, repaired, parseError } = parseMetadata(output);
+    assert.ok(meta !== null, 'the poisoned envelope must salvage into actions');
+    assert.equal(meta!.actions[0].type, 'spawn_thread');
+    // The control char is STRIPPED (accepted salvage contract: a delivered
+    // action with munged content beats a dead turn); the backslashes are
+    // repaired to their intended single literal form.
+    assert.equal(meta!.actions[0].prompt, 'Open C:\\synthetic\\logs and run.Then report.');
+    assert.equal(cleaned, 'Spawned.');
+    assert.equal(parseError, undefined, 'a salvaged envelope carries no parseError');
+    assert.equal(repaired, undefined, 'salvage is its own tier — it must not fire the backslash-specific repaired footer');
+  });
+
+  it('salvaged actions are identical to what the clean envelope yields', () => {
+    const promptRaw = 'Open C:\\synthetic\\logs and run.' + ctrl + 'Then report.';
+    const poisoned = 'S.\n[PA_META]: {"actions":[{"type":"spawn_thread","title":"T","prompt":"' + promptRaw + '"}]}';
+    // The same envelope as a well-behaved worker writes it: escaped
+    // backslashes, no control char.
+    const clean = 'S.\n[PA_META]: {"actions":[{"type":"spawn_thread","title":"T","prompt":"Open C:\\\\synthetic\\\\logs and run.Then report."}]}';
+    const salvaged = parseMetadata(poisoned).meta;
+    const expected = parseMetadata(clean).meta;
+    assert.ok(expected !== null, 'the clean envelope must parse normally');
+    assert.deepEqual(salvaged, expected, 'salvage must deliver exactly what the clean path delivers');
+  });
+
+  it('salvages an in-string control char even under a trailing artifact tag', () => {
+    const promptRaw = 'Run the sync.' + ctrl + 'Then report.';
+    const output = 'Done.\n[PA_META]: {"actions":[{"type":"notify","message":"' + promptRaw + '"}]}\n</invoke>';
+    const { meta, parseError } = parseMetadata(output);
+    assert.ok(meta !== null, 'the artifact-path salvage hook must rescue a poisoned envelope under a trailing tag');
+    assert.equal(meta!.actions[0].type, 'notify');
+    assert.equal(meta!.actions[0].message, 'Run the sync.Then report.');
+    assert.equal(parseError, undefined);
+  });
+
+  it('does not salvage a structurally hopeless envelope (control char + missing closing brace fails exactly as before)', () => {
+    const promptRaw = 'Run C:\\synthetic\\x.py now.' + ctrl + 'Then report.';
+    const output = 'Working.\n[PA_META]: {"actions":[{"type":"spawn_thread","title":"T","prompt":"' + promptRaw + '"}]';
+    const { cleaned, meta, repaired, parseError, rawExcerpt } = parseMetadata(output);
+    assert.equal(meta, null, 'sanitize cannot restore structure — must fail closed, not be guessed at');
+    assert.equal(cleaned, output, 'existing contract: envelope preserved verbatim on total parse failure');
+    assert.equal(repaired, undefined, 'no attempt succeeded, so repaired is not reported');
+    assert.ok(typeof parseError === 'string' && parseError.length > 0, 'give-up path must keep its parseError signal');
+    assert.ok(typeof rawExcerpt === 'string' && rawExcerpt.length > 0 && rawExcerpt.length <= 120);
   });
 });
 
@@ -2970,7 +3080,7 @@ describe('handleMergeCommand', () => {
 // ---------------------------------------------------------------------------
 
 describe('renderStatusCard', () => {
-  it('formats card with default, current, reason, and keep-awake lines', () => {
+  it('formats card with default, current, and reason lines', () => {
     const card = renderStatusCard({
       snapshot: buildModelStatusSnapshot({
         currentWorker: 'agy',
@@ -2982,25 +3092,21 @@ describe('renderStatusCard', () => {
         defaultLlm: 'glm-5.3',
         reasonCode: 'user_override',
       }),
-      keepAwake: { active: true, since: '2026-04-21T07:26:00.000Z' }
     });
     assert.ok(card.includes('Default: zclaude (glm-5.3)'));
     assert.ok(card.includes('Current: agy (gemini-3.7-flash-high)'));
     assert.ok(card.includes('Reason: Temporary user override until IST midnight.'));
-    assert.ok(card.includes('Keep-awake: on since 2026-04-21T07:26:00.000Z'));
   });
 
-  it('formats card with keep-awake off', () => {
+  it('formats card with default worker only', () => {
     const card = renderStatusCard({
       snapshot: buildModelStatusSnapshot({
         defaultWorker: 'claude',
         reasonCode: 'default_active',
       }),
-      keepAwake: { active: false }
     });
-    assert.ok(card.includes('Default: claude (opusplan)'));
-    assert.ok(card.includes('Current: claude (opusplan)'));
-    assert.ok(card.includes('Keep-awake: off'));
+    assert.ok(card.includes('Default: claude (opus) [high]'));
+    assert.ok(card.includes('Current: claude (opus) [high]'));
   });
 
   it('formats card with LLM when current_llm and default_llm are present', () => {
@@ -3012,7 +3118,6 @@ describe('renderStatusCard', () => {
         currentLlm: 'gemini-3.7-flash-high',
         defaultLlm: 'opusplan',
       }),
-      keepAwake: { active: false }
     });
     assert.ok(card.includes('Default: claude (opusplan)'));
     assert.ok(card.includes('Current: agy (gemini-3.7-flash-high)'));
@@ -3028,7 +3133,6 @@ describe('renderStatusCard', () => {
         currentEffort: 'high',
         defaultLlm: 'gemini-3.7-flash-high',
       }),
-      keepAwake: { active: false }
     });
     assert.ok(card.includes('Default: agy (gemini-3.7-flash-high)'));
     assert.ok(card.includes('Current: claude (opusplan) [high]'));
@@ -3038,14 +3142,13 @@ describe('renderStatusCard', () => {
     const snapshot = buildModelStatusSnapshot({ currentWorker: 'agy', defaultWorker: 'agy', reasonCode: 'default_active' });
     const withTasks = renderStatusCard({
       snapshot,
-      keepAwake: { active: false },
       tasks: { running: 2, parked: 1, queued: 3 },
     });
     assert.ok(
       withTasks.includes('Tasks: 2 running · 1 parked · 3 queued'),
       'the executor-lane Tasks line renders running/parked/queued counts'
     );
-    const withoutTasks = renderStatusCard({ snapshot, keepAwake: { active: false } });
+    const withoutTasks = renderStatusCard({ snapshot });
     assert.ok(!withoutTasks.includes('Tasks:'), 'no Tasks line when the counts are absent (empty executor lane)');
   });
 
@@ -3053,7 +3156,6 @@ describe('renderStatusCard', () => {
     const snapshot = buildModelStatusSnapshot({ currentWorker: 'agy', defaultWorker: 'agy', reasonCode: 'default_active' });
     const card = renderStatusCard({
       snapshot,
-      keepAwake: { active: false },
       threads: { running: 1, queued: 0, done: 2, failed: 1, cancelled: 0 },
     });
     assert.ok(
@@ -3066,7 +3168,6 @@ describe('renderStatusCard', () => {
     const snapshot = buildModelStatusSnapshot({ currentWorker: 'agy', defaultWorker: 'agy', reasonCode: 'default_active' });
     const card = renderStatusCard({
       snapshot,
-      keepAwake: { active: false },
       threads: { running: 0, queued: 0, done: 0, failed: 0, cancelled: 0 },
     });
     assert.ok(!card.includes('Threads:'), 'an all-zero count renders no line, never "Threads: 0 running"');
@@ -3076,7 +3177,6 @@ describe('renderStatusCard', () => {
     const snapshot = buildModelStatusSnapshot({ currentWorker: 'agy', defaultWorker: 'agy', reasonCode: 'default_active' });
     const card = renderStatusCard({
       snapshot,
-      keepAwake: { active: false },
       threads: { running: 1, queued: 2, done: 0, failed: 0, cancelled: 0 },
     });
     assert.ok(
@@ -3090,7 +3190,6 @@ describe('renderStatusCard', () => {
     const snapshot = buildModelStatusSnapshot({ currentWorker: 'agy', defaultWorker: 'agy', reasonCode: 'default_active' });
     const card = renderStatusCard({
       snapshot,
-      keepAwake: { active: false },
       tasks: { running: 2, parked: 1, queued: 3 },
     });
     assert.ok(card.includes('Tasks: 2 running · 1 parked · 3 queued'), 'the existing pinned card shape still renders');
@@ -3711,11 +3810,6 @@ describe('guardUnknownCommand', () => {
     assert.equal(result, undefined);
   });
 
-  it('does NOT guard known command /keepawake', () => {
-    const result = guardUnknownCommand('/keepawake');
-    assert.equal(result, undefined);
-  });
-
   it('does NOT guard known command /health', () => {
     const result = guardUnknownCommand('/health');
     assert.equal(result, undefined);
@@ -3752,3 +3846,32 @@ describe('guardUnknownCommand', () => {
   });
 });
 
+
+describe('sanitizeSpawnDependsOn (model-requestable spawn deps — envelope shape gate)', () => {
+  it('passes well-formed ids through in order', () => {
+    assert.deepEqual(sanitizeSpawnDependsOn(['t-1', 't-7']), ['t-1', 't-7']);
+  });
+
+  it('absent field stays absent', () => {
+    assert.equal(sanitizeSpawnDependsOn(undefined), undefined);
+  });
+
+  it('non-array drops the field (fail-open, never a rejection)', () => {
+    assert.equal(sanitizeSpawnDependsOn('t-1'), undefined);
+    assert.equal(sanitizeSpawnDependsOn(42), undefined);
+    assert.equal(sanitizeSpawnDependsOn({ zero: 't-1' }), undefined);
+  });
+
+  it('malformed entries drop individually; well-formed ones survive (PINNED choice: entry-level fail-open)', () => {
+    assert.deepEqual(sanitizeSpawnDependsOn(['t-1', 'bogus', 3, 'T-2', 't-2']), ['t-1', 't-2']);
+    assert.equal(sanitizeSpawnDependsOn(['bogus', 't-1x', '']), undefined);
+  });
+
+  it('more than 3 valid ids truncates to the first 3 (PINNED choice: truncate, not drop)', () => {
+    assert.deepEqual(sanitizeSpawnDependsOn(['t-1', 't-2', 't-3', 't-4', 't-5']), ['t-1', 't-2', 't-3']);
+  });
+
+  it('duplicates collapse to one entry', () => {
+    assert.deepEqual(sanitizeSpawnDependsOn(['t-1', 't-1', 't-2']), ['t-1', 't-2']);
+  });
+});

@@ -36,6 +36,16 @@ async function withBuildLockOrRun(repoRoot, pkg, fn) {
 // below). The mtime is the load-bearing signal (bot self-restart maintenance
 // job compares it to the running process's start time); the JSON body is
 // diagnostics only. dist/ is gitignored, so the stamp is never committed.
+//
+// BUILD_INFO (2026-09-13 deploy-staleness watchdog) is written by the same
+// best-effort policy: {commit, dirty} for the launcher's run-bot-hidden.vbs,
+// which auto-restarts the bot ONLY on a build it can prove came from a CLEAN
+// tree. dirty comes from `git status --porcelain -- projects/telegram-bot`
+// and fails CLOSED — default true, cleared only by a zero-exit git call —
+// so a failed/absent git never arms the watchdog. The JSON is compact and
+// key-ordered because the VBScript reader has no parser: it matches the
+// exact substring "dirty":false, so any pretty-printed serialization would
+// silently disarm it (fail-closed, but inert).
 function writeBuildStamp() {
   try {
     let sha = 'unknown';
@@ -50,6 +60,26 @@ function writeBuildStamp() {
       JSON.stringify({ builtAt: new Date().toISOString(), sha, pkg: 'bot' }) + '\n', 'utf8');
   } catch (e) {
     console.error('build: could not write .build-stamp:', e?.message ?? e);  // never fail the build
+  }
+  try {
+    let commit = 'unknown';
+    let dirty = true; // fail closed: an unproven tree never arms the watchdog
+    try {
+      const r = spawnSync('git', ['rev-parse', 'HEAD'],
+        { cwd: repoRoot, encoding: 'utf8', windowsHide: true });
+      if (r.status === 0 && r.stdout.trim()) commit = r.stdout.trim();
+    } catch { /* not a git checkout — 'unknown' is fine */ }
+    try {
+      const s = spawnSync('git', ['status', '--porcelain', '--', 'projects/telegram-bot'],
+        { cwd: repoRoot, encoding: 'utf8', windowsHide: true });
+      if (s.status === 0) dirty = s.stdout.trim().length > 0;
+    } catch { /* git itself failed — stays dirty */ }
+    const dist = join(pkgRoot, 'dist');
+    mkdirSync(dist, { recursive: true });
+    writeFileSync(join(dist, 'BUILD_INFO'),
+      JSON.stringify({ commit, dirty }), 'utf8');
+  } catch (e) {
+    console.error('build: could not write BUILD_INFO:', e?.message ?? e);  // never fail the build
   }
 }
 

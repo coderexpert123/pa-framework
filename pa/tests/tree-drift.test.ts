@@ -4,7 +4,7 @@ import { execFileSync } from 'child_process';
 import { mkdtemp, mkdir, writeFile, readFile, rm } from 'fs/promises';
 import { join, dirname } from 'path';
 import { tmpdir } from 'os';
-import { detectDrift, mergeAgainstHead, restoreFromHead, defaultGitRunner } from '../src/lib/tree-drift.js';
+import { detectDrift, detectRangeDrift, mergeAgainstHead, restoreFromHead, defaultGitRunner } from '../src/lib/tree-drift.js';
 import type { GitRunner } from '../src/lib/tree-drift.js';
 
 // ---------------------------------------------------------------------------
@@ -54,6 +54,23 @@ describe('detectDrift', () => {
       await commitFile(dir, 'a.txt', 'v1\n', 'add a');
       const findings = await detectDrift(dir);
       assert.deepEqual(findings, []);
+    } finally {
+      await cleanupRepo(dir);
+    }
+  });
+
+  it('catches a live reversion on a NON-ASCII path — porcelain C-quoting must decode, not leave escapes (2026-09-18 verifier finding)', async () => {
+    const dir = await initRepo();
+    try {
+      const name = 'फ़ाइल.txt';
+      const shaV0 = await commitFile(dir, name, 'v0\n', 'v0');
+      await commitFile(dir, name, 'v1\n', 'v1');
+      await writeFile(join(dir, name), 'v0\n'); // uncommitted live reversion
+
+      const findings = await detectDrift(dir);
+      assert.equal(findings.length, 1);
+      assert.equal(findings[0].path, name);
+      assert.equal(findings[0].ancestorSha, shaV0);
     } finally {
       await cleanupRepo(dir);
     }
@@ -239,6 +256,287 @@ describe('detectDrift', () => {
         () => detectDrift(dir, { gitRunner: failingRunner }),
         /git rev-list failed for a\.txt \(exit 128\)/
       );
+    } finally {
+      await cleanupRepo(dir);
+    }
+  });
+});
+
+describe('detectRangeDrift', () => {
+  it('reports exactly one finding with ancestorSha = the v0 commit when the range reverts to older-than-base content', async () => {
+    const dir = await initRepo();
+    try {
+      const shaV0 = await commitFile(dir, 'a.txt', 'v0\n', 'v0');
+      await commitFile(dir, 'a.txt', 'v1\n', 'v1');
+      git(dir, ['branch', 'base']);
+      await commitFile(dir, 'a.txt', 'v2\n', 'v2');
+      await commitFile(dir, 'a.txt', 'v0\n', 'revert to v0');
+
+      const result = await detectRangeDrift(dir, 'base');
+      assert.equal(result.baseSha, git(dir, ['rev-parse', 'base']).trim());
+      assert.equal(result.findings.length, 1);
+      assert.equal(result.findings[0].path, 'a.txt');
+      assert.equal(result.findings[0].kind, 'reverted-to-ancestor');
+      assert.equal(result.findings[0].ancestorSha, shaV0);
+    } finally {
+      await cleanupRepo(dir);
+    }
+  });
+
+  it('reports nothing when the range reverts to base content itself (HEAD==base ships nothing reverted)', async () => {
+    const dir = await initRepo();
+    try {
+      await commitFile(dir, 'a.txt', 'v0\n', 'v0');
+      await commitFile(dir, 'a.txt', 'v1\n', 'v1');
+      git(dir, ['branch', 'base']);
+      await commitFile(dir, 'a.txt', 'v2\n', 'v2');
+      await commitFile(dir, 'a.txt', 'v1\n', 'revert to v1 (= base content)');
+
+      const result = await detectRangeDrift(dir, 'base');
+      assert.deepEqual(result.findings, []);
+    } finally {
+      await cleanupRepo(dir);
+    }
+  });
+
+  it('reports nothing for a forward-only range (no ancestor match)', async () => {
+    const dir = await initRepo();
+    try {
+      await commitFile(dir, 'a.txt', 'v0\n', 'v0');
+      await commitFile(dir, 'a.txt', 'v1\n', 'v1');
+      git(dir, ['branch', 'base']);
+      await commitFile(dir, 'a.txt', 'v2 brand new\n', 'forward');
+
+      const result = await detectRangeDrift(dir, 'base');
+      assert.deepEqual(result.findings, []);
+    } finally {
+      await cleanupRepo(dir);
+    }
+  });
+
+  it('reports nothing for a file newly added in the range', async () => {
+    const dir = await initRepo();
+    try {
+      await commitFile(dir, 'a.txt', 'v1\n', 'v1');
+      git(dir, ['branch', 'base']);
+      await commitFile(dir, 'b.txt', 'new file\n', 'add b');
+
+      const result = await detectRangeDrift(dir, 'base');
+      assert.deepEqual(result.findings, []);
+    } finally {
+      await cleanupRepo(dir);
+    }
+  });
+
+  it('reports nothing for a file deleted in the range', async () => {
+    const dir = await initRepo();
+    try {
+      await commitFile(dir, 'a.txt', 'v1\n', 'v1');
+      await commitFile(dir, 'b.txt', 'b-v1\n', 'add b');
+      git(dir, ['branch', 'base']);
+      git(dir, ['rm', '-q', 'b.txt']);
+      git(dir, ['commit', '-q', '-m', 'delete b']);
+
+      const result = await detectRangeDrift(dir, 'base');
+      assert.deepEqual(result.findings, []);
+    } finally {
+      await cleanupRepo(dir);
+    }
+  });
+
+  it('misses an old reversion at maxCommits 3 but catches it at 50 (bounded scan)', async () => {
+    const dir = await initRepo();
+    try {
+      const shaOld = await commitFile(dir, 'a.txt', 'v-old\n', 'old');
+      for (let i = 0; i < 5; i++) {
+        await commitFile(dir, 'a.txt', `v${i}\n`, `v${i}`);
+      }
+      git(dir, ['branch', 'base']);
+      await commitFile(dir, 'a.txt', 'v-new\n', 'new');
+      await commitFile(dir, 'a.txt', 'v-old\n', 'revert to old');
+
+      const narrow = await detectRangeDrift(dir, 'base', { maxCommits: 3 });
+      assert.deepEqual(narrow.findings, []);
+
+      // Sanity: the same fixture DOES get flagged with a wide-enough window.
+      const wide = await detectRangeDrift(dir, 'base', { maxCommits: 50 });
+      assert.equal(wide.findings.length, 1);
+      assert.equal(wide.findings[0].ancestorSha, shaOld);
+    } finally {
+      await cleanupRepo(dir);
+    }
+  });
+
+  it('issues exactly 2 + 2 per-range-path + 1 per-rename git calls (merge-base + diff + rev-list/cat-file per path, extra rev-list per rename)', async () => {
+    const dir = await initRepo();
+    try {
+      const paths = ['a.txt', 'b.txt', 'c.txt'];
+      for (const p of paths) {
+        await commitFile(dir, p, `${p}-v1\n`, `${p} v1`);
+      }
+      await commitFile(dir, 'd.txt', 'd-v1\n', 'd v1');
+      git(dir, ['branch', 'base']);
+      for (const p of paths) {
+        await commitFile(dir, p, `${p}-v2\n`, `${p} v2`);
+      }
+      git(dir, ['mv', 'd.txt', 'e.txt']); // pure rename → R100 entry
+      git(dir, ['commit', '-q', '-m', 'rename d to e']);
+
+      let callCount = 0;
+      const countingRunner: GitRunner = async (repoRoot, args, input) => {
+        callCount++;
+        return defaultGitRunner(repoRoot, args, input);
+      };
+
+      const result = await detectRangeDrift(dir, 'base', { gitRunner: countingRunner });
+      assert.deepEqual(result.findings, []);
+      const rangePaths = 4; // a.txt, b.txt, c.txt modified + e.txt (rename new name)
+      const renames = 1;
+      assert.equal(callCount, 2 + 2 * rangePaths + renames);
+    } finally {
+      await cleanupRepo(dir);
+    }
+  });
+
+  it('throws fail-closed when merge-base cannot resolve the ref', async () => {
+    const dir = await initRepo();
+    try {
+      await commitFile(dir, 'a.txt', 'v1\n', 'v1');
+      await assert.rejects(
+        () => detectRangeDrift(dir, 'no-such-ref'),
+        /git merge-base failed \(no-such-ref\)/
+      );
+    } finally {
+      await cleanupRepo(dir);
+    }
+  });
+
+  it('throws fail-closed when the batched cat-file call fails — a broken batch read must never scan clean (2026-09-18 verifier finding)', async () => {
+    const dir = await initRepo();
+    try {
+      await commitFile(dir, 'a.txt', 'v1\n', 'v1');
+      git(dir, ['branch', 'base']);
+      await commitFile(dir, 'a.txt', 'v2\n', 'v2'); // a range path exists so cat-file IS invoked
+
+      const failingRunner: GitRunner = async (repoRoot, args, input) => {
+        if (args[0] === 'cat-file') {
+          return { stdout: Buffer.from(''), stderr: Buffer.from('simulated cat-file failure'), code: 128 };
+        }
+        return defaultGitRunner(repoRoot, args, input);
+      };
+      await assert.rejects(
+        () => detectRangeDrift(dir, 'base', { gitRunner: failingRunner }),
+        /git cat-file failed/
+      );
+      // And the same failure does NOT degrade into a clean scan on the live
+      // path either — needs a dirty file so a candidate reaches checkFileDrift.
+      await writeFile(join(dir, 'a.txt'), 'live edit\n');
+      await assert.rejects(
+        () => detectDrift(dir, { gitRunner: failingRunner }),
+        /git cat-file failed/
+      );
+    } finally {
+      await cleanupRepo(dir);
+    }
+  });
+
+  it('catches a reversion on a NON-ASCII path — the -z range diff must not C-quote it into invisibility (2026-09-18 verifier finding)', async () => {
+    const dir = await initRepo();
+    try {
+      const name = 'फ़ाइल.txt'; // C-quoted by core.quotepath in every un-flagged git listing
+      const shaV0 = await commitFile(dir, name, 'v0\n', 'v0');
+      await commitFile(dir, name, 'v1\n', 'v1');
+      git(dir, ['branch', 'base']);
+      await commitFile(dir, name, 'v2\n', 'v2');
+      await commitFile(dir, name, 'v0\n', 'revert to v0');
+
+      const result = await detectRangeDrift(dir, 'base');
+      assert.equal(result.findings.length, 1);
+      assert.equal(result.findings[0].path, name);
+      assert.equal(result.findings[0].ancestorSha, shaV0);
+    } finally {
+      await cleanupRepo(dir);
+    }
+  });
+
+  it('catches a rename+revert evasion: `git mv a→b` plus reverting content to a pre-base ancestor (name-only diff read this as delete+add — clean)', async () => {
+    const dir = await initRepo();
+    try {
+      const v0 = 'line1\nline2\nline3\nversion0\n';
+      const v1 = 'line1\nline2\nline3\nversion1\n';
+      const shaV0 = await commitFile(dir, 'a.txt', v0, 'v0');
+      await commitFile(dir, 'a.txt', v1, 'v1');
+      git(dir, ['branch', 'base']);
+      git(dir, ['mv', 'a.txt', 'b.txt']);
+      await writeFile(join(dir, 'b.txt'), v0); // revert under the new name
+      git(dir, ['add', 'b.txt']);
+      git(dir, ['commit', '-q', '-m', 'rename a to b + revert to v0']);
+
+      const result = await detectRangeDrift(dir, 'base');
+      assert.equal(result.findings.length, 1);
+      assert.equal(result.findings[0].path, 'b.txt');
+      assert.equal(result.findings[0].kind, 'reverted-to-ancestor');
+      assert.equal(result.findings[0].ancestorSha, shaV0);
+    } finally {
+      await cleanupRepo(dir);
+    }
+  });
+
+  it('reports nothing when a renamed file is edited FORWARD (content carried forward, not reverted)', async () => {
+    const dir = await initRepo();
+    try {
+      const v0 = 'line1\nline2\nline3\nversion0\n';
+      const v1 = 'line1\nline2\nline3\nversion1\n';
+      const v2 = 'line1\nline2\nline3\nversion2-forward\n';
+      await commitFile(dir, 'a.txt', v0, 'v0');
+      await commitFile(dir, 'a.txt', v1, 'v1');
+      git(dir, ['branch', 'base']);
+      git(dir, ['mv', 'a.txt', 'b.txt']);
+      await writeFile(join(dir, 'b.txt'), v2);
+      git(dir, ['add', 'b.txt']);
+      git(dir, ['commit', '-q', '-m', 'rename a to b + forward edit']);
+
+      const result = await detectRangeDrift(dir, 'base');
+      assert.deepEqual(result.findings, []);
+    } finally {
+      await cleanupRepo(dir);
+    }
+  });
+
+  it('reports nothing for a PURE rename (R100, content carried forward byte-identical) — the old-name base check keeps clean renames out of the findings', async () => {
+    const dir = await initRepo();
+    try {
+      const v1 = 'line1\nline2\nline3\nversion1\n';
+      await commitFile(dir, 'a.txt', v1, 'v1');
+      git(dir, ['branch', 'base']);
+      git(dir, ['mv', 'a.txt', 'b.txt']);
+      git(dir, ['commit', '-q', '-m', 'pure rename a to b']);
+
+      const result = await detectRangeDrift(dir, 'base');
+      assert.deepEqual(result.findings, []);
+    } finally {
+      await cleanupRepo(dir);
+    }
+  });
+
+  it('pins git -M behavior on a copy-without-deletion: a new file holding an OLDER blob of a surviving source reports A, not C — and scans clean', async () => {
+    const dir = await initRepo();
+    try {
+      const shaOld = await commitFile(dir, 'a.txt', 'alpha\nbeta\ngamma\nOLD\n', 'older');
+      await commitFile(dir, 'a.txt', 'alpha\nbeta\ngamma\nNEW\n', 'current');
+      git(dir, ['branch', 'base']);
+      const olderContent = git(dir, ['show', `${shaOld}:a.txt`]);
+      await commitFile(dir, 'b.txt', olderContent, 'add b = older a content');
+
+      // Pin: `-M` (verified against `git diff --name-status -z -M` on this fixture)
+      // reports the add as 'A' — copy detection only compares against the source's
+      // CURRENT blob, and a.txt survives at HEAD so nothing pairs as R or C. This
+      // copy-of-older-content-under-new-name evasion remains a documented edge.
+      const nameStatus = git(dir, ['diff', '--name-status', '-z', '-M', 'base', 'HEAD', '--']);
+      assert.equal(nameStatus, 'A\0b.txt\0');
+
+      const result = await detectRangeDrift(dir, 'base');
+      assert.deepEqual(result.findings, []);
     } finally {
       await cleanupRepo(dir);
     }

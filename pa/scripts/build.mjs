@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, writeFileSync, mkdirSync, copyFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
@@ -68,7 +68,15 @@ async function main() {
     });
   const run = async () => {
     const code = await spawnTsc();
-    if (code === 0) writeBuildStamp();
+    if (code === 0) {
+      // mcp/server.mjs is hand-written (not TypeScript) — tsc compiles
+      // mcp/tools.ts but never emits this file. `pa mcp serve` imports
+      // dist/mcp/server.mjs, so it must be copied on every successful build.
+      mkdirSync(join(pkgRoot, 'dist', 'mcp'), { recursive: true });
+      copyFileSync(join(pkgRoot, 'mcp', 'server.mjs'),
+                   join(pkgRoot, 'dist', 'mcp', 'server.mjs'));
+      writeBuildStamp();
+    }
     return code;
   };
   process.exit(await withBuildLockOrRun(repoRoot, 'pa', run));

@@ -23,8 +23,8 @@ You are the topic-brain writer — a nightly consolidation job that distills eac
 
 You invoke two deterministic Python scripts in sequence:
 
-1. **`python pa/scripts/topic_brains.py plan`** — reads the conversation archive (`~/.pa/conversation-history.jsonl`) and all active topic state files, produces a workplan at `~/.pa/topic-brains/.workplan.json` describing what needs to be updated.
-2. **`python pa/scripts/topic_brains.py finalize`** — ingests any brain files you wrote, updates the INDEX.md registry, and writes an audit entry.
+1. **`python3 pa/scripts/topic_brains.py plan`** (Windows fallback: `python3 pa/scripts/topic_brains.py plan`) — reads the conversation archive (`~/.pa/conversation-history.jsonl`) and all active topic state files, produces a workplan at `~/.pa/topic-brains/.workplan.json` describing what needs to be updated.
+2. **`python3 pa/scripts/topic_brains.py finalize`** (Windows fallback: `python3 pa/scripts/topic_brains.py finalize`) — ingests any brain files you wrote, updates the INDEX.md registry, and writes an audit entry.
 
 Both scripts honor `PA_HOME` if set (use the framework root as cwd, so `~/.pa` resolves correctly).
 
@@ -33,7 +33,7 @@ Both scripts honor `PA_HOME` if set (use the framework root as cwd, so `~/.pa` r
 ### 1. Run the planner
 
 ```bash
-python pa/scripts/topic_brains.py plan
+python3 pa/scripts/topic_brains.py plan
 ```
 
 Read `~/.pa/topic-brains/.workplan.json` (if `PA_HOME` is set, read from `$PA_HOME/.topic-brains/.workplan.json` instead).
@@ -112,7 +112,7 @@ Genuine contradictions (same fact stated differently) route via the `conflict` f
 ### 5. Finalize
 
 ```bash
-python pa/scripts/topic_brains.py finalize
+python3 pa/scripts/topic_brains.py finalize
 ```
 
 Review its printed summary (stamps, folds, INDEX, conflicts) and report:

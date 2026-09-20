@@ -177,6 +177,16 @@ describe('sendMessageWithKeyboard', () => {
     assert.equal(body.reply_to_message_id, 99);
     assert.equal(id, 55);
   });
+
+  it('retries a 429 and returns the success message_id (2026-09-12 unification — previously returned null with no retry)', async () => {
+    const calls = setupFetchMock([
+      { ok: false, status: 429, bodyText: JSON.stringify({ ok: false, parameters: { retry_after: 1 } }) },
+      { ok: true, bodyJson: { ok: true, result: { message_id: 88 } } },
+    ]);
+    const id = await sendMessageWithKeyboard('token', 123, 'hello', KB);
+    assert.equal(calls.length, 2, 'first POST hits the rate limit, second is the retry');
+    assert.equal(id, 88, 'returns the retry message_id');
+  });
 });
 
 describe('editMessageText — reply_markup passthrough (P1d)', () => {
@@ -291,17 +301,23 @@ describe('sendMessageWithKeyboardDetailed + isTerminalChatError (AI-186, widened
   });
 
   it('detailed send: 500 failure → terminalError false', async () => {
+    // 2026-09-12 unification: this path now goes through the shared sendChunked
+    // core's postSendMessageWithRetries, which retries 5xx up to 3 times (the
+    // gap this unification closes — previously this send had no 429/5xx retry
+    // at all, hence the old expectation of exactly 1 call).
     const calls = setupFetchMock([{ ok: false, status: 500, bodyText: 'Internal Server Error' }]);
     const r = await sendMessageWithKeyboardDetailed('token', 123, 'hello', KB);
-    assert.equal(calls.length, 1);
+    assert.equal(calls.length, 3, '5xx now retries up to 3 times (2026-09-12 unification)');
     assert.equal(r.messageId, null);
     assert.equal(r.terminalError, false, '5xx is transient, never terminal');
   });
 
   it('detailed send: network error → terminalError false', async () => {
+    // Same 2026-09-12 unification note as the 500 case above: network errors
+    // now retry up to 3 times via postSendMessageWithRetries.
     const calls = setupFetchMock([{ ok: false, throwError: new Error('ECONNRESET') }]);
     const r = await sendMessageWithKeyboardDetailed('token', 123, 'hello', KB);
-    assert.equal(calls.length, 1);
+    assert.equal(calls.length, 3, 'network errors now retry up to 3 times (2026-09-12 unification)');
     assert.equal(r.messageId, null);
     assert.equal(r.terminalError, false, 'network errors are transient');
   });

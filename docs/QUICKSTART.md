@@ -11,7 +11,7 @@ New here? [`docs/FEATURES.md`](FEATURES.md) is the one-screen inventory of every
 - **Node.js 22+** (the framework uses ES modules with Node native test runner).
 - **Python 3.11+** (only if you'll use Python-based skills like the sample `daily-mail-brief`).
 - **PowerShell 7+** on Windows. On Linux/macOS any POSIX shell (bash/zsh) is sufficient — no PowerShell needed.
-- **systemd** on Linux (for `/keepawake` and the recommended bot supervisor). Not required if you use a non-systemd distro, but those features will be unavailable.
+- **systemd** on Linux (for the recommended bot supervisor). Not required if you use a non-systemd distro, but supervised auto-restart will be unavailable.
 - **At least one LLM CLI** in your PATH:
   - [Claude Code](https://github.com/anthropics/claude-code) (`claude`)
   - [OpenAI Codex](https://github.com/openai/codex) (`codex`)
@@ -235,12 +235,12 @@ node pa/dist/bin/pa.js schedules sync
 
 Works on all platforms:
 
-- **Windows**: registers `PA-Catchup` and `PA-Catchup-Reminders` in Windows Task Scheduler (runs via a hidden VBScript wrapper every minute).
-- **macOS / Linux**: upserts two entries into your user crontab (`crontab -l` / `crontab <file>`): both `PA-Catchup` and `PA-Catchup-Reminders` fire every minute (matches the Windows cadence — `pa catchup` is lock-guarded, so the tighter interval just catches overdue skills sooner, it doesn't duplicate runs).
+- **Windows**: registers one `PA-Catchup` task in Windows Task Scheduler. Every minute its hidden VBScript launcher starts `pa catchup --loop` when it is not running, and restarts it when its progress stamps go stale.
+- **macOS / Linux**: upserts one `PA-Catchup` crontab entry that runs a generated watchdog script every minute with the same start-or-restart logic.
 
-**Running a second install?** Task/cron names are only the plain `PA-Catchup`/`PA-Catchup-Reminders` when `PA_HOME` resolves to the default `~/.pa` (whether left unset, or explicitly set to that same path). Any OTHER resolved `PA_HOME` (see [`docs/CONFIGURATION.md`](CONFIGURATION.md#pa_home-env-var) — testing, a second personal/work instance, containers) gets a short hash suffix unique to that path instead, so two installs on the same OS user account never overwrite each other's schedule. Use `pa schedules list` to see the exact name your install actually registered.
+**Running a second install?** The task/cron name is the plain `PA-Catchup` only when `PA_HOME` resolves to the default `~/.pa` (whether left unset, or explicitly set to that same path). Any OTHER resolved `PA_HOME` (see [`docs/CONFIGURATION.md`](CONFIGURATION.md#pa_home-env-var) — testing, a second personal/work instance, containers) gets a short hash suffix unique to that path instead, so two installs on the same OS user account never overwrite each other's schedule. Use `pa schedules list` to see the exact name your install actually registered.
 
-The catchup task runs `pa catchup`, which iterates overdue skills and fires them.
+The loop checks for overdue skills every minute and fires them (details: `docs/catchup-watchdog.md`).
 
 > **macOS / Linux cron PATH note:** cron runs with a minimal `PATH`. If `pa` isn't in `/usr/bin` or `/usr/local/bin`, the cron entry may fail silently. Run `which pa` to see the resolved path — `pa schedules sync` uses that full path in the registered cron lines. If `pa` isn't on `PATH` at all, install it globally (`npm install -g .` inside `pa/`) before syncing — `pa schedules sync` fails loud (prints an actionable error and exits non-zero) rather than registering a task/cron entry pointed at a bare `pa` that could never resolve. **Windows** has the identical PATH requirement: run `npm install -g .` inside `pa\` first, or `pa schedules sync` fails loud there too instead of silently registering a broken hourly-forever task.
 

@@ -21,6 +21,7 @@
  * 'test-worker-rl' appears only as the unknown-name failover TARGET; no real
  * claude/agy cooldown state is ever touched.
  */
+import './test-env-guard.js';
 import { describe, it, before, after, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, readFile, mkdir } from 'fs/promises';
@@ -51,6 +52,7 @@ after(async () => {
 // Dynamic imports after PA_HOME is set (dispatch-error-paths.test.ts pattern).
 const { dispatchOrchestratorTurn } = await import('../orchestrator.js');
 const { cwdToClaudeProjectDir } = await import('../session.js');
+const { clearRateLimitCache, NO_WORKERS_AVAILABLE_ERROR } = await import('../../../../pa/dist/src/workers.js');
 
 /** One retry-exhausted 429 api_error line — pa's classifier reads exactly this
  *  shape (type:system + subtype:api_error + error.status 429) and extracts the
@@ -275,5 +277,63 @@ describe('orchestrator lane rate-limit gain (AI-173 phase 3)', () => {
     assert.ok(dr.response.includes('orchestrator reply'));
     assert.deepEqual(await readLedger(), {}, 'no ledger write on success');
     assert.equal(existsSync(join(evidenceDir, 's-1.jsonl')), false, 'no evidence was seeded in this case');
+  });
+
+  it('OR-T5: the failover\'s rate-limit verdict surfaces as rateLimitedWorker', async () => {
+    // session: undefined → straight to the failover leg. The seam fires the
+    // exact payload runWithFailover emits on a rate-limit hop; the cascade's
+    // onWorkerSwitch wrapper must observe that verdict itself (nothing else
+    // classifies on this leg — there is no second tryClassifyAndNotify).
+    const dr = await dispatchOrchestratorTurn(baseArgs({
+      topicState: makeState({ session: undefined }),
+      failover: async (_prompt: string, opts: any) => {
+        await opts.onWorkerSwitch?.({ from: 'test-worker-rl', to: null, kind: 'rate-limit', reasonText: 'usage limit', minutes: 300, classification: 'usage-limit', source: 'session' });
+        return { worker: 'test-worker-rl', result: { success: false, output: '', error: 'exhausted', exitCode: 1 } as any };
+      },
+    }));
+
+    assert.equal(dr.rateLimitedWorker, 'test-worker-rl');
+    assert.equal(dr.workerError, true);
+  });
+
+  it('OR-T6: a non-rate-limit verdict leaves rateLimitedWorker undefined', async () => {
+    // Control that can fail: identical seam, but the hop verdict is a plain
+    // failure — the wrapper must NOT seed rateLimitedWorker from it.
+    const dr = await dispatchOrchestratorTurn(baseArgs({
+      topicState: makeState({ session: undefined }),
+      failover: async (_prompt: string, opts: any) => {
+        await opts.onWorkerSwitch?.({ from: 'test-worker-rl', to: null, kind: 'failure', reasonText: 'usage limit', minutes: 300, classification: 'usage-limit', source: 'session' });
+        return { worker: 'test-worker-rl', result: { success: false, output: '', error: 'exhausted', exitCode: 1 } as any };
+      },
+    }));
+
+    assert.equal(dr.rateLimitedWorker, undefined);
+  });
+
+  it('OR-T7: a zero-attempt all-cooling failover seeds rateLimitedWorker', async () => {
+    // The "all workers rate-limited" dead-end: the failover returns
+    // NO_WORKERS_AVAILABLE_ERROR having made ZERO attempts, so nothing was
+    // classified and no verdict fires. Seed a future cooldown for BOTH config
+    // workers — the clause must seed the ladder from the cooldown state,
+    // picking the first cooling candidate in config order ('claude').
+    const now = new Date();
+    const entry = { cooldown_until: new Date(now.getTime() + 3_600_000).toISOString(), last_event: now.toISOString(), reason: 'usage limit' };
+    writeFileSync(
+      join(testDir, 'rate-limit-state.json'),
+      JSON.stringify({ claude: entry, 'test-worker-rl': { ...entry } }),
+      'utf8'
+    );
+    // The mtime-keyed cache can otherwise serve the pre-write {} on a coarse clock.
+    clearRateLimitCache();
+
+    const dr = await dispatchOrchestratorTurn(baseArgs({
+      topicState: makeState({ session: undefined }),
+      failover: async () => ({
+        worker: 'none',
+        result: { success: false, output: '', error: NO_WORKERS_AVAILABLE_ERROR, exitCode: -1 } as any,
+      }),
+    }));
+
+    assert.equal(dr.rateLimitedWorker, 'claude');
   });
 });

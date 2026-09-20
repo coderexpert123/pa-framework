@@ -1,0 +1,26 @@
+{
+  "name": "voice-inbox",
+  "version": "1.0.0",
+  "description": "Voice inbox PWA + API for pa — typed input widgets and telemetry over a tenant-scoped task ledger",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "dev": "tsc --watch",
+    "test": "node scripts/run-tests.mjs",
+    "test:quarantined": "node scripts/run-tests.mjs --quarantined"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.11.1",
+    "proper-lockfile": "^4.1.2",
+    "yaml": "^2.9.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.0.0",
+    "@types/proper-lockfile": "^4.1.4",
+    "typescript": "^5.7.0"
+  }
+}

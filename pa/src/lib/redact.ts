@@ -8,9 +8,10 @@
  * - Zero false positives on ordinary prose is the bar — when unsure, do not match
  */
 
-import { existsSync } from 'fs';
+import { existsSync, readdirSync } from 'fs';
 import { paHome } from '../paths.js';
 import { readFileSync } from 'fs';
+import { join } from 'path';
 
 interface SecretPattern {
   name: string;
@@ -53,6 +54,75 @@ const GENERIC_PATTERNS: Array<{name: string, regex: RegExp}> = [
 ];
 
 /**
+ * Recursively collect string leaf values out of a parsed JSON value, at any
+ * nesting depth (auth broker Phase A, 2026-09-10 — D-E11).
+ */
+function collectStringLeaves(value: unknown, out: string[]): void {
+  if (typeof value === 'string') {
+    out.push(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectStringLeaves(item, out);
+    return;
+  }
+  if (value !== null && typeof value === 'object') {
+    for (const v of Object.values(value as Record<string, unknown>)) {
+      collectStringLeaves(v, out);
+    }
+  }
+}
+
+/** Every failure (missing file, unreadable, torn JSON) is swallowed — same
+ * degrade-silently contract as the missing-secrets.env path below. */
+function addPatternsFromJsonFile(patterns: SecretPattern[], filePath: string, name: string): void {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(filePath, 'utf8'));
+    const leaves: string[] = [];
+    collectStringLeaves(parsed, leaves);
+    for (const value of leaves) {
+      if (value.length >= 8) {
+        const escapedValue = value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        patterns.push({ name, value, pattern: new RegExp(escapedValue, 'g') });
+      }
+    }
+  } catch {
+    // Torn/unparseable/unreadable token file — never let one bad file break
+    // redaction for everything else.
+  }
+}
+
+/**
+ * Stored provider tokens under `~/.pa/auth/*.json` (auth broker Phase A,
+ * 2026-09-10 — D-E11, C7(b)): `requests/` (broker-private, short-lived
+ * handoff rows) and `standing.json` (no token material) are excluded by
+ * construction — the former because `entry.isFile()` skips directories, the
+ * latter by name. `~/.pa/google-token.json` is included too, so a stored
+ * refresh/access token can never reach a log line.
+ */
+function loadAuthTokenPatterns(patterns: SecretPattern[]): void {
+  try {
+    const authDirPath = join(paHome(), 'auth');
+    if (existsSync(authDirPath)) {
+      for (const entry of readdirSync(authDirPath, { withFileTypes: true })) {
+        if (!entry.isFile()) continue;
+        if (!entry.name.endsWith('.json')) continue;
+        if (entry.name === 'standing.json') continue;
+        const basename = entry.name.slice(0, -'.json'.length);
+        addPatternsFromJsonFile(patterns, join(authDirPath, entry.name), `auth:${basename}`);
+      }
+    }
+  } catch {
+    // auth dir unreadable — degrade silently, same contract as above.
+  }
+
+  const googleTokenPath = join(paHome(), 'google-token.json');
+  if (existsSync(googleTokenPath)) {
+    addPatternsFromJsonFile(patterns, googleTokenPath, 'auth:google-token');
+  }
+}
+
+/**
  * Load secret patterns from secrets.env once per process.
  * Only values >= 8 chars are considered, sorted longest-first.
  */
@@ -64,56 +134,55 @@ function loadSecretPatterns(): SecretPattern[] {
   const secretsPath = `${paHome()}/secrets.env`;
   const patterns: SecretPattern[] = [];
 
-  if (!existsSync(secretsPath)) {
-    cachedSecrets = patterns;
-    return patterns;
-  }
+  if (existsSync(secretsPath)) {
+    try {
+      const content = readFileSync(secretsPath, 'utf8');
+      const lines = content.split('\n');
 
-  try {
-    const content = readFileSync(secretsPath, 'utf8');
-    const lines = content.split('\n');
+      for (const line of lines) {
+        const trimmed = line.trim();
+        // Skip empty lines, comments, and lines without '='
+        if (!trimmed || trimmed.startsWith('#') || !trimmed.includes('=')) {
+          continue;
+        }
 
-    for (const line of lines) {
-      const trimmed = line.trim();
-      // Skip empty lines, comments, and lines without '='
-      if (!trimmed || trimmed.startsWith('#') || !trimmed.includes('=')) {
-        continue;
+        const eqIndex = trimmed.indexOf('=');
+        const name = trimmed.slice(0, eqIndex).trim();
+        let value = trimmed.slice(eqIndex + 1).trim();
+
+        // Remove quotes if present
+        if ((value.startsWith('"') && value.endsWith('"')) ||
+            (value.startsWith("'") && value.endsWith("'"))) {
+          value = value.slice(1, -1);
+        }
+
+        // Only consider values >= 8 chars
+        if (value.length >= 8) {
+          // Escape special regex characters in the value for safe pattern matching
+          const escapedValue = value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          patterns.push({
+            name,
+            value,
+            pattern: new RegExp(escapedValue, 'g')
+          });
+        }
       }
-
-      const eqIndex = trimmed.indexOf('=');
-      const name = trimmed.slice(0, eqIndex).trim();
-      let value = trimmed.slice(eqIndex + 1).trim();
-
-      // Remove quotes if present
-      if ((value.startsWith('"') && value.endsWith('"')) ||
-          (value.startsWith("'") && value.endsWith("'"))) {
-        value = value.slice(1, -1);
-      }
-
-      // Only consider values >= 8 chars
-      if (value.length >= 8) {
-        // Escape special regex characters in the value for safe pattern matching
-        const escapedValue = value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        patterns.push({
-          name,
-          value,
-          pattern: new RegExp(escapedValue, 'g')
-        });
-      }
+    } catch (err) {
+      // If we fail to read secrets.env, log a warning but continue
+      console.warn('[redact] Failed to load secrets.env, redaction will be incomplete:', err);
     }
-
-    // Sort by value length descending to prevent substring overlaps
-    // (longer values get replaced first)
-    patterns.sort((a, b) => b.value.length - a.value.length);
-
-    cachedSecrets = patterns;
-    return patterns;
-  } catch (err) {
-    // If we fail to read secrets.env, log a warning but continue
-    console.warn('[redact] Failed to load secrets.env, redaction will be incomplete:', err);
-    cachedSecrets = patterns;
-    return patterns;
   }
+
+  // Stored auth-broker tokens (D-E11) — additive, regardless of whether
+  // secrets.env exists or parsed cleanly.
+  loadAuthTokenPatterns(patterns);
+
+  // Sort by value length descending to prevent substring overlaps
+  // (longer values get replaced first)
+  patterns.sort((a, b) => b.value.length - a.value.length);
+
+  cachedSecrets = patterns;
+  return patterns;
 }
 
 /**

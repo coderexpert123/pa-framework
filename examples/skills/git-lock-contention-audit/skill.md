@@ -10,7 +10,7 @@ When the `commit` skill is repeatedly skipped on `git-workflow` lock contention,
 
 ## Step 1 — Skip census (last 14 days)
 
-Scan `$PA_HOME/app.log.jsonl` (fallback `~/.pa/app.log.jsonl`) plus any rotated `-app.log.jsonl` shards under `$PA_HOME/archive/` (fallback `~/.pa/archive/`) for `git-workflow` lock events and `Skipped` / `lock busy` outcomes. Use python with explicit `encoding='utf-8'` on every open. Extract per skip event: timestamp (UTC and IST), the skill that was skipped, wait seconds, and refId.
+Scan `$PA_HOME/app.log.jsonl` (fallback `~/.pa/app.log.jsonl`) plus any rotated `-app.log.jsonl` shards under `$PA_HOME/archive/` (fallback `~/.pa/archive/`) for `git-workflow` lock events and `Skipped` / `lock busy` outcomes. Use python3 (Windows: `python`) with explicit `encoding='utf-8'` on every open. Extract per skip event: timestamp (UTC and IST), the skill that was skipped, wait seconds, and refId.
 
 ## Step 2 — Holder attribution
 

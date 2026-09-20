@@ -1,0 +1,1227 @@
+/* Voice Inbox PWA — two colour schemes that follow the device's light or dark
+   setting (prefers-color-scheme), in CSS alone, with no manual toggle
+   (operator decision 2026-09-16; supersedes the 2026-09-08 one-scheme rule).
+   Every colour is a token declared in the two blocks below: the dark scheme
+   is the :root default and the light scheme overrides it inside one media
+   query. Outside those two blocks nothing in public/ names a colour: rules
+   use var(--token), currentColor or transparent, and icons take currentColor
+   plus a tone-* class (theme-tokens.test.ts and theme-icons.test.ts fail on
+   any literal). Roles: surfaces (ground, raised, raised-hover), text (ink,
+   dim, faint), lines (ring = control borders, hairline = separators), the
+   accent as a fill (accent + on-accent) and as text, strokes and small
+   indicators (accent-ink + on-accent-ink), translucent accent tints, the
+   modal scrim, and a violet multiselect accent (select + select-glow +
+   select-tint — the treat cross-and-multiselect reads differently from the
+   golden ready cue). Served under default-src 'self', so no web font is reachable —
+   the system stack is the design, not a fallback. */
+
+:root {
+  --ground:             oklch(0.18 0.012 250);
+  --raised:             oklch(0.235 0.014 250);
+  --raised-hover:       oklch(0.285 0.014 250);
+  --ink:                oklch(0.95 0.008 250);
+  --dim:                oklch(0.81 0.012 250);
+  --faint:              oklch(0.71 0.012 250);
+  --ring:               oklch(0.56 0.014 250);
+  --hairline:           oklch(0.33 0.012 250);
+  --accent:             oklch(0.8 0.145 82);
+  --on-accent:          oklch(0.2 0.03 75);
+  --accent-ink:         oklch(0.83 0.13 85);
+  --on-accent-ink:      oklch(0.18 0.012 250);
+  --accent-tint-soft:   color-mix(in oklch, var(--accent) 7%, transparent);
+  --accent-tint:        color-mix(in oklch, var(--accent) 20%, transparent);
+  --accent-tint-hover:  color-mix(in oklch, var(--accent) 14%, transparent);
+  --accent-tint-active: color-mix(in oklch, var(--accent) 24%, transparent);
+  --accent-glow:        color-mix(in oklch, var(--accent) 30%, transparent);
+  --select:             oklch(0.72 0.13 295);
+  --select-glow:        color-mix(in oklch, var(--select) 30%, transparent);
+  --select-tint:        color-mix(in oklch, var(--select) 8%, transparent);
+  --scrim:              oklch(0.18 0.012 250);
+  --scrim-alpha:        0.72;
+  --pad:    24px;
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --ground:             oklch(0.99 0.002 250);
+    --raised:             oklch(0.94 0.006 250);
+    --raised-hover:       oklch(0.9 0.008 250);
+    --ink:                oklch(0.22 0.015 250);
+    --dim:                oklch(0.4 0.015 250);
+    --faint:              oklch(0.49 0.013 250);
+    --ring:               oklch(0.58 0.013 250);
+    --hairline:           oklch(0.88 0.008 250);
+    --accent:             oklch(0.8 0.155 80);
+    --on-accent:          oklch(0.24 0.04 70);
+    --accent-ink:         oklch(0.49 0.105 70);
+    --on-accent-ink:      oklch(0.99 0.002 250);
+    --accent-tint-soft:   color-mix(in oklch, var(--accent) 10%, transparent);
+    --accent-tint:        color-mix(in oklch, var(--accent) 22%, transparent);
+    --accent-tint-hover:  color-mix(in oklch, var(--accent) 26%, transparent);
+    --accent-tint-active: color-mix(in oklch, var(--accent) 32%, transparent);
+    --accent-glow:        color-mix(in oklch, var(--accent) 55%, transparent);
+    --select:             oklch(0.5 0.13 295);
+    --select-glow:        color-mix(in oklch, var(--select) 50%, transparent);
+    --select-tint:        color-mix(in oklch, var(--select) 12%, transparent);
+    --scrim:              oklch(0.22 0.015 250);
+    --scrim-alpha:        0.4;
+    color-scheme: light;
+  }
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+
+body {
+  /* Copyability (vi-35a4487d5c04): an explicit selectable-by-default policy —
+     no container default (TWA vs WebView fallback) may silently block
+     selection. .mic-btn below keeps its own user-select: none override. */
+  -webkit-user-select: text;
+  user-select: text;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-size: 17px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  min-height: 100vh;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent-ink);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Skip link (U11): visually hidden until focused, then slides in from the
+   top so keyboard users can jump past the topbar straight to the content. */
+.skip-link {
+  position: absolute; top: -40px; left: 0;
+  background: var(--accent); color: var(--on-accent);
+  padding: 8px 16px; border-radius: 0 0 8px 0;
+  font-size: 14px; font-weight: 600; text-decoration: none;
+  z-index: 100; transition: top 0.15s ease;
+}
+.skip-link:focus { top: 0; }
+
+.view-root { padding-bottom: calc(96px + env(safe-area-inset-bottom, 0px)); } /* clears the one-row footer */
+.view-root.compact-footer { padding-bottom: calc(72px + env(safe-area-inset-bottom, 0px)); }
+
+/* Desktop constraint (R1): center the main content column on wide screens —
+   680px keeps text lines near 80 characters at the 17px base size. */
+#view-root { max-width: 680px; margin: 0 auto; }
+#share-container { max-width: 680px; margin: 0 auto; }
+
+/* --- text roles (§4) ------------------------------------------------------ */
+.answer { font-size: 17px; line-height: 1.55; color: var(--ink); text-wrap: pretty; margin: 0; }
+.answer strong, .answer-list strong { font-weight: 600; color: var(--ink); }
+.answer a, .answer-list a { color: var(--accent-ink); text-decoration: underline; }
+.answer-list {
+  margin: 0; padding-left: 22px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.answer-list li { font-size: 17px; line-height: 1.55; color: var(--ink); text-wrap: pretty; }
+.answer-list li::marker { color: var(--dim); }
+.answer-pre {
+  font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace;
+  font-size: 14px; line-height: 1.5; color: var(--ink);
+  background: var(--raised); border-radius: 8px;
+  padding: 12px; margin: 0; overflow-x: auto; white-space: pre;
+}
+.answer-table { display: block; overflow-x: auto; width: 100%; border-collapse: collapse; font-size: 15px; }
+.answer-table th, .answer-table td {
+  border: 1px solid var(--hairline); padding: 8px; text-align: left;
+}
+.answer-table th { color: var(--dim); font-weight: 600; }
+.answer-table td { color: var(--ink); }
+/* Phone card transform (answer presentation P0): on narrow screens each row
+   becomes a card whose cells read "Label: value" via the td's data-label.
+   Border/label colors reuse the existing table border tone and --dim. */
+@media (max-width: 680px) {
+  .answer-table thead { display: none; }
+  .answer-table, .answer-table tbody, .answer-table tr, .answer-table td { display: block; }
+  .answer-table tr { margin-bottom: 12px; border: 1px solid var(--hairline); border-radius: 8px; padding: 8px; }
+  .answer-table td { padding: 4px 0; border: none; text-align: left; }
+  .answer-table td[data-label]::before { content: attr(data-label) ": "; font-weight: 600; color: var(--dim); }
+}
+.struct-item { margin: 12px 0; padding: 8px 0; border-top: 1px solid var(--ring); }
+.struct-attrs { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; margin: 4px 0; }
+.struct-attrs dt { font-weight: 600; color: var(--dim); }
+.struct-attrs dd { margin: 0; }
+/* --- comparison renderer (answer presentation P2) ------------------------- */
+/* One DOM, two layouts: the grid is the base (desktop), the phone override at
+   the bottom of this block turns it into a swipe row. `.cmp-swipe` is a COUNT
+   modifier the renderer adds at 3+ items (two cards read better stacked than as
+   a snap row) — it changes no markup and nothing on desktop. */
+.cmp-cards {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 12px; align-items: stretch;
+  margin: 12px 0 0 0; padding: 0;
+}
+.cmp-card {
+  display: flex; flex-direction: column; gap: 10px; min-width: 0;
+  background: var(--raised); border: 1px solid var(--ring); border-radius: 12px;
+  padding: 12px 14px;
+}
+.cmp-name { font-size: 17px; line-height: 1.35; color: var(--ink); margin: 0; }
+.cmp-attrs {
+  display: grid; grid-template-columns: max-content 1fr;
+  gap: 4px 12px; margin: 0;
+}
+.cmp-attrs dt { font-weight: 600; color: var(--dim); font-size: 15px; }
+.cmp-attrs dd { margin: 0; font-size: 15px; line-height: 1.45; color: var(--ink); }
+/* Attribute values run through renderLines(), so a bare URL becomes a real
+   link — it needs the answer link colour, not the UA default blue. */
+.cmp-attrs a { color: var(--accent-ink); text-decoration: underline; }
+.cmp-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: auto; padding-top: 2px; }
+/* The action anchors reuse .act/.act-quiet; an <a> needs an explicit flex box
+   (min-height does not apply to inline elements) and no underline. */
+a.cmp-act, button.cmp-act {
+  display: inline-flex; align-items: center; justify-content: center;
+  text-decoration: none;
+}
+/* Action controls sit on --raised cards and .act-quiet is also --raised, so
+   without a border the control's shape is invisible and it reads as plain
+   text (operator report 2026-09-16: purchase buttons not recognisably
+   clickable). An accent outline makes every structured-answer action read
+   as tappable; the accent matches the answer chips. Compound selectors
+   (.act.cmp-act, 0-2-0) rather than bare .cmp-act (0-1-0): .act and
+   .act-quiet are declared later in this file at equal bare specificity, so
+   a bare .cmp-act rule here would lose the cascade regardless of source
+   position — the compound selector wins on specificity, not file order. */
+.act.cmp-act {
+  background: transparent;
+  border: 1px solid var(--accent-ink);
+  color: var(--accent-ink);
+  font-weight: 600;
+  gap: 6px;
+}
+.act.cmp-act:hover, .act.cmp-act:focus-visible { background: var(--accent-tint-hover); }
+.act.cmp-act:active { background: var(--accent-tint-active); }
+.act.cmp-act:focus-visible { outline: 2px solid var(--accent-ink); outline-offset: 2px; }
+a.cmp-act[target="_blank"]::after { content: "\2197"; font-size: 0.9em; line-height: 1; }
+.cmp-lead { font-size: 17px; line-height: 1.55; color: var(--ink); text-wrap: pretty; margin: 0; }
+@media (max-width: 680px) {
+  .cmp-cards { display: flex; flex-direction: column; gap: 12px; }
+  .cmp-cards.cmp-swipe {
+    flex-direction: row; overflow-x: auto;
+    scroll-snap-type: x mandatory; padding-bottom: 4px;
+  }
+  .cmp-cards.cmp-swipe .cmp-card { flex: 0 0 85%; scroll-snap-align: center; }
+}
+/* Raw-html lane: fixed generous height, scroll happens INSIDE the frame; the
+   frame canvas stays transparent so the app surface shows through (the
+   frame's own base style sets color-scheme + transparent document). */
+.answer-raw-frame {
+  width: 100%; height: 260px; border: none; border-radius: 8px;
+  background: transparent;
+}
+.copy-answer { align-self: flex-start; }
+.said   { font-size: 16px; line-height: 1.45; color: var(--ink); font-weight: 500; text-wrap: pretty; }
+.ask    { font-size: 14px; line-height: 1.35; color: var(--dim); font-weight: 500; }
+.title  { font-size: 22px; line-height: 1.25; color: var(--ink); font-weight: 600; text-wrap: pretty; margin: 0; }
+.state  { font-size: 13px; line-height: 1; color: var(--dim); font-weight: 500; white-space: nowrap; }
+.state-you { color: var(--accent-ink); }
+.meta   { font-size: 13px; line-height: 1; color: var(--faint); }
+.quiet  { color: var(--dim); }
+.faded  { color: var(--faint); }
+
+.row-time-chips { display: inline-flex; align-items: center; gap: 8px; }
+.time-chip { display: inline-flex; align-items: center; gap: 3px; }
+.time-chip svg { flex: none; }
+
+.clamp1 { display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; }
+.clamp2 { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.clamp3 { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+
+/* --- top bar -------------------------------------------------------------- */
+/* #list-topbar-slot (app.js) is a bare JS re-render target wrapping only
+   .topbar, with no CSS sizing of its own — its box is exactly as tall as
+   .topbar. That makes it .topbar's sticky containing block with zero spare
+   height, so position:sticky has no room to hold .topbar in place: the
+   instant the page scrolls at all, the "stuck" position is clamped back to
+   the normal, scrolled-away flow position (verified: topbarRect.top tracked
+   -scrollY exactly instead of clamping to 0). display:contents removes the
+   slot's own box so .topbar's containing block becomes the real page-height
+   ancestor around it, restoring the slack sticky positioning needs.
+   Regression, vi-39dd908f1ffd: this is why the "In progress"/"Ready"/"Done"
+   list-block headers (sticky at top:68px, right below .topbar) showed a
+   sliver of scrolled-past row content above them — that band was never
+   actually covered by .topbar once you scrolled past 68px. */
+#list-topbar-slot { display: contents; }
+.topbar {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  min-height: 44px; padding: 16px var(--pad);
+  /* Persistently visible (operator ask, 2026-09-12): Dashboard + Sign out
+     live here, so the bar itself must survive scrolling a long list, not
+     just exist at render time. */
+  position: sticky; top: 0; z-index: 3;
+  background: var(--ground);
+}
+.topbar-left {
+  display: inline-flex; align-items: center; gap: 8px; min-width: 0;
+}
+/* Brand lockup (mic-glyph task, 2026-09-13): mic mark + name as one row in
+   the topbar AND on the login title. min-width:0 keeps the topbar title's
+   ellipsis working inside this flex row when the name runs long. */
+.brand {
+  display: inline-flex; align-items: center; gap: 8px; min-width: 0;
+}
+.topbar-title {
+  font-size: 15px; font-weight: 600; letter-spacing: 0.01em; color: var(--dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.topbar-actions {
+  display: inline-flex; align-items: center; gap: 8px; flex-shrink: 0;
+}
+.topbar-btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  min-height: 40px; padding: 0 10px;
+  border-radius: 8px;
+  background: var(--raised);
+  border: 1px solid var(--ring);
+  color: var(--ink);
+  font: inherit; font-size: 13px; font-weight: 500;
+  cursor: pointer; white-space: nowrap; text-decoration: none;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+.topbar-btn:hover {
+  background: var(--raised-hover);
+  border-color: var(--accent-ink);
+  color: var(--accent-ink);
+}
+.topbar-btn.active {
+  background: var(--accent);
+  color: var(--on-accent);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+.back {
+  display: inline-flex; align-items: center; gap: 8px;
+  min-height: 44px; padding: 0 8px; margin-left: -8px;
+  background: none; border: 0; cursor: pointer; font: inherit;
+  font-size: 15px; font-weight: 600; color: var(--dim);
+}
+@media (max-width: 420px) {
+  .topbar {
+    padding-left: 14px;
+    padding-right: 14px;
+    gap: 8px;
+  }
+  .topbar-btn {
+    padding: 0 8px;
+    gap: 4px;
+    font-size: 12px;
+  }
+}
+@media (max-width: 350px) {
+  .topbar-btn-label {
+    display: none;
+  }
+  .topbar-btn {
+    padding: 0;
+    width: 40px;
+    min-height: 40px;
+  }
+}
+
+/* --- list ----------------------------------------------------------------- */
+.rows { display: flex; flex-direction: column; gap: 24px; padding: 0 var(--pad); }
+
+/* A single low-contrast hairline between rows (operator ask, 2026-09-10):
+   the design stays card-free — no border box, no shadow, no per-row fill —
+   just a rule reusing the --ring token (already the app's border colour, see
+   .field/.option-dot) at reduced opacity, sitting inside the existing
+   inter-row gap rather than crowding the row above it. */
+.rows > *:not(:first-child) { border-top: 1px solid var(--hairline); padding-top: 12px; }
+
+.row {
+  display: flex; flex-direction: column; gap: 8px; justify-content: center;
+  min-height: 44px; width: 100%; padding: 0; margin: 0;
+  background: none; border: 0; text-align: left; cursor: pointer; font: inherit; color: var(--ink);
+}
+.row-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.row-said { display: flex; align-items: flex-start; gap: 8px; }
+.row-answer { padding-left: 22px; }
+.row-title { font-size: 17px; line-height: 1.3; color: var(--ink); font-weight: 600; text-wrap: pretty; margin: 0; }
+.row-next  { font-size: 14px; line-height: 1.4; color: var(--dim); margin: 0; padding-left: 22px; }
+.row-next-you { color: var(--accent-ink); }
+
+/* 'Ready' cue (operator ask, 2026-09-13): an unopened finished conversation
+   carries an accent ring around its item box plus a slow, soft glow pulse —
+   the least intrusive treatment that still reads at a glance. A box-shadow
+   ring, not the border property, so nothing shifts layout; reduced-motion
+   drops the pulse and keeps the steady ring. */
+.row-ready {
+  border-radius: 14px;
+  padding: 10px 12px;
+  box-shadow: inset 0 0 0 1.5px var(--accent-ink);
+  animation: ready-pulse 2.6s ease-in-out infinite;
+}
+@keyframes ready-pulse {
+  0%, 100% { box-shadow: inset 0 0 0 1.5px var(--accent-ink), 0 0 3px var(--accent-glow); }
+  50%      { box-shadow: inset 0 0 0 1.5px var(--accent-ink), 0 0 12px var(--accent-glow); }
+}
+@media (prefers-reduced-motion: reduce) { .row-ready { animation: none; } }
+
+/* --- list blocks (AI-229 redo, 2026-09-12): independently collapsible
+   sections — Ready / In progress / Done, extended 2026-09-13 with Action
+   needed / Viewed — replacing a flat feed. Headers are sticky so a block
+   can be collapsed after scrolling into its rows, without a scroll back to
+   the top. */
+.rows > .list-block:not(:first-child) { border-top: 0; padding-top: 0; }
+.list-block { display: flex; flex-direction: column; }
+.list-block-header {
+  /* Sticks below the now-sticky .topbar (68px rendered height: 36px button
+     row + 16px top/bottom padding) rather than at the viewport top, so the
+     two sticky bars stack instead of the header hiding under the topbar. */
+  position: sticky; top: 68px; z-index: 2;
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  margin: 0 calc(var(--pad) * -1);
+  padding: 14px var(--pad); min-height: 44px;
+  background: var(--ground); border: 0; cursor: pointer; font: inherit;
+  color: var(--ink); text-align: left;
+}
+/* A collapsed block shows only its header (body is hidden), so the expanded
+   14px padding + 44px min-height read as dead vertical space between the
+   In Progress and Done blocks — slim the band in the collapsed state only. */
+.list-block-header[aria-expanded="false"] {
+  padding-top: 8px; padding-bottom: 8px; min-height: 36px;
+}
+/* Second half of the collapsed-gap fix: reclaim the by-design spacing that
+   still reads as dead air beside a collapsed block — half the 24px section
+   gap on each side, and 24px of the 96px bottom clearance under a collapsed
+   last block (still clear of the ~66px fixed mic footer). First block skips
+   the top cut (no gap exists above it; pulling up would run under the sticky
+   topbar); last block swaps the below-gap cut for the clearance cut. The
+   :has() guard leaves the identically-classed system-status blocks (no
+   aria-expanded header button) untouched. Expanded state is unchanged. */
+.rows > .list-block:not(:first-child):has(> .list-block-header[aria-expanded="false"]) { margin-top: -12px; }
+.rows > .list-block:not(:last-child):has(> .list-block-header[aria-expanded="false"]) { margin-bottom: -12px; }
+.rows > .list-block:last-child:has(> .list-block-header[aria-expanded="false"]) { margin-bottom: -24px; }
+.list-block-lead { display: flex; align-items: center; gap: 8px; }
+/* Title + one-line subtitle stack (U4): the subtitle explains each status
+   section in plain language for first-time users. */
+.list-block-titles { display: flex; flex-direction: column; gap: 1px; }
+.list-block-subtitle { font-size: 12px; color: var(--faint); }
+.list-block-title { font-size: 15px; font-weight: 600; color: var(--ink); }
+.list-block-count { font-size: 13px; color: var(--faint); }
+.list-block-chevron { flex: none; }
+@media (prefers-reduced-motion: no-preference) {
+  .list-block-chevron { transition: transform 140ms ease; }
+}
+.list-block-header[aria-expanded="true"] .list-block-chevron { transform: rotate(90deg); }
+.list-block-body { display: flex; flex-direction: column; gap: 24px; padding-top: 12px; }
+.list-block-body > *:not(:first-child) {
+  border-top: 1px solid var(--hairline); padding-top: 12px;
+}
+
+/* --- header-free list groups (2026-09-15): bare row stacks replace
+   the collapsible .list-block sections on the live list. Groups reuse
+   the .rows gap language (24px gap, hairline between rows); group
+   separation is .rows gap only (no extra hairline, same as .list-block
+   at line 243). The two thread bands (2026-09-17) are groups too, split
+   by the 24px gap plus .list-band-history's margin. */
+.rows-group { display: flex; flex-direction: column; gap: 24px; }
+.rows-group > *:not(:first-child) {
+  border-top: 1px solid var(--hairline); padding-top: 12px;
+}
+/* Suppress the .rows > *:not(:first-child) hairline for groups —
+   group separation is the 24px gap alone, matching .list-block. */
+.rows > .rows-group:not(:first-child) { border-top: 0; padding-top: 0; }
+/* --- thread status (thread lifecycle, 2026-09-17): four tones, not one
+   colour per status. Attention = the accent ink the Ready ring already uses;
+   problem = full ink, heavier weight, and a steady ring on the row (the theme
+   has one accent colour, so a failure reads by weight and outline, not a new
+   hue); neutral = dim; muted = faint (the history band). */
+.state.status-attention { color: var(--accent-ink); }
+.state.status-problem { color: var(--ink); font-weight: 600; }
+.state.status-neutral { color: var(--dim); }
+.state.status-muted { color: var(--faint); }
+.state-phase { margin-left: 6px; font-size: 12px; font-weight: 400; color: var(--faint); }
+.row-failed {
+  border-radius: 14px;
+  padding: 10px 12px;
+  box-shadow: inset 0 0 0 1.5px var(--ring);
+}
+.list-band-history { margin-top: 12px; }
+.view-switch {
+  display: inline-flex; align-self: flex-start; gap: 4px; padding: 3px;
+  border-radius: 999px; background: var(--raised);
+}
+.view-switch-btn {
+  min-height: 36px; padding: 6px 14px; border: 0; border-radius: 999px;
+  background: transparent; color: var(--dim); font: inherit; font-size: 14px; cursor: pointer;
+}
+.view-switch-btn[aria-pressed="true"] { background: var(--ground); color: var(--ink); font-weight: 600; }
+.failed-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.failed-bar-count { margin-right: auto; font-size: 13px; font-weight: 600; color: var(--ink); }
+.row-actions { margin-top: 8px; padding-left: 22px; }
+/* Selected row in multi-select mode (2026-09-18): a violet ring + soft glow —
+   the third distinct treatment beside the golden Ready cue and the neutral
+   failed ring (the scheme's one-accent rule: the violet is the tokens above,
+   never a literal here). Same box-shadow ring idiom, so nothing shifts
+   layout; reduced-motion keeps the steady ring. */
+.row-selected {
+  border-radius: 14px;
+  padding: 10px 12px;
+  background: var(--select-tint);
+  box-shadow: inset 0 0 0 1.5px var(--select);
+  animation: select-pulse 2.6s ease-in-out infinite;
+}
+@keyframes select-pulse {
+  0%, 100% { box-shadow: inset 0 0 0 1.5px var(--select), 0 0 3px var(--select-glow); }
+  50%      { box-shadow: inset 0 0 0 1.5px var(--select), 0 0 12px var(--select-glow); }
+}
+@media (prefers-reduced-motion: reduce) { .row-selected { animation: none; } }
+
+/* --- conversation --------------------------------------------------------- */
+.summary { display: flex; flex-direction: column; gap: 8px; padding: 0 var(--pad) 26px var(--pad); }
+.log { display: flex; flex-direction: column; gap: 26px; padding: 0 var(--pad); }
+.turn-said { display: flex; align-items: flex-start; gap: 8px; }
+.turn-assistant { margin-left: 22px; display: flex; flex-direction: column; gap: 12px; }
+
+/* Holds the single play/stop toggle button (see audioPlayer() in app.js) —
+   margin/alignment match .turn-assistant; .act-row (shared class) gives it
+   the same flex/gap treatment as the other per-turn action rows. The native
+   <audio controls> bar this used to hold is gone, so there is no player-bar
+   sizing rule here anymore. */
+.turn-audio { margin-left: 22px; align-self: flex-start; margin-top: 0; }
+
+.work {
+  margin-left: 22px; align-self: flex-start;
+  display: inline-flex; align-items: center; gap: 8px;
+  min-height: 44px; padding: 0 12px;
+  background: var(--raised); border: 0; border-radius: 8px;
+  cursor: pointer; font: inherit; color: var(--faint);
+}
+.work-chevron { flex: none; }
+@media (prefers-reduced-motion: no-preference) {
+  .work-chevron { transition: transform 140ms ease; }
+}
+.work[aria-expanded="true"] .work-chevron { transform: rotate(90deg); }
+.work-log { margin-left: 22px; display: flex; flex-direction: column; gap: 10px; }
+.work-line { display: flex; align-items: baseline; gap: 10px; }
+.work-line-text { font-size: 13px; line-height: 1.4; color: var(--dim); min-width: 0; word-break: break-word; }
+.work-line-time { font-size: 13px; line-height: 1; color: var(--faint); margin-left: auto; white-space: nowrap; }
+.work-line-meta-toggle {
+  background: none; border: 0; padding: 0; margin: 0;
+  font: inherit; text-align: left; cursor: pointer; display: inline; color: inherit;
+}
+.work-line-meta-toggle .meta { text-decoration: underline dotted; text-underline-offset: 2px; }
+.work-line-meta-toggle[aria-expanded="true"] .meta { text-decoration: none; }
+
+/* Long-URL overflow fix (2026-09-13 audit, vi-80d40a939c32): an unbreakable
+   URL measured 2318px of document width against the 390px viewport. Wrap
+   anywhere from the answer containers down (inherits into links and table
+   cells); .answer-pre keeps white-space: pre, where overflow-wrap has no
+   effect. */
+.turn-assistant, .recap-item-reply { overflow-wrap: anywhere; }
+
+/* --- live-view pane (AI-246): the watch-only stream of the screen the
+   assistant is on. Mounted inside a turn's #live-slot-<task_id> while the
+   task reports live; the badge rides beside the conversation header's state
+   word. Both keep the accent/raised vocabulary — no new colours. */
+.row-head-state { display: inline-flex; align-items: center; gap: 8px; }
+.live-badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--accent-tint); color: var(--accent-ink);
+  font-size: 13px; font-weight: 600; border-radius: 999px; padding: 4px 10px;
+}
+.live-badge::before {
+  content: ''; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent-ink); flex: none;
+}
+.live-pane {
+  margin-left: 22px;
+  position: relative;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.live-pane-head { display: flex; align-items: center; gap: 8px; }
+.live-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--accent-ink); flex: none;
+}
+.live-label {
+  flex: 1; min-width: 0;
+  font-size: 13px; font-weight: 500; color: var(--dim);
+}
+/* Local view-zoom (AI-246 v3): the img lives inside .live-viewport, which
+   clips the transformed frame and anchors the coordinate math — it never
+   transforms itself, so its client rect stays a stable screen-space anchor
+   while the img scales/translates under transform-origin 0 0. */
+.live-viewport { position: relative; overflow: hidden; width: 100%; }
+/* Responsive fit (AI-246 v2): the frame is always the pane's full width and
+   never taller than the inline card's bound — contain letterboxes inside
+   the element rather than cropping, so any device width shows the whole
+   page. No fixed pixel dimensions anywhere in the pane. touch-action
+   pan-x pan-y (v3): single-finger drags stay the browser's conversation
+   scroll inline — two-finger pinch is never claimed (no pinch-zoom token),
+   so it is always ours. */
+.live-frame {
+  display: block; width: 100%; height: auto; max-height: 62vh;
+  object-fit: contain;
+  transform-origin: 0 0;
+  touch-action: pan-x pan-y;
+  border-radius: 10px; background: var(--raised);
+}
+/* Take-over mode: native :fullscreen gives the pane the viewport box;
+   .live-fullscreen is the CSS fallback where the Fullscreen API is missing
+   or denied (iOS Safari). Both get the same layout: a thin head, the nav
+   toolbar, the frame filling what is left, and the invisible-but-focusable
+   type field pinned to the corner. z-index 100 sits above every overlay
+   the app has (sheets z-11, attach overlay z-12). */
+.live-pane:fullscreen,
+.live-pane.live-fullscreen {
+  margin-left: 0; gap: 0; width: 100%; height: 100%;
+  background: var(--ground);
+}
+.live-pane.live-fullscreen {
+  position: fixed; inset: 0; z-index: 100; width: 100vw; height: 100vh;
+}
+.live-pane:fullscreen .live-pane-head,
+.live-pane.live-fullscreen .live-pane-head { padding: 8px 12px; flex: none; }
+.live-pane:fullscreen .live-expand,
+.live-pane.live-fullscreen .live-expand { display: none; }
+/* In fullscreen the viewport takes the flex slot the frame used to hold,
+   and the img fills the viewport box (contain still letterboxes inside it). */
+.live-pane:fullscreen .live-viewport,
+.live-pane.live-fullscreen .live-viewport { flex: 1; min-height: 0; }
+.live-pane:fullscreen .live-frame,
+.live-pane.live-fullscreen .live-frame {
+  width: 100%; height: 100%; max-height: none; border-radius: 0;
+  touch-action: none;
+  -webkit-user-select: none; user-select: none;
+}
+/* Zoomed affordance (v3): grab cursor on desktop, and while zoomed the
+   inline frame claims ALL touches — a one-finger drag is a local pan, not
+   the browser's conversation scroll (pan-x pan-y would hand it over). */
+.live-viewport.live-zoomed .live-frame { cursor: grab; touch-action: none; }
+.live-toolbar { display: none; }
+.live-pane:fullscreen .live-toolbar,
+.live-pane.live-fullscreen .live-toolbar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 12px; flex: none;
+}
+.live-nav, .live-exit {
+  min-height: 40px; padding: 0 14px;
+  background: var(--raised); border: 1px solid var(--ring); border-radius: 8px;
+  color: var(--ink); font: inherit; font-size: 14px; cursor: pointer;
+  white-space: nowrap;
+}
+.live-exit { margin-left: auto; }
+.live-url {
+  flex: 1; min-width: 0; min-height: 40px; padding: 0 12px;
+  background: var(--ground); color: var(--ink);
+  border: 1px solid var(--ring); border-radius: 8px;
+  font: inherit; font-size: 14px;
+}
+/* The type field raises the mobile keyboard without being seen — nearly
+   transparent, pinned to the corner, still focusable. display:none while
+   inline because a hidden input cannot take focus. */
+.live-type { display: none; }
+.live-pane:fullscreen .live-type,
+.live-pane.live-fullscreen .live-type {
+  display: block;
+  position: absolute; left: 0; bottom: 0;
+  width: 4px; height: 4px; padding: 0; border: 0; opacity: 0.01;
+}
+@keyframes live-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+@media (prefers-reduced-motion: no-preference) {
+  .live-dot, .live-badge::before { animation: live-pulse 1.6s ease-in-out infinite; }
+}
+
+/* --- tiered answer card (2026-09-13, vi-ffb0a6d3cb44) --------------------- */
+.tldr { display: flex; flex-direction: column; gap: 12px; background: var(--raised); border-radius: 14px; padding: 14px 16px; }
+.tldr-lead { font-size: 17px; line-height: 1.55; color: var(--ink); text-wrap: pretty; margin: 0; }
+.tldr-tag { color: var(--accent-ink); font-weight: 600; font-size: 13px; letter-spacing: 0.04em; margin-right: 8px; }
+.chip-row { display: flex; gap: 8px; flex-wrap: wrap; padding-top: 2px; }
+.suggest-chips { display: flex; gap: 8px; flex-wrap: wrap; padding-top: 10px; }
+.chip {
+  background: var(--accent-tint); color: var(--accent-ink);
+  font-size: 13px; font-weight: 600; border-radius: 999px;
+  padding: 6px 12px; border: 0; cursor: pointer; font-family: inherit;
+}
+/* --- answer routing (router-metadata wave, decision 33, 2026-09-20): the ONE
+   default-visible placement line. Secondary tone family, never gold
+   (--accent-*); colours from the token blocks. The line is not interactive
+   except the link, which takes ink + underline (never gold) so it reads as a
+   link while the sentence stays quiet. ------------------------------------ */
+.answer-routing { margin-top: 10px; font-size: 13px; color: var(--faint); }
+.answer-routing a { color: var(--ink); text-decoration: underline; text-underline-offset: 2px; }
+/* --- answer provenance (WS3, 2026-09-18): quiet metadata chip + details.
+   Secondary tone only — gold (--accent-*) means "ready" and stays off this
+   chip; colours come from the token blocks above. ------------------------- */
+.answer-provenance { margin-top: 8px; }
+.answer-provenance-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  border: 0; background: none; padding: 0; cursor: pointer; font-family: inherit;
+  font-size: 12px; line-height: 1; color: var(--faint);
+}
+.answer-provenance-chip svg { flex: none; }
+.answer-provenance-chip[aria-expanded="true"] { color: var(--ink); }
+.answer-provenance-details p { margin: 3px 0 0; font-size: 12px; color: var(--faint); }
+.answer-provenance-details strong { color: var(--ink); font-weight: 500; }
+.answer-detail { border-top: 1px solid var(--hairline); }
+.answer-detail-inner { display: flex; flex-direction: column; gap: 12px; padding-top: 12px; }
+.answer-toggle { gap: 8px; align-self: flex-start; font-weight: 600; }
+.answer-toggle .meta { font-weight: 400; }
+.answer-chevron { flex: none; }
+@media (prefers-reduced-motion: no-preference) {
+  .answer-chevron { transition: transform 140ms ease; }
+}
+.answer-toggle[aria-expanded="true"] .answer-chevron { transform: rotate(90deg); }
+.said-original-toggle { align-self: flex-start; margin-left: 22px; font-size: 13px; }
+.said-original { margin: 2px 0 0 22px; white-space: pre-wrap; }
+
+/* --- earlier conversation recap & turns disclosure ----------------------- */
+.recap-section {
+  display: flex; flex-direction: column; gap: 10px;
+}
+.recap-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  min-height: 44px; padding: 0 12px; width: 100%;
+  background: var(--raised); border: 0; border-radius: 8px;
+  cursor: pointer; font: inherit; color: var(--dim); text-align: left;
+}
+.recap-bar-lead {
+  display: flex; align-items: center; gap: 8px;
+}
+.recap-chevron { flex: none; }
+@media (prefers-reduced-motion: no-preference) {
+  .recap-chevron { transition: transform 140ms ease; }
+}
+.recap-bar[aria-expanded="true"] .recap-chevron,
+.recap-item-header[aria-expanded="true"] .recap-chevron {
+  transform: rotate(90deg);
+}
+.recap-title {
+  font-size: 14px; font-weight: 500; color: var(--ink);
+}
+.recap-count {
+  font-size: 13px; color: var(--faint); margin-left: auto;
+}
+.recap-list {
+  display: flex; flex-direction: column; gap: 12px;
+  margin-top: 2px; padding: 4px 0 8px 0;
+}
+.recap-list > *:not(:first-child) {
+  border-top: 1px solid var(--hairline);
+  padding-top: 12px;
+}
+.recap-item {
+  display: flex; flex-direction: column; gap: 8px;
+  position: relative; /* anchors the collapsed item's absolute feedback flag */
+}
+.recap-item-header {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  background: none; border: 0; padding: 0; margin: 0;
+  cursor: pointer; font: inherit; width: 100%; text-align: left;
+  min-height: 44px;
+}
+.recap-item-summary {
+  display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1;
+}
+.recap-item-said {
+  display: flex; align-items: flex-start; gap: 6px;
+  font-size: 14px; line-height: 1.4; font-weight: 500; color: var(--ink);
+}
+.recap-item-reply {
+  font-size: 13px; line-height: 1.4; color: var(--dim);
+  padding-left: 20px;
+}
+.recap-item-meta {
+  display: flex; align-items: center; gap: 8px; flex: none;
+}
+.recap-item-body {
+  display: flex; flex-direction: column; gap: 16px;
+  padding-top: 8px;
+}
+
+/* --- widgets (the input request as a turn) -------------------------------- */
+.widget { display: flex; flex-direction: column; gap: 4px; background: var(--raised); border-radius: 10px; padding: 12px; }
+.option {
+  display: flex; align-items: center; gap: 10px;
+  min-height: 44px; padding: 0 10px; margin: 0 -10px;
+  width: calc(100% + 20px);
+  background: none; border: 0; border-radius: 8px; cursor: pointer;
+  font: inherit; font-size: 16px; color: var(--dim); text-align: left;
+}
+.option[aria-checked="true"] { color: var(--ink); }
+.option-dot {
+  width: 15px; height: 15px; border-radius: 50%;
+  border: 2px solid var(--ring); flex: none;
+  display: flex; align-items: center; justify-content: center;
+}
+.option[aria-checked="true"] .option-dot { border-color: var(--accent-ink); }
+.option-dot-fill { width: 7px; height: 7px; border-radius: 50%; background: var(--accent-ink); }
+
+.field {
+  width: 100%; min-height: 44px; padding: 11px 12px;
+  background: var(--ground); color: var(--ink);
+  border: 1px solid var(--ring); border-radius: 8px; font: inherit; font-size: 16px;
+}
+textarea.field { min-height: 108px; resize: vertical; line-height: 1.5; }
+
+.user-code {
+  display: block; width: fit-content;
+  font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace;
+  font-size: 20px; letter-spacing: 0.08em; color: var(--ink);
+  background: var(--ground); border-radius: 8px; padding: 8px 12px;
+  -webkit-user-select: text; user-select: text;
+}
+
+.act {
+  min-height: 44px; padding: 11px 16px;
+  border: 0; border-radius: 8px; cursor: pointer;
+  font: inherit; font-size: 16px; font-weight: 600; text-align: center;
+}
+.act-primary { background: var(--accent); color: var(--on-accent); }
+.act-quiet { background: var(--raised); color: var(--ink); font-weight: 500; font-size: 15px; }
+.act-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 6px; }
+.act:disabled { opacity: 0.5; cursor: default; }
+
+.linkish {
+  display: inline-flex; align-items: center; min-height: 44px;
+  background: none; border: 0; padding: 0; cursor: pointer;
+  font: inherit; font-size: 15px; color: var(--dim); text-align: left;
+}
+
+/* Icon-only action buttons (icon-button pass, 2026-09-10): forces the 44px
+   hit area regardless of the icon's intrinsic size and centers it. Placed
+   after .act/.linkish/.back above so these overrides win the
+   cascade for any button/link that also carries this class. */
+.icon-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  align-self: center; min-width: 44px; min-height: 44px; margin-left: 0; padding: 0; gap: 0;
+}
+
+/* Icon-plus-text buttons — destructive or confirmation actions that keep
+   their words (icon-button pass): a small gap between glyph and label. */
+.with-icon { display: inline-flex; align-items: center; gap: 8px; }
+
+.notice {
+  margin: 0 var(--pad) 16px var(--pad); padding: 12px 14px;
+  background: var(--raised); border-radius: 10px;
+  font-size: 15px; line-height: 1.45; color: var(--ink); word-break: break-word;
+}
+
+/* Origin banner (t-3, 2026-09-18): the conversation view's link back to
+   whatever a feedback thread is about — same slot as .notice, accent tint
+   so it reads as navigable rather than informational. */
+.origin-banner {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  width: calc(100% - 2 * var(--pad)); margin: 0 var(--pad) 12px var(--pad); padding: 10px 14px;
+  background: var(--accent-tint); color: var(--accent-ink); border: 0; border-radius: 10px;
+  font-family: inherit; font-size: 14px; line-height: 1.4; text-align: left; cursor: pointer;
+}
+.origin-banner-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.origin-banner-arrow { flex: none; font-size: 16px; }
+/* Notification-permission banner (maybeRenderNotifBanner in app.js): the
+   button fills the notice slot and centres its label. */
+.notif-banner-btn {
+  cursor: pointer; width: 100%; display: block; border: 0; text-align: center;
+}
+
+.empty { display: flex; flex-direction: column; gap: 8px; padding: 12vh var(--pad) 0 var(--pad); }
+.empty-hint { font-size: 15px; line-height: 1.5; color: var(--dim); max-width: 44ch; text-wrap: pretty; }
+
+/* --- the record footer (fixed; the view scrolls behind it) ---------------- */
+/* one compact row everywhere the footer appears (operator 2026-09-12: the
+   list/triage footer used to stack a 66px mic + label above a second row
+   for the keyboard button, clearing 204px of scroll padding for it). */
+.footer {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 5;
+  background: var(--ground);
+  padding: 10px var(--pad) calc(10px + env(safe-area-inset-bottom, 0px)) var(--pad);
+  display: flex; flex-direction: row; align-items: center; gap: 16px;
+}
+/* Desktop breakpoint (R4): on wide screens the footer matches the centred
+   680px content column instead of stretching edge to edge. `width:100%` is
+   load-bearing (2026-09-16 visual-verify find): a fixed box with right:auto
+   shrink-wraps to its content (~208px), which let the absolutely-centred
+   mic land on top of footer-extras and fully cover the stop button —
+   elementFromPoint returned the mic at every stop pixel. */
+@media (min-width: 681px) {
+  .footer {
+    max-width: 680px; width: 100%; left: 50%; transform: translateX(-50%); right: auto;
+  }
+}
+.footer-row { display: flex; align-items: center; gap: 12px; }
+/* conversation view: one compact row, ~66px tall, never covers the answer */
+.footer-compact { flex-direction: row; gap: 0; padding: 10px var(--pad) calc(10px + env(safe-area-inset-bottom, 0px)) var(--pad); }
+.footer-compact-row { width: 100%; gap: 16px; }
+.footer-compact-row .act-row { margin-top: 0; }
+/* the menu layout: keyboard pinned left, mic truly centred via absolute
+   positioning (a 3-column grid shifted the mic when left/right groups had
+   unequal item counts), extras cluster pinned right. */
+.footer-menu {
+  position: relative;
+  display: flex; align-items: center; justify-content: space-between;
+}
+.footer-menu .footer-centre {
+  position: absolute; left: 50%; transform: translateX(-50%);
+}
+.footer-menu .footer-extras {
+  display: inline-flex; align-items: center; gap: 12px;
+}
+.mic-btn {
+  flex: none; display: flex; align-items: center; justify-content: center;
+  background: none; border: 2px solid var(--accent-ink); border-radius: 50%;
+  color: var(--accent-ink); /* the micMark glyph rides currentColor */
+  cursor: pointer; padding: 0; touch-action: none; -webkit-user-select: none; user-select: none;
+}
+.mic-btn-lg { width: 46px; height: 46px; }
+.mic-btn-sm { width: 46px; height: 46px; }
+/* 2026-09-13: the solid 30px dot core (.mic-core*) is gone — both footer
+   record buttons now draw the micMark glyph inside the same 46px ring, so
+   the speak control reads as a mic on the list and conversation rows alike. */
+.footer-centre { align-items: center; justify-content: center; flex-direction: row; gap: 10px; display: flex; }
+
+/* --- the recording sheet (the one hero) ----------------------------------- */
+.scrim { position: fixed; inset: 0; z-index: 10; background: var(--scrim); opacity: var(--scrim-alpha); }
+.sheet {
+  position: fixed; left: 50%; right: auto; bottom: 0; z-index: 11;
+  width: 100%; max-width: 680px; transform: translateX(-50%);
+  display: flex; flex-direction: column; align-items: center; gap: 22px;
+  background: var(--raised); border-radius: 22px 22px 0 0;
+  padding: 38px var(--pad) calc(40px + env(safe-area-inset-bottom, 0px)) var(--pad);
+  touch-action: none;
+}
+/* Overflow-sheet rows (footer `More actions` + stop confirm, 2026-09-15):
+   full-width icon+label entries, 44px min hit area — not icon buttons. */
+.menu-rows {
+  display: flex; flex-direction: column; align-items: stretch;
+  gap: 4px; width: 100%;
+}
+.menu-row {
+  display: flex; align-items: center; gap: 14px;
+  min-height: 44px; padding: 0 12px; width: 100%;
+  background: none; border: 0; border-radius: 10px;
+  color: var(--ink); font: inherit; text-align: left; cursor: pointer;
+}
+a.menu-row { text-decoration: none; }
+.menu-row svg { flex: none; color: var(--dim); }
+.pill {
+  background: var(--accent-tint); color: var(--accent-ink);
+  font-size: 13px; font-weight: 600; border-radius: 999px; padding: 6px 12px;
+}
+.pill-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: center; }
+.wave { display: flex; align-items: flex-end; gap: 5px; height: 44px; }
+.wave-bar { width: 4px; border-radius: 2px; background: var(--accent-ink); min-height: 4px; }
+.halo-wrap { position: relative; width: 132px; height: 132px; display: flex; align-items: center; justify-content: center; }
+.halo { position: absolute; inset: 0; border-radius: 50%; background: var(--accent); opacity: 0.32; }
+.halo-core {
+  position: relative; width: 96px; height: 96px; border-radius: 50%; background: var(--accent);
+  display: flex; align-items: center; justify-content: center;
+  border: 0; padding: 0; cursor: pointer;
+}
+.halo-stop { width: 30px; height: 30px; border-radius: 6px; background: var(--on-accent); }
+.timer { font-size: 30px; font-weight: 600; letter-spacing: 0.02em; color: var(--ink); font-variant-numeric: tabular-nums; }
+.sheet-labels { display: flex; flex-direction: column; align-items: center; gap: 14px; text-align: center; }
+.sheet-primary { font-size: 16px; font-weight: 600; color: var(--ink); }
+.sheet-secondary { font-size: 15px; color: var(--dim); }
+
+@keyframes breathe { 0%, 100% { transform: scale(1); opacity: 0.32; } 50% { transform: scale(1.14); opacity: 0.14; } }
+@media (prefers-reduced-motion: no-preference) { .halo { animation: breathe 2.4s ease-in-out infinite; } }
+@media (prefers-reduced-motion: reduce) { .halo { animation: none; opacity: 0.24; } }
+
+/* --- login ---------------------------------------------------------------- */
+.login { display: flex; flex-direction: column; gap: 12px; padding: 12vh var(--pad) 0 var(--pad); max-width: 420px; }
+.login-hint { font-size: 15px; line-height: 1.5; color: var(--dim); }
+
+[hidden] { display: none !important; }
+
+/* Feedback capture (2026-09-13): long-press rows/turns; ellipsis opens the sheet. */
+.row-wrap { position: relative; }
+.row-wrap .row-head { padding-right: 40px; } /* keep the state word clear of the ellipsis */
+.row-feedback-btn {
+  position: absolute; top: 8px; right: 8px;
+  min-width: 36px; min-height: 36px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 0; border-radius: 999px;
+  background: transparent; color: inherit;
+  opacity: 0.55;
+  cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.row, .row-feedback-btn, .turn-said, .recap-item-header {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* Message-level feedback (2026-09-16): a quiet flag per turn — inline at the
+   end of .turn-said, absolute top-right on a collapsed .recap-item (its header
+   is a <button>, so the flag is a sibling), and the thread-level "Give
+   feedback" row lives in the footer actions sheet. Same affordance family as
+   .row-feedback-btn on the list; the answer region's flag reuses .icon-btn. */
+.turn-fb {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 36px; min-height: 36px; padding: 0;
+  border: 0; border-radius: 999px; background: transparent;
+  color: var(--faint); cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.turn-said .turn-fb { margin-left: auto; flex: none; }
+.recap-item .recap-item-header { padding-right: 44px; }
+.recap-item > .turn-fb { position: absolute; top: 4px; right: 0; }
+/* Expanded: the body's own turn-said flag takes over — the header's hides. */
+.recap-item:has(> .recap-item-body:not([hidden])) > .turn-fb { display: none; }
+
+/* --- attachments (task attachments, 2026-09-13) --------------------------- */
+/* Staged-file chips inside a composer sheet and per-turn attachment chips:
+   same ground/ring vocabulary as .field and .work. */
+.attach-staging { display: flex; flex-direction: column; gap: 8px; width: 100%; }
+.attach-chips { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+.attach-chips:empty { display: none; }
+.attach-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  max-width: 100%; min-height: 36px; padding: 4px 10px;
+  background: var(--ground); border: 1px solid var(--ring); border-radius: 999px;
+  font: inherit; font-size: 13px; color: var(--ink);
+}
+button.attach-chip { cursor: pointer; }
+.attach-chip-name { min-width: 0; max-width: 32ch; }
+.attach-chip-remove {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 32px; height: 32px; padding: 0; flex: none;
+  background: none; border: 0; border-radius: 50%;
+  color: var(--faint); cursor: pointer;
+}
+.attach-row { flex-wrap: wrap; }
+/* The image overlay: above .sheet (z-index 11), reusing the .scrim surface. */
+.attach-overlay {
+  z-index: 12; opacity: 0.92;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px;
+}
+.attach-overlay-img {
+  max-width: min(92vw, 900px); max-height: 78vh;
+  border-radius: 10px; background: var(--raised);
+}
+/* Left group: keyboard only — the mic is absolutely centred so left/right
+   groups never shift it. */
+.footer-left-group { display: inline-flex; align-items: center; gap: 4px; }
+
+/* --- Done-block disclosures + Older view (vi-19787afc4b2e) ---------------- */
+/* A quiet pill on the raised surface, same vocabulary as the tiered answer's
+   "Show full answer" toggle — never styled as a conversation row. */
+.list-disclosure { align-self: flex-start; min-height: 44px; padding: 8px 14px; }
+
+/* --- archive search box (2026-09-15) -------------------------------------- */
+.archive-search { padding: 0 var(--pad) 4px var(--pad); }
+.archive-search .field { margin-bottom: 4px; }
+
+/* --- knowledge-base view (vi-19787afc4b2e) -------------------------------- */
+/* Groups reuse .list-block (hairline separation, .rows padding); the cards
+   inside are the recap idiom: header button carries title + one-line
+   summary with a rotating chevron, body reveals the sections. */
+.kb-group { gap: 20px; padding-top: 8px; }
+.kb-card { display: flex; flex-direction: column; }
+.kb-card-header {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  min-height: 44px; width: 100%; padding: 8px 0; margin: 0;
+  background: none; border: 0; cursor: pointer; font: inherit; text-align: left;
+}
+.kb-card-lead { display: flex; align-items: flex-start; gap: 8px; min-width: 0; flex: 1; }
+.kb-card-chevron { flex: none; margin-top: 3px; }
+@media (prefers-reduced-motion: no-preference) { .kb-card-chevron { transition: transform 140ms ease; } }
+.kb-card-header[aria-expanded="true"] .kb-card-chevron { transform: rotate(90deg); }
+.kb-card-summary { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1; }
+.kb-card-title { font-size: 15px; font-weight: 600; color: var(--ink); line-height: 1.35; }
+.kb-card-sub { font-size: 13px; line-height: 1.4; color: var(--dim); }
+.kb-card-body { display: flex; flex-direction: column; gap: 14px; padding: 12px 0 4px 22px; }
+.kb-section { display: flex; flex-direction: column; gap: 6px; }
+.kb-section-heading { font-size: 13px; font-weight: 600; color: var(--dim); margin: 0; letter-spacing: 0.02em; }
+.kb-line { font-size: 16px; line-height: 1.5; color: var(--ink); margin: 0; text-wrap: pretty; }
+.kb-list { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 4px; }
+.kb-list li::marker { color: var(--dim); }
+
+/* --- share bottom sheet (vi-19787afc4b2e) ---------------------------------- */
+/* The URL line centers under the pill row and stays selectable; actions row
+   centers inside the sheet's column; Stop sharing is a quiet text action. */
+.share-url {
+  font-size: 14px; line-height: 1.45; color: var(--dim); margin: 0;
+  text-align: center; overflow-wrap: anywhere; user-select: text;
+}
+.share-act-row { justify-content: center; margin-top: 0; }
+.share-stop { align-self: center; }
+.share-stop:disabled { opacity: 0.5; cursor: default; }
+
+/* --- form widget kind (vi-6f1d767dd640): one card, steps as sections ------ */
+
+.widget-form { gap: 10px; }
+.form-progress { font-size: 13px; color: var(--faint); margin: 0; }
+.form-step { display: flex; flex-direction: column; gap: 4px; padding-top: 8px; border-top: 1px solid var(--hairline); }
+.form-step-head { font-size: 12px; color: var(--faint); text-transform: uppercase; letter-spacing: 0.04em; }
+.form-step-title { font-weight: 600; }
+.form-step-decide { font-size: 13px; color: var(--dim); }
+.form-step-locked { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--ink); }
+.form-options { display: flex; flex-direction: column; gap: 4px; }
+.form-option { align-items: flex-start; text-align: left; }
+.form-option-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.form-option-note { font-size: 12px; color: var(--dim); }
+.form-escape { margin-top: 2px; }
+.form-submit { align-self: flex-start; }
+
+/* --- form-sets (P4, SPEC §4.6): answer-driven input inside the answer card.
+   Visually distinct from a read-only answer — a lighter tint of the same
+   accent the input sheets use (this is an invitation, not an interruption).
+   The option row is the widget's own .option; .formset-option widens the tap
+   target to the plan's 48px and adds the selected-state tint. */
+.formset {
+  margin: 12px 0; padding: 12px;
+  background: var(--accent-tint-soft);
+  border: 1px solid var(--accent-tint-active);
+  border-radius: 12px;
+}
+.formset-progress { font-size: 13px; color: var(--faint); margin: 0 0 8px; }
+.formset-step {
+  display: flex; flex-direction: column; gap: 10px;
+  max-width: 400px; margin: 0 auto; width: 100%;
+  animation: formset-in 0.2s ease;
+}
+.formset-step.back { animation-name: formset-back; }
+.formset-title { font-weight: 600; }
+.formset-decide { font-size: 13px; color: var(--dim); }
+.formset-option { min-height: 48px; width: 100%; margin: 0; border: 1px solid transparent; }
+.formset-option[aria-checked="true"] {
+  border-color: var(--accent-ink);
+  background: var(--accent-tint-hover);
+}
+.formset-file { font-size: 14px; color: var(--dim); }
+.formset-done {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 15px; color: var(--ink); padding: 8px 0;
+}
+@keyframes formset-in {
+  from { transform: translateX(24px); opacity: 0; }
+  to   { transform: translateX(0);    opacity: 1; }
+}
+@keyframes formset-back {
+  from { transform: translateX(-24px); opacity: 0; }
+  to   { transform: translateX(0);     opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .formset-step, .formset-step.back { animation: none; }
+}
+
+/* --- pattern renderers (answer presentation P5) ---------------------------- */
+/* listing / guide / summary get their OWN class prefixes (.lst-, .gde-,
+   .sum-). .cmp- stays comparison-only so P6's device layout classes can key
+   on it without leaking onto these views; .cmp-actions/.cmp-act (the generic
+   action row + control), .cmp-lead (the flat-path lead line) and .cmp-attrs
+   (the section dl) are the shared pieces and are reused, not duplicated. */
+.lst-list { margin: 12px 0 0 0; }
+.lst-item {
+  padding: 10px 0; border-top: 1px solid var(--ring);
+  display: flex; flex-direction: column; gap: 6px;
+}
+.lst-item:first-child { border-top: none; padding-top: 0; }
+.lst-name { font-size: 16px; line-height: 1.35; color: var(--ink); margin: 0; }
+.lst-detail { font-size: 15px; line-height: 1.45; color: var(--dim); margin: 0; }
+/* A guide is a checklist: a progress head + bar, then one bordered step per
+   item. The check control carries the check icon over the step number — CSS
+   swaps which is visible on [aria-checked]. */
+.gde-list { margin: 12px 0 0 0; }
+.gde-head { font-size: 13px; color: var(--faint); margin: 0 0 4px; }
+.gde-bar {
+  display: block; width: 100%; height: 6px; margin: 0 0 10px;
+  accent-color: var(--accent-ink);
+}
+.gde-step {
+  display: grid; grid-template-columns: 34px 1fr; column-gap: 10px;
+  padding: 10px 0; border-top: 1px solid var(--ring); align-items: start;
+}
+.gde-step:first-of-type { border-top: none; }
+.gde-check {
+  position: relative; grid-row: 1 / span 4;
+  width: 34px; height: 34px; border-radius: 50%; padding: 0;
+  border: 2px solid var(--ring); background: transparent; color: var(--dim);
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: pointer;
+}
+.gde-check svg { display: none; }
+.gde-check .gde-num { font-size: 14px; font-weight: 600; color: var(--dim); }
+.gde-check[aria-checked="true"] {
+  border-color: var(--accent-ink); background: var(--accent-ink); color: var(--on-accent-ink);
+}
+.gde-check[aria-checked="true"] svg { display: block; }
+.gde-check[aria-checked="true"] .gde-num { display: none; }
+.gde-name { grid-column: 2; font-size: 16px; line-height: 1.35; color: var(--ink); margin: 0; }
+.gde-detail { grid-column: 2; font-size: 14px; line-height: 1.45; color: var(--dim); margin: 0; }
+.gde-points { grid-column: 2; margin: 2px 0 0; padding-left: 18px; }
+.gde-points li { font-size: 14px; line-height: 1.5; color: var(--ink); }
+.gde-step .cmp-actions { grid-column: 2; }
+.gde-step.done .gde-name { color: var(--dim); }
+.sum-cards {
+  display: grid; grid-template-columns: 1fr;
+  gap: 12px; margin: 12px 0 0 0; padding: 0;
+}
+.sum-card {
+  display: flex; flex-direction: column; gap: 8px; min-width: 0;
+  background: var(--raised); border: 1px solid var(--ring); border-radius: 12px;
+  padding: 12px 14px;
+}
+.sum-name { font-size: 16px; line-height: 1.35; color: var(--ink); margin: 0; }
+.sum-detail { font-size: 15px; line-height: 1.5; color: var(--ink); margin: 0; }
+.sum-points { margin: 0; padding-left: 18px; }
+.sum-points li { font-size: 15px; line-height: 1.5; color: var(--ink); }
+/* Desktop only: two-column section cards. The phone single column is the
+   base — no phone override needed, unlike the comparison swipe. */
+@media (min-width: 681px) {
+  .sum-cards { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+}
+/* --- device surface (answer presentation P6) ------------------------------ */
+/* The task's `surface` (ledger v13) sets which layout the comparison
+   container STARTS in, never what it contains: `cmp-phone` holds the
+   stacked/swipe layout at any width, `cmp-desktop` holds the grid. A task
+   with no surface — every pre-v13 row, and any client that does not send one
+   — gets no class here and renders exactly as it did before P6: the base
+   .cmp-cards grid plus the P2 phone override. Comparison only; P5 reserved
+   the .cmp- prefix for this, and .lst-/.gde-/.sum- stay CSS-only.
+
+   The override runs ONE WAY, and for a physical reason. A 390px screen
+   cannot show a 200px-minimum grid whatever device asked the question, so
+   the media query below takes the grid away from a `cmp-desktop` container.
+   There is deliberately NO min-width rule taking the stack away from a
+   `cmp-phone` container: a wide screen CAN show a stack, and phone-first is
+   what the phone-sourced answer asked for.
+
+   The cascade is the whole mechanism and both halves are pinned by
+   device-surface.test.ts: `.cmp-cards.cmp-desktop` is a TWO-class selector
+   that appears once above and once inside the media query, so the
+   specificities tie and SOURCE ORDER decides — the media query is later, so
+   it wins. Moving this block above the P2 media query, or writing the
+   media-query rule as bare `.cmp-cards`, silently restores the grid on a
+   phone. */
+.cmp-cards.cmp-desktop {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+}
+.cmp-cards.cmp-phone { display: flex; flex-direction: column; gap: 12px; }
+.cmp-cards.cmp-phone.cmp-swipe {
+  flex-direction: row; overflow-x: auto;
+  scroll-snap-type: x mandatory; padding-bottom: 4px;
+}
+.cmp-cards.cmp-phone.cmp-swipe .cmp-card { flex: 0 0 85%; scroll-snap-align: center; }
+@media (max-width: 680px) {
+  .cmp-cards.cmp-desktop { display: flex; flex-direction: column; gap: 12px; }
+  .cmp-cards.cmp-desktop.cmp-swipe {
+    flex-direction: row; overflow-x: auto;
+    scroll-snap-type: x mandatory; padding-bottom: 4px;
+  }
+  .cmp-cards.cmp-desktop.cmp-swipe .cmp-card { flex: 0 0 85%; scroll-snap-align: center; }
+}
+
+/* --- theme helpers (light/dark theme, 2026-09-16) ------------------------- */
+/* Icon tones: every icon draws with stroke="currentColor", so the tone class
+   on the svg picks its colour and an OS scheme flip repaints icons that are
+   already on screen — nothing resolves a colour in script. */
+.tone-accent { color: var(--accent-ink); }
+.tone-dim { color: var(--dim); }
+.tone-faint { color: var(--faint); }
+/* Section-chip scroll flash (app.js chipRow, share.js shareChipRow): a class,
+   not an inline colour, so the tint follows the scheme. Keep this rule LAST
+   in the file: it must win over the equal-specificity card backgrounds
+   declared above (.cmp-card, .sum-card) on source order. */
+.chip-flash { background-color: var(--accent-tint-hover); }

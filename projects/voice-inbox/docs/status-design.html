@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Status model design preview for Voice Inbox — what operator approval would build. Nothing here is built yet; live parts are marked.">
+<title>Voice Inbox · Status model</title>
+<style>
+  :root {
+    --gold: #e0b73f;                 /* fallback */
+    --gold: oklch(0.78 0.15 85);
+    --ink: #2a2118;
+    --muted: #8a7d6d;
+    --bg: #faf7f0;
+    --card: #ffffff;
+    --border: #e8e1d4;
+    --chip-waiting-bg: #e7eef8;
+    --chip-waiting-ink: #33506e;
+    --chip-running-bg: #f6ecc9;
+    --chip-running-ink: #6e5a17;
+    --chip-done-bg: #e2f0e2;
+    --chip-done-ink: #2f5c33;
+    --chip-needsyou-bg: #f8e3e0;
+    --chip-needsyou-ink: #7a332c;
+    --live-bg: #e2f0e2;
+    --live-ink: #2f5c33;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px 16px 48px;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+  }
+  main { max-width: 680px; margin: 0 auto; }
+  header.page h1 {
+    font-size: 1.5rem;
+    line-height: 1.3;
+    margin: 0 0 4px;
+  }
+  header.page p.sub { color: var(--muted); margin: 0 0 24px; }
+  section.card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px 18px;
+    margin: 0 0 20px;
+  }
+  h2 { font-size: 1.05rem; margin: 0 0 12px; line-height: 1.35; }
+  h3 { font-size: 0.95rem; margin: 16px 0 8px; }
+  p { margin: 0 0 10px; }
+  .muted { color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; margin: 8px 0 4px; }
+  th, td {
+    text-align: left;
+    vertical-align: top;
+    padding: 8px 10px;
+    border-top: 1px solid var(--border);
+    font-size: 0.92rem;
+  }
+  th {
+    border-top: none;
+    color: var(--muted);
+    font-weight: 600;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  td.term { white-space: nowrap; font-weight: 600; }
+  .chip {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 999px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .chip.waiting  { background: var(--chip-waiting-bg);  color: var(--chip-waiting-ink); }
+  .chip.running  { background: var(--chip-running-bg);  color: var(--chip-running-ink); }
+  .chip.ready    { background: var(--chip-running-bg);  color: var(--chip-running-ink); }
+  .chip.viewed   { background: var(--chip-done-bg);     color: var(--chip-done-ink); }
+  .chip.done     { background: var(--chip-done-bg);     color: var(--chip-done-ink); }
+  .chip.needsyou { background: var(--chip-needsyou-bg); color: var(--chip-needsyou-ink); }
+  .chip.terminal { background: var(--bg); color: var(--muted); font-weight: 500; }
+  .strip { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 4px; }
+  .strip .arrow { color: var(--muted); padding: 0 2px; }
+  .strip .branch { margin-left: 6px; }
+  .footnote { margin-top: 10px; font-size: 0.88rem; color: var(--muted); }
+  .live {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 999px;
+    background: var(--live-bg);
+    color: var(--live-ink);
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+  .listrows { display: flex; flex-direction: column; gap: 8px; }
+  .listrow {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-size: 0.92rem;
+  }
+  .listrow .name { font-weight: 700; margin-right: 6px; }
+  .callout {
+    background: #fdf6e3;
+    border: 1px solid var(--gold);
+    border-left-width: 4px;
+    border-radius: 10px;
+    padding: 14px 16px;
+    font-size: 0.95rem;
+  }
+  footer.page {
+    color: var(--muted);
+    font-size: 0.85rem;
+    text-align: center;
+    margin-top: 28px;
+  }
+</style>
+</head>
+<body>
+<main>
+  <header class="page">
+    <h1>Voice Inbox · Status model</h1>
+    <p class="sub">What your approval would build — nothing here is built yet. Live parts are marked.</p>
+  </header>
+
+  <!-- 2. Lifecycle strip -->
+  <section class="card">
+    <h2>How a note travels</h2>
+    <div class="strip">
+      <span class="chip waiting">Waiting</span>
+      <span class="arrow">→</span>
+      <span class="chip running">Running</span>
+      <span class="arrow">→</span>
+      <span class="chip ready">Ready</span>
+      <span class="arrow">→</span>
+      <span class="chip viewed">Viewed</span>
+      <span class="arrow">→</span>
+      <span class="chip done">Done</span>
+      <span class="chip needsyou branch">Needs you</span>
+    </div>
+    <p class="footnote">"Needs you" can branch off both Waiting and Running — a question can wait on you before work starts too.</p>
+    <p class="footnote">Terminal outcomes: <span class="chip terminal">Didn't work</span> · <span class="chip terminal">Cancelled</span> · <span class="chip terminal">Couldn't hear that</span></p>
+  </section>
+
+  <!-- 3. The list, top to bottom -->
+  <section class="card">
+    <h2>The list, top to bottom</h2>
+    <div class="listrows">
+      <div class="listrow">
+        <span class="name">Action needed</span><span class="live">LIVE today</span>
+        <div>Conversations with an open question for you.</div>
+      </div>
+      <div class="listrow">
+        <span class="name">Ready</span><span class="live">LIVE today</span>
+        <div>Finished, unopened — rows carry the gold glow ring.</div>
+      </div>
+      <div class="listrow">
+        <span class="name">Running</span>
+        <div>Work in progress; rows show the substate word.</div>
+      </div>
+      <div class="listrow">
+        <span class="name">Waiting</span>
+        <div>Recorded but no worker yet; rows show the substate word.</div>
+      </div>
+      <div class="listrow">
+        <span class="name">Done</span>
+        <div>Collapsed; includes Viewed rows settling here — see the open point below.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4. Waiting — four substates -->
+  <section class="card">
+    <h2>Waiting — four substates</h2>
+    <table>
+      <thead>
+        <tr><th scope="col">Substate</th><th scope="col">What it means</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="term">recorded</td><td>Capture done, uploading.</td></tr>
+        <tr><td class="term">transcribing</td><td>Audio landed, transcript being made.</td></tr>
+        <tr><td class="term">transcribed</td><td>Transcript ready, being placed into a conversation.</td></tr>
+        <tr><td class="term">routed</td><td>Assigned to a topic and worker.</td></tr>
+      </tbody>
+    </table>
+    <p class="footnote">Transcribed may jump straight to Running when placement and pickup happen in one step. A placement that cannot find its conversation shows the existing "not placed" entry. A transcription failure keeps today's "Couldn't hear that" wording and re-record button.</p>
+  </section>
+
+  <!-- 5. Running — visible substates -->
+  <section class="card">
+    <h2>Running — visible substates</h2>
+    <table>
+      <thead>
+        <tr><th scope="col">Substate</th><th scope="col">What it means</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="term">started</td><td>First progress signal.</td></tr>
+        <tr><td class="term">planning</td><td>Reading and diagnosing.</td></tr>
+        <tr><td class="term">building</td><td>Edits and commands.</td></tr>
+        <tr><td class="term">verifying</td><td>Tests and review.</td></tr>
+        <tr><td class="term">needs you</td><td>A question waiting on you (drives the Action needed block).</td></tr>
+      </tbody>
+    </table>
+    <p class="footnote">Workers signal planning / building / verifying by starting their progress line with a small phase tag. Untagged progress shows as plain "Running". No update for a while shows through the last-updated time chip <span class="live">LIVE today</span>, never a sentence.</p>
+  </section>
+
+  <!-- 6. After Running -->
+  <section class="card">
+    <h2>After Running — unchanged from what you already approved</h2>
+    <p><span class="chip ready">Ready</span> — unopened, glow ring <span class="live">LIVE today</span></p>
+    <p><span class="chip needsyou">Needs you</span> <span class="live">LIVE today</span></p>
+    <p><span class="chip viewed">Viewed</span> — you opened it; settles to Done by itself after ~30 minutes <span class="live">LIVE today</span></p>
+    <p><span class="chip done">Done</span> <span class="live">LIVE today</span></p>
+    <p class="footnote">Plus the terminal outcomes: <span class="chip terminal">Didn't work</span> · <span class="chip terminal">Cancelled</span> · <span class="chip terminal">Couldn't hear that</span></p>
+  </section>
+
+  <!-- 7. Where each piece shows -->
+  <section class="card">
+    <h2>Where each piece shows</h2>
+    <table>
+      <thead>
+        <tr><th scope="col">Place</th><th scope="col">What you'll see</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="term">List row</td><td>Just the substate word (keeps rows compact).</td></tr>
+        <tr><td class="term">List block header</td><td>The top-level state.</td></tr>
+        <tr><td class="term">Conversation header</td><td>State and substate together, like "Running · Verifying".</td></tr>
+        <tr><td class="term">Working section</td><td>The real progress lines, unchanged.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- 8. Live today vs. what approval adds -->
+  <section class="card">
+    <h2>Live today vs. what approval adds</h2>
+    <table>
+      <thead>
+        <tr><th scope="col">Live today</th><th scope="col">Approval adds</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>
+            Action needed section<br>
+            Ready label + glow<br>
+            Viewed → Done auto-settle<br>
+            Created/updated time chips<br>
+            Needs-you badge
+          </td>
+          <td>
+            "In progress" and "Working" retired for "Running" + substate<br>
+            The new Waiting block with its four substates<br>
+            The Running substate words<br>
+            List reorder (Running above Waiting, both under Ready)<br>
+            Conversation-header "State · Substate" pairs<br>
+            Workers' phase tags<br>
+            One ledger change: the legal transcribed→Running shortcut
+          </td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="footnote">Everything else is display-only over states the ledger already has.</p>
+  </section>
+
+  <!-- 9. Open point -->
+  <section class="card">
+    <div class="callout">
+      <p><strong>One choice inside the design:</strong> where Viewed rows sit once Waiting exists. The design names five list blocks; today Viewed is its own block.</p>
+      <p>Default if you approve as-is: keep today's Viewed block, unchanged, between Running/Waiting and Done.</p>
+      <p>If you'd rather fold Viewed into Done until it settles, say so with "Request changes".</p>
+    </div>
+  </section>
+
+  <footer class="page">
+    <p>This page is a static preview — the approve/request-changes buttons are in the voice-inbox app's question widget.</p>
+    <p>Design preview · 2026-09-13 (v1)</p>
+  </footer>
+</main>
+</body>
+</html>

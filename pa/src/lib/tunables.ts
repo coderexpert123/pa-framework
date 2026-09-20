@@ -332,7 +332,7 @@ export const KNOWN_CLI_DEFAULT_MODELS: Record<string, string> = {
   agy: 'gemini-3.8-flash-high',
   agyc: 'claude-sonnet-4-6',
   zclaude: 'glm-5.3',
-  claude: 'opusplan',
+  claude: 'opus',
   codex: 'gpt-5.4',
 };
 

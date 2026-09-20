@@ -4,7 +4,7 @@ on_missed: latest
 cwd: "${PA_HOME}/skills/reminders"
 secrets:
   - TELEGRAM_BOT_TOKEN
-cmd: "python process_reminders.py"
+cmd: "python3 process_reminders.py || python process_reminders.py"
 ---
 
 Process due one-off reminders from `reminders.json` (in this skill's directory) and send them to Telegram.

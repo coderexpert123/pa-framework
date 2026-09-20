@@ -15,6 +15,7 @@ import { listPendingDispatches, pendingDispatchKey, _resetPendingDispatchesForTe
 import { markTopicRecovering, clearTopicRecovering, _resetRecoveryGateForTest } from '../recovery-gate.js';
 import { _clearQueueForTest } from '../topic-queue.js';
 import { blackboard } from '../../../../pa/dist/src/blackboard.js';
+import { flushLog } from '../../../../pa/dist/src/lib/log.js';
 
 // Root cause of this file registering ZERO tests under `node --test` (dark
 // since ~2026-08-28, fixed 2026-09-01): `node --test` isolates each test file
@@ -974,6 +975,67 @@ describe('runPollLoop: model expiry sweep', { concurrency: 1 }, () => {
     assert.deepEqual(saved.turns, []);
   });
 
+  // AI-212 (pinned-card refresh latency): the in-place edit path must (a) emit a
+  // structured pinned-card-refresh-latency line measuring the sole awaited network
+  // RTT (editMessageText), and (b) await exactly ONE network method — the pin
+  // re-assert is fire-and-forget, so the collapse to one perceived round-trip is
+  // complete. syncModelStatusState is purely local (no second network call to batch).
+  it('AI-212: logs pinned-card-refresh-latency for the in-place edit and awaits only one network call', async () => {
+    const topicStateFile = join(tempDir, 'telegram-bot-topic-123_0.json');
+    const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const topicState = {
+      chat_id: 123,
+      thread_id: 0,
+      turns: [],
+      preferred_worker: 'agy',
+      preferred_worker_set_at: yesterday,
+      pinned_status_message_id: 42,
+    };
+    await writeFile(topicStateFile, JSON.stringify(topicState), 'utf8');
+
+    const controller = new AbortController();
+    const state = makeState(123, -1);
+
+    const calledUrls: string[] = [];
+    (globalThis as Record<string, unknown>).fetch = async (url: string, opts?: any) => {
+      calledUrls.push(url as string);
+      if ((url as string).includes('getUpdates')) {
+        controller.abort();
+        return {
+          ok: true, status: 200,
+          text: async () => JSON.stringify({ ok: true, result: [] }),
+          json: async () => ({ ok: true, result: [] }),
+        };
+      }
+      return {
+        ok: true, status: 200,
+        text: async () => JSON.stringify({ ok: true, result: true }),
+        json: async () => ({ ok: true, result: true }),
+      };
+    };
+
+    await runPollLoop('token', [123], state, {}, controller.signal, fastSleep);
+    await flushLog();
+
+    // (b) the refresh path (refreshPinnedStatusCardInPlace) awaits exactly ONE
+    // network method — editMessageText — and the pin re-assert is fire-and-forget
+    // (void), so the collapse to one perceived round-trip is complete. The
+    // sendMessage here is the sweep's SEPARATE session-expiry notice
+    // (main.ts:475), not a card-replace fallback — an in-place edit never falls
+    // to replacePinnedStatusCard, proven by zero unpinChatMessage calls.
+    const editCalls = calledUrls.filter(u => u.includes('/editMessageText'));
+    const unpinCalls = calledUrls.filter(u => u.includes('unpinChatMessage'));
+    const pinCalls = calledUrls.filter(u => u.includes('/pinChatMessage'));
+    assert.strictEqual(editCalls.length, 1, 'exactly one awaited editMessageText network call in the refresh path');
+    assert.strictEqual(unpinCalls.length, 0, 'in-place edit must not fall back to replacePinnedStatusCard (no unpin)');
+    assert.ok(pinCalls.length >= 1, 'the fire-and-forget pin re-assert still fires');
+
+    // (a) the structured latency line is present in the log.
+    const logRaw = await readFile(join(tempDir, 'app.log.jsonl'), 'utf8');
+    assert.match(logRaw, /"module":"pinned-card-refresh"/);
+    assert.match(logRaw, /pinned-card-refresh-latency: \d+ms/);
+  });
+
   it('skips topic-state files whose chatId is not in the configured allow-list', async () => {
     const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     const allowedFile = join(tempDir, 'telegram-bot-topic-123_0.json');
@@ -1171,6 +1233,14 @@ workers:
     check: node -e "process.exit(0)"
 topic_defaults:
   "123_0": "agy"
+maintenance:
+  # The sweep is due on the first maintenance pass (deliberately not
+  # cold-start-seeded). Its in-place refresh of the JUST-pinned failover card
+  # is a legal editMessageText that races the 0-edit assertion below — on
+  # macOS CI it landed inside the window and failed the test (2026-09-20).
+  # This test only cares about the failover path's own writes.
+  model-override-sweep:
+    enabled: false
 `);
 
     const topicStateFile = join(tempDir, 'telegram-bot-topic-123_0.json');
@@ -2088,7 +2158,9 @@ describe('runPollLoop: branch/merge commands', { concurrency: 1 }, () => {
     });
     const sendCalls = fetchLog.filter(e => e.url.includes('sendMessage'));
     assert.ok(sendCalls.length > 0, 'sendMessage must have been called');
-    assert.ok(sendCalls[0].body.includes('No parent branch'), 'must explain no parent branch');
+    // Same ambient startup sweep as the /merge test above: pin-refresh sends can
+    // precede the command reply under full-suite load, so do not index sendCalls[0].
+    assert.ok(sendCalls.some(c => c.body.includes('No parent branch')), 'must explain no parent branch');
   });
 });
 
@@ -2870,6 +2942,14 @@ describe('runPollLoop: recovery gate', { concurrency: 1 }, () => {
   }
 
   it('a plain worker message to a topic marked recovering WAITS for the clear, then dispatches (queue-not-bounce)', async () => {
+    // 2026-09-12 self-heal gap fix (t-32): this describe's shared beforeEach
+    // config.yaml worker produces EMPTY stdout (a dispatch failure) — which, now
+    // that a FRESH failed dispatch parks into the auto-retry ladder instead of
+    // settling immediately, would leave a parked pending-dispatch record and
+    // break this test's "lifecycle completes normally" assertion below for a
+    // reason unrelated to the recovery gate this test actually targets. Override
+    // with a worker that produces real output so the dispatch genuinely succeeds.
+    await writeFile(join(tempDir, 'config.yaml'), JSON.stringify({ workers: [{ name: 'claude', command: 'node', args: ['-e', 'process.stdout.write("ok")'], check: 'node -e 0' }] }), 'utf8');
     process.env.PA_RECOVERY_WAIT_MS = '5000';
     markTopicRecovering('123_0');
     const clearTimer = setTimeout(() => clearTopicRecovering('123_0'), 50);
@@ -2894,6 +2974,45 @@ describe('runPollLoop: recovery gate', { concurrency: 1 }, () => {
     } finally {
       delete process.env.PA_RECOVERY_WAIT_MS;
     }
+  });
+
+  it('a FRESH dispatch failure (no prior requeue) auto-retries instead of settling dead — self-heal gap fix (t-32)', async () => {
+    // Before this fix, only a dispatch already IN the requeue ladder (a
+    // crash-recovered continuation, __requeueCount already set) could park for
+    // an automatic retry — main.ts's parkedNow required `rqCount !== undefined`.
+    // A dispatch failing on its very FIRST attempt (e.g. every configured worker
+    // rate-limited at the same instant) fell straight through to a manual-retry-
+    // only failure reply, and its pending-dispatch record was cleared with no
+    // automatic follow-up ever scheduled — the gap voice-inbox's stuck-task sweep
+    // already closed for its own analogous case.
+    //
+    // 2026-09-12 verification fix: the describe's shared beforeEach worker
+    // (`node -e '0'`, empty stdout on the 'claude' worker) fails, but as an
+    // "empty response" — classifyRateLimit special-cases claude/zclaude to require
+    // real session-JSONL 429 evidence, so dr.rateLimitedWorker never gets set and
+    // this test was exercising the OLD non-rate-limit failure path the whole time
+    // (green for the wrong reason, until a full-suite run caught it failing on the
+    // real dist). Override with a single 'agy' worker whose stderr matches agy's
+    // real text-based classifier (rate-limits-gemini.ts's RESOURCE_EXHAUSTED rule,
+    // same fixture the AI-026 failover test above already uses) so the failure is
+    // genuinely classified as rate-limit and rateLimitedWorker is actually set.
+    await writeFile(join(tempDir, 'config.yaml'), JSON.stringify({
+      workers: [{
+        name: 'agy',
+        command: 'node',
+        args: ['-e', 'process.stderr.write("RESOURCE_EXHAUSTED"); process.exit(1)'],
+        check: 'node -e 0',
+        rate_limit_patterns: ['RESOURCE_EXHAUSTED'],
+      }],
+    }), 'utf8');
+    const sent = await runOneUpdate('hello there');
+    assert.ok(sent.some((t) => t.includes('retrying your message automatically')),
+      `expected the out-of-band auto-retry status line; got: ${JSON.stringify(sent)}`);
+    const pending = await listPendingDispatches();
+    assert.equal(pending.length, 1, 'the failed first attempt must stay parked, not clear (queue-drain owns it now)');
+    assert.equal(pending[0].updateId, 1);
+    assert.ok((pending[0] as unknown as { requeueNotBefore?: number }).requeueNotBefore! > Date.now(),
+      'parked with a future auto-retry time, per PA_REQUEUE_BACKOFF_MS');
   });
 
   it('requeueSyntheticUpdate injects a shape-complete synthetic that dispatches through the normal path exactly once', async () => {
@@ -3308,8 +3427,12 @@ describe('runPollLoop: branch ancestry race condition', { concurrency: 1 }, () =
     // Gate design: createForumTopic mock calls gateResolve(), which schedules
     // the second getUpdates continuation (MT1) before /branch continuation (MT2).
     // MT1 runs first but only causes getUpdates to resolve (scheduling MT3).
-    // MT2 (branchCreatedTopicKeys.add) was already queued before MT3, so add()
-    // always executes before the second batch starts processing.
+    // MT2 (branchCreatedTopicKeys.add, now called synchronously right after
+    // createForumTopic resolves, before any other await) was already queued
+    // before MT3, so add() always executes before the second batch starts
+    // processing.  The add() was previously at the END of the /branch block
+    // (after an LLM call), so in production the forum_topic_created event
+    // raced ahead and overwrote the branch description.
     const controller = new AbortController();
     const state = makeState(123, -1);
     let getUpdatesCount = 0;

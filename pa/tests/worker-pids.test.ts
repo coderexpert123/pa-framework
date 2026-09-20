@@ -358,4 +358,44 @@ describe('worker-pids: AI-114 harvest-window protection', () => {
       try { orphan.kill('SIGKILL'); } catch { /* already dead — expected */ }
     }
   });
+
+  it('AI-328: skips stale-PPID phantoms (createdMs predates worker start), kills real orphans', async () => {
+    const { cleanupOrphanedWorkers, isProcessAlive } = await import('../src/worker-pids.js');
+    const { spawn } = await import('child_process');
+    const realOrphan = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    const phantom = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    try {
+      await new Promise((r) => setTimeout(r, 200));
+      const pidsDir = join(dir, 'worker-pids');
+      await mkdir(pidsDir, { recursive: true });
+      await writeFile(
+        join(pidsDir, '999983.json'),
+        JSON.stringify({
+          pid: 999983, spawnedBy: 999999, worker: 'agy', skill: 'topic--999_5',
+          startedAt: new Date().toISOString(), descendants: [realOrphan.pid, phantom.pid],
+        }),
+        'utf8'
+      );
+
+      // Injected snapshot marks `phantom` with a boot-age createdMs — the
+      // stale-PPID signature of a process that can never be this worker's
+      // descendant. Killing it would hit an unrelated live process.
+      const snapshot = new Map([
+        [realOrphan.pid!, { parentPid: 999983, cmdline: 'real-orphan', createdMs: Date.now() }],
+        [phantom.pid!, { parentPid: 999983, cmdline: 'phantom-svc', createdMs: 0 }],
+      ]);
+      const killed = await cleanupOrphanedWorkers(undefined, { snapshot });
+      assert.equal(killed, 1, 'the entry still counts as one orphaned worker');
+
+      const deadline = Date.now() + 5000;
+      while (isProcessAlive(realOrphan.pid!) && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      assert.equal(isProcessAlive(realOrphan.pid!), false, 'real orphan must be reaped');
+      assert.equal(isProcessAlive(phantom.pid!), true, 'stale-PPID phantom must survive — taskkill would hit an unrelated process');
+    } finally {
+      try { realOrphan.kill('SIGKILL'); } catch { /* already dead — expected */ }
+      try { phantom.kill('SIGKILL'); } catch { /* already dead — expected */ }
+    }
+  });
 });

@@ -1,0 +1,24 @@
+# Edge relay for voice-inbox (or any localhost HTTP service): a stable
+# <name>.<subdomain>.workers.dev URL backed by long-poll pull. The home
+# machine's poller (scripts/relay_poller.mjs) fetches work; nothing inbound
+# ever reaches the home network. Free tier only: SQLite-backed Durable Object,
+# R2 bucket, workers.dev URL.
+#
+# Copy to wrangler.toml (gitignored) — scripts/relay_setup.mjs does this and
+# fills the live values. bucket_name below is a placeholder the setup rewrites.
+name = "voice-inbox-relay"
+main = "worker.js"
+compatibility_date = "2026-09-01"
+workers_dev = true
+
+[[durable_objects.bindings]]
+name = "MAILBOX"
+class_name = "Mailbox"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Mailbox"]
+
+[[r2_buckets]]
+binding = "RELAY_BUCKET"
+bucket_name = "voice-inbox-relay-bucket"

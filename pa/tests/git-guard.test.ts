@@ -140,6 +140,149 @@ describe('checkGitWorkflowAllowed — real git integration', () => {
   });
 });
 
+describe('checkGitWorkflowAllowed — AI-243 claims gate', () => {
+  const future = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+  const past = new Date(Date.now() - 60 * 1000).toISOString();
+  const mkRes = (over: Partial<import('../src/lib/reservations.js').Reservation>) => ({
+    id: 'r-test0001',
+    paths: ['docs/claimed.md'],
+    session: 'other-session',
+    note: 'foreign work in progress',
+    claimedAt: past,
+    expiresAt: future,
+    ...over,
+  });
+  const baseOpts = {
+    isInsideWorkTreeFn: async () => true,
+    stagedPathsFn: async () => ['docs/claimed.md', 'pa/src/x.ts'] as string[] | null,
+  };
+
+  it('staged path under a FOREIGN ACTIVE reservation → allowed:false, holder named', async () => {
+    await createTempConfig(tempDir, []);
+    const result = await checkGitWorkflowAllowed({
+      ...baseOpts,
+      claimsCheck: { session: 'my-session' },
+      readActiveFn: async () => [mkRes({})],
+    });
+    assert.strictEqual(result.allowed, false);
+    assert.ok(result.reason.includes('other-session'), `reason should name the holder: ${result.reason}`);
+    assert.ok(result.reason.includes('docs/claimed.md'), `reason should name the path: ${result.reason}`);
+    assert.strictEqual(result.claimBlocks?.length, 1);
+    assert.strictEqual(result.claimBlocks?.[0].path, 'docs/claimed.md');
+  });
+
+  it('directory reservation covers a staged path beneath it', async () => {
+    await createTempConfig(tempDir, []);
+    const result = await checkGitWorkflowAllowed({
+      ...baseOpts,
+      stagedPathsFn: async () => ['docs/claimed.md'],
+      claimsCheck: { session: 'my-session' },
+      readActiveFn: async () => [mkRes({ paths: ['docs'] })],
+    });
+    assert.strictEqual(result.allowed, false);
+  });
+
+  it('EXPIRED reservation → allowed:true', async () => {
+    await createTempConfig(tempDir, []);
+    const result = await checkGitWorkflowAllowed({
+      ...baseOpts,
+      claimsCheck: {},
+      readActiveFn: async () => [mkRes({ expiresAt: past })],
+    });
+    assert.strictEqual(result.allowed, true);
+  });
+
+  it('OWN-session reservation → allowed:true (wave exception)', async () => {
+    await createTempConfig(tempDir, []);
+    const result = await checkGitWorkflowAllowed({
+      ...baseOpts,
+      claimsCheck: { session: 'ai243-commit-gate' },
+      readActiveFn: async () => [mkRes({ session: 'ai243-commit-gate' })],
+    });
+    assert.strictEqual(result.allowed, true);
+  });
+
+  it('--path mode checks named paths, not the index (wave pathspec commit)', async () => {
+    await createTempConfig(tempDir, []);
+    // Foreign claim covers the staged 'docs/claimed.md', but the caller's
+    // pathspec commit targets only its own file — index contents are ignored.
+    const result = await checkGitWorkflowAllowed({
+      ...baseOpts,
+      claimsCheck: { paths: ['pa/src/x.ts'], session: 'my-session' },
+      readActiveFn: async () => [mkRes({})],
+    });
+    assert.strictEqual(result.allowed, true);
+  });
+
+  it('--path mode blocks a named path under a foreign claim', async () => {
+    await createTempConfig(tempDir, []);
+    const result = await checkGitWorkflowAllowed({
+      ...baseOpts,
+      claimsCheck: { paths: ['docs/claimed.md'], session: 'my-session' },
+      readActiveFn: async () => [mkRes({})],
+    });
+    assert.strictEqual(result.allowed, false);
+    assert.ok(result.reason.includes('other-session'));
+  });
+
+  it('@-prefixed logical reservations never match file paths', async () => {
+    await createTempConfig(tempDir, []);
+    const result = await checkGitWorkflowAllowed({
+      ...baseOpts,
+      stagedPathsFn: async () => ['build/output.js'],
+      claimsCheck: {},
+      readActiveFn: async () => [mkRes({ paths: ['@build'] })],
+    });
+    assert.strictEqual(result.allowed, true);
+  });
+
+  it('no reservations file → allowed:true (real readActive, empty store)', async () => {
+    await createTempConfig(tempDir, []);
+    // No reservations.json written into tempDir — readActive treats the
+    // missing store as "no reservations".
+    const result = await checkGitWorkflowAllowed({
+      ...baseOpts,
+      claimsCheck: {},
+    });
+    assert.strictEqual(result.allowed, true);
+  });
+
+  it('unenumerable index (git failure) → allowed:false (fail closed)', async () => {
+    await createTempConfig(tempDir, []);
+    const result = await checkGitWorkflowAllowed({
+      ...baseOpts,
+      stagedPathsFn: async () => null,
+      claimsCheck: {},
+      readActiveFn: async () => [],
+    });
+    assert.strictEqual(result.allowed, false);
+    assert.ok(result.reason.match(/staged index/i), `reason should mention the index: ${result.reason}`);
+  });
+
+  it('paths: [] (explicit empty) falls back to the staged index — never a vacuous pass', async () => {
+    await createTempConfig(tempDir, []);
+    // The documented contract is "omitted/empty → the whole staged index".
+    // An explicit empty list must NOT check nothing: the staged 'docs/claimed.md'
+    // under a foreign active reservation still refuses.
+    const result = await checkGitWorkflowAllowed({
+      ...baseOpts,
+      claimsCheck: { paths: [], session: 'my-session' },
+      readActiveFn: async () => [mkRes({})],
+    });
+    assert.strictEqual(result.allowed, false);
+    assert.ok(result.reason.includes('other-session'), `reason should name the holder: ${result.reason}`);
+  });
+
+  it('claims gate not requested → legacy verdict unchanged (staged claims ignored)', async () => {
+    await createTempConfig(tempDir, []);
+    const result = await checkGitWorkflowAllowed({
+      ...baseOpts,
+      readActiveFn: async () => [mkRes({})],
+    });
+    assert.strictEqual(result.allowed, true);
+  });
+});
+
 describe('Scaffold drift — init and config files', () => {
   it('initCommand scaffolds git_workflow.enabled:false', async () => {
     await initCommand();

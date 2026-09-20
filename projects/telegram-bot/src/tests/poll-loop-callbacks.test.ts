@@ -2,40 +2,50 @@
 // buttons & interactivity wiring in runPollLoop: the injection queue, the callback_query /
 // message_reaction branches, and the R1 poll-offset ordering guarantee.
 //
-// IMPORTANT — process.exit(0) landmine (discovered verifying this file, unrelated to this
-// wave): runPollLoop's while(!signal.aborted) loop unconditionally calls process.exit(0)
-// once it exits (main.ts, committed 2026-08-18 in 3beddf6 "WP4: non-blocking restart
-// detach" — predates and is untouched by this wave). ANY natural loop-exit path (a real
-// AbortError `break`, or `signal.aborted` becoming true at the next top-of-loop check)
-// reaches that same unconditional exit. Verified by direct repro: a BEFORE/AFTER
-// console.error probe around `await runPollLoop(...)` printed BEFORE and never printed
-// AFTER — the calling test's own continuation never runs, because the whole node:test
-// process dies first. And critically, `process.exit()` called mid-file inside node:test
-// silently collapses that file's TAP reporting to a single opaque pass/fail with every
-// other test (in that file, or in any file listed AFTER it in the same `node --test a b c`
-// invocation) never reported and never run at all.
+// IMPORTANT — process.exit(0) landmine (discovered verifying this file; root-caused
+// 2026-09-01 as the "bot dark test files" defect): runPollLoop's while(!signal.aborted)
+// loop unconditionally calls process.exit(0) once it exits (main.ts, committed
+// 2026-08-18 in 3beddf6 "WP4: non-blocking restart detach"). ANY natural loop-exit path
+// (a real AbortError `break`, or `signal.aborted` becoming true at the next
+// top-of-loop check) reaches that same unconditional exit. `process.exit()` called
+// mid-file inside node:test kills this file's subprocess before its TAP reaches the
+// runner — the file reports back as a bare shell with zero tests, which
+// scripts/run-tests.mjs's dark-file detector fails the run on.
+//
+// This file defuses the landmine the same way every other runPollLoop-driving file
+// does (the mechanism that fixed the 2026-09-01 dark files): `_setExitForTest(() => {})`
+// at module top replaces the loop's terminal exit with a no-op, so the runPollLoop
+// promise RESOLVES on abort instead of killing the subprocess mid-TAP. (This file
+// originally dodged the landmine by never awaiting the run and letting the real
+// exit kill the process after the test's asserts — that ordering was never guaranteed,
+// and the exit began winning the race, producing the dark-file failure.)
 //
 // Consequence: this file has exactly ONE test, and we deliberately do NOT `await
-// runPollLoop(...)` to completion inside it. We kick the run off, drive it through several
-// iterations via a scripted fetch mock, and poll the mock's own call log (populated
-// synchronously as each HTTP call happens, independent of whether the runPollLoop promise
-// ever settles) to know when to assert. The mock's terminal response calls
-// controller.abort() (matching the existing setupFetchMock() convention in
-// poll-loop.test.ts); once that fires, the loop makes no further HTTP calls before it
-// dies. This test explicitly waits for that final settlement before returning, so the NEXT
-// test file in a combined gate invocation (e.g. telegram-keyboard.test.js) never races a
-// still-live background run for `globalThis.fetch` — empirically, splitting this into
-// multiple `it()` blocks (even within this same file) reintroduced exactly that race, so
-// everything is folded into one continuous run instead.
+// runPollLoop(...)` to completion inside it. We kick the run off, drive it through
+// several iterations via a scripted fetch mock, and poll the mock's own call log
+// (populated synchronously as each HTTP call happens, independent of whether the
+// runPollLoop promise has settled yet) to know when to assert. The mock's terminal
+// response calls controller.abort() (matching the existing setupFetchMock()
+// convention in poll-loop.test.ts); once that fires, the loop makes no further HTTP
+// calls before it returns. This test explicitly waits for that final settlement
+// before returning, so the NEXT test file in a combined gate invocation (e.g.
+// telegram-keyboard.test.js) never races a still-live background run for
+// `globalThis.fetch` — empirically, splitting this into multiple `it()` blocks (even
+// within this same file) reintroduced exactly that race, so everything is folded
+// into one continuous run instead.
 import './test-env-guard.js';
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { runPollLoop } from '../main.js';
+import { runPollLoop, _setExitForTest } from '../main.js';
 import { rmRetry } from './rm-retry.js';
 import { waitForDrain } from './test-teardown-guard.js';
+
+// Neuter runPollLoop's terminal process.exit(0) for the life of this subprocess —
+// see the file header comment for the dark-file landmine this defuses.
+_setExitForTest(() => {});
 
 type FetchCall = { url: string; body: string };
 
@@ -161,9 +171,10 @@ topic_defaults:
         return jsonOk(true);
       };
 
-      // Deliberately NOT awaited to completion — see the file header comment. Also deliberately
-      // NOT latched (trackPendingWork): the loop dies via the REAL process.exit(0) before afterEach
-      // runs, so a held latch only hands that exit the window to darken the file mid-TAP.
+      // Deliberately NOT awaited to completion — see the file header comment. With the
+      // terminal exit neutered above, this promise RESOLVES on the abort rather than the
+      // process dying mid-TAP; not latching it (trackPendingWork) is unchanged — nothing
+      // needs to hold the run open past this test's own settlement wait below.
       runPollLoop('token', [ALLOWED_CHAT], state, {}, controller.signal, async () => {}).catch(() => {});
 
       // The cf:y press has been answered, and the resulting synthetic "yes" has been

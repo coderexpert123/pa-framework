@@ -21,7 +21,7 @@ import {
   handleCodeCommand, handleResetCommand, handleNewCommand, handleHelpCommand,
   getAgentSwitchTarget, handleSunsetLlmCommand, parseTunableCommand, promoteSessionToTopicDefaults,
   renderSessionExpiryMessage, handleRetranscribeCommand, handleRefCommand, handleReauthCommand,
-  handleUpdateBrainCommand, AUTH_PATTERN, AGENT_BARE_PATTERN, KEEP_AWAKE_PATTERN, RESET_PATTERN,
+  handleUpdateBrainCommand, AUTH_PATTERN, SECRET_PATTERN, AGENT_BARE_PATTERN, RESET_PATTERN,
   NEW_PATTERN, CODE_PATTERN, STATUS_PATTERN, SKILLS_PATTERN, HELP_PATTERN, HEALTH_PATTERN,
   REF_PATTERN, CLAIMS_PATTERN, REAUTH_PATTERN, COMMIT_PATTERN, PUSH_PATTERN, PUSH_PUBLIC_PATTERN,
   INVESTIGATE_FLAGGED_PATTERN, UPDATE_BRAIN_PATTERN, SOURCES_PATTERN, handleSourcesCommand,
@@ -35,10 +35,11 @@ import { DEBUG_PATTERN, handleDebugCommand, parseSupportTopicKey, resolveDebugTa
 import { PAIR_PATTERN, handlePairCommand } from './voice-inbox-bridge.js';
 import {
   buildOAuthCompletionMessage, launchOAuthResumeAction, normalizeResumeAction,
-  redactAuthCommand, validateTopicResumeAction, type OAuthResumeStatus,
+  redactAuthCommand, redactSecretCommand, validateTopicResumeAction, type OAuthResumeStatus,
 } from './oauth.js';
-import { getKeepAwakeStatus, toggleKeepAwake } from './keepawake.js';
-import { updateDashboard } from './dashboard.js';
+// WP-5 (§5, decision 25): the /agent standing notice gates on the same
+// deprecate-pins predicate routing.ts owns — one source of truth for the gate.
+import { deprecatePinsEffective } from './routing.js';
 import { getTopicBrainInfo, getTopicExemptions } from './topic-brains.js';
 import {
   transcribeVoiceMessage, formatTranscriptUserText, voiceErrorMessage,
@@ -62,6 +63,11 @@ import type { TopicWorkdir } from './topic-workdir.js';
 
 // Set BOT_CWD in secrets.env to the absolute path of your project root.
 const BOT_CWD = process.env.BOT_CWD || process.cwd();
+
+/** WP-5 (§5, decision 25): the standing notice the /agent reply carries while
+ *  an effective deprecate-pins gate is live — the spec's frozen phrase. The
+ *  pin still writes; it no longer steers dispatch on routed turns. */
+export const ROUTER_OWNS_DISPATCH_NOTICE = '\n\n_(routing owns worker+model now)_';
 
 /** Injectable exec seam for the pa CLI helpers: no unit test ever spawns the
  *  real `node pa/dist/bin/pa.js` against the live checkout. */
@@ -129,7 +135,6 @@ export interface CommandRouterDeps {
     threadId: number,
     state: ConversationState,
     effectiveDefault: string,
-    keepAwake: ReturnType<typeof getKeepAwakeStatus>,
     config?: { workers?: WorkerConfig[] },
   ) => Promise<void>;
   syncModelStatus: (state: ConversationState, snapshot: ReturnType<typeof buildModelStatusSnapshot>) => void;
@@ -148,9 +153,6 @@ export interface CommandRouterDeps {
   addTurnFn?: typeof addTurn;
   saveTopicStateFn?: typeof saveTopicState;
   markRepliedFn?: typeof markRepliedForThread;
-  updateDashboardFn?: typeof updateDashboard;
-  toggleKeepAwakeFn?: typeof toggleKeepAwake;
-  getKeepAwakeFn?: typeof getKeepAwakeStatus;
   spawnFn?: typeof spawn;
   statFn?: typeof stat;
   mkdirFn?: typeof mkdir;
@@ -245,7 +247,12 @@ export function execPaRef(refId: string, exec: ExecFn = execFileSync): string {
  * fixed "My PA" general topic (thread 0) regardless of where it was
  * triggered from — the ack text says so explicitly so that's never a surprise. */
 function dispatchGitWorkflowSkill(skillName: string, repoRoot: string, spawnFn: typeof spawn): string {
-  spawnFn('pa', ['run', skillName], { cwd: repoRoot, detached: true, stdio: 'ignore', shell: true, windowsHide: true }).unref();
+  // WB-304: error listener so a missing `pa` is never invisible.
+  spawnFn('pa', ['run', skillName], { cwd: repoRoot, detached: true, stdio: 'ignore', shell: true, windowsHide: true })
+    .on('error', (err) => {
+      logger.warn('command-router', `git-workflow skill spawn failed: ${(err as Error).message}`, { skill: skillName });
+    })
+    .unref();
   return `🚀 Kicked off \`${skillName}\` — it reports back in the main "My PA" topic when done, not necessarily here.`;
 }
 
@@ -265,9 +272,6 @@ export async function runCommandRouter(
   const addTurnFn = deps.addTurnFn ?? addTurn;
   const saveTopicStateFn = deps.saveTopicStateFn ?? saveTopicState;
   const markRepliedFn = deps.markRepliedFn ?? markRepliedForThread;
-  const updateDashboardFn = deps.updateDashboardFn ?? updateDashboard;
-  const toggleKeepAwakeFn = deps.toggleKeepAwakeFn ?? toggleKeepAwake;
-  const getKeepAwakeFn = deps.getKeepAwakeFn ?? getKeepAwakeStatus;
   const spawnFn = deps.spawnFn ?? spawn;
   const statFn = deps.statFn ?? stat;
   const mkdirFn = deps.mkdirFn ?? mkdir;
@@ -372,8 +376,42 @@ export async function runCommandRouter(
     skipWorker = true;
   }
 
+  if (SECRET_PATTERN.test(userText)) {
+    const secretMatch = SECRET_PATTERN.exec(userText);
+    const requestId = secretMatch![1];
+    const value = secretMatch![2];
+    log.info('auth', `Secret value received via Telegram (chat=${chatId})`);
+    archivedUserText = redactSecretCommand();
+
+    deleteMessageFn(token, chatId, messageId).catch(() => {});
+
+    const secretChild = spawnFn(
+      process.execPath,
+      [join(repoRoot, 'pa', 'dist', 'bin', 'pa.js'), 'auth', 'answer', '--request', requestId],
+      { env: runtimeEnv, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }
+    );
+    secretChild.stdin.write(value);
+    secretChild.stdin.end();
+
+    let secretOut = '';
+    secretChild.stdout.on('data', (d) => secretOut += d.toString());
+
+    const secretResult = await new Promise<any>((resolve) => {
+      secretChild.on('close', () => {
+        const lastLine = secretOut.trim().split('\n').filter(Boolean).pop();
+        try { resolve(lastLine ? JSON.parse(lastLine) : {}); }
+        catch { resolve({}); }
+      });
+    });
+
+    response = secretResult && secretResult.ok === true
+      ? 'Sent. The task continues.'
+      : 'That request is no longer pending, or the id is unknown.';
+    skipWorker = true;
+  }
+
   if (workerExpired) {
-    await deps.refreshCard(token, chatId, threadId, topicState, effectiveDefault, getKeepAwakeFn(), config);
+    await deps.refreshCard(token, chatId, threadId, topicState, effectiveDefault, config);
   }
 
   if (!userText && !audioAttachment && !msg.document && !msg.photo) {
@@ -456,20 +494,18 @@ export async function runCommandRouter(
       }));
     }
     topicState.session = undefined;
-    await deps.refreshCard(token, chatId, threadId, topicState, effectiveDefault, getKeepAwakeFn(), config);
+    await deps.refreshCard(token, chatId, threadId, topicState, effectiveDefault, config);
     const lifetime = modelTarget === effectiveDefault ? 'topic default' : 'until midnight IST';
+    // WP-5 (§5, decision 25): under an effective deprecate-pins gate the pin
+    // still WRITES (flag-off reversal is exact) but no longer steers dispatch
+    // on routed turns — the reply carries the standing notice. State writes
+    // above are unchanged.
+    const pinsNotice = deprecatePinsEffective(config?.model_router) ? ROUTER_OWNS_DISPATCH_NOTICE : '';
     if (agentSwitch.isLegacy) {
-      response = `Switched agent: ${prevDescriptor} → ${nextDescriptor} (${lifetime}).\n💡 _Tip: use \`/agent <name>\` to pick the agent and \`/model <name>\` to set its model._`;
+      response = `Switched agent: ${prevDescriptor} → ${nextDescriptor} (${lifetime}).\n💡 _Tip: use \`/agent <name>\` to pick the agent and \`/model <name>\` to set its model._${pinsNotice}`;
     } else {
-      response = `Switched agent: ${prevDescriptor} → ${nextDescriptor} (${lifetime}).`;
+      response = `Switched agent: ${prevDescriptor} → ${nextDescriptor} (${lifetime}).${pinsNotice}`;
     }
-    skipWorker = true;
-  }
-
-  if (!skipWorker && KEEP_AWAKE_PATTERN.test(userText)) {
-    const ka = await toggleKeepAwakeFn();
-    await deps.refreshCard(token, chatId, threadId, topicState, effectiveDefault, ka, config);
-    updateDashboardFn(token, chatId).catch(() => {});
     skipWorker = true;
   }
 
@@ -494,7 +530,7 @@ export async function runCommandRouter(
       : undefined;
     const nextDescriptor = formatWorkerDescriptor(effectiveDefault, currentLlm, currentEffort);
 
-    await deps.refreshCard(token, chatId, threadId, topicState, effectiveDefault, getKeepAwakeFn(), config);
+    await deps.refreshCard(token, chatId, threadId, topicState, effectiveDefault, config);
     response = renderSessionExpiryMessage(prevDescriptor, nextDescriptor, 'cleared');
     skipWorker = true;
   }
@@ -646,7 +682,7 @@ export async function runCommandRouter(
         currentEffort: nextDefaultEffort,
       }));
 
-      await deps.refreshCard(token, chatId, threadId, topicState, effectiveDefault, getKeepAwakeFn(), config);
+      await deps.refreshCard(token, chatId, threadId, topicState, effectiveDefault, config);
       if (dq.worker) {
         response = `Topic default agent set: ${prevDefaultDescriptor} → ${nextDefaultDescriptor} (persists).`;
       } else {
@@ -674,7 +710,7 @@ export async function runCommandRouter(
     if (tunableCmd) {
       response = await deps.handleTunables(tunableCmd, topicState, config, effectiveDefault);
       if (tunableCmd.action === 'set' || tunableCmd.action === 'clear') {
-        await deps.refreshCard(token, chatId, threadId, topicState, effectiveDefault, getKeepAwakeFn(), config);
+        await deps.refreshCard(token, chatId, threadId, topicState, effectiveDefault, config);
       }
       skipWorker = true;
     }
@@ -738,9 +774,8 @@ export async function runCommandRouter(
 
   // Deterministic read-only commands: /status, /skills, /help, /health, /ref <id>, /claims
   if (!skipWorker && STATUS_PATTERN.test(userText)) {
-    const ka = await getKeepAwakeFn();
     const snapshot = hydrateModelStatus(topicState, effectiveDefault, config);
-    response = appendRefIdAndLog(renderStatusCard({ snapshot, keepAwake: ka }), { kind: 'pin', chatId, threadId });
+    response = appendRefIdAndLog(renderStatusCard({ snapshot }), { kind: 'pin', chatId, threadId });
     skipWorker = true;
   }
 

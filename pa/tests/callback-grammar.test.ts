@@ -45,6 +45,20 @@ describe('parseCallbackData — moved-grammar canary (one row each)', () => {
     assert.equal(parseCallbackData(undefined), null);
     assert.equal(parseCallbackData('not-a-callback!!'), null);
   });
+
+  it('parses sr:<idx> (AI-234 quick-reply chip)', () => {
+    assert.deepEqual(parseCallbackData('sr:0'), { prefix: 'sr', index: 0, raw: 'sr:0' });
+    assert.deepEqual(parseCallbackData('sr:1'), { prefix: 'sr', index: 1, raw: 'sr:1' });
+    assert.deepEqual(parseCallbackData('sr:3'), { prefix: 'sr', index: 3, raw: 'sr:3' });
+  });
+
+  it('rejects malformed sr: data', () => {
+    assert.equal(parseCallbackData('sr:'), null);
+    assert.equal(parseCallbackData('sr:-1'), null);
+    assert.equal(parseCallbackData('sr:abc'), null);
+    assert.equal(parseCallbackData('sr:0:extra'), null);
+    assert.equal(parseCallbackData('sr:0x'), null);
+  });
 });
 
 describe('gateFor', () => {
@@ -52,6 +66,11 @@ describe('gateFor', () => {
     assert.equal(gateFor(parseCallbackData('q:0')!), 'chat');
     assert.equal(gateFor(parseCallbackData('cf:y')!), 'chat');
     assert.equal(gateFor(parseCallbackData('sk:run:fitness-sync')!), 'operator');
+  });
+
+  it('sr: is chat-gated (AI-234 — chip reply is typed by whoever may speak)', () => {
+    assert.equal(gateFor(parseCallbackData('sr:0')!), 'chat');
+    assert.equal(gateFor(parseCallbackData('sr:3')!), 'chat');
   });
 });
 
@@ -255,5 +274,71 @@ describe('WP-D2 prefixes — ru/si/ch/wt (operator-gated)', () => {
         { text: '🔁 Re-register watch', callback_data: 'wt:w-0123abcd:r' },
       ],
     }).ok);
+  });
+});
+
+// AI-214 (2026-09-08): orphan-edit disposition — operator-gated ow: prefix.
+describe('ow: — orphan-edit disposition (AI-214)', () => {
+  it('parses ow:<12hex>:<l|k|d>', () => {
+    assert.deepEqual(parseCallbackData('ow:0123abcd4567:l'), {
+      prefix: 'ow', gid: '0123abcd4567', action: 'l', raw: 'ow:0123abcd4567:l',
+    });
+    assert.deepEqual(parseCallbackData('ow:0123abcd4567:k'), {
+      prefix: 'ow', gid: '0123abcd4567', action: 'k', raw: 'ow:0123abcd4567:k',
+    });
+    assert.deepEqual(parseCallbackData('ow:0123abcd4567:d'), {
+      prefix: 'ow', gid: '0123abcd4567', action: 'd', raw: 'ow:0123abcd4567:d',
+    });
+  });
+
+  it('rejects a bad action, wrong-length gids, and non-hex gids', () => {
+    assert.equal(parseCallbackData('ow:0123abcd4567:x'), null, 'unknown action');
+    assert.equal(parseCallbackData('ow:0123abcd456:l'), null, '11-hex gid');
+    assert.equal(parseCallbackData('ow:0123abcd45677:l'), null, '13-hex gid');
+    assert.equal(parseCallbackData('ow:0123ABCD4567:l'), null, 'uppercase hex');
+    assert.equal(parseCallbackData('ow:zz23abcd4567:l'), null, 'non-hex gid');
+    assert.equal(parseCallbackData('ow:0123abcd4567'), null, 'missing action');
+  });
+
+  it('is operator-gated (same class as mc:)', () => {
+    assert.equal(gateFor(parseCallbackData('ow:0123abcd4567:l')!), 'operator');
+  });
+
+  it('ow: buttons pass validateKeyboardRequest (18 bytes each)', () => {
+    assert.ok(validateKeyboardRequest({
+      buttons: [
+        { text: '📥 Land as-is', callback_data: 'ow:0123abcd4567:l' },
+        { text: '💤 Keep dirty 24h', callback_data: 'ow:0123abcd4567:k' },
+        { text: '📄 Show diff', callback_data: 'ow:0123abcd4567:d' },
+      ],
+    }).ok);
+  });
+});
+
+describe('callback grammar — auth: prefix (auth broker)', () => {
+  it('parses auth:<provider>:<ir-12hex>', () => {
+    assert.deepEqual(parseCallbackData('auth:google:ir-0123456789ab'), {
+      prefix: 'auth', provider: 'google', requestId: 'ir-0123456789ab', raw: 'auth:google:ir-0123456789ab',
+    });
+  });
+
+  it('rejects a malformed request id', () => {
+    assert.equal(parseCallbackData('auth:google:ir-XYZ'), null);
+  });
+
+  it('rejects an uppercase provider', () => {
+    assert.equal(parseCallbackData('auth:GOOGLE:ir-0123456789ab'), null);
+  });
+
+  it('rejects a 65-byte auth: string', () => {
+    assert.equal(parseCallbackData('auth:' + 'x'.repeat(60)), null);
+  });
+
+  it('is chat-gated', () => {
+    assert.equal(gateFor(parseCallbackData('auth:google:ir-0123456789ab')!), 'chat');
+  });
+
+  it('reauth:google still returns its unchanged shape', () => {
+    assert.deepEqual(parseCallbackData('reauth:google'), { prefix: 'reauth', provider: 'google', skill: undefined, raw: 'reauth:google' });
   });
 });

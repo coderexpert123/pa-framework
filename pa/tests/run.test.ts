@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createTempPaHome, createTempSkill, createTempConfig, createTempSecrets, cleanup } from './helpers.js';
-import { runCommand, isSilentNoOp, describeSendFailure, extractKeyboardEnvelope } from '../src/commands/run.js';
+import { runCommand, isSilentNoOp, describeSendFailure, extractKeyboardEnvelope, buildOperatorArgsBlock, exitCodeForCommandResult, PA_RUNTIME_BLOCK } from '../src/commands/run.js';
 import { writeFile, mkdir, readFile, readdir } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -80,6 +80,53 @@ describe('runCommand', () => {
     assert.ok(output.includes('[other-skill] Trigger when bill mentioned'), 'Should include other skill trigger');
   });
 
+  it('a protected skill with a trigger_description is absent from the injected catalog', async () => {
+    // PROTECTED_SKILLS (commit/push/...) are human-command-only — a skill roster
+    // offered to a worker for [pa run ...] triggering must never name them.
+    await createTempSkill(tempDir, 'commit', [
+      '---',
+      'trigger_description: "Trigger when commits are requested"',
+      '---',
+      'commit prompt',
+    ].join('\n'));
+    await createTempSkill(tempDir, 'visible-skill', [
+      '---',
+      'trigger_description: "Trigger when reports are requested"',
+      '---',
+      'visible prompt',
+    ].join('\n'));
+
+    const echoScript = await writeScript('echo2.js', `
+      const fs = require('fs');
+      let arg = process.argv[2];
+      if (arg.startsWith('@')) {
+        process.stdout.write(fs.readFileSync(arg.slice(1), 'utf8'));
+      } else {
+        process.stdout.write(arg);
+      }
+    `);
+    await createTempConfig(tempDir, [
+      { name: 'w1', command: 'node', args: [echoScript, '{prompt}'], check: 'echo ok', priority: 1 },
+    ]);
+    await createTempSkill(tempDir, 'main-skill', [
+      '---',
+      'inject_triggers: true',
+      '---',
+      'main prompt',
+    ].join('\n'));
+
+    await runCommand('main-skill');
+
+    const logDir = join(tempDir, 'logs', 'main-skill');
+    const files = await readdir(logDir);
+    const logFile = files.find(f => f.endsWith('.log'));
+    assert.ok(logFile, 'Log file should exist');
+    const output = await readFile(join(logDir, logFile), 'utf8');
+    assert.ok(output.includes('Trigger System: Available Skills'), 'Should include trigger system header');
+    assert.ok(output.includes('[visible-skill] Trigger when reports are requested'), 'unprotected skill is listed');
+    assert.ok(!output.includes('[commit]'), 'protected skill must never reach the worker-facing catalog');
+  });
+
   it('automatically executes triggered skills without recursion', async () => {
     // 1. Create a skill that will be triggered
     await createTempSkill(tempDir, 'triggered-skill', [
@@ -134,16 +181,33 @@ describe('runCommand', () => {
   });
 
   it('passes extra arguments through to the worker', async () => {
-    // Script that echoes its arguments
+    // AI-187 follow-up (2026-09-10): extraArgs after `--` are bridged into the
+    // PROMPT for LLM-worker skills (agy exits 2 on any positional argument —
+    // riding both the prompt AND the worker argv was the bug), while
+    // frontmatter-declared worker_args are real worker CLI flags and still
+    // ride the argv. The script reports the worker-argv tail (everything
+    // after the substituted prompt-file arg) separately from the prompt
+    // file's own content so both halves of the contract are checkable.
     const argEchoScript = await writeScript('arg-echo.js', `
-      process.stdout.write(process.argv.slice(2).join(' '));
+      const fs = require('fs');
+      const rawArgs = process.argv.slice(2);
+      const promptArg = rawArgs[0] || '';
+      const promptContent = promptArg.startsWith('@') ? fs.readFileSync(promptArg.slice(1), 'utf8') : promptArg;
+      const argvTail = rawArgs.slice(1);
+      process.stdout.write('ARGV:' + argvTail.join(' ') + '\\nPROMPT:' + promptContent);
     `);
-    
+
     await createTempConfig(tempDir, [
-      { name: 'w1', command: 'node', args: [argEchoScript], check: 'echo ok', priority: 1 },
+      { name: 'w1', command: 'node', args: [argEchoScript, '{prompt}'], check: 'echo ok', priority: 1 },
     ]);
 
-    await createTempSkill(tempDir, 'arg-skill', 'prompt');
+    await createTempSkill(tempDir, 'arg-skill', [
+      '---',
+      'worker_args:',
+      '  - --worker-flag',
+      '---',
+      'prompt',
+    ].join('\n'));
 
     await runCommand('arg-skill', ['--flag1', 'val1']);
 
@@ -151,37 +215,54 @@ describe('runCommand', () => {
     const files = await readdir(logDir);
     const logFile = files.find(f => f.endsWith('.log'));
     const output = await readFile(join(logDir, logFile!), 'utf8');
-    
-    assert.equal(output, '--flag1 val1');
+
+    const [argvLine, promptSection] = output.split('\nPROMPT:');
+    const argv = argvLine.replace('ARGV:', '');
+
+    // extraArgs must NOT ride the worker argv; declared worker_args still do.
+    assert.equal(argv, '--worker-flag', 'only declared worker_args should reach the worker argv');
+    assert.ok(!argv.includes('--flag1') && !argv.includes('val1'), 'extraArgs must not ride the worker argv');
+
+    // extraArgs must instead be bridged into the prompt as the operator-arguments block.
+    assert.equal(promptSection, 'prompt' + buildOperatorArgsBlock('--flag1\nval1') + '\n\n## PA runtime (this run)\n' + PA_RUNTIME_BLOCK, 'extraArgs must be bridged into the prompt');
   });
 
   it('supports triggers with their own extra arguments', async () => {
-    // 1. Skill B expects an argument
-    await createTempSkill(tempDir, 'skill-b', 'prompt b');
+    // 1. Skill B declares its own worker_args, distinct from the trigger's extra arg.
+    await createTempSkill(tempDir, 'skill-b', [
+      '---',
+      'worker_args:',
+      '  - --worker-flag-b',
+      '---',
+      'prompt b',
+    ].join('\n'));
 
-    // 2. Skill A triggers Skill B with an argument
+    // 2. Skill A triggers Skill B with an argument. AI-187 follow-up
+    // (2026-09-10): the triggered dispatch's extra arg must bridge into
+    // skill-b's PROMPT only, never ride skill-b's worker argv (agy exits 2 on
+    // any positional argument) — worker_args still ride the argv.
     const triggerWithArgsScript = await writeScript('trigger-args.js', `
       const fs = require('fs');
-      let arg = process.argv[2];
-      // node trigger-args.js <script-path> ...
-      // Wait, in my config I use {prompt} which becomes @path
-      let prompt = arg.startsWith('@') ? fs.readFileSync(arg.slice(1), 'utf8') : arg;
-      
-      if (prompt.includes('trigger me')) {
+      const rawArgs = process.argv.slice(2);
+      const promptArg = rawArgs[0] || '';
+      const promptContent = promptArg.startsWith('@') ? fs.readFileSync(promptArg.slice(1), 'utf8') : promptArg;
+      const argvTail = rawArgs.slice(1);
+
+      if (promptContent.includes('trigger me')) {
         process.stdout.write("triggering\\n[pa run skill-b --flag-for-b]");
       } else {
         // This runs for skill-b
-        process.stdout.write("B_RECEIVED: " + process.argv.slice(2).join(' '));
+        process.stdout.write('ARGV:' + argvTail.join(' ') + '\\nPROMPT:' + promptContent);
       }
     `);
-    
+
     await createTempConfig(tempDir, [
-      { 
-        name: 'w1', 
-        command: 'node', 
+      {
+        name: 'w1',
+        command: 'node',
         args: [triggerWithArgsScript, '{prompt}'],
-        check: 'echo ok', 
-        priority: 1 
+        check: 'echo ok',
+        priority: 1
       }
     ]);
 
@@ -194,11 +275,14 @@ describe('runCommand', () => {
     const bFiles = await readdir(bLogDir);
     const bLog = bFiles.find(f => f.endsWith('.log'));
     assert.ok(bLog, 'Skill B log should exist');
-    
+
     const bContent = await readFile(join(bLogDir, bLog), 'utf8');
-    // Result should contain the prompt file path AND the extra flag
-    assert.ok(bContent.includes('B_RECEIVED:'), 'Should have received data');
-    assert.ok(bContent.includes('--flag-for-b'), 'Should have received the flag');
+    const [argvLine, promptSection] = bContent.split('\nPROMPT:');
+    const argv = argvLine.replace('ARGV:', '');
+
+    assert.equal(argv, '--worker-flag-b', "only declared worker_args should reach skill-b's worker argv");
+    assert.ok(!argv.includes('--flag-for-b'), "the trigger's extra arg must not ride skill-b's worker argv");
+    assert.equal(promptSection, 'prompt b' + buildOperatorArgsBlock('--flag-for-b') + '\n\n## PA runtime (this run)\n' + PA_RUNTIME_BLOCK, "the trigger's extra arg must be bridged into skill-b's prompt");
   });
 });
 
@@ -466,6 +550,69 @@ describe('describeSendFailure', () => {
   it('truncates an oversized detail so it stays log-safe', () => {
     const out = describeSendFailure({ ok: false, reason: 'http', status: 502, detail: 'x'.repeat(500) });
     assert.equal(out, `http: status 502: ${'x'.repeat(200)}`);
+  });
+});
+
+describe('runCommand — COMMIT-DEFERRED marker (AI-255 B1)', () => {
+  /** A worker whose whole reply is the claims-gate defer marker, exit 0. */
+  async function configureDeferWorker(): Promise<void> {
+    const script = await writeScript('defer.js',
+      'process.stdout.write("survey done\\nCOMMIT-DEFERRED: docs/a.md held by \\"other-session\\" until 2099-01-01\\n");');
+    await createTempConfig(tempDir, [
+      { name: 'w1', command: 'node', args: [script], check: 'echo ok', priority: 1, rate_limit_patterns: [] },
+    ]);
+  }
+
+  it('a successful run whose output carries the marker downgrades to exitCode 2', async () => {
+    await createTempSecrets(tempDir, '');
+    await configureDeferWorker();
+    await createTempSkill(tempDir, 'deferred-skill', ['---', '---', 'prompt'].join('\n'));
+
+    const result = await runCommand('deferred-skill');
+
+    assert.equal(result.success, false, 'a gated commit must not read as success');
+    assert.equal(result.exitCode, 2, 'the marker pins the distinct deferred code');
+    assert.equal(exitCodeForCommandResult(result), 2, 'the process exit is the marker code, not 1');
+    assert.ok((result.error ?? '').includes('COMMIT-DEFERRED:'), 'error carries the marker line');
+    const meta = await readRunMeta(tempDir, 'deferred-skill');
+    assert.equal(meta.status, 'error');
+  });
+
+  it('a marker mention that is NOT on its own line does not downgrade', async () => {
+    const script = await writeScript('prose.js',
+      'process.stdout.write("The marker COMMIT-DEFERRED: would be emitted if gated; nothing was.\\n");');
+    await createTempConfig(tempDir, [
+      { name: 'w1', command: 'node', args: [script], check: 'echo ok', priority: 1, rate_limit_patterns: [] },
+    ]);
+    await createTempSecrets(tempDir, '');
+    await createTempSkill(tempDir, 'prose-skill', ['---', '---', 'prompt'].join('\n'));
+
+    const result = await runCommand('prose-skill');
+
+    assert.equal(result.success, true, 'prose about the marker is not the marker');
+    assert.equal(exitCodeForCommandResult(result), 0);
+  });
+
+  it('PA_SESSION in the runner env reaches the worker (the git-guard identity path)', async () => {
+    const prior = process.env.PA_SESSION;
+    process.env.PA_SESSION = 'session-under-test';
+    try {
+      const script = await writeScript('env-echo.js',
+        'process.stdout.write(`PA_SESSION=${process.env.PA_SESSION ?? ""}`);');
+      await createTempConfig(tempDir, [
+        { name: 'w1', command: 'node', args: [script], check: 'echo ok', priority: 1, rate_limit_patterns: [] },
+      ]);
+      await createTempSecrets(tempDir, '');
+      await createTempSkill(tempDir, 'env-skill', ['---', '---', 'prompt'].join('\n'));
+
+      const result = await runCommand('env-skill');
+
+      assert.ok(result.success);
+      assert.ok((result.output ?? '').includes('PA_SESSION=session-under-test'),
+        'the dispatch env must carry the session label through to the worker');
+    } finally {
+      if (prior === undefined) delete process.env.PA_SESSION; else process.env.PA_SESSION = prior;
+    }
   });
 });
 
@@ -766,5 +913,90 @@ describe('extractKeyboardEnvelope', () => {
     const { text, keyboard } = extractKeyboardEnvelope(`Report\n${env}\nNO_OUTPUT`, 'any-skill');
     assert.equal(text, 'Report\nNO_OUTPUT');
     assert.deepEqual(keyboard, { inline_keyboard: [[{ text: 'Go', callback_data: 'cf:y' }]] });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PA runtime block (2026-09-16 evangelism wave WP-6, OD-8): the operator-facing
+// pa commands (ping/notify/watch/topic-task/ref/health/doctor/claims/recall)
+// existed but no `pa run` prompt surface named them. The block is appended to
+// every LLM-worker skill prompt; cmd: skills bypass the LLM path entirely;
+// PA_RUNTIME_BLOCK_DISABLED=1 is the rollback switch.
+// ---------------------------------------------------------------------------
+
+describe('runCommand — PA runtime block (WP-6)', () => {
+  it('appends "## PA runtime (this run)" to an LLM-worker skill prompt', async () => {
+    const echoScript = await writeScript('echo-runtime.js', `
+      const fs = require('fs');
+      const arg = process.argv[2];
+      process.stdout.write(arg.startsWith('@') ? fs.readFileSync(arg.slice(1), 'utf8') : arg);
+    `);
+    await createTempConfig(tempDir, [
+      { name: 'w1', command: 'node', args: [echoScript, '{prompt}'], check: 'echo ok', priority: 1 },
+    ]);
+    await createTempSkill(tempDir, 'runtime-skill', ['---', '---', 'prompt'].join('\n'));
+
+    await runCommand('runtime-skill');
+
+    const files = await readdir(join(tempDir, 'logs', 'runtime-skill'));
+    const logFile = files.find(f => f.endsWith('.log'));
+    assert.ok(logFile, 'run log should exist');
+    const output = await readFile(join(tempDir, 'logs', 'runtime-skill', logFile), 'utf8');
+    assert.ok(output.includes('## PA runtime (this run)'), 'LLM-worker prompt must carry the runtime block');
+    assert.ok(output.includes('`pa ping`'), 'runtime block must name pa ping');
+  });
+
+  it('does not append to a cmd: shell skill (prompt never ships)', async () => {
+    const echoScript = await writeScript('cmd-echo.js', 'console.log("cmd ran");');
+    const cmdScript = echoScript.split('\\').join('/');
+    await createTempConfig(tempDir, []);
+    await createTempSkill(tempDir, 'cmd-skill', [
+      '---',
+      `cmd: "node ${cmdScript}"`,
+      '---',
+      'unused prompt',
+    ].join('\n'));
+
+    const result = await runCommand('cmd-skill');
+
+    assert.equal(result.success, true, 'cmd skill must still run through its own branch');
+    const files = await readdir(join(tempDir, 'logs', 'cmd-skill'));
+    const logFile = files.find(f => f.endsWith('.log'));
+    if (logFile) {
+      const output = await readFile(join(tempDir, 'logs', 'cmd-skill', logFile), 'utf8');
+      assert.ok(!output.includes('## PA runtime (this run)'), 'cmd skill output must not carry the block');
+    }
+  });
+
+  it('PA_RUNTIME_BLOCK_DISABLED=1 suppresses the block (rollback)', async () => {
+    const echoScript = await writeScript('echo-runtime-off.js', `
+      const fs = require('fs');
+      const arg = process.argv[2];
+      process.stdout.write(arg.startsWith('@') ? fs.readFileSync(arg.slice(1), 'utf8') : arg);
+    `);
+    await createTempConfig(tempDir, [
+      { name: 'w1', command: 'node', args: [echoScript, '{prompt}'], check: 'echo ok', priority: 1 },
+    ]);
+    await createTempSkill(tempDir, 'runtime-off-skill', ['---', '---', 'prompt'].join('\n'));
+
+    const prev = process.env.PA_RUNTIME_BLOCK_DISABLED;
+    process.env.PA_RUNTIME_BLOCK_DISABLED = '1';
+    try {
+      await runCommand('runtime-off-skill');
+    } finally {
+      if (prev === undefined) delete process.env.PA_RUNTIME_BLOCK_DISABLED;
+      else process.env.PA_RUNTIME_BLOCK_DISABLED = prev;
+    }
+
+    const files = await readdir(join(tempDir, 'logs', 'runtime-off-skill'));
+    const logFile = files.find(f => f.endsWith('.log'));
+    assert.ok(logFile, 'run log should exist');
+    const output = await readFile(join(tempDir, 'logs', 'runtime-off-skill', logFile), 'utf8');
+    assert.ok(!output.includes('## PA runtime (this run)'), 'kill-switch must suppress the block');
+  });
+
+  it('the runtime block stays within the 900-char cap', () => {
+    const block = '\n\n## PA runtime (this run)\n' + PA_RUNTIME_BLOCK;
+    assert.ok(block.length <= 900, `block is ${block.length} chars — must stay <=900`);
   });
 });

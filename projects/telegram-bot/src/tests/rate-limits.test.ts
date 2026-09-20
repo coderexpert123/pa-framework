@@ -142,13 +142,17 @@ describe('classifyRateLimit — zclaude synthetic 429 raw field', () => {
   it('returns result with raw populated when zclaude emits a synthetic 429 envelope', async () => {
     const { classifyRateLimit: cls } = await import('../../../../pa/dist/src/rate-limits.js');
     const sessionId = 'cls-test-zclaude';
+    // Reset must be in the FUTURE relative to Date.now(): the classifier
+    // derives cooldown minutes from it and skips past-dated resets, so the
+    // absolute literal here silently degraded this test to the fallback arm.
+    const futureResetStr = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19);
     const envelope = JSON.stringify({
       type: 'assistant',
       isApiErrorMessage: true,
       apiErrorStatus: 429,
       message: {
         model: '<synthetic>',
-        content: [{ type: 'text', text: 'API Error: Request rejected (429) · Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-04-20 23:07:02' }],
+        content: [{ type: 'text', text: `API Error: Request rejected (429) · Weekly/Monthly Limit Exhausted. Your limit will reset at ${futureResetStr}` }],
       },
       timestamp: new Date().toISOString(),
     });

@@ -10,6 +10,7 @@ from datetime import datetime, timezone, timedelta
 # no reply_markup support (WP-Y1, 2026-08-24).
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'pa', 'src'))
 from telegram_notify import send_text
+from add_reminder import ReminderStoreBusy, reminders_store_lock
 
 pa_home = os.environ.get("PA_HOME") or os.path.join(os.path.expanduser("~"), ".pa")
 REMINDERS_FILE = os.path.join(pa_home, "reminders.json")
@@ -17,10 +18,28 @@ REMINDERS_FILE = os.path.join(pa_home, "reminders.json")
 # executable reminders are handed to the bot through this queue file; the
 # reminder-resume-drain maintenance job pops and injects them as system turns.
 PENDING_RESUME_FILE = os.path.join(pa_home, "pending-reminder-resume.json")
+# How long a processor waits for another processor's claim to finish (the
+# claim holds the lock for milliseconds; sends happen after it is released).
+CLAIM_WAIT_S = 10.0
+
+def local_tz():
+    """Local offset tzinfo: PA_TZ_OFFSET_MINUTES (minutes east of UTC) or UTC
+    when unset. The old silent IST default is retired (WB-54) — an unset or
+    unparseable offset now warns loudly on stderr and defaults to UTC, so a
+    missing env var is never mistaken for IST."""
+    raw = os.environ.get("PA_TZ_OFFSET_MINUTES")
+    if raw is None or raw == "":
+        print("[reminders] PA_TZ_OFFSET_MINUTES not set — defaulting to UTC (was IST before 2026-09-17)", file=sys.stderr)
+        return timezone.utc
+    try:
+        return timezone(timedelta(minutes=int(raw)))
+    except ValueError:
+        print(f"[reminders] PA_TZ_OFFSET_MINUTES={raw!r} is not an integer — defaulting to UTC", file=sys.stderr)
+        return timezone.utc
 
 def now_ist():
-    # IST is UTC + 5:30
-    return datetime.now(timezone(timedelta(hours=5, minutes=30)))
+    # Kept name for callers; now env-driven, not a fixed UTC+5:30 offset.
+    return datetime.now(local_tz())
 
 def requires_user_decision(r: dict) -> bool:
     """Whether this reminder's send should carry the Done / 1 h / Tomorrow
@@ -83,19 +102,21 @@ def append_resume_record(reminder: dict) -> dict:
     os.replace(tmp_path, PENDING_RESUME_FILE)
     return record
 
-def process_reminders():
-    if not os.path.exists(REMINDERS_FILE):
-        return
-
+def claim_due_reminders():
+    """Partition the store under the claim lock: write the not-yet-due
+    reminders back and return the due ones. Called only while
+    reminders_store_lock(REMINDERS_FILE) is held, so two processors can never
+    claim the same reminder. Returns [] when nothing is due or the store cannot
+    be read or written."""
     try:
         with open(REMINDERS_FILE, "r", encoding="utf-8") as f:
             reminders = json.load(f)
     except Exception as e:
         print(f"[Reminders] ERROR: Failed to read {REMINDERS_FILE}: {e}", file=sys.stderr)
-        return
+        return []
 
     if not reminders:
-        return
+        return []
 
     now = now_ist()
     due = []
@@ -106,7 +127,7 @@ def process_reminders():
             due_at = datetime.fromisoformat(r["due_at"])
             # Ensure due_at is offset-aware for comparison
             if due_at.tzinfo is None:
-                due_at = due_at.replace(tzinfo=timezone(timedelta(hours=5, minutes=30)))
+                due_at = due_at.replace(tzinfo=local_tz())
 
             if due_at <= now:
                 due.append(r)
@@ -117,14 +138,32 @@ def process_reminders():
             remaining.append(r)
 
     if not due:
-        return
+        return []
 
-    # Atomic-ish write back of remaining reminders
+    # Atomic write-back of the remaining reminders, still inside the claim lock.
+    tmp_path = REMINDERS_FILE + ".tmp"
     try:
-        with open(REMINDERS_FILE, "w", encoding="utf-8") as f:
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(remaining, f, indent=2)
+        os.replace(tmp_path, REMINDERS_FILE)
     except Exception as e:
         print(f"[Reminders] ERROR: Failed to save remaining reminders: {e}", file=sys.stderr)
+        return []
+
+    return due
+
+def process_reminders():
+    if not os.path.exists(REMINDERS_FILE):
+        return
+
+    try:
+        with reminders_store_lock(REMINDERS_FILE, wait_s=CLAIM_WAIT_S):
+            due = claim_due_reminders()
+    except ReminderStoreBusy:
+        print("[Reminders] SKIP: reminders store is locked by another process; due reminders stay queued for the next run", file=sys.stderr)
+        return
+
+    if not due:
         return
 
     print(f"[Reminders] Processing {len(due)} due reminder(s)...")

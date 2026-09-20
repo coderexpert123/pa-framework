@@ -59,7 +59,11 @@ def test_add_reminder_creates_file_and_appends(temp_pa_home):
     assert data[1]["thread_id"] is None
 
 
-def test_add_reminder_attaches_timezone_if_naive(temp_pa_home):
+def test_add_reminder_attaches_timezone_if_naive(temp_pa_home, monkeypatch):
+    # The default local offset is env-driven since 2026-09-17 (UTC when unset,
+    # was silent IST before) — pin IST so the naive-input assertion exercises
+    # the configured-offset path the test was written for.
+    monkeypatch.setenv("PA_TZ_OFFSET_MINUTES", "330")
     naive_iso = "2026-08-21T15:00:00"
     add_reminder.add_reminder(naive_iso, "Naive TZ test", "-1001234567890")
 
@@ -258,6 +262,65 @@ def test_add_reminder_rejects_extra_keys(temp_pa_home, capsys):
 def test_add_reminder_rejects_slash_prompt(temp_pa_home, capsys):
     _assert_rejected(temp_pa_home, _resume_json_with_prompt("/status now"),
                      'topic_resume.prompt must not start with "/"')
+    assert "ERROR: Invalid resume action:" in capsys.readouterr().err
+
+
+def test_add_reminder_rejects_unknown_resume_type(temp_pa_home, capsys):
+    _assert_rejected(temp_pa_home, json.dumps({"type": "bogus", "prompt": "do it"}),
+                     'resume_action.type must be "topic_resume" or "voice_inbox_resume"')
+    assert "ERROR: Invalid resume action:" in capsys.readouterr().err
+
+
+# --- voice_inbox_resume: a reminder resuming a voice-inbox UI conversation
+# (as opposed to topic_resume, which resumes a Telegram chat/topic) ---
+
+VALID_VOICE_INBOX_RESUME_JSON = json.dumps({
+    "type": "voice_inbox_resume",
+    "conversation_id": "vi-682a17c7e13c",
+    "prompt": "Run the fresh-OTP Swiggy re-run",
+})
+
+
+def test_add_reminder_accepts_voice_inbox_resume_action(temp_pa_home):
+    due_iso = "2026-09-12T08:00:00+05:30"
+    add_reminder.add_reminder(due_iso, "Swiggy re-run reminder", "-1001234567890", None,
+                              resume_action=json.loads(VALID_VOICE_INBOX_RESUME_JSON))
+
+    reminders_file = os.path.join(temp_pa_home, "reminders.json")
+    with open(reminders_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    assert len(data) == 1
+    assert data[0]["message"] == "Swiggy re-run reminder"
+    assert data[0]["resume_action"] == {
+        "type": "voice_inbox_resume",
+        "conversation_id": "vi-682a17c7e13c",
+        "prompt": "Run the fresh-OTP Swiggy re-run",
+    }
+
+
+def test_add_reminder_rejects_voice_inbox_resume_bad_conversation_id(temp_pa_home, capsys):
+    bad = json.dumps({"type": "voice_inbox_resume", "conversation_id": "not-a-real-id", "prompt": "do it"})
+    _assert_rejected(temp_pa_home, bad,
+                     'voice_inbox_resume.conversation_id must match "vi-<12 hex>"')
+    assert "ERROR: Invalid resume action:" in capsys.readouterr().err
+
+
+def test_add_reminder_rejects_voice_inbox_resume_extra_keys(temp_pa_home, capsys):
+    extra = json.dumps({
+        "type": "voice_inbox_resume", "conversation_id": "vi-682a17c7e13c",
+        "prompt": "do it", "extra": 1,
+    })
+    _assert_rejected(temp_pa_home, extra,
+                     'voice_inbox_resume must have exactly the keys "type", "conversation_id" and "prompt"')
+    assert "ERROR: Invalid resume action:" in capsys.readouterr().err
+
+
+def test_add_reminder_rejects_voice_inbox_resume_oversized_prompt(temp_pa_home, capsys):
+    oversized = json.dumps({
+        "type": "voice_inbox_resume", "conversation_id": "vi-682a17c7e13c", "prompt": "x" * 501,
+    })
+    _assert_rejected(temp_pa_home, oversized,
+                     "voice_inbox_resume.prompt exceeds 500 characters")
     assert "ERROR: Invalid resume action:" in capsys.readouterr().err
 
 

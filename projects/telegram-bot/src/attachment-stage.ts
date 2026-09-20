@@ -82,7 +82,7 @@ const VOICE_FILLER_WORDS = new Set(['ok', 'okay', 'hey', 'please', 'pa', 'bot'])
  *  and answer "Unknown command"), and the free-text skill commands, whose
  *  bare form is meaningless. */
 const VOICE_SAFE_BARE_COMMANDS = new Set([
-  'status', 'health', 'help', 'skills', 'claims', 'agent', 'keepawake',
+  'status', 'health', 'help', 'skills', 'claims', 'agent',
   'retranscribe', 'update_brain',
 ]);
 

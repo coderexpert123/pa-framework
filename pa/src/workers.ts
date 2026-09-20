@@ -5,13 +5,15 @@ import type { WorkerConfig, CommandResult, RunOptions, FailoverNotifyPayload } f
 import { notifyUser } from './lib/notify.js';
 import { blackboard } from './blackboard.js';
 import { logger } from './lib/log.js';
-import { isWorkerCoolingDown, recordRateLimit, parseRateLimitDuration, classifyRateLimit, getCooldownStatus, getWorkerCooldown, clearRateLimitCache } from './rate-limits.js';
+import { isWorkerCoolingDown, recordRateLimit, parseRateLimitDuration, classifyRateLimit, getCooldownStatus, getWorkerCooldown, clearRateLimitCache, autoDispatchEligibility } from './rate-limits.js';
+import type { AutoDispatchEligibilityOpts, AutoDispatchIneligibility } from './rate-limits.js';
 
 // Re-exports for backward compatibility — all existing imports from workers.js continue to work
-export { executeWorker, collectBgAlerts, selectKillTargets } from './worker-exec.js';
+export { executeWorker, collectBgAlerts, selectKillTargets, _setOrphanSweepDepsForTest } from './worker-exec.js';
 export type { BgEntry, BgAlertEntry } from './worker-exec.js';
 export { readStateTail } from './state-monitor.js';
-export { isWorkerCoolingDown, recordRateLimit, parseRateLimitDuration, classifyRateLimit, getCooldownStatus, getWorkerCooldown, clearRateLimitCache };
+export { isWorkerCoolingDown, recordRateLimit, parseRateLimitDuration, classifyRateLimit, getCooldownStatus, getWorkerCooldown, clearRateLimitCache, autoDispatchEligibility };
+export type { AutoDispatchEligibilityOpts, AutoDispatchIneligibility };
 
 // --- Worker availability ---
 
@@ -40,6 +42,9 @@ export async function checkWorker(worker: WorkerConfig, env?: Record<string, str
   });
 }
 
+/** Exact error string the zero-attempt cascade returns when every candidate worker is skipped (cooling/unavailable/excluded) — consumers match on this constant (never a re-typed literal) to classify "wall" outcomes. Exported single source. */
+export const NO_WORKERS_AVAILABLE_ERROR = 'No workers available';
+
 // --- Rate limit detection ---
 
 export interface RateLimitCheck {
@@ -49,11 +54,11 @@ export interface RateLimitCheck {
 }
 
 export function isRateLimited(worker: WorkerConfig, result: CommandResult): RateLimitCheck {
-  // codex/agy: API errors come from stderr/NDJSON (result.error), a clean error channel
-  //            separate from agent text — never scan output for these.
+  // codex/agy/devin: API/quota errors come from stderr/NDJSON (result.error), a clean error channel
+  //                  separate from agent text — never scan output for these.
   // claude/zclaude: rate-limit text can appear in the stream output, so scan both; but patterns
   //                 must be specific phrases seen in real errors, not broad heuristics.
-  const combined = (worker.name === 'codex' || worker.name === 'agy')
+  const combined = (worker.name === 'codex' || worker.name === 'agy' || worker.name === 'devin')
     ? (result.error || '')
     : `${result.output}\n${result.error || ''}`;
   const lower = combined.toLowerCase();
@@ -133,11 +138,25 @@ export async function runWithFailover(
   // Reorder workers based on config and health state
   let workers = config.workers;
 
-  // Apply worker_pin override if set (always first regardless of health)
-  if (config.worker_pin) {
+  // Apply worker_pin override if set (always first regardless of health).
+  // ignoreWorkerPin (2026-09-19 router-as-orchestrator decision 25) skips
+  // this reorder on router-decided turns — the deprecated operator pin must
+  // not outrank the router's chain.
+  if (config.worker_pin && !options.ignoreWorkerPin) {
     const pinned = config.workers.find((w) => w.name === config.worker_pin);
     const others = config.workers.filter((w) => w.name !== config.worker_pin);
     workers = pinned ? [pinned, ...others] : config.workers;
+  }
+
+  // candidateOrder (2026-09-19 decision 20): routed turns — stable-reorder so
+  // the named candidates come first in the router's probability order;
+  // unnamed workers keep the static order after them. The chain itself is
+  // never narrowed: every configured worker still trails as failover.
+  if (options.candidateOrder && options.candidateOrder.length > 0) {
+    const order = new Map(options.candidateOrder.map((name, i) => [name, i]));
+    const named = workers.filter((w) => order.has(w.name)).sort((a, b) => order.get(a.name)! - order.get(b.name)!);
+    const rest = workers.filter((w) => !order.has(w.name));
+    workers = [...named, ...rest];
   }
 
   // Apply preferredWorker if set (higher priority than pin for this dispatch only)
@@ -195,7 +214,7 @@ export async function runWithFailover(
     }
   }
 
-  let finalResult: CommandResult = { success: false, output: '', error: 'No workers available', exitCode: -1 };
+  let finalResult: CommandResult = { success: false, output: '', error: NO_WORKERS_AVAILABLE_ERROR, exitCode: -1 };
   let finalWorkerName = 'none';
   let anyAttempted = false;
 
@@ -235,9 +254,12 @@ export async function runWithFailover(
     if (options.noFallback) return false;
     for (let j = index + 1; j < workers.length; j++) {
       const w = workers[j];
-      if (w.manual_only && options.preferredWorker !== w.name && config.worker_pin !== w.name) continue;
-      if (options.excludeWorkers?.has(w.name)) continue;
-      if (await isWorkerCoolingDown(w.name)) continue;
+      const eligibility = await autoDispatchEligibility(w, {
+        preferredWorker: options.preferredWorker,
+        workerPin: config.worker_pin,
+        excludeWorkers: options.excludeWorkers,
+      });
+      if (!eligibility.eligible) continue;
       return true;
     }
     return false;
@@ -246,14 +268,28 @@ export async function runWithFailover(
   for (let i = 0; i < workers.length; i++) {
     const worker = workers[i];
 
-    // 0b. manual_only workers never receive automatic failover traffic — they
-    // run only when this dispatch EXPLICITLY names them (preferredWorker from
-    // a bot /agent pick or a skill's `worker:` frontmatter, or a global
-    // worker_pin). (2026-08-21, operator directive: agyc manual-only.)
-    if (worker.manual_only
-        && options.preferredWorker !== worker.name
-        && config.worker_pin !== worker.name) {
-      logger.info('workers', `skip: ${worker.name} — manual_only (not explicitly selected)`, ctx);
+    // 0. Automatic-dispatch eligibility (manual_only / excluded / cooling) —
+    // single predicate shared with the evaluator chain. Runs FIRST per
+    // candidate, before the cancelled check (outcome table proven equivalent:
+    // only skip-log vs abort interleaving changes when the first candidate is
+    // ineligible AND cancelled — log-only, immaterial).
+    const eligibility = await autoDispatchEligibility(worker, {
+      preferredWorker: options.preferredWorker,
+      workerPin: config.worker_pin,
+      excludeWorkers: options.excludeWorkers,
+    });
+    if (!eligibility.eligible) {
+      // manual_only workers never receive automatic failover traffic — they
+      // run only when this dispatch EXPLICITLY names them (preferredWorker from
+      // a bot /agent pick or a skill's `worker:` frontmatter, or a global
+      // worker_pin). (2026-08-21, operator directive: agyc manual-only.)
+      if (eligibility.reason === 'manual_only') {
+        logger.info('workers', `skip: ${worker.name} — manual_only (not explicitly selected)`, ctx);
+      } else if (eligibility.reason === 'excluded') {
+        logger.info('workers', `skip: ${worker.name} — excluded (already failed)`, ctx);
+      } else {
+        logger.info('workers', `skip: ${worker.name} — cooling down`, ctx);
+      }
       continue;
     }
 
@@ -264,18 +300,6 @@ export async function runWithFailover(
     if (cancelled()) {
       logger.info('workers', `abort: cancelled by caller before ${worker.name}`, ctx);
       return { result: finalResult, worker: finalWorkerName };
-    }
-
-    // 0. Skip workers excluded by caller (already failed in earlier dispatch phases)
-    if (options.excludeWorkers?.has(worker.name)) {
-      logger.info('workers', `skip: ${worker.name} — excluded (already failed)`, ctx);
-      continue;
-    }
-
-    // 1. Check shared cooldown state (shared between bot and CLI)
-    if (await isWorkerCoolingDown(worker.name)) {
-      logger.info('workers', `skip: ${worker.name} — cooling down`, ctx);
-      continue;
     }
 
     // 2. Check script availability

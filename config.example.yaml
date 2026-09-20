@@ -7,6 +7,12 @@
 # Skills are Markdown definitions stored in ~/.pa/skills/<skill-name>/skill.md
 # (or $PA_HOME/skills/<skill-name>/skill.md). Run `pa list` to discover all skills.
 
+# Worker-slot concurrency is capped by env vars, not this file: PA_MAX_CONCURRENT_WORKERS
+# is the ceiling, and with dynamic slots on (default) the effective cap floats between
+# it and PA_SLOTS_MIN, which is only reached when the machine is under pressure.
+# See docs/CONFIGURATION.md "Resource tuning env vars".
+# concurrency_limit (top-level key, absent by default) caps parallel skills in
+# pa catchup; absent = follows the dynamic worker-slot cap above.
 workers:
   # === claude (Priority 1 — Anthropic Claude Code CLI) ===
   - name: claude
@@ -143,6 +149,96 @@ workers:
         values: [low, medium, high, max]
         description: "Reasoning effort level."
 
+  # === devin (Priority 5 — Devin CLI / Codeium cloud) ===
+  # devin — setup-required; the dispatcher skips it if not installed.
+  # Requires: devin.cmd shim on PATH (wraps %LOCALAPPDATA%\devin\cli\bin\devin.exe)
+  # Auth: %APPDATA%\devin\credentials.toml must have a valid windsurf_api_key.
+  # Workspace trust: --respect-workspace-trust false required for non-interactive.
+  - name: devin
+    secret_allowlist:
+      [
+        BRIEF_STATEMENT_EXAMPLE_SENDER,
+        BRIEF_STATEMENT_EXAMPLE_SUBJECT,
+        BRIEF_STATEMENT_PROVIDER,
+        BRIEF_STATEMENT_SENDER_NAMES,
+        COROS_EMAIL,
+        COROS_PASSWORD,
+        CREDIT_CARD_PASSWORDS,
+        GEMINI_OAUTH_CLIENT_ID,
+        GEMINI_OAUTH_CLIENT_SECRET,
+        GOOGLE_AUTH_REDIRECT_URI,
+        GROQ_API_KEY,
+        OBSIDIAN_BRIEFS_DIR,
+        PA_ALERTS_CHAT_ID,
+        PA_ALERTS_THREAD_ID,
+        PA_BACKUP_PASSPHRASE,
+        PA_PLANS_DRIVE_FOLDER_ID,
+        PA_USER_NAME,
+        PORTFOLIO_CONTEXT_OWNER,
+        STRAVA_CLIENT_ID,
+        STRAVA_CLIENT_SECRET,
+        STRAVA_REFRESH_TOKEN,
+        TELEGRAM_BOT_TOKEN,
+        TELEGRAM_BRIEFING_CHAT_ID,
+        TELEGRAM_CHAT_ID,
+        TELEGRAM_DAILY_BRIEFING_THREAD_ID,
+      ]
+    command: devin
+    args:
+      - "--permission-mode"
+      - "dangerous"
+      - "--respect-workspace-trust"
+      - "false"
+      - "--prompt-file"
+      - "{prompt_file}"
+      - "-p"
+    input_mode: arg
+    output_format: plain-text
+    check: devin version
+    check_timeout: 15
+    rate_limit_patterns:
+      - "rate limit"
+      - "quota exceeded"
+      - "429"
+      - "usage limit"
+      - "out of credits"
+      - "insufficient balance"
+    priority: 5
+    state_dir: "~/AppData/Roaming/devin/cli"
+    state_pattern: "*.json"
+    tunables:
+      model:
+        args: ["--model", "{value}"]
+        description: "Devin model (e.g. adaptive, claude-sonnet-4, claude-opus-4.6)."
+
+  # === opencode (Priority 9 — opencode headless `run`, manual-only until proven) ===
+  # setup-required; the dispatcher skips it when `opencode --version` fails.
+  # Headless shape `opencode run [message..]` (no `exec` subcommand; verified
+  # --help 2026-09-17). output_format plain-text: opencode's `--format json`
+  # event envelope has no worker-exec dialect entry and worker-exec.ts is out
+  # of scope for this wave, so structured parsing is deferred to a follow-up.
+  # rate_limit_patterns intentionally EMPTY: patterns must be phrases seen in
+  # real errors (pa/src/workers.ts isRateLimited already scans output+error
+  # for any worker not named codex/agy/devin — no code change needed).
+  - name: opencode
+    command: opencode
+    args:
+      - "run"
+      - "{prompt}"
+    input_mode: arg
+    output_format: plain-text
+    check: opencode --version
+    check_timeout: 15
+    rate_limit_patterns: []
+    priority: 9
+    manual_only: true
+    state_dir: "~/.local/share/opencode"
+    state_pattern: "opencode.db"
+    tunables:
+      model:
+        args: ["--model", "{value}"]
+        description: "Model in provider/model format (opencode default when omitted)."
+
 # === Stuck Agent Evaluator ===
 evaluator:
   worker: claude
@@ -152,6 +248,8 @@ evaluator:
 maintenance:
   session-gc: { enabled: true, every: 6h }
   archive-prune: { enabled: true, every: 1h }
+  # A maintenance override may only disable a job (enabled: false) or change its cadence (every).
+  nonpaged-pool-watch: { enabled: true, every: 15m }
 
 # === usage (optional) ===
 # Track token usage and set budget alerts. The `pa costs` command reports
@@ -202,13 +300,38 @@ transcription:
 # === Voice inbox app (projects/voice-inbox) ===
 # Optional block. Omit it and only the voice-inbox app is unconfigured. The
 # app server refuses to start until inbox_topic names the topic that receives
-# new tasks. Env overrides: VOICE_INBOX_PORT, VOICE_INBOX_INBOX_TOPIC.
+# new tasks. Env overrides: VOICE_INBOX_PORT, VOICE_INBOX_INBOX_TOPIC,
+# VOICE_INBOX_MIN_AUDIO_BYTES.
 # voice_inbox:
 #   inbox_topic: "CHATID_THREADID"  # REQUIRED "<chatId>_<threadId>" topic key
 #   port: 8787                      # binds 127.0.0.1 only
 #   max_upload_mb: 25
 #   session_ttl_hours: 168          # pairing session lifetime (7 days)
 #   pairing_ttl_minutes: 10         # one-time pairing-code lifetime
+#   min_audio_bytes: 8192           # AI-223: uploads under this are rejected (400) at POST /tasks
+#   default_topic: "CHATID_THREADID" # optional; default topic for unmatched requests (default: inbox chat thread 0)
+
+# === Voice-inbox deterministic fallback (pa host job "voice-inbox-fallback") ===
+# Optional. The job's numeric thresholds are env vars — see .env.example section 9 —
+# this is the one structured knob: a transcript keyword -> topic map, checked before
+# falling back to the inbox chat's general-knowledge topic. Empty (the default) always
+# falls through.
+# voice_inbox_fallback:
+#   keyword_topics: {}
+#   # keyword_topics:
+#   #   invoice: "CHATID_THREADID"   # lowercase substring match, first match wins
+
+# === Voice-inbox typed routing (pa + telegram bot; needs TYPESAFE_API_KEY) ===
+# Optional; off unless enabled: true. The bot places a received task by two
+# TypeSafe Choices (destination topic, open-conversation continuation) and
+# hands low-confidence ones to the inbox routing turn; the fallback job uses
+# the same judgment as its last resort. Pick thresholds with `pa typesafe eval`.
+# voice_inbox_routing:
+#   enabled: true
+#   act_confidence: 0.9          # destination confidence needed to place
+#   continue_confidence: 0.9     # confidence needed to join an open conversation
+#   no_match: create-topic       # create-topic | default-topic | escalate
+#   escalation: llm-turn         # llm-turn | place
 
 # === Topic routing (optional) ===
 # support: the FALLBACK topic receiving land-or-discard triage for dirty
@@ -226,3 +349,88 @@ transcription:
 # surfaced by the weekly ops digest) but no task is filed.
 topics:
   support: "310_5"
+
+# === Routing policy (optional; off unless enabled: true) ===
+# Per-turn worker routing for the Telegram bot: each turn is classified
+# code/engineering vs general by deterministic regex signals, and code turns
+# override the topic default with a time-window worker. The peak window is
+# cost_tier.peak_window_utc above (the SAME window off_peak skills defer on) —
+# it is never configured twice.
+#
+# Onboarding: set the three workers to your own setup's names — which agent
+# should answer quick/general asks, which should take engineering work off-peak,
+# and which (usually a non-peak-quota agent) should take engineering work while
+# your code-plan provider bills peak rates. Omit the block entirely for the
+# stock behavior (topic default, else priority-ordered failover).
+#
+# routing_policy:
+#   enabled: true
+#   judge: agy                 # agy (fast LLM judge) | typesafe (TypeSafe API; needs TYPESAFE_API_KEY) | deterministic (regex only)
+#   judge_model: gemini-3.6-flash-low  # model for agy judge
+#   judge_timeout_ms: 20000    # timeout before failing open to regex (ms)
+#   judge_command: agy         # optional custom command/path to agy
+#   general_worker: agy        # general turns on topics with no topic_defaults entry
+#   code_worker: zclaude       # code-classified turns outside the peak window
+#   peak_code_worker: claude   # code-classified turns inside the peak window
+#   code_patterns: []          # extra regex sources appended to the built-ins
+#   topic_classes:             # per-topic pin: code | general | off
+#     "123_456": code
+
+# === Capability provision (pa init --provision, 2026-09-18) ===
+# `pa init --provision` generates a workers: block for the CLIs/kinds you
+# accept (written to ~/.pa/config.yaml.provisioned for review before merging
+# here) and always keeps a local delivery floor: notifications also land as
+# files under ~/.pa/outbox/ even with no Telegram configured. The generated
+# block carries PATH-resolved commands and env-var NAMES only — never a key
+# value or an absolute machine path. See docs/CONFIGURATION.md
+# "Capability provision (pa init --provision)".
+
+# === Model router (2026-09-18; commented out = zero behavior) ===
+# Optional per-turn router beside the judge ladder. Block ABSENT = disabled,
+# zero logging. Block present (even enabled: false) = SHADOW mode: the router
+# computes what it would have chosen and logs a shadow line to
+# ~/.pa/model-router-shadow.jsonl; the existing routing ladder still decides.
+# enabled: true additionally lets the router DECIDE. Pins outrank only while
+# deprecate_pins is explicitly false (below); the default retires them for
+# TURN DISPATCH on router-decided turns (command handlers keep parsing and
+# replying, and landed pins keep working as stickiness incumbents).
+#model_router:
+#  enabled: false               # true = router decides (stage-2 flip); false/absent = shadow-only
+#  judge: typesafe              # only supported value this wave
+#  state_max_chars: 4000        # max classified-source text fed to the classifier
+#  context_max_chars: 2000      # max prior-turn digest chars
+#  topic_max_chars: 300         # max topic name+description chars
+#  zai_workers:                 # workers billed on the shared z.ai quota — moved to the
+#    - zclaude                  #   END of the candidate order inside the peak window
+#  sticky: true                 # conversation stickiness (default ON): keep the incumbent
+#                              #   worker while the turn's needs stay inside its envelope;
+#                              #   escapes are capability-UP / unavailable / peak-zai-last only
+#  table:                       # policy table — config ORDER IS THE RANK; first satisfying row wins.
+#    - worker: agy              #   "cheapest" = rank order, never a price number.
+#      max_tier: quick_lookup   #   one of quick_lookup | standard | deep_reasoning | rich_toolchain
+#      max_score: 1             #   highest effort score (1-5) this row can express
+#    - worker: codex
+#      model: gpt-5-codex       # optional; omitted = the worker's configured default model
+#      max_tier: rich_toolchain
+#      max_score: 5
+#  effort_projection:           # per-worker effort-score -> native effort-knob value
+#    codex:
+#      tunable: effort          # effort | none (none = knobless worker, explicit recategorize)
+#      map: { 1: minimal, 2: low, 3: medium, 4: medium, 5: high }
+#    devin:
+#      tunable: none
+#  shadow_path: <absolute path>  # omit for the default ~/.pa/model-router-shadow.jsonl; a RELATIVE value resolves against the process CWD, not ~/.pa
+#  deprecate_pins: true         # default ON when the block exists; explicit false = today's pin behavior.
+#                              #   Under it /agent,/model,/effort,/default and worker_pin stop steering
+#                              #   DISPATCH on router-decided turns; commands still parse+reply, and
+#                              #   landed pins keep working as stickiness incumbents.
+#  availability_ttl_ms: 5000   # availability-cache TTL in ms (0 disables = always fresh);
+#                              #   env PA_MODEL_ROUTER_AVAILABILITY_TTL_MS overrides
+#  placement:                  # placement-candidate caps (reader + prompt section)
+#    candidate_cap: 25         # candidates kept, most-recently-updated first (current conversation exempt)
+#    goal_chars: 80            # per-candidate goal cap in the prompt section
+#    section_chars: 2400       # whole-candidates-section cap; candidates dropped tail-first
+#  surfaces:                   # per-surface staging; an absent key = shadow (dark — recorded, not applied)
+#    fallback: shadow          # flip 1 — the failover ladder consumes the router's probability chain
+#    steer: shadow             # flip 2 — the router's steer/wait decision corrects an in-flight run
+#    placement: shadow         # flip 3 — placement replaces the orchestrator-persona branch (flip LAST)

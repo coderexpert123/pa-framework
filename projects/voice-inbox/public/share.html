@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <!-- Injection boundary: no third-party origins, no inline script/style. All
+       dynamic content is rendered via createElement/textContent in share.js. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'">
+  <meta name="color-scheme" content="dark light">
+  <meta name="theme-color" content="#0e1217" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#fbfcfd" media="(prefers-color-scheme: light)">
+  <title>Shared conversation — Voice Inbox</title>
+  <meta property="og:title" content="Shared conversation — Voice Inbox">
+  <meta property="og:description" content="A conversation with a personal assistant. Read-only share.">
+  <meta property="og:type" content="website">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Shared conversation — Voice Inbox">
+  <meta name="twitter:description" content="A conversation with a personal assistant. Read-only share.">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/answer-shapes.js" defer></script>
+  <script src="/share.js" type="module"></script>
+</head>
+<body>
+  <main id="share-container">
+    <header class="summary">
+      <p class="meta quiet">Shared conversation &middot; read-only</p>
+      <h1 class="title" id="share-title">Loading&hellip;</h1>
+      <p class="state" id="share-status"></p>
+      <p class="said" id="share-recap"></p>
+      <p class="ask" id="share-next-action"></p>
+    </header>
+    <div class="log" id="share-turns"></div>
+    <div class="summary" id="share-error" hidden>
+      <p class="said" id="share-error-text">This conversation is no longer shared or does not exist.</p>
+    </div>
+  </main>
+  <noscript>
+    <div class="summary">
+      <p class="title">Shared conversation</p>
+      <p class="meta quiet">This shared conversation requires JavaScript to view. Please enable JavaScript in your browser settings.</p>
+    </div>
+  </noscript>
+</body>
+</html>

@@ -102,14 +102,22 @@ CLAUDE.md" community guidance assumes — a line budget is the wrong unit here.
 | Class | Soft | Hard | Action at hard |
 |---|---|---|---|
 | Root `CLAUDE.md` (auto-loaded every session) | 40,000 chars | 48,000 chars | run `/shorten-brain`, extract a topic file |
-| Directory-scoped `CLAUDE.md` (auto-loads on demand, stacks on root) | 8,000 chars | 12,000 chars (15,000 for `projects/telegram-bot` — raised 2026-09-06 when one night added five real subsystem sections: command router, topic sources, voice-inbox bridge, pin self-heal, orchestrator threads) | extract to `docs/` or a subsystem file |
+| Directory-scoped `CLAUDE.md` (auto-loads on demand, stacks on root) | 8,000 chars | 12,000 chars (22,000 for `projects/telegram-bot`: 19,000 AI-246 WP-E 2026-09-15, 21,000 transcription wave 2026-09-16, 22,000 router-metadata wave 2026-09-20; 28,000 for `projects/voice-inbox`: 16k→19k AI-246 live-screencast, →22k archive-search + footer-fix, →24k P4 form-set (2026-09-15), →25k P6 device-awareness and →27k transcription (2026-09-16), →28k router-metadata (2026-09-20) — all under the recorded-justification rule below; 12,000 for `pa/CLAUDE.md`, the pa CLI subsystem brain — extracted 2026-09-15 to seven `docs/pa-*.md` topic files and linter-checked from the same day) | extract to `docs/` or a subsystem file |
 | On-demand topic file (`docs/*.md` and the private inventory files) — content a reader holds in mind while working | 12,000 chars | 16,000 chars | split along a natural fault line |
-| Auto-managed glob-derived inventory file (a private inventory file the `update-brain` skill rewrites wholesale from one `glob()` pattern) | 12,000 chars | 26,000 chars | see note below before splitting — raised 18k→20k 2026-08-30, 20k→23k 2026-09-03 (handover waves' new lib modules; per-module legitimate growth); raised 23k→26k in code 2026-09-06 (`f9b069a`, the AI-209 landing) — this row documents the code |
+| `BACKLOG.md` (router over backlog/open-*.md) | — | 4,000 chars | it stopped being a router; re-split |
+| `backlog/open-*.md` (per-section open-item files, drain-written) | — | 24,000 chars | glob-class, covers future sections; archive DONE items — the auto-archive is the real control |
+| Auto-managed glob-derived inventory file (a private inventory file the `update-brain` skill rewrites wholesale from one `glob()` pattern) | 12,000 chars | 33,000 chars (35,000 for `inventory/pa-lib.md`, raised 2026-09-15: sweep-seeded five waves' files) | see note below before splitting — raised stepwise 18k→33k (2026-08-30 → 2026-09-11: handover, AI-209, voice-inbox steering, and slots-governor waves; this row documents the code) |
 | Router/index file (a file that replaced a monolith with pointers) | — | 4,000 chars | it stopped being a router; re-split |
 | Evergreen audience-facing guide (the 9 evergreen `UPPERCASE.md` guides under `docs/`) | — | 24,000 chars | separate class from operational-detail docs |
-| Knobs catalog (`docs/CONFIGURATION.md`) — one row per shipped knob, grows monotonically with the code | — | 25,000 chars | documented raise-class (same as the job catalog): raise per-knob growth, trim nothing (24k→25k 2026-09-04, `PA_CDISK_*` rows) |
+| Job catalog (`docs/maintenance-jobs.md`) — one paragraph per declared job, grows monotonically | — | 36,000 chars | never-trim reference; raise per-job growth (29k→31k 2026-09-14, AI-239 retry paragraph) (raised 31k→32k 2026-09-15, agent-bus busDrainJob paragraph; →36k 2026-09-18) |
+| `docs/ARCHITECTURE.md` — evergreen guide with its own ceiling (split from the knobs-catalog branch 2026-09-10) | — | 28,000 chars | raised 2026-09-04 (AI-179 WP-4, landed lock-renewal section) |
+| `docs/multi-session-protocol.md` — coordination protocol; rules accrue monotonically | — | 20,500 chars | raised 16k→17.5k 2026-09-15 after two trims in ~48h (d5161f2, ea103ad) — Rules 14-19, AI-243 claim-gate paragraph, waterfall-v2 tier wording are audited rule growth; →19k 2026-09-19 (Rule 21 bus-topology); →20.5k 2026-09-20 (Rule 22 shared-tree stash doctrine); splitting rules out of the protocol doc would orphan them from the enforcement section |
+| `docs/model-router.md` — router contract; contract sections accrue per wave | — | 17,500 chars | named raise 2026-09-20 (router-metadata wave): the routing-metadata provenance section pushed it past the 16,000 docs default — contract content, never a trim of a live contract line |
+| Knobs catalog (`docs/CONFIGURATION.md`) — one row per shipped knob, grows monotonically with the code | — | 39,000 chars | documented raise-class (same as the job catalog): raise per-knob growth, trim nothing (24k→25k 2026-09-04 `PA_CDISK_*`; 39k since 2026-09-17) |
+| Census index (`inventory/placement-registry.md`) — every item exactly once, machine-checked | — | 130,000 chars | raise-class; splitting breaks the checker's single-file contract |
+| `docs/CONVENTIONS.md` (this file) — conventions accrue monotonically | — | 28,000 chars | raised 24k→27k 2026-09-14 (AI-242): protocol rule-split relocations + doctrine paragraphs; raised 27k→28k 2026-09-17 (WP-C5): jargon-gate paragraph; same raise-class as the catalogs |
 | Append-only archive file (private archive shards) — looked up by ID, never read front to back | — | no hard ceiling | see note below |
-| Completed-item lookup index (the internal completion index) — one row per archived item, grows monotonically with shipped work, never auto-loaded | 16,000 chars | 24,000 chars | raise this row rather than splitting; splitting breaks its "every item exactly once, in one place" contract (21k→24k 2026-09-04: 16 DONE items pruned from BACKLOG.md landed as index rows) |
+| Completed-item lookup index (the internal completion index) — one row per archived item, grows monotonically with shipped work, never auto-loaded | 16,000 chars | 27,000 chars | raise this row rather than splitting or trimming — splitting breaks its "every item exactly once" contract, and a raise is net-positive where trimming already left rows mid-word (raised 21k→27k across 2026-09-04..08; three sub-1k raises in two weeks showed 1k steps too small) |
 | Open-program body file (private backlog program bodies) — bodies lifted out of `BACKLOG.md`, looked up by ID | — | no hard ceiling | same class as the archives |
 
 **Budget-pressure doctrine (operator directive 2026-09-03, after a six-trim night):**
@@ -123,7 +131,28 @@ removes verbosity, duplication, and iteration residue — never a rule, invarian
 gotcha, or anti-pattern warning; if a trim would lose a rule, that is a split,
 not a trim** (operator directive 2026-09-03). When in doubt,
 index — but doubt should first trigger a look at the file's contract. Enforced mechanically
-by docs-lint's same-file-trim counter (second trim in 24h fails with this clause's ref).
+by the docs-lint same-file-trim counter (`pa/src/lib/docs-lint.ts`, run via `pa docs-lint`
+or the docs-crossref suite — second trim in 24h fails with this clause's ref).
+
+**Per-wave brain-char allowance + the landing gate (AI-242, 2026-09-14).** Every wave
+spec carries a `Brain-char allowance: ±<n> chars → <doc>` line for each budgeted doc it
+grows, estimated before dispatch. `pa docs-lint [--] [paths]` is the same gate the
+docs-crossref suite enforces at push time — run it scoped to a commit's paths before
+landing (the `commit` skill does), or unscoped post-wave. A red run fails the landing:
+relocate the overflow into a companion doc in the SAME wave (`COMPANION_DOCS` in
+`pa/src/lib/docs-lint.ts` names the recognized destinations), or raise the ceiling in
+that file — every non-default entry requires a recorded `since` + `justification`
+(the docs-lint test rejects a bare bump), and the raise lands in the same commit as the
+growth it clears. Precedent class: voice-inbox 12k→13k→15k→16k→19k→22k→24k→25k and telegram-bot
+15k→17k→18k→19k (2026-09-14..15), content-verified.
+
+**Jargon gate (Wave C WP-C5, AI-264, 2026-09-17).** Text marked user-facing by
+`<!-- user-facing -->` … `<!-- /user-facing -->` HTML-comment fences is read by a
+non-technical audience; it is scanned for operator jargon by the blocklist arm in
+`pa/src/lib/docs-lint.ts` (the single lint implementation — every arm extends that
+file). `pa docs-lint --jargon <file ...>` prints one `J1` finding per hit and exits 1
+on any finding, 0 clean; agent-facing sections are exempt by construction. Extend the
+lexicon only by spec amendment, never ad hoc.
 
 **Note on the auto-managed inventory row**: this class exists because its size is bounded
 by *how many source files a glob pattern matches*, not by narrative verbosity — splitting
@@ -137,6 +166,10 @@ again over either of those. The telegram-bot file inventory (2026-08-07, 37 entr
 crash-recovery/delivery cluster (`orphan-reaper.ts`, `pending-dispatches.ts`,
 `recovery-gate.ts`, `delivered-store.ts`, `dlq.ts`, `watermark.ts`, `health.ts`) into its
 own reliability-side inventory file, at the cost of the routing complexity above.
+Since 2026-09-11 this class is swept nightly by the `update-brain` skill running
+`projects/pa-maintenance/scripts/inventory_seed.py --sweep` — that script's OWNERSHIP map
+is the single glob→destination mapping source, and orphaned markers or router drift
+surface as nightly findings, not silent staleness.
 
 **Note on the archive-file row**: the private archive shards hold completed `BACKLOG.md`
 items verbatim, by design (the 2026-08-07 dedupe pass exists specifically because a prior
@@ -216,7 +249,7 @@ These never live at the root and are caught by `.gitignore`:
 | `/notes-actions.md`, `/notes-preferences.md`, etc. | External knowledge-base files | `<your-kb-root>/` (outside the repo) |
 | `/message_to_user.md`, `/output.json`, `/output.md`, `/skill_proposals.json`, `/error_log.txt`, `/oracle_output.txt`, `**/glm-[0-9]*` | LLM worker "going agentic" — writes its response (or its error) to a file at cwd instead of returning text; `glm-*` is zclaude naming the file after its own model (glm-4.7, glm-5.2[1m]), in whatever subdir its cwd was | delete; not a real output path for any script (confirmed via full-repo grep) |
 
-The last row keeps growing because the failure mode keeps resurfacing under new filenames — `/output.md` and `/error_log.txt` were added on 2026-07-21, `/oracle_output.txt` on 2026-08-08 (the `oracle` skill's step 1 script prints raw profile+briefing data to stdout by design for its worker to synthesize per step 6 — the worker dumped that raw stdout to a file instead of returning the synthesized text), and `**/glm-[0-9]*` on 2026-08-13 (zclaude's model-named dumps, root AND subdirs — the first instance of the class that is a glob, not a fixed filename, because the name tracks whatever model zclaude runs). When you find a new one, add it to `.gitignore`, a `.gitignore-public` Boundary-lines registry row (then `placement_gate.py gen --gitignore`), this table, and the private brain's hygiene section in the same edit. A partial update is how the pattern list falls behind reality.
+The last row keeps growing because the failure mode keeps resurfacing under new filenames — `/output.md` and `/error_log.txt` were added on 2026-07-21, `/oracle_output.txt` on 2026-08-08 (the `oracle` skill's step-1 script prints raw profile+briefing data to stdout by design; the worker dumped it to a file instead of returning synthesized text), and `**/glm-[0-9]*` on 2026-08-13 (zclaude's model-named dumps, root AND subdirs — the first instance that is a glob, not a fixed filename, since the name tracks whatever model zclaude runs). When you find a new one, add it to `.gitignore`, a `.gitignore-public` Boundary-lines registry row (then `placement_gate.py gen --gitignore`), this table, and the private brain's hygiene section in the same edit. A partial update is how the pattern list falls behind reality.
 
 ### Patterns auto-gitignored everywhere (any depth)
 

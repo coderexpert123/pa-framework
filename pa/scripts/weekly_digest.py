@@ -19,6 +19,7 @@ Deterministic — NO LLM.
 import json
 import os
 import re
+import sqlite3
 import sys
 from datetime import datetime, timezone, timedelta
 
@@ -531,6 +532,95 @@ def read_new_feature_count(since_iso: str) -> int:
     return count
 
 
+# --- Raw-html answer lane (2026-09-14, voice-inbox free-form lane) -----------
+# Answers whose result_summary carries a :::raw-html ... ::: fence render in a
+# sandboxed iframe (voice-inbox public/answer-shapes.js). This census groups
+# the last week's occurrences by a rough shape signature — the FIRST tag and
+# its first class of each answer's first fenced block — so recurring groups
+# surface as graduation candidates for promotion into typed answer components.
+# Detection ONLY: promotion stays a human decision (same split as the app's
+# noteUnhandledShape backlog).
+
+RAW_HTML_FENCE_RE = re.compile(r"(?ms)^:::raw-html[ \t]*\r?\n(.*?)(?=^\r?:::[ \t]*\r?$|\Z)")
+RAW_HTML_OPENER_RE = re.compile(r"(?m)^:::raw-html[ \t]*\r?$")
+FIRST_TAG_RE = re.compile(r"<([a-zA-Z][a-zA-Z0-9]*)\b[^>]*>")
+CLASS_ATTR_RE = re.compile(r"""class\s*=\s*["']([^"']*)["']""", re.IGNORECASE)
+
+
+def raw_html_signature(html: str) -> str:
+    """First tag + first class of a fenced block: `table.matrix`, plain `div`
+    when classless, `(no markup)` when the block opens with no tag at all."""
+    m = FIRST_TAG_RE.search(html)
+    if not m:
+        return "(no markup)"
+    tag = m.group(1).lower()
+    cm = CLASS_ATTR_RE.search(m.group(0))
+    if cm and cm.group(1).strip():
+        return tag + "." + cm.group(1).strip().split()[0]
+    return tag
+
+
+def read_raw_html_shapes(days: int = 7) -> dict | None:
+    """Read raw-html answers from the voice-inbox ledger (READ-ONLY via
+    mode=ro; the ledger is owned by the voice-inbox server, never created
+    here). Returns {"answers": int, "signatures": {sig: count}} for tasks
+    updated in the last N days, or None when the ledger is absent/unreadable —
+    the section then renders an explicit unavailable line, never silence (the
+    alert-census precedent)."""
+    db_path = os.path.join(_pa_home(), "voice-inbox", "ledger.sqlite")
+    if not os.path.exists(db_path):
+        return None
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat().replace("+00:00", "Z")
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            rows = conn.execute(
+                "SELECT result_summary FROM tasks "
+                "WHERE result_summary LIKE '%:::raw-html%' AND updated_at >= ? "
+                "ORDER BY updated_at",
+                (cutoff,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    signatures: dict = {}
+    total = 0
+    for (summary,) in rows:
+        text = summary or ""
+        m = RAW_HTML_FENCE_RE.search(text)
+        if m:
+            sig = raw_html_signature(m.group(1))
+        elif RAW_HTML_OPENER_RE.search(text):
+            # Unterminated opener (rest-of-text rule, mirrored from the
+            # renderer) — still a raw-html answer, just not a parseable block.
+            sig = "(unterminated opener)"
+        else:
+            continue
+        total += 1
+        signatures[sig] = signatures.get(sig, 0) + 1
+    return {"answers": total, "signatures": signatures}
+
+
+def render_raw_html_section(data: dict | None) -> list:
+    """Render the 'Custom answer shapes' section — never omitted silently."""
+    lines = []
+    lines.append("## Custom answer shapes (7d)")
+    if data is None:
+        lines.append("_Voice-inbox ledger unavailable (no raw-html census)._")
+    elif data["answers"] == 0:
+        lines.append("*No raw-html answers in the last 7 days.*")
+    else:
+        ranked = sorted(data["signatures"].items(), key=lambda kv: (-kv[1], kv[0]))
+        top = ", ".join(f"`{sig}` ({n})" for sig, n in ranked[:5])
+        lines.append(f"{data['answers']} raw-html answer(s) in the last 7 days. "
+                     f"Recurring shapes are graduation candidates: {top}")
+        if len(ranked) > 5:
+            lines.append(f"- ... and {len(ranked) - 5} more shapes")
+    lines.append("")
+    return lines
+
+
 def render_retire_section(data: dict | None) -> list[str]:
     """Render the 'Retire?' section from skill-engagement data."""
     lines = []
@@ -770,6 +860,9 @@ def compose_digest(audit_entries: list, maintenance_summary: dict, parked_skills
     feature_count = read_new_feature_count(BUDGET_START)
     scorecard_lines = render_scorecard_section(alert_census, audit_entries, intervention_counts, feature_count)
     lines.extend(scorecard_lines)
+
+    # Section 8: Custom answer shapes (raw-html lane graduation detector, 2026-09-14)
+    lines.extend(render_raw_html_section(read_raw_html_shapes(days=7)))
 
     return "\n".join(lines)
 

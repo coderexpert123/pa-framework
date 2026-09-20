@@ -4,6 +4,7 @@ import { join, dirname, relative, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { ensureFreshDist } from '../../../pa/scripts/dist-guard.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // V17: this script lives at <repo>/projects/telegram-bot/scripts/, THREE
@@ -177,14 +178,19 @@ async function main() {
   // warn-and-continue escape hatch) lives in pa's assertDistFresh (this
   // runner passes pkg:'bot' so the BOT's stamp/src roots are checked); a
   // missing compiled module/function (fresh clone, pre-build bootstrap)
-  // skips it.
+  // skips it. AI-255 WP-G: a stale dist gets ONE managed rebuild via the
+  // bot's own build.mjs (which takes @build itself) before refusing —
+  // PA_NO_AUTOBUILD=1 restores refuse-fast.
   const blGuard = loadBuildLock(repoRoot);
   if (blGuard && typeof blGuard.assertDistFresh === 'function') {
-    try {
-      await blGuard.assertDistFresh({ pkg: 'bot', repoRoot });
-    } catch (e) {
-      console.error(`Refusing to run tests against this dist (AI-180): ${e?.message ?? e}`);
-      process.exitCode = 1;
+    const guardCode = await ensureFreshDist({
+      pkg: 'bot',
+      assertFresh: () => blGuard.assertDistFresh({ pkg: 'bot', repoRoot }),
+      buildScript: join(__dirname, 'build.mjs'),
+      buildCwd: join(__dirname, '..'),
+    });
+    if (guardCode !== 0) {
+      process.exitCode = guardCode;
       return;
     }
   }

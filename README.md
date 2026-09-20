@@ -19,6 +19,8 @@ cd pa-framework
 
 Then follow [`docs/QUICKSTART.md`](docs/QUICKSTART.md) — the one canonical setup path (build, `pa init`, secrets, workers, first skill, scheduling, bot).
 
+Short on time, or want the computer to do the setup? Hand [`docs/INSTALL.md`](docs/INSTALL.md) to your AI assistant — its first section explains the install in plain language and the rest is a checked, step-by-step runbook the assistant follows and verifies itself.
+
 ---
 
 ## 🌟 Key Features
@@ -85,7 +87,6 @@ The framework runs natively on **Windows, macOS, and Linux**.
 | Bot Launcher | `run-bot.ps1` + Task Scheduler | `run-bot.sh` + launchd | `run-bot.sh` + systemd |
 | Scheduler Sync | Windows Task Scheduler (`pa schedules sync`) | `crontab` | `crontab` |
 | Background Tasks | PowerShell + CIM | `ps` / `pgrep` | `ps` / `pgrep` |
-| `/keepawake` | `SetThreadExecutionState` | `caffeinate -s` | `systemd-inhibit` |
 
 For detailed per-OS installation instructions and troubleshooting, see [`docs/QUICKSTART.md`](docs/QUICKSTART.md) and [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md).
 

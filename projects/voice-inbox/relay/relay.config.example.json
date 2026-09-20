@@ -1,0 +1,7 @@
+{
+  "worker_base_url": "https://voice-inbox-relay.<your-subdomain>.workers.dev",
+  "home_base_url": "http://127.0.0.1:8787",
+  "poll_wait_ms": 25000,
+  "request_deadline_ms": 55000,
+  "localhost_timeout_ms": 50000
+}

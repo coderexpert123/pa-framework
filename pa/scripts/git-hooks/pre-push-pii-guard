@@ -1202,6 +1202,89 @@ def record_review_mode(argv: list[str]) -> int:
     return 0
 
 
+# --- Separation-checker layer (AI-264 Wave A, 2026-09-17) ----------------------
+#
+# WP1's public_separation_check.py --mode paths re-scans the pushed path set
+# with the operator identifier file (~/.pa/operator-identifiers.txt) through an
+# independent engine that applies the SAME three-view path normalization as
+# scan_path above, but loads its patterns from a separately audited file and
+# never suppresses a match. A VIOLATION is a block; a checker EXECUTION failure
+# is fail-closed (the same policy as layer 3's ok=False below): an audit layer
+# that cannot run must never present itself as a clean verdict. History
+# scanning deliberately does NOT ride this hook (cost) — it rides the weekly
+# pii-audit skill's --mode history run.
+
+SEPARATION_CHECKER_TIMEOUT = 120  # seconds; paths mode is regex-over-strings, fast
+
+
+def _resolve_separation_checker() -> str | None:
+    """PA_SEPARATION_CHECKER override, then the copy inside the public mirror's
+    own tree (pa/ is public-tracked, so pa/scripts/public_separation_check.py
+    syncs there; the hook runs with cwd = the mirror's root)."""
+    candidates = [
+        os.environ.get("PA_SEPARATION_CHECKER"),
+        os.path.join(os.getcwd(), "pa", "scripts", "public_separation_check.py"),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def run_separation_checks(touched_paths: list[str]) -> int | None:
+    """Run WP1's checker --mode paths over TOUCHED_PATHS. Returns None when the
+    scan completed clean (caller continues) or 1 when the push must BLOCK —
+    for a VIOLATION (exit 2) or for a checker execution failure (fail-closed)."""
+    checker = _resolve_separation_checker()
+    if checker is None:
+        print("🚫 PII guard: separation checker not found — set PA_SEPARATION_CHECKER "
+              "or sync pa/scripts/public_separation_check.py into this repo — "
+              "BLOCKING by policy (fail-closed)", file=sys.stderr)
+        return 1
+    patterns_file = os.path.join(PA_HOME, "operator-identifiers.txt")
+    if not os.path.isfile(patterns_file):
+        # Layer-not-configured, not an execution failure: the guard's layer 2
+        # (load_tripwires) treats a missing pattern file the same way — loud
+        # fail-open banner, no block. Blocking every push because the operator
+        # identifier file does not exist in THIS environment (CI, a fresh
+        # clone) would wedge the push path permanently. Checker EXECUTION
+        # failures below are still fail-closed (spec 4.3).
+        print("!! pii guard separation layer did not run: no operator "
+              "identifier patterns at ~/.pa/operator-identifiers.txt. this "
+              "content was not checked by that layer — do not read the "
+              "absence of findings as a clean verdict", file=sys.stderr)
+        return None
+    try:
+        result = subprocess.run(
+            [sys.executable, checker, "--repo", ".", "--patterns", patterns_file,
+             "--mode", "paths", "--paths", "-"],
+            input="\n".join(touched_paths),
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=SEPARATION_CHECKER_TIMEOUT,
+        )
+    except Exception as exc:
+        print(f"🚫 PII guard: separation checker failed to execute ({exc}) — "
+              f"BLOCKING by policy (fail-closed)", file=sys.stderr)
+        return 1
+    if result.returncode not in (0, 2):
+        print("🚫 PII guard: separation checker did not complete "
+              f"(exit {result.returncode}) — BLOCKING by policy (fail-closed)",
+              file=sys.stderr)
+        if result.stderr.strip():
+            print(f"   cause: {result.stderr.strip()[:400]}", file=sys.stderr)
+        return 1
+    if result.returncode == 2:
+        print("🚫 PII guard: separation check flagged a pushed path "
+              "(operator-identifier patterns) — push aborted", file=sys.stderr)
+        for vline in result.stdout.splitlines():
+            if vline.startswith("VIOLATION"):
+                print(f"   {vline}", file=sys.stderr)
+        return 1
+    print("✓  PII guard: separation checker clean "
+          f"({len(touched_paths)} path(s) scanned)", file=sys.stderr)
+    return None
+
+
 def _print_usage_and_exit() -> None:
     """Print usage and exit 0 WITHOUT reading stdin."""
     print("pre-push-pii-guard — PII scanner for pa-framework public mirror", file=sys.stderr)
@@ -1313,6 +1396,14 @@ def main() -> int:
         for v in violations:
             print(f"   {v}", file=sys.stderr)
         return 1
+
+    # Separation-checker layer (AI-264 Wave A): independent engine over the
+    # pushed path set + the operator identifier file. Deliberately placed
+    # BEFORE layer 3 — layer 3 has early returns (the review-record fast path
+    # returns 0) that would otherwise skip this check entirely.
+    sep_rc = run_separation_checks(TOUCHED_PATHS)
+    if sep_rc is not None:
+        return sep_rc
 
     # Layer 3: semantic scan of the ADDED LINES — agy, OR a fresh
     # review-record handoff (2026-08-13) when the identical content was

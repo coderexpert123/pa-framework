@@ -18,7 +18,7 @@
  * longer, malformed, or over-length in a field):
  *   reauth:google[:skill≤50]                       chat-gated
  *   cf:y | cf:n                                    chat-gated   (pending_action confirmation)
- *   cc:menu|agent|model|effort|back|new|stop|ka|submit|discard  chat-gated   (control card navigation/actions)
+ *   cc:menu|agent|model|effort|back|new|stop|submit|discard  chat-gated   (control card navigation/actions)
  *   cc:set:agent:<≤16> | cc:set:model:<≤40> | cc:set:effort:<≤16>
  *   wf:retry | wf:switch:<worker≤16> | wf:revert:<worker≤16>
  *   pm:<auditId≤40>:approve|reject|diff            operator-gated
@@ -35,6 +35,11 @@
  *                                                               option — Wave 2; the taskId
  *                                                               resolves against the RUNNING
  *                                                               store, never state.turns)
+ *   rq:<threadN>:<0-3>                             chat-gated   (executor-lane thread question
+ *                                                               option — AI-203 WP-3; the
+ *                                                               threadN resolves against the
+ *                                                               topic's thread store, never
+ *                                                               state.turns)
  *   ru:<ruleId≤40>:a|x                             operator-gated (weekly-digest rules
  *                                                               accept/reject — WP-D2 B.2)
  *   si:<family≤40>:m[:c]                           operator-gated, two-step (census-family
@@ -43,12 +48,22 @@
  *                                                               re-run — WP-D2 B.6)
  *   wt:<watchId≤32>:r                              operator-gated (terminal-watch re-register
  *                                                               — WP-D2 B.7)
+ *   ow:<gid12>:l|k|d                               operator-gated (orphan-edit disposition:
+ *                                                               l=land as-is, k=keep dirty 24h,
+ *                                                               d=show diff)
+ *   sr:<idx>                                        chat-gated   (AI-234 quick-reply chip —
+ *                                                               index resolves against the
+ *                                                               topic's pending_suggestions)
+ *   auth:<provider>:<ir-12hex>                     chat-gated   (auth broker Phase A —
+ *                                                               open a pending request's
+ *                                                               authorize link)
  * Conflict ids start with `cf-` (hyphen); the confirmation prefix is `cf:` (colon) —
  * anchored regexes, never startsWith.
  */
 
 export type CallbackPrefix =
   | 'reauth'
+  | 'auth'
   | 'cf'
   | 'cc'
   | 'wf'
@@ -61,17 +76,21 @@ export type CallbackPrefix =
   | 'dq'
   | 'q'
   | 'qt'
+  | 'rq'
   | 'ru'
   | 'si'
   | 'ch'
-  | 'wt';
+  | 'wt'
+  | 'ow'
+  | 'sr';
 export type CallbackGate = 'chat' | 'operator';
 
 /** Parsed callback_data. `raw` is the original string. */
 export type ParsedCallback =
   | { prefix: 'reauth'; provider: 'google'; skill?: string; raw: string }
+  | { prefix: 'auth'; provider: string; requestId: string; raw: string }
   | { prefix: 'cf'; answer: 'y' | 'n'; raw: string }
-  | { prefix: 'cc'; action: 'menu' | 'agent' | 'model' | 'effort' | 'back' | 'new' | 'stop' | 'ka' | 'submit' | 'discard'; raw: string }
+  | { prefix: 'cc'; action: 'menu' | 'agent' | 'model' | 'effort' | 'back' | 'new' | 'stop' | 'submit' | 'discard'; raw: string }
   | { prefix: 'cc'; action: 'set'; setting: 'agent' | 'model' | 'effort'; value: string; raw: string }
   | { prefix: 'wf'; action: 'retry'; raw: string }
   | { prefix: 'wf'; action: 'switch' | 'revert'; worker: string; raw: string }
@@ -84,10 +103,13 @@ export type ParsedCallback =
   | { prefix: 'dq'; index: number; confirmed: boolean; raw: string }
   | { prefix: 'q'; index: number; raw: string }
   | { prefix: 'qt'; taskId: string; index: number; raw: string }
+  | { prefix: 'rq'; threadN: number; index: number; raw: string }
   | { prefix: 'ru'; ruleId: string; action: 'a' | 'x'; raw: string }
   | { prefix: 'si'; family: string; confirmed: boolean; raw: string }
   | { prefix: 'ch'; chain: string; confirmed: boolean; raw: string }
-  | { prefix: 'wt'; watchId: string; raw: string };
+  | { prefix: 'wt'; watchId: string; raw: string }
+  | { prefix: 'ow'; gid: string; action: 'l' | 'k' | 'd'; raw: string }
+  | { prefix: 'sr'; index: number; raw: string };
 
 // --- Grammar regexes (one per row; anchored; never startsWith) --------------------
 // Callback-data contract for the inline "Re-authorize Google" button carried by every
@@ -96,8 +118,12 @@ export type ParsedCallback =
 // `reauth:google:` is 14 bytes, so 50 is the largest suffix that fits Telegram's
 // 64-byte `callback_data` limit.
 export const REAUTH_CALLBACK_PATTERN = /^reauth:(google)(?::([a-z0-9-]{1,50}))?$/;
+// auth: — auth broker Phase A (2026-09-10 build spec §3.9): opens a pending broker
+// request's authorize link. `auth:` + provider (1-16 chars) + `:` + `ir-` + 12 hex is
+// 5 + 16 + 1 + 15 = 37 bytes max, inside the 64-byte cap.
+export const AUTH_CALLBACK_PATTERN = /^auth:([a-z0-9][a-z0-9-]{0,15}):(ir-[0-9a-f]{12})$/;
 const CF_RE = /^cf:(y|n)$/;
-const CC_SIMPLE_RE = /^cc:(menu|agent|model|effort|back|new|stop|ka|submit|discard)$/;
+const CC_SIMPLE_RE = /^cc:(menu|agent|model|effort|back|new|stop|submit|discard)$/;
 const CC_SET_RE = /^cc:set:(agent|model|effort):([\s\S]{1,64})$/;
 export const CC_SET_CAPS: Record<'agent' | 'model' | 'effort', number> = { agent: 16, model: 40, effort: 16 };
 const WF_RETRY_RE = /^wf:retry$/;
@@ -121,6 +147,21 @@ const Q_RE = /^q:([0-3])$/;
 // TopicTask id grammar) + the option index. "qt:" + id + ":" + digit is 20 bytes.
 // Chat-gated like q: (a task question is answered by whoever may speak in the chat).
 export const QT_RE = /^qt:(tt-[0-9a-f]{12}):([0-3])$/;
+// rq: (AI-203 WP-3) — thread-question press: `rq:` + the thread's numeric `n`
+// (the ThreadRecord.n that WP-2's buildThreadQuestionKeyboard stamps on the
+// button) + the option index 0..3. "rq:" + n + ":" + digit is ≤64 bytes by
+// construction (n is a small per-topic counter). Chat-gated like q:/qt: (a
+// thread question is answered by whoever may speak in the chat). The handler
+// converts `t-<n>` and calls takePendingQuestion against the topic's thread
+// store — never state.turns.
+export const RQ_RE = /^rq:(\d+):([0-3])$/;
+// sr: (AI-234) — quick-reply chip press: `sr:` + the chip's numeric index. The
+// index resolves against the topic's ephemeral pending_suggestions.items[idx]
+// (set by main.ts when the orchestrator's suggested_items survive sanitize).
+// Chat-gated like q: (a chip reply is typed by whoever may speak in the chat).
+// The chip label rides the button text, NOT callback_data — the press carries
+// only the tiny index, so the 64-byte Bot API limit is never the binding constraint.
+const SR_RE = /^sr:(\d+)$/;
 
 // --- WP-D2 prefixes (Wave 2 Phase 2, SPEC §3.4) — pa-side emitters only; the bot's
 // callbacks.ts gains the four handlers against these same regexes (one-parser rule).
@@ -137,6 +178,10 @@ export const SI_RE = /^si:([A-Za-z0-9._-]{1,40}):m(:c)?$/;
 export const CH_RE = /^ch:r:([a-z0-9][a-z0-9-]{0,39})(:c)?$/;
 // wt: (B.7) — re-register a terminal watch from its failure/expiry report.
 export const WT_RE = /^wt:([a-z0-9-]{1,32}):r$/;
+// ow: — operator-gated orphan-edit disposition (AI-214): `ow:` + a 12-hex gid
+// (the emitter hashes to exactly 12, so the guard is the same on both ends —
+// mc: precedent) + one action letter. `ow:` + 12 + `:` + 1 = 18 bytes ≤ 64.
+export const OW_RE = /^ow:([0-9a-f]{12}):(l|k|d)$/;
 
 /**
  * Parses the `reauth:google[:skill]` inline-button callback_data. Pure — no I/O.
@@ -158,6 +203,9 @@ export function parseCallbackData(data: string | undefined): ParsedCallback | nu
   const reauth = parseReauthCallback(data);
   if (reauth) return { prefix: 'reauth', ...reauth, raw: data };
 
+  const authMatch = AUTH_CALLBACK_PATTERN.exec(data);
+  if (authMatch) return { prefix: 'auth', provider: authMatch[1], requestId: authMatch[2], raw: data };
+
   let m: RegExpExecArray | null;
 
   if ((m = CF_RE.exec(data))) return { prefix: 'cf', answer: m[1] as 'y' | 'n', raw: data };
@@ -176,7 +224,7 @@ export function parseCallbackData(data: string | undefined): ParsedCallback | nu
   if ((m = CC_SIMPLE_RE.exec(data))) {
     return {
       prefix: 'cc',
-      action: m[1] as 'menu' | 'agent' | 'model' | 'effort' | 'back' | 'new' | 'stop' | 'ka' | 'submit' | 'discard',
+      action: m[1] as 'menu' | 'agent' | 'model' | 'effort' | 'back' | 'new' | 'stop' | 'submit' | 'discard',
       raw: data,
     };
   }
@@ -200,15 +248,20 @@ export function parseCallbackData(data: string | undefined): ParsedCallback | nu
   if ((m = DQ_RE.exec(data))) return { prefix: 'dq', index: Number(m[1]), confirmed: !!m[2], raw: data };
   if ((m = Q_RE.exec(data))) return { prefix: 'q', index: Number(m[1]), raw: data };
   if ((m = QT_RE.exec(data))) return { prefix: 'qt', taskId: m[1], index: Number(m[2]), raw: data };
+  if ((m = RQ_RE.exec(data))) return { prefix: 'rq', threadN: Number(m[1]), index: Number(m[2]), raw: data };
   if ((m = RU_RE.exec(data))) return { prefix: 'ru', ruleId: m[1], action: m[2] as 'a' | 'x', raw: data };
   if ((m = SI_RE.exec(data))) return { prefix: 'si', family: m[1], confirmed: !!m[2], raw: data };
   if ((m = CH_RE.exec(data))) return { prefix: 'ch', chain: m[1], confirmed: !!m[2], raw: data };
   if ((m = WT_RE.exec(data))) return { prefix: 'wt', watchId: m[1], raw: data };
+  if ((m = OW_RE.exec(data))) {
+    return { prefix: 'ow', gid: m[1], action: m[2] as 'l' | 'k' | 'd', raw: data };
+  }
+  if ((m = SR_RE.exec(data))) return { prefix: 'sr', index: Number(m[1]), raw: data };
 
   return null;
 }
 
-const OPERATOR_PREFIXES = new Set<CallbackPrefix>(['pm', 'dr', 'sk', 'mc', 'rs', 'dq', 'ru', 'si', 'ch', 'wt']);
+const OPERATOR_PREFIXES = new Set<CallbackPrefix>(['pm', 'dr', 'sk', 'mc', 'rs', 'dq', 'ru', 'si', 'ch', 'wt', 'ow']);
 
 /** Pure. Which gate class a parsed callback needs (§3.3). */
 export function gateFor(parsed: ParsedCallback): CallbackGate {

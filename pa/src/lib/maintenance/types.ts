@@ -78,7 +78,11 @@ export interface MaintenanceJob {
 
 export type SkipReason = 'disabled' | 'degraded' | 'in-flight' | 'not-due' | 'failure-backoff';
 
-export type JobOutcome = 'ran' | 'failed' | 'skipped';
+/** `'started'` is RETURN-ONLY: it appears in a parallel pass's JobRunRecord and MUST
+ *  NEVER be written to the ledger's lastOutcome (status.ts counts 'failed';
+ *  alert-census green-signals on 'ran'). The detached completion handler writes the
+ *  real terminal outcome. */
+export type JobOutcome = 'ran' | 'failed' | 'skipped' | 'started';
 
 export interface JobRunRecord {
   name: string;

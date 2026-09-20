@@ -264,6 +264,29 @@ describe('topic-tasks', () => {
     });
   });
 
+  describe('appendTask model pin (WP-7)', () => {
+    it('stores an optional model pin and rejects a malformed one', async () => {
+      await appendTask(1, 0, { title: 'model pinned', prompt: 'p', createdBy: 'cli', model: 'claude-sonnet-4.6' });
+      const queued = await listTasks(1, 0);
+      assert.equal(queued[0].model, 'claude-sonnet-4.6');
+      await assert.rejects(
+        appendTask(1, 0, { title: 'bad model', prompt: 'p', createdBy: 'cli', model: 'bad model!' }),
+        /task\.model must match/,
+      );
+    });
+
+    it('an absent model stays absent; the pin rides the claim into the running record', async () => {
+      const { id: unpinned } = await appendTask(1, 0, { title: 'no pin', prompt: 'p', createdBy: 'cli' });
+      assert.equal((await listTasks(1, 0))[0].model, undefined, 'absent stays absent — not an empty string');
+      const { id: pinned } = await appendTask(1, 0, { title: 'pinned claim', prompt: 'p', createdBy: 'cli', model: 'flash-y' });
+      const first = await claimNextTask(1, 0);
+      assert.equal(first?.id, unpinned, 'FIFO claims the unpinned task first');
+      const second = await claimNextTask(1, 0);
+      assert.equal(second?.id, pinned);
+      assert.equal(second?.model, 'flash-y', 'the model pin carries onto the running record');
+    });
+  });
+
   describe('running store (Wave 2)', () => {
     it('running store lives at the frozen sibling path', async () => {
       assert.equal(

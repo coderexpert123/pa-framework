@@ -39,10 +39,11 @@ The framework reads configuration from `~/.pa/` (or wherever `PA_HOME` env var p
 | `evaluator` | `EvaluatorConfig` | No | None | LLM consulted when a worker stalls; without one, stalled workers are killed at idle_timeout. |
 | `topic_defaults` | `Record<string, string>` | No | `{}` | Maps `<chatId>_<threadId>` to a preferred worker name. Used by the bot. |
 | `bg_tasks` | `BgTasksConfig` | No | See below | Thresholds for background-leak detection. |
+| `concurrency_limit` | `number` | No | absent | Max parallel skills in `pa catchup`; absent = follows the dynamic worker-slot cap, `PA_DYNAMIC_SLOTS=0` restores the legacy 2. |
 | `usage` | `UsageConfig` | No | None | Token usage tracking and budget alerts. See below. |
-| `model_pricing` | `Record<string, {input, output, cache_read?}>` | No | No | Per-MTok USD price overrides for cost estimates; keys are model names with worker-name fallback. See below. |
+| `model_pricing` | `Record<string, {input, output, cache_read?}>` | No | No | Per-MTok USD price overrides; keys are model names with worker-name fallback. See below. |
 | `git_workflow` | `GitWorkflowConfig` | No | absent block = enabled | Opt-in for git-touching skills (see below). |
-| `topics` | `{ support?: string }` | No | absent | Topic-routing knobs. Unattributed-path triage order: (1) the optional registry `~/.pa/topic-ownership-registry.json` (JSON keyed `"<chatId>_<threadId>"`; rows carry repo-relative `owned` path prefixes; at most one `role: "catch-all"`; missing/corrupt falls through); (2) `support` = `"<chatId>_<threadId>"`, the fallback topic for paths the daily-recon job cannot attribute. Unset/invalid everywhere: unattributed paths still count in `~/.pa/daily-recon.json`'s `unknown_n`, but no task is filed. |
+| `topics` | `{ support?: string }` | No | absent | Topic-routing knobs. Unattributed-path triage: (1) the optional registry `~/.pa/topic-ownership-registry.json` (keyed `"<chatId>_<threadId>"`; rows carry repo-relative `owned` prefixes; at most one `role: "catch-all"`; missing/corrupt falls through); (2) `support` = `"<chatId>_<threadId>"`, the fallback topic for unattributed paths. Unset/invalid everywhere: unattributed paths still count in `~/.pa/daily-recon.json`'s `unknown_n`; no task is filed. |
 
 ### `WorkerConfig`
 
@@ -50,7 +51,7 @@ The framework reads configuration from `~/.pa/` (or wherever `PA_HOME` env var p
 |---|---|---|---|---|
 | `name` | string | Yes | — | Unique identifier; used in `--worker`, `skill.frontmatter.worker`, and `topic_defaults`. |
 | `command` | string | Yes | — | Binary path — PATH-resolved or absolute; on Windows `.cmd`/`.bat` works. |
-| `args` | string[] | Yes | — | CLI arguments. For `input_mode: arg`, `{prompt}` and `{prompt_file}` are substituted. A dispatch can drop named flags via `RunOptions.stripArgs` (a spawned thread strips `--append-system-prompt-file`). |
+| `args` | string[] | Yes | — | CLI arguments. For `input_mode: arg`, `{prompt}` and `{prompt_file}` are substituted. A dispatch can drop named flags via `RunOptions.stripArgs`. |
 | `check` | string | Yes | — | Availability probe; run via shell, exit 0 = available. |
 | `check_timeout` | number (sec) | No | 30 | Max time for `check` to complete. |
 | `rate_limit_patterns` | string[] | No | `[]` | Case-insensitive substrings searched in stdout+stderr; match → cooldown. |
@@ -59,8 +60,18 @@ The framework reads configuration from `~/.pa/` (or wherever `PA_HOME` env var p
 | `state_pattern` | string | No | `*.jsonl` | Glob for tailing `state_dir`. |
 | `input_mode` | `'arg' \| 'stdin-text' \| 'stdin-json'` | No | `'arg'` | How the prompt reaches the worker. |
 | `output_format` | string | No | undefined | Informational; `'stream-json'` enables NDJSON parsing for session-id extraction. |
-| `manual_only` | boolean | No | undefined | Excludes the worker from automatic failover — runs only when explicitly named (`--worker`, skill `worker:` frontmatter, or `worker_pin`). |
+| `manual_only` | boolean | No | undefined | Excluded from automatic failover; runs only when explicitly named (`--worker`, skill `worker:` frontmatter, or `worker_pin`). |
+| `tunables` | `Record<string, {args:string[]; default?; supersedes?}>` | No | `{}` | Declares the settings `/model`-style commands can set for this worker; `args` expands `{value}`. Tier pick per setting: session overrides (human lane only) → topic `tunable_defaults` → spec `default`. Executor lanes (orchestrator threads, topic tasks) honor `tunable_defaults` + a per-record `model` pin; session `/llm`/`/effort` overrides never reach them. |
 
+#### Devin CLI worker
+
+The `devin` worker uses the Devin CLI; once configured it joins automatic failover. `manual_only: true` gates it to explicit selection (`/agent devin`, skill `worker: devin`, or `worker_pin`).
+
+Setup: install the Devin CLI (default `%LOCALAPPDATA%\devin\cli\bin\devin.exe` on Windows); put a `devin.cmd` forwarding shim on PATH (or point `command:` at the binary); ensure `%APPDATA%\devin\credentials.toml` holds a valid `windsurf_api_key`; copy the `devin` worker block from `config.example.yaml`.
+
+Headless dispatch requires `--permission-mode dangerous` (non-interactive permissions), `--respect-workspace-trust false` (skip the trust prompt), and `--prompt-file <path> -p` (prompt from a temp file, response to stdout).
+
+Rate-limit patterns match stderr only (parser `pa/src/rate-limits-devin.ts`, `devin-text`). Common phrases: `rate limit`, `quota exceeded`, `429`, `usage limit`, `out of credits`, `insufficient balance`.
 ### `EvaluatorConfig`
 
 | Field | Type | Required | Default | Effect |
@@ -81,12 +92,12 @@ Controls how Telegram voice notes become text; omit the `transcription:` block a
 
 | Field | Type | Required | Default | Effect |
 |---|---|---|---|---|
-| `engine_preference` | `'auto' \| 'cloud' \| 'local'` | No | `'auto'` | `auto` = cloud when an API key is set, else local. `cloud` = cloud only — fails rather than falls back to local. `local` = local only; audio NEVER leaves this machine, even with API keys set. |
-| `worker_mode` | `'spawn' \| 'persistent'` | No | `'spawn'` | LOCAL engine only (ignored when cloud handles the note). `spawn` = fresh process per note (reloads the model). `persistent` = resident background process (~230MB+ RAM) keeping the model warm. |
-| `cloud_order` | string[] | No | `[groq, openai, deepgram]` | Providers to try, in order; only ones with a set API key are attempted. |
-| `language` | string \| null | No | `null` (auto-detect) | ISO 639-1, optionally region-qualified (`en-US`); threaded into every cloud call and the local engine's hint. A non-English value with `engine_preference: local` warns at config-load — the bundled model (`small.en`) is English-only. |
+| `engine_preference` | `'auto' \| 'cloud' \| 'local'` | No | `'auto'` | `auto` = cloud when an API key is set, else local. `cloud` = cloud only, fails rather than falling back to local. `local` = local only; audio NEVER leaves this machine even with API keys set. |
+| `worker_mode` | `'spawn' \| 'persistent'` | No | `'spawn'` | LOCAL engine only. `spawn` = fresh process per note (reloads the model); `persistent` = resident process (~230MB+ RAM) keeping the model warm. |
+| `cloud_order` | string[] | No | `[groq, openai, deepgram]` | Providers to try in order; only those with a set key are attempted. |
+| `language` | string \| null | No | `null` (auto-detect) | ISO 639-1, optionally region-qualified; threaded into every cloud call and the local engine's hint. A non-English value with `engine_preference: local` warns — the bundled model (`small.en`) is English-only. |
 
-Full walkthrough: docs/BOT_GUIDE.md "Voice messages (speech to text)". Something broken? docs/TROUBLESHOOTING.md "Voice-message transcription". Annotated example: `examples/config.yaml.example`.
+Walkthrough: docs/BOT_GUIDE.md "Voice messages (speech to text)"; troubleshooting: docs/TROUBLESHOOTING.md "Voice-message transcription". Annotated example: `examples/config.yaml.example`.
 
 ### UsageConfig
 
@@ -96,7 +107,7 @@ Optional — omit the `usage:` block and usage tracking still runs.
 |---|---|---|---|---|
 | `budget_monthly_usd` | number | No | None | Monthly USD budget; alerting reserved (not implemented). |
 
-Run `pa costs [--day|--week|--month] [--skill] [--json]` for rollups by worker/model/skill; dollars are read-time estimates (built-in list prices + `model_pricing` overrides); unpriced keys show `-`/`null`.
+Run `pa costs [--day|--week|--month] [--skill] [--json]` for rollups by worker/model/skill; dollar semantics: ARCHITECTURE § Observability.
 
 ### GitWorkflowConfig
 
@@ -116,13 +127,57 @@ Controls the cost_tier peak window for `off_peak` skills; omit the `cost_tier:` 
 | `peak_window_utc.start_hour` | number | No | `6` | Start of peak window in UTC (0-23). |
 | `peak_window_utc.end_hour` | number | No | `10` | End of peak window in UTC (0-23, must be > start_hour). |
 
-The default matches the Zhipu (z.ai) peak billing window (2x credits). `off_peak` skills defer during peak; customize for another provider. **Non-wrapping:** `start_hour` < `end_hour` required; wrap-around windows (e.g. 22:00-02:00) warn and fall back to the default.
+The default matches the Zhipu (z.ai) peak billing window (2x credits). `off_peak` skills defer during peak; customize for another provider. **Non-wrapping:** `start_hour` < `end_hour` required; wrap-around windows warn and fall back to the default.
+
+### RoutingPolicyConfig
+
+Per-turn worker routing for the Telegram bot: classifies each turn code/engineering vs general and sends code turns to a time-window worker; omit the block (or `enabled: false`) and dispatch behaves as before. The companion `model_router` block (worker/model/effort selection per turn, metadata tables, shadow staging) is documented with the routing architecture in `docs/model-router.md`.
+
+| Field | Type | Required | Default | Effect |
+|---|---|---|---|---|
+| `enabled` | boolean | Yes | — (`false`) | Must be `true` to activate; anything else = policy off. |
+| `judge` | `'typesafe' \| 'agy' \| 'deterministic'` | No | `'agy'` | Classifier engine: `'typesafe'` = one TypeSafe Choice, regex on any failure, never agy (see TypeSafe typed routing); `'agy'` = LLM first-pass via Antigravity CLI; `'deterministic'` = regex only. |
+| `judge_model` | string | No | `'gemini-3.6-flash-low'` | Model passed to the `agy` judge command. |
+| `judge_timeout_ms` | number | No | `20000` | Timeout in milliseconds before failing open to deterministic regex classification. |
+| `judge_command` | string | No | `D:\gemini-shim\agy.cmd` (Win) / `agy` | Command executable or path used for the `agy` judge. |
+| `general_worker` | string | No | None | Worker for general-classified turns on topics with no `topic_defaults` entry (else the first-priority worker applies). |
+| `code_worker` | string | No | None | Worker for code-classified turns outside the peak window. |
+| `peak_code_worker` | string | No | None | Worker for code-classified turns inside the peak window (`cost_tier.peak_window_utc` — the SAME window `off_peak` skills use). |
+| `code_patterns` | string[] | No | `[]` | Extra case-insensitive regexes appended to the built-in code signals; invalid regexes are dropped with a load warning. |
+| `topic_classes` | map | No | None | Pin a topic's classification (`code`/`general`) or exclude it (`off`). |
+
+Precedence per dispatch: `/agent` pin → a command-router worker change in the same turn → routing policy (code turns) → `topic_defaults` → automatic failover chain. Named workers must exist under `workers:`; unknown names warn at load and resolution fails open to the topic default. Both dispatch lanes inherit this; voice-inbox routed tasks via their target topic. Scheduled skills are unaffected (`worker:`/`cost_tier: off_peak` remain their knobs).
+
+The classifier reads the operator's request, never injected instruction text; a turn naming voice-inbox tasks classifies each task's ledger request (typed text or transcript), falling back to turn text on a failed or missing row, and each routed turn logs what it used (`textSource`). Command turns like `/status` skip the judge and keep the default worker (`skipped: command`); skill commands dispatching a worker are still classified.
+
+### TypeSafe typed routing
+
+Optional typed judgments from the TypeSafe API (`https://api.typesafe.ai/v1/systemone`), the one model API called directly. All of it stays off until `TYPESAFE_API_KEY` is set and the config turns a path on. `pa typesafe check [--samples N]` sends one trivial question per sample, printing latency and tokens. `pa typesafe eval [--since YYYY-MM-DD] [--limit N] [--dry-run]` replays past LLM-routed voice tasks and prints agreement by confidence band — how the thresholds get chosen.
+
+`recommended_threshold=none` means no confidence floor met the target; keep that path off.
+
+`pa typesafe eval --judge [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--limit N] [--agy N] [--labels-only] [--dry-run]` measures the code/general turn judge before `routing_policy.judge: typesafe` is set: it samples past operator requests, labels each via the `claude` CLI (cached in `~/.pa/typesafe-eval/`), prints agreement for TypeSafe, the regex and a small agy subsample. The `typesafe_ladder:` line is the live judge, the regex answering if TypeSafe cannot.
+
+The shipped question (2026-09-18) uses structured `{what, not_for, examples}` criteria per option, separating the assistant's own dev-project requests from everyday app use. On 104 Claude-labelled requests plain-string scored 75%, structured 86% — neither meets the 90% bar, but incumbent `agy` measured 55% (52.5% always-general floor) at a 45s mean, so this deployment switched to `typesafe`. The code default stays `agy`. Evidence: `plans/2026-09-17-typesafe-judge-eval-result.md`.
+
+| Key | Where | Default | Effect |
+|---|---|---|---|
+| `TYPESAFE_API_KEY` | secrets.env | unset | The credential. Unset = every typed path is off. |
+| `TYPESAFE_TIMEOUT_MS` | env | `4000` | Whole-call budget including one retry; past it the caller falls back. |
+| `routing_policy.judge: typesafe` | config.yaml | `agy` | Turn judge: topic pin, then one code/general Choice, then the regex. |
+| `voice_inbox_routing.enabled` | config.yaml | off | Bot routes received voice-inbox tasks by typed Choices; the fallback job uses them as last resort. |
+| `voice_inbox_routing.act_confidence` | config.yaml | `0.9` | Destination confidence the bot needs to place a task itself. |
+| `voice_inbox_routing.continue_confidence` | config.yaml | `0.9` | Confidence needed to join an open conversation. |
+| `voice_inbox_routing.no_match` | config.yaml | `create-topic` | A confident no-match: `create-topic`, `default-topic` or `escalate`. |
+| `voice_inbox_routing.escalation` | config.yaml | `llm-turn` | Below threshold: `llm-turn` (the inbox routing turn) or `place` (act on the top choice). |
+| `voice_inbox.default_topic` | config.yaml | inbox chat thread 0 | The default topic; `PA_VOICE_INBOX_FALLBACK_DEFAULT_TOPIC` wins over it. |
+| `PA_VOICE_INBOX_TYPED_ROUTING=0` | env | unset | Kill switch for the bot's typed routing. |
+
+**Egress.** With the key set, routing text leaves the machine for `api.typesafe.ai` (US-hosted; no training on inputs, no published retention period). The turn judge sends each non-command turn's request text (4,000-char cap); voice-inbox routing sends the request or transcript (8,000), the inbox chat's topic names/descriptions and open-conversation snippets. Nothing else: no briefings, attachments, audio, topic brains, secrets or worker output.
 
 ### ModelPricing
 
-Per-worker/model price overrides for `pa costs` estimates, under the top-level `model_pricing:` key. Omitted → built-in defaults only.
-
-Table semantics (per-million-token USD):
+Per-worker/model price overrides for `pa costs`, under the top-level `model_pricing:` key. Omitted → built-ins only. Per-million-token USD:
 
 ```yaml
 model_pricing:
@@ -131,9 +186,7 @@ model_pricing:
 
 Key resolution: try `record.model` (trimmed), else `record.worker`. Config merges over built-ins key-by-key. Thinking tokens bill at the output rate; `cache_read` defaults to 0.
 
-Parsed by `pa/src/lib/model-pricing.ts` (not `loadConfig`); any read/parse failure warns and falls back to built-ins — never crashes.
-
-Usage records often carry no model field, so the built-ins include worker-level entries (`agy` = gemini-3.8-flash rates, `zclaude` = glm-5.3); `claude`/`codex` price via model key or show unpriced.
+Parsed by `pa/src/lib/model-pricing.ts` (not `loadConfig`); any read/parse failure warns and falls back to built-ins. Usage records often carry no model field, so the built-ins include worker-level entries (`agy` = gemini-3.8-flash rates, `zclaude` = glm-5.3); `claude`/`codex` price via model key or show unpriced.
 
 ### Validation
 
@@ -156,47 +209,56 @@ The framework reads these itself, independent of any skill:
 | `PA_LOGS_DIR_HINT` | No | Logs path hint in bot's capabilities prompt |
 | `PA_BRIEFS_DIR` | No | When set, adds briefs-path hint to bot's capabilities prompt |
 | `BOT_CWD` | No | Bot's default working dir (default process.cwd()) |
-| `GOOGLE_AUTH_REDIRECT_URI` | No | Public HTTPS URL hosting `projects/google-oauth-redirect/` |
-| `GOOGLE_TELEGRAM_CREDENTIALS_FILE` | No | Override path to the Web OAuth client JSON for the Telegram/mobile flow |
-| `GOOGLE_TELEGRAM_TOKEN_FILE` | No | Override token output path for the Telegram/mobile flow |
-| `GOOGLE_TELEGRAM_STATE_FILE` | No | Override pending-auth state file path for the Telegram/mobile flow |
+| `GOOGLE_TELEGRAM_CREDENTIALS_FILE` | No | Override path to the Web OAuth client JSON |
+| `GOOGLE_TELEGRAM_TOKEN_FILE` | No | Override token output path |
+| `GOOGLE_TELEGRAM_STATE_FILE` | No | Override pending-auth state file path |
 | `CLAUDE_CMD` | No | Path to Claude CLI for LLM-based bot topic description generation |
 | `PA_REPOS_BASE` | No | Base for `/code <short-name>` resolution in the bot |
-| `PA_TZ_OFFSET_MINUTES` | No | IST offset override (default 330 = UTC+5:30) |
+| `PA_TZ_OFFSET_MINUTES` | No | Minutes east of UTC; unset = UTC (warns) |
 | `PA_GEMINI_RESET_TZ` | No | Google API daily-quota reset timezone for the agy worker's rate-limit classifier (default America/Los_Angeles) |
 | `CLAUDE_CODE_GIT_BASH_PATH` | Win only | Claude Code CLI needs this on Windows |
-| `PA_OPERATOR_USER_ID` | No (required for operator-gated buttons) | Telegram user id gating the operator-only inline-button callback classes (`pm`/`dr`/`sk`/`mc`/`rs`/`dq`); unset → those buttons answer with a "set it" alert instead of acting. The positive entry in `TELEGRAM_CHAT_ID` (a DM chat id) equals the user id. |
-| `PA_RICH_MESSAGES` | No | Set to `1` to route bot replies over 3,500 chars or with a markdown table through `sendRichMessage` (Bot API 10.1/10.2), falling back to chunked `sendMessage` on any API error. Unset = off. |
+| `PA_OPERATOR_USER_ID` | No (required for operator-gated buttons) | Telegram user id gating the operator-only inline-button callback classes (`pm`/`dr`/`sk`/`mc`/`rs`/`dq`); unset → those buttons answer with a "set it" alert. Equals the DM chat id in `TELEGRAM_CHAT_ID`. |
+| `PA_RICH_MESSAGES` | No | `1` routes bot replies over 3,500 chars or with a markdown table through `sendRichMessage` (Bot API 10.1/10.2), falling back to chunked `sendMessage` on any API error; unset = off. |
 
-**`PA_KB_SOURCES_PATH` is also read by `pa recall`** (2026-08-24): a *file* path; recall indexes its *directory*. Unset skips the KB source.
+**`PA_KB_SOURCES_PATH`** is also read by `pa recall`: a *file* path; recall indexes its *directory*. Unset skips it.
 
 All others are skill-specific — see the skill files.
 
 ## `PA_HOME` env var
 
-`PA_HOME` overrides the default `~/.pa` location. Useful for:
+`PA_HOME` overrides the default `~/.pa` location — isolated test runs (`PA_HOME=$tmpdir`), side-by-side installs, or containers. When set, all paths derive from `${PA_HOME}/` instead of `~/.pa/`; subdirectory names stay hardcoded.
 
-- **Testing**: set `PA_HOME=$tmpdir` for isolated test runs
-- **Multi-instance**: run two pa installs side-by-side (e.g., personal + work)
-- **Containers**: pin to `/var/lib/pa-state` or similar
-
-When set, all paths derive from `${PA_HOME}/` instead of `~/.pa/`. Subdirectory names (skills/, logs/, etc.) stay hardcoded.
-
-**Multi-instance and the OS scheduler (2026-07-23):** with the default `~/.pa`, scheduler entries stay `PA-Catchup`/`PA-Catchup-Reminders`; any OTHER resolved `PA_HOME` gets its own hash-suffixed task name, so two installs never silently overwrite each other. See `docs/QUICKSTART.md` §11 and `pa schedules list` for the name in effect.
+**Multi-instance and the OS scheduler (2026-07-23):** default `~/.pa` keeps `PA-Catchup`/`PA-Catchup-Reminders`; any other resolved `PA_HOME` gets a hash-suffixed task name so two installs never overwrite each other (`pa schedules list` shows the name; `docs/QUICKSTART.md` §11).
 
 ## Resource tuning env vars
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `PA_MAX_CONCURRENT_WORKERS` | `3` | Machine-wide cap on concurrent LLM workers (bot + skills share the pool via slot locks); excess dispatches queue until a slot frees. `0`/negative disables limiting. Evaluator calls exempt; shell/`cmd:` skills unaffected. |
-| `UV_THREADPOOL_SIZE` | Node default `4` | Recommended `16` for bot + catchup: fs and DNS share the libuv pool; heavy disk I/O can starve DNS. Set it in the process launcher (Task Scheduler wrapper, systemd unit, shell profile) — it must exist before Node starts. |
+| `PA_MAX_CONCURRENT_WORKERS` | derived: `clamp(4, cores × 4, 64)` when dynamic; `3` with `PA_DYNAMIC_SLOTS=0` | Machine-wide ceiling on concurrent LLM workers (bot + skills share the pool); excess dispatches queue until a slot frees. Explicit values are honored verbatim; `0`/negative disables limiting. Evaluator calls exempt; shell/`cmd:` skills unaffected. |
+| `PA_MAX_RUNNING_THREADS_PER_TOPIC` | `10` | Per-topic ceiling on simultaneously `running` orchestrator threads; excess `createThread` requests park as `queued` until the executor claims a slot. Machine-profile tunable (raise on big machines — `pa doctor`); a missing/non-numeric/`< 1` value falls back to the default. |
+| `PA_MAX_THREADS_PER_TOPIC` | `20` | Per-topic cap on total stored thread records; `createThread` prunes oldest terminal records past it (running/queued and dependency-referenced ones are never pruned). Machine-profile tunable — same fallback as `PA_MAX_RUNNING_THREADS_PER_TOPIC`. |
+| `PA_DYNAMIC_SLOTS` | on (`0` disables) | Dynamic worker-slot governor: the pool runs AT the ceiling and sheds a quarter of its slots on each sampled minute in which the machine is struggling (see the three brake knobs), never below `PA_SLOTS_MIN`; recovery climbs a quarter per clean sample back to the ceiling. Memory is never a sizing gate (pagefile capacity counts). `0` restores the exact legacy static cap. |
+| `PA_SLOTS_MIN` | `3` | Floor of the dynamic cap; never exceeds the ceiling; keeps the legacy count under memory pressure. |
+| `PA_SLOTS_PHYSICAL_BRAKE_MB` | `400` | Pressure input: free physical below this counts as the machine struggling. `0` disables this input. |
+| `PA_SLOTS_CPU_BRAKE_PCT` | `90` | Pressure input: total CPU busy at or above this counts as struggling. `0` disables this input. |
+| `PA_SLOTS_DISK_QUEUE_BRAKE` | `8` | Pressure input: physical-disk queue at or above this counts as struggling. `0` disables this input. |
+| `UV_THREADPOOL_SIZE` | Node default `4` | Recommended `16` for bot + catchup: fs and DNS share the libuv pool, and heavy disk I/O can starve DNS. Set it in the process launcher (Task Scheduler wrapper, systemd unit, shell profile) — it must exist before Node starts. |
+| `PA_CATCHUP_LOOP_INTERVAL_MS` | `60000` (1 min) | Lane cadence of `pa catchup --loop`. One long-lived process drives three lanes (`default`, `reminders`, `maintenance`) off this timer; each lane skips its tick while in flight, so a slow lane never delays another. The `maintenance` lane runs the declared-maintenance pass under its own lock. |
+| `PA_CATCHUP_LOOP_MAX_MS` | `21600000` (6 h) | Lifetime cap on the catchup loop (`startLockRenewal`). At the cap the loop releases its lock and exits cleanly; the per-minute watchdog restarts it — also how a rebuilt `pa/dist` gets picked up. |
+| `PA_CATCHUP_LOOP_HEARTBEAT_STALE_MS` | `300000` (5 min) | Read at `pa schedules sync` time and baked into the generated watchdog artifact (the VBS on Windows, the cron line on POSIX) — not read at watchdog-run time, since a Task Scheduler/cron launch has no useful environment; re-run sync after changing it. Applies to the loop's heartbeat (its PID file) and to every lane progress file under ~/.pa/catchup-lanes/; a live PID with either older than this is stuck, and the watchdog kills that PID once its command line proves it is the loop, relaunches and pages catchup-loop-stalled (docs/catchup-watchdog.md). |
+| `PA_STORE_WAIT_MAX_MS` | `180000` (3 min) | How long a caller queued behind an in-process store serializer (log appends, maintenance ledger, archive rotation, reservations, topic tasks, watch jobs, agent bus, rate-limit state) waits on its predecessor before detaching. Each detach appends a record to `~/.pa/stall-records.jsonl`, and the catchup loop answers the first one by exiting (code `4`) for relaunch. Keep it below `PA_CATCHUP_LOOP_HEARTBEAT_STALE_MS`. |
+| `PA_CATCHUP_KILL_EXIT_WAIT_S` | `120` (2 min) | Read by the catchup watchdog launcher from its own environment on every run (never at sync, never from secrets.env; set it in the scheduler's launcher environment: Task Scheduler user env, or the crontab). After killing a stuck loop the launcher polls every 2 s for up to this many seconds for the process to exit; still running, it relaunches anyway and adds the did-not-exit cause to the `catchup-loop-stalled` page (docs/catchup-watchdog.md). Whole seconds 1–9999; else default. |
 | `PA_SELF_IMPROVER_CODE_FIX_BUDGET_MS` | `2400000` (40 min) | Per-run wall-clock budget for the self-improver's code-fix loop; once elapsed, a new fix is skipped (`code-fix-skipped-budget-exhausted`) rather than killed mid-verification. |
 | `PA_SELF_IMPROVER_MAX_CODE_FIXES` | unset (unlimited) | Optional hard cap on code-fix attempts (applied or not) in one self-improver run (`code-fix-skipped-limit-reached` past the cap). |
-| `PA_ALERT_CENSUS_NOTIFY_PER_DAY` | `50` | `alert-census` job threshold (daily, pa host). Always writes `~/.pa/alert-census.json`; pages pa-alerts with a one-line "Alert census (7d)" summary only when `totalSent / windowDays` reaches this value. |
+| `PA_CATCHUP_BUDGET_MS` | `900000` (15 min) | Wall-clock budget for one `pa catchup` run; past it, catchup stops dispatching, releases its lock, and exits (code `3`) rather than wait on a wedged skill (it keeps running under its own timeout; 2026-09-10 fix). |
+| `PA_AGY_NO_PROGRESS_TIMEOUT_MS` | `300000` (5 min) | Wall-clock companion to the agy/agyc error-loop guard (`AGY_ERROR_LOOP_THRESHOLD`, `worker-exec.ts`): kills an agy/agyc run producing no usable output (a non-empty `text_delta` or a real `result.response`/`.error`) for this long even while the stream keeps emitting bytes — the silent-spin case the error-loop counter can't see. Resets on any usable output, so a self-healing blip never fires it (2026-09-10 incident fix). |
+| `PA_WORKER_FAULT_COOLDOWN_MS` | `600000` (10 min) | Cooldown written when agy's error-loop or no-progress guard kills a run, so the next dispatch skips that worker instead of re-spawning it to fail. Rounded up to whole minutes, minimum 1. |
+| `PA_RECOVERY_WAIT_MS` | `3000000` (50 min) | How long a follow-up waits for a topic whose pre-restart worker may still be alive before re-dispatching. `0` re-injects immediately, which is correct whenever restarts are graceful. |
+| `PA_ALERT_CENSUS_NOTIFY_PER_DAY` | `50` | `alert-census` job threshold (daily, pa host). Always writes `~/.pa/alert-census.json`; pages pa-alerts with a one-line summary only when `totalSent / windowDays` reaches this value. |
 | `PA_ALLOW_STALE_DIST` | unset (guard ON) | `1` = warn-and-continue when the dist-identity guard (AI-180) refuses a test run on a stale/mixed dist (bisect escape; builds stay mandatory in waves). |
 | `PA_BUILD_LOCK` | unset (lock ON) | `0` skips the automatic `@build` reservation of `npm run build`/`npm test` — for scoped runs in an orchestrated wave, where several builders would otherwise serialize. Never for a full-suite or pre-push gate. |
 | `PA_BUILD_LOCK_HELD` | unset | Set by `build-lock.ts` while holding `@build` (the reservation id); never by hand. |
-| `PA_WORKER_EDIT_AUDIT` | unset (on) | `0` disables the worker-edit audit (AI-175) — no windows, no sweep alerts. |
+| `PA_WORKER_EDIT_AUDIT` | unset (on) | `0` disables the worker-edit audit (AI-175): no windows, no sweep alerts. |
 | `PA_WORKER_EDIT_AUDIT_IGNORE` | unset (empty) | Repo-relative path prefixes the audit never reports. |
 | `PA_WORKER_EDIT_AUDIT_MAX_ALERTS_PER_DAY` | `10` | Daily delivered cap for `Unreserved worker edits`; past it, log-only. |
 | `PA_WORKER_EDIT_WINDOW_MAX_MS` | `7200000` (2 h) | Window age past which the sweep closes it even if the bot PID looks alive. |
@@ -210,13 +272,18 @@ Only for lock-TTL debugging or tests needing short TTLs — see `docs/multi-sess
 | `PA_HEARTBEAT_STALE_MS` | `600000` (10 min) | Heartbeat silence before a lock is stale/purged; read fresh per-call. |
 | `PA_LOCK_RENEW_INTERVAL_MS` | `60000` (1 min) | How often `startLockRenewal()` refreshes a held lock's heartbeat. |
 | `PA_LOCK_RENEW_MAX_MS` | `21600000` (6 h) | Absolute cap on `startLockRenewal()`; past it the lock goes stale normally. |
-| `PA_HEARTBEAT_WRITE_RETRY_MS` | `1000,5000,15000` (1 s/5 s/15 s) | Renewal write-failure retry ladder (`renewHeartbeat()`, AI-179): one immediate attempt plus one retry per comma-separated ms delay (invalid/absent → default); on exhaustion the tick verifies the row (`peekLockRow`) before `onLost` fires. |
+| `PA_HEARTBEAT_WRITE_RETRY_MS` | `1000,5000,15000` (1 s/5 s/15 s) | Renewal write-failure retry ladder (`renewHeartbeat()`, AI-179): one immediate attempt plus one retry per comma-separated ms delay (invalid/absent → default); on exhaustion the tick verifies the row (`peekLockRow`) before `onLost`. |
 | `PA_PUBLIC_SYNC_LOCK_WAIT_MS` | `300000` (5 min) | `public-sync` wait for the git-public lock before exit 5 (busy); test-only in practice — leave unset in production. |
-| `PA_TEST_TMP_DIR` | unset | Where run-tests.mjs points `TMP`/`TEMP` so test temp files (sqlite fsyncs) land off the repo drive. When set, that dir is used (must exist); otherwise the runners use the deployment's fast-drive scratch dir if present, else the OS default. Unset on CI. |
-| `PA_CDISK_FLOOR_BYTES` | `5368709120` (5 GiB) | `c-disk-floor-watchdog` (pa host) alert floor: pages when C: free bytes cross below it. The default is a deployment convention (the push gate's free-space precondition), not a property of the job. |
+| `PA_TEST_TMP_DIR` | unset | Where run-tests.mjs points `TMP`/`TEMP` so test temp files (sqlite fsyncs) land off the repo drive; set = that dir (must exist), unset = the fast-drive scratch dir if present, else the OS default. Unset on CI. |
+| `PA_CDISK_FLOOR_BYTES` | `5368709120` (5 GiB) | `c-disk-floor-watchdog` (pa host) alert floor: pages when C: free bytes cross below it. Default is a deployment convention (the push gate's free-space precondition), not a property of the job. |
 | `PA_CDISK_SCAN_ROOT` | `C:/wt` (win32) | `c-disk-floor-watchdog` scratch root whose top consumers the crossing alert names. |
 | `PA_CDISK_SCAN_BUDGET_MS` | `2000` (2 s) | `c-disk-floor-watchdog` best-effort budget for that consumer scan; exhausted, the alert defers to a manual sweep instead of stalling the tick. |
-| `PA_BOT_SELF_RESTART` | unset (enabled) | `0` disables `bot-self-restart` — the graceful restart when the bot's dist stamp is newer than its process start and it is idle (no dispatch, pending action, topic lock, or `@build`). Never in-process — Task Scheduler relaunches on the newer `dist/`. See `docs/maintenance-jobs.md`. |
+| `PA_POOL_NONPAGED_ALERT_BYTES` | `3221225472` (3 GiB) | `nonpaged-pool-watch` (pa host) absolute floor: pages when nonpaged kernel pool crosses above it. A deployment convention, not a property of Windows. |
+| `PA_POOL_NONPAGED_EARLY_BYTES` | `1610612736` (1.5 GiB) | `nonpaged-pool-watch` early warning: pages the separate `nonpaged-pool-early` family when the pool crosses above it while still below the floor. Transition-gated in the same state file (`wasEarlyAlerting`); half the default floor, read per pass. |
+| `PA_POOL_NONPAGED_GROWTH_BYTES_PER_HOUR` | `104857600` (100 MiB/h) | `nonpaged-pool-watch` growth trigger, measured against the stored baseline sample. Either condition fires the one `nonpaged-pool` alert family. |
+| `PA_POOL_NONPAGED_MIN_WINDOW_MS` | `600000` (10 min) | Minimum baseline age before `nonpaged-pool-watch` evaluates growth at all; below it the baseline is carried forward so the window accumulates instead of measuring noise. |
+| `PA_POOL_TAGS_TOP_N` | `3` | How many pool tags `nonpaged-pool-watch` names in its alert — a total with no attribution costs the next reader the whole investigation, so never 0. |
+| `PA_BOT_SELF_RESTART` | unset (enabled) | `0` disables `bot-self-restart` — the graceful restart when the bot's dist stamp is newer than its process start and it is idle (no dispatch, pending action, topic lock, or `@build`). Never in-process: Task Scheduler relaunches on the newer `dist/` (docs/maintenance-jobs.md). |
 
 ## Voice transcription env vars
 
@@ -234,91 +301,83 @@ Tuning knobs (`~/.pa/secrets.env`), all optional — defaults ship without any o
 |---|---|---|
 | `PA_VOICE_TRANSCRIBE_TIMEOUT_MS` | `600000` (10 min) | Max wait for a single transcription (cloud call or local spawn) before giving up. |
 | `PA_VOICE_MAX_DURATION_S` | `1800` (30 min) | Longest voice note attempted — longer notes are rejected before download. |
-| `PA_VOICE_MAX_FILE_BYTES` | `20971520` (20 MiB) | Largest audio file the bot will download for transcription — matches Telegram's own bot-download ceiling. |
+| `PA_VOICE_MAX_FILE_BYTES` | `20971520` (20 MiB) | Largest audio file the bot downloads for transcription — matches Telegram's own bot-download ceiling. |
 | `PA_VOICE_TRANSCRIBE_SCRIPT` | `pa/scripts/transcribe_voice.py` | Override the one-shot transcription script path (spawn mode). |
 | `PA_VOICE_WORKER_SCRIPT` | `pa/scripts/voice_worker.py` | Override the persistent-worker script path (`worker_mode: persistent`). |
-| `PA_VOICE_WORKER_IDLE_MS` | `600000` (10 min) | How long the persistent worker stays resident with no requests before shutting down. |
+| `PA_VOICE_WORKER_IDLE_MS` | `600000` (10 min) | How long the persistent worker stays resident with no requests before exiting. |
 | `PA_VOICE_WORKER_START_TIMEOUT_MS` | `60000` (1 min) | Max wait for a freshly-spawned persistent worker to become ready before falling back to spawn mode. |
 | `PA_VOICE_WORKER_PING_TIMEOUT_MS` | `5000` (5 sec) | Max wait for a liveness ping against an already-running persistent worker before treating it as busy. |
 
 ## Voice inbox app (projects/voice-inbox)
 
-The voice inbox PWA + API reads one `voice_inbox:` block; omit it and only
-the app is unconfigured. Startup is refused until `inbox_topic`
-names the topic that receives new tasks.
-
-| Key | Default | Meaning |
-|---|---|---|
-| `inbox_topic` | — (required) | `<chatId>_<threadId>` topic key that receives new tasks |
-| `port` | `8787` | API port; binds `127.0.0.1` only — a tunnel dials it locally (1..65535) |
-| `max_upload_mb` | `25` | Upload cap for voice notes and `file` widgets (1..1024) |
-| `session_ttl_hours` | `168` | Bearer session lifetime after pairing (1..8760) |
-| `pairing_ttl_minutes` | `10` | One-time code lifetime (1..1440) |
-
-Env overrides win over the file: `VOICE_INBOX_PORT`, `VOICE_INBOX_INBOX_TOPIC`.
-Transcription is not a config knob: the topic worker transcribes voice notes
-with keys from pa's per-worker env injection — the API server holds none.
-
-Pairing: an 8-char code (unambiguous charset — no 0/O/1/I/L) is minted by the
-bot's `/pair` command in an allowed chat, or `node scripts/mint_pairing.mjs` for
-dev/emergency. Single-use, expiring after `pairing_ttl_minutes`, and
-sha256-hashed once exchanged for the session token.
-
-Remote access runs through the edge relay. `node scripts/relay_setup.mjs` writes
-`~/.pa/voice-inbox/relay.json`:
-
-| Key | Default | Meaning |
-|---|---|---|
-| `worker_base_url` | — (set by setup) | Stable workers.dev URL of the deployed relay worker |
-| `home_base_url` | `http://127.0.0.1:<voice_inbox.port>` | Localhost app the poller executes claimed requests against |
-| `poll_wait_ms` | `25000` | Long-poll wait per `/work` claim (the worker clamps it to 25 s) |
-| `request_deadline_ms` | `55000` | Parked-request lifetime; the browser sees a 504 past it |
-| `localhost_timeout_ms` | `50000` | Home-leg timeout, 5 s under the request deadline |
-
-The poller reads `VOICE_INBOX_RELAY_SECRET` from `~/.pa/secrets.env` — setup
-generates and reuses it. Setup registers the `PA-VoiceInbox-RelayPoller`
-scheduled task (every minute, ensure-running). On multi-account machines the deploy
-credentials `CF_RELAY_API_TOKEN` + `CF_RELAY_ACCOUNT_ID` live in the same
-`secrets.env`. Detail: `projects/voice-inbox/relay/README.md`.
+Moved to `docs/voice-inbox-config.md` (split 2026-09-14): the `voice_inbox:`
+block table, the `voice-inbox-fallback` env knobs, pairing and edge-relay
+config live there beside the app.
 
 ## `pa init` defaults
 
 Running `node pa/dist/bin/pa.js init` scaffolds:
 
-- A minimal `config.yaml` with the default workers (claude, codex, agy, zclaude) at PATH-resolved commands
-- An empty `secrets.env` (you fill it in)
-- The codex-skill-translations.json + brain-files.json (defaults)
-- The `skills/`, `logs/`, `skill-drafts/` directories
-- A "Next steps" message pointing at this doc and others
+- A minimal `config.yaml` with the default workers (claude, codex, agy, zclaude) at PATH-resolved commands; an empty `secrets.env`; the codex-skill-translations.json + brain-files.json defaults; the `skills/`, `logs/`, `skill-drafts/` directories; a "Next steps" message pointing at this doc and others
 
 Re-running `pa init` is idempotent: it skips files that exist. Use it to add new JSON files after upgrading.
+
+## Capability provision (`pa init --provision`)
+
+Probes assistant CLIs (claude / codex / opencode / devin) and API keys by presence, asks before connecting; a key collision routes to the ask flow, never an overwrite (`pa coexistence`). Free-text "describe your setup" outranks the offered defaults. Keys with no CLI → a base-URL+key harness (opencode first-class); nothing found → free tiers (opencode first-class, Devin best-effort). "Keep a copy of your assistant's own changes?" flips `git_workflow.enabled: true` — preserved changes go to YOUR fork as a pull request, never a direct push. Zero workers → install completes with "your assistant runs but can't think yet" (`pa health` WARN, not FAIL); notifications land under `~/.pa/outbox/` (`PA_OUTBOX_DIR`). The generated block at `~/.pa/config.yaml.provisioned` carries PATH commands and env-var NAMES only.
+
+## `pa doctor` (machine profile, 2026-09-13)
+
+`pa doctor [--json] [--text]` detects this machine and prints a profile — JSON default, `--text` a human table. Strictly read-only (nothing written, no knob); every probe fails soft (`unknown`/`false`, never throws); a run stays well under 30 s.
+
+- **OS & resources**: platform/release/arch, powershell/pwsh/bash availability, CPU count, total memory bytes
+- **Disks**: mount + size on every platform; rotational flag from `Get-PhysicalDisk` on Windows (one retry — cold enumeration can exceed 10 s), `'unknown'` elsewhere. `ssdLikely` is conservative: one confirmed spindle reads `hdd` for every mount.
+- **Environment**: scheduler backend, resolved `PA_HOME`, repo root, Node version, 5 s HEAD probe of api.telegram.org
+- **Fleet CLIs**: `claude`, `zclaude`, `agy`, `codex` — parallel 5 s `--version` probe each (available = exit 0 + non-empty version)
+
+`derivedProfile` collapses the raw numbers for downstream tooling (thread caps, serialize-suites hints): `resourceClass` — `low` (≤2 cpus or ≤4 GB), `high` (≥8 cpus and ≥16 GB), else `mid`; `diskClass` — `hdd`/`ssd`/`unknown`; `suggestedSerializeSuites` — true exactly when `hdd`. Thresholds are named constants in `pa/src/commands/doctor.ts`, knob-free.
+
+## Coexistence registry (`pa coexistence`, 2026-09-17)
+
+PA never overwrites an existing key in a user's CLI config. Every in-place edit of a config surface (claude/codex/opencode/devin — `docs/cli-onboarding.md` § D2) is preceded by a full pre-edit snapshot under `~/.pa/coexistence-snapshots/`, recorded as one row in `~/.pa/coexistence-registry.json` (`id`, `cli`, `surface`, `mode: registry-restore`, `snapshot`, `addedKeys`, `timestamp`). Engine: `pa/src/lib/coexistence.ts` — `applyAdditive` throws `KeyCollisionError` on any existing-key collision, writing nothing (the ask flow takes over); `restore(id)` copies the snapshot back, verifies byte-identically, then spends the row. UI: `pa coexistence list|restore` and the `coexistence` block in `pa doctor`.
 
 ## OAuth Environment Variables
 
 Variables in ~/.pa/secrets.env for the Google OAuth flow (Telegram bot + some skills):
-
 | Variable | Purpose | Default (if PA_HOME is set) |
 |---|---|---|
-| PA_OAUTH_START_SCRIPT | Path to the OAuth start script. Read by the bot's `/reauth` command when it spawns a reauth link (2026-08-23) — `preflight.py` and `google_reauth_kick.py` locate it by relative path, so this override only affects `/reauth`. | pa/scripts/start_google_telegram_reauth.py |
+| PA_OAUTH_START_SCRIPT | Path to the OAuth start script; read by the bot's `/reauth` (2026-08-23) only — callers locate it by relative path, so the override affects nothing else. | pa/scripts/start_google_telegram_reauth.py |
 | PA_OAUTH_FINISH_SCRIPT | Path to the OAuth finish script | pa/scripts/finish_google_telegram_reauth.py |
 | PA_OAUTH_SECRETS_FILE | Path to the Google client secrets JSON | ~/.pa/google-credentials-telegram.json |
 | PA_OAUTH_STATE_FILE | Path to store pending auth session state | ~/.pa/google-telegram-auth.json |
 | PA_OAUTH_TOKEN_FILE | Path to save the resulting Google token | ~/.pa/google-token.json |
 | GOOGLE_AUTH_REDIRECT_URI | The registered redirect URI (bridge page URL) | None (Required) |
 | PA_TELEGRAM_OAUTH_RESUME_HOOK | Path to an optional Python hook called after /auth success | ~/.pa/oauth_resume_hook.py |
-| PA_REAUTH_CHAT_ID | (2026-08-23) Chat reauth links deliver to — `google_reauth_kick.py`'s resolver reads it (env, then `~/.pa/secrets.env`) before falling back to `TELEGRAM_CHAT_ID`'s first entry. The operator's general topic, never pa-alerts. | `TELEGRAM_CHAT_ID` (first entry) |
+| PA_REAUTH_CHAT_ID | (2026-08-23) Chat reauth links deliver to; read env → `secrets.env` → `TELEGRAM_CHAT_ID` first entry. The operator's general topic, never pa-alerts. | `TELEGRAM_CHAT_ID` (first entry) |
 | PA_REAUTH_THREAD_ID | (2026-08-23) Forum thread for reauth delivery, same resolver. | `0` |
+
+## Auth broker (`pa auth`)
+
+Generalized phone-approval CLI for any provider: five request shapes, a callback
+endpoint, its own store, a Telegram fallback. Reference: `docs/auth-broker.md`.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PA_AUTH_TENANT` | unset — the single tenant | Tenant id `pa auth request` resolves to when more than one tenant exists |
+| `PA_VOICE_INBOX_FALLBACK_RUNNING_STALE_MS` | `1200000` | Staleness threshold (ms) for the AI-221 dead-dispatch fallback re-dispatch check |
+
+No env var controls the callback base URL: point `GOOGLE_AUTH_REDIRECT_URI`
+at `<relay base url>/api/v1/auth/callback`; the server derives the rest from it.
 
 ## `run_brief.py` LLM env vars (2026-08-23)
 
 `projects/daily-mail-brief/scripts/run_brief.py` shells the Antigravity CLI (`agy`) for its
-one-shot completion. The prompt is always written to a temp file and passed as `@<path>`,
-never inlined — email-header-bearing prompts can exceed the ~32 KB Windows
-command-line cap.
+one-shot completion; prompts go via a `@<path>` temp file, never inlined —
+email-header-bearing prompts can exceed the ~32 KB Windows command-line cap.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `AGY_CMD` | `<path-to-agy>` | Path to the agy shim/binary. Same variable the pre-push PII guard reads (`examples/secrets.env.example`) — one setting covers both. |
+| `AGY_CMD` | `<path-to-agy>` | Path to the agy shim/binary; same variable the pre-push PII guard reads — one setting covers both. |
 | `DAILY_MAIL_BRIEF_MODEL` | `gemini-3.8-flash-high` | `--model` value passed to agy. |
 | `DAILY_MAIL_BRIEF_PRINT_TIMEOUT` | `10m` | `--print-timeout` value passed to agy. |
 

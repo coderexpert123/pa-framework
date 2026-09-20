@@ -283,8 +283,14 @@ const DEFAULT_EXEMPT_JSON = `{}`;
 
 
 import { join } from 'path';
+import { runProvisionLadder } from '../lib/provision.js';
 
-export async function initCommand(opts?: { notify?: typeof notifyUser }): Promise<void> {
+export async function initCommand(opts?: { notify?: typeof notifyUser; provision?: boolean }): Promise<void> {
+  // `pa init --provision` runs the capability ladder (WP-C3) after scaffolding.
+  // The flag is read here — not in the CLI dispatch — so the scaffold-only
+  // default path stays byte-for-byte what it was.
+  const wantProvision =
+    opts?.provision === true || process.argv.slice(2).includes('--provision');
   const home = paHome();
   console.log(`Initializing PA at ${home}...`);
 
@@ -356,6 +362,25 @@ export async function initCommand(opts?: { notify?: typeof notifyUser }): Promis
     console.log(`[+] Created topic-brains/EXEMPT.json (empty exemption registry)`);
   }
 
+  if (wantProvision) {
+    const { discover } = await import('../lib/provision.js');
+    await runProvisionLadder({
+      discovery: await discover(),
+      io: {
+        print: (line) => console.log(line),
+        ask: async (question) => {
+          const rl = await import('readline/promises');
+          const iface = rl.createInterface({ input: process.stdin, output: process.stdout });
+          try {
+            return await iface.question(`${question} `);
+          } finally {
+            iface.close();
+          }
+        },
+      },
+    });
+  }
+
   console.log('\n========================================');
   console.log('Initialization complete.');
   console.log('========================================');
@@ -376,8 +401,8 @@ export async function initCommand(opts?: { notify?: typeof notifyUser }): Promis
   console.log("     if your LLM CLIs aren't in PATH. See docs/WORKERS_GUIDE.md.");
   console.log('');
   console.log('  3. Copy a sample skill:');
-  console.log('       PowerShell: Copy-Item -Recurse examples/skills/reminders ~/.pa/skills/');
   console.log('       Bash:       cp -r examples/skills/reminders ~/.pa/skills/');
+  console.log('       PowerShell: Copy-Item -Recurse examples/skills/reminders ~/.pa/skills/');
   console.log('     See docs/SKILLS_GUIDE.md.');
   console.log('');
   console.log('  4. Verify: `pa health` should report every check as PASS or WARN.');

@@ -1,6 +1,6 @@
 import { readdir, stat, unlink } from 'fs/promises';
 import { join } from 'path';
-import { gcExpired, reservationsPath, MAX_TTL_MINUTES } from '../../reservations.js';
+import { gcExpired, sweepDeadOwners, reservationsPath, MAX_TTL_MINUTES } from '../../reservations.js';
 import type { MaintenanceJob } from '../types.js';
 import { paHome } from '../../../paths.js';
 
@@ -69,7 +69,13 @@ export const reservationGcJob: MaintenanceJob = {
   ],
   async run(ctx) {
     const expiredReservations = await gcExpired(ctx.now);
+    // AI-255 B4: rows whose recorded owner session pid is already dead don't
+    // get to wait out their TTL — a crashed session's claims are shed here.
+    const deadOwnerReservations = await sweepDeadOwners(ctx.now);
     const cleanedTmpFiles = await cleanStaleTmpFiles(ctx.now);
-    return { touched: expiredReservations + cleanedTmpFiles, detail: { expiredReservations, cleanedTmpFiles } };
+    return {
+      touched: expiredReservations + deadOwnerReservations + cleanedTmpFiles,
+      detail: { expiredReservations, deadOwnerReservations, cleanedTmpFiles },
+    };
   },
 };

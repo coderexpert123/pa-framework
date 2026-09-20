@@ -432,6 +432,104 @@ class TestQuotaFailoverInCallLlm(unittest.TestCase):
         self.assertEqual(run_brief.call_llm("p"), "real reply")
 
 
+class TestFallbackFailureNamesTheRealCause(unittest.TestCase):
+    """When the fallback CLI dies, the raised error (which fail_llm cuts to 300
+    chars for the alert, the stderr line and the failure marker) must carry the
+    CLI's real error, not its startup noise.
+
+    Recorded 2026-09-14..15 (6 failed runs) and live-reproduced 2026-09-19:
+    zclaude exits 1 after Claude Code retries z.ai's `429 [1310] Weekly/Monthly
+    Limit Exhausted` 10 times. In `-p --output-format text` mode the CLI prints
+    that error as the LAST line of STDOUT (after the wrapper's banner); stderr
+    holds only two startup lines that print on every launch — the wrapper
+    exports ANTHROPIC_AUTH_TOKEN itself, so the "connectors are disabled"
+    warning appears even with no ANTHROPIC_* in the parent env. The code
+    reported only stderr[:300], so every alert read "claude.ai connectors are
+    disabled ... unrecognized_model" and the quota wall behind it (with its
+    reset time) went unreported, sending diagnosis down an env/model dead end."""
+
+    QUOTA_STDERR = "Error: Individual quota reached. Resets in 43h55m54s."
+
+    API_ERROR_LINE = (
+        "API Error: Request rejected (429) · [1310][Weekly/Monthly Limit "
+        "Exhausted. Your limit will reset at 2026-09-19 20:24:43]"
+        "[202609190856430bd1776f9a504401]"
+    )
+    # Shape of zclaude.bat's stdout banner in a headless run (abridged).
+    WRAPPER_BANNER = (
+        "\n[ZHIPU GLM Coding Plan - 4-tier Waterfall + Peak/Off-peak]\n\n"
+        "Model Waterfall (Coding-Plan models only):\n"
+        "  fable  planner          - glm-5.3[1m] off-peak, glm-5.3-flash[1m] peak\n"
+        "  opus   main + deep-plan - glm-5.3-flash[1m]\n"
+        "Peak hours: Mon-Fri 14:00-18:00 Singapore (UTC+8) = 06:00-10:00 UTC\n\n"
+        "Tavily web search: ENABLED via tavily-local MCP (SessionStart hook)\n\n"
+    )
+    NOISE_STDERR = (
+        "⚠ claude.ai connectors are disabled because ANTHROPIC_API_KEY or another "
+        "auth source is set and takes precedence over your claude.ai login · "
+        "Unset it to load your organization's connectors\n"
+        '[claude-code:unrecognized_model] {"model":"glm-5.3-flash[1m]",'
+        '"query_source":"generate_session_title"}\n'
+        '[claude-code:unrecognized_model] {"model":"glm-5.3-flash[1m]",'
+        '"query_source":"sdk"}\n'
+    )
+
+    def _fail_over(self, mock_run, fallback_stdout, fallback_stderr):
+        mock_run.side_effect = [
+            MagicMock(returncode=1, stdout="", stderr=self.QUOTA_STDERR),
+            MagicMock(returncode=1, stdout=fallback_stdout, stderr=fallback_stderr),
+        ]
+        with self.assertRaises(RuntimeError) as ctx:
+            run_brief.call_llm("the prompt")
+        return str(ctx.exception)
+
+    @patch("run_brief.subprocess.run")
+    def test_recorded_429_is_reported_instead_of_startup_noise(self, mock_run):
+        message = self._fail_over(
+            mock_run, self.WRAPPER_BANNER + self.API_ERROR_LINE + "\n", self.NOISE_STDERR
+        )
+
+        # What fail_llm actually surfaces (alert body, stderr line, marker).
+        surfaced = message[:300]
+        self.assertTrue(message.startswith("fallback LLM exited 1: "), message)
+        self.assertIn("Weekly/Monthly Limit Exhausted", surfaced)
+        self.assertIn("2026-09-19 20:24:43", surfaced)
+        self.assertNotIn("connectors are disabled", surfaced)
+        self.assertNotIn("unrecognized_model", surfaced)
+        self.assertFalse(
+            run_brief.is_llm_auth_failure(message),
+            "a dry fallback pool must stay transient-classified, never llm-auth",
+        )
+
+    @patch("run_brief.subprocess.run")
+    def test_real_stderr_error_after_noise_is_kept(self, mock_run):
+        """Some failures print to stderr instead (crash, bad flag): the real
+        line must survive even when it follows more than 300 chars of noise."""
+        message = self._fail_over(
+            mock_run, "", self.NOISE_STDERR + "Error: unknown option '--frobnicate'\n"
+        )
+
+        self.assertIn("unknown option '--frobnicate'", message[:300])
+        self.assertNotIn("connectors are disabled", message)
+
+    @patch("run_brief.subprocess.run")
+    def test_wrapper_error_on_stdout_is_reported(self, mock_run):
+        """zclaude.bat's own failure (missing key) is an `echo` to stdout."""
+        message = self._fail_over(
+            mock_run, "ERROR: ZHIPU_API_KEY is not set. Cannot start zclaude.\n", ""
+        )
+
+        self.assertIn("ZHIPU_API_KEY is not set", message)
+
+    @patch("run_brief.subprocess.run")
+    def test_reason_is_never_blank_when_only_noise_is_available(self, mock_run):
+        """Nothing but startup noise on either stream: keep the raw stderr
+        rather than raising an empty reason."""
+        message = self._fail_over(mock_run, "", self.NOISE_STDERR)
+
+        self.assertIn("connectors are disabled", message)
+
+
 class TestLlmAuthFailureFailsFast(RunBriefTestCase):
     """A non-transient auth/license failure must skip the pointless second
     attempt, write a distinct 'llm-auth' marker, and alert with actionable

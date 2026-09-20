@@ -6,7 +6,7 @@ cwd: "${PA_HOME}/skills/human-gated-blocker-watch"
 secrets:
   - TELEGRAM_BOT_TOKEN
   - TELEGRAM_CHAT_ID
-cmd: "python human_gated_blocker_watch.py"
+cmd: "python3 human_gated_blocker_watch.py || python human_gated_blocker_watch.py"
 # Reads two small local JSON files and one YAML config — no CLI subprocess
 # probing, so a low timeout is generous (worker-capability-watch needs 1800s
 # only because it launches every worker CLI's --version/--help).
@@ -91,6 +91,6 @@ silently killed a whole run of scheduled alerts.
 ## Manual use
 
 ```
-python human_gated_blocker_watch.py
-python human_gated_blocker_watch.py --no-send --no-write
+python3 human_gated_blocker_watch.py || python human_gated_blocker_watch.py
+python3 human_gated_blocker_watch.py --no-send --no-write || python human_gated_blocker_watch.py --no-send --no-write
 ```

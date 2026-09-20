@@ -29,7 +29,7 @@ import { appendTopicEvent, readTopicEvents, resolveTopicKey } from '../lib/topic
  */
 
 const TASK_USAGE = `Usage:
-  pa topic-task add <chatId>_<threadId> --title "<text>" --prompt "<text>" [--created-by <s>] [--worker <pin>]  Queue a task for the topic's bot drain (content-hash dedup; pin = preferred worker)
+  pa topic-task add <chatId>_<threadId> --title "<text>" --prompt "<text>" [--created-by <s>] [--worker <pin>] [--model <id>]  Queue a task for the topic's bot drain (content-hash dedup; pin = preferred worker, model = per-task model pin)
   pa topic-task list <topicKey>    List a topic's queued + in-flight (running/parked) tasks`;
 
 const NOTE_USAGE = `Usage:
@@ -77,7 +77,7 @@ async function resolveTopicArg(arg: string | undefined): Promise<{ chatId: numbe
 // ---------------------------------------------------------------------------
 
 async function taskAddSubcommand(args: string[]): Promise<number> {
-  const parsed = parseFlags(args, new Set(['--title', '--prompt', '--created-by', '--worker']));
+  const parsed = parseFlags(args, new Set(['--title', '--prompt', '--created-by', '--worker', '--model']));
   if (parsed.unknown.length > 0 || parsed.positionals.length !== 1) {
     console.error(TASK_USAGE);
     if (parsed.unknown.length > 0) console.error(`Unrecognized option(s): ${parsed.unknown.join(', ')}`);
@@ -105,6 +105,7 @@ async function taskAddSubcommand(args: string[]): Promise<number> {
       prompt,
       createdBy: parsed.values['--created-by'] ?? 'cli',
       ...(parsed.values['--worker'] !== undefined ? { worker: parsed.values['--worker'] } : {}),
+      ...(parsed.values['--model'] !== undefined ? { model: parsed.values['--model'] } : {}),
     });
   } catch (err) {
     console.error(`Error: ${(err as Error).message}`);

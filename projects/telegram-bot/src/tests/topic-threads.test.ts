@@ -1,8 +1,10 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'fs';
+import { spawnSync } from 'child_process';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { join, dirname } from 'path';
+import { fileURLToPath, pathToFileURL } from 'url';
 import {
   createThread,
   listThreads,
@@ -12,19 +14,24 @@ import {
   bumpRunSeq,
   updateThread,
   cancelRunningThreads,
+  cancelOneThread,
   claimThreadStarts,
   listStoreKeys,
   activeThreadCount,
   countThreads,
+  settleOrphanedThread,
+  restartParkFields,
   _clearThreadsForTest,
   _setStoreDirForTest,
   MAX_RUNNING_THREADS_PER_TOPIC,
+  MAX_THREADS_PER_TOPIC,
   type ThreadRecord,
 } from '../topic-threads.js';
 import { waitForDrain } from './test-teardown-guard.js';
 
 let home: string;
 const KEY = '-1001234567890_5001'; // synthetic fixture id family, never real chat/thread ids
+const __dirname = dirname(fileURLToPath(import.meta.url)); // ESM: no native __dirname
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'pa-topic-threads-'));
@@ -154,6 +161,65 @@ describe('createThread', () => {
   });
 });
 
+// Ask-mirroring stamp (button parity, 2026-09-11): createThread persists a
+// sanitized voiceTaskIds array; invalid entries fail open (dropped + logged),
+// never a spawn rejection.
+describe('voiceTaskIds (ask-mirroring stamp)', () => {
+  it('persists valid ids onto the record and into the store file', async () => {
+    const r = await createThread(KEY, {
+      title: 'T', goal: 'g', workdir: 'C:/pa-checkout',
+      voiceTaskIds: ['vi-1234567890ab', 'vi-abcdefabcdef'],
+    });
+    assert.ok(r.ok);
+    if (!r.ok) return;
+    assert.deepEqual(r.thread.voiceTaskIds, ['vi-1234567890ab', 'vi-abcdefabcdef']);
+    const raw = JSON.parse(readFileSync(join(home, `${KEY}.json`), 'utf8')) as Record<string, ThreadRecord>;
+    assert.deepEqual(raw['t-1'].voiceTaskIds, ['vi-1234567890ab', 'vi-abcdefabcdef']);
+  });
+
+  it('omits the field entirely when no ids are passed (old stores and spawns stay clean)', async () => {
+    const r = await createThread(KEY, { title: 'T', goal: 'g', workdir: 'C:/pa-checkout' });
+    assert.ok(r.ok);
+    if (!r.ok) return;
+    assert.equal(r.thread.voiceTaskIds, undefined);
+  });
+
+  it('drops malformed ids and duplicates silently (fail-open), keeping only valid ones', async () => {
+    const r = await createThread(KEY, {
+      title: 'T', goal: 'g', workdir: 'C:/pa-checkout',
+      voiceTaskIds: [
+        'vi-1234567890ab',   // valid
+        'vi-ZZZZZZZZZZZZ',   // bad hex
+        'vi-123',            // wrong length
+        'task-1234567890ab', // wrong prefix
+        'vi-1234567890ab',   // duplicate of the valid one
+        42 as unknown as string, // wrong type
+      ],
+    });
+    assert.ok(r.ok, 'a malformed stamp never rejects the spawn');
+    if (!r.ok) return;
+    assert.deepEqual(r.thread.voiceTaskIds, ['vi-1234567890ab']);
+  });
+
+  it('caps the stamp at 5 ids', async () => {
+    const six: string[] = [];
+    for (let i = 0; i < 6; i++) six.push(`vi-${i.toString(16).padStart(12, '0')}`);
+    const r = await createThread(KEY, { title: 'T', goal: 'g', workdir: 'C:/pa-checkout', voiceTaskIds: six });
+    assert.ok(r.ok);
+    if (!r.ok) return;
+    assert.equal(r.thread.voiceTaskIds?.length, 5);
+  });
+
+  it('an all-invalid stamp persists no voiceTaskIds field at all', async () => {
+    const r = await createThread(KEY, { title: 'T', goal: 'g', workdir: 'C:/pa-checkout', voiceTaskIds: ['nope', 'vi-xyz'] });
+    assert.ok(r.ok);
+    if (!r.ok) return;
+    assert.equal(r.thread.voiceTaskIds, undefined);
+    const raw = JSON.parse(readFileSync(join(home, `${KEY}.json`), 'utf8')) as Record<string, ThreadRecord>;
+    assert.ok(!('voiceTaskIds' in raw['t-1']));
+  });
+});
+
 describe('claimThreadStarts (increment 4 FIFO claim)', () => {
   it('T-claim-1: a full cap claims nothing — queued records stay queued', async () => {
     for (let i = 0; i < MAX_RUNNING_THREADS_PER_TOPIC + 2; i++) {
@@ -274,16 +340,26 @@ describe('updateThread / bumpRunSeq', () => {
   });
 });
 
-describe('lazy stale demotion on read', () => {
-  it('demotes a running record stale past 30m to failed with an interrupted error', async () => {
+describe('lazy stale demotion requeues on restart (WP-G, 2026-09-13)', () => {
+  it('requeues a running record stale past 30m with a restart-parked error and a ~5-minute park stamp', async () => {
+    const before = Date.now();
     seedFile(KEY, [mkRec('t-1', 1, 'running', 31)]);
     const threads = await listThreads(KEY);
     assert.equal(threads.length, 1);
-    assert.equal(threads[0].status, 'failed');
-    assert.ok(threads[0].lastError?.includes('interrupted'));
-    // Demotion persists, so the running cap frees up for the next spawn.
+    assert.equal(threads[0].status, 'queued');
+    assert.ok(threads[0].lastError?.includes('restart-parked'));
+    assert.ok(threads[0].lastError?.includes('auto-requeued'));
+    // One gentle cycle: the park stamp lands ~5 minutes in the future (the
+    // window also rules out the wall-park ladder's 15/30/60-minute values).
+    const parked = Date.parse(threads[0].parkedUntil!);
+    assert.ok(parked >= before + 4 * 60_000 && parked <= Date.now() + 6 * 60_000,
+      `parkedUntil ${threads[0].parkedUntil} should be ~5m future`);
+    // updatedAt bumped — the requeued record is not itself stale on the next read.
+    assert.ok(Date.parse(threads[0].updatedAt) >= before);
+    // The requeue persists, so the running cap still frees up for the next spawn.
     const raw = JSON.parse(readFileSync(join(home, `${KEY}.json`), 'utf8')) as Record<string, ThreadRecord>;
-    assert.equal(raw['t-1'].status, 'failed');
+    assert.equal(raw['t-1'].status, 'queued');
+    assert.ok(raw['t-1'].parkedUntil);
     const fresh = await createThread(KEY, { title: 'After wedge', goal: 'g', workdir: 'C:/pa-checkout' });
     assert.ok(fresh.ok);
   });
@@ -294,17 +370,49 @@ describe('lazy stale demotion on read', () => {
     assert.equal(threads[0].status, 'running');
   });
 
-  it('T-demote: a stale queued record is NOT demoted — no executor, no pump; revival is the drain\'s job (increment 4)', async () => {
-    seedFile(KEY, [mkRec('t-1', 1, 'queued', 31), mkRec('t-2', 2, 'running', 31)]);
+  it('the demote pass itself does not re-claim — the fresh park stamp blocks the same claimThreadStarts pass', async () => {
+    seedFile(KEY, [mkRec('t-1', 1, 'running', 31)]);
+    const claimed = await claimThreadStarts(KEY);
+    assert.deepEqual(claimed, []); // demoted to queued, but parkedUntil is future this pass
+    const rec = await getThread(KEY, 't-1');
+    assert.equal(rec?.status, 'queued');
+    assert.ok(rec?.parkedUntil);
+  });
+
+  it('a later claim pass after the park stamp passes re-claims the requeued thread', async () => {
+    seedFile(KEY, [mkRec('t-1', 1, 'running', 31)]);
+    assert.deepEqual(await claimThreadStarts(KEY), []); // demoted + parked this pass
+    assert.equal((await getThread(KEY, 't-1'))?.status, 'queued');
+    // Backdate the stamp (the 5-minute grace elapsing) — the next pass claims.
+    await updateThread(KEY, 't-1', { parkedUntil: new Date(Date.now() - 60_000).toISOString() });
+    const claimed = await claimThreadStarts(KEY);
+    assert.deepEqual(claimed.map((r) => r.id), ['t-1']);
+    assert.equal((await getThread(KEY, 't-1'))?.status, 'running');
+  });
+
+  it('T-demote: stale queued and cancelled records are NOT touched by demotion — no executor, no pump; revival is the drain\'s job (increment 4)', async () => {
+    const stopErr = 'operator stopped it';
+    const stamp = new Date(Date.now() + 60 * 60_000).toISOString();
+    seedFile(KEY, [
+      mkRec('t-1', 1, 'queued', 31),
+      { ...mkRec('t-2', 2, 'cancelled', 31), lastError: stopErr, parkedUntil: stamp },
+      mkRec('t-3', 3, 'running', 31),
+    ]);
     const threads = await listThreads(KEY);
     const queued = threads.find((t) => t.id === 't-1');
-    const running = threads.find((t) => t.id === 't-2');
+    const cancelled = threads.find((t) => t.id === 't-2');
+    const requeued = threads.find((t) => t.id === 't-3');
     assert.equal(queued?.status, 'queued'); // healthy waiting work stays queued
     assert.ok(!queued?.lastError);
-    assert.equal(running?.status, 'failed'); // existing behavior pinned: running at the same age still demotes
+    assert.ok(!queued?.parkedUntil);
+    assert.equal(cancelled?.status, 'cancelled'); // terminal stays terminal
+    assert.equal(cancelled?.lastError, stopErr); // demotion wrote nothing to it
+    assert.equal(cancelled?.parkedUntil, stamp);
+    assert.equal(requeued?.status, 'queued'); // the running one still requeues
     const raw = JSON.parse(readFileSync(join(home, `${KEY}.json`), 'utf8')) as Record<string, ThreadRecord>;
     assert.equal(raw['t-1'].status, 'queued');
-    assert.equal(raw['t-2'].status, 'failed');
+    assert.equal(raw['t-2'].status, 'cancelled');
+    assert.equal(raw['t-3'].status, 'queued');
   });
 });
 
@@ -339,6 +447,49 @@ describe('cancelRunningThreads', () => {
     assert.equal(lines.length, 2);
     assert.ok(lines.every((e) => e.kind === 'thread_cancelled'));
     assert.equal(await cancelRunningThreads(KEY), 0); // second pass: nothing left running or queued
+  });
+});
+
+describe('cancelOneThread (per-task cancel path, AI-214 backend redesign)', () => {
+  it('flips only the named record while a sibling running record stays running (blast-radius pin)', async () => {
+    seedFile(KEY, [mkRec('t-1', 1, 'running'), mkRec('t-2', 2, 'running')]);
+    assert.equal(await cancelOneThread(KEY, 't-1'), true);
+    const raw = JSON.parse(readFileSync(join(home, `${KEY}.json`), 'utf8')) as Record<string, ThreadRecord>;
+    assert.equal(raw['t-1'].status, 'cancelled');
+    assert.equal(raw['t-2'].status, 'running', 'the sibling must never be touched by a per-task cancel');
+  });
+
+  it('returns false for an unknown thread id and writes nothing', async () => {
+    seedFile(KEY, [mkRec('t-1', 1, 'running')]);
+    assert.equal(await cancelOneThread(KEY, 't-99'), false);
+    const raw = JSON.parse(readFileSync(join(home, `${KEY}.json`), 'utf8')) as Record<string, ThreadRecord>;
+    assert.equal(raw['t-1'].status, 'running');
+  });
+
+  it('returns false for an already-terminal (done) record and does not flip it', async () => {
+    seedFile(KEY, [mkRec('t-1', 1, 'done')]);
+    assert.equal(await cancelOneThread(KEY, 't-1'), false);
+    const raw = JSON.parse(readFileSync(join(home, `${KEY}.json`), 'utf8')) as Record<string, ThreadRecord>;
+    assert.equal(raw['t-1'].status, 'done');
+  });
+
+  it('emits thread_cancelled for a running record that was flipped', async () => {
+    seedFile(KEY, [mkRec('t-1', 1, 'running')]);
+    assert.equal(await cancelOneThread(KEY, 't-1'), true);
+    const events = readFileSync(join(process.env.PA_HOME!, 'topic-events', `${KEY}.jsonl`), 'utf8');
+    const lines = events.trim().split('\n').map((l) => JSON.parse(l) as { kind: string; ref: string; detail: string });
+    assert.equal(lines.length, 1);
+    assert.equal(lines[0].kind, 'thread_cancelled');
+    assert.equal(lines[0].ref, 't-1');
+    assert.equal(lines[0].detail, 'thread 1');
+  });
+
+  it('flips a queued record but emits no topic event for it', async () => {
+    seedFile(KEY, [mkRec('t-1', 1, 'queued')]);
+    assert.equal(await cancelOneThread(KEY, 't-1'), true);
+    const raw = JSON.parse(readFileSync(join(home, `${KEY}.json`), 'utf8')) as Record<string, ThreadRecord>;
+    assert.equal(raw['t-1'].status, 'cancelled');
+    assert.equal(existsSync(join(process.env.PA_HOME!, 'topic-events', `${KEY}.jsonl`)), false, 'a queued record never started, so no event fires');
   });
 });
 
@@ -466,13 +617,13 @@ describe('countThreads (AI-203 increment 3)', () => {
     assert.deepEqual(await countThreads(KEY), { running: 1, queued: 2, done: 2, failed: 1, cancelled: 1 });
   });
 
-  it('T-S2: unknown key tallies an all-zero five-field shape without throwing, and the read demotes a 31-min-stale running record', async () => {
+  it('T-S2: unknown key tallies an all-zero five-field shape without throwing, and the read requeues a 31-min-stale running record', async () => {
     assert.deepEqual(await countThreads('unknown_0'), { running: 0, queued: 0, done: 0, failed: 0, cancelled: 0 });
     seedFile(KEY, [mkRec('t-1', 1, 'running', 31)]);
     const counts = await countThreads(KEY);
-    assert.deepEqual(counts, { running: 0, queued: 0, done: 0, failed: 1, cancelled: 0 });
+    assert.deepEqual(counts, { running: 0, queued: 1, done: 0, failed: 0, cancelled: 0 });
     const rec = await getThread(KEY, 't-1');
-    assert.equal(rec?.status, 'failed');
+    assert.equal(rec?.status, 'queued');
   });
 });
 
@@ -488,5 +639,219 @@ describe('listStoreKeys (increment 4)', () => {
     writeFileSync(join(home, 'not-a-dir'), 'x');
     _setStoreDirForTest(join(home, 'not-a-dir'));
     assert.deepEqual(await listStoreKeys(), []);
+  });
+});
+
+// Wall-park claim gate (2026-09-12): claimThreadStarts skips a queued record
+// whose parkedUntil stamp is in the future; absent/past/unparseable stamps are
+// claimable, and the stamp is inert on non-queued records (its only reader is
+// the queued-claim filter).
+describe('wall-park claim gate (2026-09-12)', () => {
+  it('T-PARK-B1: a future stamp blocks the claim — the record stays queued', async () => {
+    seedFile(KEY, [{ ...mkRec('t-9', 9, 'queued'), parkedUntil: new Date(Date.now() + 60 * 60_000).toISOString(), unavailableParks: 3 }]);
+    assert.deepEqual(await claimThreadStarts(KEY), []);
+    assert.equal((await getThread(KEY, 't-9'))?.status, 'queued');
+  });
+
+  it('T-PARK-B2: a past stamp claims — the record flips to running', async () => {
+    seedFile(KEY, [{ ...mkRec('t-9', 9, 'queued'), parkedUntil: new Date(Date.now() - 60_000).toISOString() }]);
+    const claimed = await claimThreadStarts(KEY);
+    assert.deepEqual(claimed.map((r) => r.id), ['t-9']);
+    assert.equal((await getThread(KEY, 't-9'))?.status, 'running');
+  });
+
+  it('T-PARK-B3: an absent stamp claims (back-compat with old stores)', async () => {
+    seedFile(KEY, [mkRec('t-9', 9, 'queued')]);
+    assert.deepEqual((await claimThreadStarts(KEY)).map((r) => r.id), ['t-9']);
+  });
+
+  it('T-PARK-B4: an unparseable stamp fails open — claimed (NaN is never > nowMs)', async () => {
+    seedFile(KEY, [{ ...mkRec('t-9', 9, 'queued'), parkedUntil: 'not-a-timestamp' }]);
+    assert.deepEqual((await claimThreadStarts(KEY)).map((r) => r.id), ['t-9']);
+  });
+
+  it('T-PARK-B5: round-trips via updateThread, and a seeded record carrying the fields loads them verbatim', async () => {
+    const created = await createThread(KEY, { title: 'T', goal: 'g', workdir: 'C:/pa-checkout' });
+    assert.ok(created.ok);
+    if (!created.ok) return;
+    const iso = new Date(Date.now() + 5 * 60_000).toISOString();
+    await updateThread(KEY, created.thread.id, { parkedUntil: iso, unavailableParks: 7 });
+    const rec = await getThread(KEY, created.thread.id);
+    assert.equal(rec?.parkedUntil, iso);
+    assert.equal(rec?.unavailableParks, 7);
+    seedFile(KEY, [{ ...mkRec('t-9', 9, 'queued'), parkedUntil: iso, unavailableParks: 3 }]);
+    const seeded = await getThread(KEY, 't-9');
+    assert.equal(seeded?.parkedUntil, iso);
+    assert.equal(seeded?.unavailableParks, 3);
+  });
+
+  it('T-PARK-B6: a stale stamp is inert on non-queued records — done keeps its future stamp untouched', async () => {
+    const futureStamp = new Date(Date.now() + 60 * 60_000).toISOString();
+    seedFile(KEY, [
+      { ...mkRec('t-1', 1, 'done'), parkedUntil: futureStamp },
+      mkRec('t-2', 2, 'queued'),
+    ]);
+    const claimed = await claimThreadStarts(KEY);
+    assert.deepEqual(claimed.map((r) => r.id), ['t-2']);
+    const done = await getThread(KEY, 't-1');
+    assert.equal(done?.status, 'done');
+    assert.equal(done?.parkedUntil, futureStamp); // stamp untouched — code never clears it
+  });
+});
+
+describe('per-topic thread caps env-tunable (machine-profile scaling)', () => {
+  // The caps are parsed ONCE at module load, so overrides are proven in a fresh
+  // child process against the same compiled module the bot process loads.
+  const modulePath = join(__dirname, '..', 'topic-threads.js');
+  const probe =
+    `const m = await import(${JSON.stringify(pathToFileURL(modulePath).href)});` +
+    `console.log(JSON.stringify([m.MAX_RUNNING_THREADS_PER_TOPIC, m.MAX_THREADS_PER_TOPIC]));` +
+    `process.exit(0);`;
+  const probeCaps = (extra: Record<string, string>) =>
+    spawnSync(process.execPath, ['--input-type=module', '-e', probe], {
+      encoding: 'utf8',
+      windowsHide: true,
+      env: { ...process.env, ...extra },
+    });
+
+  it('pins defaults 10/20 when neither override is set', () => {
+    const res = probeCaps({ PA_MAX_RUNNING_THREADS_PER_TOPIC: '', PA_MAX_THREADS_PER_TOPIC: '' });
+    assert.equal(res.status, 0, `child failed: ${res.stderr}`);
+    assert.deepEqual(JSON.parse(res.stdout.trim()), [10, 20]);
+    // The in-process module exports the same constants by name for every
+    // existing consumer (tests below loop against the imported symbols).
+    assert.equal(MAX_RUNNING_THREADS_PER_TOPIC, 10);
+    assert.equal(MAX_THREADS_PER_TOPIC, 20);
+  });
+
+  it('honors PA_MAX_RUNNING_THREADS_PER_TOPIC / PA_MAX_THREADS_PER_TOPIC overrides', () => {
+    const res = probeCaps({ PA_MAX_RUNNING_THREADS_PER_TOPIC: '7', PA_MAX_THREADS_PER_TOPIC: '33' });
+    assert.equal(res.status, 0, `child failed: ${res.stderr}`);
+    assert.deepEqual(JSON.parse(res.stdout.trim()), [7, 33]);
+  });
+
+  it('falls back to defaults on garbage (non-numeric, zero)', () => {
+    const res = probeCaps({ PA_MAX_RUNNING_THREADS_PER_TOPIC: 'abc', PA_MAX_THREADS_PER_TOPIC: '0' });
+    assert.equal(res.status, 0, `child failed: ${res.stderr}`);
+    assert.deepEqual(JSON.parse(res.stdout.trim()), [10, 20]);
+  });
+});
+
+describe('settleOrphanedThread — conditional settle (AI-228)', () => {
+  const fileRaw = () => readFileSync(join(home, `${KEY}.json`), 'utf8');
+
+  it('flips a running + matching-runSeq record and persists the patch shape', async () => {
+    const rec = mkRec('t-1', 1, 'running', 5);
+    rec.runSeq = 3;
+    rec.lastError = 'restart-parked: earlier episode — auto-requeued';
+    rec.parkedUntil = new Date(Date.now() - 60_000).toISOString(); // stale, past
+    seedFile(KEY, [rec]);
+    const before = Date.now();
+    const wrote = await settleOrphanedThread(KEY, 't-1', 3, {
+      status: 'done',
+      lastResult: 'the harvested answer',
+      lastError: undefined,
+      parkedUntil: undefined,
+      unavailableParks: 0,
+    });
+    assert.equal(wrote, true);
+    const after = await getThread(KEY, 't-1');
+    assert.equal(after?.status, 'done');
+    assert.equal(after?.lastResult, 'the harvested answer');
+    // Terminal hygiene: a previous episode's stale park/error fields are cleared.
+    assert.equal(after?.lastError, undefined);
+    assert.equal(after?.parkedUntil, undefined);
+    assert.ok(Date.parse(after!.updatedAt) >= before, 'updatedAt bumps on a write');
+    // Persisted to disk, not just the in-memory map.
+    const raw = JSON.parse(fileRaw()) as Record<string, ThreadRecord>;
+    assert.equal(raw['t-1'].status, 'done');
+    assert.equal(raw['t-1'].lastResult, 'the harvested answer');
+    assert.equal(raw['t-1'].parkedUntil, undefined);
+  });
+
+  it('carries the shared restart-park demote shape (queued + restart-parked + ~5m stamp), preserving attempts/parks/pendingInput', async () => {
+    const rec = mkRec('t-1', 1, 'running', 5);
+    rec.runSeq = 2;
+    rec.attempts = 1;
+    rec.unavailableParks = 3;
+    rec.pendingInput = ['steer me later'];
+    seedFile(KEY, [rec]);
+    const before = Date.now();
+    const wrote = await settleOrphanedThread(KEY, 't-1', 2, restartParkFields(before, 'bot restarted mid-run'));
+    assert.equal(wrote, true);
+    const after = await getThread(KEY, 't-1');
+    assert.equal(after?.status, 'queued');
+    assert.equal(after?.lastError, 'restart-parked: bot restarted mid-run — auto-requeued');
+    const parked = Date.parse(after!.parkedUntil!);
+    assert.ok(parked >= before + 4 * 60_000 && parked <= Date.now() + 6 * 60_000,
+      `parkedUntil ${after?.parkedUntil} should be ~5m future`);
+    // A crash is not an attempt outcome — counters and queued steer input untouched.
+    assert.equal(after?.attempts, 1);
+    assert.equal(after?.unavailableParks, 3);
+    assert.deepEqual(after?.pendingInput, ['steer me later']);
+    // The parked record is NOT claimable this pass (the stamp gate), and the
+    // next pass after the stamp re-claims it — the reclaim is the funnel's.
+    assert.deepEqual(await claimThreadStarts(KEY), []);
+    await updateThread(KEY, 't-1', { parkedUntil: new Date(Date.now() - 60_000).toISOString() });
+    assert.deepEqual((await claimThreadStarts(KEY)).map((r) => r.id), ['t-1']);
+  });
+
+  it('no-op on a terminal record — returns false, file unchanged', async () => {
+    seedFile(KEY, [mkRec('t-1', 1, 'done', 5)]);
+    const beforeFile = fileRaw();
+    assert.equal(await settleOrphanedThread(KEY, 't-1', 1, { status: 'queued' }), false);
+    assert.equal(fileRaw(), beforeFile);
+  });
+
+  it('no-op on a queued record — returns false, file unchanged', async () => {
+    seedFile(KEY, [mkRec('t-1', 1, 'queued', 5)]);
+    const beforeFile = fileRaw();
+    assert.equal(await settleOrphanedThread(KEY, 't-1', 1, { status: 'done' }), false);
+    assert.equal(fileRaw(), beforeFile);
+  });
+
+  it('no-op on a runSeq mismatch (a new owner claimed it) — returns false, file unchanged', async () => {
+    const rec = mkRec('t-1', 1, 'running', 5);
+    rec.runSeq = 4; // advanced past the adopted runSeq
+    seedFile(KEY, [rec]);
+    const beforeFile = fileRaw();
+    assert.equal(await settleOrphanedThread(KEY, 't-1', 3, { status: 'done' }), false);
+    assert.equal(fileRaw(), beforeFile);
+    assert.equal((await getThread(KEY, 't-1'))?.status, 'running'); // never clobbered
+  });
+
+  it('no-op on a missing record — returns false, no file written', async () => {
+    assert.equal(await settleOrphanedThread(KEY, 't-99', 1, { status: 'done' }), false);
+    assert.equal(existsSync(join(home, `${KEY}.json`)), false);
+  });
+});
+
+// Router-metadata wave WP-2 (2026-09-20): ThreadRecord.routing — the origin
+// turn's provenance persisted at createThread time (ids/enum words only) so
+// the thread executor stamps PA_ROUTING_* into every dispatch's getEnv.
+describe('createThread routing field (WP-2)', () => {
+  it('persists routing and round-trips it through the store', async () => {
+    const routing = {
+      decision: 'router' as const,
+      placement: 'diverted' as const,
+      target: 'vi-0123456789ab',
+      steer: 'wait' as const,
+      steerBy: 'router' as const,
+      effortProj: 'nearest' as const,
+    };
+    const r = await createThread(KEY, { title: 'Routed spawn', goal: 'g', workdir: 'C:/pa-checkout', routing });
+    assert.ok(r.ok);
+    assert.deepEqual(r.thread.routing, routing, 'the create result carries it verbatim');
+    const back = await getThread(KEY, r.thread.id);
+    assert.deepEqual(back?.routing, routing, 'the store round-trips it (a queued/parked thread starts minutes later)');
+  });
+
+  it('no routing passed ⇒ no key on the record (additive — old stores load fine)', async () => {
+    const r = await createThread(KEY, { title: 'Plain spawn', goal: 'g', workdir: 'C:/pa-checkout' });
+    assert.ok(r.ok);
+    assert.ok(!('routing' in r.thread), 'the key must be absent, not undefined-valued');
+    const back = await getThread(KEY, r.thread.id);
+    assert.ok(back);
+    assert.equal(back!.routing, undefined);
   });
 });

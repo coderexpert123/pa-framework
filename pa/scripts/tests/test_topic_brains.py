@@ -1777,13 +1777,31 @@ class TestCliAndStampForms(unittest.TestCase):
         self.assertRegex(content, STAMP_REGEX)
 
     def test_finalize_stamp_carries_ist_offset(self):
-        """consolidated must carry +05:30 — IST wall time under a UTC suffix lies."""
+        """consolidated must carry the CONFIGURED local offset — wall time under
+        a wrong suffix lies (WB-54: offset comes from PA_TZ_OFFSET_MINUTES, with
+        a loud UTC default when unset; this test pins the +05:30 config)."""
+        os.environ['PA_TZ_OFFSET_MINUTES'] = '330'
         topic_key = '-1001234567890_7'
         brain_path = self._write_brain(topic_key)
         self.assertEqual(topic_brains.finalize(self.pa_home, stamp_topic_key=topic_key), 0)
         with open(brain_path, 'r', encoding='utf-8') as f:
             content = f.read()
         self.assertRegex(content, r'consolidated=\S+05:30 covers=')
+
+    def test_finalize_stamp_defaults_to_utc_loudly_when_offset_unset(self):
+        """WB-54 known-bad companion: with PA_TZ_OFFSET_MINUTES unset the stamp
+        carries UTC (+00:00) — never a silent IST fallback."""
+        saved = os.environ.pop('PA_TZ_OFFSET_MINUTES', None)
+        try:
+            topic_key = '-1001234567890_71'
+            brain_path = self._write_brain(topic_key)
+            self.assertEqual(topic_brains.finalize(self.pa_home, stamp_topic_key=topic_key), 0)
+            with open(brain_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            self.assertRegex(content, r'consolidated=\S+00:00 covers=')
+        finally:
+            if saved is not None:
+                os.environ['PA_TZ_OFFSET_MINUTES'] = saved
 
 
 if __name__ == '__main__':

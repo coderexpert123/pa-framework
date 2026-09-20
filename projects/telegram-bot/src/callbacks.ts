@@ -29,6 +29,11 @@
  *                                                               index resolves against the
  *                                                               topic's pending_question)
  *   qt:<tt-12hex>:<0-3>                            chat-gated   (executor-lane task question)
+ *   rq:<threadN>:<0-3>                             chat-gated   (executor-lane thread question
+ *                                                               option — AI-203 WP-3)
+ *   sr:<idx>                                        chat-gated   (AI-234 quick-reply chip —
+ *                                                               index resolves against the
+ *                                                               topic's pending_suggestions)
  *   ru:<ruleId≤40>:a|x                             operator-gated (weekly-digest rules)
  *   si:<family≤40>:m[:c]                           operator-gated, two-step (census mute)
  *   ch:r:<chain≤40>[:c]                            operator-gated, two-step (chain re-run)
@@ -45,6 +50,7 @@ import {
   answerCallbackQuery,
   editMessageReplyMarkup,
   sendMessage,
+  sendPlainMessage,
   setMessageReaction,
   editMessageText,
   sanitizeMdV2,
@@ -57,6 +63,7 @@ import { isBarePlaceholderUserText } from './voice.js';
 import { logger } from '../../../pa/dist/src/lib/log.js';
 import { resolvePythonCommand } from '../../../pa/dist/src/lib/python.js';
 import { paHome } from '../../../pa/dist/src/paths.js';
+import { voiceInboxInputRequestAuthUrl } from '../../../pa/dist/src/lib/voice-inbox-ledger.js';
 import { toIST, IST_OFFSET_MS } from '../../../pa/dist/src/ist.js';
 import { listSkills } from '../../../pa/dist/src/skills.js';
 import { loadDraft } from '../../../pa/dist/src/drafts.js';
@@ -66,6 +73,19 @@ import { dlqReplayCommand } from '../../../pa/dist/src/commands/dlq.js';
 import { KNOWN_CLI_DEFAULT_MODELS, KNOWN_CLI_DEFAULT_EFFORTS } from '../../../pa/dist/src/lib/tunables.js';
 import { appendTopicEvent } from '../../../pa/dist/src/lib/topic-events.js';
 import { answerTask, type RunningTask } from '../../../pa/dist/src/lib/topic-tasks.js';
+// AI-203 WP-3 (item 2): the `rq:` thread-question press resolves the answer
+// against the topic's thread store. These three are safe per-key-lock store
+// ops (file reads/writes under the topic key) — imported directly like
+// answerTask above; the wake's fireClaimedThreads is injected via CallbackDeps
+// (it fires real execution, so tests stub it).
+import {
+  takePendingQuestion,
+  queueThreadInput,
+  claimThreadStarts,
+  getThread,
+  updateThread,
+  type ThreadRecord,
+} from './topic-threads.js';
 // The pure callback grammar is single-sourced in pa (SPEC §3.4) — imported here and
 // re-exported below so every existing `from './callbacks.js'` import keeps working.
 import {
@@ -104,7 +124,6 @@ export function buildControlCardKeyboard(): InlineKeyboardMarkup {
       [
         { text: '🆕 New', callback_data: 'cc:new' },
         { text: '⏹ Stop', callback_data: 'cc:stop' },
-        { text: '☕ Keep-awake', callback_data: 'cc:ka' },
       ],
     ],
   };
@@ -212,6 +231,32 @@ export function buildTaskQuestionKeyboard(taskId: string, options: string[]): In
   };
 }
 
+/** AI-203 WP-3 (item 2, SPEC §5.1.7): the inline keyboard for an executor-lane
+ *  THREAD question — one button per option, `callback_data: rq:<threadN>:<idx>`.
+ *  The `<threadN>` is the ThreadRecord's numeric `n` (the executor's inline
+ *  twin builder stamps the same shape); the `rq:` prefix is the pa-side
+ *  callback grammar. ≤64 bytes by construction (same pattern as
+ *  `buildTaskQuestionKeyboard`). Exported here for any future non-executor
+ *  emitter; the executor builds its own inline twin per SPEC §6. */
+export function buildThreadQuestionKeyboard(threadN: number, options: string[]): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: options.map((optionText, idx) => [{ text: optionText, callback_data: `rq:${threadN}:${idx}` }]),
+  };
+}
+
+/** AI-234 (SPEC §3a): the inline keyboard for quick-reply chips — one button
+ *  per row (chips are prose-length, like question options), label = the chip
+ *  text verbatim, callback_data `sr:<idx>` (≤64 bytes by construction — the
+ *  index is tiny; the label rides the button text, NOT callback_data). The
+ *  press resolves the index against the topic's ephemeral
+ *  pending_suggestions.items[idx] (set by main.ts when suggested_items survive
+ *  sanitize). */
+export function buildSuggestKeyboard(items: string[]): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: items.map((label, idx) => [{ text: label, callback_data: `sr:${idx}` }]),
+  };
+}
+
 export function buildResendKeyboard(chatId: number, threadId: number, updateId: number): InlineKeyboardMarkup | undefined {
   const data = `rs:${chatId}:${threadId}:${updateId}`;
   if (data.length > 64) return undefined;
@@ -287,13 +332,12 @@ export function syntheticTextFor(parsed: ParsedCallback): string | null {
       }
       if (parsed.action === 'new') return '/new';
       if (parsed.action === 'stop') return '/stop';
-      if (parsed.action === 'ka') return '/keepawake';
       return null; // menu, agent, model, effort, back, submit, discard — handled in-process
     case 'wf':
       if (parsed.action === 'switch' || parsed.action === 'revert') return `/agent ${parsed.worker}`;
       return null; // 'retry' needs the topic's last user turn — async, see handleCallbackQuery
     default:
-      return null; // reauth, q, pm, dr, sk, rm, mc, rs, dq — handled in-process
+      return null; // reauth, q, sr, pm, dr, sk, rm, mc, rs, dq — handled in-process
   }
 }
 
@@ -443,6 +487,26 @@ export interface CallbackDeps {
    *  (pa/dist listRunningTasks) to keep this module's constructor-time imports
    *  identical to what tests stub. */
   loadRunningTasks: (chatId: number, threadId: number) => Promise<RunningTask[]>;
+  /** AI-203 WP-3 (item 2): fires every claimed record of one topic after an
+   *  `rq:` thread-question press parks a terminal thread as 'queued' and
+   *  claimThreadStarts flips it to running. Injected (not imported) because it
+   *  fires real execution; tests stub it. Optional so existing test fixtures
+   *  (callbacks.test.ts's makeDeps) keep compiling without it — when omitted
+   *  the `rq:` handler logs a warning and skips the fire (the record is still
+   *  'running' from claimThreadStarts; the next poll-tick reconcile wakes it). */
+  fireClaimedThreads?: (
+    topicKey: string,
+    claimed: ThreadRecord[],
+    opts: { secrets: Record<string, string>; token: string; topicName: string }
+  ) => void;
+  /** AI-203 WP-3 (item 2): the topic name for the fireClaimedThreads opts.
+   *  Optional — defaults to '' (the executor's prompt header tolerates an
+   *  unresolvable name). main.ts wires the real getTopicName resolver. */
+  topicNameFor?: (chatId: number, threadId: number) => string;
+  /** Auth broker Phase A (2026-09-10 build spec §3.9): resolves a pending
+   *  `auth:` request's authorize URL, or null when unresolvable. Optional —
+   *  the default (`defaultAuthRequestUrl`, in-module) is used when omitted. */
+  authRequestUrl?: (requestId: string) => Promise<string | null>;
 }
 
 /** AI-210: the ONE derivation behind the cc:agent/cc:model/cc:effort open branches AND
@@ -485,6 +549,17 @@ async function pickerContextFor(
 }
 
 const SPAWN_OPTS = { detached: true, stdio: 'ignore' as const, shell: true, windowsHide: true };
+
+/** WB-304: fire-and-forget spawns must never fail invisibly — every child gets
+ *  an error listener that logs the failure before unref, so a missing `pa` (or
+ *  any spawn failure) reaches the log instead of dying silently. */
+function spawnPaLogged(cmd: string, args: string[], cwd: string, context: Record<string, unknown>): void {
+  spawnImpl(cmd, args, { cwd, ...SPAWN_OPTS })
+    .on('error', (err) => {
+      logger.warn('callback', `fire-and-forget spawn failed: ${(err as Error).message}`, context);
+    })
+    .unref();
+}
 
 // Node's built-in child_process.spawn is a non-configurable export — node:test's
 // mock.method() cannot redefine it, so every spawn call in this file goes through this
@@ -578,6 +653,23 @@ async function ackSelection(deps: CallbackDeps, cb: CallbackQuery, label: string
   }
 }
 
+/**
+ * Default reader for the `auth:` callback's `CallbackDeps.authRequestUrl` seam
+ * (auth broker Phase A, 2026-09-10 build spec §3.9). `auth_url` is minted
+ * into the voice-inbox LEDGER's `input_requests.params_json`, never into the
+ * §3.3 broker row (`~/.pa/auth/requests/<id>.json`) — neither real writer's
+ * `AuthRequestRow` shape (`pa/src/lib/auth/store.ts`,
+ * `projects/voice-inbox/src/auth-providers.ts`) carries that field, so
+ * reading the broker-row file here always resolved null in production
+ * (fixed, deep-recheck 2026-09-10 — see `pa/src/lib/voice-inbox-ledger.ts`'s
+ * `voiceInboxInputRequestAuthUrl` for the full explanation). Read-only,
+ * fail-open: any failure (bad id, missing ledger, torn params) returns null,
+ * same as before.
+ */
+async function defaultAuthRequestUrl(requestId: string): Promise<string | null> {
+  return voiceInboxInputRequestAuthUrl(requestId);
+}
+
 /** Handles one callback_query end to end. Never throws. Returns a short outcome
  *  string for the log line. Answers the callback FIRST, then acts (design rule 2). */
 export async function handleCallbackQuery(cb: CallbackQuery, deps: CallbackDeps): Promise<string> {
@@ -625,6 +717,20 @@ export async function handleCallbackQuery(cb: CallbackQuery, deps: CallbackDeps)
           threadId || undefined
         );
         return 'reauth';
+      }
+
+      case 'auth': {
+        const url = await (deps.authRequestUrl ?? defaultAuthRequestUrl)(parsed.requestId);
+        await answerCallbackQuery(deps.token, cb.id, '🔐 Opening the authorization link…');
+        if (messageId) await ackSelection(deps, cb, 'Open authorization link');
+        if (url) {
+          // sendPlainMessage, NOT sendMessage — a raw URL through sendMessage's
+          // MarkdownV2 escaping comes back backslash-mangled and non-tappable
+          // (2026-08-15 OAuth-URL lesson, pa/CLAUDE.md; proven in telegram.test.ts).
+          await sendPlainMessage(deps.token, chatId, url, threadId || undefined);
+          return 'auth:opened';
+        }
+        return 'auth:unresolved';
       }
 
       case 'cf': {
@@ -718,6 +824,109 @@ export async function handleCallbackQuery(cb: CallbackQuery, deps: CallbackDeps)
           logger.warn('callback', `question_answered event failed: ${(err as Error).message}`, { chatId, threadId });
         }
         return 'qt:answered';
+      }
+
+      case 'rq': {
+        // AI-203 WP-3 (item 2, SPEC §5.1.7): executor-lane THREAD question
+        // press. Convergence, not injection — the press answers the THREAD
+        // directly (takePendingQuestion + queueThreadInput + wake), it must
+        // NOT inject a poll-loop turn (the answer lives in the thread's
+        // pendingInput and the executor's wake path delivers it). Mirrors
+        // handleSteer's terminal wake: park a terminal record as 'queued' so
+        // the FIFO claim owns the start, then claimThreadStarts +
+        // fireClaimedThreads. The `rq:` press must NOT take the topic lock for
+        // an orchestrator dispatch (it is a thread steer, not an orchestrator
+        // turn) — direct store write + executor fire, assistantWorker 'local'.
+        const topicKey = `${chatId}_${threadId}`;
+        const threadRecId = `t-${parsed.threadN}`;
+        const question = await takePendingQuestion(topicKey, threadRecId).catch(() => undefined);
+        if (!question) {
+          // Idempotent no-op for a stale button press (already answered, or
+          // the record is gone/cancelled). Graceful, no store write.
+          await answerCallbackQuery(deps.token, cb.id, 'Question already answered or expired', true);
+          return 'rq:gone';
+        }
+        const optionText = question.options[parsed.index];
+        if (optionText === undefined) {
+          await answerCallbackQuery(deps.token, cb.id, 'Invalid option', true);
+          return 'rq:bad';
+        }
+        const queued = await queueThreadInput(topicKey, threadRecId, optionText).catch(() => ({ ok: false as const, reason: 'queue write failed' }));
+        if (!queued.ok) {
+          await answerCallbackQuery(deps.token, cb.id, `Could not route: ${queued.reason}`, true);
+          return 'rq:queue-failed';
+        }
+        // Wake path (handleSteer's terminal-wake precedent): park a terminal
+        // record as 'queued' so claimThreadStarts owns the start; a running
+        // record just drains the queued input on its current run.
+        const parked = await getThread(topicKey, threadRecId).catch(() => undefined);
+        if (parked && (parked.status === 'done' || parked.status === 'failed')) {
+          await updateThread(topicKey, threadRecId, { status: 'queued' }).catch(() => {});
+        }
+        const claimed = await claimThreadStarts(topicKey).catch(() => []);
+        if (claimed.length > 0 && deps.fireClaimedThreads) {
+          const topicName = deps.topicNameFor ? deps.topicNameFor(chatId, threadId) : '';
+          deps.fireClaimedThreads(topicKey, claimed, { secrets: deps.secrets, token: deps.token, topicName });
+        } else if (claimed.length > 0) {
+          // fireClaimedThreads not wired (a test fixture without it): the
+          // record is 'running' from claimThreadStarts; the next poll-tick
+          // reconcile wakes it. Log so a production misconfiguration surfaces.
+          logger.warn('callback', 'rq: press claimed threads but no fireClaimedThreads dep wired', { chatId, threadId, threadRecId });
+        }
+        await answerCallbackQuery(deps.token, cb.id, `✅ ${optionText}`);
+        if (messageId) await ackSelection(deps, cb, optionText);
+        await sendMessage(
+          deps.token,
+          chatId,
+          appendRefIdAndLog(`✅ Answered: ${optionText} — routed to thread ${threadRecId}.`, { kind: 'callback', chatId, threadId }),
+          undefined,
+          threadId || undefined
+        );
+        try {
+          await appendTopicEvent(chatId, threadId, {
+            kind: 'question_answered',
+            ref: threadRecId,
+            detail: optionText,
+          });
+        } catch (err) {
+          // The queued input + wake are the load-bearing effect; a failed
+          // audit line must not turn the press into an 'error' outcome.
+          logger.warn('callback', `question_answered event failed: ${(err as Error).message}`, { chatId, threadId });
+        }
+        return 'rq:answered';
+      }
+
+      case 'sr': {
+        // AI-234 (SPEC §3a): quick-reply chip press. The press IS typing the
+        // chip text: injected as a synthetic turn through the one-parser path
+        // (the same path q:/qt: use — a press is a typed command, CLAUDE.md:111).
+        // The index resolves against the topic's ephemeral pending_suggestions;
+        // the chip text lives in button text, NOT callback_data. Clear
+        // pending_suggestions and strip the keyboard (AI-192 rule).
+        const state = await deps.loadTopicState(chatId, threadId);
+        if (!state.pending_suggestions) {
+          await answerCallbackQuery(deps.token, cb.id, 'Those suggestions are no longer active', true);
+          return 'sr:gone';
+        }
+        const chipText = state.pending_suggestions.items[parsed.index];
+        if (chipText === undefined) {
+          await answerCallbackQuery(deps.token, cb.id, 'Invalid suggestion', true);
+          return 'sr:bad';
+        }
+        await answerCallbackQuery(deps.token, cb.id, `✅ ${chipText}`);
+        if (messageId) await ackSelection(deps, cb, chipText);
+        deps.injectUpdate(
+          buildSyntheticUpdate({
+            updateId: nextSyntheticUpdateId(),
+            chatId,
+            threadId,
+            messageId: messageId ?? 0,
+            from: cb.from,
+            text: chipText,
+            via: 'button',
+          })
+        );
+        return 'sr:answered';
       }
 
       case 'cc': {
@@ -815,7 +1024,7 @@ export async function handleCallbackQuery(cb: CallbackQuery, deps: CallbackDeps)
           }
           return `cc:set:${parsed.setting}`;
         }
-        // 'new' | 'stop' | 'ka' — synthesize a typed command
+        // 'new' | 'stop' — synthesize a typed command
         const text = syntheticTextFor(parsed);
         if (!text) {
           await answerCallbackQuery(deps.token, cb.id, 'Unhandled control');
@@ -831,10 +1040,10 @@ export async function handleCallbackQuery(cb: CallbackQuery, deps: CallbackDeps)
         await answerCallbackQuery(
           deps.token,
           cb.id,
-          parsed.action === 'new' ? 'New topic' : parsed.action === 'stop' ? 'Stop worker' : 'Keep awake'
+          parsed.action === 'new' ? 'New topic' : 'Stop worker'
         );
         if (messageId) {
-          // 'new'/'stop'/'ka' are top-level presses with no submenu displayed — nothing
+          // 'new'/'stop' are top-level presses with no submenu displayed — nothing
           // left to protect from the sweep's top-level rewrite. (cc:set no longer
           // passes here — it stages in its own branch above.)
           clearCardKeyboard(chatId, messageId);
@@ -1015,7 +1224,7 @@ export async function handleCallbackQuery(cb: CallbackQuery, deps: CallbackDeps)
           }
           return 'dr:show';
         }
-        spawnImpl('pa', [parsed.action, parsed.draft], { cwd: deps.botCwd, ...SPAWN_OPTS }).unref();
+        spawnPaLogged('pa', [parsed.action, parsed.draft], deps.botCwd, { action: parsed.action, draft: parsed.draft });
         await answerCallbackQuery(deps.token, cb.id, parsed.action === 'approve' ? '✅ Approving…' : '❌ Rejecting…');
         if (messageId) await ackSelection(deps, cb, parsed.action === 'approve' ? 'Approve' : 'Reject');
         return `dr:${parsed.action}`;
@@ -1050,7 +1259,7 @@ export async function handleCallbackQuery(cb: CallbackQuery, deps: CallbackDeps)
           return `sk:${parsed.kind}:unconfirmed`;
         }
         const args = parsed.kind === 'run' ? ['run', parsed.name] : ['maintenance', 'run', parsed.name];
-        spawnImpl('pa', args, { cwd: deps.botCwd, ...SPAWN_OPTS }).unref();
+        spawnPaLogged('pa', args, deps.botCwd, { kind: parsed.kind, name: parsed.name });
         await answerCallbackQuery(deps.token, cb.id, `🚀 Started ${parsed.name}`);
         if (messageId) await ackSelection(deps, cb, `${parsed.kind === 'run' ? 'Run' : 'Job'} ${parsed.name} started`);
         return `sk:${parsed.kind}:started`;
@@ -1070,7 +1279,12 @@ export async function handleCallbackQuery(cb: CallbackQuery, deps: CallbackDeps)
         // across argv (spec item 454).
         const args = [scriptPath, dueAt, message, String(chatId)];
         if (threadId) args.push(String(threadId));
-        spawnImpl(resolvePythonCommand(deps.runtimeEnv), args, { cwd: deps.botCwd, detached: true, stdio: 'ignore', shell: false, windowsHide: true }).unref();
+        // WB-304: error listener so a spawn failure (missing python) is never invisible.
+        spawnImpl(resolvePythonCommand(deps.runtimeEnv), args, { cwd: deps.botCwd, detached: true, stdio: 'ignore', shell: false, windowsHide: true })
+          .on('error', (err) => {
+            logger.warn('callback', `reminder spawn failed: ${(err as Error).message}`, { chatId });
+          })
+          .unref();
         recordDecision({ source: 'bot', skill: 'reminders', thread_id: threadId, chat_id: chatId, message_id: messageId, request_excerpt: message, decision: parsed.action === '1h' ? 'snoozed 1 h' : 'snoozed to tomorrow 09:00 IST', rationale: 'User deferred the reminder from the reminder keyboard.', alternatives: parsed.action === '1h' ? ['dismissed (done)', 'snoozed to tomorrow 09:00 IST'] : ['dismissed (done)', 'snoozed 1 h'] });
         await answerCallbackQuery(deps.token, cb.id, parsed.action === '1h' ? '💤 Snoozed 1 h' : '🌅 Snoozed to tomorrow');
         if (messageId) await ackSelection(deps, cb, parsed.action === '1h' ? 'Snoozed 1 h' : 'Snoozed to tomorrow 09:00 IST');
@@ -1080,14 +1294,31 @@ export async function handleCallbackQuery(cb: CallbackQuery, deps: CallbackDeps)
       case 'mc': {
         const actionWord = parsed.action === 'a' ? 'accept' : parsed.action === 'r' ? 'reject' : 'ignore';
         const scriptPath = join(deps.botCwd, 'pa', 'scripts', 'review_digest_action.py');
+        // shell:false (WB-301): argv is already array-form, so shell:true only adds a
+        // word-splitting surface; a spawn failure surfaces via the error listener below
+        // instead of hiding behind the Accepted toast.
         spawnImpl(resolvePythonCommand(deps.runtimeEnv), [scriptPath, '--conflict-id', parsed.conflictId, '--action', actionWord], {
           cwd: deps.botCwd,
-          ...SPAWN_OPTS,
+          detached: true,
+          stdio: 'ignore' as const,
+          shell: false,
+          windowsHide: true,
+        }).on('error', (err) => {
+          logger.warn('callback', `review_digest spawn failed: ${(err as Error).message}`, { conflictId: parsed.conflictId, action: actionWord });
         }).unref();
         const toast = actionWord === 'accept' ? '✅ Accepted' : actionWord === 'reject' ? '❌ Kept existing' : '🚫 Ignored';
         await answerCallbackQuery(deps.token, cb.id, toast);
         if (messageId) await ackSelection(deps, cb, actionWord === 'accept' ? 'Accept' : actionWord === 'reject' ? 'Keep existing' : 'Ignore');
         return `mc:${parsed.action}`;
+      }
+
+      case 'ow': {
+        const sub = parsed.action === 'l' ? 'land' : parsed.action === 'k' ? 'keep' : 'diff';
+        spawnPaLogged('pa', ['orphan', sub, parsed.gid], deps.botCwd, { gid: parsed.gid, sub });
+        const toast = parsed.action === 'l' ? '📥 Landing…' : parsed.action === 'k' ? '💤 Keeping dirty 24h' : '📄 Showing diff';
+        await answerCallbackQuery(deps.token, cb.id, toast);
+        if (messageId) await ackSelection(deps, cb, toast.replace(/^\S+\s/, ''));
+        return `ow:${parsed.action}`;
       }
 
       case 'rs': {
@@ -1158,7 +1389,7 @@ export async function handleCallbackQuery(cb: CallbackQuery, deps: CallbackDeps)
         const args = parsed.action === 'a'
           ? ['rules', 'accept', parsed.ruleId]
           : ['rules', 'supersede', parsed.ruleId, '--reason', 'rejected via weekly-digest button'];
-        spawnImpl('pa', args, { cwd: deps.botCwd, ...SPAWN_OPTS }).unref();
+        spawnPaLogged('pa', args, deps.botCwd, { ruleId: parsed.ruleId });
         await answerCallbackQuery(deps.token, cb.id, parsed.action === 'a' ? '✅ Accepting…' : '✖ Rejecting…');
         if (messageId) {
           await ackSelection(deps, cb, parsed.action === 'a' ? `Accept rule ${parsed.ruleId}` : `Reject rule ${parsed.ruleId}`);
@@ -1175,7 +1406,7 @@ export async function handleCallbackQuery(cb: CallbackQuery, deps: CallbackDeps)
           }
           return 'si:unconfirmed';
         }
-        spawnImpl('pa', ['fix', parsed.family, '--note', 'muted from nightly report button'], { cwd: deps.botCwd, ...SPAWN_OPTS }).unref();
+        spawnPaLogged('pa', ['fix', parsed.family, '--note', 'muted from nightly report button'], deps.botCwd, { family: parsed.family });
         await answerCallbackQuery(deps.token, cb.id, '🔇 Muting…');
         if (messageId) await ackSelection(deps, cb, `Mute ${parsed.family}`);
         return 'si:muted';
@@ -1203,7 +1434,7 @@ export async function handleCallbackQuery(cb: CallbackQuery, deps: CallbackDeps)
           if (messageId) await ackSelection(deps, cb, `Re-run ${parsed.chain} — unknown chain`);
           return 'ch:unknown';
         }
-        spawnImpl('pa', ['chain', 'run', parsed.chain], { cwd: deps.botCwd, ...SPAWN_OPTS }).unref();
+        spawnPaLogged('pa', ['chain', 'run', parsed.chain], deps.botCwd, { chain: parsed.chain });
         await answerCallbackQuery(deps.token, cb.id, `🔁 Re-running ${parsed.chain}`);
         if (messageId) await ackSelection(deps, cb, `Chain ${parsed.chain} re-run started`);
         return 'ch:started';
@@ -1212,7 +1443,7 @@ export async function handleCallbackQuery(cb: CallbackQuery, deps: CallbackDeps)
       case 'wt': {
         // WP-D2 B.7 (2026-09-02): re-register a terminal watch — idempotent and
         // side-effect-light (a fresh watch row), so no two-tap.
-        spawnImpl('pa', ['watch', 're-register', parsed.watchId], { cwd: deps.botCwd, ...SPAWN_OPTS }).unref();
+        spawnPaLogged('pa', ['watch', 're-register', parsed.watchId], deps.botCwd, { watchId: parsed.watchId });
         await answerCallbackQuery(deps.token, cb.id, '🔁 Re-registering…');
         if (messageId) await ackSelection(deps, cb, `Re-register watch ${parsed.watchId}`);
         return 'wt:re-registered';

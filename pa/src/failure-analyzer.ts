@@ -209,22 +209,31 @@ export interface CensusProposalInput {
   /** Predicate for "does pa/src/lib/maintenance/jobs/<name>.ts exist" — injected
    *  so this stays pure; the caller passes an existsSync-backed closure. */
   jobFileExists: (relPath: string) => boolean;
+  /** The DETECTED repo root (repoRootFromModule), normalized by the caller or
+   *  here to forward slashes — never a hardcoded path segment (WB-53): any
+   *  clone directory yields code targets. */
+  repoRoot: string;
 }
 
 /** Extracts the LAST `File "<path>", line N` traceback frame whose path
- *  resolves under this repo (i.e. contains a `Personal Assistant/` segment),
- *  normalised to forward slashes and repo-relative. undefined when no frame
- *  in `text` resolves under the repo. */
-export function tracebackCodeTarget(text: string): string | undefined {
+ *  resolves under `repoRoot`, normalized to forward slashes and repo-relative.
+ *  undefined when no frame in `text` resolves under the repo. `repoRoot` is
+ *  injected (WB-53) — matching used to key on a hardcoded `Personal Assistant/`
+ *  segment, so a clone into any other directory yielded no code targets. */
+export function tracebackCodeTarget(text: string, repoRoot: string): string | undefined {
   const FILE_LINE_RE = /File "([^"]+)", line \d+/g;
-  const marker = 'Personal Assistant/';
+  const root = repoRoot.replace(/\\/g, '/').replace(/\/+$/, '');
   let match: RegExpExecArray | null;
   let result: string | undefined;
   while ((match = FILE_LINE_RE.exec(text)) !== null) {
     const normalized = match[1].replace(/\\/g, '/');
-    const idx = normalized.indexOf(marker);
-    if (idx === -1) continue; // does not resolve under the repo — skip, keep scanning
-    result = normalized.slice(idx + marker.length);
+    if (root && normalized.startsWith(`${root}/`)) {
+      result = normalized.slice(root.length + 1);
+    } else if (!root) {
+      // No detectable root (extracted tarball, CI export): fall back to the first
+      // path-bearing frame rather than returning nothing.
+      result = normalized;
+    }
   }
   return result;
 }
@@ -262,7 +271,7 @@ export function censusProposals(
       // a script, and this loop does not author prompt fixes — no proposal either way.
       if (!skill || !skill.frontmatter.cmd) continue;
       targetKind = 'skill';
-      codeTarget = tracebackCodeTarget(family.ownerStatus?.lastError ?? family.bodySample ?? '');
+      codeTarget = tracebackCodeTarget(family.ownerStatus?.lastError ?? family.bodySample ?? '', input.repoRoot);
     } else if (family.ownerKind === 'maintenance-job') {
       if (!input.maintenanceJobNames.includes(owner)) continue;
       const jobPath = `pa/src/lib/maintenance/jobs/${owner}.ts`;

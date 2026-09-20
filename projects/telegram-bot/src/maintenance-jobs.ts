@@ -3,7 +3,7 @@
  * See pa/src/lib/maintenance/types.ts for the MaintenanceJob contract this satisfies.
  */
 import { statSync, writeFileSync } from 'fs';
-import { readFile } from 'fs/promises';
+import { readFile, stat } from 'fs/promises';
 import { join } from 'path';
 import type { MaintenanceJob } from '../../../pa/dist/src/lib/maintenance/types.js';
 import { notifyUser, collectUnflushedDigests, formatDigestMessage, markDigestFlushed } from '../../../pa/dist/src/lib/notify.js';
@@ -23,7 +23,7 @@ import { loadRegistryContentRules, type RegistryContentRule } from './registry-c
 import type { TopicNameMap } from './topic-names.js';
 import { isSuspiciousDescription } from './grounding-check.js';
 import { listPendingDispatches } from './pending-dispatches.js';
-import { listTopicStateRefs } from './conversation.js';
+import { listTopicStateRefs, loadTopicState } from './conversation.js';
 import { shouldSelfRestart, shouldWarnStaleCode, formatRestartBlockers, formatDurationCompact } from './self-restart.js';
 import { refreshDashboardIfBootstrapped } from './dashboard.js';
 import { writeFileAtomic } from '../../../pa/dist/src/lib/atomic-write.js';
@@ -140,6 +140,11 @@ export interface BotMaintenanceDeps {
    * Injected for testability (default: loadRegistryContentRules()).
    */
   rules?: RegistryContentRule[];
+  /** Injected (runModelSweep precedent): live size of runPollLoop's in-process
+   *  `inFlight` Set, read at call time. Feeds boundBotSelfRestart's busy check
+   *  (self-restart.ts pollLoopInFlight) — defaults to `() => 0` when absent
+   *  (most tests don't run a real poll loop). */
+  pollLoopInFlight?: () => number;
 }
 
 /**
@@ -346,7 +351,31 @@ export function createBotMaintenanceJobs(deps: BotMaintenanceDeps): MaintenanceJ
           severity: 'warn',
         }).catch(() => {});
       }
-      return { touched: suspicious.length, detail: { suspicious } };
+      // Declared-sources half (2026-09-16 evangelism wave): every /sources
+      // declaration must still resolve to a readable file — the executor lanes
+      // now inject the section, so a missing file silently degrades grounding.
+      const sourceIssues: Array<{ topicKey: string; path: string; reason: string }> = [];
+      for (const ref of await listTopicStateRefs()) {
+        const ts = await loadTopicState(ref.chatId, ref.threadId).catch(() => null);
+        for (const src of ts?.sources ?? []) {
+          const st = await stat(src.path).catch(() => null);
+          if (!st || !st.isFile()) {
+            sourceIssues.push({ topicKey: `${ref.chatId}_${ref.threadId}`, path: src.path,
+              reason: st ? 'not a file' : 'missing/unreadable' });
+          }
+        }
+      }
+      if (sourceIssues.length > 0) {
+        const body = sourceIssues
+          .map((s) => `${s.topicKey}: ${s.path} (${s.reason})`).join('\n');
+        logger.warn('maintenance', `${sourceIssues.length} declared topic source(s) missing or unreadable`, { sourceIssues });
+        await notifyUser('Declared topic source missing', body, {
+          dedupKey: 'grounding-check-sources',   // separate key — never masked by the clobber page
+          severity: 'warn',
+        }).catch(() => {});
+      }
+      return { touched: suspicious.length + sourceIssues.length,
+               detail: { suspicious, sourceIssues } };
     },
   };
 
@@ -416,6 +445,8 @@ export function createBotMaintenanceJobs(deps: BotMaintenanceDeps): MaintenanceJ
 
       const disabled = process.env.PA_BOT_SELF_RESTART === '0';
 
+      const pollLoopInFlight = (deps.pollLoopInFlight ?? (() => 0))();
+
       const d = shouldSelfRestart({
         procStartMs,
         stampMtimeMs,
@@ -424,6 +455,7 @@ export function createBotMaintenanceJobs(deps: BotMaintenanceDeps): MaintenanceJ
         inFlightWorkers,
         pendingActions,
         topicLocksHeld,
+        pollLoopInFlight,
         disabled,
       });
 
@@ -454,6 +486,7 @@ export function createBotMaintenanceJobs(deps: BotMaintenanceDeps): MaintenanceJ
           inFlightWorkers,
           pendingActions,
           topicLocksHeld,
+          pollLoopInFlight,
           oldestPendingActionAgeMs,
         });
         logger.warn('bot', 'self-restart: dist stamp has been newer than this process for 30+ minutes but the bot has never gone idle long enough to self-restart', { stampMtimeMs, procStartMs, firstSeenNewerStampMs, staleMs, blockers });

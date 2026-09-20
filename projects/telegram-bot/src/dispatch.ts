@@ -18,10 +18,9 @@ import { buildPrompt, buildResumedPrompt } from './context.js';
 import {
   parseMetadata, isPrematureAsyncReply, buildWorkerResponse, buildWorkerErrorResponse,
   workerReceivesStaticPromptFile, hydrateModelStatus, buildModelStatusSnapshot,
-  modelStatusNeedsRefresh,
+  modelStatusNeedsRefresh, sanitizeSuggestedItems,
 } from './logic.js';
 import { parseSupportTopicKey } from './debug-command.js';
-import { getKeepAwakeStatus, type KeepAwakeStatus } from './keepawake.js';
 import { isTopicStopped } from './worker-stop.js';
 import { isSessionValid, buildResumeArgs, getPriorSessionPath } from './session.js';
 // maybeDropAgySession's moved body reads the exclusion set + resource parser too.
@@ -39,13 +38,16 @@ import { ORPHAN_HARVEST_WINDOW_MS } from './task-executor.js';
 import type { ConversationState, SessionInfo, PAMeta, ModelStatusSnapshot, ModelStatusReasonCode } from './types.js';
 import type { TopicNameMap } from './topic-names.js';
 import type { TopicWorkdir } from './topic-workdir.js';
-import { runWithFailover, executeWorker, isWorkerCoolingDown, classifyRateLimit, recordRateLimit } from '../../../pa/dist/src/workers.js';
+import { runWithFailover, executeWorker, isWorkerCoolingDown, classifyRateLimit, recordRateLimit, getCooldownStatus, NO_WORKERS_AVAILABLE_ERROR } from '../../../pa/dist/src/workers.js';
 import { loadConfig } from '../../../pa/dist/src/config.js';
 import type { CommandResult, FailoverNotifyPayload, RunOptions, WorkerConfig } from '../../../pa/dist/src/types.js';
 import { resolveTunableArgs, mergeTunableArgs, resolveWorkerLlm, resolveWorkerEffort, selectWorkerTunables } from '../../../pa/dist/src/lib/tunables.js';
+import type { TunableStore, TunableOverrides } from '../../../pa/dist/src/lib/tunables.js';
 import { loadSupportTopic } from '../../../pa/dist/src/lib/maintenance/jobs/daily-recon.js';
 import { redactSecrets } from '../../../pa/dist/src/lib/redact.js';
 import { logger } from '../../../pa/dist/src/lib/log.js';
+import { parseBotResource } from '../../../pa/dist/src/lib/turn-trace.js';
+import { listRows as listAuthRequestRows } from '../../../pa/dist/src/lib/auth/store.js';
 
 // Default bot working directory — same formula as main.ts's BOT_CWD (duplicated
 // rather than imported: main.ts is the composition root and must not be
@@ -81,6 +83,97 @@ export function buildDispatchExtraArgs(
   );
   const merged = mergeTunableArgs(baseArgs, tunableArgs);
   return merged.length > 0 ? merged : undefined;
+}
+
+/** Topic-tier-only extraArgs: tunable_defaults + an optional per-record model pin —
+ *  session tunable_overrides are deliberately excluded (executor lanes own no /llm
+ *  session). recordModel sits in the overrides slot = highest precedence, last-wins.
+ *  Evangelism WP-7 (OD-4): thread/task lanes honor TOPIC-tier tunable_defaults plus
+ *  a per-record `model`; the orchestrator's applySessionTunables:false divergence
+ *  is untouched — this helper is for the executor lanes only. */
+export function buildTopicTierExtraArgs(
+  topicDefaults: TunableStore | undefined,
+  recordModel: string | undefined,
+  worker: WorkerConfig | undefined,
+  baseArgs?: string[],
+): string[] | undefined {
+  const overrides: TunableOverrides | undefined = recordModel ? { model: recordModel } : undefined;
+  const tunableArgs = resolveTunableArgs(
+    worker,
+    overrides,
+    selectWorkerTunables(topicDefaults, worker?.name),
+  );
+  const merged = mergeTunableArgs(baseArgs, tunableArgs);
+  return merged.length > 0 ? merged : undefined;
+}
+
+/**
+ * Answer-provenance env (WS3, ledger schema v15, 2026-09-18): what the worker
+ * records about this dispatch via task_telemetry.py — PA_WORKER_CLI /
+ * PA_WORKER_MODEL / PA_WORKER_EFFORT become tasks.worker_cli/worker_model/
+ * worker_effort. Resolution mirrors buildTopicTierExtraArgs exactly: the
+ * record's model pin sits in the overrides slot (last-wins), topic
+ * tunable_defaults supply the rest.
+ *
+ * PER-HOP resolution (2026-09-18, per-hop env hook): the caller hands us the
+ * failover hop's own WorkerConfig via RunOptions.getEnv, so the recorded
+ * worker is the one that ACTUALLY ran — a failover stamps the hop's identity,
+ * not the first-chosen worker's. The CLI key always stamps (the hop's name is
+ * always known); model/effort resolve from the hop's real config and may stay
+ * absent → ledger NULL → the PWA chip fails open. Bonus correctness: getEnv
+ * lands in worker-exec AFTER runWithFailover's secret_allowlist filtering, so
+ * these keys survive workers whose static env is allowlist-stripped.
+ */
+export function buildWorkerProvenanceEnv(opts: {
+  worker: WorkerConfig;
+  topicDefaults: TunableStore | undefined;
+  recordModel: string | undefined;
+}): Record<string, string> {
+  const env: Record<string, string> = { PA_WORKER_CLI: opts.worker.name };
+  const slice = selectWorkerTunables(opts.topicDefaults, opts.worker.name);
+  const model = resolveWorkerLlm(opts.worker, opts.recordModel ? { model: opts.recordModel } : undefined, slice);
+  const effort = resolveWorkerEffort(opts.worker, undefined, slice);
+  if (model) env.PA_WORKER_MODEL = String(model);
+  if (effort) env.PA_WORKER_EFFORT = String(effort);
+  return env;
+}
+
+/**
+ * Turn-level routing provenance (router-metadata wave, 2026-09-20, decision 31):
+ * what a serving turn knows about HOW it was routed. `buildRoutingProvenanceEnv`
+ * is the vocabulary's ONE producer — the seven PA_ROUTING_* env keys the ledger's
+ * router_* columns read via task_telemetry.py (schema v16). Closed vocabulary per
+ * key; an optional fact is simply absent when it doesn't apply. NO turn text may
+ * ride any field — ids only in `target` (a ledger conversation id), enum words
+ * everywhere else (the mapping test guards this structurally).
+ */
+export interface TurnRoutingMeta {
+  decision: 'router' | 'ladder' | 'command';
+  placement?: 'continued-here' | 'diverted' | 'new-conversation' | 'split';
+  /** A ledger conversation id (vi-<12 hex>) — never a topic name, never text. */
+  target?: string;
+  steer?: 'steer' | 'wait';
+  /** Who decided the steer/wait (decision 30). Together-or-absent with `steer`:
+   *  the builder emits the steer keys ONLY when BOTH are set. */
+  steerBy?: 'router' | 'operator';
+  effortProj?: 'applied' | 'nearest' | 'recategorize';
+}
+
+/** The seven-key env bag (§1.1). Pure: optional facts omit their key; never an
+ *  empty string, never an out-of-vocabulary value. `PA_ROUTING_FAILOVERS` is
+ *  NOT produced here — the dispatch cascade appends it per hop (§1.3). */
+export function buildRoutingProvenanceEnv(m: TurnRoutingMeta): Record<string, string> {
+  const env: Record<string, string> = { PA_ROUTING_DECISION: m.decision };
+  if (m.placement) env.PA_ROUTING_PLACEMENT = m.placement;
+  if (m.target) env.PA_ROUTING_TARGET = m.target;
+  // Together-or-absent (§1.1): a steer fact is stamped only when BOTH the
+  // steer word and its decider are present.
+  if (m.steer && m.steerBy) {
+    env.PA_ROUTING_STEER = m.steer;
+    env.PA_ROUTING_STEER_BY = m.steerBy;
+  }
+  if (m.effortProj) env.PA_ROUTING_EFFORT_PROJ = m.effortProj;
+  return env;
 }
 
 export function syncModelStatusState(state: ConversationState, snapshot: ModelStatusSnapshot): void {
@@ -119,7 +212,6 @@ type RefreshCardFn = (
   threadId: number,
   state: ConversationState,
   effectiveDefault: string,
-  keepAwake?: KeepAwakeStatus,
   config?: { workers?: WorkerConfig[] }
 ) => Promise<void>;
 
@@ -155,7 +247,7 @@ export async function maybeUpdatePinnedStatusAfterDispatch(
     });
     syncModelStatusState(state, nextSnapshot);
     if (modelStatusNeedsRefresh(currentSnapshot, nextSnapshot) || !state.pinned_status_message_id) {
-      await refreshCard(token, chatId, threadId, state, effectiveDefault, getKeepAwakeStatus(), config);
+      await refreshCard(token, chatId, threadId, state, effectiveDefault, config);
     }
     return;
   }
@@ -171,13 +263,13 @@ export async function maybeUpdatePinnedStatusAfterDispatch(
     });
     syncModelStatusState(state, nextSnapshot);
     if (modelStatusNeedsRefresh(currentSnapshot, nextSnapshot) || !state.pinned_status_message_id) {
-      await refreshCard(token, chatId, threadId, state, effectiveDefault, getKeepAwakeStatus(), config);
+      await refreshCard(token, chatId, threadId, state, effectiveDefault, config);
     }
     return;
   }
 
   if (!state.pinned_status_message_id) {
-    await refreshCard(token, chatId, threadId, state, effectiveDefault, getKeepAwakeStatus(), config);
+    await refreshCard(token, chatId, threadId, state, effectiveDefault, config);
     return;
   }
 
@@ -209,6 +301,22 @@ export interface CascadeArgs {
   execute?: ExecuteSeam;
   failover?: FailoverSeam;
   capture?: CaptureSeam;
+  /** Decision 20: the router's full chain (chosen.worker first, entry 0
+   *  included — excludeWorkers already handles the failed default attempt).
+   *  Forwarded into runWithFailover ONLY when model_router.surfaces.fallback
+   *  === 'live' (spec-recheck M2: dark = the shadow line records the chain,
+   *  the failover seam receives NO candidateOrder, dispatch byte-identical). */
+  candidateOrder?: string[];
+  /** Decision 25: true when this is a router-decided (non-command) turn under
+   *  an effective deprecate_pins gate — the failover opts carry ignoreWorkerPin
+   *  so config.worker_pin reordering is skipped on this dispatch (spec §5). */
+  routedTurn?: boolean;
+  /** Router-metadata wave (2026-09-20, decision 31): the turn-level PA_ROUTING_*
+   *  env bag (buildRoutingProvenanceEnv's output) merged into every attempt
+   *  site's getEnv AFTER the per-hop worker provenance. Absent ⇒ only the
+   *  PA_WORKER_* keys stamp (fail-open; correction 1 closes the human-lane
+   *  PA_WORKER_* gap on every path regardless). */
+  routingEnv?: Record<string, string>;
 }
 
 export type CascadeOutcome =
@@ -287,8 +395,40 @@ export async function runDispatchCascade(args: CascadeArgs): Promise<CascadeOutc
   let rateLimitedWorker: string | undefined;
   const failedWorkers = new Set<string>();
   let lastFailedSession: { worker: string; sessionId: string } | undefined;
+  // Auth-prompt sentinel (auth broker Phase A, 2026-09-10, C6/D8): a broker
+  // row created at or after this instant means the worker raised a proper
+  // `pa auth request` sometime during this dispatch — snapshotted before any
+  // worker runs so the later "was a request minted?" check has a fixed start.
+  const dispatchStartedAt = new Date().toISOString();
   // (1) One config load, returned in the done outcome for the lane tails.
   const config = await loadConfig();
+  // Router-as-orchestrator gates (2026-09-19, spec §2.3/§5): the chain
+  // pass-through is SURFACE-gated (fallback 'live' — dark forwards nothing);
+  // ignoreWorkerPin rides the deprecate-pins gate (block present + enabled +
+  // not explicitly false) on routed turns — the two gates are independent.
+  const routerBlock = config.model_router;
+  const fallbackLive = routerBlock?.surfaces?.fallback === 'live';
+  const pinsDeprecated =
+    routerBlock !== undefined && routerBlock.enabled === true && routerBlock.deprecate_pins !== false;
+  const candidateOrder = fallbackLive ? args.candidateOrder : undefined;
+  const ignoreWorkerPin = pinsDeprecated && args.routedTurn === true ? true : undefined;
+
+  // Router-metadata wave (2026-09-20, correction 1): EVERY attempt site
+  // evaluates getEnv — the per-hop PA_WORKER_* provenance with the turn-level
+  // PA_ROUTING_* bag merged after it. Present even when routingEnv is
+  // undefined: the human lane previously stamped NO provenance at all (NULL
+  // ledger columns on the primary serving lane).
+  const hopEnv = (w: WorkerConfig): Record<string, string> => ({
+    ...buildWorkerProvenanceEnv({ worker: w, topicDefaults: state.tunable_defaults, recordModel: undefined }),
+    ...(args.routingEnv ?? {}),
+  });
+  // §1.3 failover count: failedWorkers (explicit resume/preferred/default
+  // attempts that failed) + onWorkerSwitch invocations (ladder attempts that
+  // failed before the hop that succeeded). The failover arm's getEnv appends
+  // PA_ROUTING_FAILOVERS so the SURVIVING hop records the count — incremented
+  // inside onWorkerSwitch, which runWithFailover awaits BEFORE the next hop's
+  // getEnv evaluates.
+  let failoverSwitches = 0;
 
   // (2) AI-092: /stop and /steer kill the worker running right now, so EVERY
   // attempt below has to consult the marker — the between-phase checks alone
@@ -327,8 +467,8 @@ export async function runDispatchCascade(args: CascadeArgs): Promise<CascadeOutc
       if (worker) {
         const prompt = await lane.buildResumed({ userText: args.userText, replyContext: args.replyContext, pendingDesc: args.pendingDesc, worker });
         const result = args.execute
-          ? await args.execute(worker, prompt, { cwd: args.workdir.dir, env: secrets, extraArgs: lane.applySessionTunables ? buildDispatchExtraArgs(state, worker, buildResumeArgs(activeSession)) : buildResumeArgs(activeSession), resource, updateId: args.updateId, agentName: activeSession.worker, contextId: args.contextId, isCancelled: isCancelledFn, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS })
-          : await executeWorker(worker, prompt, { cwd: args.workdir.dir, env: secrets, extraArgs: lane.applySessionTunables ? buildDispatchExtraArgs(state, worker, buildResumeArgs(activeSession)) : buildResumeArgs(activeSession), resource, updateId: args.updateId, agentName: activeSession.worker, contextId: args.contextId, isCancelled: isCancelledFn, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS });
+          ? await args.execute(worker, prompt, { cwd: args.workdir.dir, env: secrets, extraArgs: lane.applySessionTunables ? buildDispatchExtraArgs(state, worker, buildResumeArgs(activeSession)) : buildResumeArgs(activeSession), resource, updateId: args.updateId, agentName: activeSession.worker, contextId: args.contextId, isCancelled: isCancelledFn, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS, getEnv: hopEnv })
+          : await executeWorker(worker, prompt, { cwd: args.workdir.dir, env: secrets, extraArgs: lane.applySessionTunables ? buildDispatchExtraArgs(state, worker, buildResumeArgs(activeSession)) : buildResumeArgs(activeSession), resource, updateId: args.updateId, agentName: activeSession.worker, contextId: args.contextId, isCancelled: isCancelledFn, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS, getEnv: hopEnv });
         if (result.success) {
           dispatchResult = { result, worker: activeSession.worker, session: activeSession };
         } else if (!isCancelledFn()) {
@@ -361,8 +501,8 @@ export async function runDispatchCascade(args: CascadeArgs): Promise<CascadeOutc
           const priorCtx = lastFailedSession ? { ...lastFailedSession, sessionPath: getPriorSessionPath(lastFailedSession.worker, lastFailedSession.sessionId, args.workdir.dir) } : undefined;
           const prompt = await lane.buildFresh({ userText: args.userText, state, topicNames: args.topicNames, replyContext: args.replyContext, pendingDesc: args.pendingDesc, worker: preferredWorkerConfig, priorContext: priorCtx, workdir: args.workdir.tier === 'bot-cwd' ? undefined : { dir: args.workdir.dir, tier: args.workdir.tier } });
           const prefResult = args.execute
-            ? await args.execute(preferredWorkerConfig, prompt, { cwd: args.workdir.dir, env: secrets, extraArgs: buildDispatchExtraArgs(state, preferredWorkerConfig), resource, updateId: args.updateId, agentName: state.preferred_worker, contextId: args.contextId, isCancelled: isCancelledFn, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS })
-            : await executeWorker(preferredWorkerConfig, prompt, { cwd: args.workdir.dir, env: secrets, extraArgs: buildDispatchExtraArgs(state, preferredWorkerConfig), resource, updateId: args.updateId, agentName: state.preferred_worker, contextId: args.contextId, isCancelled: isCancelledFn, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS });
+            ? await args.execute(preferredWorkerConfig, prompt, { cwd: args.workdir.dir, env: secrets, extraArgs: buildDispatchExtraArgs(state, preferredWorkerConfig), resource, updateId: args.updateId, agentName: state.preferred_worker, contextId: args.contextId, isCancelled: isCancelledFn, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS, getEnv: hopEnv })
+            : await executeWorker(preferredWorkerConfig, prompt, { cwd: args.workdir.dir, env: secrets, extraArgs: buildDispatchExtraArgs(state, preferredWorkerConfig), resource, updateId: args.updateId, agentName: state.preferred_worker, contextId: args.contextId, isCancelled: isCancelledFn, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS, getEnv: hopEnv });
           if (prefResult.success) freshResult = { result: prefResult, worker: preferredWorkerConfig.name };
           else if (!isCancelledFn()) {
             if (lane.classifyFailures) {
@@ -387,8 +527,8 @@ export async function runDispatchCascade(args: CascadeArgs): Promise<CascadeOutc
           const priorCtxDef = lastFailedSession ? { ...lastFailedSession, sessionPath: getPriorSessionPath(lastFailedSession.worker, lastFailedSession.sessionId, args.workdir.dir) } : undefined;
           const prompt = await lane.buildFresh({ userText: args.userText, state, topicNames: args.topicNames, replyContext: args.replyContext, pendingDesc: args.pendingDesc, worker: defaultWorkerConfig, priorContext: priorCtxDef, workdir: args.workdir.tier === 'bot-cwd' ? undefined : { dir: args.workdir.dir, tier: args.workdir.tier } });
           const defResult = args.execute
-            ? await args.execute(defaultWorkerConfig, prompt, { cwd: args.workdir.dir, env: secrets, extraArgs: buildDispatchExtraArgs(state, defaultWorkerConfig), resource, updateId: args.updateId, agentName: defaultWorker, contextId: args.contextId, isCancelled: isCancelledFn, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS })
-            : await executeWorker(defaultWorkerConfig, prompt, { cwd: args.workdir.dir, env: secrets, extraArgs: buildDispatchExtraArgs(state, defaultWorkerConfig), resource, updateId: args.updateId, agentName: defaultWorker, contextId: args.contextId, isCancelled: isCancelledFn, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS });
+            ? await args.execute(defaultWorkerConfig, prompt, { cwd: args.workdir.dir, env: secrets, extraArgs: buildDispatchExtraArgs(state, defaultWorkerConfig), resource, updateId: args.updateId, agentName: defaultWorker, contextId: args.contextId, isCancelled: isCancelledFn, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS, getEnv: hopEnv })
+            : await executeWorker(defaultWorkerConfig, prompt, { cwd: args.workdir.dir, env: secrets, extraArgs: buildDispatchExtraArgs(state, defaultWorkerConfig), resource, updateId: args.updateId, agentName: defaultWorker, contextId: args.contextId, isCancelled: isCancelledFn, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS, getEnv: hopEnv });
           if (defResult.success) freshResult = { result: defResult, worker: defaultWorkerConfig.name };
           else if (!isCancelledFn()) {
             if (lane.classifyFailures) {
@@ -417,17 +557,26 @@ export async function runDispatchCascade(args: CascadeArgs): Promise<CascadeOutc
         resource,
         updateId: args.updateId,
         excludeWorkers: failedWorkers,
-        onWorkerSwitch: async (payload) => { if (args.onNotify) await args.onNotify(payload); },
+        onWorkerSwitch: async (payload) => {
+          failoverSwitches++;
+          if (lane.classifyFailures && payload.kind === 'rate-limit') {
+            rateLimitedWorker = rateLimitedWorker ?? payload.from;
+          }
+          if (args.onNotify) await args.onNotify(payload);
+        },
         checkAvailable: async (w) => !(await isWorkerCoolingDown(w.name)),
         preferredWorker: lane.failoverPreferredWorker(state, defaultWorker),
+        ...(candidateOrder ? { candidateOrder } : {}),
+        ...(ignoreWorkerPin ? { ignoreWorkerPin } : {}),
         contextId: args.contextId,
         isCancelled: isCancelledFn,
         harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS,
         ...(lane.applySessionTunables ? { getExtraArgs: (w: WorkerConfig) => buildDispatchExtraArgs(state, w) } : {}),
+        getEnv: (w: WorkerConfig) => ({ ...hopEnv(w), PA_ROUTING_FAILOVERS: String(failedWorkers.size + failoverSwitches) }),
       };
       freshResult = args.failover
         ? await args.failover(failoverPrompt, failoverOpts)
-        : await runWithFailover(failoverPrompt, { cwd: args.workdir.dir, env: secrets, resource, updateId: args.updateId, excludeWorkers: failedWorkers, onWorkerSwitch: failoverOpts.onWorkerSwitch, checkAvailable: failoverOpts.checkAvailable, preferredWorker: failoverOpts.preferredWorker, contextId: args.contextId, isCancelled: isCancelledFn, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS, ...(lane.applySessionTunables ? { getExtraArgs: (w: WorkerConfig) => buildDispatchExtraArgs(state, w) } : {}) });
+        : await runWithFailover(failoverPrompt, { cwd: args.workdir.dir, env: secrets, resource, updateId: args.updateId, excludeWorkers: failedWorkers, onWorkerSwitch: failoverOpts.onWorkerSwitch, checkAvailable: failoverOpts.checkAvailable, preferredWorker: failoverOpts.preferredWorker, ...(candidateOrder ? { candidateOrder } : {}), ...(ignoreWorkerPin ? { ignoreWorkerPin } : {}), contextId: args.contextId, isCancelled: isCancelledFn, harvestWindowMs: ORPHAN_HARVEST_WINDOW_MS, ...(lane.applySessionTunables ? { getExtraArgs: (w: WorkerConfig) => buildDispatchExtraArgs(state, w) } : {}), getEnv: (w: WorkerConfig) => ({ ...hopEnv(w), PA_ROUTING_FAILOVERS: String(failedWorkers.size + failoverSwitches) }) });
       // The cascade stopped because the caller cancelled. Return the same shape
       // as the other three cancellation exits — crucially with the session
       // UNCHANGED: a killed run's session id must not become the topic's.
@@ -439,6 +588,30 @@ export async function runDispatchCascade(args: CascadeArgs): Promise<CascadeOutc
       // successful result here would throw that answer away.
       if (!freshResult.result.success && isCancelledFn()) {
         return { kind: 'cancelled', session: maybeDropAgySession(state.session, resource, true) };
+      }
+      // AI-251: the failover made ZERO attempts because every candidate was
+      // cooling — nothing ran, so nothing was classified, but an all-cooling
+      // candidate set IS rate-limit evidence (the "all workers rate-limited"
+      // dead-end). Seed the requeue ladder's evidence flag from the cooldown
+      // state; a no-workers-available failure with any non-cooling candidate
+      // (a broken binary, a bad config) keeps today's immediate error reply.
+      if (!freshResult.result.success
+          && freshResult.result.error === NO_WORKERS_AVAILABLE_ERROR
+          && lane.classifyFailures) {
+        const cooling = await getCooldownStatus().catch(() => ({} as Record<string, { cooldown_until: string }>));
+        const nowMs = Date.now();
+        const coolingNow = new Set(
+          Object.entries(cooling)
+            .filter(([, e]) => {
+              const t = new Date(e.cooldown_until).getTime();
+              return Number.isFinite(t) && t > nowMs;
+            })
+            .map(([name]) => name)
+        );
+        const allCooling = config.workers.length > 0
+          && config.workers.every((w) => failedWorkers.has(w.name) || coolingNow.has(w.name) || w.manual_only);
+        const firstCooling = config.workers.find((w) => coolingNow.has(w.name));
+        if (allCooling && firstCooling) rateLimitedWorker = rateLimitedWorker ?? firstCooling.name;
       }
     }
 
@@ -453,6 +626,17 @@ export async function runDispatchCascade(args: CascadeArgs): Promise<CascadeOutc
     if (freshResult.result.rawTelegramSends?.length) {
       alertRawTelegramSends(secrets, freshResult.worker, freshResult.result.sessionId, freshResult.result.rawTelegramSends)
         .catch((err) => logger.warn('dispatch', `raw-send alert failed: ${(err as Error).message}`, { worker: freshResult.worker }));
+    }
+    // Auth-prompt sentinel (auth broker Phase A, 2026-09-10, C6/D8): after the
+    // fresh result is fully settled, fire ONE best-effort nudge into the same
+    // topic if this run's output looked auth-shaped but no broker request was
+    // minted. Never awaited into the reply path.
+    if (freshResult.result.authPrompts?.length) {
+      const bot = parseBotResource(resource);
+      if (bot) {
+        nudgeAuthPrompt({ secrets, sinceIso: dispatchStartedAt }, freshResult.result, bot.chatId, bot.threadId)
+          .catch((err) => logger.warn('dispatch', `auth nudge failed: ${(err as Error).message}`, { worker: freshResult.worker }));
+      }
     }
     dispatchResult = { ...freshResult, session: newSession };
   }
@@ -512,6 +696,56 @@ async function alertRawTelegramSends(
   await sendMessage(token, support.chatId, text, undefined, support.threadId);
 }
 
+/**
+ * The auth-prompt nudge's exact user-facing text (auth broker Phase A,
+ * 2026-09-10 build spec §5 WP-G, G-E4). Byte-identical to the spec — do not
+ * edit without a spec change.
+ */
+export const AUTH_PROMPT_NUDGE_TEXT =
+  'Your last turn printed something that looks like an authorization step (a link, a code to enter, or a paste prompt), but no auth request was raised. Do not stall and do not ask here: run pa auth request with the shape, then pa auth wait, and re-run the tool non-interactively with the value.';
+
+export interface NudgeAuthPromptDeps {
+  secrets: Record<string, string>;
+  /** ISO timestamp marking the start of this dispatch (before any worker
+   *  ran). A broker row created at or after this instant means the worker
+   *  already raised a `pa auth request` during this turn. */
+  sinceIso: string;
+  /** Injected for tests. Real default: pa/src/lib/auth/store.ts's listRows()
+   *  (the WP-D broker store's own exported reader — never a second parser),
+   *  filtered to rows created at/after sinceIso. */
+  recentAuthRequestsFn?: (sinceIso: string) => number;
+  /** Injected for tests. Real default: telegram.js's sendMessage. */
+  sendFn?: typeof sendMessage;
+}
+
+function defaultRecentAuthRequests(sinceIso: string): number {
+  return listAuthRequestRows().filter((row) => row.created_at >= sinceIso).length;
+}
+
+/**
+ * One best-effort nudge into the same topic when a worker turn's raw stdout
+ * looked auth-shaped (auth broker Phase A, 2026-09-10, C6/D8) but no broker
+ * request was minted during this dispatch. Fail-silent by contract, same as
+ * alertRawTelegramSends: a failed nudge must never block or alter the
+ * delivered reply. Fires at most once per dispatch. Never logs the matched
+ * line's full text — only the kind (`authPrompts`) and a count, never the
+ * content, which could carry a device code or URL token.
+ */
+export async function nudgeAuthPrompt(
+  deps: NudgeAuthPromptDeps,
+  result: CommandResult,
+  chatId: number,
+  threadId: number
+): Promise<void> {
+  if (!result.authPrompts?.length) return;
+  const recentFn = deps.recentAuthRequestsFn ?? defaultRecentAuthRequests;
+  if (recentFn(deps.sinceIso) > 0) return;
+  const token = deps.secrets['TELEGRAM_BOT_TOKEN'];
+  if (!token) return;
+  const send = deps.sendFn ?? sendMessage;
+  await send(token, chatId, AUTH_PROMPT_NUDGE_TEXT, undefined, threadId || undefined);
+}
+
 export async function dispatchMessage(
   userText: string,
   replyContext: string | undefined,
@@ -525,6 +759,16 @@ export async function dispatchMessage(
   updateId?: number,
   workdir?: TopicWorkdir,
   contextId?: string,
+  /** Decision 20: the routed turn's full chain — forwarded into CascadeArgs
+   *  verbatim (runDispatchCascade applies the fallback-surface gate itself).
+   *  WP-5 integrator seam: dispatchMessage was the missing producer leg. */
+  candidateOrder?: string[],
+  /** Decision 25: true on a router-decided turn under an effective
+   *  deprecate-pins gate — forwarded into CascadeArgs unchanged. */
+  routedTurn?: boolean,
+  /** Router-metadata wave (2026-09-20): the turn-level PA_ROUTING_* env bag —
+   *  forwarded into CascadeArgs.routingEnv verbatim. */
+  routingEnv?: Record<string, string>,
 ): Promise<{
   response: string;
   session: SessionInfo | undefined;
@@ -558,6 +802,9 @@ export async function dispatchMessage(
     lane, state, secrets, resource, defaultWorker, topicNames, onNotify, updateId,
     workdir: workdir ?? { dir: BOT_CWD, tier: 'bot-cwd' },
     contextId, userText, replyContext, pendingDesc,
+    ...(candidateOrder !== undefined ? { candidateOrder } : {}),
+    ...(routedTurn !== undefined ? { routedTurn } : {}),
+    ...(routingEnv !== undefined ? { routingEnv } : {}),
   });
   if (outcome.kind === 'cancelled') {
     return { response: '', session: outcome.session, meta: null, workerError: true };
@@ -577,5 +824,11 @@ export async function dispatchMessage(
   // Only report a dispatchedWorker when it actually succeeded — on full cascade
   // exhaustion, `workerName` is the last worker tried, which still failed. Reporting
   // it here would make main.ts's caller pin the status card to a broken worker.
+  // AI-234: sanitize suggested_items (fail-open drops non-plain chips) — one
+  // more pure pass on the envelope before returning, mirroring the orchestrator.
+  if (meta) {
+    const sanitizedItems = sanitizeSuggestedItems(meta.suggested_items);
+    meta.suggested_items = sanitizedItems.length > 0 ? sanitizedItems : undefined;
+  }
   return { response: buildWorkerResponse({ ...result, output: deliverable }, workerName), session: capturedSession, meta, rateLimitedWorker: outcome.rateLimitedWorker, dispatchedWorker: result.success ? workerName : undefined, rateLimitTelemetry: result.rateLimitTelemetry, workerError: result.success ? undefined : true };
 }

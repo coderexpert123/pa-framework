@@ -7,7 +7,14 @@ import assert from 'node:assert/strict';
 import { platform, homedir } from 'os';
 import { join } from 'path';
 import { createTempPaHome, cleanup } from './helpers.js';
-import { resolveWindowsPaPath, resolvePosixPaPath, scheduledTaskName } from '../src/scheduler.js';
+import {
+  resolveWindowsPaPath,
+  resolvePosixPaPath,
+  scheduledTaskName,
+  buildCatchupWatchdogCronLine,
+  buildCatchupWatchdogShScript,
+  shSingleQuote,
+} from '../src/scheduler.js';
 
 let tempDir: string;
 
@@ -51,20 +58,22 @@ function upsertCronLines(
   return updated;
 }
 
-// Default catchup cadence matches Windows (every minute) as of 2026-07-10 —
-// catchup is lock-guarded, so the tighter cadence just means overdue skills
-// are caught sooner, not duplicated. Was */15 * * * *.
+// 2026-09-10 launch-cadence wave: ONE managed line — the watchdog-gated
+// `catchup --loop`, the POSIX twin of S1 (`kill -0` is a shell builtin, so
+// the healthy path spawns nothing beyond the shell cron already starts).
+// Replaces the two-line `--topic reminders` / bare `catchup` pair.
+const LOCK_PATH = '/home/user/.pa/catchup-loop.lock';
+const LOOP_CRON_LINE = `* * * * * /bin/sh '/home/user/.pa/run-catchup-watchdog.sh'`;
+const REMINDERS_SENTINEL = '# PA-Catchup-Reminders (managed by pa schedules sync)';
+const CATCHUP_SENTINEL = '# PA-Catchup (managed by pa schedules sync)';
 const ENTRIES = [
-  { sentinel: '# PA-Catchup-Reminders (managed by pa schedules sync)', line: '* * * * * pa catchup --topic reminders' },
-  { sentinel: '# PA-Catchup (managed by pa schedules sync)',            line: '* * * * * pa catchup' },
+  { sentinel: CATCHUP_SENTINEL, line: LOOP_CRON_LINE },
 ];
 
 describe('POSIX crontab upsert logic', () => {
-  it('appends both entries to an empty crontab', () => {
+  it('appends the single loop entry to an empty crontab', () => {
     const result = upsertCronLines('', ENTRIES);
-    assert.ok(result.includes('* * * * * pa catchup --topic reminders'));
-    assert.ok(result.includes('* * * * * pa catchup'));
-    assert.ok(result.includes('PA-Catchup-Reminders'));
+    assert.ok(result.includes(LOOP_CRON_LINE));
     assert.ok(result.includes('PA-Catchup (managed'));
   });
 
@@ -72,29 +81,21 @@ describe('POSIX crontab upsert logic', () => {
     const existing = '0 9 * * 1 /usr/local/bin/weekly-report\n';
     const result = upsertCronLines(existing, ENTRIES);
     assert.ok(result.startsWith('0 9 * * 1 /usr/local/bin/weekly-report\n'));
-    assert.ok(result.includes('* * * * * pa catchup --topic reminders'));
-    assert.ok(result.includes('* * * * * pa catchup'));
+    assert.ok(result.includes(LOOP_CRON_LINE));
   });
 
-  it('replaces existing PA lines in-place (no duplicates)', () => {
+  it('replaces an existing PA line in-place (no duplicates)', () => {
     const existing =
       '0 9 * * 1 /usr/local/bin/weekly-report\n' +
-      '# PA-Catchup-Reminders (managed by pa schedules sync)\n' +
-      '* * * * * pa-old catchup --topic reminders\n' +
-      '# PA-Catchup (managed by pa schedules sync)\n' +
+      `${CATCHUP_SENTINEL}\n` +
       '*/30 * * * * pa-old catchup\n';
     const result = upsertCronLines(existing, ENTRIES);
-    // Old lines replaced
+    // Old line replaced
     assert.ok(!result.includes('pa-old'));
     assert.ok(!result.includes('*/30'));
-    // New lines present exactly once. The `$` anchor matters: the reminders
-    // line ends in "--topic reminders", so it can't accidentally satisfy the
-    // catchup-line count now that both share the "* * * * * pa catchup"
-    // prefix (they didn't before the cadence unification).
-    const remindersCount = (result.match(/\* \* \* \* \* pa catchup --topic reminders/g) ?? []).length;
-    const catchupCount = (result.match(/\* \* \* \* \* pa catchup$/mg) ?? []).length;
-    assert.equal(remindersCount, 1);
-    assert.equal(catchupCount, 1);
+    // New line present exactly once
+    const count = (result.match(/\/bin\/sh '\/home\/user\/\.pa\/run-catchup-watchdog\.sh'$/mg) ?? []).length;
+    assert.equal(count, 1);
     // Existing non-PA line preserved
     assert.ok(result.includes('0 9 * * 1 /usr/local/bin/weekly-report'));
   });
@@ -102,18 +103,265 @@ describe('POSIX crontab upsert logic', () => {
   it('handles crontab with no trailing newline', () => {
     const existing = '0 1 * * * /usr/bin/some-job';
     const result = upsertCronLines(existing, ENTRIES);
-    assert.ok(result.includes('\n# PA-Catchup-Reminders'));
-    assert.ok(!result.includes('some-job# PA'));
+    assert.ok(result.includes(`\n${CATCHUP_SENTINEL}`));
+    assert.ok(!result.includes(`some-job${CATCHUP_SENTINEL}`));
   });
 
   it('sentinels are escaped correctly (no regex injection)', () => {
-    // Sentinel contains characters that could break an unescaped regex
-    const trickySentinel = '# PA-Catchup (managed by pa schedules sync)';
-    const entries = [{ sentinel: trickySentinel, line: '* * * * * pa catchup' }];
-    const existing = `${trickySentinel}\n* * * * * pa catchup\n`;
-    const result = upsertCronLines(existing, entries);
+    // Sentinel contains parens, which could break an unescaped regex
+    const existing = `${CATCHUP_SENTINEL}\n${LOOP_CRON_LINE}\n`;
+    const result = upsertCronLines(existing, ENTRIES);
     // Should replace, not duplicate
-    const count = (result.match(/\* \* \* \* \* pa catchup$/mg) ?? []).length;
+    const count = (result.match(/\/bin\/sh '\/home\/user\/\.pa\/run-catchup-watchdog\.sh'$/mg) ?? []).length;
+    assert.equal(count, 1);
+  });
+
+  it('buildCatchupWatchdogCronLine runs the generated script through /bin/sh with a single-quoted path', () => {
+    assert.equal(buildCatchupWatchdogCronLine('/home/user/.pa/run-catchup-watchdog.sh'), LOOP_CRON_LINE);
+    assert.equal(
+      buildCatchupWatchdogCronLine("/home/o'neil/.pa/w.sh"),
+      "* * * * * /bin/sh '/home/o'\\''neil/.pa/w.sh'"
+    );
+  });
+
+  // 2026-09-12 stuck-loop incident: `kill -0` alone proved the PID was alive,
+  // not that its event loop was still turning — a frozen-but-alive loop ran
+  // silently for 7.5h before self-recovering. buildCatchupWatchdogCronLine
+  // is the actual generator these tests exercise directly (unlike
+  // LOOP_CRON_LINE above, a hand-written literal used only to test the
+  // upsert/sentinel logic).
+  describe('buildCatchupWatchdogShScript (POSIX lane-progress watchdog)', () => {
+    const paPath = '/usr/local/bin/pa';
+    const paths = {
+      lockPath: LOCK_PATH,
+      lanesDir: '/home/user/.pa/catchup-lanes',
+      stallMarkerPath: '/home/user/.pa/catchup-loop.stalled',
+      stallRecordsPath: '/home/user/.pa/stall-records.jsonl',
+      pageBodyPath: '/home/user/.pa/catchup-loop-page.txt',
+    };
+    const minutes = 5;
+
+    it('matches the golden script text', () => {
+      const script = buildCatchupWatchdogShScript(paPath, paths, minutes);
+      const EXPECTED = [
+        `#!/bin/sh`,
+        `# Generated by pa schedules sync; edits are overwritten on the next sync.`,
+        `L=${shSingleQuote(paths.lockPath)}`,
+        `D=${shSingleQuote(paths.lanesDir)}`,
+        `M=${shSingleQuote(paths.stallMarkerPath)}`,
+        `R=${shSingleQuote(paths.stallRecordsPath)}`,
+        `B=${shSingleQuote(paths.pageBodyPath)}`,
+        `PA=${shSingleQuote(paPath)}`,
+        `N=${minutes}`,
+        `W=$PA_CATCHUP_KILL_EXIT_WAIT_S`,
+        `case "$W" in`,
+        `  ''|*[!0-9]*|0*|?????*) W=120 ;;`,
+        `esac`,
+        `: "\${UV_THREADPOOL_SIZE:=16}"`,
+        `export UV_THREADPOOL_SIZE`,
+        ``,
+        `# Appends "; <marker>" to C and deletes the loop's store-stall marker, if any.`,
+        `append_marker() {`,
+        `  if [ -f "$M" ]; then`,
+        `    MK=$(head -n 1 "$M" 2>/dev/null)`,
+        `    rm -f "$M"`,
+        `    C="$C; \${MK:-store stall}"`,
+        `  fi`,
+        `}`,
+        ``,
+        `# Appends one JSON line of launcher evidence for PID $1 with store label $2.`,
+        `record() {`,
+        `  J=$(printf '%s' "$C" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')`,
+        `  printf '{"ts":"%s","pid":%s,"host":"launcher","store":"%s","cause":"%s"}\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "$J" >> "$R"`,
+        `}`,
+        ``,
+        `# True while PID $1 is still the catchup loop. A zombie, or a PID that now runs`,
+        `# another command line, reads as exited; when ps reports nothing, kill -0 decides.`,
+        `loop_alive() {`,
+        `  Z=$(ps -p "$1" -o stat= 2>/dev/null)`,
+        `  if [ -z "$Z" ]; then`,
+        `    kill -0 "$1" 2>/dev/null && return 0`,
+        `    return 1`,
+        `  fi`,
+        `  case "$Z" in`,
+        `    *Z*) return 1 ;;`,
+        `  esac`,
+        `  case "$(ps -p "$1" -o args= 2>/dev/null)" in`,
+        `    ''|*catchup*--loop*) return 0 ;;`,
+        `  esac`,
+        `  return 1`,
+        `}`,
+        ``,
+        `C=`,
+        `O=`,
+        `V=error`,
+        `K=catchup-loop-stalled`,
+        `P=$(cat "$L" 2>/dev/null)`,
+        `if [ -n "$P" ]; then`,
+        `  A=$(ps -p "$P" -o args= 2>/dev/null)`,
+        `  case "$A" in`,
+        `    ''|*catchup*--loop*) ;;`,
+        `    *) O=$P; P= ;;`,
+        `  esac`,
+        `fi`,
+        `if [ -n "$P" ] && kill -0 "$P" 2>/dev/null; then`,
+        `  if [ -n "$(find "$L" -mmin +"$N" 2>/dev/null)" ]; then`,
+        `    C='heartbeat stale'`,
+        `  else`,
+        `    for lane in default reminders maintenance; do`,
+        `      f="$D/$lane"`,
+        `      if [ ! -f "$f" ] || [ -n "$(find "$f" -mmin +"$N" 2>/dev/null)" ]; then`,
+        `        S=$(awk -F'|' 'NR==1 && NF>=3 { s=" at " $3; if (NF>=4 && $4 != "") s=s ": " $4; printf "%s", s }' "$f" 2>/dev/null)`,
+        `        C="lane $lane stale$S"`,
+        `        break`,
+        `      fi`,
+        `    done`,
+        `  fi`,
+        `  [ -z "$C" ] && exit 0`,
+        `  append_marker`,
+        `  record "$P" lane-progress`,
+        `  kill -9 "$P" 2>/dev/null`,
+        `  T=0`,
+        `  while loop_alive "$P"; do`,
+        `    if [ "$T" -ge "$W" ]; then`,
+        `      C="$C; killed catchup loop did not exit within $W s; relaunched anyway - a stale write may land"`,
+        `      break`,
+        `    fi`,
+        `    sleep 2`,
+        `    T=$((T + 2))`,
+        `  done`,
+        `elif [ -n "$O" ]; then`,
+        `  C='catchup loop was not running (recorded PID now belongs to another process); relaunched'`,
+        `  append_marker`,
+        `  record "$O" pid-reused`,
+        `  V=warn`,
+        `  K=catchup-loop-pid-reused`,
+        `elif [ -f "$M" ]; then`,
+        `  MK=$(head -n 1 "$M" 2>/dev/null)`,
+        `  rm -f "$M"`,
+        `  C="\${MK:-store stall}"`,
+        `fi`,
+        `if [ -n "$C" ]; then`,
+        `  printf '%s\\nCause: %s\\n' 'Catchup loop restarted by its watchdog.' "$C" > "$B"`,
+        `  "$PA" notify --subject 'Catchup loop restarted' --body-file "$B" --dedup-key "$K" --severity "$V" >/dev/null 2>&1 &`,
+        `fi`,
+        `exec "$PA" catchup --loop`,
+      ].join('\n') + '\n';
+      assert.equal(script, EXPECTED);
+    });
+
+    it('kills only a live PID whose heartbeat or lane file is stale, after recording evidence', () => {
+      const script = buildCatchupWatchdogShScript(paPath, paths, minutes);
+      const iGate = script.indexOf('if [ -n "$P" ] && kill -0 "$P" 2>/dev/null; then');
+      const iExit = script.indexOf('[ -z "$C" ] && exit 0');
+      const iRecord = script.indexOf('record "$P" lane-progress');
+      const iKill = script.indexOf('kill -9 "$P" 2>/dev/null');
+      const iElif = script.indexOf('elif [ -n "$O" ]; then');
+      assert.ok(iGate >= 0 && iGate < iExit);
+      assert.ok(iExit < iRecord);
+      assert.ok(iRecord < iKill);
+      assert.ok(iKill < iElif);
+    });
+
+    it('checks the heartbeat first, then each lane in order', () => {
+      const script = buildCatchupWatchdogShScript(paPath, paths, minutes);
+      const iHeartbeat = script.indexOf('find "$L" -mmin +"$N"');
+      const iLanes = script.indexOf('for lane in default reminders maintenance; do');
+      assert.ok(iHeartbeat >= 0 && iHeartbeat < iLanes);
+    });
+
+    it('a dead PID with a stall marker pages without a kill', () => {
+      const script = buildCatchupWatchdogShScript(paPath, paths, minutes);
+      const start = script.indexOf('elif [ -f "$M" ]; then');
+      const end = script.indexOf('fi\n', start);
+      const body = script.slice(start, end);
+      assert.ok(body.includes('C="${MK:-store stall}"'));
+      assert.ok(!body.includes('kill'));
+    });
+
+    it('pages in the background, then execs the loop as the last line', () => {
+      const script = buildCatchupWatchdogShScript(paPath, paths, minutes);
+      const nonEmpty = script.split('\n').filter((l) => l.length > 0);
+      assert.equal(nonEmpty[nonEmpty.length - 1], 'exec "$PA" catchup --loop');
+      const notifyLine = script.split('\n').find((l) => l.includes(' notify --subject '));
+      assert.ok(notifyLine?.endsWith('>/dev/null 2>&1 &'));
+    });
+
+    it('defaults UV_THREADPOOL_SIZE to 16 without overriding a set value', () => {
+      const script = buildCatchupWatchdogShScript(paPath, paths, minutes);
+      assert.ok(script.includes(': "${UV_THREADPOOL_SIZE:=16}"'));
+    });
+
+    it('single-quotes every baked path', () => {
+      const script = buildCatchupWatchdogShScript(paPath, { ...paths, lockPath: "/home/o'neil/.pa/catchup-loop.lock" }, minutes);
+      assert.ok(script.includes(`L='/home/o'\\''neil/.pa/catchup-loop.lock'`));
+    });
+
+    it('clears the PID when ps reports a command line that is not the catchup loop', () => {
+      const script = buildCatchupWatchdogShScript(paPath, paths, minutes);
+      const iArgs = script.indexOf('A=$(ps -p "$P" -o args= 2>/dev/null)');
+      const iCase = script.indexOf("''|*catchup*--loop*) ;;");
+      const iClear = script.indexOf('*) O=$P; P= ;;');
+      const iGate = script.indexOf('if [ -n "$P" ] && kill -0 "$P" 2>/dev/null; then');
+      assert.ok(iArgs >= 0 && iArgs < iCase);
+      assert.ok(iCase < iClear);
+      assert.ok(iClear < iGate);
+    });
+
+    it('the script waits for the killed PID to exit before relaunching, bounded by PA_CATCHUP_KILL_EXIT_WAIT_S', () => {
+      const script = buildCatchupWatchdogShScript(paPath, paths, minutes);
+      assert.ok(script.includes('W=$PA_CATCHUP_KILL_EXIT_WAIT_S'));
+      assert.ok(script.includes(`  ''|*[!0-9]*|0*|?????*) W=120 ;;`));
+      const iKill = script.indexOf('kill -9 "$P" 2>/dev/null');
+      const iWhile = script.indexOf('while loop_alive "$P"; do');
+      const iGe = script.indexOf('if [ "$T" -ge "$W" ]; then');
+      const iCause = script.indexOf('C="$C; killed catchup loop did not exit within $W s; relaunched anyway - a stale write may land"');
+      const iSleep = script.indexOf('sleep 2');
+      const iElif = script.indexOf('elif [ -n "$O" ]; then');
+      assert.ok(iKill >= 0 && iKill < iWhile);
+      assert.ok(iWhile < iGe);
+      assert.ok(iGe < iCause);
+      assert.ok(iCause < iSleep);
+      assert.ok(iSleep < iElif);
+    });
+
+    it('loop_alive reads a zombie or a reused PID as exited and lets kill -0 decide when ps is silent', () => {
+      const script = buildCatchupWatchdogShScript(paPath, paths, minutes);
+      const start = script.indexOf('loop_alive() {');
+      const end = script.indexOf('\n}\n', start);
+      const body = script.slice(start, end);
+      assert.ok(body.includes('  Z=$(ps -p "$1" -o stat= 2>/dev/null)'));
+      assert.ok(body.includes('    kill -0 "$1" 2>/dev/null && return 0'));
+      assert.ok(body.includes('    *Z*) return 1 ;;'));
+      assert.ok(body.includes(`    ''|*catchup*--loop*) return 0 ;;`));
+      assert.ok(body.indexOf('stat=') < body.indexOf('kill -0'));
+    });
+
+    it('the script records a reused PID once as catchup-loop-pid-reused at warn without any kill', () => {
+      const script = buildCatchupWatchdogShScript(paPath, paths, minutes);
+      const start = script.indexOf('elif [ -n "$O" ]; then');
+      const end = script.indexOf('elif [ -f "$M" ]; then');
+      const body = script.slice(start, end);
+      assert.ok(body.includes(`  C='catchup loop was not running (recorded PID now belongs to another process); relaunched'`));
+      assert.ok(body.includes('  append_marker'));
+      assert.ok(body.includes('  record "$O" pid-reused'));
+      assert.ok(body.includes('  V=warn'));
+      assert.ok(body.includes('  K=catchup-loop-pid-reused'));
+      assert.ok(!body.includes('kill'));
+      const iV = script.indexOf('V=error');
+      const iK = script.indexOf('K=catchup-loop-stalled');
+      const iP = script.indexOf('P=$(cat "$L" 2>/dev/null)');
+      assert.ok(iV >= 0 && iV < iP);
+      assert.ok(iK >= 0 && iK < iP);
+    });
+  });
+
+  it('a legacy PA-Catchup-Reminders block survives the upsert untouched', () => {
+    const existing = `${REMINDERS_SENTINEL}\n* * * * * pa catchup --topic reminders\n`;
+    const result = upsertCronLines(existing, ENTRIES);
+    assert.ok(result.includes(REMINDERS_SENTINEL));
+    assert.ok(result.includes('* * * * * pa catchup --topic reminders'));
+    const count = (result.match(/\/bin\/sh '\/home\/user\/\.pa\/run-catchup-watchdog\.sh'$/mg) ?? []).length;
     assert.equal(count, 1);
   });
 });

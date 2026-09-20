@@ -15,7 +15,8 @@
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { tools, pa_ref_lookup, pa_claims, pa_maintenance_status, pa_costs, pa_slo_report, pa_recall } from './tools.js';
+import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { tools, pa_ref_lookup, pa_claims, pa_maintenance_status, pa_costs, pa_slo_report, pa_recall, bus_send, bus_inbox, bus_wait, bus_list, bus_whoami } from './tools.js';
 
 /**
  * Create and start the MCP server.
@@ -34,7 +35,7 @@ async function main() {
   );
 
   // Register tool handlers
-  server.setRequestHandler(tools, async (request) => {
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const toolName = request.params.name;
     const args = request.params.arguments ?? {};
 
@@ -58,6 +59,21 @@ async function main() {
           break;
         case 'pa_recall':
           result = await pa_recall.handler(args);
+          break;
+        case 'bus_send':
+          result = await bus_send.handler(args);
+          break;
+        case 'bus_inbox':
+          result = await bus_inbox.handler(args);
+          break;
+        case 'bus_wait':
+          result = await bus_wait.handler(args);
+          break;
+        case 'bus_list':
+          result = await bus_list.handler(args);
+          break;
+        case 'bus_whoami':
+          result = await bus_whoami.handler(args);
           break;
         default:
           throw new Error(`Unknown tool: ${toolName}`);
@@ -103,9 +119,6 @@ async function main() {
   // Server is now listening on stdin/stdout
   // Process stays alive until the stdin stream closes
 }
-
-// Import the schema we need
-import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
 main().catch((error) => {
   console.error('Fatal error starting MCP server:', error);

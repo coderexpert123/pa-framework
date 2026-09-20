@@ -18,6 +18,12 @@ describe('DEPLOYMENT_ENV_SCRUB', () => {
       );
     }
   });
+
+  it('scrubs the TypeSafe key and base URL so no test reaches the live API', () => {
+    for (const name of ['TYPESAFE_API_KEY', 'TYPESAFE_BASE_URL']) {
+      assert.ok(DEPLOYMENT_ENV_SCRUB.includes(name), `${name} must be scrubbed from suite spawns`);
+    }
+  });
 });
 
 describe('stripDeploymentEnv', () => {

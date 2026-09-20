@@ -48,8 +48,8 @@ no_fallback: true             # don't failover (use with worker:)
 cmd: "python run.py"          # direct command — bypasses LLM
 timeout: 1800                 # seconds; default 3600
 idle_timeout: 120             # seconds without stdout before kill; default 300
-inject_triggers: false        # inject other skills' trigger_descriptions
-trigger_description: "Run when X..."  # used by other skills for chaining
+inject_triggers: false        # inject other skills' trigger_descriptions (the pa run catalog switch — no shipped skill sets it)
+trigger_description: "Run when X..."  # used by other skills for chaining; also the roster text on run_skill-bearing lanes
 telegram_output:              # optional — deliver output to Telegram
   chat_id: '${TELEGRAM_CHAT_ID}'
   thread_id: 0
@@ -94,6 +94,8 @@ Output a Markdown summary with a single recommendation: "good week for outdoor",
 ```
 
 The worker (codex) receives the body as its prompt. Its output is captured and routed to Telegram via the `telegram_output` envelope. No script involved.
+
+`pa run` also appends a `## PA runtime (this run)` block to every LLM-worker prompt automatically — it names the operator-facing commands (`pa ping`, `pa notify --topic-thread`, `pa watch add`, `pa topic-task add`, `pa ref`, `pa health`/`pa doctor`, `pa recall`, `pa claims`). No frontmatter needed; `PA_RUNTIME_BLOCK_DISABLED=1` rolls it off.
 
 ### Hybrid (subprocess + LLM)
 

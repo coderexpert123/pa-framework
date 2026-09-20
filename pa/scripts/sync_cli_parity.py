@@ -38,9 +38,13 @@ Usage:
     gemini        ~/.gemini/GEMINI.md (classic Gemini CLI)
     agy           ~/.gemini/antigravity-cli/GEMINI.md AND AGY.md (Antigravity)
     codex         ~/.codex/instructions.md (Codex CLI)
+    devin         %APPDATA%/devin/AGENTS.md (Devin CLI; ~/.config fallback)
+    opencode      ~/.config/opencode/AGENTS.md (opencode)
   skill catalogs (mirrors of the portable subset of ~/.claude/skills/)
     skills        ~/.gemini/config/skills/   (shared: Gemini CLI + Antigravity)
     codex-skills  ~/.codex/skills/           (Codex CLI)
+    devin-skills  %APPDATA%/devin/skills/    (Devin CLI; `loop` excluded —
+                  Devin has a native /loop it must not shadow)
 """
 import argparse
 import difflib
@@ -53,11 +57,30 @@ GEMINI_MD_PATH = os.path.expanduser("~/.gemini/GEMINI.md")
 AGY_DIR = os.path.expanduser("~/.gemini/antigravity-cli")
 AGY_TARGET_PATHS = [os.path.join(AGY_DIR, "GEMINI.md"), os.path.join(AGY_DIR, "AGY.md")]
 CODEX_INSTRUCTIONS_PATH = os.path.expanduser("~/.codex/instructions.md")
+OPENCODE_AGENTS_MD = os.path.expanduser("~/.config/opencode/AGENTS.md")
+
+# Devin CLI's global brain and skill paths are Windows-%APPDATA%-first, falling
+# back to ~/.config on other platforms so the module is importable everywhere.
+_DEVIN_BASE = os.environ.get("APPDATA") or os.path.expanduser("~/.config")
+DEVIN_AGENTS_MD = os.path.join(_DEVIN_BASE, "devin", "AGENTS.md")
+DEVIN_SKILLS_DIR = os.path.join(_DEVIN_BASE, "devin", "skills")
+
+# Bus protocol doc — mirrored to each CLI's rules directory as bus.md.
+BUS_DOC_SOURCE = os.path.join(os.path.dirname(__file__), '..', 'docs', 'bus.md')
+BUS_DOC_TARGETS = {
+    'gemini': os.path.expanduser('~/.gemini/bus.md'),
+    'agy': os.path.join(AGY_DIR, 'bus.md'),
+    'codex': os.path.expanduser('~/.codex/bus.md'),
+    'devin': os.path.join(_DEVIN_BASE, 'devin', 'bus.md'),
+    'opencode': os.path.expanduser('~/.config/opencode/bus.md'),
+}
 
 TARGETS = {
     "gemini": [GEMINI_MD_PATH],
     "agy": AGY_TARGET_PATHS,
     "codex": [CODEX_INSTRUCTIONS_PATH],
+    "devin": [DEVIN_AGENTS_MD],
+    "opencode": [OPENCODE_AGENTS_MD],
 }
 
 CLAUDE_SKILLS_DIR = os.path.expanduser("~/.claude/skills")
@@ -69,18 +92,17 @@ SHARED_SKILLS_DIR = os.path.expanduser("~/.gemini/config/skills")
 # ADDITIVE per skill name: it replaces the allowlisted directories wholesale
 # and never touches Codex-native skills sitting beside them.
 CODEX_SKILLS_DIR = os.path.expanduser("~/.codex/skills")
+# Devin's skills dir was defined up top beside DEVIN_AGENTS_MD (same
+# _DEVIN_BASE resolution) — DEVIN_SKILLS_DIR, do not redefine here.
 
-# Reviewed 2026-07-29 against ~/.claude/skills/ (22 skills total):
-# - claude-sync EXCLUDED unconditionally — syncs Claude Code's own files by
-#   definition; mirroring it into Antigravity would be actively wrong.
-# - deep-plan, deep-recheck EXCLUDED — reference Claude-Code-only tool names
-#   directly (EnterPlanMode, AskUserQuestion).
-# - deep-recheck-loop, update-brain, shorten-brain EXCLUDED as a set — each
-#   depends on /deep-recheck or /deep-recheck-loop as part of its own
-#   process; mirroring any of them alone would leave a dangling
-#   slash-command reference in Antigravity's catalog.
-# Everything below scanned clean (no Claude-only tool names, no dependency
-# on an excluded skill).
+# Reviewed 2026-09-14 against ~/.claude/skills/ (24 skills total):
+# - claude-sync, agy-sync, codex-sync, opencode-sync EXCLUDED unconditionally —
+#   each syncs its own CLI's files; mirroring it into another CLI would be
+#   actively wrong. (opencode needs no skill-mirror target at all: it
+#   auto-loads ~/.claude/skills/*/SKILL.md natively.)
+# Everything below scanned clean (no CLI-only tool names, no dependency
+# on an excluded skill). Skill bodies were genericized where needed so they
+# work across Claude Code, Devin, Antigravity/AGY, and Codex.
 # NOTE: ~/.local/bin/codex-sync.ps1 carries a copy of this list as
 # $derivedSkills so its push can exclude derived skills from the CodexSettings
 # snapshot. gate_c_allowlist.py fails if the two lists ever disagree.
@@ -89,13 +111,24 @@ SKILL_MIRROR_ALLOWLIST = [
     "cloudflare-one-migrations", "durable-objects", "sandbox-sdk",
     "agents-sdk", "workers-best-practices", "web-perf", "wrangler",
     "turnstile-spin", "transcription", "itr-tax-docs",
-    "ultrathink", "check-brain",
+    "ultrathink", "check-brain", "deep-recheck", "deep-plan",
+    "deep-recheck-loop", "shorten-brain", "update-brain", "compose-mail",
+    "loop",
 ]
+
+# Per-target skill exclusions. Some CLIs have native commands with the same
+# name as a mirrored skill; mirroring the skill there would shadow or confuse
+# the native command.
+TARGET_SKILL_EXCLUDES = {
+    # Devin CLI has a native /loop command.
+    "devin-skills": {"loop"},
+}
 
 # Mirror targets: one CLI-visible target name per destination catalog.
 MIRROR_TARGETS = {
     "skills": SHARED_SKILLS_DIR,
     "codex-skills": CODEX_SKILLS_DIR,
+    "devin-skills": DEVIN_SKILLS_DIR,
 }
 
 # end_heading=None means "to the next top-level '## ' heading, or EOF".
@@ -108,6 +141,17 @@ BEGIN_MARKER = "<!-- CLI-PARITY:BEGIN:{name} -->"
 END_MARKER = "<!-- CLI-PARITY:END:{name} -->"
 
 MEMORIES_HEADING = "## Gemini Added Memories"
+DEVIN_NOTES_HEADING = "## Devin CLI Notes"
+OPENCODE_NOTES_HEADING = "## Opencode Notes"
+# Each target's fallback insertion heading; most use the Gemini/AGY memory
+# section, but Devin/Opencode's native preambles are their own notes headings.
+TARGET_MEMORIES_HEADINGS = {
+    "gemini": MEMORIES_HEADING,
+    "agy": MEMORIES_HEADING,
+    "codex": "## Codex Harness",
+    "devin": DEVIN_NOTES_HEADING,
+    "opencode": OPENCODE_NOTES_HEADING,
+}
 
 _NEXT_H2_RE = re.compile(r"^## ", re.MULTILINE)
 _H2_LINE_RE = re.compile(r"^## .+$", re.MULTILINE)
@@ -184,13 +228,44 @@ def extract_region(claude_text, region):
 # test_agy_profile_pattern_is_the_historic_literal.
 GENERALIZE_PROFILES = {
     "gemini": {"brain_files": ["AGY.md", "GEMINI.md"],
-               "needs_brain": [".gemini-needs-brain", ".agy-needs-brain"]},
+               "needs_brain": [".gemini-needs-brain", ".agy-needs-brain"],
+               "tier_map": "`fable` → `gemini-3.7-flash-tiered`, `opus` → `gemini-3.6-flash-high`, "
+                           "`sonnet` → `gemini-3.6-flash-medium`, `haiku` → `gemini-3.6-flash-low` "
+                           "(the gclaude ladder). Effort is baked into the model name — separate "
+                           "effort pins are inert, so each tier's model IS its effort; `opus` serves "
+                           "both orchestration and deep-plan at `-high` (this ladder has no separate "
+                           "medium orchestration level)."},
     "agy": {"brain_files": ["AGY.md", "GEMINI.md"],
-            "needs_brain": [".gemini-needs-brain", ".agy-needs-brain"]},
+            "needs_brain": [".gemini-needs-brain", ".agy-needs-brain"],
+            "tier_map": "`fable` → `claude-opus-4-6-thinking`, `opus` → `claude-opus-4-6-thinking`, "
+                        "`sonnet` → `claude-sonnet-4-6`, `haiku` → `claude-sonnet-4-6` "
+                        "(the gaclaude ladder). These 4.6 models accept effort `low`/`medium`/`high`/"
+                        "`max` but not `xhigh`, so `xhigh` pins run as `high`; orchestration stays "
+                        "`medium`."},
     "codex": {"brain_files": ["AGENTS.md"],
-              "needs_brain": [".codex-needs-brain"]},
+              "needs_brain": [".codex-needs-brain"],
+              "tier_map": "every tier runs `gpt-5.6-terra`; the tier is `model_reasoning_effort` in "
+                          "`~/.codex/config.toml` (levels `minimal`/`low`/`medium`/`high`; `high` "
+                          "stands in for `xhigh`) — `fable` planner and `opus` deep-planner → `high`, "
+                          "`opus` main thread (orchestration) → `medium`, `sonnet` → `medium` "
+                          "(builder) or `high` (verifier), `haiku` → `low`."},
+    "devin": {"brain_files": ["AGENTS.md"],
+              "needs_brain": [".devin-needs-brain"],
+              "tier_map": "`fable` → `deepseek-v4-1-flash-max`, `opus` → `glm-5-2`, "
+                          "`sonnet` → `swe-2-max`, `haiku` → `swe-2-max`; in free / SWE-2-only mode "
+                          "every tier is `swe-2-max` (the dclaude ladder). Effort is baked into the "
+                          "model name — separate effort pins are inert — and SWE-2 always runs at "
+                          "`-max`, never a lower SWE-2 variant."},
+    "opencode": {"brain_files": ["AGENTS.md"],
+               "needs_brain": [".opencode-needs-brain"],
+               "tier_map": "no tier map is configured yet — every tier runs on the session model until "
+                           "`~/.config/opencode/opencode.jsonc` or the agent files pin one."},
 }
 DEFAULT_GENERALIZE_PROFILE = GENERALIZE_PROFILES["agy"]
+
+_TIER_MAP_POINTER_RE = re.compile(
+    re.escape("Where each setting lives is CLI-specific — for Claude Code see "
+              "§ Claude Code model & effort settings."))
 
 
 def _claude_md_re(brain_files):
@@ -235,6 +310,14 @@ def generalize_for_non_claude(content, profile=None):
     needs_brain_text = _needs_brain_replacement(profile["needs_brain"])
     content = _NEEDS_BRAIN_RE.sub(lambda _m: needs_brain_text, content)
     content = _MANAGED_BY_RE.sub("managed by the agent", content)
+    tier_map = profile.get("tier_map")
+    if tier_map is not None:
+        content = _TIER_MAP_POINTER_RE.sub(
+            lambda _m: "In this CLI: " + tier_map, content)
+    if "§ Claude Code model & effort settings" in content:
+        raise ValueError(
+            "tier-map pointer sentence drifted: update _TIER_MAP_POINTER_RE "
+            "to match ~/.claude/CLAUDE.md")
     return content
 
 
@@ -303,7 +386,7 @@ def _remove_stale_heading_sections(text, headings):
     return text
 
 
-def splice_region_into_target(target_text, region, region_content):
+def splice_region_into_target(target_text, region, region_content, memories_heading=MEMORIES_HEADING):
     """Replace (steady state) or insert/migrate (first run) one named
     region in target_text. Pure function — no I/O."""
     name = region["name"]
@@ -321,29 +404,26 @@ def splice_region_into_target(target_text, region, region_content):
         start, end = span
         migrated = target_text[:start] + wrapped + "\n\n" + target_text[end:]
     else:
-        # Heading doesn't exist in target at all — insert right after the
-        # CLI's own memory section so that stays the first thing it reads.
-        mem_span = _find_heading_span(target_text, MEMORIES_HEADING, None)
-        if mem_span is not None:
-            insert_at = mem_span[1]
-            migrated = target_text[:insert_at] + "\n\n" + wrapped + "\n" + target_text[insert_at:]
+        # No matching heading in target. Prefer appending after any CLI-PARITY
+        # block already spliced in (preserves region order during first run)
+        # and fall back to the CLI's own memory section or the very top.
+        last_end = -1
+        marker = "<!-- CLI-PARITY:END:"
+        idx = target_text.find(marker)
+        while idx != -1:
+            close = target_text.find("-->", idx)
+            if close != -1:
+                last_end = close + len("-->")
+            idx = target_text.find(marker, close if close != -1 else idx + 1)
+        if last_end != -1:
+            migrated = target_text[:last_end] + "\n\n" + wrapped + target_text[last_end:]
         else:
-            # No memories heading either — insert after any CLI-PARITY
-            # block(s) already spliced in earlier in this same call
-            # (preserves region order when multiple regions all hit this
-            # fallback), else at the very top.
-            last_end = -1
-            marker = "<!-- CLI-PARITY:END:"
-            idx = target_text.find(marker)
-            while idx != -1:
-                close = target_text.find("-->", idx)
-                if close != -1:
-                    last_end = close + len("-->")
-                idx = target_text.find(marker, close if close != -1 else idx + 1)
-            if last_end == -1:
-                migrated = wrapped + "\n\n" + target_text
+            mem_span = _find_heading_span(target_text, memories_heading, None)
+            if mem_span is not None:
+                insert_at = mem_span[1]
+                migrated = target_text[:insert_at] + "\n\n" + wrapped + "\n" + target_text[insert_at:]
             else:
-                migrated = target_text[:last_end] + "\n\n" + wrapped + target_text[last_end:]
+                migrated = wrapped + "\n\n" + target_text
 
     # The target's end_heading may be absent (e.g. ~/.codex/instructions.md
     # has no "## Machine Notes"), in which case the heading-span match above
@@ -352,17 +432,18 @@ def splice_region_into_target(target_text, region, region_content):
     return _remove_stale_heading_sections(migrated, _owned_headings(region_content))
 
 
-def sync_all_regions(claude_text, target_text, profile=None):
+def sync_all_regions(claude_text, target_text, profile=None, memories_heading=MEMORIES_HEADING):
     """Apply all REGIONS in order. Pure function — no I/O."""
     for region in REGIONS:
         content = extract_region(claude_text, region)
         content = generalize_for_non_claude(content, profile=profile)
-        target_text = splice_region_into_target(target_text, region, content)
+        target_text = splice_region_into_target(target_text, region, content, memories_heading=memories_heading)
     return target_text
 
 
-def has_drift(claude_text, target_text, profile=None):
-    return sync_all_regions(claude_text, target_text, profile=profile) != target_text
+def has_drift(claude_text, target_text, profile=None, memories_heading=MEMORIES_HEADING):
+    return sync_all_regions(claude_text, target_text, profile=profile,
+                            memories_heading=memories_heading) != target_text
 
 
 def _dirs_equal(a, b):
@@ -434,10 +515,11 @@ def run(target_name, apply, claude_md_path=CLAUDE_MD_PATH, targets=TARGETS, out=
     if profile is None:
         profile = GENERALIZE_PROFILES.get(target_name, DEFAULT_GENERALIZE_PROFILE)
     claude_text = _read(claude_md_path)
+    memories_heading = TARGET_MEMORIES_HEADINGS.get(target_name, MEMORIES_HEADING)
     exit_code = 0
     for path in targets[target_name]:
         target_text = _read(path)
-        new_text = sync_all_regions(claude_text, target_text, profile=profile)
+        new_text = sync_all_regions(claude_text, target_text, profile=profile, memories_heading=memories_heading)
         if new_text == target_text:
             print(f"{path}: no drift", file=out)
             continue
@@ -465,11 +547,47 @@ def main(argv=None):
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check", action="store_true")
     mode.add_argument("--apply", action="store_true")
-    parser.add_argument("target", choices=sorted(TARGETS) + sorted(MIRROR_TARGETS))
+    mode.add_argument("--check-bus", action="store_true")
+    mode.add_argument("--apply-bus", action="store_true")
+    parser.add_argument("target", choices=sorted(TARGETS) + sorted(MIRROR_TARGETS) + sorted(BUS_DOC_TARGETS))
     args = parser.parse_args(argv)
+    if args.check_bus or args.apply_bus:
+        if args.target not in BUS_DOC_TARGETS:
+            print(f"bus doc mirror has no target '{args.target}'", file=sys.stderr)
+            return 1
+        return run_bus_mirror(args.target, apply=args.apply_bus)
     if args.target in MIRROR_TARGETS:
-        return run_skill_mirror(args.apply, shared_skills_dir=MIRROR_TARGETS[args.target])
+        allowlist = [
+            name for name in SKILL_MIRROR_ALLOWLIST
+            if name not in TARGET_SKILL_EXCLUDES.get(args.target, set())
+        ]
+        return run_skill_mirror(args.apply, shared_skills_dir=MIRROR_TARGETS[args.target], allowlist=allowlist)
     return run(args.target, args.apply)
+
+
+def run_bus_mirror(target, apply=False):
+    """Mirror docs/bus.md to the CLI's rules directory. Returns 0 if
+    no drift (or applied), 1 if --check found drift."""
+    import shutil
+    dest = BUS_DOC_TARGETS[target]
+    src = os.path.normpath(BUS_DOC_SOURCE)
+    if not os.path.isfile(src):
+        print(f"bus doc source missing: {src}", file=sys.stderr)
+        return 1
+    src_content = open(src, 'r', encoding='utf-8').read()
+    dest_content = None
+    if os.path.isfile(dest):
+        dest_content = open(dest, 'r', encoding='utf-8').read()
+    if dest_content == src_content:
+        print(f"{target}: bus.md no drift")
+        return 0
+    if apply:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copy2(src, dest)
+        print(f"{target}: bus.md applied")
+        return 0
+    print(f"{target}: bus.md drift (missing or differs)")
+    return 1
 
 
 def run_skill_mirror(apply, claude_skills_dir=CLAUDE_SKILLS_DIR, shared_skills_dir=SHARED_SKILLS_DIR,

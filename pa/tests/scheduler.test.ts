@@ -1,8 +1,20 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { createTempPaHome, createTempSkill, cleanup } from './helpers.js';
 import { writeLog } from '../src/logger.js';
-import { getOverdueSkills, partitionOverdueByCostTier, buildLauncherVbs } from '../src/scheduler.js';
+import {
+  getOverdueSkills,
+  partitionOverdueByCostTier,
+  buildCatchupWatchdogVbs,
+  launcherDrift,
+  formatLauncherDriftLine,
+  CATCHUP_KILL_EXIT_WAIT_ENV,
+  DEFAULT_CATCHUP_KILL_EXIT_WAIT_SECS,
+  CATCHUP_LOOP_PID_REUSED_DEDUP_KEY,
+  CATCHUP_LOOP_PID_REUSED_CAUSE,
+} from '../src/scheduler.js';
+import { repoRootFromModule } from '../src/lib/git-root.js';
 import type { RunMeta } from '../src/types.js';
 
 let tempDir: string;
@@ -332,33 +344,435 @@ describe('partitionOverdueByCostTier', () => {
   });
 });
 
-describe('buildLauncherVbs', () => {
+describe('buildCatchupWatchdogVbs (lane-progress launcher)', () => {
   const paPathCmd = 'C:\\Program Files\\pa\\pa.cmd';
-  const args = 'catchup --topic default';
+  const args = 'catchup --loop';
+  const root = 'D:\\Personal Assistant';
+  const paths = {
+    lockPath: 'C:\\Users\\me\\.pa\\catchup-loop.lock',
+    lanesDir: 'C:\\Users\\me\\.pa\\catchup-lanes',
+    stallMarkerPath: 'C:\\Users\\me\\.pa\\catchup-loop.stalled',
+    stallRecordsPath: 'C:\\Users\\me\\.pa\\stall-records.jsonl',
+    pageBodyPath: 'C:\\Users\\me\\.pa\\catchup-loop-page.txt',
+  };
 
-  it('sets CurrentDirectory to the repo root, appearing before the Run line', () => {
-    const vbs = buildLauncherVbs(paPathCmd, args, 'D:\\Personal Assistant');
-    const currentDirLine = 'WshShell.CurrentDirectory = "D:\\Personal Assistant"';
-    assert.ok(vbs.includes(currentDirLine), 'must set CurrentDirectory to the repo root');
+  it('matches the golden launcher text', () => {
+    const vbs = buildCatchupWatchdogVbs(paPathCmd, args, root, paths);
+    const EXPECTED = [
+      `Set WshShell = CreateObject("WScript.Shell")`,
+      `Set fso = CreateObject("Scripting.FileSystemObject")`,
+      `WshShell.CurrentDirectory = "${root}"`,
+      `lockPath = "${paths.lockPath}"`,
+      `lanesDir = "${paths.lanesDir}"`,
+      `laneNames = Array("default", "reminders", "maintenance")`,
+      `stallMarkerPath = "${paths.stallMarkerPath}"`,
+      `stallRecordsPath = "${paths.stallRecordsPath}"`,
+      `pageBodyPath = "${paths.pageBodyPath}"`,
+      `heartbeatStaleSecs = 300`,
+      `Set procEnv = WshShell.Environment("Process")`,
+      `If procEnv("UV_THREADPOOL_SIZE") = "" Then procEnv("UV_THREADPOOL_SIZE") = "16"`,
+      `killExitWaitSecs = ReadWaitSecs(procEnv("${CATCHUP_KILL_EXIT_WAIT_ENV}"), ${DEFAULT_CATCHUP_KILL_EXIT_WAIT_SECS})`,
+      `cause = ""`,
+      `pageSeverity = "error"`,
+      `pageDedupKey = "catchup-loop-stalled"`,
+      `pid = ReadPidFile(lockPath)`,
+      `If PidIsLiveNode(pid) Then`,
+      `  cause = StaleCause(lockPath, lanesDir, laneNames, heartbeatStaleSecs)`,
+      `  If cause = "" Then WScript.Quit 0`,
+      `  If CommandLineIsOtherProcess(pid) Then`,
+      `    cause = "${CATCHUP_LOOP_PID_REUSED_CAUSE}"`,
+      `    marker = ConsumeStallMarker(stallMarkerPath)`,
+      `    If marker <> "" Then cause = cause & "; " & marker`,
+      `    AppendLauncherRecord stallRecordsPath, pid, "pid-reused", cause`,
+      `    pageSeverity = "warn"`,
+      `    pageDedupKey = "${CATCHUP_LOOP_PID_REUSED_DEDUP_KEY}"`,
+      `  Else`,
+      `    marker = ConsumeStallMarker(stallMarkerPath)`,
+      `    If marker <> "" Then cause = cause & "; " & marker`,
+      `    AppendLauncherRecord stallRecordsPath, pid, "lane-progress", cause`,
+      `    WshShell.Run "cmd /c taskkill /F /PID " & pid, 0, True`,
+      `    If Not LoopExitedWithin(pid, killExitWaitSecs) Then cause = cause & "; killed catchup loop did not exit within " & killExitWaitSecs & " s; relaunched anyway - a stale write may land"`,
+      `  End If`,
+      `Else`,
+      `  cause = ConsumeStallMarker(stallMarkerPath)`,
+      `End If`,
+      `WshShell.Run "cmd /c """"${paPathCmd}"" ${args}""", 0, False`,
+      `If cause <> "" Then`,
+      `  WriteText pageBodyPath, "Catchup loop restarted by its watchdog." & vbCrLf & "Cause: " & cause`,
+      `  WshShell.Run "cmd /c """"${paPathCmd}"" notify --subject ""Catchup loop restarted"" --body-file ""${paths.pageBodyPath}"" --dedup-key " & pageDedupKey & " --severity " & pageSeverity & """", 0, False`,
+      `End If`,
+      ``,
+      `' Reads the loop's PID from its lock file; 0 when missing or unparseable.`,
+      `Function ReadPidFile(path)`,
+      `  Dim text`,
+      `  ReadPidFile = 0`,
+      `  If Not fso.FileExists(path) Then Exit Function`,
+      `  On Error Resume Next`,
+      `  text = Trim(fso.OpenTextFile(path, 1).ReadAll())`,
+      `  If Err.Number <> 0 Then Err.Clear : Exit Function`,
+      `  On Error GoTo 0`,
+      `  If IsNumeric(text) Then ReadPidFile = CLng(text)`,
+      `End Function`,
+      ``,
+      `' Seconds to wait for a killed loop to exit: the environment value when it is a`,
+      `' whole number from 1 to 9999, otherwise the default baked in at sync time.`,
+      `Function ReadWaitSecs(text, defaultSecs)`,
+      `  Dim re`,
+      `  ReadWaitSecs = defaultSecs`,
+      `  Set re = New RegExp`,
+      `  re.Pattern = "^[1-9][0-9]{0,3}$"`,
+      `  If re.Test(text) Then ReadWaitSecs = CLng(text)`,
+      `End Function`,
+      ``,
+      `' Liveness gate: true only when a live node.exe holds this PID. Anything else -`,
+      `' missing lock file, unparseable PID, dead process, a non-node process that`,
+      `' reused the PID, an unexpected tasklist result - reads as NOT live, so the`,
+      `' worst case is one wasted launch that exits on the real lock. Never the`,
+      `' reverse: a false "alive" would leave the service down forever.`,
+      `Function PidIsLiveNode(pid)`,
+      `  Dim cmdText`,
+      `  PidIsLiveNode = False`,
+      `  If Not IsNumeric(pid) Then Exit Function`,
+      `  If CDbl(pid) <= 0 Then Exit Function`,
+      `  cmdText = "cmd /c tasklist /NH /FI ""PID eq " & CLng(pid) & """ /FI ""IMAGENAME eq node.exe"" | find /I ""node.exe"" >nul"`,
+      `  PidIsLiveNode = (WshShell.Run(cmdText, 0, True) = 0)`,
+      `End Function`,
+      ``,
+      `' True only when WMI positively reports a command line for this PID that is not`,
+      `' the catchup loop's - the dead loop's PID was reused by another process, which`,
+      `' must never be killed. Any WMI error or an empty command line reads as False,`,
+      `' so the worst case stays one extra kill and relaunch, never a silent skip.`,
+      `Function CommandLineIsOtherProcess(pid)`,
+      `  Dim procs, proc, cmdLine`,
+      `  CommandLineIsOtherProcess = False`,
+      `  cmdLine = ""`,
+      `  On Error Resume Next`,
+      `  Set procs = GetObject("winmgmts:\\\\.\\root\\cimv2").ExecQuery("SELECT CommandLine FROM Win32_Process WHERE ProcessId = " & CLng(pid))`,
+      `  If Err.Number <> 0 Then Err.Clear : Exit Function`,
+      `  For Each proc In procs`,
+      `    cmdLine = proc.CommandLine`,
+      `  Next`,
+      `  If Err.Number <> 0 Then Err.Clear : Exit Function`,
+      `  On Error GoTo 0`,
+      `  If IsNull(cmdLine) Then Exit Function`,
+      `  If Len(cmdLine) = 0 Then Exit Function`,
+      `  CommandLineIsOtherProcess = Not (InStr(1, cmdLine, "catchup", vbTextCompare) > 0 And InStr(1, cmdLine, "--loop", vbTextCompare) > 0)`,
+      `End Function`,
+      ``,
+      `' Polls every 2 s until the killed loop is gone: its PID is no longer a live`,
+      `' node.exe, or it now runs another command line. False when it is still the`,
+      `' loop after waitSecs. It polls before sleeping, so a loop that has already`,
+      `' exited costs no wait. Timer counts seconds since midnight, hence the wrap.`,
+      `Function LoopExitedWithin(pid, waitSecs)`,
+      `  Dim started, elapsed`,
+      `  LoopExitedWithin = True`,
+      `  started = Timer`,
+      `  Do While PidIsLiveNode(pid)`,
+      `    If CommandLineIsOtherProcess(pid) Then Exit Function`,
+      `    elapsed = Timer - started`,
+      `    If elapsed < 0 Then elapsed = elapsed + 86400`,
+      `    If elapsed >= waitSecs Then`,
+      `      LoopExitedWithin = False`,
+      `      Exit Function`,
+      `    End If`,
+      `    WScript.Sleep 2000`,
+      `  Loop`,
+      `End Function`,
+      ``,
+      `' Seconds since the file was last written. A missing file or any FSO error`,
+      `' reads as infinitely old, so the worst case is one extra kill and relaunch.`,
+      `Function FileAgeSecs(path)`,
+      `  Dim modified`,
+      `  FileAgeSecs = 2147483647`,
+      `  If Not fso.FileExists(path) Then Exit Function`,
+      `  On Error Resume Next`,
+      `  modified = fso.GetFile(path).DateLastModified`,
+      `  If Err.Number <> 0 Then Err.Clear : Exit Function`,
+      `  On Error GoTo 0`,
+      `  FileAgeSecs = DateDiff("s", modified, Now())`,
+      `End Function`,
+      ``,
+      `' First line of a small text file, trimmed; empty on any error.`,
+      `Function ReadFirstLine(path)`,
+      `  Dim text`,
+      `  ReadFirstLine = ""`,
+      `  If Not fso.FileExists(path) Then Exit Function`,
+      `  On Error Resume Next`,
+      `  text = fso.OpenTextFile(path, 1).ReadAll()`,
+      `  If Err.Number <> 0 Then Err.Clear : Exit Function`,
+      `  On Error GoTo 0`,
+      `  text = Replace(text, vbCr, "")`,
+      `  If InStr(text, vbLf) > 0 Then text = Left(text, InStr(text, vbLf) - 1)`,
+      `  ReadFirstLine = Trim(text)`,
+      `End Function`,
+      ``,
+      `' Empty when the heartbeat and every lane progress file are fresh; otherwise`,
+      `' names the first stale file in lane order, with that lane's last breadcrumb.`,
+      `Function StaleCause(lock, dir, lanes, staleSecs)`,
+      `  Dim lane, laneFile`,
+      `  StaleCause = ""`,
+      `  If FileAgeSecs(lock) > staleSecs Then`,
+      `    StaleCause = "heartbeat stale"`,
+      `    Exit Function`,
+      `  End If`,
+      `  For Each lane In lanes`,
+      `    laneFile = dir & "\\" & lane`,
+      `    If FileAgeSecs(laneFile) > staleSecs Then`,
+      `      StaleCause = "lane " & lane & " stale" & CrumbSuffix(ReadFirstLine(laneFile))`,
+      `      Exit Function`,
+      `    End If`,
+      `  Next`,
+      `End Function`,
+      ``,
+      `' " at <phase>[: <detail>]" from a "<ts>|<lane>|<phase>|<detail>" breadcrumb.`,
+      `Function CrumbSuffix(crumb)`,
+      `  Dim parts`,
+      `  CrumbSuffix = ""`,
+      `  parts = Split(crumb, "|")`,
+      `  If UBound(parts) < 2 Then Exit Function`,
+      `  CrumbSuffix = " at " & parts(2)`,
+      `  If UBound(parts) >= 3 Then`,
+      `    If Len(parts(3)) > 0 Then CrumbSuffix = CrumbSuffix & ": " & parts(3)`,
+      `  End If`,
+      `End Function`,
+      ``,
+      `' Reads and deletes the loop's store-stall marker; empty when absent.`,
+      `Function ConsumeStallMarker(path)`,
+      `  ConsumeStallMarker = ""`,
+      `  If Not fso.FileExists(path) Then Exit Function`,
+      `  ConsumeStallMarker = ReadFirstLine(path)`,
+      `  If ConsumeStallMarker = "" Then ConsumeStallMarker = "store stall"`,
+      `  On Error Resume Next`,
+      `  fso.DeleteFile path, True`,
+      `  Err.Clear`,
+      `  On Error GoTo 0`,
+      `End Function`,
+      ``,
+      `' Appends one JSON line of launcher evidence; best-effort.`,
+      `Sub AppendLauncherRecord(path, pid, store, cause)`,
+      `  Dim f`,
+      `  On Error Resume Next`,
+      `  Set f = fso.OpenTextFile(path, 8, True)`,
+      `  If Err.Number <> 0 Then Err.Clear : Exit Sub`,
+      `  f.WriteLine "{""ts"":""" & IsoNow() & """,""pid"":" & CLng(pid) & ",""host"":""launcher"",""store"":""" & store & """,""cause"":""" & JsonSafe(cause) & """}"`,
+      `  f.Close`,
+      `  Err.Clear`,
+      `  On Error GoTo 0`,
+      `End Sub`,
+      ``,
+      `' Escapes backslash, then double quote, for a JSON string value.`,
+      `Function JsonSafe(text)`,
+      `  JsonSafe = Replace(Replace(text, "\\", "\\\\"), """", "\\""")`,
+      `End Function`,
+      ``,
+      `' Local time as yyyy-mm-ddThh:nn:ss (no zone suffix).`,
+      `Function IsoNow()`,
+      `  Dim t`,
+      `  t = Now()`,
+      `  IsoNow = Year(t) & "-" & Right("0" & Month(t), 2) & "-" & Right("0" & Day(t), 2) & "T" & Right("0" & Hour(t), 2) & ":" & Right("0" & Minute(t), 2) & ":" & Right("0" & Second(t), 2)`,
+      `End Function`,
+      ``,
+      `' Overwrites a small text file; best-effort.`,
+      `Sub WriteText(path, text)`,
+      `  Dim f`,
+      `  On Error Resume Next`,
+      `  Set f = fso.CreateTextFile(path, True)`,
+      `  If Err.Number <> 0 Then Err.Clear : Exit Sub`,
+      `  f.Write text`,
+      `  f.Close`,
+      `  Err.Clear`,
+      `  On Error GoTo 0`,
+      `End Sub`,
+    ].join('\n') + '\n';
+    assert.equal(vbs, EXPECTED);
+  });
 
-    const currentDirIndex = vbs.indexOf(currentDirLine);
+  it('sets CurrentDirectory to the repo root before any Run', () => {
+    const vbs = buildCatchupWatchdogVbs(paPathCmd, args, root, paths);
+    const currentDirIndex = vbs.indexOf(`WshShell.CurrentDirectory = "${root}"`);
     const runIndex = vbs.indexOf('WshShell.Run');
-    assert.ok(currentDirIndex >= 0, 'CurrentDirectory line must be present');
-    assert.ok(runIndex >= 0, 'Run line must be present');
-    assert.ok(currentDirIndex < runIndex, 'CurrentDirectory line must appear before the Run line');
+    assert.ok(currentDirIndex >= 0 && runIndex >= 0 && currentDirIndex < runIndex);
   });
 
-  it('doubles an embedded double-quote in repoRoot', () => {
-    const vbs = buildLauncherVbs(paPathCmd, args, 'D:\\Weird"Path');
-    assert.ok(
-      vbs.includes('WshShell.CurrentDirectory = "D:\\Weird""Path"'),
-      'embedded quote in repoRoot must be doubled per VBScript string-literal escaping'
-    );
+  it('doubles embedded double-quotes in repoRoot, lockPath and pageBodyPath', () => {
+    const weirdPaths = { ...paths, lockPath: 'D:\\Weird"Lock.txt', pageBodyPath: 'D:\\Weird"Body.txt' };
+    const vbs = buildCatchupWatchdogVbs(paPathCmd, args, 'D:\\Weird"Path', weirdPaths);
+    assert.ok(vbs.includes('WshShell.CurrentDirectory = "D:\\Weird""Path"'));
+    assert.ok(vbs.includes('lockPath = "D:\\Weird""Lock.txt"'));
+    assert.ok(vbs.includes('pageBodyPath = "D:\\Weird""Body.txt"'));
+    assert.ok(vbs.includes('--body-file ""D:\\Weird""Body.txt""'));
   });
 
-  it('the WshShell.Run line is byte-identical to the pre-fix format for the same paPathCmd/args (regression pin)', () => {
-    const vbs = buildLauncherVbs(paPathCmd, args, 'D:\\Personal Assistant');
-    const runLine = `WshShell.Run "cmd /c ""${paPathCmd}"" ${args}", 0, True\n`;
-    assert.ok(vbs.includes(runLine), 'Run line must not change shape when CurrentDirectory was added');
+  it('relaunches without waiting through a fully wrapped cmd line', () => {
+    const vbs = buildCatchupWatchdogVbs(paPathCmd, args, root, paths);
+    assert.ok(vbs.includes(`WshShell.Run "cmd /c """"${paPathCmd}"" catchup --loop""", 0, False`));
+  });
+
+  it('the only awaited Runs are the tasklist gate and the taskkill', () => {
+    const vbs = buildCatchupWatchdogVbs(paPathCmd, args, root, paths);
+    const awaited = vbs.split('\n').filter((l) => l.includes(', 0, True'));
+    assert.equal(awaited.length, 2);
+    for (const l of awaited) assert.ok(l.includes('cmdText') || l.includes('taskkill /F /PID'));
+  });
+
+  it('keeps the PidIsLiveNode gate with both filters and the find pipe', () => {
+    const vbs = buildCatchupWatchdogVbs(paPathCmd, args, root, paths);
+    assert.ok(vbs.includes('Function PidIsLiveNode(pid)'));
+    assert.ok(vbs.includes('/FI ""PID eq " & CLng(pid)'));
+    assert.ok(vbs.includes('/FI ""IMAGENAME eq node.exe""'));
+    assert.ok(vbs.includes('| find /I ""node.exe""'));
+  });
+
+  it('quits only when the PID is live and StaleCause is empty, before anything is killed or launched', () => {
+    const vbs = buildCatchupWatchdogVbs(paPathCmd, args, root, paths);
+    const iLive = vbs.indexOf('If PidIsLiveNode(pid) Then');
+    const iStale = vbs.indexOf('cause = StaleCause(lockPath, lanesDir, laneNames, heartbeatStaleSecs)');
+    const iQuit = vbs.indexOf('If cause = "" Then WScript.Quit 0');
+    const iKill = vbs.indexOf('WshShell.Run "cmd /c taskkill');
+    const iRelaunch = vbs.indexOf(`WshShell.Run "cmd /c """"${paPathCmd}"" catchup --loop`);
+    assert.ok(iLive >= 0 && iLive < iStale);
+    assert.ok(iStale < iQuit);
+    assert.ok(iQuit < iKill);
+    assert.ok(iKill < iRelaunch);
+  });
+
+  it('records kill evidence before the taskkill and relaunches after it', () => {
+    const vbs = buildCatchupWatchdogVbs(paPathCmd, args, root, paths);
+    const iRecord = vbs.indexOf('AppendLauncherRecord stallRecordsPath, pid, "lane-progress", cause');
+    const iKill = vbs.indexOf('WshShell.Run "cmd /c taskkill /F /PID " & pid');
+    const iRelaunch = vbs.indexOf(`WshShell.Run "cmd /c """"${paPathCmd}"" catchup --loop`);
+    assert.ok(iRecord >= 0 && iRecord < iKill && iKill < iRelaunch);
+  });
+
+  it('checks the lanes in CATCHUP_LOOP_LANES order', () => {
+    const vbs = buildCatchupWatchdogVbs(paPathCmd, args, root, paths);
+    assert.ok(vbs.includes('laneNames = Array("default", "reminders", "maintenance")'));
+    const vbsAlt = buildCatchupWatchdogVbs(paPathCmd, args, root, paths, undefined, ['alpha', 'beta']);
+    assert.ok(vbsAlt.includes('laneNames = Array("alpha", "beta")'));
+    assert.throws(() => buildCatchupWatchdogVbs(paPathCmd, args, root, paths, undefined, ['Bad Lane']));
+  });
+
+  it('bakes the staleness threshold in seconds (default 300, custom 90)', () => {
+    const vbs = buildCatchupWatchdogVbs(paPathCmd, args, root, paths);
+    assert.ok(vbs.includes('heartbeatStaleSecs = 300'));
+    const vbs90 = buildCatchupWatchdogVbs(paPathCmd, args, root, paths, 90_000);
+    assert.ok(vbs90.includes('heartbeatStaleSecs = 90'));
+  });
+
+  it('pages through pa notify only when a cause exists', () => {
+    const vbs = buildCatchupWatchdogVbs(paPathCmd, args, root, paths);
+    const notifyLine = `  WshShell.Run "cmd /c """"${paPathCmd}"" notify --subject ""Catchup loop restarted"" --body-file ""${paths.pageBodyPath}"" --dedup-key " & pageDedupKey & " --severity " & pageSeverity & """", 0, False`;
+    assert.ok(vbs.includes(notifyLine));
+    const iIf = vbs.indexOf('If cause <> "" Then');
+    const iRelaunch = vbs.indexOf(`WshShell.Run "cmd /c """"${paPathCmd}"" catchup --loop`);
+    const iNotify = vbs.indexOf(notifyLine);
+    assert.ok(iIf > iRelaunch);
+    assert.ok(iNotify > iIf);
+  });
+
+  it('sets UV_THREADPOOL_SIZE only when the process environment lacks it', () => {
+    const vbs = buildCatchupWatchdogVbs(paPathCmd, args, root, paths);
+    assert.ok(vbs.includes('If procEnv("UV_THREADPOOL_SIZE") = "" Then procEnv("UV_THREADPOOL_SIZE") = "16"'));
+  });
+
+  it('a missing or unreadable file reads as infinitely old', () => {
+    const vbs = buildCatchupWatchdogVbs(paPathCmd, args, root, paths);
+    const fnStart = vbs.indexOf('Function FileAgeSecs');
+    const fnBody = vbs.slice(fnStart);
+    const iDefault = fnBody.indexOf('FileAgeSecs = 2147483647');
+    const iGuard = fnBody.indexOf('If Not fso.FileExists(path) Then Exit Function');
+    assert.ok(iDefault >= 0 && iGuard >= 0 && iDefault < iGuard);
+  });
+
+  it('JsonSafe escapes backslash before double quote', () => {
+    const vbs = buildCatchupWatchdogVbs(paPathCmd, args, root, paths);
+    assert.ok(vbs.includes('JsonSafe = Replace(Replace(text, "\\", "\\\\"), """", "\\""")'));
+  });
+
+  it('never kills a live PID whose command line is not the catchup loop', () => {
+    const vbs = buildCatchupWatchdogVbs(paPathCmd, args, root, paths);
+    assert.ok(vbs.includes('Function CommandLineIsOtherProcess(pid)'));
+    assert.ok(vbs.includes('CommandLineIsOtherProcess = Not (InStr(1, cmdLine, "catchup", vbTextCompare) > 0 And InStr(1, cmdLine, "--loop", vbTextCompare) > 0)'));
+    const iCheck = vbs.indexOf('If CommandLineIsOtherProcess(pid) Then');
+    const iRecord = vbs.indexOf('AppendLauncherRecord stallRecordsPath, pid, "lane-progress", cause');
+    assert.ok(iCheck >= 0 && iCheck < iRecord);
+  });
+
+  it('waits for the killed PID to exit before relaunching, bounded by PA_CATCHUP_KILL_EXIT_WAIT_S', () => {
+    const vbs = buildCatchupWatchdogVbs(paPathCmd, args, root, paths);
+    assert.equal(CATCHUP_KILL_EXIT_WAIT_ENV, 'PA_CATCHUP_KILL_EXIT_WAIT_S');
+    assert.equal(DEFAULT_CATCHUP_KILL_EXIT_WAIT_SECS, 120);
+    assert.ok(vbs.includes('killExitWaitSecs = ReadWaitSecs(procEnv("PA_CATCHUP_KILL_EXIT_WAIT_S"), 120)'));
+    assert.ok(vbs.includes('  re.Pattern = "^[1-9][0-9]{0,3}$"'));
+    const iKill = vbs.indexOf('WshShell.Run "cmd /c taskkill /F /PID " & pid, 0, True');
+    const iWait = vbs.indexOf('If Not LoopExitedWithin(pid, killExitWaitSecs) Then cause = cause & "; killed catchup loop did not exit within " & killExitWaitSecs & " s; relaunched anyway - a stale write may land"');
+    const iRelaunch = vbs.indexOf(`WshShell.Run "cmd /c """"${paPathCmd}"" catchup --loop""", 0, False`);
+    assert.ok(iKill >= 0 && iKill < iWait);
+    assert.ok(iWait < iRelaunch);
+  });
+
+  it('polls before sleeping, every 2 s, and treats a reused PID as exited', () => {
+    const vbs = buildCatchupWatchdogVbs(paPathCmd, args, root, paths);
+    const start = vbs.indexOf('Function LoopExitedWithin(pid, waitSecs)');
+    const end = vbs.indexOf('End Function', start);
+    const body = vbs.slice(start, end);
+    const iDo = body.indexOf('  Do While PidIsLiveNode(pid)');
+    const iOther = body.indexOf('    If CommandLineIsOtherProcess(pid) Then Exit Function');
+    const iElapsed = body.indexOf('    If elapsed >= waitSecs Then');
+    const iSleep = body.indexOf('    WScript.Sleep 2000');
+    assert.ok(iDo >= 0 && iDo < iOther && iOther < iElapsed && iElapsed < iSleep);
+    assert.equal((vbs.match(/WScript\.Sleep/g) ?? []).length, 1);
+  });
+
+  it('a reused PID records evidence and pages once as catchup-loop-pid-reused at warn without any kill', () => {
+    const vbs = buildCatchupWatchdogVbs(paPathCmd, args, root, paths);
+    const start = vbs.indexOf('  If CommandLineIsOtherProcess(pid) Then\n');
+    const end = vbs.indexOf('\n  Else\n', start);
+    const body = vbs.slice(start, end);
+    assert.ok(body.includes(`    cause = "${CATCHUP_LOOP_PID_REUSED_CAUSE}"`));
+    assert.ok(body.includes('    AppendLauncherRecord stallRecordsPath, pid, "pid-reused", cause'));
+    assert.ok(body.includes('    pageSeverity = "warn"'));
+    assert.ok(body.includes('    pageDedupKey = "catchup-loop-pid-reused"'));
+    assert.ok(!body.includes('taskkill'));
+    assert.equal(CATCHUP_LOOP_PID_REUSED_DEDUP_KEY, 'catchup-loop-pid-reused');
+    assert.equal(CATCHUP_LOOP_PID_REUSED_CAUSE, 'catchup loop was not running (recorded PID now belongs to another process); relaunched');
+  });
+
+  it('every page goes through one notify tail whose severity and dedup key default to the stall family', () => {
+    const vbs = buildCatchupWatchdogVbs(paPathCmd, args, root, paths);
+    const iSeverity = vbs.indexOf('pageSeverity = "error"');
+    const iDedup = vbs.indexOf('pageDedupKey = "catchup-loop-stalled"');
+    const iPid = vbs.indexOf('pid = ReadPidFile(lockPath)');
+    assert.ok(iSeverity >= 0 && iSeverity < iPid);
+    assert.ok(iDedup >= 0 && iDedup < iPid);
+    const notifyLines = vbs.split('\n').filter((l) => l.includes(' notify --subject '));
+    assert.equal(notifyLines.length, 1);
+    assert.ok(notifyLines[0].includes('--dedup-key " & pageDedupKey & " --severity " & pageSeverity & """", 0, False'));
+  });
+});
+
+describe('launcher drift (pa schedules list)', () => {
+  it('launcherDrift distinguishes missing, in-sync and out-of-sync', () => {
+    assert.equal(launcherDrift(null, 'x'), 'missing');
+    assert.equal(launcherDrift('x', 'x'), 'in-sync');
+    assert.equal(launcherDrift('y', 'x'), 'out-of-sync');
+  });
+
+  it('formatLauncherDriftLine renders the three states exactly', () => {
+    assert.equal(formatLauncherDriftLine('P', 'in-sync'), 'Launcher P: in sync with this build');
+    assert.equal(formatLauncherDriftLine('P', 'out-of-sync'), 'Launcher P: OUT OF SYNC with this build — run `pa schedules sync`');
+    assert.equal(formatLauncherDriftLine('P', 'missing'), 'Launcher P: MISSING — run `pa schedules sync`');
+  });
+});
+
+describe('pa schedules sync and the legacy reminders task', () => {
+  it('sync never retires the legacy reminders task and prints the proof-gated advisory', async () => {
+    const repoRoot = await repoRootFromModule(__filename);
+    const src = readFileSync(`${repoRoot}/pa/src/scheduler.ts`, 'utf8');
+    assert.ok(!src.includes('schtasks /delete /tn "${remindersName}"'));
+    assert.ok(!src.includes("Retired '"));
+    assert.ok(!src.includes('remindersPattern'));
+    const count = src.split('Retiring the legacy reminders task').length - 1;
+    assert.equal(count, 2);
   });
 });

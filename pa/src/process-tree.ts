@@ -2,18 +2,50 @@ import { exec } from 'child_process';
 import { platform } from 'os';
 import { promisify } from 'util';
 
-const execAsync = promisify(exec);
+export type ExecFn = (cmd: string) => Promise<{ stdout: string; stderr: string }>;
+
+// Low-level exec runner backing the DEFAULT (no execFn injected) snapshot path.
+// Overridable ONLY for tests. ExecFn deliberately erases exec() options
+// (timeout, windowsHide) so a mock and the real exec function share one shape —
+// which means no test can see, from that shape alone, whether a given call
+// carried those options. _rawExec is the seam: a test swaps it to capture the
+// options argument directly and prove the default path is wired to the timed,
+// hidden exec — see the 4th-storm-variant note below.
+export type RawExec = (cmd: string, options: Record<string, unknown>) => Promise<{ stdout: string; stderr: string }>;
+const realRawExec: RawExec = promisify(exec) as unknown as RawExec;
+let _rawExec: RawExec = realRawExec;
+export function _setRawExecForTest(fn: RawExec | null): void {
+  _rawExec = fn ?? realRawExec;
+}
 
 // Hidden exec wrapper for Windows — prevents console window flash on every spawn
-const execHidden = (cmd: string) => execAsync(cmd, { windowsHide: true, timeout: 15_000, killSignal: 'SIGKILL' });
+const execHidden: ExecFn = (cmd) => _rawExec(cmd, { windowsHide: true, timeout: 15_000, killSignal: 'SIGKILL' });
 // timeout (2026-08-31): a saturated WMI makes Get-CimInstance hang forever, and
 // exec's default timeout is NONE — stuck snapshot queries then accumulate one
 // wedged powershell per pa process and hold WMI hostage machine-wide (third
 // storm variant, 19:30 IST: 120 zombie shells, WMI dead, both lock-heartbeat
 // timers stalled). 15s hard cap → stuck child killed, empty snapshot returned,
 // next heartbeat retries; degradation instead of deadlock.
-
-export type ExecFn = (cmd: string) => Promise<{ stdout: string; stderr: string }>;
+//
+// 4th storm variant (2026-09-12): the timed/hidden wrapper above and the 300ms
+// cache below both already existed, but neither was actually load-bearing in
+// production — "the mechanism exists somewhere in the file" is not the same
+// claim as "the default call path uses it". getProcessSnapshot's default fetch
+// called the PLAIN untimed/unhidden promisified exec instead of execHidden, and
+// its cache-bypass check (`if (execFn) return buildSnapshotFromQuery(execFn)`)
+// tripped for ANY truthy execFn — including the `= execHidden` DEFAULT
+// PARAMETER value that getDescendantPids/getCommandLines/hasChildProcesses all
+// carry, so every production caller bypassed the cache and ran untimed queries.
+// With 6+ workers live and a 30s heartbeat each, this stacked 67-127 concurrent
+// Get-CimInstance shells (3.8-6.4GB RAM, ~1.2s/query serialized by WMI, some
+// living up to 4 minutes). Fixed by (1) routing the default path through
+// execHidden, (2) treating `execFn === undefined || execFn === execHidden` as
+// "not genuinely injected" so the cache actually applies to production's
+// default-parameter calls, (3) coalescing concurrent default-path snapshot
+// requests into one in-flight promise, and (4) a heartbeat re-entrancy guard in
+// worker-exec.ts so a slow tick can't stack a second one on top of itself.
+// Next reader: verify the actual call site every time, not just that the right
+// primitive exists in the file.
 
 // Raw C0 control characters (U+0000 through U+001F) are ILLEGAL inside JSON
 // strings, but PowerShell's ConvertTo-Json leaves some of them unescaped in its
@@ -50,26 +82,52 @@ const BATCH_SIZE = 50;
 
 // Snapshot cache to avoid per-PID OS queries on hot paths (heartbeat, idle checks)
 const SNAPSHOT_TTL_MS = 300;
-interface ProcessRecord {
+export interface ProcessRecord {
   parentPid: number;
   cmdline: string;
+  /** Process creation time in epoch ms when the platform query provides it
+   *  (Windows: Win32_Process.CreationDate; POSIX: etimes-derived). Absent on
+   *  callers/tests that build synthetic records — consumers must tolerate
+   *  undefined (a missing timestamp proves nothing, never excludes). */
+  createdMs?: number;
 }
 let _cachedSnapshot: Map<number, ProcessRecord> | null = null;
 let _snapshotExpiresAt = 0;
+// In-flight default-path snapshot query. Concurrent default callers (including
+// a `fresh: true` caller arriving while one is already running) await this
+// SAME promise instead of each spawning their own Get-CimInstance shell.
+let _inFlightSnapshot: Promise<Map<number, ProcessRecord>> | null = null;
+
+/** Test-only: clear cache + in-flight state so cases don't leak into each other. */
+export function _resetSnapshotCacheForTest(): void {
+  _cachedSnapshot = null;
+  _snapshotExpiresAt = 0;
+  _inFlightSnapshot = null;
+}
 
 /**
  * Get a process-tree snapshot in ONE OS query. Returns a map of PID→{parentPid,cmdline}.
  * Results are cached for 300ms to make consecutive heartbeats/idle checks essentially free.
- * When a custom execFn is injected (tests), bypass the cache to preserve call-count semantics.
+ * When a GENUINELY injected execFn is passed (tests — anything other than the
+ * `execHidden` default-parameter value production code carries), bypass the
+ * cache/coalescing entirely to preserve call-count semantics. Treating the
+ * `execHidden` default-parameter value itself as "injected" was the 4th storm
+ * variant's root cause (see execHidden's header comment above) — every
+ * production caller using the default parameter was bypassing the cache.
  * `fresh: true` forces a new query AND refreshes the cache — for DECISION points
  * (kill/extend, idle-kill) where a ≤300ms-stale read can see a just-exited child
- * as still present and wrongly extend instead of killing (2026-08-31).
+ * as still present and wrongly extend instead of killing (2026-08-31). A fresh
+ * call arriving while another default-path query is already in flight coalesces
+ * onto it rather than issuing a second one.
+ *
+ * Exported for bus-queue's termKey liveness check (AI-272): a registry row's
+ * recorded pid is probed against this same snapshot — no per-PID queries.
  */
-async function getProcessSnapshot(execFn?: ExecFn, fresh = false): Promise<Map<number, ProcessRecord>> {
+export async function getProcessSnapshot(execFn?: ExecFn, fresh = false): Promise<Map<number, ProcessRecord>> {
   const now = Date.now();
 
-  // If injected execFn, bypass cache entirely (tests need exact call counts)
-  if (execFn) {
+  // Genuinely injected execFn (tests) — bypass cache/coalescing entirely.
+  if (execFn && execFn !== execHidden) {
     return buildSnapshotFromQuery(execFn);
   }
 
@@ -78,11 +136,22 @@ async function getProcessSnapshot(execFn?: ExecFn, fresh = false): Promise<Map<n
     return _cachedSnapshot;
   }
 
-  // Cache miss, expired, or fresh — fetch and cache
-  const snapshot = await buildSnapshotFromQuery(execAsync);
-  _cachedSnapshot = snapshot;
-  _snapshotExpiresAt = now + SNAPSHOT_TTL_MS;
-  return snapshot;
+  // Cache miss, expired, or fresh — coalesce concurrent default-path callers
+  // onto ONE in-flight query instead of each spawning their own.
+  if (_inFlightSnapshot) {
+    return _inFlightSnapshot;
+  }
+  _inFlightSnapshot = (async () => {
+    try {
+      const snapshot = await buildSnapshotFromQuery(execHidden);
+      _cachedSnapshot = snapshot;
+      _snapshotExpiresAt = Date.now() + SNAPSHOT_TTL_MS;
+      return snapshot;
+    } finally {
+      _inFlightSnapshot = null;
+    }
+  })();
+  return _inFlightSnapshot;
 }
 
 async function buildSnapshotFromQuery(execFn: ExecFn): Promise<Map<number, ProcessRecord>> {
@@ -91,7 +160,7 @@ async function buildSnapshotFromQuery(execFn: ExecFn): Promise<Map<number, Proce
 
     if (platform() === 'win32') {
       const { stdout } = await execFn(
-        `powershell -NoProfile -Command "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress"`
+        `powershell -NoProfile -Command "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine,@{n='CreatedMs';e={if ($_.CreationDate) {[DateTimeOffset]$_.CreationDate.ToUnixTimeMilliseconds()} else {$null}}} | ConvertTo-Json -Compress"`
       );
       const raw = stdout.trim();
       if (!raw) return new Map();
@@ -103,19 +172,26 @@ async function buildSnapshotFromQuery(execFn: ExecFn): Promise<Map<number, Proce
           records.set(p.ProcessId, {
             parentPid: p.ParentProcessId as number,
             cmdline: p.CommandLine ?? '',
+            ...(typeof p.CreatedMs === 'number' ? { createdMs: p.CreatedMs } : {}),
           });
         }
       }
     } else {
-      const { stdout } = await execFn('ps -eo pid=,ppid= --no-headers 2>/dev/null || ps -eo pid,ppid');
+      const { stdout } = await execFn('ps -eo pid=,ppid=,etimes= --no-headers 2>/dev/null || ps -eo pid,ppid');
+      const nowMs = Date.now();
       records = new Map();
       for (const line of stdout.trim().split('\n')) {
         if (!line.trim()) continue;
-        const [pidStr, ppidStr] = line.trim().split(/\s+/);
+        const [pidStr, ppidStr, etimesStr] = line.trim().split(/\s+/);
         const pid = parseInt(pidStr, 10);
         const ppid = parseInt(ppidStr, 10);
         if (!isNaN(pid) && !isNaN(ppid)) {
-          records.set(pid, { parentPid: ppid, cmdline: '' });
+          const etimes = parseInt(etimesStr, 10);
+          records.set(pid, {
+            parentPid: ppid,
+            cmdline: '',
+            ...(isNaN(etimes) ? {} : { createdMs: nowMs - etimes * 1000 }),
+          });
         }
       }
     }
@@ -187,6 +263,20 @@ export async function hasChildProcesses(pid: number, isShell: boolean = false, e
       const grandchildren = adjacency.get(childPid) ?? [];
       if (grandchildren.length > 0) return true;
     }
+    // POSIX sh -c exec-collapse (macOS CI fail 2026-09-20): when `pid` is a
+    // shell that exec'd its single-command payload, `pid` itself IS the
+    // worker and `children` are its tools — the depth-2 walk above probes
+    // the TOOLS' children and wrongly reports "no liveness", so the
+    // no-progress guard killed live workers on macOS (/bin/sh = bash, which
+    // execs `-c` payloads; dash on ubuntu does not). Probe pid's own
+    // cmdline: no longer a shell → children are the worker's tools → alive.
+    if (platform() !== 'win32' && children.length > 0) {
+      try {
+        const own = (await getCommandLines([pid], execFn)).get(pid) ?? '';
+        const argv0 = (own.trim().split(/\s+/)[0] ?? '').split('/').pop() ?? '';
+        if (argv0 && !/^(?:-?\w*sh|cmd(?:\.exe)?|command)$/i.test(argv0)) return true;
+      } catch { /* fall through — a dead pid reads as no liveness anyway */ }
+    }
     return false;
   }
 
@@ -221,6 +311,92 @@ export async function getDescendantPids(
   }
 
   return result;
+}
+
+/**
+ * Return the ancestor chain of a pid, nearest parent first. One OS-level
+ * query (the shared snapshot), then an in-memory parent walk — O(tree
+ * depth). Stops at a missing record or a parent cycle.
+ */
+export async function getAncestorPids(
+  pid: number,
+  execFn?: ExecFn,
+): Promise<number[]> {
+  const snapshot = await getProcessSnapshot(execFn);
+  const result: number[] = [];
+  const seen = new Set<number>([pid]);
+  let cur = snapshot.get(pid)?.parentPid ?? 0;
+  while (cur > 0 && !seen.has(cur)) {
+    seen.add(cur);
+    result.push(cur);
+    cur = snapshot.get(cur)?.parentPid ?? 0;
+  }
+  return result;
+}
+
+/**
+ * Verify that a pid genuinely belongs to a tracked process family before
+ * killing or alerting on it. Two stale-PPID failure modes this defends
+ * against (Windows ParentProcessId is set at spawn and NEVER updated — a
+ * dead ancestor's pid can be reused by an unrelated process, and BFS then
+ * mis-attributes unrelated processes, including system services, into the
+ * tree — observed live 2026-09-18: 211 "descendants" incl. svchost /
+ * WUDFHost / fontdrvhost on a skill-commit run):
+ *
+ *  - Phantom: the process PREDATES the run — createdMs < notBeforeMs proves
+ *    it cannot be the worker's descendant regardless of what its recorded
+ *    parentPid says. (skipped when createdMs is absent — no data, no verdict)
+ *  - Pid reuse / mis-attribution: the pid's LIVE ancestor chain contains a
+ *    process outside familyPids → it hangs off a foreign live process, not
+ *    the dead worker tree. Real descendants' chains either reach rootPid or
+ *    terminate at dead in-family ancestors (dead pids are absent from the
+ *    snapshot — the walk stops there and stays "verified").
+ *
+ * `pid === rootPid` is always verified: the family's own root is expected to
+ * have ancestors outside the family (the executor that spawned it).
+ */
+export function isVerifiedTreeMember(
+  pid: number,
+  rootPid: number | undefined,
+  familyPids: ReadonlySet<number>,
+  snapshot: ReadonlyMap<number, ProcessRecord>,
+  notBeforeMs?: number,
+): boolean {
+  if (pid === rootPid) return true;
+  const rec = snapshot.get(pid);
+  if (!rec) return false; // absent from snapshot = already dead — nothing to verify or kill
+  if (notBeforeMs !== undefined && rec.createdMs !== undefined && rec.createdMs < notBeforeMs) {
+    return false;
+  }
+  const seen = new Set<number>([pid]);
+  let cur = rec.parentPid ?? 0;
+  while (cur > 0 && !seen.has(cur)) {
+    if (cur === rootPid) return true;          // chain reached the family root
+    if (!familyPids.has(cur)) return false;    // live ancestor outside the family → not ours
+    seen.add(cur);
+    const parentRec = snapshot.get(cur);
+    if (!parentRec) return true;               // in-family ancestor is dead → chain ends inside the family
+    cur = parentRec.parentPid ?? 0;
+  }
+  return true;
+}
+
+/** Partition pids into verified family members vs foreign/mis-attributed. */
+export function partitionVerifiedTreeMembers(
+  pids: number[],
+  rootPid: number | undefined,
+  trackedPids: ReadonlySet<number> | readonly number[],
+  snapshot: ReadonlyMap<number, ProcessRecord>,
+  notBeforeMs?: number,
+): { verified: number[]; foreign: number[] } {
+  const familyPids = new Set<number>(trackedPids);
+  if (rootPid !== undefined) familyPids.add(rootPid);
+  const verified: number[] = [];
+  const foreign: number[] = [];
+  for (const pid of pids) {
+    (isVerifiedTreeMember(pid, rootPid, familyPids, snapshot, notBeforeMs) ? verified : foreign).push(pid);
+  }
+  return { verified, foreign };
 }
 
 /**
@@ -297,6 +473,32 @@ async function getCommandLinesDirect(
   }
 
   return result;
+}
+
+/**
+ * Every live process whose command line contains `needle`, from the SAME cached
+ * snapshot the other readers use (one OS query per TTL, coalesced, hidden+timed
+ * exec on the default path — never a per-PID query). For decision points that
+ * must find a process WITHOUT a registry pid to anchor on (voice-inbox
+ * fallback's dead-dispatch arm scanning by dispatch id — the registry can lose
+ * entries, so its absence must not by itself conclude "dead").
+ * POSIX limitation: the shared snapshot's `ps -eo pid=,ppid=` query deliberately
+ * carries no command lines, so this finds nothing there — callers must treat a
+ * miss as "no scan evidence", never as positive evidence of death.
+ */
+export async function findProcessesByCommandLine(
+  needle: string,
+  execFn: ExecFn = execHidden
+): Promise<Array<{ pid: number; cmdline: string }>> {
+  if (!needle) return [];
+  const snapshot = await getProcessSnapshot(execFn);
+  const hits: Array<{ pid: number; cmdline: string }> = [];
+  for (const [pid, record] of snapshot) {
+    if (record.cmdline && record.cmdline.includes(needle)) {
+      hits.push({ pid, cmdline: record.cmdline });
+    }
+  }
+  return hits;
 }
 
 /**

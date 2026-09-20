@@ -89,6 +89,10 @@ export interface ConversationTurn {
   refId?: string;       // bot reply debug handle (e.g., 'c-a59a') — set on assistant turns; queryable via `pa ref`
   /** Set when this turn came from a button press or a reaction instead of typed text. */
   via?: 'button' | 'reaction';
+  /** The execution-thread id (e.g. 't-3') when this turn archives a thread
+   *  result. Absent on all other turns (user messages, orchestrator replies,
+   *  etc.). Additive — old turns load fine. */
+  thread_ref?: string;
 }
 
 export interface PendingAction {
@@ -96,6 +100,8 @@ export interface PendingAction {
   proposed_at: string;
   /** message_id of the reply that asked the question — the anchor for the ✅/❌ keyboard and for 👍/👎 reaction approval. */
   message_id?: number;
+  /** The vi- task id this ask was mirrored to in the voice-inbox app (ask mirroring); Telegram-side answers cancel the widget via that id. */
+  voice_task?: string;
 }
 
 /** PA_META `question` action armed for this topic (2026-09-02, topic-task handover
@@ -108,6 +114,8 @@ export interface PendingQuestion {
   task_id?: string;
   asked_at: string;         // ISO
   message_id?: number;      // set by main.ts at attach (WP-F)
+  /** The vi- task id this ask was mirrored to in the voice-inbox app (ask mirroring); Telegram-side answers cancel the widget via that id. */
+  voice_task?: string;
 }
 
 export interface SessionInfo {
@@ -176,7 +184,7 @@ export interface ConversationState {
   tunable_defaults?: TunableStore;               // TOPIC tier — set by `/default <setting> <value>`, persistent (never expires)
   model_status?: ModelStatusSnapshot; // canonical snapshot for the topic status card
   pinned_worker?: string;         // legacy mirror of model_status.current_worker for backward compatibility
-  pinned_status_message_id?: number; // message_id of the pinned status card (model + keep-awake) — unpinned when context is cleared
+  pinned_status_message_id?: number; // message_id of the pinned status card — unpinned when context is cleared
   last_codex_usage_pct?: number;    // Codex rate-limit window used_percent from last turn — debounces proactive warnings
   pendingDescription?: {            // AI-029: auto-suggest description awaiting user approval
     text: string;                   // suggested description text (empty string = open prompt only)
@@ -184,6 +192,11 @@ export interface ConversationState {
     expiresAt: number;              // epoch ms — auto-accept if now > expiresAt
   };
   ancestry?: BranchAncestry;       // AI-028: branch relationship to a parent topic
+  /** AI-234: the chips attached to the most recent assistant reply, keyed
+   *  for sr:<idx> callback resolution. Ephemeral — cleared on the next
+   *  turn and on press. Mirrors pending_question's shape, not its
+   *  semantics (no pending ask, no TTL). */
+  pending_suggestions?: { message_id?: number; items: string[] };
 }
 
 export interface BranchAncestry {
@@ -195,7 +208,10 @@ export interface BranchAncestry {
 
 export interface PAMetaAction {
   type: 'retry_with_worker' | 'run_skill' | 'confirm_required' | 'restart_bot' | 'kb_note' | 'watch_job' | string;
-  worker?: string;   // ignored by dispatch — system picks next worker by config priority
+  worker?: string;   // retry_with_worker: ignored by dispatch — system picks next worker by config priority.
+                     // spawn_thread (AI-203 WP-1): optional per-thread worker pin (claude/zclaude/agy/codex);
+                     // validated in orchestrator.ts's validateSpawnThreadAction, carried on the route, and
+                     // passed to createThread's init.worker (WP-2 wires it into dispatchOpts.preferredWorker).
   skill?: string;    // for run_skill: skill name to trigger
   reason?: string;   // human-readable explanation (optional)
   domain?: string;   // for kb_note: Sources.md domain section to update (e.g. "Ekadashi / fasting calendar")
@@ -218,8 +234,15 @@ export interface PAMetaAction {
   thread_id?: string; // for steer_thread: `t-<n>` matching a store record
   message?: string;   // for steer_thread: the steer text, 1..4000 chars
   mode?: string;      // for steer_thread: "queue" | "interrupt" (optional — the orchestrator classifies per message)
+  depends_on?: string[]; // for spawn_thread: up to 3 ids like "t-3" (from Execution threads) the new thread waits on; fail-open sanitized
+  model?: string;   // for spawn_thread (WP-7/OD-4): optional per-thread model pin — /^[a-zA-Z0-9._-]{1,64}$/, validated in orchestrator.ts's validateSpawnThreadAction, stored on the record, folded into the executor's buildTopicTierExtraArgs overrides slot (last-wins over topic tunable_defaults)
 }
 
 export interface PAMeta {
   actions: PAMetaAction[];
+  /** AI-234: candidate quick-reply chips the worker emits in THIS same turn,
+   *  alongside its answer text. NOT an action — it has no server side effect;
+   *  it is a rendering hint the surface turns into tappable chips. Plain
+   *  product language only (sanitizeSuggestedItems drops non-plain entries). */
+  suggested_items?: string[];
 }

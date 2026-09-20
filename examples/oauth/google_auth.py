@@ -5,7 +5,7 @@ Token:       ~/.pa/google-token.json
 Credentials: ~/.pa/google-credentials.json
 
 To re-authenticate (e.g. after revocation):
-    python ~/.pa/reauth_google.py
+    python3 ~/.pa/reauth_google.py   # (Windows: python ~/.pa/reauth_google.py)
 
 The token covers all scopes used across PA projects:
   drive, gmail.send, gmail.readonly, documents
@@ -68,7 +68,7 @@ def get_credentials():
     if not creds or not creds.valid:
         raise RuntimeError(
             f"Google token is missing or invalid.\n"
-            f"Run to re-authenticate: python \"{PA_HOME / 'reauth_google.py'}\""
+            f"Run to re-authenticate: python3 \"{PA_HOME / 'reauth_google.py'}\" (Windows: python)"
         )
 
     return creds

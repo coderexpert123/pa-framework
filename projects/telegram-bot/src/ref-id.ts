@@ -8,8 +8,14 @@ import { logger } from '../../../pa/dist/src/lib/log.js';
 export type RefKind = 'pin' | 'help' | 'branch' | 'lock_busy' | 'failover' | 'system' | 'recovered' | 'callback' | 'requeue-deferred'
   | 'task-pickup' | 'task-done' | 'task-retry' | 'task-failed' | 'task-route' | 'task-question'
   // AI-203 orchestrator execution threads: pickup/retry/done/failed FYIs the
-  // thread executor posts back into the owning topic.
-  | 'thread-spawned' | 'thread-retry' | 'thread-done' | 'thread-failed';
+  // thread executor posts back into the owning topic; 'thread-parked' is the
+  // wall-park notice (2026-09-12) — posted once per park episode.
+  | 'thread-spawned' | 'thread-retry' | 'thread-done' | 'thread-failed' | 'thread-parked'
+  | 'thread-question'
+  // Router-as-orchestrator (2026-09-20): the placement announce in the origin
+  // topic (WP-5 §3.2). pa's appLogKind whitelist collapses unknown kinds to
+  // 'system', so `pa ref` queryability holds unchanged.
+  | 'route';
 
 export function makeRefId(prefix: string = 's'): string {
   return `${prefix}-${randomBytes(6).toString('hex')}`;

@@ -211,7 +211,16 @@ export class Blackboard {
     await this.ensureFile();
     const start = Date.now();
 
-    while (Date.now() - start < timeoutMs) {
+    // `firstAttempt` guarantees the loop body runs at least once even when
+    // timeoutMs is 0 — `Date.now() - start < 0` is already false on the very
+    // first check, so a plain `while` condition here returns false without
+    // ever trying to acquire, even against a fully free resource (2026-09-13
+    // drain incident: backlog-fragments-drain's waitMs-0 "try once, skip if
+    // busy" call always saw the lock as busy and permanently skipped every
+    // merge pass, regardless of whether anything actually held the lock).
+    let firstAttempt = true;
+    while (firstAttempt || Date.now() - start < timeoutMs) {
+      firstAttempt = false;
       // Use proper-lockfile to ensure atomic access to blackboard.json
       let release: (() => Promise<void>) | undefined;
       try {
@@ -276,8 +285,13 @@ export class Blackboard {
           // Already locked by a conflicting holder
           await release();
           release = undefined;
-          // Wait and retry
-          await new Promise((resolve) => setTimeout(resolve, 1000));
+          // Only sleep if another attempt will actually happen — a zero (or
+          // exhausted) time budget must fail fast, never pay a retry sleep it
+          // will never use (same 2026-09-13 drain incident: a waitMs-0 call
+          // must return a busy verdict instantly, not after a 1s delay).
+          if (Date.now() - start < timeoutMs) {
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+          }
           continue;
         }
 
@@ -299,7 +313,9 @@ export class Blackboard {
         return true;
       } catch (err) {
         console.error('[blackboard] acquireLock error:', err);
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+        if (Date.now() - start < timeoutMs) {
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
       } finally {
         if (release) await release();
       }

@@ -10,6 +10,19 @@ import { listSkills } from './skills.js';
 import { getLastSuccessfulRun, getFailureState } from './logger.js';
 import { paHome } from './paths.js';
 import { repoRootFromModule } from './lib/git-root.js';
+import { catchupLoopLockPath, readCatchupLoopHeartbeatStaleMs, DEFAULT_CATCHUP_LOOP_HEARTBEAT_STALE_MS } from './commands/catchup.js';
+import { stallRecordsPath } from './lib/stall.js';
+import {
+  CATCHUP_LAUNCHER_UV_THREADPOOL_SIZE,
+  CATCHUP_LOOP_LANES,
+  CATCHUP_LOOP_PAGE_FIRST_LINE,
+  CATCHUP_LOOP_PAGE_SUBJECT,
+  CATCHUP_LOOP_STALLED_DEDUP_KEY,
+  catchupLanesDir,
+  catchupPageBodyPath,
+  catchupStallMarkerPath,
+  catchupWatchdogScriptPath,
+} from './lib/catchup-contract.js';
 import type { Skill, RunMeta, CostTierPeakWindowUtc } from './types.js';
 
 const execAsync = promisify(exec);
@@ -24,25 +37,15 @@ export interface OverdueSkill {
 // z.ai peak = Mon-Fri 06:00-10:00 UTC (11:30-15:30 IST, 2x credits). Periodic
 // (non-time-pinned) skills marked cost_tier: off_peak defer during that window;
 // they catch up at the next evaluation inside the cheap window (19:30-11:30 IST).
-
-export const DEFAULT_PEAK_WINDOW_UTC: PeakWindowUtc = {
-  days: [1, 2, 3, 4, 5], // Mon-Fri
-  start_hour: 6,            // 06:00 UTC
-  end_hour: 10,              // 10:00 UTC
-};
-
-export interface PeakWindowUtc {
-  days: number[];
-  start_hour: number;
-  end_hour: number;
-}
-
-/** True while inside the z.ai peak billing window (Mon-Fri 06:00-10:00 UTC by default). */
-export function isPeakWindow(now: Date = new Date(), window: PeakWindowUtc = DEFAULT_PEAK_WINDOW_UTC): boolean {
-  const d = now.getUTCDay();
-  const h = now.getUTCHours();
-  return window.days.includes(d) && h >= window.start_hour && h < window.end_hour;
-}
+//
+// The window primitives moved to lib/peak-window.ts (2026-09-11 — the model
+// routing policy consumes them without this module's import chain); re-exported
+// here so every existing importer (pa/tests/cost-tier.test.ts, docs) keeps
+// resolving from scheduler.
+export { DEFAULT_PEAK_WINDOW_UTC, isPeakWindow } from './lib/peak-window.js';
+export type { PeakWindowUtc } from './lib/peak-window.js';
+import { DEFAULT_PEAK_WINDOW_UTC, isPeakWindow, resolvePeakWindowUtc } from './lib/peak-window.js';
+import type { PeakWindowUtc } from './lib/peak-window.js';
 
 /** Log-once-per-day-per-skill deferral marker (catchup is a fresh process each
  *  minute; a module map would re-log every evaluation). Best-effort: failures
@@ -309,9 +312,7 @@ export async function partitionOverdueByCostTier(
     // Config missing or invalid — use default window
   }
 
-  const window = configuredWindow
-    ? { days: configuredWindow.days ?? [1, 2, 3, 4, 5], start_hour: configuredWindow.start_hour ?? 6, end_hour: configuredWindow.end_hour ?? 10 }
-    : DEFAULT_PEAK_WINDOW_UTC;
+  const window = resolvePeakWindowUtc(configuredWindow);
 
   const isInOffPeak = isOffPeakWindow(now, window);
 
@@ -437,7 +438,10 @@ export function scheduledTaskName(baseLabel: string): string {
  * call time (not a module-level constant) so each call reflects whatever
  * PA_HOME is set to right now — tests can set process.env.PA_HOME per case
  * without needing to re-import the module. */
-function cronSentinelReminders(): string {
+/** Exported (2026-09-10 launch-cadence wave): syncSchedulesPosix() uses this
+ *  both to remove the legacy reminders block on migration and, unchanged, as
+ *  listSchedules()'s filter. */
+export function cronSentinelReminders(): string {
   return `# ${scheduledTaskName('PA-Catchup-Reminders')} (managed by pa schedules sync)`;
 }
 function cronSentinelDefault(): string {
@@ -523,84 +527,567 @@ export async function syncSchedules(): Promise<void> {
   }
 }
 
+/** R-A (2026-09-17): env var both launchers read at run time from their own
+ *  environment (never secrets.env) - seconds to wait for a killed loop's PID
+ *  to exit before relaunching anyway. Whole seconds 1-9999; else the default. */
+export const CATCHUP_KILL_EXIT_WAIT_ENV = 'PA_CATCHUP_KILL_EXIT_WAIT_S';
+export const DEFAULT_CATCHUP_KILL_EXIT_WAIT_SECS = 120;
+/** R-B (2026-09-17): the page a launcher sends when the recorded PID now runs
+ *  another command line - the loop died without its clean shutdown. */
+export const CATCHUP_LOOP_PID_REUSED_DEDUP_KEY = 'catchup-loop-pid-reused';
+export const CATCHUP_LOOP_PID_REUSED_CAUSE = 'catchup loop was not running (recorded PID now belongs to another process); relaunched';
+
+export interface CatchupWatchdogPaths {
+  lockPath: string;
+  lanesDir: string;
+  stallMarkerPath: string;
+  stallRecordsPath: string;
+  pageBodyPath: string;
+}
+
+/** Paths baked into both launchers at sync time (a scheduler launch has no useful environment). */
+export function catchupWatchdogPaths(): CatchupWatchdogPaths {
+  return {
+    lockPath: catchupLoopLockPath(),
+    lanesDir: catchupLanesDir(),
+    stallMarkerPath: catchupStallMarkerPath(),
+    stallRecordsPath: stallRecordsPath(),
+    pageBodyPath: catchupPageBodyPath(),
+  };
+}
+
+function assertLaneNames(lanes: readonly string[]): void {
+  for (const lane of lanes) {
+    if (!/^[a-z][a-z0-9-]*$/.test(lane)) throw new Error(`invalid catchup lane name: ${lane}`);
+  }
+}
+
 /** Pure, unit-tested (same pattern as resolveWindowsPaPath/resolvePosixPaPath).
  *  The CurrentDirectory line is load-bearing: without it wscript inherits Task
  *  Scheduler's cwd (C:\Windows\System32) and every cwd-relative path inside
  *  `pa catchup` resolves there. The bot's launcher had this exact bug fixed in
- *  303f439; the generator never got the fix (alerts-week-review §5.2). */
-export function buildLauncherVbs(paPathCmd: string, args: string, repoRoot: string): string {
+ *  303f439; the generator never got the fix (alerts-week-review §5.2).
+ *
+ *  2026-09-16 lane-wedge work: (1) the gate reads the heartbeat AND every lane
+ *  progress file — a live PID whose lane hasn't ticked is wedged even though
+ *  the loop-wide heartbeat still looks fresh. (2) The launch is UNAWAITED
+ *  because an awaited launch keeps the launcher alive for the loop's whole
+ *  life, and the task's one-instance policy then refuses every later
+ *  trigger. (3) The only awaited children are the tasklist gate and the
+ *  taskkill of a proven PID. (4) It pages through a fresh `pa notify` with a
+ *  cause-only body. (5) Before any kill it confirms the PID's command line
+ *  is the loop's, because a dead loop's PID can be reused (C17).
+ *
+ *  2026-09-17 (R-A/R-B): (6) after the kill it waits up to
+ *  `PA_CATCHUP_KILL_EXIT_WAIT_S` seconds (default 120), polling every 2 s.
+ *  When the PID outlives the wait it relaunches anyway and pages the
+ *  did-not-exit cause. (7) A recorded PID that now runs another command
+ *  line is never killed; the launcher appends a `pid-reused` record and
+ *  pages once under `catchup-loop-pid-reused` at `warn`. */
+export function buildCatchupWatchdogVbs(
+  paPathCmd: string,
+  args: string,
+  repoRoot: string,
+  paths: CatchupWatchdogPaths,
+  heartbeatStaleMs: number = DEFAULT_CATCHUP_LOOP_HEARTBEAT_STALE_MS,
+  lanes: readonly string[] = CATCHUP_LOOP_LANES,
+): string {
+  assertLaneNames(lanes);
   const rootVbs = repoRoot.replace(/"/g, '""');
-  return `Set WshShell = CreateObject("WScript.Shell")\n` +
-    `WshShell.CurrentDirectory = "${rootVbs}"\n` +
-    `WshShell.Run "cmd /c ""${paPathCmd}"" ${args}", 0, True\n`;
+  const lockVbs = paths.lockPath.replace(/"/g, '""');
+  const lanesDirVbs = paths.lanesDir.replace(/"/g, '""');
+  const markerVbs = paths.stallMarkerPath.replace(/"/g, '""');
+  const recordsVbs = paths.stallRecordsPath.replace(/"/g, '""');
+  const bodyVbs = paths.pageBodyPath.replace(/"/g, '""');
+  const staleSecs = Math.max(1, Math.round(heartbeatStaleMs / 1000));
+  const laneList = lanes.map((l) => `"${l}"`).join(', ');
+  const lines = [
+    `Set WshShell = CreateObject("WScript.Shell")`,
+    `Set fso = CreateObject("Scripting.FileSystemObject")`,
+    `WshShell.CurrentDirectory = "${rootVbs}"`,
+    `lockPath = "${lockVbs}"`,
+    `lanesDir = "${lanesDirVbs}"`,
+    `laneNames = Array(${laneList})`,
+    `stallMarkerPath = "${markerVbs}"`,
+    `stallRecordsPath = "${recordsVbs}"`,
+    `pageBodyPath = "${bodyVbs}"`,
+    `heartbeatStaleSecs = ${staleSecs}`,
+    `Set procEnv = WshShell.Environment("Process")`,
+    `If procEnv("UV_THREADPOOL_SIZE") = "" Then procEnv("UV_THREADPOOL_SIZE") = "${CATCHUP_LAUNCHER_UV_THREADPOOL_SIZE}"`,
+    `killExitWaitSecs = ReadWaitSecs(procEnv("${CATCHUP_KILL_EXIT_WAIT_ENV}"), ${DEFAULT_CATCHUP_KILL_EXIT_WAIT_SECS})`,
+    `cause = ""`,
+    `pageSeverity = "error"`,
+    `pageDedupKey = "${CATCHUP_LOOP_STALLED_DEDUP_KEY}"`,
+    `pid = ReadPidFile(lockPath)`,
+    `If PidIsLiveNode(pid) Then`,
+    `  cause = StaleCause(lockPath, lanesDir, laneNames, heartbeatStaleSecs)`,
+    `  If cause = "" Then WScript.Quit 0`,
+    `  If CommandLineIsOtherProcess(pid) Then`,
+    `    cause = "${CATCHUP_LOOP_PID_REUSED_CAUSE}"`,
+    `    marker = ConsumeStallMarker(stallMarkerPath)`,
+    `    If marker <> "" Then cause = cause & "; " & marker`,
+    `    AppendLauncherRecord stallRecordsPath, pid, "pid-reused", cause`,
+    `    pageSeverity = "warn"`,
+    `    pageDedupKey = "${CATCHUP_LOOP_PID_REUSED_DEDUP_KEY}"`,
+    `  Else`,
+    `    marker = ConsumeStallMarker(stallMarkerPath)`,
+    `    If marker <> "" Then cause = cause & "; " & marker`,
+    `    AppendLauncherRecord stallRecordsPath, pid, "lane-progress", cause`,
+    `    WshShell.Run "cmd /c taskkill /F /PID " & pid, 0, True`,
+    `    If Not LoopExitedWithin(pid, killExitWaitSecs) Then cause = cause & "; killed catchup loop did not exit within " & killExitWaitSecs & " s; relaunched anyway - a stale write may land"`,
+    `  End If`,
+    `Else`,
+    `  cause = ConsumeStallMarker(stallMarkerPath)`,
+    `End If`,
+    `WshShell.Run "cmd /c """"${paPathCmd}"" ${args}""", 0, False`,
+    `If cause <> "" Then`,
+    `  WriteText pageBodyPath, "${CATCHUP_LOOP_PAGE_FIRST_LINE}" & vbCrLf & "Cause: " & cause`,
+    `  WshShell.Run "cmd /c """"${paPathCmd}"" notify --subject ""${CATCHUP_LOOP_PAGE_SUBJECT}"" --body-file ""${bodyVbs}"" --dedup-key " & pageDedupKey & " --severity " & pageSeverity & """", 0, False`,
+    `End If`,
+    ``,
+    `' Reads the loop's PID from its lock file; 0 when missing or unparseable.`,
+    `Function ReadPidFile(path)`,
+    `  Dim text`,
+    `  ReadPidFile = 0`,
+    `  If Not fso.FileExists(path) Then Exit Function`,
+    `  On Error Resume Next`,
+    `  text = Trim(fso.OpenTextFile(path, 1).ReadAll())`,
+    `  If Err.Number <> 0 Then Err.Clear : Exit Function`,
+    `  On Error GoTo 0`,
+    `  If IsNumeric(text) Then ReadPidFile = CLng(text)`,
+    `End Function`,
+    ``,
+    `' Seconds to wait for a killed loop to exit: the environment value when it is a`,
+    `' whole number from 1 to 9999, otherwise the default baked in at sync time.`,
+    `Function ReadWaitSecs(text, defaultSecs)`,
+    `  Dim re`,
+    `  ReadWaitSecs = defaultSecs`,
+    `  Set re = New RegExp`,
+    `  re.Pattern = "^[1-9][0-9]{0,3}$"`,
+    `  If re.Test(text) Then ReadWaitSecs = CLng(text)`,
+    `End Function`,
+    ``,
+    `' Liveness gate: true only when a live node.exe holds this PID. Anything else -`,
+    `' missing lock file, unparseable PID, dead process, a non-node process that`,
+    `' reused the PID, an unexpected tasklist result - reads as NOT live, so the`,
+    `' worst case is one wasted launch that exits on the real lock. Never the`,
+    `' reverse: a false "alive" would leave the service down forever.`,
+    `Function PidIsLiveNode(pid)`,
+    `  Dim cmdText`,
+    `  PidIsLiveNode = False`,
+    `  If Not IsNumeric(pid) Then Exit Function`,
+    `  If CDbl(pid) <= 0 Then Exit Function`,
+    `  cmdText = "cmd /c tasklist /NH /FI ""PID eq " & CLng(pid) & """ /FI ""IMAGENAME eq node.exe"" | find /I ""node.exe"" >nul"`,
+    `  PidIsLiveNode = (WshShell.Run(cmdText, 0, True) = 0)`,
+    `End Function`,
+    ``,
+    `' True only when WMI positively reports a command line for this PID that is not`,
+    `' the catchup loop's - the dead loop's PID was reused by another process, which`,
+    `' must never be killed. Any WMI error or an empty command line reads as False,`,
+    `' so the worst case stays one extra kill and relaunch, never a silent skip.`,
+    `Function CommandLineIsOtherProcess(pid)`,
+    `  Dim procs, proc, cmdLine`,
+    `  CommandLineIsOtherProcess = False`,
+    `  cmdLine = ""`,
+    `  On Error Resume Next`,
+    `  Set procs = GetObject("winmgmts:\\\\.\\root\\cimv2").ExecQuery("SELECT CommandLine FROM Win32_Process WHERE ProcessId = " & CLng(pid))`,
+    `  If Err.Number <> 0 Then Err.Clear : Exit Function`,
+    `  For Each proc In procs`,
+    `    cmdLine = proc.CommandLine`,
+    `  Next`,
+    `  If Err.Number <> 0 Then Err.Clear : Exit Function`,
+    `  On Error GoTo 0`,
+    `  If IsNull(cmdLine) Then Exit Function`,
+    `  If Len(cmdLine) = 0 Then Exit Function`,
+    `  CommandLineIsOtherProcess = Not (InStr(1, cmdLine, "catchup", vbTextCompare) > 0 And InStr(1, cmdLine, "--loop", vbTextCompare) > 0)`,
+    `End Function`,
+    ``,
+    `' Polls every 2 s until the killed loop is gone: its PID is no longer a live`,
+    `' node.exe, or it now runs another command line. False when it is still the`,
+    `' loop after waitSecs. It polls before sleeping, so a loop that has already`,
+    `' exited costs no wait. Timer counts seconds since midnight, hence the wrap.`,
+    `Function LoopExitedWithin(pid, waitSecs)`,
+    `  Dim started, elapsed`,
+    `  LoopExitedWithin = True`,
+    `  started = Timer`,
+    `  Do While PidIsLiveNode(pid)`,
+    `    If CommandLineIsOtherProcess(pid) Then Exit Function`,
+    `    elapsed = Timer - started`,
+    `    If elapsed < 0 Then elapsed = elapsed + 86400`,
+    `    If elapsed >= waitSecs Then`,
+    `      LoopExitedWithin = False`,
+    `      Exit Function`,
+    `    End If`,
+    `    WScript.Sleep 2000`,
+    `  Loop`,
+    `End Function`,
+    ``,
+    `' Seconds since the file was last written. A missing file or any FSO error`,
+    `' reads as infinitely old, so the worst case is one extra kill and relaunch.`,
+    `Function FileAgeSecs(path)`,
+    `  Dim modified`,
+    `  FileAgeSecs = 2147483647`,
+    `  If Not fso.FileExists(path) Then Exit Function`,
+    `  On Error Resume Next`,
+    `  modified = fso.GetFile(path).DateLastModified`,
+    `  If Err.Number <> 0 Then Err.Clear : Exit Function`,
+    `  On Error GoTo 0`,
+    `  FileAgeSecs = DateDiff("s", modified, Now())`,
+    `End Function`,
+    ``,
+    `' First line of a small text file, trimmed; empty on any error.`,
+    `Function ReadFirstLine(path)`,
+    `  Dim text`,
+    `  ReadFirstLine = ""`,
+    `  If Not fso.FileExists(path) Then Exit Function`,
+    `  On Error Resume Next`,
+    `  text = fso.OpenTextFile(path, 1).ReadAll()`,
+    `  If Err.Number <> 0 Then Err.Clear : Exit Function`,
+    `  On Error GoTo 0`,
+    `  text = Replace(text, vbCr, "")`,
+    `  If InStr(text, vbLf) > 0 Then text = Left(text, InStr(text, vbLf) - 1)`,
+    `  ReadFirstLine = Trim(text)`,
+    `End Function`,
+    ``,
+    `' Empty when the heartbeat and every lane progress file are fresh; otherwise`,
+    `' names the first stale file in lane order, with that lane's last breadcrumb.`,
+    `Function StaleCause(lock, dir, lanes, staleSecs)`,
+    `  Dim lane, laneFile`,
+    `  StaleCause = ""`,
+    `  If FileAgeSecs(lock) > staleSecs Then`,
+    `    StaleCause = "heartbeat stale"`,
+    `    Exit Function`,
+    `  End If`,
+    `  For Each lane In lanes`,
+    `    laneFile = dir & "\\" & lane`,
+    `    If FileAgeSecs(laneFile) > staleSecs Then`,
+    `      StaleCause = "lane " & lane & " stale" & CrumbSuffix(ReadFirstLine(laneFile))`,
+    `      Exit Function`,
+    `    End If`,
+    `  Next`,
+    `End Function`,
+    ``,
+    `' " at <phase>[: <detail>]" from a "<ts>|<lane>|<phase>|<detail>" breadcrumb.`,
+    `Function CrumbSuffix(crumb)`,
+    `  Dim parts`,
+    `  CrumbSuffix = ""`,
+    `  parts = Split(crumb, "|")`,
+    `  If UBound(parts) < 2 Then Exit Function`,
+    `  CrumbSuffix = " at " & parts(2)`,
+    `  If UBound(parts) >= 3 Then`,
+    `    If Len(parts(3)) > 0 Then CrumbSuffix = CrumbSuffix & ": " & parts(3)`,
+    `  End If`,
+    `End Function`,
+    ``,
+    `' Reads and deletes the loop's store-stall marker; empty when absent.`,
+    `Function ConsumeStallMarker(path)`,
+    `  ConsumeStallMarker = ""`,
+    `  If Not fso.FileExists(path) Then Exit Function`,
+    `  ConsumeStallMarker = ReadFirstLine(path)`,
+    `  If ConsumeStallMarker = "" Then ConsumeStallMarker = "store stall"`,
+    `  On Error Resume Next`,
+    `  fso.DeleteFile path, True`,
+    `  Err.Clear`,
+    `  On Error GoTo 0`,
+    `End Function`,
+    ``,
+    `' Appends one JSON line of launcher evidence; best-effort.`,
+    `Sub AppendLauncherRecord(path, pid, store, cause)`,
+    `  Dim f`,
+    `  On Error Resume Next`,
+    `  Set f = fso.OpenTextFile(path, 8, True)`,
+    `  If Err.Number <> 0 Then Err.Clear : Exit Sub`,
+    `  f.WriteLine "{""ts"":""" & IsoNow() & """,""pid"":" & CLng(pid) & ",""host"":""launcher"",""store"":""" & store & """,""cause"":""" & JsonSafe(cause) & """}"`,
+    `  f.Close`,
+    `  Err.Clear`,
+    `  On Error GoTo 0`,
+    `End Sub`,
+    ``,
+    `' Escapes backslash, then double quote, for a JSON string value.`,
+    `Function JsonSafe(text)`,
+    `  JsonSafe = Replace(Replace(text, "\\", "\\\\"), """", "\\""")`,
+    `End Function`,
+    ``,
+    `' Local time as yyyy-mm-ddThh:nn:ss (no zone suffix).`,
+    `Function IsoNow()`,
+    `  Dim t`,
+    `  t = Now()`,
+    `  IsoNow = Year(t) & "-" & Right("0" & Month(t), 2) & "-" & Right("0" & Day(t), 2) & "T" & Right("0" & Hour(t), 2) & ":" & Right("0" & Minute(t), 2) & ":" & Right("0" & Second(t), 2)`,
+    `End Function`,
+    ``,
+    `' Overwrites a small text file; best-effort.`,
+    `Sub WriteText(path, text)`,
+    `  Dim f`,
+    `  On Error Resume Next`,
+    `  Set f = fso.CreateTextFile(path, True)`,
+    `  If Err.Number <> 0 Then Err.Clear : Exit Sub`,
+    `  f.Write text`,
+    `  f.Close`,
+    `  Err.Clear`,
+    `  On Error GoTo 0`,
+    `End Sub`,
+  ];
+  return lines.join('\n') + '\n';
 }
 
-async function syncSchedulesWindows(): Promise<boolean> {
-  // Find pa executable path and sanitize for shell safety
-  let whereStdout: string | null;
-  try {
-    const { stdout } = await execAsync('where pa', {});
-    whereStdout = stdout;
-  } catch {
-    whereStdout = null;
-  }
-  const resolution = resolveWindowsPaPath(whereStdout);
-  if (!resolution.ok) {
-    console.error(`Error: ${resolution.errorMessage}`);
-    process.exitCode = 1;
-    return false;
-  }
-  const paPath = resolution.paPath;
-  const repoRoot = await repoRootFromModule(__filename);
+export function shSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
 
-  // Write VBScript launchers to ~/.pa/
-  const createVbs = (name: string, args: string) => {
-    const vbsPath = join(paHome(), `run-${name}-hidden.vbs`);
-    const paPathCmd = paPath.replace(/"/g, '""');
-    writeFileSync(
-      vbsPath,
-      buildLauncherVbs(paPathCmd, args, repoRoot),
-      'utf8'
-    );
-    return vbsPath.replace(/'/g, "''");
-  };
+/** Pure. POSIX twin of buildCatchupWatchdogVbs; produces the same
+ *  lane-progress + kill-exit-wait + PID-reuse behaviour via `sh`, `ps`,
+ *  `find` and `kill`. Unit-tested directly, same pattern as
+ *  resolveWindowsPaPath/resolvePosixPaPath above. */
+export function buildCatchupWatchdogShScript(
+  paPath: string,
+  paths: CatchupWatchdogPaths,
+  heartbeatStaleMinutes: number,
+  lanes: readonly string[] = CATCHUP_LOOP_LANES,
+): string {
+  assertLaneNames(lanes);
+  const lines = [
+    `#!/bin/sh`,
+    `# Generated by pa schedules sync; edits are overwritten on the next sync.`,
+    `L=${shSingleQuote(paths.lockPath)}`,
+    `D=${shSingleQuote(paths.lanesDir)}`,
+    `M=${shSingleQuote(paths.stallMarkerPath)}`,
+    `R=${shSingleQuote(paths.stallRecordsPath)}`,
+    `B=${shSingleQuote(paths.pageBodyPath)}`,
+    `PA=${shSingleQuote(paPath)}`,
+    `N=${heartbeatStaleMinutes}`,
+    `W=$${CATCHUP_KILL_EXIT_WAIT_ENV}`,
+    `case "$W" in`,
+    `  ''|*[!0-9]*|0*|?????*) W=${DEFAULT_CATCHUP_KILL_EXIT_WAIT_SECS} ;;`,
+    `esac`,
+    `: "\${UV_THREADPOOL_SIZE:=${CATCHUP_LAUNCHER_UV_THREADPOOL_SIZE}}"`,
+    `export UV_THREADPOOL_SIZE`,
+    ``,
+    `# Appends "; <marker>" to C and deletes the loop's store-stall marker, if any.`,
+    `append_marker() {`,
+    `  if [ -f "$M" ]; then`,
+    `    MK=$(head -n 1 "$M" 2>/dev/null)`,
+    `    rm -f "$M"`,
+    `    C="$C; \${MK:-store stall}"`,
+    `  fi`,
+    `}`,
+    ``,
+    `# Appends one JSON line of launcher evidence for PID $1 with store label $2.`,
+    `record() {`,
+    `  J=$(printf '%s' "$C" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')`,
+    `  printf '{"ts":"%s","pid":%s,"host":"launcher","store":"%s","cause":"%s"}\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "$J" >> "$R"`,
+    `}`,
+    ``,
+    `# True while PID $1 is still the catchup loop. A zombie, or a PID that now runs`,
+    `# another command line, reads as exited; when ps reports nothing, kill -0 decides.`,
+    `loop_alive() {`,
+    `  Z=$(ps -p "$1" -o stat= 2>/dev/null)`,
+    `  if [ -z "$Z" ]; then`,
+    `    kill -0 "$1" 2>/dev/null && return 0`,
+    `    return 1`,
+    `  fi`,
+    `  case "$Z" in`,
+    `    *Z*) return 1 ;;`,
+    `  esac`,
+    `  case "$(ps -p "$1" -o args= 2>/dev/null)" in`,
+    `    ''|*catchup*--loop*) return 0 ;;`,
+    `  esac`,
+    `  return 1`,
+    `}`,
+    ``,
+    `C=`,
+    `O=`,
+    `V=error`,
+    `K=${CATCHUP_LOOP_STALLED_DEDUP_KEY}`,
+    `P=$(cat "$L" 2>/dev/null)`,
+    `if [ -n "$P" ]; then`,
+    `  A=$(ps -p "$P" -o args= 2>/dev/null)`,
+    `  case "$A" in`,
+    `    ''|*catchup*--loop*) ;;`,
+    `    *) O=$P; P= ;;`,
+    `  esac`,
+    `fi`,
+    `if [ -n "$P" ] && kill -0 "$P" 2>/dev/null; then`,
+    `  if [ -n "$(find "$L" -mmin +"$N" 2>/dev/null)" ]; then`,
+    `    C='heartbeat stale'`,
+    `  else`,
+    `    for lane in ${lanes.join(' ')}; do`,
+    `      f="$D/$lane"`,
+    `      if [ ! -f "$f" ] || [ -n "$(find "$f" -mmin +"$N" 2>/dev/null)" ]; then`,
+    `        S=$(awk -F'|' 'NR==1 && NF>=3 { s=" at " $3; if (NF>=4 && $4 != "") s=s ": " $4; printf "%s", s }' "$f" 2>/dev/null)`,
+    `        C="lane $lane stale$S"`,
+    `        break`,
+    `      fi`,
+    `    done`,
+    `  fi`,
+    `  [ -z "$C" ] && exit 0`,
+    `  append_marker`,
+    `  record "$P" lane-progress`,
+    `  kill -9 "$P" 2>/dev/null`,
+    `  T=0`,
+    `  while loop_alive "$P"; do`,
+    `    if [ "$T" -ge "$W" ]; then`,
+    `      C="$C; killed catchup loop did not exit within $W s; relaunched anyway - a stale write may land"`,
+    `      break`,
+    `    fi`,
+    `    sleep 2`,
+    `    T=$((T + 2))`,
+    `  done`,
+    `elif [ -n "$O" ]; then`,
+    `  C='${CATCHUP_LOOP_PID_REUSED_CAUSE}'`,
+    `  append_marker`,
+    `  record "$O" pid-reused`,
+    `  V=warn`,
+    `  K=${CATCHUP_LOOP_PID_REUSED_DEDUP_KEY}`,
+    `elif [ -f "$M" ]; then`,
+    `  MK=$(head -n 1 "$M" 2>/dev/null)`,
+    `  rm -f "$M"`,
+    `  C="\${MK:-store stall}"`,
+    `fi`,
+    `if [ -n "$C" ]; then`,
+    `  printf '%s\\nCause: %s\\n' '${CATCHUP_LOOP_PAGE_FIRST_LINE}' "$C" > "$B"`,
+    `  "$PA" notify --subject '${CATCHUP_LOOP_PAGE_SUBJECT}' --body-file "$B" --dedup-key "$K" --severity "$V" >/dev/null 2>&1 &`,
+    `fi`,
+    `exec "$PA" catchup --loop`,
+  ];
+  return lines.join('\n') + '\n';
+}
 
-  const highVbs = join(paHome(), 'run-catchup-reminders-hidden.vbs');
-  createVbs('catchup-reminders', 'catchup --topic reminders');
-  const defaultVbs = join(paHome(), 'run-catchup-hidden.vbs');
-  createVbs('catchup', 'catchup --topic default');
+export function buildCatchupWatchdogCronLine(scriptPath: string): string {
+  return `* * * * * /bin/sh ${shSingleQuote(scriptPath)}`;
+}
 
-  const registerTask = async (name: string, vbsPath: string) => {
+export type WatchdogArtifact =
+  | { ok: true; platform: 'win32'; path: string; text: string }
+  | { ok: true; platform: 'posix'; path: string; text: string; cronLine: string }
+  | { ok: false; errorMessage: string };
+
+/** Exactly what `pa schedules sync` writes on this platform — also what
+ *  `pa schedules list` compares the on-disk launcher against (a build never
+ *  deploys the launcher; only sync does). */
+export async function expectedCatchupWatchdogArtifact(): Promise<WatchdogArtifact> {
+  const paths = catchupWatchdogPaths();
+  if (platform() === 'win32') {
+    let whereStdout: string | null;
     try {
-      await execAsync(`schtasks /delete /tn "${name}" /f`).catch(() => {});
-      const { stdout } = await execAsync(`schtasks /create /tn "${name}" /tr "wscript.exe \\"${vbsPath}\\"" /sc minute /mo 1 /f`);
-      console.log(`[+] Registered '${name}': ${stdout.trim()}`);
-    } catch (err: any) {
-      console.error(`[-] Failed to register '${name}': ${err.message}`);
+      whereStdout = (await execAsync('where pa', {})).stdout;
+    } catch {
+      whereStdout = null;
     }
-  };
-
-  await registerTask(scheduledTaskName('PA-Catchup-Reminders'), highVbs);
-  await registerTask(scheduledTaskName('PA-Catchup'), defaultVbs);
-  return true;
-}
-
-async function syncSchedulesPosix(): Promise<boolean> {
-  // Find pa on PATH
+    const resolution = resolveWindowsPaPath(whereStdout);
+    if (!resolution.ok) return { ok: false, errorMessage: resolution.errorMessage ?? PA_NOT_FOUND_MESSAGE };
+    const repoRoot = await repoRootFromModule(__filename);
+    return {
+      ok: true,
+      platform: 'win32',
+      path: join(paHome(), 'run-catchup-hidden.vbs'),
+      text: buildCatchupWatchdogVbs(resolution.paPath.replace(/"/g, '""'), 'catchup --loop', repoRoot, paths, readCatchupLoopHeartbeatStaleMs()),
+    };
+  }
   let whichStdout: string | null;
   try {
-    const { stdout } = await execAsync('which pa');
-    whichStdout = stdout;
+    whichStdout = (await execAsync('which pa')).stdout;
   } catch {
     whichStdout = null;
   }
   const resolution = resolvePosixPaPath(whichStdout);
-  if (!resolution.ok) {
-    console.error(`Error: ${resolution.errorMessage}`);
+  if (!resolution.ok) return { ok: false, errorMessage: resolution.errorMessage ?? PA_NOT_FOUND_MESSAGE };
+  const scriptPath = catchupWatchdogScriptPath();
+  if (/[%\r\n]/.test(scriptPath)) {
+    return { ok: false, errorMessage: `the watchdog script path contains a character cron cannot carry (% or a line break): ${scriptPath}` };
+  }
+  const minutes = Math.max(1, Math.round(readCatchupLoopHeartbeatStaleMs() / 60_000));
+  return {
+    ok: true,
+    platform: 'posix',
+    path: scriptPath,
+    text: buildCatchupWatchdogShScript(resolution.paPath, paths, minutes),
+    cronLine: buildCatchupWatchdogCronLine(scriptPath),
+  };
+}
+
+export type LauncherDrift = 'in-sync' | 'out-of-sync' | 'missing';
+
+export function launcherDrift(onDisk: string | null, expected: string): LauncherDrift {
+  if (onDisk === null) return 'missing';
+  return onDisk === expected ? 'in-sync' : 'out-of-sync';
+}
+
+export function formatLauncherDriftLine(path: string, drift: LauncherDrift): string {
+  if (drift === 'in-sync') return `Launcher ${path}: in sync with this build`;
+  if (drift === 'out-of-sync') return `Launcher ${path}: OUT OF SYNC with this build — run \`pa schedules sync\``;
+  return `Launcher ${path}: MISSING — run \`pa schedules sync\``;
+}
+
+/**
+ * 2026-09-10 launch-cadence wave: registers ONE watchdog task over the
+ * long-lived `pa catchup --loop`. 2026-09-16 lane-wedge work: retirement of
+ * the legacy `PA-Catchup-Reminders` task is proof-gated (see
+ * docs/catchup-watchdog.md) — this function never disables or deletes it.
+ */
+async function syncSchedulesWindows(): Promise<boolean> {
+  const artifact = await expectedCatchupWatchdogArtifact();
+  if (!artifact.ok || artifact.platform !== 'win32') {
+    console.error(`Error: ${artifact.ok ? 'unexpected platform artifact' : artifact.errorMessage}`);
     process.exitCode = 1;
     return false;
   }
-  const paPath = resolution.paPath;
+  const vbsPath = artifact.path;
+  writeFileSync(vbsPath, artifact.text, 'utf8');
+
+  const registerTask = async (name: string, path: string): Promise<boolean> => {
+    try {
+      await execAsync(`schtasks /delete /tn "${name}" /f`).catch(() => {});
+      const { stdout } = await execAsync(`schtasks /create /tn "${name}" /tr "wscript.exe \\"${path}\\"" /sc minute /mo 1 /f`);
+      console.log(`[+] Registered '${name}': ${stdout.trim()}`);
+      return true;
+    } catch (err: any) {
+      console.error(`[-] Failed to register '${name}': ${err.message}`);
+      return false;
+    }
+  };
+
+  const taskExists = async (name: string): Promise<boolean> => {
+    try {
+      await execAsync(`schtasks /query /tn "${name}"`);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const taskName = scheduledTaskName('PA-Catchup');
+  const registered = await registerTask(taskName, vbsPath);
+  if (!registered) {
+    console.error(`Error: failed to register '${taskName}'. Nothing was retired.`);
+    process.exitCode = 1;
+    return false;
+  }
+
+  const verified = await taskExists(taskName);
+  if (!verified) {
+    console.error(`Error: '${taskName}' did not verify after registration — leaving the existing tasks in place. Nothing was retired.`);
+    process.exitCode = 1;
+    return false;
+  }
+
+  // Retirement of the legacy reminders task is proof-gated (2026-09-16): sync
+  // never disables or deletes it. See docs/catchup-watchdog.md.
+  const remindersName = scheduledTaskName('PA-Catchup-Reminders');
+  if (await taskExists(remindersName)) {
+    console.log(`[!] Left '${remindersName}' untouched: retire it only through docs/catchup-watchdog.md, "Retiring the legacy reminders task".`);
+  }
+
+  return true;
+}
+
+async function syncSchedulesPosix(): Promise<boolean> {
+  const artifact = await expectedCatchupWatchdogArtifact();
+  if (!artifact.ok || artifact.platform !== 'posix') {
+    console.error(`Error: ${artifact.ok ? 'unexpected platform artifact' : artifact.errorMessage}`);
+    process.exitCode = 1;
+    return false;
+  }
+  writeFileSync(artifact.path, artifact.text, { encoding: 'utf8', mode: 0o755 });
 
   // Read existing crontab (empty string if none set)
   let existing = '';
@@ -611,26 +1098,22 @@ async function syncSchedulesPosix(): Promise<boolean> {
     // No crontab yet — start fresh
   }
 
-  // Desired cron lines — both fire every minute (matches Windows Task
-  // Scheduler's cadence; catchup is lock-guarded so the tighter interval
-  // just means overdue skills get caught sooner, not duplicated).
-  const lines: Record<string, string> = {
-    [cronSentinelReminders()]: `* * * * * ${paPath} catchup --topic reminders`,
-    [cronSentinelDefault()]:   `* * * * * ${paPath} catchup`,
-  };
-
-  // Upsert: replace any existing PA-managed block, or append
+  const hasLegacyReminders = existing.includes(cronSentinelReminders());
   let updated = existing;
-  for (const [sentinel, cronLine] of Object.entries(lines)) {
-    const escapedSentinel = sentinel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const pattern = new RegExp(`${escapedSentinel}\\n[^\\n]*\\n?`, 'g');
-    const block = `${sentinel}\n${cronLine}\n`;
-    if (pattern.test(updated)) {
-      updated = updated.replace(pattern, block);
-    } else {
-      if (!updated.endsWith('\n') && updated.length > 0) updated += '\n';
-      updated += block;
-    }
+
+  // Single managed line: the POSIX twin of the Windows launcher. Retirement
+  // of the legacy reminders sentinel is proof-gated (2026-09-16) — see
+  // docs/catchup-watchdog.md.
+  const cronLine = artifact.cronLine;
+  const sentinel = cronSentinelDefault();
+  const escapedSentinel = sentinel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pattern = new RegExp(`${escapedSentinel}\\n[^\\n]*\\n?`, 'g');
+  const block = `${sentinel}\n${cronLine}\n`;
+  if (pattern.test(updated)) {
+    updated = updated.replace(pattern, block);
+  } else {
+    if (!updated.endsWith('\n') && updated.length > 0) updated += '\n';
+    updated += block;
   }
 
   // Write back via `crontab -`
@@ -652,8 +1135,10 @@ async function syncSchedulesPosix(): Promise<boolean> {
       }
       throw err;
     }
-    console.log(`[+] Registered ${scheduledTaskName('PA-Catchup-Reminders')}: * * * * * ${paPath} catchup --topic reminders`);
-    console.log(`[+] Registered ${scheduledTaskName('PA-Catchup')}:           * * * * * ${paPath} catchup`);
+    console.log(`[+] Registered ${scheduledTaskName('PA-Catchup')}: ${cronLine}`);
+    if (hasLegacyReminders) {
+      console.log(`[!] Left the '${scheduledTaskName('PA-Catchup-Reminders')}' crontab entry untouched: retire it only through docs/catchup-watchdog.md, "Retiring the legacy reminders task".`);
+    }
   } finally {
     await unlink(tmpPath).catch(() => {});
   }
@@ -707,6 +1192,19 @@ export async function listSchedules(): Promise<void> {
         console.log('No crontab set. Run `pa schedules sync` to register PA entries.');
       }
     }
+  }
+
+  const artifact = await expectedCatchupWatchdogArtifact();
+  if (artifact.ok) {
+    let onDisk: string | null = null;
+    try {
+      onDisk = readFileSync(artifact.path, 'utf8');
+    } catch {
+      onDisk = null;
+    }
+    console.log(`\n${formatLauncherDriftLine(artifact.path, launcherDrift(onDisk, artifact.text))}`);
+  } else {
+    console.log(`\nLauncher: cannot verify — ${artifact.errorMessage}`);
   }
 
   // Show skills with cron schedules

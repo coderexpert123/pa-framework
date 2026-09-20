@@ -3,6 +3,9 @@ import { readUsableStateTail } from './state-monitor.js';
 import { log } from './lib/log.js';
 import { notifyUser } from './lib/notify.js';
 import type { WorkerConfig, CommandResult, RunOptions, EvaluatorConfig } from './types.js';
+import { autoDispatchEligibility } from './rate-limits.js';
+import { readPressureSampleCached, type PressureSample } from './lib/pressure-sample.js';
+import { DEFAULT_PHYSICAL_BRAKE_MB, DEFAULT_CPU_BRAKE_PCT, DEFAULT_DISK_QUEUE_BRAKE } from './lib/dynamic-slots.js';
 
 export interface EvaluatorVerdict {
   verdict: 'extend' | 'kill' | 'done';
@@ -24,6 +27,41 @@ async function notifyEvaluatorFailure(workerName: string, rawOutput: string, rea
     `Worker: ${workerName}\nReason: ${reason}\nVerdict: defaulted to extend\n\n${truncated}`,
     { dedupKey: `evaluator-${workerName}`, severity: 'warn' },
   ).catch(() => {});
+}
+
+/**
+ * Zero-meaningful knob reader mirroring dynamic-slots.ts's envIntZeroOk: 0
+ * is a VALUE (it disables that pressure input), so the accept test is
+ * >= 0, not > 0. Local mirror — no new shared const, no new import.
+ */
+function evalEnvIntZeroOk(name: string, fallback: number): number {
+  const n = parseInt(process.env[name] ?? '', 10);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+/**
+ * Pressure-scaled evaluator timeout multiplier (1x–3x). Pure: the sample is
+ * passed in, brake knobs are read live. Per-input null = no evidence = skip
+ * that input (sampler doctrine). Floor (1x) = today's configured values;
+ * PA_DYNAMIC_SLOTS=0 (existing kill switch) forces 1x.
+ */
+export function evaluatorTimeoutMultiplier(sample: PressureSample | null): 1 | 2 | 3 {
+  if (sample === null) return 1;
+  if (process.env.PA_DYNAMIC_SLOTS === '0') return 1;
+  const brakeMb = evalEnvIntZeroOk('PA_SLOTS_PHYSICAL_BRAKE_MB', DEFAULT_PHYSICAL_BRAKE_MB);
+  const cpuBrake = evalEnvIntZeroOk('PA_SLOTS_CPU_BRAKE_PCT', DEFAULT_CPU_BRAKE_PCT);
+  const dqBrake = evalEnvIntZeroOk('PA_SLOTS_DISK_QUEUE_BRAKE', DEFAULT_DISK_QUEUE_BRAKE);
+  const severe =
+    (brakeMb > 0 && sample.physFreeMb !== null && sample.physFreeMb < brakeMb / 2) ||
+    (cpuBrake > 0 && sample.cpuPct !== null && sample.cpuPct >= 97) ||
+    (dqBrake > 0 && sample.diskQueue !== null && sample.diskQueue >= dqBrake * 2);
+  if (severe) return 3;
+  const pressured =
+    (brakeMb > 0 && sample.physFreeMb !== null && sample.physFreeMb < brakeMb) ||
+    (cpuBrake > 0 && sample.cpuPct !== null && sample.cpuPct >= cpuBrake) ||
+    (dqBrake > 0 && sample.diskQueue !== null && sample.diskQueue >= dqBrake);
+  if (pressured) return 2;
+  return 1;
 }
 
 /**
@@ -55,13 +93,15 @@ export async function evaluateWorkerState(
     // order (zclaude first), not priority order, so without the sort zclaude
     // would be tried before agyc despite being lower priority.
     const evalWorkers: WorkerConfig[] = [];
+    const excluded = new Set([stuckWorkerName]);
     const primary = config.workers.find((w) => w.name === evalCfg.worker);
-    if (primary && primary.name !== stuckWorkerName) {
+    if (primary && (await autoDispatchEligibility(primary, { excludeWorkers: excluded })).eligible) {
       evalWorkers.push(primary);
     }
     const sorted = [...config.workers].sort((a, b) => (a.priority ?? 99) - (b.priority ?? 99));
     for (const w of sorted) {
-      if (w.name !== stuckWorkerName && !evalWorkers.some(e => e.name === w.name)) {
+      if (!evalWorkers.some(e => e.name === w.name)
+        && (await autoDispatchEligibility(w, { excludeWorkers: excluded })).eligible) {
         evalWorkers.push(w);
       }
     }
@@ -101,12 +141,18 @@ ${stateContent}
     let result: CommandResult | null = null;
     let evalWorkerUsed: WorkerConfig | undefined;
 
+    // Pressure-scaled timeouts: floor = today's configured values, ceiling
+    // 3x. The sample read is sync, TTL-cached, spawn-free RAM/CPU — safe on
+    // this path. PA_DYNAMIC_SLOTS=0 forces 1x (inside the multiplier).
+    const pressureMult = evaluatorTimeoutMultiplier(readPressureSampleCached());
+
     for (const evalWorker of evalWorkers) {
       try {
         const attempt = await executor(evalWorker, prompt, {
-          timeout: evalCfg.timeout,
-          idleTimeout: 30,
+          timeout: evalCfg.timeout * pressureMult,
+          idleTimeout: 30 * pressureMult,
           isEvaluator: true,
+          stripArgs: ['--append-system-prompt-file'],
           resource: `evaluator-${stuckWorkerName}`,
           agentName: evalWorker.name,
           env,

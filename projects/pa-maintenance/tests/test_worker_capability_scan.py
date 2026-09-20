@@ -486,6 +486,46 @@ class TestCacheMergeInvariant(unittest.TestCase):
                          [(wcs.INFO, "probe-failed")])
 
 
+class TestRecommendedAction(unittest.TestCase):
+    """A worker/model capability change (CLI version bump, a retired model, a
+    new Gemini flash version) must carry a concrete, approvable recommended
+    action in its own finding message — not just a fact the reader is left to
+    conclude 'no action needed' about (operator pushback 2026-09-01 and again
+    2026-09-04 after exactly this shape of report)."""
+
+    def test_version_changed_carries_a_recommended_action(self):
+        cfg = {"workers": [worker("agy", tunables={"model": {"args": ["--model", "{value}"]}})]}
+        prev = {"workers": {"agy": {"version": "1.0.13", "flags": []}}}
+        findings, _ = wcs.scan(cfg, {"agy": probe(AGY_HELP, version="1.1.5")}, prev, NOW)
+        self.assertEqual([f["kind"] for f in findings], ["version-changed"])
+        self.assertIn("Recommended action", findings[0]["message"])
+
+    def test_new_model_value_carries_a_recommended_action(self):
+        """A new Gemini flash version appearing in `agy models` is a new-values
+        finding — it must say what to do, not just that it happened."""
+        cfg = {"workers": [worker("agy", tunables={"model": {
+            "args": ["--model", "{value}"],
+            "values": ["gemini-3.6-flash-high"]}})]}
+        findings, _ = wcs.scan(
+            cfg, {"agy": probe(AGY_HELP, version="1.1.5",
+                               values={"model": ["gemini-3.6-flash-high",
+                                                  "gemini-3.7-flash-high"]})}, None, NOW)
+        self.assertEqual([f["kind"] for f in findings], ["new-values"])
+        self.assertIn("Recommended action", findings[0]["message"])
+        self.assertIn("config.yaml", findings[0]["message"])
+
+    def test_retired_model_value_carries_a_recommended_action(self):
+        cfg = {"workers": [worker("agy", tunables={"model": {
+            "args": ["--model", "{value}"],
+            "values": ["gemini-3.5-flash-high", "gemini-3.6-flash-high"]}})]}
+        findings, _ = wcs.scan(
+            cfg, {"agy": probe(AGY_HELP, version="1.1.5",
+                               values={"model": ["gemini-3.6-flash-high"]})}, None, NOW)
+        self.assertEqual([f["kind"] for f in findings], ["stale-values"])
+        self.assertIn("Recommended action", findings[0]["message"])
+        self.assertIn("nothing is auto-removed", findings[0]["message"])
+
+
 class TestRenderReport(unittest.TestCase):
     def test_breaking_section_says_nothing_was_auto_removed(self):
         text = wcs.render_report([wcs.finding(wcs.BREAKING, "agy", "missing-flag", "x")])

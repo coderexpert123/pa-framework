@@ -88,4 +88,24 @@ describe('parsePorcelainEntries', () => {
       { x: 'R', y: ' ', path: 'new.ts' },
     ]);
   });
+
+  it('decodes C-quoted octal escapes into the real non-ASCII path — an undecoded escape string names a file that never exists on disk (2026-09-18 verifier finding)', () => {
+    // git emits \NNN octal UTF-8 bytes inside C-quotes for non-ASCII names.
+    // Build the escape string FROM the encoded name so the fixture can't drift
+    // from its own expected value: क.txt → \340\244\225.txt.
+    const name = 'क.txt';
+    const quoted = Array.from(Buffer.from(name, 'utf8'))
+      .map((b) => (b >= 0x80 ? `\\${b.toString(8).padStart(3, '0')}` : String.fromCharCode(b)))
+      .join('');
+    assert.match(quoted, /\\/); // the fixture actually exercises the escape path
+    const output = ` M "${quoted}"\n`;
+    assert.deepEqual(parsePorcelainPaths(output), [name]);
+  });
+
+  it('decodes named escapes inside quotes and leaves unquoted/unknown escapes literal', () => {
+    const output = '?? "a\\tb.txt"\n M plain\\path.ts\n';
+    // a\tb.txt decodes to a real tab; plain\path.ts is unquoted so the
+    // backslash-normalization rule still applies (forward slashes).
+    assert.deepEqual(parsePorcelainPaths(output), ['a\tb.txt', 'plain/path.ts']);
+  });
 });

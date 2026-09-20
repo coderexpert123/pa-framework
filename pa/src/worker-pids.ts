@@ -1,7 +1,8 @@
 import { writeFile, readFile, readdir, unlink, mkdir, rename, stat } from 'fs/promises';
 import { join } from 'path';
 import { paHome } from './paths.js';
-import { killProcessTree } from './process-tree.js';
+import { killProcessTree, getProcessSnapshot } from './process-tree.js';
+import type { ProcessRecord } from './process-tree.js';
 import { log } from './lib/log.js';
 
 export interface WorkerPidEntry {
@@ -9,6 +10,13 @@ export interface WorkerPidEntry {
   spawnedBy: number;   // PID of the process that spawned this worker (bot or catchup)
   worker: string;
   skill: string;
+  /** Identity of THIS dispatch, not of the lane. `skill` is a RESOURCE and a
+   * bare topic resource is reused by every message in that topic, so a kill
+   * that matches on `skill` alone can take down an unrelated dispatch that
+   * started after the intended one ended. The worker carries the same value
+   * in PA_WORKER_DISPATCH_ID, so any consumer that recorded it can prove the
+   * registry still holds the dispatch it meant before acting. */
+  dispatchId?: string;
   startedAt: string;
   /** Live descendant PIDs, refreshed each executeWorker heartbeat. Needed because
    * `pid` is the shell wrapper (spawn shell:true) — the wrapper can die with the
@@ -26,6 +34,16 @@ export interface WorkerPidEntry {
    * AGY_TEE_OUT was externally set). Read by the orphan reaper to recover
    * sessionless workers' replies. */
   teePath?: string;
+  /** Epoch-ms of the last executor heartbeat, stamped by listWorkerPids from
+   * the entry file's mtime — NOT persisted in the JSON. The file is
+   * atomically rewritten at spawn (addWorkerPid) and on every executeWorker
+   * heartbeat (updateWorkerPidDescendants, 30 s cadence), so its mtime IS
+   * the executor's liveness clock. Consumers deciding kill/replay semantics
+   * use it to tell "alive and supervised" from "processes linger but nobody
+   * is driving" (2026-09-14 AI-221 incident: a healthy streaming run was
+   * killed off ledger-telemetry staleness alone). Absent on stat failure —
+   * treat as stale. */
+  heartbeatAt?: number;
 }
 
 function pidsDir(): string {
@@ -104,7 +122,13 @@ export async function listWorkerPids(): Promise<WorkerPidEntry[]> {
   for (const file of files) {
     if (!file.endsWith('.json')) continue;
     try {
-      entries.push(JSON.parse(await readFile(join(dir, file), 'utf8')) as WorkerPidEntry);
+      const entry = JSON.parse(await readFile(join(dir, file), 'utf8')) as WorkerPidEntry;
+      try {
+        entry.heartbeatAt = (await stat(join(dir, file))).mtimeMs;
+      } catch {
+        /* absent → stale */
+      }
+      entries.push(entry);
     } catch {
       /* corrupt file — cleanupOrphanedWorkers handles removal */
     }
@@ -156,7 +180,7 @@ export async function reapStaleWorkerPidTmps(): Promise<number> {
  */
 export async function cleanupOrphanedWorkers(
   excludeSkills?: Set<string>,
-  opts?: { now?: number }
+  opts?: { now?: number; snapshot?: ReadonlyMap<number, ProcessRecord> }
 ): Promise<number> {
   const dir = pidsDir();
   let files: string[];
@@ -167,6 +191,9 @@ export async function cleanupOrphanedWorkers(
   }
 
   const now = opts?.now ?? Date.now();
+  // Lazily fetched on first survivors-bearing entry — one OS query for the
+  // whole sweep, skipped entirely when nothing needs killing.
+  let snapshot: ReadonlyMap<number, ProcessRecord> | null | undefined;
   let killed = 0;
   for (const file of files) {
     if (!file.endsWith('.json')) continue;  // skips .json.tmp crash artifacts
@@ -185,6 +212,36 @@ export async function cleanupOrphanedWorkers(
         // individually rather than relying on one walk from the wrapper.
         const survivors = [entry.pid, ...(entry.descendants ?? [])].filter(isProcessAlive);
 
+        // Stale-PPID guard (AI-328): `descendants` was enumerated while the
+        // worker lived, but Windows ParentProcessId is immutable — pid reuse
+        // can mis-attribute foreign/system processes into the persisted list
+        // (observed: svchost/services in a 211-pid descendant set). A process
+        // created BEFORE this worker's startedAt cannot be its descendant —
+        // exclude those from the kill set. The registry entry stays the
+        // membership authority (no ancestry re-walk here): the recorded
+        // descendants were verified by their own spawner's enumeration, and
+        // post-hoc ancestry is ambiguous once intermediates die. Snapshot
+        // unavailable/empty → kill survivors as before (degraded > blind).
+        let killable = survivors;
+        if (survivors.length > 0) {
+          if (snapshot === undefined) {
+            snapshot = opts?.snapshot ?? (await getProcessSnapshot(undefined, true).catch(() => null));
+          }
+          if (snapshot && snapshot.size > 0) {
+            const notBefore = Date.parse(entry.startedAt) - 5_000;
+            killable = survivors.filter(pid => {
+              const rec = snapshot!.get(pid);
+              if (rec?.createdMs !== undefined && rec.createdMs < notBefore) {
+                log('warn', 'worker-pids', 'Skipping stale-PPID phantom in orphan reap (predates worker start)', {
+                  pid, entryPid: entry.pid, worker: entry.worker, skill: entry.skill,
+                });
+                return false;
+              }
+              return true;
+            });
+          }
+        }
+
         // AI-114: a caller may have stamped a harvest deadline (RunOptions'
         // harvestWindowMs) so a still-replying dispatch survives the periodic
         // `pa catchup` sweep (which runs every 60s with no excludeSkills of
@@ -201,12 +258,12 @@ export async function cleanupOrphanedWorkers(
           continue;
         }
 
-        if (survivors.length > 0) {
+        if (killable.length > 0) {
           log('warn', 'worker-pids', 'Killing orphaned worker', {
             pid: entry.pid, worker: entry.worker, skill: entry.skill,
-            spawnedBy: entry.spawnedBy, survivors,
+            spawnedBy: entry.spawnedBy, survivors: killable,
           });
-          for (const pid of survivors) killProcessTree(pid);
+          for (const pid of killable) killProcessTree(pid);
           killed++;
         } else if (entry.descendants === undefined) {
           // Removing an entry that never recorded descendants, this soon

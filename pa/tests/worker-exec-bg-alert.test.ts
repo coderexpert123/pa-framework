@@ -6,10 +6,17 @@ import { writeFile, mkdir } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { createTempPaHome, createTempSecrets, cleanup } from './helpers.js';
-import { executeWorker, collectBgAlerts } from '../src/workers.js';
+import { executeWorker, collectBgAlerts, _setOrphanSweepDepsForTest } from '../src/workers.js';
 import type { BgEntry } from '../src/workers.js';
 import type { WorkerConfig, RunOptions, CommandResult } from '../src/types.js';
-import { getDescendantPids, getCommandLines, areProcessesAlive } from '../src/process-tree.js';
+import {
+  getDescendantPids,
+  getCommandLines,
+  areProcessesAlive,
+  _setRawExecForTest,
+  _resetSnapshotCacheForTest,
+} from '../src/process-tree.js';
+import { blackboard } from '../src/blackboard.js';
 import { logger } from '../src/lib/log.js';
 
 let tempDir: string;
@@ -23,6 +30,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  _setOrphanSweepDepsForTest(null);
   await cleanup(tempDir);
   const { rm } = await import('fs/promises');
   try { await rm(scriptDir, { recursive: true, force: true }); } catch {}
@@ -169,6 +177,13 @@ describe('BG-task tracking: orphan sweep', () => {
     const script = await writeScript('orphan.js', 'setTimeout(() => process.stdout.write("done"), 1500);');
     const notified: string[] = [];
     const worker = makeWorker({ args: [script] });
+    // AI-328: the sweep verifies survivors before reaping — the fake pid needs
+    // a snapshot record whose ancestry ends in-family (parentPid 0 = chain
+    // terminates immediately) and whose createdMs is within the run.
+    _setOrphanSweepDepsForTest({
+      getProcessSnapshot: async () => new Map([[99995, { parentPid: 0, cmdline: 'orphan-cmd', createdMs: Date.now() }]]),
+      killProcessTree: () => {},
+    });
 
     await executeWorker(worker, '', {
       timeout: 10,
@@ -261,6 +276,88 @@ describe('BG-task tracking: orphan sweep', () => {
     assert.ok(orphanCall, 'areProcessesAlive should have been called for orphan sweep');
     assert.equal(orphanCall.length, fakePids.length, 'All tracked pids should be checked in one call');
   });
+
+  it('AI-328: reaps verified orphans but skips non-family survivors (phantom/reuse)', async () => {
+    const script = await writeScript('reap-orphan.js', 'setTimeout(() => process.stdout.write("done"), 1500);');
+    const killed: number[] = [];
+    const notified: string[] = [];
+    const worker = makeWorker({ args: [script] });
+    const NOW = Date.now();
+
+    // Two survivors: 50001 is a real orphan (dead in-family parent 50003 →
+    // chain ends in-family); 50002 hangs off live foreign parent 77777
+    // (pid-reuse/mis-attribution) and must be skipped — taskkilling it would
+    // hit an unrelated process.
+    _setOrphanSweepDepsForTest({
+      getProcessSnapshot: async () => new Map([
+        [50001, { parentPid: 50003, cmdline: 'node mcp-serve', createdMs: NOW }],
+        [50002, { parentPid: 77777, cmdline: 'foreign-svc', createdMs: NOW }],
+        [77777, { parentPid: 1, cmdline: 'foreign-parent', createdMs: NOW }],
+        // 50003 intentionally absent — dead in-family intermediate
+      ]),
+      killProcessTree: (pid) => { killed.push(pid); },
+    });
+
+    await executeWorker(worker, '', {
+      timeout: 10,
+      resource: uniqueResource(),
+      bgTasksConfig: { alert_seconds: 0, alert_repeat_seconds: 1 },
+      _bgTaskHooks: {
+        heartbeatIntervalMs: 100,
+        getDescendantPids: async () => [{ pid: 50001, parentPid: 0 }, { pid: 50002, parentPid: 0 }, { pid: 50003, parentPid: 0 }],
+        getCommandLines: async (pids) => new Map(pids.map(p => [p, `cmd-${p}`])),
+        areProcessesAlive: async (pids) => new Map(pids.map(p => [p, p !== 50003])), // 50003 already dead
+        notifyUser: async (subject) => { notified.push(subject); return { sent: true, suppressed: false }; },
+      },
+    });
+
+    // Sweep is fire-and-forget — poll for the kill.
+    for (let i = 0; i < 80 && !killed.includes(50001); i++) {
+      await new Promise(r => setTimeout(r, 25));
+    }
+
+    assert.deepEqual(killed, [50001], 'only the verified in-family orphan may be reaped');
+    assert.ok(notified.some(s => s.startsWith('bg-orphan:')), `Expected bg-orphan alert for reaped orphan, got: ${JSON.stringify(notified)}`);
+  });
+
+  it('AI-328: tracking drops stale-PPID phantoms at insertion (createdMs predates run)', async () => {
+    const script = await writeScript('phantom-track.js', 'setTimeout(() => process.stdout.write("done"), 1500);');
+    const aliveCalls: number[][] = [];
+    const worker = makeWorker({ args: [script] });
+    const NOW = Date.now();
+
+    // 50004 is enumerated as a descendant but predates the run by a day —
+    // stale-PPID mis-attribution. It must never enter bgTaskMap, so the
+    // sweep's areProcessesAlive call never sees it. 50001 is a real member.
+    _setOrphanSweepDepsForTest({
+      getProcessSnapshot: async () => new Map([
+        [50001, { parentPid: 50003, cmdline: 'node mcp-serve', createdMs: NOW }],
+        [50004, { parentPid: 999, cmdline: 'phantom-svc', createdMs: NOW - 86_400_000 }],
+      ]),
+      killProcessTree: () => {},
+    });
+
+    await executeWorker(worker, '', {
+      timeout: 10,
+      resource: uniqueResource(),
+      bgTasksConfig: { alert_seconds: 0, alert_repeat_seconds: 1 },
+      _bgTaskHooks: {
+        heartbeatIntervalMs: 100,
+        getDescendantPids: async () => [{ pid: 50001, parentPid: 0 }, { pid: 50004, parentPid: 0 }],
+        getCommandLines: async (pids) => new Map(pids.map(p => [p, `cmd-${p}`])),
+        areProcessesAlive: async (pids) => { aliveCalls.push([...pids]); return new Map(pids.map(p => [p, true])); },
+        notifyUser: async () => ({ sent: true, suppressed: false }),
+      },
+    });
+
+    for (let i = 0; i < 80 && aliveCalls.length === 0; i++) {
+      await new Promise(r => setTimeout(r, 25));
+    }
+
+    const allChecked = aliveCalls.flat();
+    assert.ok(allChecked.includes(50001), 'real descendant must be tracked');
+    assert.ok(!allChecked.includes(50004), `phantom pid must be filtered at tracking, got: ${JSON.stringify(allChecked)}`);
+  });
 });
 
 describe('BG-task tracking: no descendants', () => {
@@ -302,10 +399,47 @@ function spyOnLoggerInfo(): { logged: Array<{ module: string; message: string; c
 }
 
 describe('cmdline sanitizer', () => {
+  // The bg-leak log can only fire on the SECOND completed heartbeat tick:
+  // the tick that first observes a descendant stamps firstSeen=now, so
+  // ageMs=0 fails collectBgAlerts' `ageMs > alertMs` even at alert_seconds=0.
+  // The _bgTaskHooks seam does NOT cover the two real-I/O calls inside the
+  // tick body, and either alone can eat the whole 1500ms worker window on a
+  // loaded box:
+  //   1. hasChildProcesses(fresh) — a fresh WMI/Get-CimInstance query (~1.2s
+  //      serialized under load; flake seen 2026-09-14). Stubbed via _rawExec.
+  //   2. blackboard.updateHeartbeat x2 per tick (resource lock + worker-slot
+  //      lock) — real proper-lockfile round-trips on disk; on a starved disk
+  //      each can take hundreds of ms, leaving <2 completed ticks and no
+  //      bg-leak log (same 'Expected a bg-leak log entry' flake, reproduced
+  //      by injecting an 800ms updateHeartbeat delay). Stubbed by patching
+  //      the blackboard singleton directly — same wrap/restore pattern as
+  //      blackboard.test.ts's updateHeartbeat wrapper.
+  // With both legs instant, the second tick lands ~60ms into the 1500ms
+  // worker — ~25x margin. Not in runWithBgHooks: that helper predates the
+  // log-only path and its tests assert on notifyUser, not the tick clock.
+  let savedUpdateHeartbeat: typeof blackboard.updateHeartbeat | null = null;
+  function stubTickIo(): void {
+    _setRawExecForTest(async () => ({
+      stdout: process.platform === 'win32' ? '[]' : '',
+      stderr: '',
+    }));
+    savedUpdateHeartbeat = blackboard.updateHeartbeat;
+    (blackboard as any).updateHeartbeat = async () => true;
+  }
+  function restoreTickIo(): void {
+    _setRawExecForTest(null);
+    _resetSnapshotCacheForTest();
+    if (savedUpdateHeartbeat) {
+      (blackboard as any).updateHeartbeat = savedUpdateHeartbeat;
+      savedUpdateHeartbeat = null;
+    }
+  }
+
   it('strips api_key, token, password, secret from query strings', async () => {
     const script = await writeScript('sanitize.js', 'setTimeout(() => process.stdout.write("done"), 1500);');
     const worker = makeWorker({ args: [script] });
     const spy = spyOnLoggerInfo();
+    stubTickIo();
 
     try {
       await executeWorker(worker, '', {
@@ -323,6 +457,7 @@ describe('cmdline sanitizer', () => {
       });
     } finally {
       spy.restore();
+      restoreTickIo();
     }
 
     const bgLeakLog = spy.logged.find(l => l.module === 'worker-exec' && l.message === 'bg-leak');
@@ -350,6 +485,7 @@ describe('cmdline sanitizer', () => {
       const script = await writeScript(`san-${paramTests.indexOf(cmdline)}.js`, 'setTimeout(() => process.stdout.write("done"), 1500);');
       const worker = makeWorker({ args: [script] });
       const spy = spyOnLoggerInfo();
+      stubTickIo();
 
       try {
         await executeWorker(worker, '', {
@@ -365,9 +501,13 @@ describe('cmdline sanitizer', () => {
         });
       } finally {
         spy.restore();
+        restoreTickIo();
       }
 
       const bgLeakLog = spy.logged.find(l => l.module === 'worker-exec' && l.message === 'bg-leak');
+      // Presence asserted too — a missing bg-leak log made `detail` '' and
+      // the redaction check below passed vacuously.
+      assert.ok(bgLeakLog, `Expected a bg-leak log entry for cmdline: ${cmdline}`);
       const detail = String(bgLeakLog?.ctx?.detail ?? '');
       assert.ok(!detail.includes('abc123'), `"abc123" should be redacted in cmdline: ${cmdline}`);
     }
@@ -422,6 +562,91 @@ describe('process-tree helpers: single-query invariant', () => {
     const result = await getDescendantPids(1, fakeFn);
     assert.deepEqual(result.map(d => d.pid).sort((a, b) => a - b), [2, 3, 4]);
     assert.ok(!result.some(d => d.pid === 5), 'Unrelated process should not be included');
+  });
+
+  // ── Full heartbeat integration (4th storm variant, 2026-09-12) ──────────────
+  // The unit tests above call getDescendantPids directly with an injected
+  // ExecFn. These two exercise the REAL heartbeat tick inside executeWorker,
+  // where bgGetDescendants (getDescendantPids, real default execHidden path)
+  // AND hasChildProcesses (also real, default path) both fire per tick — the
+  // invariant that matters in production is that those two calls, made moments
+  // apart within one tick, resolve to ONE raw OS query, not two, and that a
+  // slow tick body can't stack a second tick on top of itself.
+  afterEach(() => {
+    _setRawExecForTest(null);
+    _resetSnapshotCacheForTest();
+  });
+
+  it('a real heartbeat tick performs at most ONE raw snapshot query (bgGetDescendants + hasChildProcesses share the cache)', async () => {
+    _resetSnapshotCacheForTest();
+    let rawCallCount = 0;
+    _setRawExecForTest(async () => {
+      rawCallCount++;
+      return { stdout: process.platform === 'win32' ? '[]' : '', stderr: '' };
+    });
+
+    const script = await writeScript('single-raw-query.js', 'setTimeout(() => process.stdout.write("done"), 250);');
+    const worker = makeWorker({ args: [script] });
+
+    await executeWorker(worker, '', {
+      timeout: 5,
+      resource: uniqueResource(),
+      bgTasksConfig: { alert_seconds: 0, alert_repeat_seconds: 1 },
+      // No _bgTaskHooks.getDescendantPids/getCommandLines/areProcessesAlive
+      // overrides — this deliberately exercises the REAL default-path
+      // functions (via bgGetDescendants ?? getDescendantPids) that route
+      // through the shared cache under test.
+      _bgTaskHooks: { heartbeatIntervalMs: 1000 },
+    });
+
+    assert.ok(rawCallCount <= 1, `expected at most one raw exec call for one heartbeat tick, got ${rawCallCount}`);
+  });
+
+  it('a tick whose previous body is still pending is skipped (heartbeat re-entrancy guard)', async () => {
+    // hasChildProcesses(child.pid!, true, undefined, true) at worker-exec.ts's
+    // "Check 1" runs inside the SAME tick body, after bgGetDescendants, and is
+    // NOT overridable via _bgTaskHooks — left unmocked it issues a REAL
+    // fresh:true OS query (uncontrolled duration), which starves this test of
+    // the multiple ticks it needs to observe. Pin it to an instant empty
+    // snapshot so the ONLY deliberate slowness is the injected
+    // getDescendantPids delay below (found 2026-09-12: real-OS latency here
+    // reduced observed ticks to 1, failing the totalCalls >= 2 assertion).
+    _resetSnapshotCacheForTest();
+    _setRawExecForTest(async () => ({ stdout: process.platform === 'win32' ? '[]' : '', stderr: '' }));
+
+    const script = await writeScript('slow-heartbeat.js', 'setTimeout(() => process.stdout.write("done"), 700);');
+    let activeCalls = 0;
+    let maxConcurrent = 0;
+    let totalCalls = 0;
+    const worker = makeWorker({ args: [script] });
+
+    try {
+      await executeWorker(worker, '', {
+        timeout: 5,
+        resource: uniqueResource(),
+        bgTasksConfig: { alert_seconds: 0, alert_repeat_seconds: 1 },
+        _bgTaskHooks: {
+          heartbeatIntervalMs: 30, // much shorter than the fake query's own delay below
+          getDescendantPids: async () => {
+            totalCalls++;
+            activeCalls++;
+            maxConcurrent = Math.max(maxConcurrent, activeCalls);
+            await new Promise(r => setTimeout(r, 150)); // outlasts several interval periods
+            activeCalls--;
+            return [];
+          },
+          getCommandLines: async () => new Map(),
+          areProcessesAlive: async () => new Map(),
+          notifyUser: async () => ({ sent: true, suppressed: false }),
+        },
+      });
+    } finally {
+      _setRawExecForTest(null);
+      _resetSnapshotCacheForTest();
+    }
+
+    assert.equal(maxConcurrent, 1, 'no two heartbeat tick bodies should run concurrently');
+    assert.ok(totalCalls >= 2, `expected the guard to still allow multiple sequential ticks, got ${totalCalls}`);
   });
 });
 
@@ -569,6 +794,14 @@ setTimeout(() => process.exit(0), 1500);
 
     const notified: string[] = [];
     const worker = makeWorker({ args: [workerScript] });
+
+    // AI-328: the sweep verifies survivors before reaping — fake pid needs a
+    // snapshot record whose ancestry ends in-family (parentPid 0) with a
+    // createdMs inside the run, or it classifies as non-family and is skipped.
+    _setOrphanSweepDepsForTest({
+      getProcessSnapshot: async () => new Map([[88800, { parentPid: 0, cmdline: 'orphan-cmd', createdMs: Date.now() }]]),
+      killProcessTree: () => {},
+    });
 
     await executeWorker(worker, '', {
       timeout: 10,
