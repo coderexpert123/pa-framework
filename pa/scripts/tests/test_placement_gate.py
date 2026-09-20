@@ -224,13 +224,38 @@ class DeriveTests(GateTestBase):
     def test_derive_deny_rules(self):
         rows = placement_gate.parse_registry_rows(census_table("N1", [
             row("priv-exact", "pkg/secret.py", "private-excluded", "PRIVATE"),
-            row("priv-dir", "pkg/dir/", "private-excluded", "PRIVATE"),
-            row("priv-dir-nodot", "pkg/otherdir", "private-excluded", "PRIVATE"),
-            row("priv-glob", "pkg/*.md", "private-excluded", "PRIVATE"),
         ]))
         proj = placement_gate.derive(rows)
         self.assertEqual(proj.allow, [])
         self.assertEqual([e["glob"] for e in proj.deny], ["pkg/secret.py"])
+
+    def test_derive_private_dir_glob_surface_refused(self):
+        # A PRIVATE row's surface must be exact-file: a directory or glob surface
+        # can never produce a DENY, so authoring one is refused at parse time
+        # instead of silently accepted as a no-op the table would otherwise present
+        # as an enforced exclusion. Proves the check can FAIL on each malformed
+        # shape (trailing-slash dir, no-dot dir, and glob) before proving it clears.
+        for feature, surface in (
+            ("priv-dir", "pkg/dir/"),
+            ("priv-dir-nodot", "pkg/otherdir"),
+            ("priv-glob", "pkg/*.md"),
+        ):
+            rows = placement_gate.parse_registry_rows(census_table("N1", [
+                row(feature, surface, "private-excluded", "PRIVATE"),
+            ]))
+            with self.assertRaises(placement_gate.PlacementGateError) as ctx:
+                placement_gate.derive(rows)
+            msg = str(ctx.exception)
+            self.assertIn(feature, msg)
+            self.assertIn(surface, msg)
+            self.assertIn("directory- or glob-grained", msg)
+        # Same fixture, rewritten with an exact-file surface -> derives cleanly.
+        rows_fixed = placement_gate.parse_registry_rows(census_table("N1", [
+            row("priv-dir-fixed", "pkg/dir/file.py", "private-excluded", "PRIVATE"),
+        ]))
+        proj = placement_gate.derive(rows_fixed)
+        self.assertEqual(proj.allow, [])
+        self.assertEqual([e["glob"] for e in proj.deny], ["pkg/dir/file.py"])
 
 
 class GenTests(GateTestBase):
@@ -598,8 +623,8 @@ class EmitTests(GateTestBase):
                 row("pub-a", "pkg/*.pub.md", "public-tracked", "PUBLIC"),
             ],
             "N3", [
-                row("L7:pkg/*", "children-level base deny (a `<dir>/` base could "
-                    "never be re-included under)", "private-excluded", "PRIVATE"),
+                row("L7:pkg/*", "children-level base deny (a directory-grained base "
+                    "could never be re-included under)", "private-excluded", "PRIVATE"),
                 row("L8:!pkg/one.pub.md", "single carve-out", "private-excluded",
                     "PRIVATE"),
                 row("L9:!/.gitignore-public", "self re-include", "private-excluded",

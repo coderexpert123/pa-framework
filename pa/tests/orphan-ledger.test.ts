@@ -311,6 +311,15 @@ describe('orphan-ledger', () => {
         assert.equal((await runDailyRecon(deps)).detail?.skipped, 'lock-held');
         assert.deepEqual(git.calls, []);
       }
+      // (b2) a FOREIGN catchup lock (a different pa catchup process) still
+      // stands the whole tick down — unchanged behavior.
+      {
+        const { deps, git } = makeDeps({
+          getActiveLocksFn: async () => [{ resource: 'catchup', pid: process.pid + 1 }],
+        });
+        assert.equal((await runDailyRecon(deps)).detail?.skipped, 'lock-held');
+        assert.deepEqual(git.calls, []);
+      }
       // (c) an ordinary reservation covering ONE dirty path skips that path
       // only — the rest of the sweep still runs.
       {
@@ -327,6 +336,32 @@ describe('orphan-ledger', () => {
         const state = await readStateFile();
         assert.equal(state?.unknown_n, 1);
       }
+    });
+
+    it('does not self-skip under its own catchup lock (regression: daily-recon was dead 6 days)', async () => {
+      // pa catchup acquires the `catchup` (or `catchup:topic:<t>`) blackboard
+      // lock, then calls runDueJobs IN-PROCESS from inside that lock region —
+      // so this job's own getActiveLocksFn always used to see that SAME lock
+      // and stand itself down forever (empirical proof: the live ledger
+      // showed lastOutcome:"skipped" every run for 6 days straight). A row
+      // whose pid is this process's own pid must not trigger the skip.
+      const { runDailyRecon } = await import('../src/lib/maintenance/jobs/daily-recon.js');
+      // makeDeps spreads `overrides` AFTER building its own internal `git`
+      // recorder, so an override here would silently detach the returned
+      // `git` from `deps.gitRunner` (the existing "runs once per IST day"
+      // test does exactly this and simply never asserts on `git.calls`) —
+      // build the recorder ourselves and hand its `.fn` in instead.
+      const git = sweepGitRunner(' M proj/a.ts\n');
+      const { deps, append } = makeDeps({
+        gitRunner: git.fn,
+        readLedgerFn: async () => [ledgerRec(['proj/a.ts'], '7366_42')],
+        getActiveLocksFn: async () => [{ resource: 'catchup', pid: process.pid }],
+      });
+      const result = await runDailyRecon(deps);
+      assert.notEqual(result.detail?.skipped, 'lock-held', 'own-pid catchup lock must not self-skip');
+      assert.equal(result.touched, 1, 'the body actually ran and filed the group');
+      assert.equal(append.calls.length, 1);
+      assert.ok(git.calls.length > 0, 'the tree was actually listed, proving the body executed');
     });
 
     it('sweep files land-or-discard task per owning topic', async () => {

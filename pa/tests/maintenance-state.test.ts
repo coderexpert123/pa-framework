@@ -365,9 +365,9 @@ describe('maintenance run lock (AI-200)', () => {
     return data.active_locks.filter((l) => l.agent === 'maintenance-run-command').length;
   }
 
-  it('refuses loudly when the pass lock is held — catchup:topic:default spelling (the Windows Task Scheduler tick)', async () => {
+  it('refuses loudly when the pass lock is held — catchup:maintenance spelling (the loop\'s maintenance lane)', async () => {
     const { maintenanceCommand } = await import('../src/commands/maintenance.js');
-    const key = 'catchup:topic:default';
+    const key = 'catchup:maintenance';
     await holdPassKey(key);
 
     const prevExit = process.exitCode;
@@ -379,13 +379,31 @@ describe('maintenance run lock (AI-200)', () => {
       await maintenanceCommand(['run', 'archive-prune']);
       assert.equal(process.exitCode, 1, 'a refusal must exit non-zero');
       const joined = errors.join('\n');
-      assert.match(joined, /catchup:topic:default/, 'the refusal must name the contested resource');
+      assert.match(joined, /catchup:maintenance/, 'the refusal must name the contested resource');
       assert.match(joined, /catchup-command/, 'the refusal must name the holder agent');
       const ledger = await readLedger();
       assert.equal(ledger.jobs['archive-prune'], undefined, 'the job body must not execute under a contested pass lock');
       assert.equal(await commandLockRowCount(), 0, 'the earlier-acquired key must be released on refusal (no partial rows)');
     } finally {
       console.error = origError;
+      await releasePassKey(key);
+      process.exitCode = prevExit;
+    }
+  });
+
+  it('a skill-running topic lane (catchup:topic:default) no longer refuses a manual run (2026-09-11 fix)', async () => {
+    const { maintenanceCommand } = await import('../src/commands/maintenance.js');
+    const key = 'catchup:topic:default';
+    await holdPassKey(key);
+
+    const prevExit = process.exitCode;
+    try {
+      process.exitCode = 0;
+      await maintenanceCommand(['run', 'archive-prune']);
+      assert.equal(process.exitCode, 0, 'holding a topic lane\'s own key must not refuse the run — that key never drives the pass since 2026-09-11');
+      const ledger = await readLedger();
+      assert.equal(ledger.jobs['archive-prune']?.lastOutcome, 'ran', 'the forced run must have executed the job body');
+    } finally {
       await releasePassKey(key);
       process.exitCode = prevExit;
     }
@@ -435,7 +453,7 @@ describe('maintenance run lock (AI-200)', () => {
 
   it('--dry-run stays available while the pass lock is held (read-only preview takes no lock)', async () => {
     const { maintenanceCommand } = await import('../src/commands/maintenance.js');
-    const key = 'catchup:topic:default';
+    const key = 'catchup:maintenance';
     await holdPassKey(key);
 
     const prevExit = process.exitCode;

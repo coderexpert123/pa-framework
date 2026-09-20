@@ -2,10 +2,12 @@ import { readFile, writeFile, rename } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
 import type { TelegramMessage } from './types.js';
+import { parseTopicRegistryJson } from '../../../pa/dist/src/lib/topic-registry.js';
 
-// Adding a field here also requires updating loadTopicNames's whitelist below
-// (it destructures known fields explicitly — an unlisted key in the JSON file
-// is silently dropped on load, hand-edit or not). The writers (updateTopicName,
+// Adding a field here also requires updating pa's parseTopicRegistryJson
+// (pa/src/lib/topic-registry.ts, the one registry parser — it reads known fields
+// explicitly, so an unlisted key in the JSON file is silently dropped on load,
+// hand-edit or not). The writers (updateTopicName,
 // setTopicDescription) spread the existing entry, so once a field survives the
 // loader it survives every write automatically.
 export interface TopicEntry {
@@ -59,31 +61,19 @@ async function withTopicFileMutex<T>(fn: () => Promise<T>): Promise<T> {
 export async function loadTopicNames(): Promise<TopicNameMap> {
   try {
     const raw = await readFile(getTopicNamesPath(), 'utf8');
-    const json = JSON.parse(raw) as Record<string, Record<string, unknown>>;
     const map: TopicNameMap = new Map();
-    for (const [chatId, threads] of Object.entries(json)) {
-      const inner = new Map<number, TopicEntry>();
-      for (const [threadIdStr, value] of Object.entries(threads)) {
-        const threadId = parseInt(threadIdStr, 10);
-        if (isNaN(threadId)) continue;
-
-        // Handle both old format (string) and new format (object with name/description)
-        if (typeof value === 'string') {
-          // Old format: "0": "General" -> { name: "General", description: undefined }
-          if (value) {
-            inner.set(threadId, { name: value });
-          }
-        } else if (value && typeof value === 'object') {
-          // New format: "0": { name: "General", description: "..." }
-          const entry = value as { name?: string; description?: string; guide_message_id?: number };
-          if (entry.name) {
-            inner.set(threadId, { name: entry.name, description: entry.description, guide_message_id: entry.guide_message_id });
-          }
-        }
+    for (const e of parseTopicRegistryJson(JSON.parse(raw))) {
+      let inner = map.get(e.chatId);
+      if (!inner) {
+        inner = new Map();
+        map.set(e.chatId, inner);
       }
-      if (inner.size > 0) {
-        map.set(chatId, inner);
-      }
+      inner.set(
+        e.threadId,
+        e.legacyString
+          ? { name: e.name }
+          : { name: e.name, description: e.description, guide_message_id: e.guideMessageId }
+      );
     }
     return map;
   } catch {

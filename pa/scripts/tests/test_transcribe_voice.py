@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -562,8 +563,33 @@ class TestCloudBudget(TranscribeVoiceTestCase):
             with self.assertRaises(FakeHTTPError):
                 tv._call_with_retry(attempt, deadline=5.0, sleep_fn=sleep_fn)
 
-        self.assertNotIn(8, sleeps)  # the 8s tier would cross the deadline
-        self.assertEqual(sleeps, [1, 3])
+        self.assertNotIn(15, sleeps)  # the 15s tier would cross the deadline
+        self.assertEqual(sleeps, [5])
+
+    def test_retry_ladder_is_the_operator_shape(self):
+        # Operator ruling 2026-09-13: groq-429 retries start at 5s, stay under
+        # a 60s single-delay cap, and stop after a few attempts. Pinned here so
+        # a ladder retune is a deliberate act, not a drift.
+        self.assertEqual(tv.RETRY_DELAYS, (5, 15, 45))
+        clock = FakeClock(0.0)
+        sleeps = []
+
+        def sleep_fn(seconds):
+            sleeps.append(seconds)
+            clock.advance(seconds)
+
+        calls = {"n": 0}
+
+        def attempt():
+            calls["n"] += 1
+            raise FakeHTTPError(429)
+
+        with mock.patch.object(tv.time, "monotonic", clock):
+            with self.assertRaises(FakeHTTPError):
+                tv._call_with_retry(attempt, sleep_fn=sleep_fn, label="groq")
+
+        self.assertEqual(sleeps, [5, 15, 45], "delays must start at 5s and stay under the 60s cap")
+        self.assertEqual(calls["n"], 4, "a few attempts: first try + 3 retries")
 
     def test_deadline_already_passed_before_any_attempt_raises_timeout_not_none(self):
         def attempt():
@@ -641,6 +667,65 @@ class TestMakePostFn(unittest.TestCase):
         with self.assertRaises(tv.CloudHTTPError) as ctx:
             post_fn("http://x")
         self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_explicit_timeout_s_overrides_the_default_constant(self):
+        calls = []
+
+        class FakeRequests:
+            def post(self, url, **kwargs):
+                calls.append(kwargs)
+                return TestMakePostFn._FakeResp(200, body={"text": "hi"})
+
+        post_fn = tv._make_post_fn(FakeRequests(), timeout_s=120.0)
+        post_fn("http://x")
+        self.assertEqual(calls[0]["timeout"], 120.0)
+
+
+class TestScaledCloudBudget(unittest.TestCase):
+    def test_cloud_budget_flat_then_linear_then_capped(self):
+        self.assertEqual(tv.cloud_budget_s(0), 90.0)
+        self.assertEqual(tv.cloud_budget_s(299), 90.0)
+        self.assertEqual(tv.cloud_budget_s(300), 90.0)
+        self.assertEqual(tv.cloud_budget_s(600), 390.0)  # 90 + 1.0 * 300
+        self.assertEqual(tv.cloud_budget_s(9000), 600.0)  # cap
+        self.assertEqual(tv.cloud_budget_s(-5), 90.0)  # negatives clamp to the floor
+
+    def test_cloud_http_timeout_flat_then_linear_then_capped(self):
+        self.assertEqual(tv.cloud_http_timeout_s(0), 45.0)
+        self.assertEqual(tv.cloud_http_timeout_s(300), 45.0)
+        self.assertEqual(tv.cloud_http_timeout_s(600), 195.0)  # 45 + 0.5 * 300
+        self.assertEqual(tv.cloud_http_timeout_s(9000), 300.0)  # cap
+        self.assertEqual(tv.cloud_http_timeout_s(-5), 45.0)
+
+    def test_estimated_duration_from_file_size_never_raises(self):
+        path = make_temp_audio_file(16)
+        try:
+            est = tv._estimated_duration_s(path)
+            self.assertGreater(est, 0)
+            self.assertLess(est, 1.0)
+        finally:
+            os.remove(path)
+        self.assertEqual(tv._estimated_duration_s(os.path.join("no", "such", "file.oga")), 0.0)
+
+    def test_envelope_threads_scaled_budget_and_timeout_into_transcribe_cloud(self):
+        seen = {}
+
+        def spy(provider, audio_path, **kwargs):
+            seen.update(kwargs)
+            raise RuntimeError("boom")  # end the single groq attempt
+
+        path = make_temp_audio_file(6 * 1024 * 1024)  # est ~= 2097 s -> both capped
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        before = time.monotonic()
+        with mock.patch.object(tv, "transcribe_cloud", side_effect=spy):
+            envelope, code = tv.transcribe_to_envelope(
+                path, engine="groq", env={"GROQ_API_KEY": "k"}
+            )
+
+        self.assertEqual(code, 1)
+        self.assertAlmostEqual(seen["http_timeout_s"], 300.0)
+        # Deadline is the shared budget taken just after `before`: 600 s at the cap.
+        self.assertLessEqual(abs(seen["deadline"] - (before + 600.0)), 2.0)
 
 
 class TestWhitespaceApiKeys(TranscribeVoiceTestCase):

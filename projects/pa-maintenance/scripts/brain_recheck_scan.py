@@ -41,7 +41,22 @@ for _stream in (sys.stdout, sys.stderr):
 SCRIPTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPTS_DIR.parents[2]  # scripts -> pa-maintenance -> projects -> repo root
 
-IST = timezone(timedelta(hours=5, minutes=30))
+def local_tz():
+    """PA_TZ_OFFSET_MINUTES (minutes east of UTC) or UTC when unset — a loud
+    stderr warning replaces the old silent IST default (WB-54)."""
+    raw = os.environ.get("PA_TZ_OFFSET_MINUTES")
+    if raw is None or raw == "":
+        print("[brain-recheck] PA_TZ_OFFSET_MINUTES not set — defaulting to UTC (was IST before 2026-09-17)", file=sys.stderr)
+        return timezone.utc
+    try:
+        return timezone(timedelta(minutes=int(raw)))
+    except ValueError:
+        print(f"[brain-recheck] PA_TZ_OFFSET_MINUTES={raw!r} is not an integer — defaulting to UTC", file=sys.stderr)
+        return timezone.utc
+
+
+# Back-compat alias; evaluated per call, never a cached import-time offset.
+IST = local_tz
 
 STALE_MEMORY_DAYS = 60
 OVERDUE_PLAN_DAYS = 21
@@ -393,7 +408,7 @@ def scan(repo_root: Path, memory_dir: Path, skills_dir: Path, today: date) -> di
     # --- stale memory files ----------------------------------------------
     if memory_dir.is_dir():
         for f in sorted(memory_dir.glob("*.md")):
-            mtime = datetime.fromtimestamp(f.stat().st_mtime, IST).date()
+            mtime = datetime.fromtimestamp(f.stat().st_mtime, local_tz()).date()
             age = (today - mtime).days
             if age > STALE_MEMORY_DAYS:
                 issue("info", "STALE MEMORY", f"{f.name} last updated {age} days ago")
@@ -426,7 +441,7 @@ def scan(repo_root: Path, memory_dir: Path, skills_dir: Path, today: date) -> di
 
     severities = [i["severity"] for i in issues]
     return {
-        "generatedAt": datetime.now(IST).isoformat(),
+        "generatedAt": datetime.now(local_tz()).isoformat(),
         "today": today.isoformat(),
         "repoRoot": str(repo_root),
         "index": counts,
@@ -455,7 +470,7 @@ def main(argv=None) -> int:
     repo_root = Path(args.repo_root).resolve()
     memory_dir = Path(args.memory_dir) if args.memory_dir else default_memory_dir(repo_root)
     skills_dir = Path(args.skills_dir) if args.skills_dir else default_skills_dir()
-    today = date.fromisoformat(args.today) if args.today else datetime.now(IST).date()
+    today = date.fromisoformat(args.today) if args.today else datetime.now(local_tz()).date()
 
     print(json.dumps(scan(repo_root, memory_dir, skills_dir, today),
                      indent=2, ensure_ascii=False))

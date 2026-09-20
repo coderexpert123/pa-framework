@@ -10,8 +10,8 @@
  * `recall-index` (host: 'pa') never yields mid-index and the bot's event
  * loop is never touched by this module (it is never imported bot-side).
  *
- * Five sources are indexed, keyed by the `docs.source` column:
- *   conversation | trace | brain | kb | review
+ * Sources are indexed, keyed by the `docs.source` column:
+ *   conversation | trace | brain | kb | review | decisions | profile
  * See §3.3/C3 in the spec for the exact per-source doc-unit / doc_id /
  * cursor rules this file implements.
  */
@@ -44,6 +44,7 @@ export interface RecallSources {
   kb: { dir: string } | null;
   reviewDigest: { path: string } | null;
   decisions: { dbPath: string } | null;
+  profile: { path: string } | null;
 }
 
 export interface RecallQuery {
@@ -784,6 +785,95 @@ function indexReviewDigest(db: Database.Database, stmts: UpsertStmts, path: stri
   );
 }
 
+// --- profile: one doc per interest / preference key / live history row ------
+// (WP-8, OD-3: ~/.pa/data/profile.json becomes a `pa recall` source so the
+// pointer-based prompts reach operator facts at zero prompt cost. Whole-file
+// source like review — the file is ~5 KB, no incremental cursor.)
+
+/** Build profile docs. interests[] → profile:interest:<i>; each top-level
+ *  preferences key → profile:preference:<key> (value JSON-serialized — it is
+ *  nested, not flat); history[] rows WITHOUT superseded_by →
+ *  profile:history:<i> carrying valid_from as ts and the whole entry as ref
+ *  (valid_until/key/source ride it). Malformed JSON or a missing field yields
+ *  zero docs — the source is optional state, never a failure. */
+function contentToProfileDocs(content: string, mtimeIso: string, filePath: string): DocRow[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return [];
+  }
+  if (!parsed || typeof parsed !== 'object') return [];
+  const profile = parsed as Record<string, unknown>;
+  const docs: DocRow[] = [];
+
+  if (Array.isArray(profile.interests)) {
+    profile.interests.forEach((interest, i) => {
+      if (typeof interest !== 'string' || interest.trim().length === 0) return;
+      docs.push({
+        doc_id: `profile:interest:${i}`,
+        source: 'profile',
+        ref_json: JSON.stringify({ file: filePath, kind: 'interest', index: i }),
+        ts: mtimeIso,
+        thread_id: null,
+        role: null,
+        title: 'profile interest',
+        text: interest,
+      });
+    });
+  }
+
+  if (profile.preferences && typeof profile.preferences === 'object' && !Array.isArray(profile.preferences)) {
+    for (const [key, value] of Object.entries(profile.preferences as Record<string, unknown>)) {
+      const valueText = typeof value === 'string' ? value : JSON.stringify(value);
+      const text = `${key}: ${valueText}`;
+      if (text.trim().length === 0) continue;
+      docs.push({
+        doc_id: `profile:preference:${key}`,
+        source: 'profile',
+        ref_json: JSON.stringify({ file: filePath, kind: 'preference', key }),
+        ts: mtimeIso,
+        thread_id: null,
+        role: null,
+        title: `preference ${key}`,
+        text,
+      });
+    }
+  }
+
+  if (Array.isArray(profile.history)) {
+    profile.history.forEach((entry, i) => {
+      if (!entry || typeof entry !== 'object') return;
+      const e = entry as Record<string, unknown>;
+      if (e.superseded_by != null) return; // superseded rows are dead facts — skip
+      const update = typeof e.update === 'string' ? e.update : '';
+      if (update.trim().length === 0) return;
+      docs.push({
+        doc_id: `profile:history:${i}`,
+        source: 'profile',
+        ref_json: JSON.stringify({ file: filePath, kind: 'history', index: i, ...e }),
+        ts: typeof e.valid_from === 'string' ? e.valid_from : (typeof e.timestamp === 'string' ? e.timestamp : mtimeIso),
+        thread_id: null,
+        role: null,
+        title: `profile history ${typeof e.key === 'string' ? e.key : i}`,
+        text: update,
+      });
+    });
+  }
+
+  return docs;
+}
+
+function indexProfileSource(db: Database.Database, stmts: UpsertStmts, path: string): IndexStats {
+  const filePath = resolvePath(path);
+  const cursorKey = `md:${filePath}`;
+  // reindexOneFile's missing-file branch already does the right thing: a
+  // vanished profile deletes its indexed docs (or no-ops when never indexed).
+  return reindexOneFile(db, stmts, cursorKey, filePath, 'profile:', (content, mtimeIso, fp) =>
+    contentToProfileDocs(content, mtimeIso, fp)
+  );
+}
+
 // --- decisions: one doc per decision row (AI-164) -------------------------
 
 /** Build one recall doc from a decisions.sqlite row.
@@ -993,6 +1083,12 @@ function runFullSourcePass(
     const s = db.transaction(() => indexDecisionsSource(db, stmts, sources.decisions!))();
     s.ms = Date.now() - t0;
     result.decisions = s;
+  }
+  if (sources.profile) {
+    const t0 = Date.now();
+    const s = db.transaction(() => indexProfileSource(db, stmts, sources.profile!.path))();
+    s.ms = Date.now() - t0;
+    result.profile = s;
   }
 
   return result;

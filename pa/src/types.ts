@@ -191,19 +191,46 @@ export interface TranscriptionConfig {
   language?: string | null;
 }
 
+/**
+ * The optional `browser:` block (AI-246 WP-D). Always resolved to defaults in
+ * loadConfig — like bg_tasks — so consumers read a concrete port. `cdp_port`
+ * is the Chrome DevTools port PA launches its headed browser-session Chrome
+ * with; Playwright MCP attaches to it via PLAYWRIGHT_MCP_CDP_ENDPOINT instead
+ * of launching its own Chrome.
+ */
+export interface BrowserConfig {
+  cdp_port: number;  // 1024..65535, default 9222
+}
+
+/**
+ * PA's typed view of the optional `voice_inbox:` config block — only the keys
+ * PA itself consumes. The voice-inbox app reads the same config.yaml keys
+ * through its own loader (projects/voice-inbox/src/config.ts); the fallback
+ * maintenance job reads inbox_topic/keyword_topics raw. This is NOT a
+ * duplicate loader — one YAML file, two typed views.
+ */
+export interface VoiceInboxConfig {
+  port?: number;                    // voice_inbox.port — app server bind port; consumers default to 8787
+  screencast_ingest_token?: string; // voice_inbox.screencast_ingest_token — shared Bearer secret injected as PA_SCREENCAST_INGEST_TOKEN (AI-246)
+}
+
 export interface PaConfig {
   workers: WorkerConfig[];
   evaluator?: EvaluatorConfig;
   topic_defaults?: Record<string, string>;  // topicKey ("chatId_threadId") → worker name
   bg_tasks: BgTasksConfig;
-  concurrency_limit?: number; // max parallel skills in catchup
+  concurrency_limit?: number; // max parallel skills in catchup; undefined = follow the dynamic worker-slot cap
   maintenance?: Record<string, MaintenanceConfig>;
   transcription?: TranscriptionConfig;
   usage?: UsageConfig;
   cost_tier?: CostTierConfig;  // optional cost-tier window configuration
+  routing_policy?: RoutingPolicyConfig;  // optional code/general turn-routing policy (absent = disabled)
+  model_router?: ModelRouterConfig;  // optional model router (block absent = disabled; enabled only gates the decision, shadow runs on presence)
   quota_aware_failover?: boolean;  // opt-in flag for health-score-based worker ordering (default false)
   worker_pin?: string;  // persisted override for 'pa worker pin <name>'
   git_workflow?: GitWorkflowConfig;  // absent = legacy git-allowed; see GitWorkflowConfig
+  browser: BrowserConfig;          // always resolved (default cdp_port 9222), like bg_tasks
+  voice_inbox?: VoiceInboxConfig;  // absent = the app is not configured; block is optional
 }
 
 export interface UsageConfig {
@@ -228,6 +255,95 @@ export interface CostTierConfig {
   peak_window_utc?: CostTierPeakWindowUtc;  // optional peak window override; default Mon-Fri 06:00-10:00 UTC
 }
 
+/**
+ * Request-routing policy (2026-09-11, plans/2026-09-11-model-routing-policy.md):
+ * classifies each bot turn as code/engineering or general and overrides the
+ * topic default with a time-window worker for code turns. Absent = disabled =
+ * zero behavior change. Worker names must exist in `workers:` (load warns and
+ * resolve fails open to the topic default otherwise). Peak window is NOT
+ * configured here — `cost_tier.peak_window_utc` is the single window truth.
+ */
+export type RoutingJudgeType = 'typesafe' | 'agy' | 'deterministic';
+
+export interface RoutingPolicyConfig {
+  enabled: boolean;
+  judge?: RoutingJudgeType;
+  judge_model?: string;
+  judge_timeout_ms?: number;
+  judge_command?: string;
+  /** General-classified turns on topics with NO configured topic default
+   *  (otherwise they already fall to the first-priority worker). */
+  general_worker?: string;
+  /** Code-classified turns outside the peak window. */
+  code_worker?: string;
+  /** Code-classified turns inside the peak window. */
+  peak_code_worker?: string;
+  /** Extra regex sources appended to the built-in code signals (invalid
+   *  sources are dropped with a warning at config load). */
+  code_patterns?: string[];
+  /** Per-topic classification pin: 'code' | 'general' always classify that
+   *  way, 'off' excludes the topic from the policy. */
+  topic_classes?: Record<string, 'code' | 'general' | 'off'>;
+}
+
+/**
+ * Model router (2026-09-18, plans/2026-09-18-model-router-SPEC.md). Absent
+ * block = zero behavior, zero logging. Shadow runs iff the block EXISTS
+ * (regardless of `enabled`); `enabled: true` additionally lets the router
+ * DECIDE. Worker names in table/effort_projection are NOT validated at load —
+ * the router's availability layer re-checks fleet membership at resolve time
+ * and fails open.
+ */
+export type CapabilityTier = 'quick_lookup' | 'standard' | 'deep_reasoning' | 'rich_toolchain';
+export type EffortScore = 1 | 2 | 3 | 4 | 5;
+export interface ModelRouterPolicyRow {
+  worker: string;
+  model?: string;            // omitted = the worker's configured default model
+  max_tier: CapabilityTier;  // highest tier this row satisfies
+  max_score: EffortScore;    // highest effort Score this row can express
+}
+export interface ModelRouterEffortProjection {
+  tunable: 'effort' | 'none'; // 'none' = worker has NO effort knob (agy/agyc/devin)
+  map?: Partial<Record<EffortScore, string>>; // when tunable === 'effort'
+}
+export interface ModelRouterConfig {
+  enabled: boolean;
+  judge?: 'typesafe';            // only value this wave; reserved
+  state_max_chars?: number;      // default 4000
+  context_max_chars?: number;    // default 2000
+  topic_max_chars?: number;      // default 300
+  zai_workers?: string[];        // default ['zclaude']
+  /** Conversation stickiness (intent decision 19): absent = ON when the block
+   *  exists — keep the incumbent worker while the turn's needs stay inside its
+   *  capability envelope; escapes are capability-UP/unavailable/peak-zai-last
+   *  only. `sticky: false` opts out and every turn resolves fresh. */
+  sticky?: boolean;
+  table?: ModelRouterPolicyRow[];
+  effort_projection?: Record<string, ModelRouterEffortProjection>;
+  shadow_path?: string;          // default paHome()/model-router-shadow.jsonl
+  /** Pin deprecation (2026-09-19 router-as-orchestrator intent decision 25):
+   *  absent + block present = true (pins are no-ops for TURN DISPATCH on
+   *  router-decided turns); explicit `false` = today's behavior. */
+  deprecate_pins?: boolean;
+  /** Availability cache TTL in ms (decision 27), default 5000; `0` disables
+   *  the cache (always fresh). Env override PA_MODEL_ROUTER_AVAILABILITY_TTL_MS. */
+  availability_ttl_ms?: number;
+  /** Placement candidate caps (decision 21): reader list cap, per-candidate
+   *  goal cap, and the classifier's prompt-assembly section cap. */
+  placement?: {
+    candidate_cap?: number;   // default 25
+    goal_chars?: number;      // default 80
+    section_chars?: number;   // default 2400
+  };
+  /** Per-surface staging (decision 28): absent surface = 'shadow' (dark —
+   *  recorded, never acted on). Flips one config edit at a time. */
+  surfaces?: {
+    fallback?: 'shadow' | 'live';
+    steer?: 'shadow' | 'live';
+    placement?: 'shadow' | 'live';
+  };
+}
+
 export interface WorkerHealthState {
   workerName: string;
   isCoolingDown: boolean;
@@ -247,9 +363,17 @@ export interface RunOptions {
   resource?: string;   // unique identifier for the task (e.g. topicId, skillName)
   agentName?: string;  // name of the agent (e.g. agy, claude)
   isEvaluator?: boolean; // prevents recursive LLM evaluation of the evaluator itself
+  // Admission-control slot priority (2026-09-11): 'routing' waiters poll for a freed
+  // worker slot every 250ms instead of the 5s normal cadence. Set ONLY for short-lived
+  // routing dispatches (the bot's voice-routed thread executor does); skill and
+  // conversation dispatches stay unset. Forwarded by runWithFailover's options spread;
+  // deliberately NOT set by commands/run.ts's preferred-worker path.
+  slotPriority?: 'routing' | 'normal';
   onWorkerSwitch?: (payload: FailoverNotifyPayload) => Promise<void>;
   checkAvailable?: (worker: WorkerConfig) => Promise<boolean>;
   preferredWorker?: string;  // preferred worker name (e.g. "codex") to try first
+  candidateOrder?: string[];  // decision 20: routed turns — replaces the static priority order
+  ignoreWorkerPin?: boolean;  // decision 25: skip config.worker_pin reordering on this dispatch
   excludeWorkers?: Set<string>; // workers to skip (already failed in earlier dispatch phases)
   updateId?: number; // Telegram update_id for log correlation
   suppressExitAlert?: boolean; // suppress worker-exit notify for intermediate failover attempts
@@ -272,6 +396,13 @@ export interface RunOptions {
   priorAttempts?: string[]; // workers that already failed before runWithFailover was invoked
   contextId?: string; // execution-context UUID; allows nested same-context blackboard lock re-entrancy
   getExtraArgs?: (worker: WorkerConfig) => string[] | undefined; // dynamic extraArgs resolver per failover candidate
+  /** Per-hop env keys, evaluated per failover hop with that hop's WorkerConfig —
+   *  merged AFTER `env` so the hop's own identity wins over any static value.
+   *  This is ALSO the only place non-secret dispatch env survives: runWithFailover
+   *  replaces `env` with the hop's secret_allowlist-filtered subset, which drops
+   *  every non-allowlisted key before it reaches the child. Semantics mirror
+   *  getExtraArgs (WS3 answer provenance, 2026-09-18). */
+  getEnv?: (worker: WorkerConfig) => Record<string, string> | undefined;
   // Flag names removed from the worker's CONFIGURED args for THIS run only
   // (stripConfiguredArgs in worker-exec.ts). Bare form ('--flag value') drops
   // the flag AND its following token unconditionally; '--flag=value' drops the
@@ -326,6 +457,7 @@ export interface SkillFrontmatter {
   critical?: boolean;            // if true, self-improver never autonomously approves changes targeting this skill
   worker_args?: string[];        // extra CLI args appended to the worker command for THIS skill only (e.g. agy --include-directories to widen its file-tool workspace beyond the shim-forced repo cwd). Merged ahead of run-time extraArgs.
   exclusive_resource?: string;   // when set, pa run serializes this skill against every OTHER skill declaring the same resource name via a blackboard lock (e.g. "git-workflow" for commit/push/push-public/investigate-flagged, which all mutate the same working tree). Do NOT set this on a skill that itself invokes `pa run` on another skill declaring the same resource — the child would deadlock waiting for the parent's own lock.
+  worktree_cwd?: boolean;        // when true, pa run lets a caller inside a LINKED WORKTREE of the declared cwd's repo redirect the worker into the caller's own toplevel (resolveWorkerTreeRoot; AI-320). Off by default: skills that push refs or inspect main-branch state (push/push-public) must stay pinned to the declared checkout until their branch semantics are reviewed.
   cost_tier?: 'off_peak' | 'anytime';  // default 'anytime'; off_peak skills run only during z.ai off-peak window (19:30-11:30 IST). Periodic off_peak skills are deferred during peak hours with once-daily logging.
 }
 
@@ -406,4 +538,8 @@ export interface CommandResult {
    * — the bot turns this into one best-effort pa-support alert and never
    * blocks the reply on it. */
   rawTelegramSends?: string[];
+  /** Auth-shaped lines in this run's output (auth broker Phase A, 2026-09-10).
+   *  Present only when the detector matched — the bot turns this into ONE
+   *  best-effort nudge and never blocks the reply on it. */
+  authPrompts?: string[];
 }

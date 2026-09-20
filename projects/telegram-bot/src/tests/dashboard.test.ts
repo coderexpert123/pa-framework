@@ -27,16 +27,8 @@ before(async () => {
 
   // 1. Mock config.yaml
   await writeConfig(sharedTempDir, BASE_CONFIG);
-  
-  // 2. Mock telegram-keepawake.json
-  const ka = {
-    active: true,
-    since: '2026-04-22T10:00:00.000Z',
-    pid: process.pid // use our own PID so it's "alive"
-  };
-  await writeFile(join(sharedTempDir, 'telegram-keepawake.json'), JSON.stringify(ka), 'utf8');
-  
-  // 3. Mock skills directory
+
+  // 2. Mock skills directory
   const skillsPath = join(sharedTempDir, 'skills');
   await mkdir(skillsPath);
   const briefPath = join(skillsPath, 'daily-mail-brief');
@@ -68,22 +60,13 @@ const sent = (text: string) => sanitizeMdV2(text.trim()).length;
 describe('Dashboard', () => {
   it('generates correct dashboard content', async () => {
     const content = await getDashboardContent();
-    
+
     assert.ok(content.includes('SYSTEM DASHBOARD'));
-    assert.ok(content.includes('Keep-awake**: on since 15:30 IST'));
     assert.ok(content.includes('Agent Failover Order'));
     assert.ok(content.includes('1. claude (priority 1)'));
     assert.ok(content.includes('2. agy (priority 2)'));
     assert.ok(content.includes('Skill Schedule'));
     assert.ok(content.includes('daily-mail-brief**: `45 7 * * *`'));
-  });
-
-  it('handles off keep-awake', async () => {
-    // Modify keep-awake state on disk
-    await writeFile(join(sharedTempDir, 'telegram-keepawake.json'), JSON.stringify({ active: false }), 'utf8');
-
-    const content = await getDashboardContent();
-    assert.ok(content.includes('Keep-awake**: off'));
   });
 });
 

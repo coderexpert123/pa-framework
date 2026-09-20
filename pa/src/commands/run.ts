@@ -10,9 +10,12 @@ import { killProcessTree } from '../process-tree.js';
 import { log } from '../lib/log.js';
 import { notifyUser } from '../lib/notify.js';
 import { blackboard, startLockRenewal } from '../blackboard.js';
+import { resolveWorkerTreeRoot } from '../lib/git-root.js';
 import { validateKeyboardRequest } from '../lib/callback-grammar.js';
+import { buildBrowserSessionEnv } from '../lib/browser-launcher.js';
 import { PROTECTED_SKILLS } from '../validator.js';
-import type { RunMeta, CommandResult, TelegramOutput, RunOptions } from '../types.js';
+import { renderSkillRoster } from '../lib/skill-roster.js';
+import type { RunMeta, CommandResult, TelegramOutput, RunOptions, Skill } from '../types.js';
 
 /**
  * Lock key for a skill's `exclusive_resource`. Shared by acquire/heartbeat/release
@@ -62,6 +65,42 @@ export function exitCodeForCommandResult(result: CommandResult): number {
  *  skills' binding-allowlist rules key on this block, not on CLI args. */
 export function buildOperatorArgsBlock(promptArgs: string): string {
   return `\n\n## Operator arguments (this run)\n${promptArgs}\nTreat these as if the operator typed them alongside the skill trigger; they scope and constrain this run only.`;
+}
+
+/** Appended to every LLM-worker skill prompt (`## PA runtime (this run)`)
+ *  — OD-8: the operator-facing pa commands existed but no prompt surface
+ *  named them, so `pa run` workers could not page the operator, deliver
+ *  cross-topic, register watches, or queue topic work. `pa/bin/pa.ts` owns
+ *  the command roster; PA_RUNTIME_BLOCK_DISABLED=1 rolls the block off. */
+export const PA_RUNTIME_BLOCK =
+  'You are a `pa run` skill dispatch. This run logs under ~/.pa/logs/<skill-name>/ — `pa logs <skill-name>` tails it. Stalled on something only the operator can unblock: `pa ping`. Deliver into a Telegram topic: `pa notify --topic-thread <id>`. Register a completion watch: `pa watch add`. Queue work for a topic: `pa topic-task add <chatId>_<threadId> --title "<t>" --prompt "<p>"`. `_Ref:` lookup: `pa ref <id>`. Platform check: `pa health`, then `pa doctor`. History/precedent: `pa recall "<terms>" --json`. Multi-file repo edits: `pa claims` first, then `pa claim <paths> --session <label> --note "<what>"`.';
+
+/**
+ * Builds the extra CLI args passed to the worker executable for a skill run.
+ * Since AI-187 (2026-09-03), `-- <extraArgs>` for an LLM-worker skill (no
+ * `cmd`) is bridged into the PROMPT (buildOperatorArgsBlock above) because the
+ * args are inert or actively fatal on worker CLIs — agy exits 2 on any
+ * positional argument (live failure, 2026-09-10: `pa run commit -- <files>`
+ * got "unexpected argument" from agy, excluding it from failover and dying
+ * with "No workers available" once the rest of the chain was cooling down).
+ * Once bridged into the prompt, extraArgs must NOT also ride the worker argv
+ * — riding both was the defect (this function's predecessor unconditionally
+ * appended extraArgs here regardless of the bridge). `worker_args` (skill
+ * frontmatter, e.g. agy `--include-directories`) are real worker CLI flags
+ * declared for this skill and always ride the argv.
+ *
+ * `cmd` skills never reach this in practice (runSkillBody returns from its
+ * own `cmd` branch, with extraArgs appended to the shell command string
+ * instead, before this is called) — the branch below is kept explicit so the
+ * invariant is self-contained and testable rather than implicit in caller
+ * control flow.
+ */
+export function buildWorkerExtraArgs(skill: Skill, extraArgs: string[]): string[] {
+  const workerArgs = skill.frontmatter.worker_args ?? [];
+  if (skill.frontmatter.cmd) {
+    return [...workerArgs, ...extraArgs];
+  }
+  return [...workerArgs];
 }
 
 /**
@@ -336,6 +375,25 @@ async function handleSkillResult(
       : `Skill ${detail}. Emit NO_OUTPUT as the last line if this run legitimately had nothing to send.`;
   }
 
+  // AI-255 B1: a commit gated by a foreign active reservation prints
+  // `COMMIT-DEFERRED: <reason>` (commit skill contract). Exit 0 + that marker =
+  // the silent no-op the marker exists to catch, so the run is downgraded to a
+  // failure with exitCode 2 — distinct from crash (1) and lock-busy skip
+  // (handleSkillResult's -1 → 1) — and a shell caller cannot miss it.
+  const deferredMarker = /^COMMIT-DEFERRED:\s*(.*)$/m.exec(result.output ?? '');
+  if (result.success && deferredMarker) {
+    const detail = `COMMIT-DEFERRED: ${deferredMarker[1].trim() || '(no reason given)'}`;
+    log('warn', 'run', `Skill ${skillName} deferred by the claims gate — ${detail}`, {
+      skill: skillName,
+      worker,
+      duration,
+      commitDeferred: true,
+    });
+    result.success = false;
+    result.exitCode = 2;
+    result.error = result.error ? `${result.error}\n${detail}` : detail;
+  }
+
   // --- Telegram delivery, BEFORE the run is recorded -------------------------
   // Suppression check: the NO_OUTPUT sentinel (last non-empty line) means "I ran
   // and decided there is nothing to send" — a success that delivers nothing on
@@ -508,14 +566,15 @@ export async function runCommand(
   // If inject_triggers is set, find all other skills with trigger_descriptions
   if (skill.frontmatter.inject_triggers) {
     const allSkills = await listSkills();
-    const otherTriggers = allSkills
-      .filter((s) => s.name !== skillName && s.frontmatter.trigger_description)
-      .map((s) => `[${s.name}] ${s.frontmatter.trigger_description}`);
+    const roster = renderSkillRoster(
+      allSkills.filter((s) => s.name !== skillName),
+      { requireTriggerDescription: true },
+    );
 
-    if (otherTriggers.length > 0) {
+    if (roster) {
       finalPrompt = `${finalPrompt}\n\n## Trigger System: Available Skills\n` +
         `If the briefing content matches any of these triggers, output EXACTLY \`[pa run <skill-name>]\` on its own line after the briefing.\n\n` +
-        otherTriggers.join('\n');
+        roster;
     }
   }
 
@@ -551,6 +610,15 @@ export async function runCommand(
       skill: skillName,
       bridgedArgs: extraArgs,
     });
+  }
+
+  // OD-8 (2026-09-16 evangelism wave WP-6): the operator-facing pa commands
+  // (ping/notify/watch/topic-task/ref/health/doctor) existed but no prompt
+  // surface told `pa run` workers about them — orphaned infrastructure. The
+  // runtime block is always-on for LLM-worker skills; cmd: shell skills get
+  // no prompt at all; PA_RUNTIME_BLOCK_DISABLED=1 is the rollback.
+  if (!skill.frontmatter.cmd && process.env.PA_RUNTIME_BLOCK_DISABLED !== '1') {
+    finalPrompt += `\n\n## PA runtime (this run)\n` + PA_RUNTIME_BLOCK;
   }
 
   // Load all secrets. For cmd: shell skills, filter to only declared secrets (security hardening).
@@ -597,6 +665,11 @@ export async function runCommand(
   // a transient heartbeat-write failure alone never fires onLost, so phantoms no longer
   // reach this downgrade.
   let lockLost: 'expired' | 'purged' | undefined;
+  // AI-246 v4: recorded for logging only. Chrome is NEVER torn down by
+  // `pa run` — it persists across runs so the credential profile accumulates
+  // and task-lane `pa browser ensure` calls can reuse it. `pa browser stop`
+  // is the manual teardown path.
+  let browserChromeStartedByUs = false;
 
   if (lockKey && exclusiveResource) {
     const waitStart = Date.now();
@@ -671,12 +744,63 @@ export async function runCommand(
     return result;
   } finally {
     if (lockRenewal) lockRenewal.stop();
+    // AI-246 v4: no Chrome teardown here — the browser outlives the run (the
+    // detached+unref'd spawn survives pa's exit by design). Only the lock is
+    // released; the next `pa run`/`pa browser ensure` reuses the live Chrome.
     if (lockHeld && lockKey) {
       await blackboard.releaseLock(lockKey, skillName, lockContextId, { pid: process.pid }).catch(() => {});
     }
   }
 
   async function runSkillBody(): Promise<CommandResult> {
+  // AI-246 WP-D: a skill holding the browser-session lock drives the
+  // operator-visible Chrome that PA launches — Playwright MCP attaches over
+  // CDP via env instead of launching its own (the D1 registration is
+  // unchanged; the env override reaches the MCP server through the worker's
+  // inherited env). Chrome must be up BEFORE dispatch or the env injected
+  // below points at nothing. A launch failure fails the run fast — a
+  // browser-session skill without a browser can only flail.
+  if (exclusiveResource === 'browser-session') {
+    const browserPrepStart = Date.now();
+    try {
+      const paConfig = await loadConfig();
+      const { env: browserEnv, startedByUs } = await buildBrowserSessionEnv(paConfig);
+      Object.assign(secrets, browserEnv);
+      // jev-browser-wingman's lockCheck (PA/src/lib/wingman-plugin.ts) reads
+      // this to recognize its own run's held lock, not another run's.
+      if (lockContextId) secrets.PA_BROWSER_SESSION_LOCK_CONTEXT = lockContextId;
+      browserChromeStartedByUs = startedByUs;
+      log('info', 'run', `Skill ${skillName}: browser-session Chrome ready`, {
+        skill: skillName,
+        port: browserEnv.PA_BROWSER_CDP_PORT,
+        startedByUs: browserChromeStartedByUs,
+      });
+    } catch (err: any) {
+      const failResult: CommandResult = {
+        success: false,
+        error: `browser-session Chrome launch failed: ${err?.message ?? String(err)}`,
+        exitCode: -1,
+        output: '',
+      };
+      await handleSkillResult(failResult, 'browser-launcher', skillName, Date.now() - browserPrepStart, extraArgs, depth, preferredWorker, skill.frontmatter.telegram_output, allSecrets);
+      return failResult;
+    }
+  }
+
+  // Worker cwd (AI-320): the skill's declared cwd by default — or the caller's
+  // toplevel when `pa run` was invoked from a linked worktree of that same repo
+  // (same --git-common-dir) and the skill opts in via `worktree_cwd: true`.
+  // Without this, a pinned `cwd:` made every worker operate on the main
+  // checkout and rendered worktree callers' pending files invisible — a commit
+  // run reported "nothing to commit" over six files that were modified in the
+  // worktree it was invoked from. Opt-in, not universal: skills that push refs
+  // or account `origin/main..HEAD` (push/push-public) must keep the declared
+  // checkout until their branch semantics are reviewed. Resolved once here so
+  // the shell path, the pinned worker and every failover attempt agree.
+  const workerCwd = skill.frontmatter.worktree_cwd
+    ? await resolveWorkerTreeRoot(skill.frontmatter.cwd)
+    : skill.frontmatter.cwd;
+
   // 1. Direct command execution (bypasses LLM)
   if (skill.frontmatter.cmd) {
     const start = Date.now();
@@ -687,7 +811,7 @@ export async function runCommand(
     return new Promise<CommandResult>((resolve) => {
       const child = spawn(fullCmd, {
         shell: true,
-        cwd: skill.frontmatter.cwd,
+        cwd: workerCwd,
         env: { ...process.env, ...secrets, ...shellSkillExtraEnv(fullCmd) },
         // POSIX only — see worker-exec.ts spawn for rationale (process-group
         // leader for killProcessTree; Windows keeps taskkill /T).
@@ -777,9 +901,10 @@ export async function runCommand(
 
   // 2. LLM worker execution
   // Skill-declared worker_args (e.g. agy --include-directories to widen its
-  // file-tool workspace past the shim-forced repo cwd) prepend the run-time
-  // extraArgs. cmd-based skills above don't use these — they're worker CLI flags.
-  const workerExtraArgs = [...(skill.frontmatter.worker_args ?? []), ...extraArgs];
+  // file-tool workspace past the shim-forced repo cwd) ride the worker argv.
+  // Run-time extraArgs do NOT — they're bridged into the prompt above instead
+  // (buildWorkerExtraArgs / AI-187 follow-up, 2026-09-10).
+  const workerExtraArgs = buildWorkerExtraArgs(skill, extraArgs);
   // Resolve preferred worker: CLI --worker flag > skill frontmatter > global failover
   const workerPref = preferredWorker || skill.frontmatter.worker;
   const willFailover = !skill.frontmatter.no_fallback;
@@ -789,7 +914,7 @@ export async function runCommand(
     if (workerConfig) {
       const start = Date.now();
       const prefResult = await executeWorker(workerConfig, finalPrompt, {
-        cwd: skill.frontmatter.cwd,
+        cwd: workerCwd,
         env: secrets,
         timeout: skill.frontmatter.timeout,
         idleTimeout: skill.frontmatter.idle_timeout,
@@ -825,7 +950,7 @@ export async function runCommand(
 
   const start = Date.now();
   const failoverOpts: RunOptions = {
-    cwd: skill.frontmatter.cwd,
+    cwd: workerCwd,
     env: secrets,
     timeout: skill.frontmatter.timeout,
     idleTimeout: skill.frontmatter.idle_timeout,

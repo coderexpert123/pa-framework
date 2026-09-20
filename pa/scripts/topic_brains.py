@@ -22,11 +22,21 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
 
-# IST as a real tzinfo (spec §3.2: consolidated stamps carry the +05:30 offset).
-# Do NOT build IST by adding a timedelta to a UTC datetime — that shifts the wall
-# clock but keeps tzinfo=+00:00, producing IST values labeled as UTC (Gate D
-# finding, 2026-08-21).
-IST = timezone(timedelta(hours=5, minutes=30))
+# Local tzinfo: PA_TZ_OFFSET_MINUTES (minutes east of UTC) or UTC when unset,
+# with a loud stderr warning (WB-54: the old silent IST default is retired).
+# Always a REAL tzinfo — do NOT build it by adding a timedelta to a UTC
+# datetime: that shifts the wall clock but keeps tzinfo=+00:00, producing
+# offset values labeled as UTC (Gate D finding, 2026-08-21).
+def _local_tz() -> timezone:
+    raw = os.environ.get("PA_TZ_OFFSET_MINUTES")
+    if raw is None or raw == "":
+        print("[topic-brains] PA_TZ_OFFSET_MINUTES not set — defaulting to UTC (was IST before 2026-09-17)", file=sys.stderr)
+        return timezone.utc
+    try:
+        return timezone(timedelta(minutes=int(raw)))
+    except ValueError:
+        print(f"[topic-brains] PA_TZ_OFFSET_MINUTES={raw!r} is not an integer — defaulting to UTC", file=sys.stderr)
+        return timezone.utc
 
 # Dormant exemption threshold: 30 days (spec §3.2)
 DORMANT_MS = 30 * 24 * 3600
@@ -963,8 +973,7 @@ def finalize(pa_home: str, stamp_topic_key: Optional[str] = None) -> int:
             return 1
 
         # Generate stamp timestamp first (needed for covers fallback)
-        # Explicit IST offset (+05:30)
-        now_ist = datetime.now(IST)
+        now_ist = datetime.now(_local_tz())
         consolidated = now_ist.isoformat()
 
         # Get max timestamp from archive for this topic
@@ -1158,10 +1167,9 @@ def finalize(pa_home: str, stamp_topic_key: Optional[str] = None) -> int:
                 except (IOError, json.JSONDecodeError):
                     pass
 
-                # Generate stamp
-                # Explicit IST offset (+05:30)
-                now_ist = datetime.now(IST)
-                consolidated = now_ist.isoformat()
+                # Generate stamp in the configured local offset (PA_TZ_OFFSET_MINUTES)
+                now_local = datetime.now(_local_tz())
+                consolidated = now_local.isoformat()
                 covers = max_ts or 'consolidated'  # Fallback to 'consolidated' literal only when no file/rows exist
 
                 # Remove existing stamp
@@ -1231,8 +1239,8 @@ def finalize(pa_home: str, stamp_topic_key: Optional[str] = None) -> int:
             except (json.JSONDecodeError, IOError):
                 pass
 
-        # Generate consolidated timestamp for folds (IST offset)
-        now_ist = datetime.now(IST)
+        # Consolidated stamp in the configured local offset (PA_TZ_OFFSET_MINUTES)
+        now_ist = datetime.now(_local_tz())
         consolidated = now_ist.isoformat()
 
         # Perform folds
@@ -1295,7 +1303,7 @@ def finalize(pa_home: str, stamp_topic_key: Optional[str] = None) -> int:
                 # Get branch's max archive timestamp for covers
                 parts = branch_key.split('_')
                 branch_thread_id = int(parts[1]) if len(parts) == 2 else None
-                branch_covers = consolidated  # fallback to now IST
+                branch_covers = consolidated  # fallback to now in the local offset
 
                 if branch_thread_id is not None:
                     try:

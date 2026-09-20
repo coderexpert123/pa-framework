@@ -17,7 +17,7 @@
  * persists via writeJsonAtomic.
  */
 import { createHash, randomBytes } from 'crypto';
-import { dirname, join } from 'path';
+import { basename, dirname, join } from 'path';
 import fs from 'fs-extra';
 import lockfile from 'proper-lockfile';
 import { paHome } from '../paths.js';
@@ -25,6 +25,7 @@ import { safeLockOptions } from './safe-lock.js';
 import { writeJsonAtomic } from './atomic-write.js';
 import { log } from './log.js';
 import { appendTopicEvent } from './topic-events.js';
+import { _resetBoundedQueueForTest, withBoundedQueue } from './stall.js';
 
 /**
  * Notes now have their own store (TopicNote, below) rather than riding this
@@ -52,12 +53,18 @@ export interface TopicTask {
   /** Optional worker pin — Wave 2 (SPEC §3.1): rides the record into the running
    *  store and reaches runWithFailover as `preferredWorker` at execution time. */
   worker?: string;
+  /** Optional model pin — evangelism WP-7 (OD-4): rides the record into the
+   *  running store and reaches the executor's buildTopicTierExtraArgs as the
+   *  highest-precedence tunable override. */
+  model?: string;
 }
 
 export const TOPIC_TASK_MAX_TITLE_CHARS = 80;
 const TOPIC_TASK_MAX_PROMPT_CHARS = 500;
 /** Wave 2 worker pin grammar (SPEC §3.1). */
 export const TOPIC_TASK_WORKER_RE = /^[a-z0-9-]{1,16}$/;
+/** WP-7 model pin grammar — wider than worker: model ids carry dots. */
+export const TOPIC_TASK_MODEL_RE = /^[a-zA-Z0-9._-]{1,64}$/;
 
 /**
  * Pa-side twin of the AI-185 topic_resume prompt rules (deliberate-mirror
@@ -165,11 +172,10 @@ async function readQueueStrict(path: string): Promise<TopicTask[]> {
   return data.filter(isTopicTask);
 }
 
-// In-process promise mutex (pending-dispatches.ts pattern): same-process
+// In-process bounded queue (lib/stall.ts, key 'topic-tasks'): same-process
 // callers serialize BEFORE ever touching proper-lockfile, whose retry/backoff
 // is built for cross-process contention and far too slow for N same-process
 // calls racing one mkdir-based lock.
-let queueMutex: Promise<unknown> = Promise.resolve();
 
 /**
  * Wave 2 generalization of the Wave-1 queue lock: every mutating call passes
@@ -192,9 +198,7 @@ async function withTopicTaskLock<T>(paths: string[], fn: () => Promise<T>): Prom
       await release();
     }
   };
-  const task = queueMutex.catch(() => {}).then(run);
-  queueMutex = task.catch(() => {});
-  return task;
+  return withBoundedQueue('topic-tasks', run, { store: 'topic-tasks', target: basename(paths[0]) });
 }
 
 /**
@@ -206,7 +210,7 @@ async function withTopicTaskLock<T>(paths: string[], fn: () => Promise<T>): Prom
 export async function appendTask(
   chatId: number,
   threadId: number,
-  input: { title: string; prompt: string; createdBy: string; worker?: string },
+  input: { title: string; prompt: string; createdBy: string; worker?: string; model?: string },
 ): Promise<{ id: string; deduped: boolean }> {
   const titleCheck = validateTaskTitle(input.title);
   if (!titleCheck.ok) throw new Error(titleCheck.error);
@@ -217,6 +221,9 @@ export async function appendTask(
   }
   if (input.worker !== undefined && !TOPIC_TASK_WORKER_RE.test(input.worker)) {
     throw new Error('task.worker must match ^[a-z0-9-]{1,16}$');
+  }
+  if (input.model !== undefined && !TOPIC_TASK_MODEL_RE.test(input.model)) {
+    throw new Error('task.model must match ^[a-zA-Z0-9._-]{1,64}$');
   }
 
   const path = taskQueuePath(chatId, threadId);
@@ -234,6 +241,7 @@ export async function appendTask(
       created_by: input.createdBy,
       content_hash: contentHash,
       ...(input.worker !== undefined ? { worker: input.worker } : {}),
+      ...(input.model !== undefined ? { model: input.model } : {}),
     };
     tasks.push(record);
     await writeJsonAtomic(path, tasks, { spaces: 2 });
@@ -478,6 +486,8 @@ export interface RunningTask {
   created_by: string;
   content_hash: string;
   worker?: string;
+  /** WP-7: carried from the queued record — per-record model pin. */
+  model?: string;
   status: RunningTaskStatus;
   slot: number;
   started_at: string;
@@ -681,6 +691,7 @@ export async function claimNextTask(chatId: number, threadId: number): Promise<R
       created_by: next.created_by,
       content_hash: next.content_hash,
       ...(next.worker !== undefined ? { worker: next.worker } : {}),
+      ...(next.model !== undefined ? { model: next.model } : {}),
       status: 'running',
       slot,
       started_at: new Date(now).toISOString(),
@@ -944,6 +955,6 @@ export async function findTaskByAnchorMessage(
  * otherwise leave non-pristine.
  */
 export function _resetTopicTasksForTest(): void {
-  queueMutex = Promise.resolve();
+  _resetBoundedQueueForTest('topic-tasks');
   lastActivityWriteAt = 0;
 }

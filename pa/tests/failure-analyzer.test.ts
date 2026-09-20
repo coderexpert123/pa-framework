@@ -405,6 +405,7 @@ function makeInput(overrides: Partial<CensusProposalInput> = {}): CensusProposal
     skills: [{ name: 'daily-mail-brief', frontmatter: { cmd: 'python run_brief.py' } }],
     maintenanceJobNames: ['restore-drill', 'clobber-sentinel'],
     jobFileExists: () => true,
+    repoRoot: 'D:/any-clone-dir',
     ...overrides,
   };
 }
@@ -508,34 +509,41 @@ describe('censusProposals (2026-08-23 alerts wave)', () => {
   });
 });
 
-describe('tracebackCodeTarget (2026-08-23 alerts wave)', () => {
-  it('extracts a repo-relative path from a File "..." traceback line under Personal Assistant/', () => {
-    const text = 'Traceback (most recent call last):\n  File "D:\\Personal Assistant\\projects\\daily-mail-brief\\scripts\\run_brief.py", line 42, in main\n    raise RuntimeError';
-    assert.equal(tracebackCodeTarget(text), 'projects/daily-mail-brief/scripts/run_brief.py');
+describe('tracebackCodeTarget (2026-08-23 alerts wave; WB-53 repo-root-relative)', () => {
+  const ROOT = 'D:/any-clone-dir';
+
+  it('extracts a repo-relative path from a File "..." traceback line under the detected repo root', () => {
+    const text = 'Traceback (most recent call last):\n  File "D:\\any-clone-dir\\projects\\daily-mail-brief\\scripts\\run_brief.py", line 42, in main\n    raise RuntimeError';
+    assert.equal(tracebackCodeTarget(text, ROOT), 'projects/daily-mail-brief/scripts/run_brief.py');
   });
 
   it('takes the LAST frame that resolves under the repo when there are several', () => {
     const text = [
-      'File "D:\\Personal Assistant\\pa\\scripts\\a.py", line 1, in <module>',
-      'File "D:\\Personal Assistant\\pa\\scripts\\b.py", line 2, in helper',
+      'File "D:\\any-clone-dir\\pa\\scripts\\a.py", line 1, in <module>',
+      'File "D:\\any-clone-dir\\pa\\scripts\\b.py", line 2, in helper',
     ].join('\n');
-    assert.equal(tracebackCodeTarget(text), 'pa/scripts/b.py');
+    assert.equal(tracebackCodeTarget(text, ROOT), 'pa/scripts/b.py');
   });
 
   it('skips a frame outside the repo and still returns the one that resolves under it', () => {
     const text = [
       'File "C:\\Python313\\lib\\subprocess.py", line 100, in run',
-      'File "D:\\Personal Assistant\\pa\\scripts\\backup_secrets.py", line 223, in main',
+      'File "D:\\any-clone-dir\\pa\\scripts\\backup_secrets.py", line 223, in main',
     ].join('\n');
-    assert.equal(tracebackCodeTarget(text), 'pa/scripts/backup_secrets.py');
+    assert.equal(tracebackCodeTarget(text, ROOT), 'pa/scripts/backup_secrets.py');
+  });
+
+  it('resolves code targets from ANY clone directory, not just one hardcoded segment (WB-53)', () => {
+    const text = 'File "D:\\My Repos\\pa-fork\\projects\\x\\a.py", line 3, in f';
+    assert.equal(tracebackCodeTarget(text, 'D:/My Repos/pa-fork'), 'projects/x/a.py');
   });
 
   it('returns undefined when no frame resolves under the repo', () => {
     const text = 'File "C:\\Python313\\lib\\subprocess.py", line 100, in run';
-    assert.equal(tracebackCodeTarget(text), undefined);
+    assert.equal(tracebackCodeTarget(text, ROOT), undefined);
   });
 
   it('returns undefined for text with no traceback frame at all', () => {
-    assert.equal(tracebackCodeTarget('ENOENT: no such file or directory'), undefined);
+    assert.equal(tracebackCodeTarget('ENOENT: no such file or directory', ROOT), undefined);
   });
 });

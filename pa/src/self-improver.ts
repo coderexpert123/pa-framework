@@ -579,6 +579,7 @@ async function generateProposals(census?: AlertCensus, taskLane?: TaskLaneActivi
       skills: await listSkills(),
       maintenanceJobNames: jobsForHost('pa').map((j) => j.name),
       jobFileExists: (p) => existsSync(join(repoRoot, p)),
+      repoRoot,
     });
     for (const { proposal, evidence } of censusPairs) {
       if (!excludesSelf(proposal)) continue;

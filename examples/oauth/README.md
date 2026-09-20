@@ -54,17 +54,17 @@ If you're running the `daily-mail-brief` sample, its `projects/daily-mail-brief/
 
 ### 3. Run the auth flow
 
-```powershell
-python ~/.pa/reauth_google.py
+```bash
+python3 ~/.pa/reauth_google.py || python ~/.pa/reauth_google.py
 ```
 
 A browser window opens. Sign in with your Google account. Approve the requested scopes. The token is written to `~/.pa/google-token.json`.
 
 ### 4. Verify
 
-```powershell
-# Should print the expiry timestamp:
-python -c "from pathlib import Path; import sys; sys.path.insert(0, str(Path.home() / '.pa')); from google_auth import get_credentials; print('Token expires:', get_credentials().expiry)"
+```bash
+# Should print the expiry timestamp (Windows: `python` instead of `python3`):
+python3 -c "from pathlib import Path; import sys; sys.path.insert(0, str(Path.home() / '.pa')); from google_auth import get_credentials; print('Token expires:', get_credentials().expiry)"
 ```
 
 Or just try running a sample skill that uses OAuth (e.g., `daily-mail-brief`).
@@ -75,7 +75,7 @@ Or just try running a sample skill that uses OAuth (e.g., `daily-mail-brief`).
 
 1. Edit `~/.pa/google_auth.py` — remove unwanted entries from `ALL_SCOPES`.
 2. Delete `~/.pa/google-token.json` to force re-auth.
-3. Re-run `python ~/.pa/reauth_google.py`.
+3. Re-run `python3 ~/.pa/reauth_google.py` (Windows: `python ~/.pa/reauth_google.py`).
 
 The new token will be limited to your edited scope set.
 
@@ -151,7 +151,7 @@ If your OAuth client ID is exposed (e.g., committed to a repo by accident):
 3. Create a new Desktop OAuth Client ID (step 1 above).
 4. Download the new JSON → overwrite `~/.pa/google-credentials.json`.
 5. Delete `~/.pa/google-token.json` (the old token is now bound to a dead client).
-6. Re-run `python ~/.pa/reauth_google.py`.
+6. Re-run `python3 ~/.pa/reauth_google.py` (Windows: `python ~/.pa/reauth_google.py`).
 
 All existing skills resume working without code changes — they read the new credentials/token automatically.
 

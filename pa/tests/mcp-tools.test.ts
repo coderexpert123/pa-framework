@@ -10,10 +10,10 @@ import { mkdir, rm } from 'fs/promises';
 import { tools, pa_ref_lookup, pa_claims, pa_maintenance_status, pa_costs, pa_slo_report, pa_recall } from '../mcp/tools.js';
 
 describe('MCP tool definitions (Wave H WPH2)', () => {
-  it('exports exactly six read-only tools', () => {
-    assert.equal(tools.length, 6);
+  it('exports exactly eleven read-only tools', () => {
+    assert.equal(tools.length, 11);
     const names = tools.map(t => t.name);
-    assert.deepEqual(names.sort(), ['pa_claims', 'pa_costs', 'pa_maintenance_status', 'pa_recall', 'pa_ref_lookup', 'pa_slo_report']);
+    assert.deepEqual(names.sort(), ['bus_inbox', 'bus_list', 'bus_send', 'bus_wait', 'bus_whoami', 'pa_claims', 'pa_costs', 'pa_maintenance_status', 'pa_recall', 'pa_ref_lookup', 'pa_slo_report']);
   });
 
   it('every tool has name, description, inputSchema, and handler', () => {
@@ -43,6 +43,10 @@ describe('MCP tool definitions (Wave H WPH2)', () => {
 
   it('pa_recall source enum includes decisions (AI-164)', () => {
     assert.ok(pa_recall.inputSchema.properties.source.enum.includes('decisions'));
+  });
+
+  it('pa_recall source enum includes profile (WP-8)', () => {
+    assert.ok(pa_recall.inputSchema.properties.source.enum.includes('profile'));
   });
 
   it('no tool has a mutating verb in its name (read-only surface)', () => {

@@ -14,8 +14,12 @@ import {
   areProcessesAlive,
   getChildPids,
   hasChildProcesses,
+  isVerifiedTreeMember,
+  partitionVerifiedTreeMembers,
+  _setRawExecForTest,
+  _resetSnapshotCacheForTest,
 } from '../src/process-tree.js';
-import type { ExecFn } from '../src/process-tree.js';
+import type { ExecFn, ProcessRecord } from '../src/process-tree.js';
 
 const IS_WIN = platform() === 'win32';
 
@@ -254,14 +258,37 @@ describe('hasChildProcesses', () => {
       : [[1, 0], [100, 1], [200, 100]];
 
     let callCount = 0;
-    const countingExec: ExecFn = async (_cmd) => {
+    const countingExec: ExecFn = async (cmd) => {
       callCount++;
+      // POSIX exec-collapse probe: children-without-grandchildren triggers a
+      // second query for the wrapper's OWN cmdline — here it is still a
+      // shell, so the child stays "the worker" and the answer stays false.
+      if (cmd.includes('command=')) {
+        return { stdout: commandLinesOutput([[100, '/bin/sh -c "node /x/worker.mjs"']]), stderr: '' };
+      }
       return { stdout: descendantOutput(rows), stderr: '' };
     };
 
     const result = await hasChildProcesses(100, true, countingExec);
     assert.equal(result, false, 'should return false when no grandchildren');
-    assert.equal(callCount, 1, 'should issue exactly ONE exec call even when result is false');
+    // POSIX costs one extra targeted ps for the wrapper cmdline; win32 reads
+    // cmdlines from the same snapshot.
+    assert.equal(callCount, IS_WIN ? 1 : 2, 'snapshot query + (POSIX) wrapper-cmdline probe');
+  });
+
+  it('with isShell=true on POSIX: a wrapper that exec\'d its payload counts the worker\'s own children (macOS sh -c collapse)', { skip: IS_WIN }, async () => {
+    // /bin/sh -c 'cmd' on macOS/bash execs the payload — pid 100 IS the
+    // worker (argv0=node), its direct children are its tools. Depth-2-only
+    // logic probes the tools' children and reports dead; the wrapper-cmdline
+    // probe must rescue the liveness verdict (CI fail 2026-09-20).
+    const rows: Array<[number, number, string?]> = [[1, 0], [100, 1], [200, 100]];
+    const exec: ExecFn = async (cmd) => ({
+      stdout: cmd.includes('command=')
+        ? commandLinesOutput([[100, 'node /x/worker.mjs']])
+        : descendantOutput(rows),
+      stderr: '',
+    });
+    assert.equal(await hasChildProcesses(100, true, exec), true);
   });
 
   it('bypasses cache when custom execFn is injected', async () => {
@@ -328,5 +355,211 @@ describe('control-char-poisoned snapshots (2026-09-03 incident)', () => {
     if (!IS_WIN) return;
     const children = await getChildPids(99, async () => ({ stdout: 'not json at all {{', stderr: '' }));
     assert.deepEqual(children, [], 'genuine corruption keeps the graceful empty-map floor');
+  });
+});
+
+// ── Default snapshot path: timed exec, cache, coalescing (4th storm variant, 2026-09-12) ──
+// Fixed defects: (D1) the default (no-execFn) path called the plain untimed/
+// unhidden exec instead of execHidden; (D2) the cache-bypass check treated the
+// `execHidden` DEFAULT PARAMETER value (carried by getDescendantPids/
+// getCommandLines/hasChildProcesses) as a genuine injection, so every
+// production call bypassed the 300ms cache. These tests exercise the REAL
+// default path (no execFn argument at all) via the _rawExec seam, which is the
+// only way to observe exec() OPTIONS (timeout/windowsHide) — the ExecFn shape
+// itself erases them by design so mocks and the real function share one type.
+function emptySnapshotOutput(): string {
+  return IS_WIN ? '[]' : '';
+}
+
+describe('default snapshot path: timed exec + cache + coalescing', () => {
+  it('the default path calls the raw exec with windowsHide/timeout/killSignal (D1)', async () => {
+    _resetSnapshotCacheForTest();
+    let capturedOptions: Record<string, unknown> | undefined;
+    _setRawExecForTest(async (_cmd, options) => {
+      capturedOptions = options;
+      return { stdout: emptySnapshotOutput(), stderr: '' };
+    });
+    try {
+      await getChildPids(1); // no execFn — exercises the real default path
+    } finally {
+      _setRawExecForTest(null);
+      _resetSnapshotCacheForTest();
+    }
+
+    assert.ok(capturedOptions, 'default path must call the raw exec with an options object');
+    assert.equal(capturedOptions?.windowsHide, true, 'default path must set windowsHide:true');
+    assert.equal(capturedOptions?.timeout, 15_000, 'default path must set the 15s timeout');
+    assert.equal(capturedOptions?.killSignal, 'SIGKILL', 'default path must set killSignal');
+  });
+
+  it('two default calls within the TTL window share ONE query (cache, D2)', async () => {
+    _resetSnapshotCacheForTest();
+    let callCount = 0;
+    _setRawExecForTest(async () => {
+      callCount++;
+      return { stdout: emptySnapshotOutput(), stderr: '' };
+    });
+    try {
+      await getChildPids(1);
+      await getChildPids(1);
+    } finally {
+      _setRawExecForTest(null);
+      _resetSnapshotCacheForTest();
+    }
+    assert.equal(callCount, 1, 'second default call within the TTL must reuse the cached snapshot');
+  });
+
+  it("getDescendantPids's internal execHidden default also shares the cache (D2 — the actual reported bug shape)", async () => {
+    // getDescendantPids/hasChildProcesses default their OWN execFn parameter to
+    // execHidden, then pass THAT to getProcessSnapshot — pre-fix, that truthy
+    // value was (wrongly) treated as "injected" and always bypassed the cache.
+    // (Deliberately excludes a fresh:true call — see the next test — fresh is
+    // DESIGNED to force a new query even past a valid cache, so mixing it in
+    // here would assert against the very semantics fresh:true exists to keep.)
+    _resetSnapshotCacheForTest();
+    let callCount = 0;
+    _setRawExecForTest(async () => {
+      callCount++;
+      return { stdout: emptySnapshotOutput(), stderr: '' };
+    });
+    try {
+      await getDescendantPids(100); // no execFn passed — defaults to execHidden internally
+      await getChildPids(100); // no execFn passed — undefined
+    } finally {
+      _setRawExecForTest(null);
+      _resetSnapshotCacheForTest();
+    }
+    assert.equal(callCount, 1, 'both default-path calls must share ONE cached/coalesced query');
+  });
+
+  it('a fresh:true call still forces a new query past a valid cache (fresh semantics preserved)', async () => {
+    _resetSnapshotCacheForTest();
+    let callCount = 0;
+    _setRawExecForTest(async () => {
+      callCount++;
+      return { stdout: emptySnapshotOutput(), stderr: '' };
+    });
+    try {
+      await getChildPids(100); // populates the cache — call 1
+      await hasChildProcesses(100, true, undefined, true); // fresh:true — must NOT reuse the cache — call 2
+    } finally {
+      _setRawExecForTest(null);
+      _resetSnapshotCacheForTest();
+    }
+    assert.equal(callCount, 2, 'fresh:true must force a new query even though a valid cache entry exists');
+  });
+
+  it('N concurrent default calls issue exactly ONE query (coalescing)', async () => {
+    _resetSnapshotCacheForTest();
+    let callCount = 0;
+    let releaseQuery: (() => void) | undefined;
+    const gate = new Promise<void>(resolve => { releaseQuery = resolve; });
+    _setRawExecForTest(async () => {
+      callCount++;
+      await gate; // hold the query open so concurrent callers genuinely overlap
+      return { stdout: emptySnapshotOutput(), stderr: '' };
+    });
+
+    try {
+      const calls = Promise.all([getChildPids(1), getChildPids(1), getChildPids(1), getChildPids(100)]);
+      // Let the microtask queue advance so all four calls reach the in-flight check.
+      await new Promise(resolve => setImmediate(resolve));
+      releaseQuery!();
+      await calls;
+    } finally {
+      _setRawExecForTest(null);
+      _resetSnapshotCacheForTest();
+    }
+
+    assert.equal(callCount, 1, 'concurrent default-path calls must coalesce onto ONE in-flight query');
+  });
+
+  it('an injected execFn still bypasses the cache with exact call counts (unchanged behavior)', async () => {
+    _resetSnapshotCacheForTest();
+    let callCount = 0;
+    const countingExec: ExecFn = async () => {
+      callCount++;
+      return { stdout: emptySnapshotOutput(), stderr: '' };
+    };
+
+    await getChildPids(1, countingExec);
+    await getChildPids(1, countingExec);
+    assert.equal(callCount, 2, 'a genuinely injected execFn must bypass the default-path cache entirely');
+  });
+});
+
+// ── AI-328: stale-PPID orphan discrimination ─────────────────────────────────
+// Windows ParentProcessId is immutable — a dead ancestor's pid can be reused
+// by an unrelated process, and BFS then mis-attributes foreign/system
+// processes into the tracked tree. Verification: createdMs must be >= run
+// start (phantoms predate it) AND no live ancestor may sit outside the
+// family (pid-reuse victims hang off foreign live parents).
+
+describe('partitionVerifiedTreeMembers (AI-328 stale-PPID discrimination)', () => {
+  const NOW = 1_800_000_000_000;
+  const snap = (rows: Array<[number, number, number?]>) =>
+    new Map<number, ProcessRecord>(
+      rows.map(([pid, ppid, created]) => [
+        pid,
+        { parentPid: ppid, cmdline: `cmd-${pid}`, ...(created !== undefined ? { createdMs: created } : {}) },
+      ])
+    );
+
+  it('verifies a real orphan whose parent chain ends at a dead in-family pid', () => {
+    // 200's parent 150 is tracked but dead (absent from snapshot) → chain ends in-family
+    const s = snap([[200, 150, NOW]]);
+    const { verified, foreign } = partitionVerifiedTreeMembers([200], 100, new Set([150, 200]), s, NOW - 5_000);
+    assert.deepEqual(verified, [200]);
+    assert.deepEqual(foreign, []);
+  });
+
+  it('rejects a stale-PPID phantom whose creation predates the run', () => {
+    // "svchost" created at boot; its recorded parentPid 150 IS in the family
+    // (pid-reuse artifact — how it got tracked), but createdMs gives it away.
+    const s = snap([[300, 150, NOW - 86_400_000]]);
+    const { verified, foreign } = partitionVerifiedTreeMembers([300], 100, new Set([150, 300]), s, NOW - 5_000);
+    assert.deepEqual(verified, []);
+    assert.deepEqual(foreign, [300]);
+  });
+
+  it('rejects a pid-reuse victim: live ancestor outside the family', () => {
+    // pid 400 reused post-exit by a new process parented to live foreign 700.
+    const s = snap([
+      [400, 700, NOW],
+      [700, 1, NOW],
+    ]);
+    const { verified, foreign } = partitionVerifiedTreeMembers([400], 100, new Set([150, 400]), s, NOW - 5_000);
+    assert.deepEqual(verified, []);
+    assert.deepEqual(foreign, [400]);
+  });
+
+  it('verifies a live descendant whose chain reaches the root', () => {
+    const s = snap([
+      [200, 150, NOW],
+      [150, 100, NOW],
+      [100, 50, NOW],
+    ]);
+    assert.equal(isVerifiedTreeMember(200, 100, new Set([100, 150, 200]), s, NOW - 5_000), true);
+  });
+
+  it('always verifies the root pid (its foreign ancestors are expected)', () => {
+    const s = snap([
+      [100, 50, NOW],
+      [50, 1, NOW],
+    ]);
+    assert.equal(isVerifiedTreeMember(100, 100, new Set([100]), s, NOW - 5_000), true);
+  });
+
+  it('missing createdMs never excludes (POSIX/no-date snapshots)', () => {
+    const s = snap([[200, 150]]); // dead parent 150 in family, no createdMs
+    const { verified } = partitionVerifiedTreeMembers([200], 100, new Set([150, 200]), s, NOW - 5_000);
+    assert.deepEqual(verified, [200]);
+  });
+
+  it('absent-from-snapshot pid is not verified (already dead — nothing to kill)', () => {
+    const s = snap([[200, 150, NOW]]);
+    const { verified, foreign } = partitionVerifiedTreeMembers([999], 100, new Set([999]), s, NOW - 5_000);
+    assert.deepEqual(verified, []);
+    assert.deepEqual(foreign, [999]);
   });
 });

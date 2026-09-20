@@ -237,14 +237,21 @@ describe('analyzeFeedbackRules (AI-165 WP-B)', () => {
         ts TEXT NOT NULL
       )
     `);
+    // Seeded relative to the current run time (not a fixed calendar date): the reaction
+    // compiler filters on `ts >= now - ANALYSIS_DAYS days` (analyzeFeedbackRules's default
+    // is 14), so a hardcoded absolute timestamp ages out of that rolling window as real time
+    // advances past it — it did, silently, for these two rows (see feedback-analyzer.test.ts
+    // git history: seeded 2026-08-27, still inside the window on that day, outside it from
+    // 2026-09-10 on). Compute them as "recently" instead so the fixture stays valid forever.
+    const daysAgo = (n: number) => new Date(Date.now() - n * 86400000).toISOString();
     db.prepare(`
       INSERT INTO decisions (decision_id, skill, source, decision, rationale, reaction, thread_id, ts)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run('d-000000000001-abc', 'daily-mail-brief', 'test', 'send brief', 'too long', '👎', 4242, '2026-08-27T09:00:00.000Z');
+    `).run('d-000000000001-abc', 'daily-mail-brief', 'test', 'send brief', 'too long', '👎', 4242, daysAgo(2));
     db.prepare(`
       INSERT INTO decisions (decision_id, skill, source, decision, rationale, reaction, thread_id, ts)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run('d-000000000002-def', 'daily-mail-brief', 'test', 'send brief', 'too verbose', '👎', 4242, '2026-08-27T10:00:00.000Z');
+    `).run('d-000000000002-def', 'daily-mail-brief', 'test', 'send brief', 'too verbose', '👎', 4242, daysAgo(1));
     db.close();
   });
 

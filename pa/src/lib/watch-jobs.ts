@@ -44,6 +44,7 @@ import { notifyUser } from './notify.js';
 import { appendTopicEvent } from './topic-events.js';
 import { appendTask, TOPIC_TASK_MAX_TITLE_CHARS } from './topic-tasks.js';
 import { areProcessesAlive } from '../process-tree.js';
+import { withBoundedQueue } from './stall.js';
 
 // ---------------------------------------------------------------------------
 // Types (SPEC §2.1 — frozen, copied verbatim)
@@ -236,12 +237,11 @@ async function readStore(path: string): Promise<WatchStore> {
 
 /**
  * Read-modify-write a fresh copy of the store under the file lock. Same
- * pattern as reservations.ts's `mutate`: an in-process `mutateQueue` chain
+ * pattern as reservations.ts's `mutate`: an in-process bounded queue (lib/stall.ts)
  * serializes same-process callers before proper-lockfile ever gets involved
  * (its retry/backoff is built for cross-process contention, far too slow for
  * N same-process calls racing the same mkdir-based lock).
  */
-let mutateQueue: Promise<unknown> = Promise.resolve();
 
 function mutate<T>(fn: (store: WatchStore) => T): Promise<T> {
   const run = async (): Promise<T> => {
@@ -258,9 +258,7 @@ function mutate<T>(fn: (store: WatchStore) => T): Promise<T> {
     }
   };
 
-  const task = mutateQueue.catch(() => {}).then(run);
-  mutateQueue = task.catch(() => {});
-  return task;
+  return withBoundedQueue('watch-jobs', run, { store: 'watch-jobs', target: 'watch-jobs.json' });
 }
 
 // Built via fromCharCode rather than a Unicode NUL escape sequence written out

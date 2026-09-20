@@ -99,15 +99,25 @@ const defaultDeps: StopDeps = {
 };
 
 /**
- * Kill every live worker (wrapper + descendants) serving this topic.
- * Returns the number of PIDs killed — 0 means nothing was running.
+ * Kill every live worker (wrapper + descendants) registered under EXACTLY this
+ * worker-pids `skill` key. Exact equality, never a prefix: `topic-<key>`,
+ * `topic-<key>-th<n>`, task-lane resources and every unrelated dispatch are
+ * structurally unreachable from one another. Returns the number of PIDs
+ * killed; 0 means nothing was registered.
+ *
+ * `expectedDispatchId`, when given, additionally requires the registered
+ * entry's `dispatchId` to match (WP-5 D12): a `skill` names a LANE, and a bare
+ * topic resource is reused by every message in that topic, so a caller that
+ * knows WHICH dispatch it meant must be able to prove the registry still
+ * holds that exact dispatch before this kills anything. Omitting it keeps
+ * today's behaviour (a thread resource is already one-per-dispatch).
  */
-export async function stopTopicWorkers(
-  chatId: number,
-  threadId: number,
+export async function stopWorkerByResource(
+  resource: string,
   deps: StopDeps = defaultDeps,
+  expectedDispatchId?: string,
 ): Promise<number> {
-  const resource = `topic-${chatId}_${threadId}`;
+  if (resource === '') return 0;
   let killed = 0;
   let entries;
   try {
@@ -117,6 +127,12 @@ export async function stopTopicWorkers(
   }
   for (const entry of entries) {
     if (entry.skill !== resource) continue;
+    // WP-5 D12. `skill` names a LANE. A bare topic resource is reused by every
+    // message in that topic, so a caller that recorded WHICH dispatch it meant
+    // must be able to prove the registry still holds that dispatch — otherwise
+    // this kill lands on a stranger's worker. A caller that passes no id keeps
+    // today's behaviour (a thread resource is already one-per-dispatch).
+    if (expectedDispatchId !== undefined && entry.dispatchId !== expectedDispatchId) continue;
     const pids = [entry.pid, ...(entry.descendants ?? [])];
     for (const pid of pids) {
       if (deps.alive(pid)) {
@@ -129,9 +145,22 @@ export async function stopTopicWorkers(
     await deps.removeEntry(entry.pid).catch(() => {});
   }
   if (killed > 0) {
-    logger.info('worker-stop', `killed ${killed} pid(s) for ${resource}`, { chatId, threadId });
+    logger.info('worker-stop', `killed ${killed} pid(s) for ${resource}`, { resource });
   }
   return killed;
+}
+
+/**
+ * Kill every live worker (wrapper + descendants) serving this topic.
+ * Returns the number of PIDs killed — 0 means nothing was running.
+ * Body delegates to stopWorkerByResource (AI-214 backend redesign, 2026-09-08).
+ */
+export async function stopTopicWorkers(
+  chatId: number,
+  threadId: number,
+  deps: StopDeps = defaultDeps,
+): Promise<number> {
+  return stopWorkerByResource(`topic-${chatId}_${threadId}`, deps);
 }
 
 /**
@@ -142,8 +171,8 @@ export async function stopTopicWorkers(
  * every non-thread dispatch are structurally unreachable from here. Returns
  * the number of PIDs killed; 0 means nothing was registered (an interrupt
  * whose run already finished still proceeds — the runSeq bump already
- * orphaned it). Mirrors stopTopicWorkers body-for-body with only the match
- * string differing.
+ * orphaned it). Body delegates to stopWorkerByResource (AI-214 backend
+ * redesign, 2026-09-08).
  */
 export async function stopThreadWorker(
   chatId: number,
@@ -151,31 +180,7 @@ export async function stopThreadWorker(
   threadN: number,
   deps: StopDeps = defaultDeps,
 ): Promise<number> {
-  const resource = `topic-${chatId}_${threadId}-th${threadN}`;
-  let killed = 0;
-  let entries;
-  try {
-    entries = await deps.list();
-  } catch {
-    return 0;
-  }
-  for (const entry of entries) {
-    if (entry.skill !== resource) continue;
-    const pids = [entry.pid, ...(entry.descendants ?? [])];
-    for (const pid of pids) {
-      if (deps.alive(pid)) {
-        try {
-          deps.kill(pid);
-          killed++;
-        } catch { /* already gone */ }
-      }
-    }
-    await deps.removeEntry(entry.pid).catch(() => {});
-  }
-  if (killed > 0) {
-    logger.info('worker-stop', `killed ${killed} pid(s) for ${resource}`, { chatId, threadId, threadN });
-  }
-  return killed;
+  return stopWorkerByResource(`topic-${chatId}_${threadId}-th${threadN}`, deps);
 }
 
 // --- Command parsing (exported for tests) -----------------------------------

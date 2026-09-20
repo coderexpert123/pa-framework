@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <!-- Injection boundary: no third-party origins, no inline script/style. All
+       dynamic content is rendered via createElement/textContent in app.js. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; media-src 'self' blob:; img-src 'self' blob:">
+  <meta name="color-scheme" content="dark light">
+  <meta name="theme-color" content="#0e1217" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#fbfcfd" media="(prefers-color-scheme: light)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Voice Inbox">
+  <title>Voice Inbox</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" type="image/png" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="styles.css">
+  <script src="answer-shapes.js" defer></script>
+  <script src="live-pane.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <a href="#view-root" class="skip-link">Skip to content</a>
+  <main id="view-root" tabindex="-1"></main>
+</body>
+</html>

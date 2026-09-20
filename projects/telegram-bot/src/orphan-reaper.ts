@@ -20,10 +20,10 @@
  * the honest death notice.
  */
 import { readFile, stat } from 'fs/promises';
-import { sendMessage, sendMessageWithKeyboard, sendMessageWithKeyboardDetailed, sendTyping, editMessageText, type InlineKeyboardMarkup } from './telegram.js';
+import { sendMessage, sendMessageWithKeyboard, sendMessageWithKeyboardDetailed, sendTyping, editMessageText, sendMessageWithId, type InlineKeyboardMarkup } from './telegram.js';
 import { sendReplyText } from './rich-message.js';
 import { getPriorSessionPath, buildResumeArgs } from './session.js';
-import { parseMetadata, buildModelStatusSnapshot, renderStatusCard, resolveWorkerLlm, selectWorkerTunables, formatWorkerReply, isPrematureAsyncReply } from './logic.js';
+import { parseMetadata, buildModelStatusSnapshot, renderStatusCard, resolveWorkerLlm, selectWorkerTunables, formatWorkerReply, isPrematureAsyncReply, normalizeMarkdown } from './logic.js';
 import type { ModelStatusReasonCode } from './types.js';
 import { loadTopicState, saveTopicState, addTurn } from './conversation.js';
 import { deliveredKey, wasDelivered, markDelivered } from './delivered-store.js';
@@ -31,16 +31,29 @@ import { listPendingDispatches, removePendingDispatch, pendingDispatchKey, updat
 import { putResend, takeResend, resendKey } from './resend-store.js';
 import { isBarePlaceholderUserText, transcribeVoiceMessage, formatTranscriptUserText, extensionForAttachment, voiceAttachmentPath } from './voice.js';
 import { buildResendKeyboard } from './callbacks.js';
-import { makeRefId } from './ref-id.js';
+import { makeRefId, appendRefIdAndLog, type RefKind } from './ref-id.js';
 import { markTopicRecovering, clearTopicRecovering } from './recovery-gate.js';
 import { isTopicStopped } from './worker-stop.js';
 import { ORPHAN_HARVEST_WINDOW_MS } from './task-executor.js';
-import { listWorkerPids, isProcessAlive } from '../../../pa/dist/src/worker-pids.js';
-import { getDescendantPids } from '../../../pa/dist/src/process-tree.js';
+import { THREAD_RESPONSE_CAP_CHARS } from './thread-executor.js';
+import {
+  listStoreKeys,
+  listThreads,
+  getThread,
+  touchThread,
+  settleOrphanedThread,
+  restartParkFields,
+  type ThreadRecord,
+} from './topic-threads.js';
+import { extractVoiceInboxTaskIds } from './voice-inbox-bridge.js';
+import { listWorkerPids } from '../../../pa/dist/src/worker-pids.js';
+import { getDescendantPids, areProcessesAlive, findProcessesByCommandLine } from '../../../pa/dist/src/process-tree.js';
 import { executeWorker } from '../../../pa/dist/src/worker-exec.js';
 import { loadConfig } from '../../../pa/dist/src/config.js';
 import { logger } from '../../../pa/dist/src/lib/log.js';
-import { getKeepAwakeStatus } from './keepawake.js';
+import { voiceInboxTerminalTaskIds as voiceInboxTerminalTaskIdsSync } from '../../../pa/dist/src/lib/voice-inbox-ledger.js';
+import { appendTopicEvent, type TopicEventKind } from '../../../pa/dist/src/lib/topic-events.js';
+import { redactSecrets } from '../../../pa/dist/src/lib/redact.js';
 
 /** Minimal structural logger so tests can observe the held-record notice via
  *  `_setLoggerForTest` (AI-208 fix-wave m3). */
@@ -175,6 +188,9 @@ export interface ReaperDeps {
    * failure is treated as non-terminal (pre-AI-186 behavior). */
   sendDetailed?: (record: PendingDispatch, text: string, replyMarkup?: InlineKeyboardMarkup) => Promise<{ delivered: boolean; terminal?: boolean }>;
   readTranscript: (record: PendingDispatch) => Promise<{ content: string; mtimeMs: number } | null>;
+  /** Dead-dispatch arm's liveness decision (AI-241): the default impl is
+   *  OS-truth (`isTopicWorkerAliveOnMachine`) — the worker-pids registry is
+   *  only a pid HINT inside it, never the verdict. */
   isTopicWorkerAlive: (record: PendingDispatch) => Promise<boolean>;
   now: () => number;
   /** Optional: keep the topic's typing indicator alive while a recovery is
@@ -210,6 +226,11 @@ export interface ReaperDeps {
    *  the formatted transcript text, or null on any failure (caller falls to the
    *  neutral notice). Injected for testing; default impl in makeDefaultDeps. */
   reviveVoiceNote?: (record: PendingDispatch) => Promise<string | null>;
+  /** Which of these voice-inbox task ids are in a terminal ledger state
+   *  (done/failed/cancelled/transcribe_failed). Optional: when absent the
+   *  guard is skipped entirely, so hand-built test deps keep today's
+   *  behavior. Fails open — an unreadable ledger returns an empty set. */
+  voiceInboxTerminalTaskIds?: (taskIds: string[]) => Promise<Set<string>>;
 }
 
 function defaultReadTranscript(record: PendingDispatch): Promise<{ content: string; mtimeMs: number } | null> {
@@ -227,37 +248,142 @@ function defaultReadTranscript(record: PendingDispatch): Promise<{ content: stri
   })();
 }
 
+/** Injectable OS reads backing the dead-dispatch liveness decision (AI-241).
+ *  Defaults route through process-tree's shared snapshot — ONE full-process
+ *  OS query per TTL window, never per-PID CIM/ps calls on this path. Tests
+ *  inject fakes for call-count semantics. */
+export interface TopicWorkerOsReads {
+  areProcessesAlive?: (pids: number[]) => Promise<Map<number, boolean>>;
+  getDescendantPids?: (pid: number) => Promise<Array<{ pid: number; parentPid: number }>>;
+  scanCommandLines?: (needle: string) => Promise<Array<{ pid: number; cmdline: string }>>;
+}
+
 /**
- * Registry-based worker liveness. Checks BOTH the registered pid (the shell
- * wrapper) and its last-known descendants: when the spawner crashes, the
- * wrapper often dies with it while the real CLI child keeps running — checking
- * only `e.pid` false-negatives and triggers a premature harvest (2026-07-04
- * incident: intermediate assistant text delivered as a "final" reply).
- * Exported for tests.
+ * OS-truth worker liveness core (AI-241, generalized for AI-228's thread
+ * sibling). The worker-pids registry is a HINT — candidate pids to resolve —
+ * never the verdict itself: it lies stale after bot restarts in BOTH
+ * directions (entry lingers while the process is dead; entry gone while the
+ * process lives — registry removal must never by itself conclude "dead"). Two
+ * prongs, in fixed order, both answered by the OS process snapshot:
+ *
+ *  1. Registry pids resolved against the OS: every registry entry matching
+ *     `resource` contributes its wrapper pid plus recorded descendants (the
+ *     wrapper can die while the real CLI child lives — 2026-07-04 incident:
+ *     intermediate assistant text delivered as a "final" reply), plus a live
+ *     snapshot tree-walk when the descendants list is empty (30 s heartbeat
+ *     gap — a just-dispatched worker's children aren't recorded yet). A
+ *     matching entry's `teePath` basename also joins the needle set here —
+ *     the same entries prong 1 already lists, no second registry read (the
+ *     agy tee helper's `<contextId>.out` path survives on the orphan's
+ *     cmdline even when the record itself never captured one).
+ *  2. Command-line scan, reached ONLY when prong 1 found nothing alive:
+ *     scan the snapshot's command lines for needles that actually appear on
+ *     a worker's cmdline — the resumed session id (`--resume`/`resume`/
+ *     `--conversation <id>`) and tee-path basenames (basename only —
+ *     slash-normalization-proof). Catches the live-but-unregistered worker
+ *     the registry lost. A POSIX snapshot carries no command lines, so this
+ *     finds nothing there — a miss is "no evidence", never positive proof
+ *     of death.
  */
-export async function isTopicWorkerAliveByRegistry(record: PendingDispatch): Promise<boolean> {
-  const resource = `topic-${record.chatId}_${record.threadId}`;
+async function isWorkerAliveOnMachineCore(
+  resource: string,
+  needles: Iterable<string>,
+  reads: TopicWorkerOsReads,
+): Promise<boolean> {
+  const areAlive = reads.areProcessesAlive ?? areProcessesAlive;
+  const descendantsOf = reads.getDescendantPids ?? getDescendantPids;
+  const scanCmdlines = reads.scanCommandLines ?? findProcessesByCommandLine;
+
+  const allNeedles = new Set(needles);
+  // Prong 1 — registry-resolved pids checked against the OS snapshot.
   try {
     const entries = await listWorkerPids();
-    // for...of instead of .some() — the descendants-gap fallback below needs await
+    const candidates = new Set<number>();
     for (const e of entries) {
       if (e.skill !== resource) continue;
-      // Direct PID check or descendants check
-      if (isProcessAlive(e.pid) || (e.descendants ?? []).some((d) => isProcessAlive(d))) return true;
-      // Descendants-list gap fix (30-second heartbeat): the worker was
-      // dispatched recently but the heartbeat hasn't fired yet, so the
-      // descendants list is empty. Do a direct process-tree scan.
+      candidates.add(e.pid);
+      for (const d of e.descendants ?? []) candidates.add(d);
+      // The matching entry's own tee file is a prong-2 needle too — pulled
+      // from the entry prong 1 already holds (see header).
+      const teeBase = e.teePath?.split(/[\\/]/).pop();
+      if (teeBase) allNeedles.add(teeBase);
       if (!e.descendants || e.descendants.length === 0) {
         try {
-          const desc = await getDescendantPids(e.pid);
-          if (desc.some((d: { pid: number }) => isProcessAlive(d.pid))) return true;
+          for (const d of await descendantsOf(e.pid)) candidates.add(d.pid);
         } catch { /* process-tree scan failed — fall through */ }
       }
     }
-    return false;
-  } catch {
-    return false;
+    if (candidates.size > 0) {
+      const aliveByPid = await areAlive([...candidates]);
+      for (const alive of aliveByPid.values()) {
+        if (alive) return true;
+      }
+    }
+  } catch { /* registry unreadable — fall through to the cmdline scan */ }
+
+  // Prong 2 — command-line scan for the live-but-unregistered worker.
+  for (const needle of allNeedles) {
+    try {
+      if ((await scanCmdlines(needle)).length > 0) return true;
+    } catch { /* scan failed — no evidence */ }
   }
+  return false;
+}
+
+/**
+ * Topic-turn dispatch liveness — thin adapter over the core (AI-241).
+ * Resource is the topic lane's `topic-<chatId>_<threadId>`; needles are the
+ * record's own session id + captured tee basename. Exported for tests.
+ */
+export async function isTopicWorkerAliveOnMachine(
+  record: PendingDispatch,
+  reads: TopicWorkerOsReads = {},
+): Promise<boolean> {
+  const resource = `topic-${record.chatId}_${record.threadId}`;
+  return isWorkerAliveOnMachineCore(resource, dispatchCmdlineNeedles(record), reads);
+}
+
+/**
+ * Thread-worker liveness (AI-228) — same OS-truth core, thread resource
+ * `topic-<key>-th<rec.n>` (byte-identical to the executor's resource at
+ * dispatch). Needles: the resumed run's session id; matching registry
+ * entries' teePath basenames are collected by the core itself. Known hole,
+ * accepted by design: a FRESH-run claude orphan that lost its registry entry
+ * carries no needle at all → prong 2 is empty → can false-negative to dead →
+ * demote-while-alive → duplicate run. Bounded because a live orphan inside
+ * its 50-min harvest window keeps its entry (the startup kill pass spares
+ * it) and outside it the kill pass already killed it — the residual is
+ * registry-removal-while-alive only (spawnedBy PID reuse, manual rm).
+ * Exported for tests.
+ */
+export async function isThreadWorkerAliveOnMachine(
+  key: string,
+  rec: Pick<ThreadRecord, 'n' | 'session'>,
+  reads: TopicWorkerOsReads = {},
+): Promise<boolean> {
+  const resource = `topic-${key}-th${rec.n}`;
+  const needles: string[] = [];
+  if (rec.session?.session_id) needles.push(rec.session.session_id);
+  return isWorkerAliveOnMachineCore(resource, needles, reads);
+}
+
+/** Command-line needles identifying THIS dispatch's worker on the OS
+ *  process table (AI-241 prong 2). Session ids and contextId-based tee
+ *  filenames are uuid-class strings — a substring hit inside an unrelated
+ *  longer id is astronomically unlikely; the topic resource string itself
+ *  is deliberately NOT a needle (PA_WORKER_RESOURCE is env-only, never on
+ *  a command line). */
+export function dispatchCmdlineNeedles(record: PendingDispatch): string[] {
+  const needles = new Set<string>();
+  if (record.session?.session_id) needles.add(record.session.session_id);
+  if (record.teePath) {
+    // Split on BOTH separators — path.basename ignores '\' on POSIX, and the
+    // tee path is written with platform separators while cmdlines may carry
+    // either form. The basename alone is the needle (slash-agnostic).
+    const base = record.teePath.split(/[\\/]/).pop();
+    if (base) needles.add(base);
+  }
+  return [...needles];
 }
 
 /**
@@ -283,11 +409,33 @@ export async function findTeePathByRegistry(record: PendingDispatch): Promise<st
   return null;
 }
 
+/**
+ * The tee-captured stdout path for a THREAD worker (AI-228): the record
+ * carries no teePath field (unlike PendingDispatch), so the registry entry
+ * matching the thread's `topic-<key>-th<n>` resource is the only source.
+ * Exported for tests.
+ */
+export async function findThreadTeePathByRegistry(key: string, n: number): Promise<string | null> {
+  const resource = `topic-${key}-th${n}`;
+  try {
+    const entries = await listWorkerPids();
+    for (const entry of entries) {
+      if (entry.skill === resource && entry.teePath) return entry.teePath;
+    }
+  } catch {
+    // registry unreadable — no recovery source
+  }
+  return null;
+}
+
 export function makeDefaultDeps(token: string, secrets?: Record<string, string>): ReaperDeps {
   return {
     send: async (record, text, replyMarkup) => {
       const refId = makeRefId();
-      const fullText = `${text}\n\n_Ref: ${refId}_`;
+      // normalizeMarkdown wraps a markdown table in a ``` block before
+      // sanitizeMdV2 escapes it (see main.ts's textToSend for the same fix) —
+      // recovered worker output degrades to raw pipe text otherwise.
+      const fullText = `${normalizeMarkdown(text)}\n\n_Ref: ${refId}_`;
       const delivered = replyMarkup !== undefined
         ? (await sendMessageWithKeyboard(token, record.chatId, fullText, replyMarkup, record.messageId, record.threadId)) !== null
         : (await sendReplyText(token, record.chatId, fullText, record.messageId, record.threadId, process.env)).delivered;
@@ -317,7 +465,7 @@ export function makeDefaultDeps(token: string, secrets?: Record<string, string>)
     },
     sendDetailed: async (record, text, replyMarkup) => {
       const refId = makeRefId();
-      const fullText = `${text}\n\n_Ref: ${refId}_`;
+      const fullText = `${normalizeMarkdown(text)}\n\n_Ref: ${refId}_`;
       let delivered: boolean;
       let terminal = false;
       if (replyMarkup !== undefined) {
@@ -348,7 +496,7 @@ export function makeDefaultDeps(token: string, secrets?: Record<string, string>)
       return { delivered, terminal };
     },
     readTranscript: defaultReadTranscript,
-    isTopicWorkerAlive: isTopicWorkerAliveByRegistry,
+    isTopicWorkerAlive: isTopicWorkerAliveOnMachine,
     readTeePath: findTeePathByRegistry,
     readFile: readFile,
     now: () => Date.now(),
@@ -413,7 +561,7 @@ export function makeDefaultDeps(token: string, secrets?: Record<string, string>)
         });
         topicState.model_status = snapshot;
         if (topicState.pinned_status_message_id) {
-          const pinText = renderStatusCard({ snapshot, keepAwake: getKeepAwakeStatus() });
+          const pinText = renderStatusCard({ snapshot });
           await editMessageText(token, record.chatId, topicState.pinned_status_message_id, pinText).catch(() => false);
         } else {
           // No pinned message — skip
@@ -425,6 +573,7 @@ export function makeDefaultDeps(token: string, secrets?: Record<string, string>)
     },
     redispatchWithResume: (record) => redispatchWithResume(record, token, secrets ?? Object.fromEntries(Object.entries(process.env).filter(([k,v]) => v !== undefined)) as Record<string, string>),
     reviveVoiceNote: (record) => reviveVoiceNote(record, token, secrets ?? {}),
+    voiceInboxTerminalTaskIds: async (taskIds) => voiceInboxTerminalTaskIdsSync(taskIds),
   };
 }
 
@@ -461,7 +610,7 @@ async function reviveVoiceNote(record: PendingDispatch, token: string, secrets: 
 // Per-record evaluation (single step, no sleeping — the loop lives outside)
 // ---------------------------------------------------------------------------
 
-export type ReapOutcome = 'already-delivered' | 'recovered' | 'dead' | 'waiting' | 'requeued' | 'parked' | 'held';
+export type ReapOutcome = 'already-delivered' | 'recovered' | 'dead' | 'waiting' | 'requeued' | 'parked' | 'held' | 'terminal';
 
 function preview(text: string): string {
   const t = text.replace(/\s+/g, ' ').trim();
@@ -544,6 +693,25 @@ export async function evaluatePendingDispatch(
   deps: ReaperDeps,
   deadlineMs: number,
 ): Promise<ReapOutcome> {
+  // Step -1: a voice-inbox task the operator cancelled (or that already
+  // finished) must never be re-dispatched. The fact lives in the voice-inbox
+  // ledger, which the HTTP cancel writes synchronously — a bot-side mirror
+  // would only be written by the drain, and the crash window where the drain
+  // has NOT run is exactly the case this guard exists for (live incident
+  // 2026-09-08: two stale records for one cancelled task). Guard fires only
+  // when the record names at least one task id and EVERY named id is terminal,
+  // so a batched prompt mixing a cancelled and a live request still recovers.
+  const namedTaskIds = extractVoiceInboxTaskIds(record.userText);
+  if (namedTaskIds.length > 0 && deps.voiceInboxTerminalTaskIds) {
+    const terminal = await deps.voiceInboxTerminalTaskIds(namedTaskIds).catch(() => new Set<string>());
+    if (namedTaskIds.every((id) => terminal.has(id))) {
+      logger.info('reaper', 'dropping a pending dispatch for a terminal voice-inbox task',
+        { updateId: record.updateId, chatId: record.chatId, threadId: record.threadId, taskIds: namedTaskIds.join(',') });
+      await removePendingDispatch(pendingDispatchKey(record.chatId, record.threadId, record.updateId));
+      return 'terminal';
+    }
+  }
+
   // AI-208 WP-4 E3: a held record (drained by a /steer or /stop, transcript
   // held for the topic's next dispatch instead of dispatched) is NOT a dead
   // dispatch. It must never get a death notice and never be requeued as a
@@ -586,10 +754,10 @@ export async function evaluatePendingDispatch(
   const expired = deps.now() >= deadlineMs;
 
   // Step 1: Worker alive? (ALWAYS first, for ALL records)
-  // The 30-second heartbeat gap means a newly-dispatched worker's
-  // descendants list may be empty, so `isTopicWorkerAliveByRegistry`
-  // can false-negative. The deps implementation adds a direct
-  // process-tree scan fallback for that window.
+  // The default deps implementation is OS-truth (AI-241): registry pids
+  // resolved against the process snapshot plus a command-line scan for
+  // the live-but-unregistered case — registry membership alone never
+  // decides "dead".
   const workerAlive = await deps.isTopicWorkerAlive(record);
 
   if (workerAlive && !expired) {
@@ -912,5 +1080,433 @@ export async function reapOrphanedDispatches(
     // where records may never individually settle — clearing an
     // already-cleared topic (the common case) is a safe no-op.
     for (const t of markedTopics) clearTopicRecovering(t);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Orphaned THREAD records (AI-228) — the topic-threads store's recovery pass
+// ---------------------------------------------------------------------------
+//
+// When the bot crashes mid-dispatch of an orchestrator thread, the owning
+// ThreadRecord keeps `status: 'running'` with a frozen updatedAt — a zombie
+// only the lazy 30-minute stale sweep would eventually requeue. Thread
+// dispatches never write PendingDispatch records (the executor fires
+// runWithFailover directly on resource `topic-<key>-th<n>`), so this is a
+// SIBLING pass in the same module, keyed off the thread store itself: at
+// process start — before any claimThreadStarts can fire — every `running`
+// record is definitionally orphaned, because the executor pump that owns its
+// updatedAt died with the previous process. Startup state is unambiguous in
+// a way mid-run reads never are.
+//
+// Ordering is LOAD-BEARING: this pass must run AFTER the startup
+// cleanupOrphanedWorkers kill pass. A live orphan inside its 50-min
+// harvestUntil window keeps its registry entry (the kill spares it), while a
+// dead one's entry is already gone — so registry+OS truth is reliable
+// exactly because we run second. The topic's recovery gate is deliberately
+// NOT involved: a thread orphan writes its own session on its own resource,
+// so marking its topic 'recovering' would block unrelated dispatches for no
+// safety gain.
+
+/** Slack subtracted from a record's adoption-time `updatedAt` to anchor
+ *  transcript harvest: the dead executor's last pump beat precedes death by
+ *  <= the ~10 s pump cadence, so 60 s covers the pump gap without reaching
+ *  into the previous turn's answer. For a resumed run the session transcript
+ *  IS the current run's. */
+export const THREAD_HARVEST_LOOKBACK_MS = 60_000;
+/** Detached-watcher cadence for the give-up tail (D7) — slower than the
+ *  active-pass poll; it only needs to outlive the orphan. */
+export const THREAD_WATCHER_POLL_MS = 60_000;
+/** The honest 'done' note when the dead orphan's carried voice tasks are ALL
+ *  already terminal — its own task_complete.py beat the crash, and
+ *  re-running finished work is the worst outcome. No FYI rides it: the task
+ *  card already settled, so there is nothing new for the operator. Same
+ *  register as the executor's THREAD_VOICE_EMPTY_RESULT_NOTE. */
+export const THREAD_ORPHAN_CLOSED_TASK_NOTE =
+  'This run was interrupted by a bot restart; the task it carried was already closed. Ask again to redo it.';
+
+/** One running record adopted at pass 0 — the ownership gate rides runSeq. */
+export interface AdoptedThread {
+  key: string;
+  id: string;
+  /** runSeq captured at adoption; any advance means a new owner took it. */
+  runSeq: number;
+  /** Transcript harvest anchor (ISO): adoption-time updatedAt minus
+   *  THREAD_HARVEST_LOOKBACK_MS. Frozen at adoption — the reaper's own
+   *  touchThread pump must never slide it forward and lose a
+   *  completed-before-death result. */
+  afterIso: string;
+}
+
+export type ThreadReapOutcome = 'done' | 'requeued' | 'waiting' | 'dropped';
+
+/**
+ * Every side effect injectable (ReaperDeps precedent). Defaults hit the real
+ * stores, the OS process snapshot and Telegram.
+ */
+export interface ThreadReaperDeps {
+  listStoreKeys: () => Promise<string[]>;
+  /** Per-topic read WITH lazy stale demotion — records already >30 min stale
+   *  are requeued by the existing sweep for free; we adopt only what stays
+   *  `running`. */
+  listThreads: (key: string) => Promise<ThreadRecord[]>;
+  /** Fresh re-read each round (no demotion on read). */
+  getThread: (key: string, id: string) => Promise<ThreadRecord | undefined>;
+  /** The dead pump's replacement — REQUIRED for a live orphan, or demoteStale
+   *  fires underneath it. */
+  touchThread: (key: string, id: string) => Promise<void>;
+  /** The conditional write — every settle goes through it so a lost race is a
+   *  no-op, never a clobber. */
+  settleOrphanedThread: (key: string, id: string, expectedRunSeq: number, patch: Partial<ThreadRecord>) => Promise<boolean>;
+  /** OS-truth liveness for the thread's `topic-<key>-th<n>` resource. */
+  isThreadWorkerAlive: (key: string, rec: ThreadRecord) => Promise<boolean>;
+  /** The matching registry entry's teePath (agy), or null. */
+  readTeeForThread: (key: string, rec: ThreadRecord) => Promise<string | null>;
+  /** Claude-family session transcript for a resumed run (session + workdir),
+   *  or null. */
+  readTranscriptForThread: (key: string, rec: ThreadRecord) => Promise<{ content: string; mtimeMs: number } | null>;
+  /** File read for the tee source (mocked in tests). */
+  readFile?: (path: string, encoding: 'utf8') => Promise<string>;
+  /** The `✅ Thread <id> done:` FYI — same shape the executor sends. */
+  sendThreadFyi: (key: string, text: string, kind: RefKind) => Promise<unknown>;
+  /** Topic-event append (thread_completed), keyed by store key. */
+  appendThreadEvent: (key: string, ev: { kind: TopicEventKind; ref?: string | null; detail?: string }) => Promise<void>;
+  /** Which carried voice-inbox task ids are already terminal. Optional and
+   *  fail-OPEN — absent or throwing means "not all terminal" → demote, the
+   *  safe direction. */
+  voiceInboxTerminalTaskIds?: (taskIds: string[]) => Promise<Set<string>>;
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+}
+
+function defaultReadThreadTranscript(rec: ThreadRecord): Promise<{ content: string; mtimeMs: number } | null> {
+  const session = rec.session;
+  if (!session || !CLAUDE_FAMILY.has(session.worker)) return Promise.resolve(null);
+  const path = getPriorSessionPath(session.worker, session.session_id, rec.workdir);
+  if (!path) return Promise.resolve(null);
+  return (async () => {
+    try {
+      const [content, s] = await Promise.all([readFile(path, 'utf8'), stat(path)]);
+      return { content, mtimeMs: s.mtime.getTime() };
+    } catch {
+      return null;
+    }
+  })();
+}
+
+export function makeDefaultThreadDeps(token: string, _secrets?: Record<string, string>): ThreadReaperDeps {
+  return {
+    listStoreKeys,
+    listThreads,
+    getThread,
+    touchThread,
+    settleOrphanedThread,
+    isThreadWorkerAlive: (key, rec) => isThreadWorkerAliveOnMachine(key, rec),
+    readTeeForThread: (key, rec) => findThreadTeePathByRegistry(key, rec.n),
+    readTranscriptForThread: (_key, rec) => defaultReadThreadTranscript(rec),
+    readFile,
+    sendThreadFyi: async (key, text, kind) => {
+      // Same unparseable-key skip as cancelRunningThreads' event emission —
+      // some test store dirs use keys the Telegram path cannot address.
+      const parsed = /^(-?\d+)_(\d+)$/.exec(key);
+      if (!parsed) return null;
+      const chatId = Number(parsed[1]);
+      const threadId = Number(parsed[2]);
+      return sendMessageWithId(
+        token,
+        chatId,
+        appendRefIdAndLog(text, { kind, chatId, threadId }),
+        threadId || undefined,
+      );
+    },
+    appendThreadEvent: async (key, ev) => {
+      const parsed = /^(-?\d+)_(\d+)$/.exec(key);
+      if (!parsed) return;
+      await appendTopicEvent(Number(parsed[1]), Number(parsed[2]), ev);
+    },
+    voiceInboxTerminalTaskIds: async (taskIds) => voiceInboxTerminalTaskIdsSync(taskIds),
+    now: () => Date.now(),
+    sleep: (ms) => new Promise<void>((r) => setTimeout(r, ms)),
+  };
+}
+
+/**
+ * Harvested text → storable body, or null. Same gate trio the dispatch arm
+ * relies on (parseMetadata strip → formatWorkerReply non-empty → the AI-202
+ * premature-async guard gated on meta === null): a contentless
+ * "launched, waiting" stub must never become a lastResult.
+ */
+function usableThreadResult(raw: string, rec: ThreadRecord): string | null {
+  const { cleaned, meta } = parseMetadata(raw);
+  const body = cleaned.trim() || raw.trim();
+  const formatted = formatWorkerReply(body, rec.session?.worker ?? 'agy');
+  if (formatted === '' || (meta === null && isPrematureAsyncReply(body))) return null;
+  return body;
+}
+
+/**
+ * The orphan's harvest sources, mirroring the dispatch arm's step 2:
+ * (a) the matching registry entry's teePath → extractTeeResult (agy);
+ * (b) a claude-family session transcript → extractFinalAssistantText
+ *     anchored at adopted.afterIso and gated on TRANSCRIPT_QUIESCENT_MS mtime
+ *     quiescence (a still-moving transcript is never final).
+ *
+ * `pending` reports "a post-anchor reply exists but is not yet quiescent" —
+ * the dispatch arm's `!quiescent && !expired → waiting` case. A dead orphan
+ * with a pending reply WAITS a round for the mtime to settle rather than
+ * demoting under work that already finished; a premature-async stub is never
+ * pending (it cannot improve).
+ */
+async function harvestOrphanedThreadResult(
+  adopted: AdoptedThread,
+  rec: ThreadRecord,
+  deps: ThreadReaperDeps,
+): Promise<{ result: string | null; pending: boolean }> {
+  const teePath = await deps.readTeeForThread(adopted.key, rec).catch(() => null);
+  if (teePath) {
+    try {
+      const raw = await (deps.readFile ?? readFile)(teePath, 'utf8');
+      const extracted = extractTeeResult(raw);
+      const usable = extracted ? usableThreadResult(extracted, rec) : null;
+      if (usable) return { result: usable, pending: false };
+    } catch { /* tee unreadable — fall through to the transcript */ }
+  }
+  const transcript = await deps.readTranscriptForThread(adopted.key, rec).catch(() => null);
+  if (transcript) {
+    const final = extractFinalAssistantText(transcript.content, adopted.afterIso);
+    const quiescent = deps.now() - transcript.mtimeMs >= TRANSCRIPT_QUIESCENT_MS;
+    if (final && quiescent) {
+      const usable = usableThreadResult(final.text, rec);
+      if (usable) return { result: usable, pending: false };
+    } else if (final) {
+      return { result: null, pending: usableThreadResult(final.text, rec) !== null };
+    }
+  }
+  return { result: null, pending: false };
+}
+
+/**
+ * One per-record step of the thread-reaper pass — no sleeping (the loop lives
+ * in reapOrphanedThreads / the detached watcher). Outcomes:
+ *
+ *  - 'dropped'  — the record left our ownership: re-read shows terminal /
+ *    queued / a new runSeq (a claim, /stop, demoteStale or a settle won the
+ *    race). Never written.
+ *  - 'done'     — a harvestable result settled it (redactSecrets'd, uncapped;
+ *    `thread_completed` event + the standard ✅ FYI), OR the dead orphan's
+ *    carried voice tasks were all already terminal (honest note, NO FYI).
+ *  - 'requeued' — dead orphan, no result, work plausibly unfinished: demoted
+ *    to `queued` via the shared restartParkFields shape. The claim is NOT
+ *    ours — claimThreadStarts is the only queued→running transition; the
+ *    60 s reconcile picks it up after the park stamp and its own 🧵 FYI is
+ *    the visibility.
+ *  - 'waiting'  — the orphan is still alive: touched (the dead pump's
+ *    replacement) and kept `running` for the next round.
+ */
+export async function evaluateOrphanedThread(
+  adopted: AdoptedThread,
+  deps: ThreadReaperDeps,
+): Promise<ThreadReapOutcome> {
+  const rec = await deps.getThread(adopted.key, adopted.id).catch(() => undefined);
+  if (!rec || rec.status !== 'running' || rec.runSeq !== adopted.runSeq) return 'dropped';
+
+  // Harvest FIRST — it covers the dead orphan AND the live orphan that
+  // finished output but has not exited yet (settles 'done' early).
+  const harvest = await harvestOrphanedThreadResult(adopted, rec, deps);
+  if (harvest.result !== null) {
+    const wrote = await deps.settleOrphanedThread(adopted.key, adopted.id, adopted.runSeq, {
+      status: 'done',
+      lastResult: redactSecrets(harvest.result) as string, // uncapped — the 2026-09-13 rule
+      lastError: undefined,   // terminal hygiene: clear a stale restart-park/error
+      parkedUntil: undefined, // from a previous episode (recommended + harmless)
+      unavailableParks: 0,    // every outcome write resets the episode counter
+    }).catch(() => false);
+    if (!wrote) return 'dropped';
+    try {
+      await deps.appendThreadEvent(adopted.key, { kind: 'thread_completed', ref: adopted.id, detail: rec.title });
+    } catch (err) {
+      logger.warn('thread-reaper', `thread_completed event failed: ${(err as Error).message}`, { key: adopted.key, id: adopted.id });
+    }
+    // The executor's done-FYI shape, minus mirror/notice footers (a harvested
+    // reply's PA_META actions do not re-arm — the record is already settled;
+    // the operator can reply to continue the thread). No restart narration,
+    // per the AI-095 user-strings rule.
+    const normalized = normalizeMarkdown(redactSecrets(harvest.result) as string);
+    const capped = normalized.length > THREAD_RESPONSE_CAP_CHARS
+      ? normalized.slice(0, THREAD_RESPONSE_CAP_CHARS) + '…'
+      : normalized;
+    try {
+      await deps.sendThreadFyi(
+        adopted.key,
+        `✅ Thread ${adopted.id} done: ${rec.title}\n\n${capped}\n\n_(Reply to this message to continue the thread.)_`,
+        'thread-done',
+      );
+    } catch (err) {
+      logger.warn('thread-reaper', `thread-done FYI failed: ${(err as Error).message}`, { key: adopted.key, id: adopted.id });
+    }
+    return 'done';
+  }
+
+  const alive = await deps.isThreadWorkerAlive(adopted.key, rec).catch(() => false);
+  if (alive) {
+    // REQUIRED, not optional: replace the dead executor's activity pump so
+    // demoteStale cannot fire underneath a genuinely live orphan.
+    await deps.touchThread(adopted.key, adopted.id).catch(() => {});
+    return 'waiting';
+  }
+
+  if (harvest.pending) {
+    // Dead worker, but a usable post-anchor reply sits inside the quiescence
+    // window — wait a round for the mtime to settle instead of demoting under
+    // finished work (the dispatch arm's `!quiescent && !expired` case).
+    await deps.touchThread(adopted.key, adopted.id).catch(() => {});
+    return 'waiting';
+  }
+
+  // Dead + no result + every carried voice task already terminal → an honest
+  // 'done'. The ledger read fails OPEN (unreadable ⇒ empty ⇒ treated open ⇒
+  // demote) — re-running finished work is the worst outcome, but a lost
+  // ledger must never bury still-open work.
+  const carried = rec.voiceTaskIds ?? [];
+  if (carried.length > 0 && deps.voiceInboxTerminalTaskIds) {
+    const terminal = await deps.voiceInboxTerminalTaskIds(carried).catch(() => new Set<string>());
+    if (carried.every((vt) => terminal.has(vt))) {
+      const wrote = await deps.settleOrphanedThread(adopted.key, adopted.id, adopted.runSeq, {
+        status: 'done',
+        lastResult: THREAD_ORPHAN_CLOSED_TASK_NOTE,
+        lastError: undefined,
+        parkedUntil: undefined,
+        unavailableParks: 0,
+      }).catch(() => false);
+      if (!wrote) return 'dropped';
+      try {
+        await deps.appendThreadEvent(adopted.key, { kind: 'thread_completed', ref: adopted.id, detail: rec.title });
+      } catch (err) {
+        logger.warn('thread-reaper', `thread_completed event failed: ${(err as Error).message}`, { key: adopted.key, id: adopted.id });
+      }
+      return 'done';
+    }
+  }
+
+  // Dead + no result + open/absent voice tasks → the restart-park demote,
+  // field-identical to demoteStale's (shared shaper — they cannot drift).
+  // `pendingInput` survives: a queued steer drains on the re-claimed run.
+  const wrote = await deps.settleOrphanedThread(
+    adopted.key,
+    adopted.id,
+    adopted.runSeq,
+    restartParkFields(deps.now(), 'bot restarted mid-run'),
+  ).catch(() => false);
+  if (wrote) {
+    logger.info('thread-reaper', 'orphaned thread requeued (restart-parked)', { key: adopted.key, id: adopted.id });
+  }
+  return wrote ? 'requeued' : 'dropped';
+}
+
+/**
+ * D7 give-up tail: a shared unref'd interval keeps pumping and settling
+ * still-live orphans until each exits or the process ends — pa's
+ * orphan-worker-reap kills the worker at `harvestUntil` anyway, which bounds
+ * the watch. The interval clears itself once every record settles and is
+ * unref'd so it can never be an exit-blocking handle (the WP-H lesson).
+ */
+function armOrphanedThreadWatcher(
+  remaining: AdoptedThread[],
+  deps: ThreadReaperDeps,
+  pollMs: number,
+): void {
+  let inFlight = false;
+  const timer = setInterval(() => {
+    if (inFlight) return; // a slow round never double-fires
+    inFlight = true;
+    void (async () => {
+      try {
+        const still: AdoptedThread[] = [];
+        for (const a of remaining) {
+          try {
+            const outcome = await evaluateOrphanedThread(a, deps);
+            if (outcome === 'waiting') still.push(a);
+          } catch (err) {
+            logger.warn('thread-reaper', 'watcher evaluation failed', { key: a.key, id: a.id, error: String(err) });
+            still.push(a);
+          }
+        }
+        remaining.length = 0;
+        remaining.push(...still);
+      } finally {
+        inFlight = false;
+        if (remaining.length === 0) clearInterval(timer);
+      }
+    })();
+  }, pollMs);
+  timer.unref();
+}
+
+/**
+ * Settle (or watch) every thread record left `running` by a crashed prior
+ * instance. Launched from main.ts's startup chain AFTER the awaited
+ * cleanupOrphanedWorkers kill pass (its ordering is load-bearing — see the
+ * section header), beside reapOrphanedDispatches; runs concurrently with it
+ * and never touches the recovery gate. Resolves when every adopted record
+ * settles, or hands the stragglers to the detached watcher at give-up.
+ */
+export async function reapOrphanedThreads(
+  opts: {
+    token?: string;
+    secrets?: Record<string, string>;
+    deps?: ThreadReaperDeps;
+    maxWaitMs?: number;
+    pollMs?: number;
+    /** Detached-watcher cadence — tests shrink it. */
+    watcherPollMs?: number;
+  } = {},
+): Promise<void> {
+  const deps = opts.deps ?? makeDefaultThreadDeps(opts.token ?? '', opts.secrets ?? {});
+  const maxWaitMs = opts.maxWaitMs ?? REAP_MAX_WAIT_MS;
+  const pollMs = opts.pollMs ?? REAP_POLL_MS;
+  const watcherPollMs = opts.watcherPollMs ?? THREAD_WATCHER_POLL_MS;
+
+  // Pass 0 — enumerate every topic store and adopt each record STILL
+  // 'running': listThreads' own demoteStale already requeued anything past
+  // the 30-min silence window for free.
+  const adopted: AdoptedThread[] = [];
+  for (const key of await deps.listStoreKeys().catch(() => [] as string[])) {
+    const records = await deps.listThreads(key).catch(() => [] as ThreadRecord[]);
+    for (const rec of records) {
+      if (rec.status !== 'running') continue;
+      const updatedMs = Date.parse(rec.updatedAt);
+      adopted.push({
+        key,
+        id: rec.id,
+        runSeq: rec.runSeq,
+        afterIso: new Date((Number.isFinite(updatedMs) ? updatedMs : deps.now()) - THREAD_HARVEST_LOOKBACK_MS).toISOString(),
+      });
+    }
+  }
+  if (adopted.length === 0) return;
+  logger.info('thread-reaper', `adopted ${adopted.length} running thread record(s) orphaned by a prior instance`, {});
+
+  // Same give-up shape as the dispatch pass: the poll window plus a grace of
+  // ten more polls for stragglers, then the detached watcher takes over.
+  const giveUpAt = deps.now() + maxWaitMs + 10 * pollMs;
+  let remaining = adopted;
+  while (remaining.length > 0) {
+    const waiting: AdoptedThread[] = [];
+    for (const a of remaining) {
+      try {
+        const outcome = await evaluateOrphanedThread(a, deps);
+        if (outcome === 'waiting') waiting.push(a);
+      } catch (err) {
+        logger.warn('thread-reaper', 'evaluation failed', { key: a.key, id: a.id, error: String(err) });
+        waiting.push(a);
+      }
+    }
+    remaining = waiting;
+    if (remaining.length === 0) break;
+    if (deps.now() >= giveUpAt) {
+      logger.warn('thread-reaper', `handing ${remaining.length} still-running orphaned thread(s) to the detached watcher`, {});
+      armOrphanedThreadWatcher(remaining, deps, watcherPollMs);
+      break;
+    }
+    await deps.sleep(pollMs);
   }
 }

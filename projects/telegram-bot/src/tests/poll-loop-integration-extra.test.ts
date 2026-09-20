@@ -1,7 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, readFile, writeFile } from 'fs/promises';
-import { appendFileSync, readFileSync, existsSync, unlinkSync } from 'node:fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { runPollLoop, _setExitForTest } from '../main.js';
@@ -195,80 +194,6 @@ topic_defaults:
     assert.equal(saved.turns[0].role, 'assistant');
     assert.equal(saved.preferred_worker, undefined, 'preferred_worker should be cleared');
     assert.equal(saved.model_status?.reason_code, 'reset');
-  });
-
-  it('/keepawake preserves the Reason line in edited pin', async () => {
-    // This test checks if /keepawake edits the existing pin and keeps the Reason line.
-    const configPath = join(tempDir, 'config.yaml');
-    await writeFile(configPath, 'workers: [{name: "claude", command: "node", args: ["-e", ""], check: "node -e \\"process.exit(0)\\""}]', 'utf8');
-
-    const topicStateFile = join(tempDir, 'telegram-bot-topic-123_0.json');
-    const topicState = {
-      chat_id: 123,
-      thread_id: 0,
-      turns: [],
-      model_status: {
-        current_worker: 'claude',
-        default_worker: 'claude',
-        reason_code: 'user_override',
-        reason_text: 'Temporary user override until IST midnight.',
-        changed_at: new Date().toISOString()
-      },
-      pinned_status_message_id: 100
-    };
-    await writeFile(topicStateFile, JSON.stringify(topicState), 'utf8');
-
-    const controller = new AbortController();
-    const state = makeState(123, -1);
-    let getUpdatesCount = 0;
-    const fetchLog: string[] = [];
-    const debugFile = join(tempDir, 'debug-fetch.log');
-    if (existsSync(debugFile)) unlinkSync(debugFile);
-
-    (globalThis as Record<string, unknown>).fetch = async (url: string, opts?: any) => {
-      const entry = url + (opts?.body ? ' ' + opts.body : '');
-      fetchLog.push(entry);
-      appendFileSync(debugFile, entry + '\n', 'utf8');
-      if (url.includes('getUpdates')) {
-        getUpdatesCount++;
-        if (getUpdatesCount === 1) {
-          return {
-            ok: true, status: 200,
-            text: async () => JSON.stringify({ ok: true, result: [{
-              update_id: 1,
-              message: { message_id: 10, chat: { id: 123, type: 'private' }, date: Math.floor(Date.now() / 1000), text: '/keepawake' },
-            }] }),
-            json: async () => ({ ok: true, result: [{
-              update_id: 1,
-              message: { message_id: 10, chat: { id: 123, type: 'private' }, date: Math.floor(Date.now() / 1000), text: '/keepawake' },
-            }] }),
-          };
-        }
-        controller.abort();
-        return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: [] }), json: async () => ({ ok: true, result: [] }) };
-      }
-      if (url.includes('sendMessage')) {
-        return {
-          ok: true, status: 200,
-          text: async () => JSON.stringify({ ok: true, result: { message_id: 200 } }),
-          json: async () => ({ ok: true, result: { message_id: 200 } }),
-        };
-      }
-      return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: true }), json: async () => ({ ok: true, result: true }) };
-    };
-
-    // Need to simulate keepawake.ts toggling.
-    const keepAwakeFile = join(tempDir, 'telegram-keepawake.json');
-    // Initialize as off
-    await writeFile(keepAwakeFile, JSON.stringify({ active: false }), 'utf8');
-
-    await runPollLoop('token', [123], state, { TELEGRAM_CHAT_ID: '123' }, controller.signal, fastSleep);
-
-    const editCalls = fetchLog.filter(u => u.includes('editMessageText'));
-    const debugLog = readFileSync(debugFile, 'utf8');
-    assert.ok(editCalls.length >= 1, 'should edit the existing pin. Fetch Log: ' + debugLog);
-    assert.ok(editCalls[0].includes('Temporary user override'), 'should preserve Reason line');
-    assert.ok(editCalls[0].includes('awake: on'), 'should show Keep-awake: on');
   });
 
   it('recovery-after-failover posts a recovery card', async () => {

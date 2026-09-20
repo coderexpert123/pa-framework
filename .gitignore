@@ -99,6 +99,9 @@ pa/data/profile-history-archive.jsonl
 # trigger file (referenced only in the global ~/.claude/CLAUDE.md protocol) in
 # subdirectories they work in — recurred 3x during 2026-07 agent sessions.
 **/.claude-needs-brain
+# Playwright MCP page snapshots (2026-09-12 browser-mcp wiring wave) —
+# throwaway captures of MCP browser sessions, never source.
+/.playwright-mcp/
 /all_files.txt
 /out*.txt
 *.bak
@@ -271,3 +274,7 @@ projects/telegram-bot/bot-instructions.md
 # program-SPEC.md §3.5) names the bot's Telegram username — deployment-
 # specific, never committed. config.example.js stays tracked as the template.
 projects/google-oauth-redirect/config.js
+
+# BACKLOG.md pending fragments — per-thread queue state, merged+deleted by the
+# backlog-fragments-drain maintenance job (plans/2026-09-12-brain-file-lock-contention-SPEC.md)
+/backlog/fragments/

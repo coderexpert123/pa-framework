@@ -1,7 +1,6 @@
 import { readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
-import { getKeepAwakeStatus } from './keepawake.js';
 import { sendMessageWithId, editMessageText, pinChatMessage, createForumTopic } from './telegram.js';
 import { loadConfig } from '../../../pa/dist/src/config.js';
 import { listSkills } from '../../../pa/dist/src/skills.js';
@@ -15,7 +14,7 @@ import { loadTopicNames, setTopicDescription } from './topic-names.js';
 import { appendRefIdAndLog } from './ref-id.js';
 
 const DASHBOARD_TOPIC_NAME = 'system-dashboard';
-const DASHBOARD_DESCRIPTION = 'Live system status — keep-awake state, agent failover order, per-CLI settings, and scheduled skill crons. Auto-updated by the bot.';
+const DASHBOARD_DESCRIPTION = 'Live system status — agent failover order, per-CLI settings, and scheduled skill crons. Auto-updated by the bot.';
 
 /**
  * THE CAPABILITY MATRIX IS GLOBAL, NOT PER-TOPIC.
@@ -67,9 +66,10 @@ const MAX_OBSERVED_SHOWN = 3;
 
 /**
  * The observed-values scan is bounded harder here than the reader's own
- * defaults (300 files / 90 days). The dashboard only refreshes on bot startup
- * and on a keep-awake toggle, so cost is not the driver — recency is: a pinned
- * "recently used" hint listing a model from three months ago is misinformation.
+ * defaults (300 files / 90 days). The dashboard refreshes on bot startup and
+ * on the 30-minute maintenance cadence, so cost is not the driver — recency
+ * is: a pinned "recently used" hint listing a model from three months ago is
+ * misinformation.
  */
 const OBSERVED_OPTS = { maxFiles: 150, maxAgeDays: 60 } as const;
 
@@ -245,7 +245,6 @@ async function saveDashboardState(state: DashboardState): Promise<void> {
 }
 
 export async function getDashboardContent(): Promise<string> {
-  const ka = getKeepAwakeStatus();
   const config = await loadConfig();
   const skills = await listSkills();
 
@@ -256,20 +255,11 @@ export async function getDashboardContent(): Promise<string> {
   head.push(`_${DASHBOARD_DESCRIPTION}_`);
   head.push('');
 
-  // 1. Keep-awake status
-  let kaStatus = 'off';
-  if (ka.active) {
-    const since = ka.since ? formatIST(new Date(ka.since)).slice(11, 16) : '';
-    kaStatus = `on${since ? ` since ${since} IST` : ''}`;
-  }
-  head.push(`⏰ **Keep-awake**: ${kaStatus}`);
-  head.push('');
-
-  // 2. Agent priorities + per-worker capability matrix
+  // 1. Agent priorities + per-worker capability matrix
   head.push('⚙️ **Agent Failover Order & Settings**');
   head.push(`_${CAPABILITY_NOTE}_`);
 
-  // 3. Scheduled Skills
+  // 2. Scheduled Skills
   const scheduled = skills.filter(s => s.frontmatter.cron);
   const skillSection = (max?: number): string[] => {
     const lines = ['', '📊 **Skill Schedule**'];

@@ -36,6 +36,16 @@ const AGY_ERROR_RESULT = [
   '{"event":"result","result":{"conversation_id":"test-id","status":"ERROR","response":"API quota exceeded"}}',
 ];
 
+// Real production shape (2026-09-10 incident fix, verified against the live
+// tee corpus): a terminal quota-exhaustion result event carries status:"ERROR",
+// an EMPTY response (agy never produced usable text before giving up), and
+// the actual message on `.error` — a field the pre-fix code never read at
+// all (it only ever looked at `.response`).
+const AGY_QUOTA_ERROR_RESULT = [
+  '{"event":"init","conversation_id":"quota-test","init":{"model":"gemini-3.8-flash-high"}}',
+  '{"event":"result","result":{"conversation_id":"quota-test","status":"ERROR","response":"","error":"Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 12h13m34s.","duration_seconds":7.19,"num_turns":1,"usage":{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":0}}}',
+];
+
 const CLAUDE_EVENT_STREAM = [
   '{"type":"assistant","message":{"content":[{"type":"text","text":"hello from claude"}]}}',
 ];
@@ -142,6 +152,24 @@ describe('worker-exec agy stream-json parsing', () => {
 
     assert.equal(result.exitCode, 0);
     assert.ok(result.error && result.error.includes('API quota exceeded'), `Expected error to contain 'API quota exceeded', got: ${result.error}`);
+  });
+
+  it('agy stream-json: result event .error field (not empty .response) carries the quota-exhaustion text into CommandResult.error', async () => {
+    // Before the 2026-09-10 fix, only `.response` was read on a non-SUCCESS
+    // result event — on a real quota-exhaustion result that field is empty,
+    // so the phrase silently never reached the rate-limit classifier and
+    // ~/.pa/rate-limit-state.json got no agy entry despite the account being
+    // quota-exhausted for hours.
+    const stub = await writeNdjsonStub('agy-quota-error', AGY_QUOTA_ERROR_RESULT);
+    const worker = makeWorker({ command: stub.command, args: stub.args });
+
+    const result = await executeWorker(worker, 'test prompt', { timeout: 10 });
+
+    assert.equal(result.exitCode, 0);
+    assert.ok(
+      result.error && result.error.includes('Individual quota reached'),
+      `Expected error to contain the quota phrase from .error, got: ${result.error}`,
+    );
   });
 
   it('agy stream-json: trailing buffer flush captures result event', async () => {

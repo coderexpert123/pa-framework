@@ -95,3 +95,15 @@ Active pointer: the scoped brain links here per incident class. RESOLVED inciden
   the theory, previously recorded here, that a push-gate failure of that suite was a
   resource-contention flake explained by this contract.
 
+- **Fresh prompt must interpolate `userMessage` (fixed 2026-09-09, present since
+  introduction, AI-203 WP-2):** `buildOrchestratorPrompt` never wrote its `userMessage`
+  arg into the template — unlike `buildOrchestratorResumedPrompt` (which has a
+  `## Current Message` section), so every fresh/unresumable dispatch reached the worker
+  with NO user content, direct or failed-over alike (`runDispatchCascade` builds the
+  fresh prompt ONCE and reuses it for every failover attempt). Surfaced as the
+  2026-09-09 voice-inbox route-text-loss incident (those tasks always land on a topic's
+  first-ever turn): the worker replied it saw "just system context." A test comment had
+  already found and *worked around* the exact gap 3 days earlier
+  (`batch-uptake-dispatch.test.ts` T9) instead of fixing it.
+
+- **Mutation-pass residue disabled the voice-closure sweep tree-wide (2026-09-13, vi-d935e5e13537):** a verifier mutation pass left a `return; // MUTATION (c)` residue at the top of `sweepSettledVoiceTaskClosures`, disabling the sweep everywhere. Two lessons: mutation passes MUST revert their mutations before reporting, and a red-first proof run against a mutated tree proves nothing — the red comes from the mutation, not the code under test.

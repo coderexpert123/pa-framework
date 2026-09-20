@@ -21,10 +21,10 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sync_cli_parity as scp
 
-# Order is the report order. Brain-file targets first, then the two skill
+# Order is the report order. Brain-file targets first, then the skill
 # catalogs — a mirror target is dispatched by membership in
 # sync_cli_parity.MIRROR_TARGETS, never by hard-coded name.
-TARGETS = ["gemini", "agy", "skills", "codex", "codex-skills"]
+TARGETS = ["gemini", "agy", "skills", "codex", "codex-skills", "devin", "devin-skills"]
 
 
 def check_target(name, out=sys.stdout):
@@ -36,8 +36,16 @@ def check_target(name, out=sys.stdout):
     buf = io.StringIO()
     try:
         if name in scp.MIRROR_TARGETS:
+            # Same per-target exclusions main() applies — a registered mirror
+            # target must never report drift for a skill it deliberately
+            # does not mirror (e.g. `loop` on devin-skills).
+            allowlist = [
+                n for n in scp.SKILL_MIRROR_ALLOWLIST
+                if n not in scp.TARGET_SKILL_EXCLUDES.get(name, set())
+            ]
             code = scp.run_skill_mirror(
-                apply=False, shared_skills_dir=scp.MIRROR_TARGETS[name], out=buf)
+                apply=False, shared_skills_dir=scp.MIRROR_TARGETS[name],
+                allowlist=allowlist, out=buf)
         else:
             code = scp.run(name, apply=False, out=buf)
         return (name, code, buf.getvalue(), None)

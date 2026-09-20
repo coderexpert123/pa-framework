@@ -23,13 +23,20 @@
  * - T-CANCEL /stop cancels running AND queued threads (truthful count).
  * - T6     /stop cancels running threads (count in the reply) and the
  *          executor's ownership gate discards the result — no done FYI.
+ * - T-KILL-PAIR AI-216: bare /stop pairs the topic-wide record flip with
+ *          per-thread exact-resource kills (signalThreadInterrupt + stopThreadWorker)
+ *          — BOTH halves in a single /stop scenario (T6/T-CANCEL pin the flip
+ *          only; T-INT pins signalThreadInterrupt for steer, not /stop).
  * - T7     /orchestrator on: mode armed, role-boundary session clear.
- * - T8     non-orchestrator regression: the same envelope behaves exactly as
- *          today and touches no thread store.
+ * - T8     explicit opt-out regression (AI-215): a topic with
+ *          orchestrator_enabled = false takes the human lane — the same
+ *          envelope behaves as today and touches no thread store.
+ * - T-DEF1 default-on proof (AI-215): a keyless topic dispatches via the
+ *          orchestrator lane — spawn footer + thread store record.
  */
 import { describe, it, before, after, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, readFile } from 'fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile } from 'fs/promises';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -64,8 +71,9 @@ after(async () => {
 const { runPollLoop, _setExitForTest } = await import('../main.js');
 _setExitForTest(() => {});
 const { createThread, getThread, listThreads, updateThread } = await import('../topic-threads.js');
-const { _waitForThreadExecutionsForTest, _resetThreadQueueReconcileForTest } = await import('../thread-executor.js');
+const { _waitForThreadExecutionsForTest, _resetThreadQueueReconcileForTest, _setThreadInterruptHookForTest } = await import('../thread-executor.js');
 const { _clearStoppedForTest } = await import('../worker-stop.js');
+const { listWorkerPids } = await import('../../../../pa/dist/src/worker-pids.js');
 const { _resetPendingDispatchesForTest } = await import('../pending-dispatches.js');
 const { _resetDeliveredCacheForTest } = await import('../delivered-store.js');
 const { _resetRecoveryGateForTest } = await import('../recovery-gate.js');
@@ -297,10 +305,25 @@ describe('orchestrator dispatch wiring (AI-203 WP-5, end-to-end)', () => {
     assert.ok(reply, `the orchestrator ack must be delivered; got: ${JSON.stringify(L())}`);
     assert.ok(reply.includes('_(Thread t-1 spawned: Sweep logs'), `footer missing from: ${reply}`);
 
-    // The store record exists and is running (the executor owns it now).
-    const rec = await getThread(topicKey, 't-1');
-    assert.ok(rec, 'thread record t-1 must exist in the store');
-    assert.equal(rec!.status, 'running');
+    // The store record exists and the executor owns it. `running` is a
+    // TRANSIENT the observer can miss entirely — on a fast host the whole
+    // thread lifecycle (pickup FYI, the worker's 1.5 s hold, the completion
+    // write) can close between runOne's drain and this read, and the record
+    // already reads 'done' (AI-217; same class T2's wake poll documents —
+    // bot-test-rules: accept the SETTLED durable end-state). The durable
+    // evidence is executor-owned state: runSeq is bumped only by the
+    // executor's dispatch loop (bumpRunSeq at dispatch start), and a done
+    // record's lastResult only by its completion write — either proves the
+    // seam fired. The pickup/done FYI polls below pin the lifecycle itself.
+    const owned = await pollFor(async () => {
+      const rec = await getThread(topicKey, 't-1');
+      if (!rec || rec.runSeq < 1) return false;
+      return rec.status === 'running' || rec.status === 'done';
+    });
+    assert.ok(
+      owned,
+      `thread record t-1 must exist and be executor-owned (runSeq bumped; running or settled done); last=${JSON.stringify(await getThread(topicKey, 't-1'))}`
+    );
 
     // The thread-dispatch seam actually fired: pickup FYI, then the done FYI.
     const pickedUp = await pollFor(() => L().some((t) => t.includes('🧵 Thread t-1 started: Sweep logs')));
@@ -401,11 +424,30 @@ describe('orchestrator dispatch wiring (AI-203 WP-5, end-to-end)', () => {
     });
     await writeWorker(currentTestDir, workerScript(INTERRUPT_ENVELOPE));
 
+    // The interrupt signal must name the runSeq of the run being killed —
+    // the record's PRE-bump value (the dying run captured exactly that at its
+    // dispatch start; isCancelled is `=== capturedRunSeq`, T-SIG1). A signal
+    // carrying the post-bump value can never match and the killed cascade
+    // respawns on the next worker. Capture at call time via the hook: the
+    // restart's own capture deletes the entry before any post-hoc peek.
+    const preSeq = (await getThread(topicKey, 't-1'))!.runSeq;
+    let signalled: { resource: string; runSeq: number } | undefined;
+    _setThreadInterruptHookForTest((resource, runSeq) => { signalled = { resource, runSeq }; });
+
     const sent = await runOne([{ update_id: 1, text: 'no — redo it for the failures log instead' }], threadId);
+    _setThreadInterruptHookForTest(undefined);
     const L = () => sent.map(plain);
 
     const reply = L().find((t) => t.includes('_(Interrupted thread t-1 — restarting with your message.)_'));
     assert.ok(reply, `interrupt footer missing from: ${JSON.stringify(L())}`);
+
+    // The interrupt signalled the record's PRE-bump runSeq — the dying run's
+    // capturedRunSeq — never the post-bump value a fresh caller would see.
+    assert.deepEqual(
+      signalled,
+      { resource: `topic-${topicKey}-th1`, runSeq: preSeq },
+      'interrupt must signal the dying run\'s runSeq (pre-bump); a post-bump signal never matches capturedRunSeq and the cascade respawns the killed prompt'
+    );
 
     // The restart consumed the fold as its first turn and the kill-drop
     // cleared the dead session. killed=0 is expected here (no registered
@@ -458,6 +500,9 @@ describe('orchestrator dispatch wiring (AI-203 WP-5, end-to-end)', () => {
     });
     const L = () => sent.map(plain);
 
+    // The stop block is tracked in runPollLoop's `inFlight` and the test-mode
+    // shutdown drain awaits every member, so its reply has landed by the time
+    // runOne returns — read `sent` once.
     const stopReply = L().find((t) => t.includes('cancelled 1 thread(s)'));
     assert.ok(stopReply, `the stop reply must state the cancelled-thread count; got: ${JSON.stringify(L())}`);
     assert.ok(stopReply.includes('their results will be discarded'));
@@ -494,6 +539,102 @@ describe('orchestrator dispatch wiring (AI-203 WP-5, end-to-end)', () => {
     assert.ok(!L().some((t) => t.includes('✅ Thread t-2 done')), 'a cancelled thread must never post its result');
   });
 
+  it('T-KILL-PAIR: bare /stop pairs the topic-wide record flip with per-thread exact-resource kills (signalThreadInterrupt + stopThreadWorker)', async () => {
+    // AI-216: a bare /stop is the ONE call site where the topic-wide cancel
+    // (cancelRunningThreads) is paired with per-thread exact-resource kills
+    // (signalThreadInterrupt + stopThreadWorker). T6/T-CANCEL pin the record
+    // flip only; T-INT pins signalThreadInterrupt but for steer-interrupt, not
+    // /stop. This test verifies BOTH halves in a single /stop scenario.
+    await seedTopicState(threadId, { orchestrator_enabled: true });
+    const first = await createThread(topicKey, { title: 'one', goal: 'g', workdir: currentTestDir });
+    const second = await createThread(topicKey, { title: 'two', goal: 'g', workdir: currentTestDir });
+    assert.ok(first.ok && second.ok);
+    // t-1 is running with a non-zero runSeq (the executor's ownership stamp);
+    // t-2 is parked as queued (never started, runSeq still 0). A non-zero
+    // runSeq on t-1 proves the signal carries the record's real value, not a
+    // default 0 that would pass even if the code read the wrong field.
+    await updateThread(topicKey, 't-1', {
+      runSeq: 3,
+      session: { session_id: 's-run', worker: 'fake', started_at: new Date().toISOString() },
+    });
+    await updateThread(topicKey, 't-2', { status: 'queued' });
+
+    // Pre-seed the worker-pids registry with entries for each thread's
+    // exact-resource key, using a dead pid. stopThreadWorker has no test hook
+    // (unlike signalThreadInterrupt's _setThreadInterruptHookForTest), so the
+    // registry is the observation seam: stopWorkerByResource calls removeEntry
+    // for every exact-skill match (alive or dead), so the file's disappearance
+    // proves stopThreadWorker was called for that thread. spawnedBy = the live
+    // test process so the orphan reaper skips these entries.
+    const pidsDir = join(process.env.PA_HOME!, 'worker-pids');
+    await mkdir(pidsDir, { recursive: true });
+    const deadPidBase = 999_000;
+    const seededSkills = [`topic-${topicKey}-th1`, `topic-${topicKey}-th2`];
+    for (let i = 0; i < seededSkills.length; i++) {
+      const pid = deadPidBase + i + 1;
+      await writeFile(join(pidsDir, `${pid}.json`), JSON.stringify({
+        pid,
+        skill: seededSkills[i],
+        worker: 'fake',
+        spawnedBy: process.pid,
+        startedAt: new Date().toISOString(),
+      }), 'utf8');
+    }
+    const seeded = (await listWorkerPids()).filter((e) => seededSkills.includes(e.skill));
+    assert.equal(seeded.length, 2, 'both thread registry entries must exist before /stop');
+
+    // Wire the interrupt hook to capture signalThreadInterrupt calls (T-INT
+    // pattern, line ~430). The hook fires synchronously inside the call, so
+    // the captured array reflects the exact call order and arguments.
+    const signals: { resource: string; runSeq: number }[] = [];
+    _setThreadInterruptHookForTest((resource, runSeq) => { signals.push({ resource, runSeq }); });
+
+    // Holds long enough that a drain-fired t-2 cannot settle before /stop
+    // lands — parked or mid-run, both states must be caught by the kill pair.
+    await writeWorker(currentTestDir, workerScript('busy', { holdMs: 2500 }));
+
+    const sent = await runOne([{ update_id: 1, text: '/stop' }], threadId);
+    _setThreadInterruptHookForTest(undefined);
+    const L = () => sent.map(plain);
+
+    // --- Record flip (T6/T-CANCEL half) ---
+    const stopReply = L().find((t) => t.includes('cancelled 2 thread(s)'));
+    assert.ok(stopReply, `the stop reply must count both threads; got: ${JSON.stringify(L())}`);
+    assert.ok(stopReply.includes('their results will be discarded'));
+    await _waitForThreadExecutionsForTest();
+    const one = await getThread(topicKey, 't-1');
+    const two = await getThread(topicKey, 't-2');
+    assert.equal(one?.status, 'cancelled', 't-1 (running) must be flipped to cancelled');
+    assert.equal(two?.status, 'cancelled', 't-2 (queued) must be flipped to cancelled');
+
+    // --- Kill signals (signalThreadInterrupt half) ---
+    // signalThreadInterrupt must fire for EACH running/queued thread with the
+    // exact resource key (topic-<key>-th<n>) and the matching runSeq. The
+    // signal re-reads the thread post-flip (main.ts:2477-2478); cancelRunningThreads
+    // does NOT bump runSeq, so the signal's runSeq equals the final cancelled
+    // record's runSeq — assert against that (robust to any reconcile-drain
+    // bump that may have landed between seed and /stop).
+    assert.equal(signals.length, 2, `signalThreadInterrupt must fire for each thread; got: ${JSON.stringify(signals)}`);
+    const sig1 = signals.find((s) => s.resource === `topic-${topicKey}-th1`);
+    const sig2 = signals.find((s) => s.resource === `topic-${topicKey}-th2`);
+    assert.ok(sig1, `t-1 must be signalled on its exact resource key; got: ${JSON.stringify(signals)}`);
+    assert.ok(sig2, `t-2 must be signalled on its exact resource key; got: ${JSON.stringify(signals)}`);
+    assert.equal(sig1!.runSeq, one!.runSeq, `t-1 signal runSeq must match the cancelled record's runSeq (pre-bump, the dying run's capturedRunSeq)`);
+    assert.equal(sig2!.runSeq, two!.runSeq, `t-2 signal runSeq must match the cancelled record's runSeq`);
+
+    // --- Kill calls (stopThreadWorker half) ---
+    // stopThreadWorker must be called for EACH thread — observed via the
+    // registry entries being removed (stopWorkerByResource calls removeEntry
+    // for every exact-skill match, alive or dead). No surviving entry with a
+    // thread skill key proves both kills fired.
+    const remaining = (await listWorkerPids()).filter((e) => seededSkills.includes(e.skill));
+    assert.equal(remaining.length, 0, `stopThreadWorker must remove each thread's registry entry; remaining: ${JSON.stringify(remaining)}`);
+
+    // No completion FYI for either thread (the runSeq gate discards results).
+    assert.ok(!L().some((t) => t.includes('✅ Thread t-1 done')), 'a cancelled thread must never post its result');
+    assert.ok(!L().some((t) => t.includes('✅ Thread t-2 done')), 'a cancelled thread must never post its result');
+  });
+
   it('T7: /orchestrator on arms the mode and clears the session (role boundary)', async () => {
     await seedTopicState(threadId, {
       session: { session_id: 's-orch', worker: 'fake', started_at: new Date().toISOString() },
@@ -509,8 +650,11 @@ describe('orchestrator dispatch wiring (AI-203 WP-5, end-to-end)', () => {
     assert.equal(state.session, undefined, 'the role switch must clear the topic session');
   });
 
-  it('T8: non-orchestrator regression — the same envelope behaves exactly as today', async () => {
-    await seedTopicState(threadId);
+  it('T8: explicit opt-out regression — a topic with orchestrator_enabled = false takes the human lane (AI-215)', async () => {
+    // AI-215: under default-on, the ONLY way to reach the human execution lane
+    // is an explicit orchestrator_enabled = false. A keyless topic now
+    // orchestrates (see T-DEF1), so this regression must seed the opt-out.
+    await seedTopicState(threadId, { orchestrator_enabled: false });
     await writeWorker(currentTestDir, workerScript(SPAWN_ENVELOPE));
 
     const sent = await runOne([{ update_id: 1, text: 'sweep the logs please' }], threadId);
@@ -518,7 +662,37 @@ describe('orchestrator dispatch wiring (AI-203 WP-5, end-to-end)', () => {
 
     assert.ok(L().some((t) => t.includes(SPAWN_ACK)), 'the cleaned reply is delivered as today');
     assert.ok(!L().some((t) => t.includes('Thread t-1 spawned')), 'no thread footer on the human lane');
-    assert.equal(await listThreads(topicKey).then((l) => l.length), 0, 'no thread store file may be created for a non-orchestrator topic');
+    assert.equal(await listThreads(topicKey).then((l) => l.length), 0, 'no thread store file may be created for an opted-out topic');
+  });
+
+  it('T-DEF1: default-on proof — a keyless topic dispatches via the orchestrator lane (AI-215)', async () => {
+    // AI-215 §6.1 #3: a plain message in a keyless-topic state (no
+    // orchestrator_enabled key) must dispatch via dispatchOrchestratorTurn,
+    // not dispatchMessage. The spawn envelope produces a thread footer + a
+    // thread store record — proof the orchestrator lane fired. The existing
+    // orchestrator_enabled: true seed sites (T1/T4/etc) are now the explicit
+    // opt-in case; this no-seed case is the default-on proof.
+    await seedTopicState(threadId); // NO orchestrator_enabled key
+    await writeWorker(currentTestDir, workerScript(SPAWN_ENVELOPE, { holdMs: 1500 }));
+
+    const sent = await runOne([{ update_id: 1, text: 'sweep the logs please' }], threadId);
+    const L = () => sent.map(plain);
+
+    // The orchestrator lane fired: the spawn footer is present and a thread
+    // store record exists (the human lane would produce neither).
+    const reply = L().find((t) => t.includes(SPAWN_ACK));
+    assert.ok(reply, `the orchestrator ack must be delivered on a keyless topic; got: ${JSON.stringify(L())}`);
+    assert.ok(reply.includes('_(Thread t-1 spawned: Sweep logs'), `spawn footer missing from: ${reply}`);
+
+    const owned = await pollFor(async () => {
+      const rec = await getThread(topicKey, 't-1');
+      if (!rec || rec.runSeq < 1) return false;
+      return rec.status === 'running' || rec.status === 'done';
+    });
+    assert.ok(
+      owned,
+      `a keyless topic must create a thread store record via the orchestrator lane; last=${JSON.stringify(await getThread(topicKey, 't-1'))}`
+    );
   });
 
   // --- AI-203 increment 3: the reply-to-FYI anchor steer (T-A1..T-A6) ---
@@ -690,5 +864,30 @@ describe('orchestrator dispatch wiring (AI-203 WP-5, end-to-end)', () => {
       `exactly the warmup + the follower's own turn may dispatch; got: ${blocks.length} block(s)`
     );
     assert.ok(blocks.every((b) => !b.includes('[Batched:')), `no prompt may carry batch scaffolding: ${JSON.stringify(blocks.map((b) => b.slice(0, 120)))}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WP-5 (router-as-orchestrator 2026-09-19): source invariant — the persona
+// branch in main.ts is guarded so a routed turn under the LIVE placement
+// surface dispatches directly (the router owns orchestration there), while
+// every fixture above (no model_router block) proves the branch untouched
+// for the dark/no-block world byte-for-byte.
+// ---------------------------------------------------------------------------
+describe('WP-5 source invariant: the persona branch is placement-guarded', () => {
+  it('main.ts guards dispatchOrchestratorTurn with the personaBranchSkipped predicate', async () => {
+    const { readFileSync } = await import('fs');
+    const { join, dirname } = await import('path');
+    const { fileURLToPath } = await import('url');
+    const here = dirname(fileURLToPath(import.meta.url));
+    const mainSrc = readFileSync(join(here, '..', '..', 'src', 'main.ts'), 'utf8');
+    assert.ok(
+      mainSrc.includes('isOrchestratorMode(topicState) && !personaSkipped'),
+      'the persona branch must be skipped on routed turns under the live placement surface',
+    );
+    assert.ok(
+      mainSrc.includes('const personaSkipped = personaBranchSkipped(placementLive, routedTurn);'),
+      'the skip must come from orchestrator.ts’s predicate over the surface flag and the routed marker',
+    );
   });
 });

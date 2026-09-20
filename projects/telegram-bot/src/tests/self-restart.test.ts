@@ -23,6 +23,7 @@ function baseInputs(overrides: Partial<SelfRestartInputs> = {}): SelfRestartInpu
     inFlightWorkers: 0,
     pendingActions: 0,
     topicLocksHeld: 0,
+    pollLoopInFlight: 0,
     graceMs: SELF_RESTART_GRACE_MS,
     disabled: false,
     ...overrides,
@@ -89,6 +90,16 @@ describe('shouldSelfRestart', () => {
     assert.deepEqual(d, { restart: false, reason: 'busy', stampIsNewer: true });
   });
 
+  it('pollLoopInFlight > 0 alone blocks as busy (all other durable signals zero)', () => {
+    const d = shouldSelfRestart(baseInputs({ pollLoopInFlight: 1 }));
+    assert.deepEqual(d, { restart: false, reason: 'busy', stampIsNewer: true });
+  });
+
+  it('pollLoopInFlight === 0 with every other signal zero still restarts (guards against an always-busy check)', () => {
+    const d = shouldSelfRestart(baseInputs({ pollLoopInFlight: 0 }));
+    assert.deepEqual(d, { restart: true, reason: 'stamp-newer-and-idle', stampIsNewer: true });
+  });
+
   it('otherwise restarts: stamp-newer-and-idle', () => {
     const d = shouldSelfRestart(baseInputs());
     assert.equal(d.restart, true);
@@ -111,6 +122,7 @@ describe('shouldSelfRestart', () => {
       ['within-grace', { procStartMs: 0, stampMtimeMs: 1, nowMs: SELF_RESTART_GRACE_MS }],
       ['build-lock-held', { buildLockHeld: true }],
       ['busy', { inFlightWorkers: 1 }],
+      ['busy (pollLoopInFlight)', { pollLoopInFlight: 1 }],
       ['stamp-newer-and-idle', {}],
     ];
     for (const [label, overrides] of fromWithinGraceCases) {
@@ -173,6 +185,7 @@ describe('formatRestartBlockers', () => {
     assert.equal(formatRestartBlockers(baseInputs({ inFlightWorkers: 2 })), 'in-flight workers×2');
     assert.equal(formatRestartBlockers(baseInputs({ topicLocksHeld: 1 })), 'topic locks×1 (this pid)');
     assert.equal(formatRestartBlockers(baseInputs({ pendingActions: 3 })), 'pending_action×3');
+    assert.equal(formatRestartBlockers(baseInputs({ pollLoopInFlight: 4 })), 'in-flight turns×4');
   });
 
   it('pending_action includes the oldest age when provided', () => {
@@ -193,7 +206,8 @@ describe('formatRestartBlockers', () => {
       pendingActions: 2,
       oldestPendingActionAgeMs: 5 * 60_000,
       topicLocksHeld: 1,
+      pollLoopInFlight: 2,
     }));
-    assert.equal(result, '@build reservation held, in-flight workers×1, pending_action×2 (oldest 5m), topic locks×1 (this pid)');
+    assert.equal(result, '@build reservation held, in-flight workers×1, pending_action×2 (oldest 5m), topic locks×1 (this pid), in-flight turns×2');
   });
 });

@@ -7,7 +7,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { createTempPaHome, createTempConfig, createTempSecrets, cleanup } from './helpers.js';
 import { flushLog } from '../src/lib/log.js';
-import { checkWorker, executeWorker, isRateLimited, runWithFailover, readStateTail, clearRateLimitCache } from '../src/workers.js';
+import { checkWorker, executeWorker, isRateLimited, runWithFailover, readStateTail, clearRateLimitCache, NO_WORKERS_AVAILABLE_ERROR } from '../src/workers.js';
 import type { WorkerConfig } from '../src/types.js';
 import { notifyUser } from '../src/lib/notify.js';
 
@@ -805,7 +805,8 @@ describe('runWithFailover', () => {
     const { result, worker } = await runWithFailover('unused', { timeout: 10 });
     assert.equal(result.success, false);
     assert.equal(worker, 'none');
-    assert.ok(result.error?.includes('No workers available'));
+    // WP-A (2026-09-12): zero attempts → the wall contract string, EXACTLY — consumers match on it
+    assert.equal(result.error, NO_WORKERS_AVAILABLE_ERROR);
   });
 
   it('skips excluded workers', async () => {
@@ -835,6 +836,8 @@ describe('runWithFailover', () => {
     const { result, worker } = await runWithFailover('unused', { timeout: 10, resource: 'skill-test-exhaustion' });
     assert.equal(result.success, false);
     assert.equal(result.alreadyAlertedPaSupport, true);
+    // WP-A (2026-09-12): a real attempt's failure carries the worker's own error — never the zero-attempt wall string
+    assert.notEqual(result.error, NO_WORKERS_AVAILABLE_ERROR);
   });
 
   it('noFallback: true does not emit exhaustion notify', async () => {
@@ -882,6 +885,8 @@ describe('runWithFailover', () => {
     });
     assert.equal(result.success, false);
     assert.equal(result.alreadyAlertedPaSupport, true);
+    // WP-A (2026-09-12): all-cooling is also a zero-attempt run → the wall contract string
+    assert.equal(result.error, NO_WORKERS_AVAILABLE_ERROR);
   });
 
   it('empty pool: no alert, just a warning log', async () => {
@@ -897,6 +902,16 @@ describe('runWithFailover', () => {
     assert.equal(result.success, false);
     // No exhaustion alert because no workers were attempted and none are cooling
     assert.equal(result.alreadyAlertedPaSupport, undefined);
+  });
+});
+
+// WP-A (2026-09-12): the zero-attempt cascade's error string is a cross-module
+// contract — consumers classify a "wall" outcome by matching it. Import the
+// constant, never re-type the literal. The behavioral pins live inside the
+// runWithFailover describe above (extended in place, not duplicated).
+describe('NO_WORKERS_AVAILABLE_ERROR wall-outcome contract', () => {
+  it('constant stays in sync with the literal the cascade returns', () => {
+    assert.equal(NO_WORKERS_AVAILABLE_ERROR, 'No workers available');
   });
 });
 
@@ -1629,5 +1644,79 @@ describe('runWithFailover — WPE4 quota-aware failover ordering', () => {
     const { result, worker } = await runWithFailover('unused', { timeout: 10, preferredWorker: 'w2' });
     assert.equal(result.success, true);
     assert.equal(worker, 'w2', 'preferredWorker option should override pinned worker');
+  });
+});
+
+// Router-as-orchestrator decisions 20/25 (2026-09-19): routed turns consume
+// the router's probability chain (candidateOrder) and skip the deprecated
+// operator pin (ignoreWorkerPin). Fail-open: neither option set = today's
+// byte-identical static chain.
+describe('runWithFailover — candidateOrder + ignoreWorkerPin', () => {
+  it('candidateOrder replaces the static priority order on this dispatch', async () => {
+    const s1 = await writeScript('co-w1.js', 'process.stdout.write("w1");');
+    const s2 = await writeScript('co-w2.js', 'process.stdout.write("w2");');
+    const s3 = await writeScript('co-w3.js', 'process.stdout.write("w3");');
+    await createTempConfig(tempDir, [
+      { name: 'w1', command: 'node', args: [s1], check: 'echo ok', priority: 1, rate_limit_patterns: [] },
+      { name: 'w2', command: 'node', args: [s2], check: 'echo ok', priority: 2, rate_limit_patterns: [] },
+      { name: 'w3', command: 'node', args: [s3], check: 'echo ok', priority: 3, rate_limit_patterns: [] },
+    ]);
+    const { worker } = await runWithFailover('unused', { timeout: 10, candidateOrder: ['w3', 'w2'] });
+    assert.equal(worker, 'w3', 'the router-named candidate must be tried first despite lowest priority');
+  });
+
+  it('candidateOrder is a reorder, never a narrowing — the chain falls through to unnamed workers', async () => {
+    const s1 = await writeScript('cof-w1.js', 'process.stdout.write("w1");');
+    const s2 = await writeScript('cof-w2.js', 'process.stdout.write("w2");');
+    // w3 (named first) fails -> w2 (named second) succeeds.
+    const failS3 = await writeScript('cof-w3-fail.js', 'process.stderr.write("boom"); process.exit(1);');
+    await createTempConfig(tempDir, [
+      { name: 'w1', command: 'node', args: [s1], check: 'echo ok', priority: 1, rate_limit_patterns: [] },
+      { name: 'w2', command: 'node', args: [s2], check: 'echo ok', priority: 2, rate_limit_patterns: [] },
+      { name: 'w3', command: 'node', args: [failS3], check: 'echo ok', priority: 3, rate_limit_patterns: [] },
+    ]);
+    const { worker } = await runWithFailover('unused', { timeout: 10, candidateOrder: ['w3', 'w2'] });
+    assert.equal(worker, 'w2');
+  });
+
+  it('unnamed workers keep the static config order AFTER the named candidates', async () => {
+    const s1 = await writeScript('cou-w1.js', 'process.stdout.write("w1");');
+    const s2 = await writeScript('cou-w2.js', 'process.stdout.write("w2");');
+    const s3 = await writeScript('cou-w3.js', 'process.stdout.write("w3");');
+    // Named: w2 (fails). Unnamed after: w1 then w3 (static order) -> w1 answers.
+    const failS2 = await writeScript('cou-w2-fail.js', 'process.stderr.write("boom"); process.exit(1);');
+    await createTempConfig(tempDir, [
+      { name: 'w1', command: 'node', args: [s1], check: 'echo ok', priority: 1, rate_limit_patterns: [] },
+      { name: 'w2', command: 'node', args: [failS2], check: 'echo ok', priority: 2, rate_limit_patterns: [] },
+      { name: 'w3', command: 'node', args: [s3], check: 'echo ok', priority: 3, rate_limit_patterns: [] },
+    ]);
+    const { worker } = await runWithFailover('unused', { timeout: 10, candidateOrder: ['w2'] });
+    assert.equal(worker, 'w1', 'after the named candidate, the static order (w1 before w3) must hold');
+  });
+
+  it('ignoreWorkerPin skips the config.worker_pin reorder (deprecated pin loses to the router)', async () => {
+    const s1 = await writeScript('pin-skip-w1.js', 'process.stdout.write("w1");');
+    const s3 = await writeScript('pin-skip-w3.js', 'process.stdout.write("w3");');
+    await createTempConfig(tempDir, [
+      { name: 'w1', command: 'node', args: [s1], check: 'echo ok', priority: 1, rate_limit_patterns: [] },
+      { name: 'w3', command: 'node', args: [s3], check: 'echo ok', priority: 3, rate_limit_patterns: [] },
+    ], { worker_pin: 'w3' });
+    // Without the flag: the pin moves w3 to front.
+    const pinned = await runWithFailover('unused', { timeout: 10 });
+    assert.equal(pinned.worker, 'w3');
+    // With the flag: the static config order holds and w1 answers.
+    const skipped = await runWithFailover('unused', { timeout: 10, ignoreWorkerPin: true });
+    assert.equal(skipped.worker, 'w1', 'ignoreWorkerPin must leave the pinned worker in its static position');
+  });
+
+  it('preferredWorker still wins over candidateOrder (thread-spawn pins are executor machinery)', async () => {
+    const s1 = await writeScript('pref-co-w1.js', 'process.stdout.write("w1");');
+    const s2 = await writeScript('pref-co-w2.js', 'process.stdout.write("w2");');
+    await createTempConfig(tempDir, [
+      { name: 'w1', command: 'node', args: [s1], check: 'echo ok', priority: 1, rate_limit_patterns: [] },
+      { name: 'w2', command: 'node', args: [s2], check: 'echo ok', priority: 2, rate_limit_patterns: [] },
+    ]);
+    const { worker } = await runWithFailover('unused', { timeout: 10, candidateOrder: ['w1'], preferredWorker: 'w2' });
+    assert.equal(worker, 'w2');
   });
 });

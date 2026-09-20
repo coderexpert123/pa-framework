@@ -14,6 +14,7 @@ import {
 import { markTopicStopped, _clearStoppedForTest } from '../worker-stop.js';
 import { _resetPendingDispatchesForTest } from '../pending-dispatches.js';
 import { logger } from '../../../../pa/dist/src/lib/log.js';
+import { listWorkerPids } from '../../../../pa/dist/src/worker-pids.js';
 import { waitForDrain } from './test-teardown-guard.js';
 import { runPollLoop, _setExitForTest, placeholderDispatchText } from '../main.js';
 import type { ConversationState } from '../types.js';
@@ -97,22 +98,48 @@ function readLastWorkerPrompt(capturePath: string): string {
   return raw.slice(start + 'GOTPROMPTSTART'.length, end);
 }
 
-/** True once TWO prompt blocks are captured (killed dispatch + probe dispatch). */
-function captureComplete(capturePath: string): boolean {
+/** Count of complete prompt blocks captured so far. */
+function countCaptureBlocks(capturePath: string): number {
   try {
-    return readFileSync(capturePath, 'utf8').split('GOTPROMPTEND').length - 1 >= 2;
+    return readFileSync(capturePath, 'utf8').split('GOTPROMPTEND').length - 1;
   } catch {
-    return false;
+    return 0;
   }
 }
+
+/** True once TWO prompt blocks are captured (killed dispatch + probe dispatch). */
+function captureComplete(capturePath: string): boolean {
+  return countCaptureBlocks(capturePath) >= 2;
+}
+
+/** Hard wall-clock ceiling for the WHOLE mock, checked on every getUpdates
+ * call regardless of phase — a stuck phase 1 (registration never appears),
+ * phase 2 (ack never sent) or phase 3 (capture never completes) all abort
+ * and report a clear error instead of spinning `runPollLoop`'s
+ * `while (!signal.aborted)` loop forever. Generous on purpose — this must
+ * never be the thing that makes the test flaky; a real stall past this is a
+ * genuine defect, reported via a clear error rather than a silent hang. */
+const MOCK_HARD_TIMEOUT_MS = 15_000;
 
 /**
  * Phase-driven Telegram mock for the /stop scenarios:
  *  phase 0 → first batch (the message whose dispatch gets killed);
- *  after the dispatch's first sendChatAction (+ a grace period so the worker is
- *    already spawned when /stop kills it) → second batch (queued entries + /stop);
+ *  after the dispatch's first sendChatAction, once the killed dispatch's
+ *    worker has actually REGISTERED in pa's worker-pids registry (the same
+ *    registry /stop's stopTopicWorkers snapshots to find something to kill)
+ *    → second batch (queued entries + /stop);
  *  after the stop ack was sent → third batch (the next dispatch's probe message);
  *  after the probe's worker echo arrived → abort the poll loop.
+ *
+ * Registration readiness (not a wall-clock guess): sendChatAction fires from
+ * sendTyping() BEFORE the worker is spawned and registered by addWorkerPid
+ * (pa/src/worker-exec.ts) — a fixed post-sendChatAction delay is a race
+ * against however long that spawn+registration actually takes on this host
+ * under this load, and can fire before the entry exists (killed=0, ack reads
+ * "Held N" instead of "Stopped … and held N", S1's first assertion fails
+ * non-deterministically). Polling listWorkerPids() (pa's own registry, same
+ * PA_HOME as the code under test) for the killed dispatch's topic resource is
+ * the actual signal /stop depends on, so it can't be ready-but-still-fail.
  *
  * Every empty poll response resolves through a REAL setTimeout: with the test
  * fastSleep, a synchronous empty response makes the poll loop spin in pure
@@ -128,24 +155,44 @@ function makeStopFetchMock(
   firstBatch: unknown[],
   secondBatch: unknown[],
   thirdBatch: unknown[],
-): (url: string, opts?: { body?: string }) => Promise<unknown> {
+  topicKey: string,
+): { fetch: (url: string, opts?: { body?: string }) => Promise<unknown>; timeoutError: () => Error | null } {
   let phase = 0;
   let dispatchStartedAt = 0;
+  let stallError: Error | null = null;
+  const mockCreatedAt = Date.now();
   const empty = { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: [] }), json: async () => ({ ok: true, result: [] }) };
   const batchResponse = (result: unknown[]) => {
     const batch = { ok: true, result };
     return { ok: true, status: 200, text: async () => JSON.stringify(batch), json: async () => batch };
   };
-  return async (url: string, opts?: { body?: string }) => {
+  const fetchFn = async (url: string, opts?: { body?: string }) => {
     const u = url as string;
     if (u.includes('getUpdates')) {
+      if (stallError === null && Date.now() - mockCreatedAt >= MOCK_HARD_TIMEOUT_MS) {
+        stallError = new Error(
+          `makeStopFetchMock stalled in phase ${phase} (topicKey="${topicKey}") — no terminal condition reached within ${MOCK_HARD_TIMEOUT_MS}ms`,
+        );
+        controller.abort();
+        return empty;
+      }
       if (phase === 0) {
         phase = 1;
         return batchResponse(firstBatch);
       }
-      if (phase === 1 && dispatchStartedAt > 0 && Date.now() - dispatchStartedAt >= 600) {
-        phase = 2;
-        return batchResponse(secondBatch);
+      if (phase === 1 && dispatchStartedAt > 0) {
+        const entries = await listWorkerPids();
+        // Gate on the worker's FIRST captured block, not registration alone:
+        // a slow runner (ubuntu CI, deterministic stall 2026-09-20) delivers
+        // /stop's kill before the echo worker finishes booting and drains its
+        // stdin — block 1 never exists and phase 3's two-block wait hangs.
+        // Block 1 in the capture file is the strictly stronger readiness:
+        // spawned, registered, stdin consumed, and inside its 1500ms tail
+        // window — i.e. still killable when the /stop batch lands.
+        if (entries.some((e) => e.skill === topicKey) && countCaptureBlocks(capturePath) >= 1) {
+          phase = 2;
+          return batchResponse(secondBatch);
+        }
       }
       if (phase === 2 && sentTexts.some(t => t.includes('⏹'))) {
         phase = 3;
@@ -174,6 +221,7 @@ function makeStopFetchMock(
     }
     return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, result: true }), json: async () => ({ ok: true, result: true }) };
   };
+  return { fetch: fetchFn, timeoutError: () => stallError };
 }
 
 describe('steer-text-safety (AI-208 WP-5)', { concurrency: 1 }, () => {
@@ -308,7 +356,7 @@ topic_defaults:
     }
   });
 
-  it('/stop with [text, voice, text] holds all three in arrival order, no inline await (S1)', async () => {
+  it('/stop with [text, voice, text] holds all three in arrival order, no inline await (S1)', { timeout: 25_000 }, async () => {
     // M4: driven through the REAL /stop handler (runPollLoop) — the in-file
     // re-implementation of the drain-to-held loop is deleted. The killed first
     // message contributes the A6-held text; the two queued entries and the voice
@@ -371,16 +419,20 @@ topic_defaults:
     };
 
     const sentTexts: string[] = [];
-    (globalThis as Record<string, unknown>).fetch = makeStopFetchMock(
+    const mock = makeStopFetchMock(
       controller,
       sentTexts,
       capturePath,
       [msg1],
       [msg2, msg3, stopMsg],
       [probeMsg],
+      'topic--1001234567890_5001',
     );
+    (globalThis as Record<string, unknown>).fetch = mock.fetch;
 
     await runPollLoop('token', [-1001234567890], state, {}, controller.signal, fastSleep);
+    const timeoutError = mock.timeoutError();
+    if (timeoutError) throw timeoutError;
 
     const cleanSent = sentTexts.join('\n').replace(/\\/g, '');
     assert.ok(cleanSent.includes('held 2 queued message(s)'), `stop ack must count the synchronously held entries, got: ${cleanSent}`);
@@ -402,7 +454,7 @@ topic_defaults:
     );
   });
 
-  it('/stop → next dispatch: each held text appears exactly once in that prompt (M1: in-memory held + record absorb deduped)', async () => {
+  it('/stop → next dispatch: each held text appears exactly once in that prompt (M1: in-memory held + record absorb deduped)', { timeout: 25_000 }, async () => {
     // M1 regression: a /stop-held entry lives in BOTH the in-memory held list and
     // (flagged heldForTopic by E6) the durable pending-dispatch store. The
     // normalizer must dedup the two routes by updateId so each held text is
@@ -464,16 +516,20 @@ topic_defaults:
     };
 
     const sentTexts: string[] = [];
-    (globalThis as Record<string, unknown>).fetch = makeStopFetchMock(
+    const mock = makeStopFetchMock(
       controller,
       sentTexts,
       capturePath,
       [msg1],
       [msg2, msg3, stopMsg],
       [probeMsg],
+      'topic--1001234567890_5001',
     );
+    (globalThis as Record<string, unknown>).fetch = mock.fetch;
 
     await runPollLoop('token', [-1001234567890], state, {}, controller.signal, fastSleep);
+    const timeoutError = mock.timeoutError();
+    if (timeoutError) throw timeoutError;
 
     const prompt = readLastWorkerPrompt(capturePath);
     const textCount = prompt.split('M1_QUEUED_TEXT_SECOND').length - 1;

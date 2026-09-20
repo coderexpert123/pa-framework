@@ -982,3 +982,37 @@ describe('AI-179 tri-state heartbeat renewal + verified row-absent', () => {
     );
   });
 });
+
+describe('acquireLock timeoutMs 0 — try-once semantics (2026-09-13 drain incident)', () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await createTempPaHome();
+  });
+
+  afterEach(async () => {
+    await cleanup(dir);
+  });
+
+  it('timeoutMs 0 ACQUIRES a free resource (regression: used to return false without attempting)', async () => {
+    const { blackboard } = await import('../src/blackboard.js');
+    const acquired = await blackboard.acquireLock(
+      'skill-exclusive:git-workflow-zero-regression', 'zero-wait-caller', process.pid, 0, 'ctx-zero-free',
+    );
+    assert.equal(acquired, true, 'waitMs 0 must make exactly one attempt, and the lock is free');
+    await blackboard.releaseLock('skill-exclusive:git-workflow-zero-regression', 'zero-wait-caller', 'ctx-zero-free');
+  });
+
+  it('timeoutMs 0 against a conflicting holder fails fast without the 1s retry sleep', async () => {
+    const { blackboard } = await import('../src/blackboard.js');
+    await blackboard.acquireLock('skill-exclusive:git-workflow-zero-regression', 'holder', process.pid, 5000, 'ctx-hold');
+    const t0 = Date.now();
+    const acquired = await blackboard.acquireLock(
+      'skill-exclusive:git-workflow-zero-regression', 'zero-wait-caller', process.pid, 0, 'ctx-zero-held',
+    );
+    const elapsed = Date.now() - t0;
+    assert.equal(acquired, false, 'conflicting live holder must block a zero-wait acquire');
+    assert.ok(elapsed < 1000, `fail-fast expected (no retry sleep), took ${elapsed}ms`);
+    await blackboard.releaseLock('skill-exclusive:git-workflow-zero-regression', 'holder', 'ctx-hold');
+  });
+});

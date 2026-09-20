@@ -25,6 +25,7 @@ import tempfile
 import time
 
 logging.basicConfig(stream=sys.stderr, level=logging.WARNING)
+_LOGGER = logging.getLogger("transcribe_voice")
 
 CLOUD_PROVIDERS = ("groq", "openai", "deepgram")
 ERROR_CODES = ("no-engine", "cloud-auth", "ffmpeg-missing", "oversize", "missing-file", "other")
@@ -43,7 +44,16 @@ _ERROR_CODE_PRIORITY = ("cloud-auth", "oversize", "ffmpeg-missing", "missing-fil
 # PA_VOICE_MAX_DURATION_S. See plan D11.
 DEFAULT_MAX_CHARS = 40000
 
-RETRY_DELAYS = (1, 3, 8)
+# Cloud 429/5xx retry ladder (operator ruling 2026-09-13): start at 5s,
+# exponential, single-delay cap 60s, a few attempts. Groq's limits are
+# per-minute request/token windows, so a short wait-and-retry is the correct
+# response to a 429 — each retry is logged. The whole ladder stays inside
+# CLOUD_TOTAL_BUDGET_S's flat tier (0+5+15+45 = 65s worst case), so short
+# notes still fit the bot-side spawn timeout (PA_VOICE_TRANSCRIBE_TIMEOUT_MS,
+# default 10 min) with room for the final HTTP call. This ladder is shared by
+# all three cloud providers; it says nothing about the worker-fleet cooldown
+# book — transcription does not ride the worker fleet.
+RETRY_DELAYS = (5, 15, 45)
 MiB = 1024 * 1024
 GiB = 1024 * 1024 * 1024
 _MAX_UPLOAD_BYTES = {"groq": 25 * MiB, "openai": 25 * MiB, "deepgram": 2 * GiB}
@@ -54,6 +64,26 @@ _MAX_UPLOAD_BYTES = {"groq": 25 * MiB, "openai": 25 * MiB, "deepgram": 2 * GiB}
 # client-side timeout.
 CLOUD_TOTAL_BUDGET_S = 90.0
 CLOUD_HTTP_TIMEOUT_S = 45.0
+
+# 2026-09-13 (vi-ed1d56beebe1): voice-inbox recordings are no longer
+# force-stopped at 2 minutes, so a legitimate note can now be ~25 MiB /
+# ~27 min of audio. A fixed 90 s budget would kill a long-but-healthy
+# transcription as 'budget exhausted'. Both the shared retry budget and the
+# per-request HTTP timeout now scale with a conservative size-derived
+# duration estimate: flat at today's values up to
+# CLOUD_SCALE_MIN_DURATION_S of audio (old behavior, byte-for-byte), then
+# linear with the overage, capped.
+CLOUD_SCALE_MIN_DURATION_S = 300.0
+CLOUD_BUDGET_S_PER_AUDIO_S = 1.0
+CLOUD_HTTP_TIMEOUT_S_PER_AUDIO_S = 0.5
+CLOUD_TOTAL_BUDGET_CAP_S = 600.0
+CLOUD_HTTP_TIMEOUT_CAP_S = 300.0
+# Duration estimate assumes at least this bitrate. Real notes are browser-
+# default opus/AAC (bitrate UNPINNED again 2026-09-13, vi-9c17b02e9171:
+# ~120 kbps measured; the 32 kbps pin was rejected as quality loss), so
+# size*8/24000 OVER-estimates duration -- the safe direction for a budget
+# (too much budget costs a slow failure; too little kills a healthy one).
+_EST_BITRATE_BPS = 24000.0
 
 GROQ_MODEL = "whisper-large-v3-turbo"
 OPENAI_MODEL = "whisper-1"
@@ -260,13 +290,16 @@ def select_reported_error(attempt_errors):
     return best_exc
 
 
-def _make_post_fn(requests_module):
+def _make_post_fn(requests_module, timeout_s=None):
     """Build the default post_fn from an injected `requests` module, without
     touching sys.modules -- keeps test_module_imports_without_optional_dependencies
-    valid while still being directly testable."""
+    valid while still being directly testable. timeout_s=None keeps the flat
+    CLOUD_HTTP_TIMEOUT_S default; transcribe_cloud threads the scaled value in."""
 
     def post_fn(url, **kwargs):
-        resp = requests_module.post(url, timeout=CLOUD_HTTP_TIMEOUT_S, **kwargs)
+        resp = requests_module.post(
+            url, timeout=timeout_s if timeout_s is not None else CLOUD_HTTP_TIMEOUT_S, **kwargs
+        )
         if resp.status_code >= 400:
             raise CloudHTTPError(resp.status_code, resp.text)
         return resp.json()
@@ -276,6 +309,36 @@ def _make_post_fn(requests_module):
 
 def _upload_ceiling(provider):
     return _MAX_UPLOAD_BYTES.get(provider)
+
+
+def _estimated_duration_s(audio_path):
+    """Conservative audio-duration estimate from file size alone, never
+    raises (missing/unreadable file -> 0.0). See _EST_BITRATE_BPS."""
+    try:
+        size = os.path.getsize(audio_path)
+    except OSError:
+        return 0.0
+    return max(0.0, size * 8.0 / _EST_BITRATE_BPS)
+
+
+def cloud_budget_s(est_duration_s):
+    """Total shared cloud budget for a note of this estimated duration:
+    CLOUD_TOTAL_BUDGET_S flat up to CLOUD_SCALE_MIN_DURATION_S, then
+    + CLOUD_BUDGET_S_PER_AUDIO_S per second of overage, capped at
+    CLOUD_TOTAL_BUDGET_CAP_S."""
+    overage = max(0.0, est_duration_s - CLOUD_SCALE_MIN_DURATION_S)
+    return min(CLOUD_TOTAL_BUDGET_CAP_S, CLOUD_TOTAL_BUDGET_S + CLOUD_BUDGET_S_PER_AUDIO_S * overage)
+
+
+def cloud_http_timeout_s(est_duration_s):
+    """Per-request HTTP timeout for the same estimate: CLOUD_HTTP_TIMEOUT_S
+    flat up to CLOUD_SCALE_MIN_DURATION_S, then
+    + CLOUD_HTTP_TIMEOUT_S_PER_AUDIO_S per second of overage, capped at
+    CLOUD_HTTP_TIMEOUT_CAP_S."""
+    overage = max(0.0, est_duration_s - CLOUD_SCALE_MIN_DURATION_S)
+    return min(
+        CLOUD_HTTP_TIMEOUT_CAP_S, CLOUD_HTTP_TIMEOUT_S + CLOUD_HTTP_TIMEOUT_S_PER_AUDIO_S * overage
+    )
 
 
 def _format_size(num_bytes):
@@ -300,17 +363,19 @@ def _upload_part(provider, audio_path):
     return basename, _EXT_MIME.get(ext, "application/octet-stream")
 
 
-def _call_with_retry(attempt_fn, *, deadline=None, sleep_fn=time.sleep):
-    """Delays (0, 1, 3, 8)s; retries on 429/5xx; re-raises immediately on any
-    other 4xx. `attempt_fn` is a zero-arg callable so each retry reopens its own
-    file handle rather than reusing one positioned at EOF.
+def _call_with_retry(attempt_fn, *, deadline=None, sleep_fn=time.sleep, label="cloud"):
+    """Delays (0,) + RETRY_DELAYS (5/15/45s — operator ruling 2026-09-13);
+    retries on 429/5xx, logging each absorbed failure; re-raises immediately on
+    any other 4xx. `attempt_fn` is a zero-arg callable so each retry reopens its
+    own file handle rather than reusing one positioned at EOF.
 
     `deadline` (a time.monotonic() timestamp) is optional; when given, retrying
     stops (raising the last exception) once the next sleep or attempt would
     cross it -- rather than always exhausting RETRY_DELAYS -- so several cloud
     providers can share one wall-clock budget (CLOUD_TOTAL_BUDGET_S)."""
+    delays = (0,) + RETRY_DELAYS
     last_exc = None
-    for delay in (0,) + RETRY_DELAYS:
+    for idx, delay in enumerate(delays):
         if deadline is not None:
             now = time.monotonic()
             if (now + delay if delay else now) > deadline:
@@ -325,6 +390,11 @@ def _call_with_retry(attempt_fn, *, deadline=None, sleep_fn=time.sleep):
                 raise CloudAuthError(str(exc)) from exc
             if status == 429 or (isinstance(status, int) and 500 <= status < 600):
                 last_exc = exc
+                next_delay = delays[idx + 1] if idx + 1 < len(delays) else None
+                if next_delay is None:
+                    _LOGGER.warning("transcribe retry (%s): HTTP %s — retries exhausted", label, status)
+                else:
+                    _LOGGER.warning("transcribe retry (%s): HTTP %s — retrying in %ss", label, status, next_delay)
                 continue
             raise
     if last_exc is None:
@@ -386,14 +456,17 @@ def _parse_duration(provider, body):
         return None
 
 
-def transcribe_cloud(provider, audio_path, *, env, post_fn=None, deadline=None, language=None):
+def transcribe_cloud(
+    provider, audio_path, *, env, post_fn=None, deadline=None, language=None, http_timeout_s=None
+):
     """Self-contained REST call. post_fn=None -> lazy `import requests` INSIDE
     this function. Returns {"text","turns","engine","duration_s","speakers"};
-    raises on failure."""
+    raises on failure. http_timeout_s only shapes the DEFAULT post_fn -- an
+    injected post_fn keeps full control of its own request timeout."""
     if post_fn is None:
         import requests
 
-        post_fn = _make_post_fn(requests)
+        post_fn = _make_post_fn(requests, timeout_s=http_timeout_s)
 
     size = os.path.getsize(audio_path)
     ceiling = _upload_ceiling(provider)
@@ -421,7 +494,7 @@ def transcribe_cloud(provider, audio_path, *, env, post_fn=None, deadline=None, 
                     data=data,
                 )
 
-        body = _call_with_retry(attempt, deadline=deadline)
+        body = _call_with_retry(attempt, deadline=deadline, label=provider)
     elif provider == "openai":
         url = "https://api.openai.com/v1/audio/transcriptions"
         headers = {"Authorization": f"Bearer {api_key}"}
@@ -439,7 +512,7 @@ def transcribe_cloud(provider, audio_path, *, env, post_fn=None, deadline=None, 
                     data=data,
                 )
 
-        body = _call_with_retry(attempt, deadline=deadline)
+        body = _call_with_retry(attempt, deadline=deadline, label=provider)
     elif provider == "deepgram":
         url = "https://api.deepgram.com/v1/listen"
         headers = {"Authorization": f"Token {api_key}", "Content-Type": "audio/*"}
@@ -456,7 +529,7 @@ def transcribe_cloud(provider, audio_path, *, env, post_fn=None, deadline=None, 
             with open(audio_path, "rb") as fh:
                 return post_fn(url, headers=headers, data=fh, params=params)
 
-        body = _call_with_retry(attempt, deadline=deadline)
+        body = _call_with_retry(attempt, deadline=deadline, label=provider)
     else:
         raise ValueError(f"unknown cloud provider: {provider}")
 
@@ -553,8 +626,14 @@ def transcribe_to_envelope(
 
     # One shared retry budget across every cloud attempt in THIS call -- see
     # CLOUD_TOTAL_BUDGET_S's docstring. Harmless (unused) when plan is
-    # local-only.
-    cloud_deadline = time.monotonic() + CLOUD_TOTAL_BUDGET_S
+    # local-only. Both the budget and the per-request HTTP timeout scale with
+    # a conservative size-derived duration estimate once it passes
+    # CLOUD_SCALE_MIN_DURATION_S, so long-but-healthy recordings aren't killed
+    # at the fixed 90 s floor; notes at or under it get the old constants
+    # unchanged.
+    est_duration_s = _estimated_duration_s(audio_path)
+    cloud_deadline = time.monotonic() + cloud_budget_s(est_duration_s)
+    http_timeout_s = cloud_http_timeout_s(est_duration_s)
 
     attempt_errors = []
     for idx, attempt_engine in enumerate(plan):
@@ -570,6 +649,7 @@ def transcribe_to_envelope(
                     post_fn=post_fn,
                     deadline=cloud_deadline,
                     language=language,
+                    http_timeout_s=http_timeout_s,
                 )
         except Exception as exc:
             # A missing `transcription` package only means "nothing is

@@ -149,13 +149,11 @@ describe('refresh-cards (WP-1, WP-2, WP-3)', () => {
       assert.equal(row0[2].callback_data, 'cc:effort');
 
       const row1 = kb.inline_keyboard[1];
-      assert.equal(row1.length, 3);
+      assert.equal(row1.length, 2);
       assert.equal(row1[0].text, '🆕 New');
       assert.equal(row1[0].callback_data, 'cc:new');
       assert.equal(row1[1].text, '⏹ Stop');
       assert.equal(row1[1].callback_data, 'cc:stop');
-      assert.equal(row1[2].text, '☕ Keep-awake');
-      assert.equal(row1[2].callback_data, 'cc:ka');
     });
 
     it('currentCardKeyboard defaults to buildControlCardKeyboard when no submenu active', () => {
@@ -174,10 +172,9 @@ describe('refresh-cards (WP-1, WP-2, WP-3)', () => {
         current_llm: 'gemini-3.8-flash-high',
         current_effort: 'high',
       };
-      const keepAwake = { active: false };
       const tasks = { running: 1, parked: 0, queued: 2 };
 
-      const pinText = renderStatusCard({ snapshot, keepAwake, tasks });
+      const pinText = renderStatusCard({ snapshot, tasks });
       assert.match(pinText, /Tasks: 1 running · 0 parked · 2 queued/);
 
       const controlKeyboard = buildControlCardKeyboard();

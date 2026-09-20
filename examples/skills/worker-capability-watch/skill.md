@@ -6,7 +6,7 @@ cwd: "${PA_HOME}/skills/worker-capability-watch"
 secrets:
   - TELEGRAM_BOT_TOKEN
   - TELEGRAM_CHAT_ID
-cmd: "python worker_capability_scan.py"
+cmd: "python3 worker_capability_scan.py || python worker_capability_scan.py"
 # Worst-case sequential probing across today's 5 workers: 5 x (90s --version +
 # 90s --help) + one 150s subcommand probe (agy models) = 5*180 + 150 = 1050s.
 # 1200s left only ~12.5% headroom against a script whose own comments already
@@ -107,8 +107,8 @@ conflating them would page on every transient hang.
 ## Manual use
 
 ```
-python worker_capability_scan.py
-python worker_capability_scan.py --worker agy --json --no-write --no-send
+python3 worker_capability_scan.py || python worker_capability_scan.py
+python3 worker_capability_scan.py --worker agy --json --no-write --no-send || python worker_capability_scan.py --worker agy --json --no-write --no-send
 ```
 
 Live verification 2026-07-22: full scan of all five workers in 13.6s → `NO_OUTPUT`

@@ -9,7 +9,10 @@ import './test-env-guard.js';
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { splitMessage, sanitizeMdV2, getUpdates, sendMessage, sendMessageWithId, pinChatMessage, unpinChatMessage, sendTyping, editMessageText, SEND_TYPING_TIMEOUT_MS } from '../telegram.js';
+import { writeFile, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { splitMessage, sanitizeMdV2, getUpdates, sendMessage, sendMessageWithId, sendPlainMessage, pinChatMessage, unpinChatMessage, sendTyping, editMessageText, SEND_TYPING_TIMEOUT_MS } from '../telegram.js';
+import { resetRedactCache } from '../../../../pa/dist/src/lib/redact.js';
 
 const MAX = 4000;
 
@@ -968,6 +971,121 @@ describe('sendMessage', () => {
 });
 
 // ---------------------------------------------------------------------------
+// sendPlainMessage — auth broker Phase A (2026-09-10): the plain-text, no
+// parse_mode twin of sendMessage (2026-08-15 OAuth-URL lesson).
+// ---------------------------------------------------------------------------
+
+describe('sendPlainMessage', () => {
+  // Underscore, dot, equals and hyphen are exactly the characters sanitizeMdV2
+  // backslash-escapes under MarkdownV2 — a URL is the realistic case that breaks.
+  const url = 'https://accounts.google.com/o/oauth2/v2/auth?client_id=abc-def_ghi&state=xyz';
+
+  it('sendMessage (the old path) mangles this URL under MarkdownV2 — the defect sendPlainMessage exists to fix', async () => {
+    const calls = setupFetchMock([{ ok: true, bodyJson: { ok: true } }]);
+    await sendMessage('token', 123, url);
+    const body = JSON.parse(calls[0].init!.body as string);
+    assert.equal(body.parse_mode, 'MarkdownV2');
+    assert.notEqual(body.text, url, 'sanity check: sendMessage is expected to escape this URL, proving the fix is needed');
+  });
+
+  it('delivers the URL byte-identical with no parse_mode key in the body', async () => {
+    const calls = setupFetchMock([{ ok: true, bodyJson: { ok: true } }]);
+    const result = await sendPlainMessage('token', 123, url);
+    assert.equal(calls.length, 1);
+    assert.ok(calls[0].url.includes('/sendMessage'));
+    const body = JSON.parse(calls[0].init!.body as string);
+    assert.equal(body.text, url, 'text must round-trip byte-identical, unlike sendMessage');
+    assert.equal('parse_mode' in body, false, 'body must carry no parse_mode key at all');
+    assert.equal(body.chat_id, 123);
+    assert.equal(result.ok, true);
+  });
+
+  it('includes message_thread_id when threadId > 0', async () => {
+    const calls = setupFetchMock([{ ok: true, bodyJson: { ok: true } }]);
+    await sendPlainMessage('token', 123, 'hi', 456);
+    const body = JSON.parse(calls[0].init!.body as string);
+    assert.equal(body.message_thread_id, 456);
+  });
+
+  it('omits message_thread_id when threadId is 0 or undefined', async () => {
+    const calls = setupFetchMock([{ ok: true, bodyJson: { ok: true } }]);
+    await sendPlainMessage('token', 123, 'hi', 0);
+    const body = JSON.parse(calls[0].init!.body as string);
+    assert.equal(body.message_thread_id, undefined);
+  });
+
+  it('attaches replyMarkup on the last chunk only', async () => {
+    const longText = 'a'.repeat(MAX + 100);
+    const calls = setupFetchMock([
+      { ok: true, bodyJson: { ok: true } },
+      { ok: true, bodyJson: { ok: true } },
+    ]);
+    const keyboard = { inline_keyboard: [[{ text: 'Done', callback_data: 'auth:google:ir-0123456789ab' }]] };
+    await sendPlainMessage('token', 123, longText, undefined, keyboard);
+    assert.equal(calls.length, 2);
+    const first = JSON.parse(calls[0].init!.body as string);
+    const second = JSON.parse(calls[1].init!.body as string);
+    assert.equal(first.reply_markup, undefined, 'first chunk must not carry the keyboard');
+    assert.deepEqual(second.reply_markup, keyboard, 'last chunk carries the keyboard');
+  });
+
+  it('returns ok:false and does not throw on HTTP failure', async () => {
+    setupFetchMock([{ ok: false, status: 403, bodyText: 'Forbidden' }]);
+    const result = await sendPlainMessage('token', 123, 'hi');
+    assert.equal(result.ok, false);
+    assert.equal(result.lastStatus, 403);
+  });
+
+  it('returns ok:true and sends nothing for empty text', async () => {
+    const calls = setupFetchMock([]);
+    const result = await sendPlainMessage('token', 123, '   ');
+    assert.equal(calls.length, 0);
+    assert.equal(result.ok, true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sendPlainMessage redaction (deep-recheck 2026-09-10, auth broker Phase A) —
+// sendPlainMessage's own docstring claims it redacts inline ("unlike
+// sendMessage this one has no other transformation between caller-supplied
+// text and the wire") but nothing pinned that claim: this wave's callback
+// callsite (callbacks.ts's auth: handler) sends a live auth_url through this
+// exact path with no caller-side pre-redaction, unlike task-executor.ts's
+// callers of sendMessage. Same secrets.env-fixture pattern as dlq.test.ts's
+// "appendDlq redaction (AI-184)" describe block.
+// ---------------------------------------------------------------------------
+
+describe('sendPlainMessage redaction', () => {
+  const SECRET_VALUE = 'SendPlainMessageSecretFixture';
+  const paHome = process.env.PA_HOME as string;
+
+  beforeEach(async () => {
+    await writeFile(join(paHome, 'secrets.env'), `SPM_TEST_SECRET=${SECRET_VALUE}\n`, 'utf8');
+    resetRedactCache();
+  });
+
+  afterEach(async () => {
+    await rm(join(paHome, 'secrets.env'), { force: true });
+    resetRedactCache();
+  });
+
+  it('redacts a secrets.env value before it reaches the wire', async () => {
+    const calls = setupFetchMock([{ ok: true, bodyJson: { ok: true } }]);
+    await sendPlainMessage('token', 123, `Open this: https://example.test/x?token=${SECRET_VALUE}`);
+    const body = JSON.parse(calls[0].init!.body as string);
+    assert.equal(body.text.includes(SECRET_VALUE), false, 'the literal secret must never reach the wire');
+    assert.equal(body.text.includes('<redacted:SPM_TEST_SECRET>'), true, 'the placeholder must replace it');
+  });
+
+  it('leaves text with no matching secret untouched', async () => {
+    const calls = setupFetchMock([{ ok: true, bodyJson: { ok: true } }]);
+    await sendPlainMessage('token', 123, 'plain text with no secret');
+    const body = JSON.parse(calls[0].init!.body as string);
+    assert.equal(body.text, 'plain text with no secret');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // sendTyping — fetch mocked
 // ---------------------------------------------------------------------------
 
@@ -1065,6 +1183,37 @@ describe('sendMessageWithId', () => {
     const calls = setupFetchMock([{ ok: true, bodyJson: { ok: true, result: { message_id: 42 } } }]);
     await sendMessageWithId('token', 123, 'hi');
     assert.ok(calls[0].init?.signal instanceof AbortSignal);
+  });
+
+  it('issues 3 chunked POSTs for a 9000-char body and returns the first chunk message_id (2026-09-12 unification)', async () => {
+    const calls = setupFetchMock([
+      { ok: true, bodyJson: { ok: true, result: { message_id: 100 } } },
+      { ok: true, bodyJson: { ok: true, result: { message_id: 101 } } },
+      { ok: true, bodyJson: { ok: true, result: { message_id: 102 } } },
+    ]);
+    const id = await sendMessageWithId('token', 123, 'x'.repeat(9000));
+    assert.equal(calls.length, 3, `expected 3 chunks, got ${calls.length}`);
+    assert.equal(id, 100, 'returns first chunk message_id');
+  });
+
+  it('falls back to plain text on a 400 parse error and returns the retry message_id (2026-09-12 unification)', async () => {
+    const calls = setupFetchMock([
+      { ok: false, status: 400, bodyText: 'Bad Request: can\'t parse entities' },
+      { ok: true, bodyJson: { ok: true, result: { message_id: 77 } } },
+    ]);
+    const id = await sendMessageWithId('token', 123, 'hello *world');
+    assert.equal(calls.length, 2, 'first POST fails on parse, second is the plain-text retry');
+    assert.equal(id, 77, 'returns the fallback retry message_id');
+  });
+
+  it('retries a 429 and returns the success message_id (2026-09-12 unification)', async () => {
+    const calls = setupFetchMock([
+      { ok: false, status: 429, bodyText: 'Too Many Requests' },
+      { ok: true, bodyJson: { ok: true, result: { message_id: 88 } } },
+    ]);
+    const id = await sendMessageWithId('token', 123, 'hello');
+    assert.equal(calls.length, 2);
+    assert.equal(id, 88, 'returns the retry message_id');
   });
 });
 
@@ -1300,7 +1449,11 @@ describe('sendMessage Phase 3 hardening', () => {
       assert.strictEqual(attempt, 2, 'exactly one retry');
       // delays[0] = the 429 rate-limit wait; delays[1] = attempt-2 pre-backoff
       // (telegram.ts:227, 1000 * attempt) — both expected, in this order.
-      assert.deepStrictEqual(delays, [3000, 1000], 'rate-limit wait first, then the attempt backoff');
+      // The app-log stall watchdog (stall.ts, 180000ms store-wait) also fires
+      // under the stubbed setTimeout; send-path waits are by design all
+      // <= 61000 ms, so filter to that invariant before asserting.
+      const sendDelays = delays.filter((ms) => ms <= 61_000);
+      assert.deepStrictEqual(sendDelays, [3000, 1000], 'rate-limit wait first, then the attempt backoff');
     } finally {
       (globalThis as Record<string, unknown>).fetch = originalFetch;
       (globalThis as Record<string, unknown>).setTimeout = origSetTimeout;
@@ -1333,7 +1486,10 @@ describe('sendMessage Phase 3 hardening', () => {
     try {
       const delivered = await sendMessage('t', -100, 'hello');
       assert.strictEqual(delivered, true);
-      assert.deepStrictEqual(delays, [61000, 1000], 'capped rate-limit wait first, then the attempt backoff');
+      // Same stall-watchdog interference as above; filter to the documented
+      // send-path invariant (all send waits <= 61000 ms) before asserting.
+      const sendDelays = delays.filter((ms) => ms <= 61_000);
+      assert.deepStrictEqual(sendDelays, [61000, 1000], 'capped rate-limit wait first, then the attempt backoff');
     } finally {
       (globalThis as Record<string, unknown>).fetch = originalFetch;
       (globalThis as Record<string, unknown>).setTimeout = origSetTimeout;

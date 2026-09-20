@@ -177,10 +177,14 @@ describe('readTaskLaneActivity', () => {
     assert.deepEqual(empty.topics, []);
     assert.deepEqual(empty.totals, { tasks: 0, starts: 0, completed: 0, failed: 0 });
 
+    // Rolling-window fixture: timestamps are relative to now — an absolute
+    // date seeds events OUTSIDE the 14d window once the calendar moves past it
+    // (2026-09-05 went stale on 2026-09-20 and this test read 0 tasks).
+    const iso = (msAgo: number) => new Date(Date.now() - msAgo).toISOString();
     await writeRawEvents(111, 222, [
       '{"ts":"2026-09-05T09:00:00.000Z","kind":"task_started"',
-      rawEvent('2026-09-05T09:00:00.000Z', 'task_started', 'tt-good', 'Real task'),
-      rawEvent('2026-09-05T09:01:00.000Z', 'task_completed', 'tt-good', 'Real task'),
+      rawEvent(iso(60_000), 'task_started', 'tt-good', 'Real task'),
+      rawEvent(iso(0), 'task_completed', 'tt-good', 'Real task'),
     ]);
     await writeFile(join(topicEventsDir(), 'notes.txt'), 'not a topic file\n', 'utf8');
 

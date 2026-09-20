@@ -2,6 +2,7 @@ import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   parseStopSteer,
+  stopWorkerByResource,
   stopTopicWorkers,
   stopThreadWorker,
   markTopicStopped,
@@ -94,11 +95,11 @@ describe('stopped-topic markers', () => {
   });
 });
 
-function makeDeps(entries: Array<{ pid: number; skill: string; descendants?: number[] }>, alivePids: Set<number>) {
+function makeDeps(entries: Array<{ pid: number; skill: string; descendants?: number[]; dispatchId?: string }>, alivePids: Set<number>) {
   const killed: number[] = [];
   const removed: number[] = [];
   const deps: StopDeps = {
-    list: async () => entries.map((e) => ({ pid: e.pid, spawnedBy: 1, worker: 'claude', skill: e.skill, startedAt: '', descendants: e.descendants })),
+    list: async () => entries.map((e) => ({ pid: e.pid, spawnedBy: 1, worker: 'claude', skill: e.skill, startedAt: '', descendants: e.descendants, dispatchId: e.dispatchId })),
     alive: (pid) => alivePids.has(pid),
     kill: (pid) => { killed.push(pid); alivePids.delete(pid); },
     removeEntry: async (pid) => { removed.push(pid); },
@@ -142,6 +143,88 @@ describe('stopTopicWorkers', () => {
     );
     await stopTopicWorkers(1, 2, deps);
     assert.deepEqual(killed, [10]);
+  });
+});
+
+describe('stopWorkerByResource (exact-key kill, shared by stopTopicWorkers/stopThreadWorker — AI-214 backend redesign)', () => {
+  it('kills only the exact resource match among topic/thread/task siblings', async () => {
+    const { deps, killed, removed } = makeDeps(
+      [
+        { pid: 10, skill: 'topic-1_2' },                            // the topic's own resource — unreachable
+        { pid: 20, skill: 'topic-1_2-th3', descendants: [21] },     // the target thread
+        { pid: 30, skill: 'topic-1_2-th30' },                        // similarly-prefixed sibling — unreachable
+        { pid: 40, skill: 'task-vi-x' },                             // a task-lane resource — unreachable
+      ],
+      new Set([10, 20, 21, 30, 40]),
+    );
+    assert.equal(await stopWorkerByResource('topic-1_2-th3', deps), 2);
+    assert.deepEqual(killed, [20, 21]);
+    assert.deepEqual(removed, [20]);
+  });
+
+  it('an empty resource string is a no-op returning 0 with no list() call', async () => {
+    const { deps, killed, removed } = makeDeps([{ pid: 10, skill: 'topic-1_2' }], new Set([10]));
+    assert.equal(await stopWorkerByResource('', deps), 0);
+    assert.deepEqual(killed, []);
+    assert.deepEqual(removed, []);
+  });
+
+  it('a throwing list() returns 0', async () => {
+    const throwing: StopDeps = {
+      list: async () => { throw new Error('registry unreadable'); },
+      alive: () => true,
+      kill: () => {},
+      removeEntry: async () => {},
+    };
+    assert.equal(await stopWorkerByResource('topic-1_2', throwing), 0);
+  });
+});
+
+describe('stopWorkerByResource — dispatch-identity guard (WP-5 D12)', () => {
+  it('two entries share the same skill; passing the expected dispatchId kills only that one', async () => {
+    const { deps, killed, removed } = makeDeps(
+      [
+        { pid: 10, skill: 'topic-1_2', dispatchId: 'aaa' },
+        { pid: 20, skill: 'topic-1_2', dispatchId: 'bbb' },
+      ],
+      new Set([10, 20]),
+    );
+    assert.equal(await stopWorkerByResource('topic-1_2', deps, 'aaa'), 1);
+    assert.deepEqual(killed, [10]);
+    assert.deepEqual(removed, [10]);
+  });
+
+  it('a dispatchId matching nothing kills 0 and never calls kill', async () => {
+    const { deps, killed } = makeDeps(
+      [
+        { pid: 10, skill: 'topic-1_2', dispatchId: 'aaa' },
+        { pid: 20, skill: 'topic-1_2', dispatchId: 'bbb' },
+      ],
+      new Set([10, 20]),
+    );
+    assert.equal(await stopWorkerByResource('topic-1_2', deps, 'ccc'), 0);
+    assert.deepEqual(killed, []);
+  });
+
+  it('omitting the expected dispatchId keeps backward-compatible behaviour (kills both)', async () => {
+    const { deps, killed } = makeDeps(
+      [
+        { pid: 10, skill: 'topic-1_2', dispatchId: 'aaa' },
+        { pid: 20, skill: 'topic-1_2', dispatchId: 'bbb' },
+      ],
+      new Set([10, 20]),
+    );
+    assert.equal(await stopWorkerByResource('topic-1_2', deps), 2);
+    assert.deepEqual(killed.sort(), [10, 20]);
+  });
+
+  it('an entry with no dispatchId is never killed when an id is supplied', async () => {
+    const { deps, killed } = makeDeps(
+      [{ pid: 10, skill: 'topic-1_2' }], // no dispatchId at all
+      new Set([10]),
+    );
+    assert.equal(await stopWorkerByResource('topic-1_2', deps, 'aaa'), 0);
+    assert.deepEqual(killed, []);
   });
 });
 

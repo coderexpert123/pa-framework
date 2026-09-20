@@ -17,6 +17,7 @@ import {
   buildFailoverKeyboard,
   buildRunNowKeyboard,
   buildQuestionKeyboard,
+  buildSuggestKeyboard,
   buildResendKeyboard,
   buildDlqReplayKeyboard,
   syntheticTextFor,
@@ -68,8 +69,8 @@ describe('parseCallbackData — valid examples (one per §3.2 row)', () => {
     assert.deepEqual(parseCallbackData('cf:n'), { prefix: 'cf', answer: 'n', raw: 'cf:n' });
   });
 
-  it('cc:menu (and the other 9 simple cc actions)', () => {
-    for (const action of ['menu', 'agent', 'model', 'effort', 'back', 'new', 'stop', 'ka', 'submit', 'discard']) {
+  it('cc:menu (and the other 8 simple cc actions)', () => {
+    for (const action of ['menu', 'agent', 'model', 'effort', 'back', 'new', 'stop', 'submit', 'discard']) {
       const p = parseCallbackData(`cc:${action}`);
       assert.deepEqual(p, { prefix: 'cc', action, raw: `cc:${action}` });
     }
@@ -272,10 +273,9 @@ describe('syntheticTextFor', () => {
     assert.equal(syntheticTextFor({ prefix: 'cc', action: 'set', setting: 'effort', value: 'high', raw: '' }), '/effort high');
   });
 
-  it('cc:new -> /new, cc:stop -> /stop, cc:ka -> /keepawake', () => {
+  it('cc:new -> /new, cc:stop -> /stop', () => {
     assert.equal(syntheticTextFor({ prefix: 'cc', action: 'new', raw: 'cc:new' }), '/new');
     assert.equal(syntheticTextFor({ prefix: 'cc', action: 'stop', raw: 'cc:stop' }), '/stop');
-    assert.equal(syntheticTextFor({ prefix: 'cc', action: 'ka', raw: 'cc:ka' }), '/keepawake');
   });
 
   it('null for menu-navigation and in-process-only prefixes', () => {
@@ -352,6 +352,38 @@ describe('keyboard builders stay within the 64-byte callback_data budget', () =>
       const kb = buildDlqReplayKeyboard(9999, confirmed);
       for (const d of allButtons(kb)) assert.ok(Buffer.byteLength(d) <= 64, d);
     }
+  });
+});
+
+// AI-234 (SPEC §3a): buildSuggestKeyboard — one button per chip, one row per
+// chip, callback_data is sr:<idx>, label is the chip text verbatim.
+describe('buildSuggestKeyboard (AI-234)', () => {
+  it('one row per chip, callback_data sr:<idx>, label = chip text', () => {
+    const items = ['Tell me more', 'Yes', 'No', 'Maybe later'];
+    const kb = buildSuggestKeyboard(items);
+    assert.equal(kb.inline_keyboard.length, 4, 'one row per chip');
+    for (let i = 0; i < items.length; i++) {
+      assert.equal(kb.inline_keyboard[i].length, 1, `row ${i} has exactly one button`);
+      assert.equal(kb.inline_keyboard[i][0].text, items[i], `row ${i} label is chip text`);
+      assert.equal(kb.inline_keyboard[i][0].callback_data, `sr:${i}`, `row ${i} callback_data is sr:${i}`);
+    }
+  });
+
+  it('all callback_data ≤64 bytes (index is tiny)', () => {
+    const kb = buildSuggestKeyboard(['A', 'B', 'C', 'D']);
+    for (const d of allButtons(kb)) assert.ok(Buffer.byteLength(d) <= 64, d);
+  });
+
+  it('empty items → empty keyboard', () => {
+    const kb = buildSuggestKeyboard([]);
+    assert.equal(kb.inline_keyboard.length, 0);
+  });
+
+  it('single chip → single row', () => {
+    const kb = buildSuggestKeyboard(['Go ahead']);
+    assert.equal(kb.inline_keyboard.length, 1);
+    assert.equal(kb.inline_keyboard[0][0].callback_data, 'sr:0');
+    assert.equal(kb.inline_keyboard[0][0].text, 'Go ahead');
   });
 });
 
@@ -626,6 +658,55 @@ describe('handleCallbackQuery', () => {
     });
   });
 
+  describe('sr: — AI-234 quick-reply chip press', () => {
+    function stateWithSuggestions(items: string[]): ConversationState {
+      return {
+        chat_id: 555,
+        last_update_id: 0,
+        thread_id: 0,
+        turns: [],
+        pending_suggestions: { items, message_id: 200 },
+      };
+    }
+
+    it('sr: press injects the chip text as a synthetic turn', async () => {
+      const deps = makeDeps({
+        loadTopicState: async () => stateWithSuggestions(['Tell me more', 'Yes']),
+      });
+      const outcome = await handleCallbackQuery(makeCb('sr:0'), deps);
+      assert.equal(outcome, 'sr:answered');
+      assert.equal(deps.injected.length, 1, 'exactly one synthetic turn');
+      assert.equal(deps.injected[0].message.text, 'Tell me more', 'the chip text verbatim');
+      assert.equal((deps.injected[0] as any).__synthetic, 'button');
+      assert.equal(deps.injected[0].message.chat.id, 555);
+    });
+
+    it('sr:1 injects the second chip', async () => {
+      const deps = makeDeps({
+        loadTopicState: async () => stateWithSuggestions(['Tell me more', 'Yes']),
+      });
+      const outcome = await handleCallbackQuery(makeCb('sr:1'), deps);
+      assert.equal(outcome, 'sr:answered');
+      assert.equal(deps.injected[0].message.text, 'Yes');
+    });
+
+    it('sr: gone when no pending suggestions', async () => {
+      const deps = makeDeps(); // default fixture state has no pending_suggestions
+      const outcome = await handleCallbackQuery(makeCb('sr:0'), deps);
+      assert.equal(outcome, 'sr:gone');
+      assert.equal(deps.injected.length, 0);
+    });
+
+    it('sr: index out of bounds answers with an alert and injects nothing', async () => {
+      const deps = makeDeps({
+        loadTopicState: async () => stateWithSuggestions(['Only one']),
+      });
+      const outcome = await handleCallbackQuery(makeCb('sr:5'), deps);
+      assert.equal(outcome, 'sr:bad');
+      assert.equal(deps.injected.length, 0);
+    });
+  });
+
   describe('qt: — task-lane question press (2026-09-02, handover Wave 2 SPEC §3.1 A.3)', () => {
     // Fresh PA_HOME per test: _resetTopicTasksForTest only clears the module
     // mutex — store FILES persist, and this file shares one PA_HOME.
@@ -828,7 +909,7 @@ describe('handleCallbackQuery', () => {
       const spawnCalls: Array<{ cmd: string; args: string[] }> = [];
       _setSpawnForTest(((cmd: string, args: string[]) => {
         spawnCalls.push({ cmd, args });
-        return { unref: () => {} } as any;
+        const child = { on: () => child, unref: () => {} }; return child as any;
       }) as any);
 
       const deps = makeDeps({ secrets: { PA_OPERATOR_USER_ID: '1' } });
@@ -846,7 +927,7 @@ describe('handleCallbackQuery', () => {
       const spawnCalls: unknown[] = [];
       _setSpawnForTest(((..._args: unknown[]) => {
         spawnCalls.push(_args);
-        return { unref: () => {} } as any;
+        const child = { on: () => child, unref: () => {} }; return child as any;
       }) as any);
       const deps = makeDeps({ secrets: { PA_OPERATOR_USER_ID: '1' } });
       const outcome = await handleCallbackQuery(makeCb('sk:run:push:c'), deps);
@@ -878,7 +959,7 @@ describe('handleCallbackQuery', () => {
       const spawnCalls: Array<{ cmd: string; args: string[] }> = [];
       _setSpawnForTest(((cmd: string, args: string[]) => {
         spawnCalls.push({ cmd, args });
-        return { unref: () => {} } as any;
+        const child = { on: () => child, unref: () => {} }; return child as any;
       }) as any);
       const deps = makeDeps({ secrets: { PA_OPERATOR_USER_ID: '1' } });
       const outcome = await handleCallbackQuery(makeCb('ru:rule-feedback-1:a'), deps);
@@ -896,7 +977,7 @@ describe('handleCallbackQuery', () => {
       const spawnCalls: Array<{ cmd: string; args: string[] }> = [];
       _setSpawnForTest(((cmd: string, args: string[]) => {
         spawnCalls.push({ cmd, args });
-        return { unref: () => {} } as any;
+        const child = { on: () => child, unref: () => {} }; return child as any;
       }) as any);
       const deps = makeDeps({ secrets: { PA_OPERATOR_USER_ID: '1' } });
 
@@ -918,7 +999,7 @@ describe('handleCallbackQuery', () => {
       const spawnCalls: Array<{ cmd: string; args: string[] }> = [];
       _setSpawnForTest(((cmd: string, args: string[]) => {
         spawnCalls.push({ cmd, args });
-        return { unref: () => {} } as any;
+        const child = { on: () => child, unref: () => {} }; return child as any;
       }) as any);
       const deps = makeDeps({ secrets: { PA_OPERATOR_USER_ID: '1' } });
 
@@ -937,7 +1018,7 @@ describe('handleCallbackQuery', () => {
       const spawnCalls: Array<{ cmd: string; args: string[] }> = [];
       _setSpawnForTest(((cmd: string, args: string[]) => {
         spawnCalls.push({ cmd, args });
-        return { unref: () => {} } as any;
+        const child = { on: () => child, unref: () => {} }; return child as any;
       }) as any);
       const deps = makeDeps({ secrets: { PA_OPERATOR_USER_ID: '1' } });
       const outcome = await handleCallbackQuery(makeCb('ch:r:removed-chain:c'), deps);
@@ -951,7 +1032,7 @@ describe('handleCallbackQuery', () => {
       const spawnCalls: Array<{ cmd: string; args: string[] }> = [];
       _setSpawnForTest(((cmd: string, args: string[]) => {
         spawnCalls.push({ cmd, args });
-        return { unref: () => {} } as any;
+        const child = { on: () => child, unref: () => {} }; return child as any;
       }) as any);
       const deps = makeDeps({ secrets: { PA_OPERATOR_USER_ID: '1' } });
       const outcome = await handleCallbackQuery(makeCb('wt:w-0123abcd:r'), deps);
@@ -959,6 +1040,194 @@ describe('handleCallbackQuery', () => {
       assert.equal(spawnCalls.length, 1);
       assert.equal(spawnCalls[0].cmd, 'pa');
       assert.deepEqual(spawnCalls[0].args, ['watch', 're-register', 'w-0123abcd']);
+    });
+  });
+
+  describe('ow: — orphan-edit disposition (AI-214 WP-B)', () => {
+    it('press spawns pa orphan <sub> <gid> with cwd=botCwd and toasts per action', async () => {
+      const spawnCalls: Array<{ cmd: string; args: string[]; opts: any }> = [];
+      _setSpawnForTest(((cmd: string, args: string[], opts: any) => {
+        spawnCalls.push({ cmd, args, opts });
+        const child = { on: () => child, unref: () => {} }; return child as any;
+      }) as any);
+      const deps = makeDeps({ secrets: { PA_OPERATOR_USER_ID: '1' } });
+
+      const land = await handleCallbackQuery(makeCb('ow:0123abcd4567:l'), deps);
+      assert.equal(land, 'ow:l');
+      assert.equal(spawnCalls.length, 1);
+      assert.equal(spawnCalls[0].cmd, 'pa');
+      assert.deepEqual(spawnCalls[0].args, ['orphan', 'land', '0123abcd4567']);
+      assert.equal(spawnCalls[0].opts.cwd, deps.botCwd);
+      let answerCalls = fetchStub.calls.filter((c) => c.url.includes('answerCallbackQuery'));
+      assert.equal(answerCalls.length, 1);
+      assert.equal(answerCalls[0].body.text, '📥 Landing…');
+
+      const keep = await handleCallbackQuery(makeCb('ow:0123abcd4567:k'), deps);
+      assert.equal(keep, 'ow:k');
+      assert.deepEqual(spawnCalls[1].args, ['orphan', 'keep', '0123abcd4567']);
+      answerCalls = fetchStub.calls.filter((c) => c.url.includes('answerCallbackQuery'));
+      assert.equal(answerCalls[1].body.text, '💤 Keeping dirty 24h');
+
+      const diff = await handleCallbackQuery(makeCb('ow:0123abcd4567:d'), deps);
+      assert.equal(diff, 'ow:d');
+      assert.deepEqual(spawnCalls[2].args, ['orphan', 'diff', '0123abcd4567']);
+      answerCalls = fetchStub.calls.filter((c) => c.url.includes('answerCallbackQuery'));
+      assert.equal(answerCalls[2].body.text, '📄 Showing diff');
+    });
+
+    it('fire-and-forget: unref with ONE error listener — a spawn failure logs, never dies silent (WB-304)', async () => {
+      let unrefCalled = false;
+      const listenerNames: string[] = [];
+      // on() must be chainable — real children return themselves from .on().
+      const mockChild = {
+        unref: () => {
+          unrefCalled = true;
+        },
+        on: (ev: string) => {
+          listenerNames.push(ev);
+          return mockChild;
+        },
+        once: (ev: string) => {
+          listenerNames.push(ev);
+          return mockChild;
+        },
+      };
+      _setSpawnForTest((() => mockChild as any) as any);
+      const deps = makeDeps({ secrets: { PA_OPERATOR_USER_ID: '1' } });
+      const outcome = await handleCallbackQuery(makeCb('ow:0123abcd4567:l'), deps);
+      assert.equal(outcome, 'ow:l');
+      assert.equal(unrefCalled, true, 'child detached from the event loop');
+      assert.deepEqual(listenerNames, ['error'], 'exactly the spawn-error listener — a spawn failure logs, never silent (WB-304)');
+      const answerCalls = fetchStub.calls.filter((c) => c.url.includes('answerCallbackQuery'));
+      assert.equal(answerCalls.length, 1, 'the press is still answered');
+    });
+  });
+
+  describe('auth: — opens the pending link (auth broker Phase A)', () => {
+    it('a resolvable request sends the URL byte-identical via sendPlainMessage (no parse_mode)', async () => {
+      const url = 'https://accounts.google.com/o/oauth2/v2/auth?client_id=abc-def_ghi&state=xyz';
+      const deps = makeDeps({ authRequestUrl: async () => url });
+      const outcome = await handleCallbackQuery(makeCb('auth:google:ir-0123456789ab'), deps);
+      assert.equal(outcome, 'auth:opened');
+      const answerCalls = fetchStub.calls.filter((c) => c.url.includes('answerCallbackQuery'));
+      assert.equal(answerCalls.length, 1);
+      assert.equal(answerCalls[0].body.text, '🔐 Opening the authorization link…');
+      const sendCalls = fetchStub.calls.filter((c) => c.url.includes('/sendMessage'));
+      assert.equal(sendCalls.length, 1);
+      assert.equal(sendCalls[0].body.text, url, 'the URL must round-trip byte-identical');
+      assert.equal('parse_mode' in sendCalls[0].body, false, 'no parse_mode key — sendPlainMessage, not sendMessage');
+    });
+
+    it('an unresolvable request answers the callback and sends nothing', async () => {
+      const deps = makeDeps({ authRequestUrl: async () => null });
+      const outcome = await handleCallbackQuery(makeCb('auth:google:ir-0123456789ab'), deps);
+      assert.equal(outcome, 'auth:unresolved');
+      const answerCalls = fetchStub.calls.filter((c) => c.url.includes('answerCallbackQuery'));
+      assert.equal(answerCalls.length, 1, 'the press is still answered');
+      const sendCalls = fetchStub.calls.filter((c) => c.url.includes('/sendMessage'));
+      assert.equal(sendCalls.length, 0, 'nothing sent when the link cannot be resolved');
+    });
+  });
+
+  describe('auth: — the REAL default reader against a realistic fixture (deep-recheck 2026-09-10)', () => {
+    // The two tests above only ever exercise the INJECTED authRequestUrl seam
+    // — never defaultAuthRequestUrl itself. That let a real bug ship: the
+    // §3.3 broker row (`~/.pa/auth/requests/<id>.json`) NEVER carries
+    // `auth_url` — neither real writer's AuthRequestRow shape
+    // (`pa/src/lib/auth/store.ts`, `projects/voice-inbox/src/auth-providers.ts`)
+    // has that field. `auth_url` is minted into the LEDGER's
+    // `input_requests.params_json` by oauth-mint.ts / `pa auth request --url`.
+    // defaultAuthRequestUrl used to read the broker-row file and therefore
+    // always resolved null in production. Fixed via
+    // `voiceInboxInputRequestAuthUrl` in `pa/src/lib/voice-inbox-ledger.ts`.
+    let paHome: string;
+    let savedPaHome: string | undefined;
+    let Database: any;
+
+    const REQUEST_ID = 'ir-0123456789ab';
+    const AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth?client_id=abc-def&state=xyz';
+
+    beforeEach(async () => {
+      savedPaHome = process.env.PA_HOME;
+      paHome = await mkdtemp(join(tmpdir(), 'tgbot-auth-url-'));
+      process.env.PA_HOME = paHome;
+      const require = createRequire(import.meta.url);
+      // Load better-sqlite3 from pa/node_modules (relative to dist/tests/) —
+      // same idiom as the "Decision capture" describe block below.
+      Database = require(join(fileURLToPath(import.meta.url), '../../../../../pa/node_modules/better-sqlite3'));
+    });
+
+    afterEach(async () => {
+      if (savedPaHome === undefined) delete process.env.PA_HOME;
+      else process.env.PA_HOME = savedPaHome;
+      await rm(paHome, { recursive: true, force: true });
+    });
+
+    /** Builds the REALISTIC on-disk state: the ledger's `input_requests` row
+     *  carries `auth_url` in `params_json` (the only real writer), and the
+     *  §3.3 broker-row file also exists, exactly as both real writers shape
+     *  it — WITHOUT an `auth_url` field. */
+    async function buildRealisticFixture(): Promise<void> {
+      const ledgerDir = join(paHome, 'voice-inbox');
+      await mkdir(ledgerDir, { recursive: true });
+      const db = new Database(join(ledgerDir, 'ledger.sqlite'));
+      try {
+        db.exec('CREATE TABLE input_requests (request_id TEXT PRIMARY KEY, params_json TEXT NOT NULL)');
+        db.prepare('INSERT INTO input_requests (request_id, params_json) VALUES (?, ?)').run(
+          REQUEST_ID,
+          JSON.stringify({ provider: 'google', auth_url: AUTH_URL })
+        );
+      } finally {
+        db.close();
+      }
+      const requestsDir = join(paHome, 'auth', 'requests');
+      await mkdir(requestsDir, { recursive: true });
+      await writeFile(
+        join(requestsDir, `${REQUEST_ID}.json`),
+        JSON.stringify({
+          request_id: REQUEST_ID, task_id: 'vi-0123456789ab', tenant_id: 't-1', shape: 'S1',
+          provider: 'google', kind: 'oauth', status: 'pending',
+          created_at: '2026-09-10T00:00:00.000Z', expires_at: '2026-09-10T12:00:00.000Z',
+          state: null, code_verifier: null, redirect_uri: null, auth_id: null,
+          answer_pointer: null, delivered_at: null,
+        }),
+        'utf8'
+      );
+    }
+
+    it('resolves auth_url from the LEDGER and sends it, with no authRequestUrl override', async () => {
+      await buildRealisticFixture();
+      const fetchStub = stubFetch();
+      try {
+        const deps = makeDeps(); // no authRequestUrl override — exercises the real defaultAuthRequestUrl
+        const outcome = await handleCallbackQuery(makeCb(`auth:google:${REQUEST_ID}`), deps);
+        assert.equal(outcome, 'auth:opened');
+        const sendCalls = fetchStub.calls.filter((c) => c.url.includes('/sendMessage'));
+        assert.equal(sendCalls.length, 1, 'the real reader must resolve the URL and send it');
+        assert.equal(sendCalls[0].body.text, AUTH_URL);
+      } finally {
+        fetchStub.restore();
+      }
+    });
+
+    it('proves the OLD file-based reader would have failed on this exact realistic fixture', async () => {
+      await buildRealisticFixture();
+      // The pre-fix logic, verbatim: read the broker-row FILE and look for
+      // `auth_url` there. Against the real §3.3 shape (no auth_url field
+      // ever written by either real writer), this always resolves null —
+      // the bug this fix closes.
+      const oldReaderResult = await (async () => {
+        try {
+          const raw = await readFile(join(paHome, 'auth', 'requests', `${REQUEST_ID}.json`), 'utf8');
+          const parsed = JSON.parse(raw) as { auth_url?: unknown };
+          return typeof parsed.auth_url === 'string' && parsed.auth_url.startsWith('https://')
+            ? parsed.auth_url
+            : null;
+        } catch {
+          return null;
+        }
+      })();
+      assert.equal(oldReaderResult, null, 'the old file-based reader never finds auth_url on a realistic fixture');
     });
   });
 
@@ -1476,7 +1745,7 @@ describe('AI-210 — picker stage-then-apply (cc:submit / cc:discard)', () => {
     return markup.inline_keyboard.flat().map((b: any) => b.callback_data);
   }
 
-  const TOP_LEVEL_DATA = ['cc:agent', 'cc:model', 'cc:effort', 'cc:new', 'cc:stop', 'cc:ka'];
+  const TOP_LEVEL_DATA = ['cc:agent', 'cc:model', 'cc:effort', 'cc:new', 'cc:stop'];
 
   beforeEach(() => {
     fetchStub = stubFetch();

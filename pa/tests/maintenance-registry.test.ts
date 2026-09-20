@@ -12,17 +12,21 @@ describe('MAINTENANCE_JOBS registry', () => {
     assert.doesNotThrow(() => validateRegistry([...MAINTENANCE_JOBS]));
   });
 
-  it('registry declares 32 jobs (23 pa + 9 bot) with the expected names', () => {
-    assert.equal(MAINTENANCE_JOBS.length, 32);
+  it('registry declares 40 jobs (31 pa + 9 bot) with the expected names', () => {
+    assert.equal(MAINTENANCE_JOBS.length, 40);
     const names = MAINTENANCE_JOBS.map((j) => j.name).sort();
     assert.deepEqual(names, [
       'alert-census',
       'alert-digest',
       'alert-state-gc',
       'archive-prune',
+      'auth-answer-reap',
+      'backlog-fragments-drain',
       'blackboard-purge',
       'bot-log-rotation-check',
       'bot-self-restart',
+      'bus-drain',
+      'bus-prune',
       'c-disk-floor-watchdog',
       'clobber-sentinel',
       'daily-recon',
@@ -30,6 +34,9 @@ describe('MAINTENANCE_JOBS registry', () => {
       'delivered-store-compact',
       'grounding-check',
       'model-override-sweep',
+      'model-router-cooldown-normalize',
+      'nonpaged-pool-watch',
+      'orphan-edit-watch',
       'orphan-worker-reap',
       'proxy-pool-refresh',
       'recall-index',
@@ -44,6 +51,7 @@ describe('MAINTENANCE_JOBS registry', () => {
       'skill-log-rotate',
       'staleness-check',
       'voice-attachment-gc',
+      'voice-inbox-fallback',
       'watch-jobs-runner',
       'weekly-learn',
       'worker-edit-audit-sweep',
@@ -51,8 +59,8 @@ describe('MAINTENANCE_JOBS registry', () => {
     ]);
   });
 
-  it('splits jobs correctly by host (23 pa, 9 bot)', () => {
-    assert.equal(jobsForHost('pa').length, 23);
+  it('splits jobs correctly by host (31 pa, 9 bot)', () => {
+    assert.equal(jobsForHost('pa').length, 31);
     assert.equal(jobsForHost('bot').length, 9);
     const botNames = jobsForHost('bot').map((j) => j.name).sort();
     assert.deepEqual(botNames, [
@@ -76,6 +84,26 @@ describe('MAINTENANCE_JOBS registry', () => {
     assert.deepEqual(job!.targets, [], 'phase 1 is a read-only sweep — no retention targets');
     assert.equal(job!.destructive, false);
     assert.equal(job!.shedWhenDegraded, true);
+  });
+
+  it('orphan-edit-watch registered for pa with a 24h cadence and no targets', () => {
+    const job = findJob('orphan-edit-watch');
+    assert.ok(job, 'orphan-edit-watch should exist');
+    assert.equal(job!.host, 'pa');
+    assert.equal(resolveEvery(job!), 86_400_000);
+    assert.deepEqual(job!.targets, [], 'surface-only — own-state writes are not retention');
+    assert.equal(job!.destructive, false);
+    assert.equal(job!.shedWhenDegraded, true);
+  });
+
+  it('backlog-fragments-drain registered for pa with a 3-minute cadence and no targets', () => {
+    const job = findJob('backlog-fragments-drain');
+    assert.ok(job, 'backlog-fragments-drain should exist');
+    assert.equal(job!.host, 'pa');
+    assert.equal(resolveEvery(job!), 180_000);
+    assert.deepEqual(job!.targets, [], 'surface-only — own-state writes are not retention');
+    assert.equal(job!.destructive, false);
+    assert.equal(job!.shedWhenDegraded, false);
   });
 
   it('recall-index is declared for host pa with a 10-minute cadence and no targets', () => {
@@ -178,12 +206,33 @@ describe('MAINTENANCE_JOBS registry', () => {
     assert.ok(job!.targets[0].note, 'row-level expiry must be declared in the target note');
   });
 
+  it('model-router-cooldown-normalize is declared for host pa, daily, destructive, shadow + telemetry targets', () => {
+    const job = findJob('model-router-cooldown-normalize');
+    assert.ok(job, 'model-router-cooldown-normalize should exist');
+    assert.equal(job!.host, 'pa');
+    assert.equal(resolveEvery(job!), 86_400_000);
+    assert.equal(job!.destructive, true);
+    assert.equal(job!.shedWhenDegraded, true);
+    assert.equal(job!.targets.length, 2);
+    assert.ok(job!.targets[0].match.test('model-router-shadow.jsonl'));
+    assert.equal(job!.targets[0].match.test('model-router-shadow.jsonl.bak'), false);
+    assert.equal(job!.targets[0].action, 'delete');
+    assert.equal(job!.targets[0].ownership, 'pa-owned');
+    assert.ok(job!.targets[1].match.test('model-router-telemetry.jsonl'));
+    assert.equal(job!.targets[1].match.test('model-router-telemetry.jsonl.bak'), false);
+    assert.equal(job!.targets[1].action, 'delete');
+    assert.equal(job!.targets[1].ownership, 'pa-owned');
+  });
+
   it('locks the declared destructive set across both hosts', () => {
     const destructive = MAINTENANCE_JOBS.filter((j) => j.destructive).map((j) => j.name).sort();
     assert.deepEqual(destructive, [
       'alert-state-gc',
       'archive-prune',
+      'auth-answer-reap',
+      'bus-prune',
       'delivered-store-compact',
+      'model-router-cooldown-normalize',
       'orphan-worker-reap',
       'reservation-gc',
       'session-gc',
@@ -233,11 +282,21 @@ describe('MAINTENANCE_JOBS registry', () => {
       doc.includes('extending a registry entry (a drain source, a recon phase) beats adding a job'),
       'the admission rule sentence must stay in docs/maintenance-jobs.md',
     );
-    // The counts line states the numbers' history in one line (SPEC §5,
-    // named edge 4): the current total plus what each growth step replaced.
+    // WP-C (2026-09-12): the backlog-fragments-drain catalog section is
+    // documented (WP-E lands before this gate in the build order).
     assert.ok(
-      doc.includes('32 (23 pa + 9 bot)') && doc.includes('31 (22 pa + 9 bot)') && doc.includes('32 (22 pa + 10 bot)'),
-      'the counts line must carry the current total AND the replaced ones',
+      doc.includes('backlog-fragments-drain'),
+      'the drain must be documented in docs/maintenance-jobs.md',
+    );
+    // The counts line states the current registry total (the 2026-09-13 trim
+    // moved the per-join history to git log). The numbers are derived from the
+    // registry itself, so the doc pin cannot go stale at the next job addition.
+    const paHostCount = MAINTENANCE_JOBS.filter((j) => j.host === 'pa').length;
+    const botHostCount = MAINTENANCE_JOBS.filter((j) => j.host === 'bot').length;
+    assert.ok(
+      doc.includes(`Registry total, both hosts: ${MAINTENANCE_JOBS.length} (${paHostCount} pa + ${botHostCount} bot)`) &&
+        doc.includes(`${paHostCount} pa-host jobs`),
+      'the counts line must carry the current registry-derived totals',
     );
     // The consolidated family has its own section naming every source.
     for (const needle of ['`queue-drain`', '`requeue`', '`reminder-resume`', '`topic-task`', '`dlq`']) {

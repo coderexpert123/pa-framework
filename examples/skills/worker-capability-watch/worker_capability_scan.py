@@ -56,7 +56,7 @@ Classification
   INFO      a CLI version changed, new flags appeared, or the CLI prints values
             config does not know about. Recorded and reported, never paged.
 
-Usage:  python worker_capability_scan.py
+Usage:  python3 worker_capability_scan.py   # (Windows: python worker_capability_scan.py)
 """
 from __future__ import annotations
 
@@ -795,7 +795,10 @@ def diff_worker(name: str, worker: dict, probe: dict, prev: dict | None) -> tupl
 
     if prev and probe.get("version") and prev.get("version") and probe["version"] != prev["version"]:
         findings.append(finding(INFO, name, "version-changed",
-                                f"CLI version {prev['version']} -> {probe['version']}."))
+                                f"CLI version {prev['version']} -> {probe['version']}. "
+                                f"Recommended action: skim the {name} changelog/release notes for "
+                                f"behavior or flag changes (no config.yaml edit needed unless a "
+                                f"new/stale-value finding below says otherwise)."))
 
     # Value catalogue: only compare where config has actually committed to a
     # `values:` hint. An absent list means "deliberately undeclared" (model names
@@ -812,12 +815,17 @@ def diff_worker(name: str, worker: dict, probe: dict, prev: dict | None) -> tupl
         if added:
             findings.append(finding(INFO, name, "new-values",
                                     f"`{setting}` accepts value(s) config does not list: "
-                                    + ", ".join(f"`{v}`" for v in added)))
+                                    + ", ".join(f"`{v}`" for v in added)
+                                    + f" — Recommended action: add these to config.yaml's "
+                                    f"tunables.{setting}.values for `{name}` (edit by hand; "
+                                    f"nothing is auto-added)."))
         if gone:
             findings.append(finding(INFO, name, "stale-values",
                                     f"`{setting}` value(s) config lists are no longer offered: "
                                     + ", ".join(f"`{v}`" for v in gone)
-                                    + " (hint only — nothing is auto-removed)."))
+                                    + f" — Recommended action: confirm these were retired "
+                                    f"upstream, then remove them from config.yaml's "
+                                    f"tunables.{setting}.values by hand (nothing is auto-removed)."))
 
     # MERGE, do not overwrite: a setting this run did not (re)discover — e.g.
     # `agy models` came back empty this one time — must fall back to the

@@ -2,7 +2,7 @@ import { readFile, stat, open, readdir } from 'fs/promises';
 import { join } from 'path';
 import { resolveStateDir, findLatestStateFile } from './state-monitor.js';
 import type { RateLimitParseResult } from './rate-limits.js';
-import { DEFAULT_COOLDOWN_MINUTES } from './rate-limits.js';
+import { DEFAULT_COOLDOWN_MINUTES, BURST_RETRY_COOLDOWN_S } from './rate-limits.js';
 import { formatIST } from './ist.js';
 
 export interface ApiErrorEvent {
@@ -197,6 +197,54 @@ export async function readClaudeSessionErrors(
  */
 export const ACCOUNT_EXHAUSTED_COOLDOWN_MINUTES = 6 * 60;
 
+/**
+ * Absence-ladder probe cooldown (operator ruling 2026-09-13): a fresh 429
+ * whose message states NEITHER an end time NOR a recognizable class gets this
+ * short probe rest plus a loud unparseable-log row — never a fabricated long
+ * "usage-limit-session" window again (the ghost-cooldown factory that parked
+ * threads against workers which were not actually windowed). The park-cycle
+ * retry IS the probe: it either recovers or re-records with fresh evidence.
+ */
+export const RATE_LIMIT_PROBE_COOLDOWN_MIN = 15;
+
+/**
+ * Proxy-banner noise (2026-09-13): zclaude output carrying these CLI banners
+ * is not rate-limit evidence at all — it is auth/config noise riding in the
+ * worker stream that, treated as 429 evidence, fed the transient gate, the
+ * cooldown fallback and the unparseable log (4 rows on its first day).
+ * Contains-check on the two exact CLI literals suffices; both are fixed
+ * strings the CLI itself prints.
+ */
+const PROXY_BANNER_NOISE = /claude\.ai connectors are disabled|unrecognized_model/;
+
+export function isProxyBannerNoise(text: string): boolean {
+  return !!text && PROXY_BANNER_NOISE.test(text);
+}
+
+/**
+ * Time-hint heuristic (2026-09-13): the message LOOKS like it carries timing
+ * information the parser failed to read. Its unparseable-log rows (reason
+ * 'time-hint-unparsed') feed the hourly retrospective digest, so a new
+ * provider phrasing surfaces within the hour — and feeds the parser
+ * self-heal — instead of silently falling to the probe cooldown forever.
+ */
+const TIME_HINT_RE =
+  /\bresets?\b|\b(?:am|pm)\b|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{1,2}|\b\d+\s*(?:minute|hour|day)s?\b/i;
+
+export function hasTimeHint(text: string): boolean {
+  return !!text && TIME_HINT_RE.test(text);
+}
+
+/**
+ * Burst phrasing (2026-09-13): a 429 with NO stated end whose text is still
+ * recognizably a per-request-rate limit ("[1302] Rate limit reached for
+ * requests", "too many requests") is burst-class — retrying shortly is the
+ * correct response. recordRateLimit maps this classification to the 90s
+ * retry cooldown plus a slot-governor shed; the classifier returns that same
+ * duration directly so the value is right even when read without recording.
+ */
+const BURST_PHRASING_RE = /\[\s*1302\s*\]|rate limit|too many requests/i;
+
 // Zhipu (GLM) returns `[1113][Insufficient balance or no resource package...]`
 // for an exhausted account balance. Either half of the signature is sufficient
 // evidence ONCE we already know we are looking at a 429 error payload.
@@ -297,6 +345,40 @@ function extractMinutesFromText(text: string): { minutes: number; source: 'zhipu
     };
   }
 
+  // 4. Weekly/monthly limits state a full date: "resets Sep 15, 5:30pm
+  // (Asia/Kolkata)". Case 3 cannot match the "Sep 15," prefix (it wants
+  // digits straight after "resets"), so this clearly-stated end time used to
+  // fall through to the no-time fallback and got fabricated into a cooldown
+  // (2026-09-13 ghost-cooldown incident). Parsed in LOCAL time — the trailing
+  // "(Asia/Kolkata)" annotation is informational and this machine runs IST;
+  // an unparseable month/day or a target still in the past after the yearly
+  // rollover falls through to null (the probe ladder handles it loudly).
+  const datedResetMatch = text.match(
+    /resets\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{1,2}),?\s+(\d{1,2}):(\d{2})\s*(am|pm)/i,
+  );
+  if (datedResetMatch) {
+    const [, monStr, dStr, hStr, mStr, ampm] = datedResetMatch;
+    const monthIdx = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
+      .indexOf(monStr.toLowerCase());
+    if (monthIdx >= 0) {
+      let targetH = parseInt(hStr, 10);
+      const targetM = parseInt(mStr, 10);
+      if (ampm.toLowerCase() === 'pm' && targetH < 12) targetH += 12;
+      if (ampm.toLowerCase() === 'am' && targetH === 12) targetH = 0;
+      const now = new Date();
+      const target = new Date(now.getFullYear(), monthIdx, parseInt(dStr, 10), targetH, targetM, 0, 0);
+      if (target <= now) target.setFullYear(target.getFullYear() + 1);
+      const diffMs = target.getTime() - now.getTime();
+      if (diffMs > 0) {
+        return {
+          minutes: Math.ceil(diffMs / 60000),
+          source: 'claude-text',
+          resetsAtIST: formatIST(target),
+        };
+      }
+    }
+  }
+
   return null;
 }
 
@@ -351,6 +433,13 @@ export function classifyClaudeErrors(
 
   const latest = fresh[fresh.length - 1];
 
+  // 2b. Proxy-banner noise is not rate-limit evidence (2026-09-13): a latest
+  // event dominated by the CLI's auth/config banners is treated as absent —
+  // no transient no-op, no cooldown, no fallback, nothing logged.
+  if (isProxyBannerNoise(latest.message)) {
+    return null;
+  }
+
   // 3. Terminal account-balance fault — checked BEFORE the retry-budget gate.
   // Retrying an exhausted balance is pointless: it is not a window that reopens,
   // it is a bill that has to be paid. Returning the transient no-op here would
@@ -384,9 +473,26 @@ export function classifyClaudeErrors(
       raw: latest.message,
     };
   }
+
+  // 6. No stated end — the absence ladder (operator ruling 2026-09-13; the
+  // fabricated 60-minute 'usage-limit-session' fallback is deleted):
+  //    - burst phrasing, no time → burst class; recordRateLimit turns this
+  //      classification into the 90s retry cooldown plus a slot-governor shed;
+  //    - anything else → the short probe cooldown, and the caller's claude
+  //      branch writes the loud unparseable-log row ('time-hint-unparsed'
+  //      when the text looks like it carried timing the parser missed, else
+  //      'unknown-pattern').
+  if (BURST_PHRASING_RE.test(latest.message)) {
+    return {
+      minutes: BURST_RETRY_COOLDOWN_S / 60,
+      classification: 'quota-per-minute',
+      source: 'claude-session',
+      raw: latest.message,
+    };
+  }
   return {
-    minutes: 60,
-    classification: 'usage-limit-session',
+    minutes: RATE_LIMIT_PROBE_COOLDOWN_MIN,
+    classification: 'unknown',
     source: 'claude-session',
     raw: latest.message,
   };

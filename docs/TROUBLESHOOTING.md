@@ -34,6 +34,13 @@ node pa/dist/bin/pa.js bot restart
 
 This writes a fresh lock and spawns a new bot via your supervisor.
 
+### secrets-backup FAIL — "PA_GEMINI_SHIM_DIR=... is set but the directory does not exist"
+
+The weekly secrets backup refuses to run when the shim directory you configured
+is missing. It never guesses a path. Fix the `PA_GEMINI_SHIM_DIR` value in
+`~/.pa/secrets.env`, or unset it if this machine has no CLI wrapper shims — the
+backup then skips that section and still bundles your secrets.
+
 ### `blackboard` WARN/FAIL — "stale locks > 4h"
 
 Workers died without releasing their locks. Reasons: SIGKILL by OS, system reboot, crash mid-execution.
@@ -72,14 +79,23 @@ node pa/dist/bin/pa.js bot rotate
 
 Or manually move `~/.pa/logs/telegram-bot.log` to `~/.pa/archive/`.
 
-### `workers` FAIL — "all unavailable"
+### `workers` WARN — "all unavailable"
 
-None of your configured workers passed their `check`. Causes:
+None of your configured workers passed their `check`. Since 2026-09-20 this is
+WARN, not FAIL: zero installed worker CLIs is the documented degraded floor —
+the assistant still runs and delivers to `~/.pa/outbox/`; it just can't think
+yet (docs/INSTALL.md §3 step 5). To make it think:
 
 1. **Worker CLI not installed** — install at least one (Claude Code, openai-codex).
 2. **`command` path wrong** in `~/.pa/config.yaml` — see [`WORKERS_GUIDE.md`](WORKERS_GUIDE.md).
-3. **All workers cooling** (rate-limited) — wait, or `rm ~/.pa/rate-limit-state.json` to clear cooldowns (only if you're certain they're stale).
-4. **PATH issue** — if commands work in a fresh shell but `pa workers` reports unavailable, the bot's environment may not include the right PATH. Set `command` to an absolute path.
+3. **PATH issue** — if commands work in a fresh shell but `pa workers` reports unavailable, the bot's environment may not include the right PATH. Set `command` to an absolute path.
+
+### `workers` FAIL — "all available workers cooling / rate-limited"
+
+Every worker that exists is in rate-limit cooldown at once — a real runtime
+outage (unlike all-unavailable, which is the degraded floor). Wait, or
+`rm ~/.pa/rate-limit-state.json` to clear cooldowns (only if you're certain
+they're stale).
 
 ### `workers` WARN — "X cooling"
 
@@ -233,9 +249,14 @@ All commands are cross-platform. Per-platform backends:
 |---------|---------|-------|-------|
 | `pa schedules sync` | Windows Task Scheduler | crontab | crontab |
 | Process tree / bgtasks | PowerShell + CIM | `ps`/`pgrep` | `ps`/`pgrep` |
-| `/keepawake` | `SetThreadExecutionState` (PS helper) | `caffeinate -s` | `systemd-inhibit` |
+| Local notification (`pa ping` toast leg) | PowerShell WinRT toast | `osascript` notification | `notify-send` |
 
-> **Linux keepawake caveat:** requires systemd. On non-systemd distros `/keepawake` will fail to start; see "Unsupported OS" below.
+> **Attention loud-degraded floor:** when the local-notification leg cannot fire
+> (an unsupported platform, or a failed `osascript`/`notify-send` spawn), the
+> attention channel degrades LOUDLY, never silently: it logs a WARN and writes
+> the message to `~/.pa/outbox/attention-<timestamp>-<title>.md`. If you expected
+> a desktop notification and none arrived, check the outbox and the log — the
+> message was never dropped.
 
 ### Unsupported OS (FreeBSD, Alpine, musl, other POSIX)
 
@@ -273,18 +294,6 @@ pa/src/process-tree.ts:getChildPids() using your platform's process-listing tool
 ```
 
 Adaptation point: `pa/src/process-tree.ts` — two functions: `getChildPids()` (immediate children) and `getDescendantPids()` (full subtree via BFS). Both have complete Windows and POSIX implementations in the same file.
-
-**Needs `caffeinate` / `systemd-inhibit` — throws with exact instructions:**
-
-`/keepawake` (bot sleep-prevention toggle) is the only feature with no universal POSIX fallback. On an unknown OS the toggle throws:
-
-```
-keepawake not supported on platform "<os>". To add support, implement a new branch
-in projects/telegram-bot/src/keepawake.ts inside startKeepAwake(): spawn a background
-process that prevents sleep and can be killed by PID (or process group if it forks).
-```
-
-The pattern is identical for every OS: spawn a sleep-inhibitor process, store its PID, kill it in `stopKeepAwake()`. If your tool forks children (as `systemd-inhibit` does), kill the process group (`process.kill(-pid, 'SIGTERM')`); if it's a single process (as `caffeinate` is), kill by PID. Both reference implementations are in the same file.
 
 ### Path separators
 

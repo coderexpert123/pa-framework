@@ -1,0 +1,47 @@
+# pa-framework — annotated ~/.pa/auth-profiles.yaml template.
+#
+# `pa auth learn --provider <name> --shape S1..S5 --command <text> [...]`
+# writes rows into ~/.pa/auth-profiles.yaml — one entry per provider,
+# replaced whole on a re-learn (never merged). See docs/auth-broker.md for
+# the full auth-broker reference (shapes, the pa auth CLI, the callback
+# endpoint). Copy the rows you need; this file is illustrative only — no
+# operator ids, no machine paths, no real provider credentials.
+#
+# Fields:
+#   shape           one of S1..S5 (see docs/auth-broker.md § "the five shapes")
+#   command         the exact command a worker runs to trigger this provider's
+#                   own login/auth flow
+#   env             (optional) env var the resulting credential is read from
+#   credential_path (optional) where the credential ultimately lives —
+#                   "keyring", a config file path, or similar
+#   expires_days    (optional) how long the credential is good for, 0 = no
+#                   fixed expiry
+#   notes           (optional) anything a future operator needs to know
+#   learned_at      ISO timestamp — set automatically by `pa auth learn`
+
+github:
+  shape: S2
+  command: gh auth login --with-token
+  env: GH_TOKEN
+  credential_path: keyring
+  expires_days: 0
+  notes: device flow must be enabled per app
+  learned_at: 2026-09-10T06:00:00.000Z
+
+cloudflare:
+  shape: S4
+  command: wrangler login
+  env: CLOUDFLARE_API_TOKEN
+  credential_path: ~/.wrangler/config/default.toml
+  expires_days: 0
+  notes: token-based; re-run wrangler login if it expires
+  learned_at: 2026-09-10T06:00:00.000Z
+
+some-api:
+  shape: S4
+  command: some-cli auth set-key
+  env: SOME_API_KEY
+  credential_path: keyring
+  expires_days: 90
+  notes: rotate quarterly per the provider's dashboard
+  learned_at: 2026-09-10T06:00:00.000Z

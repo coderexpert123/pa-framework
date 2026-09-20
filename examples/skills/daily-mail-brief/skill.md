@@ -14,7 +14,7 @@ telegram_output:
   chat_id: '${TELEGRAM_BRIEFING_CHAT_ID}'
   thread_id: '${TELEGRAM_DAILY_BRIEFING_THREAD_ID}'
   token_secret: TELEGRAM_BOT_TOKEN
-cmd: "python scripts/run_brief.py"
+cmd: "python3 scripts/run_brief.py || python scripts/run_brief.py"
 ---
 
 # Daily mail brief

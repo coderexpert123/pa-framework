@@ -31,7 +31,7 @@ import decisions as decisions_lib  # import-safe (WP-B); PA_HOME resolves inside
 # (the 2026-08-23 alerts-week review, internal, §2.2).
 AGY_CMD = os.environ.get("AGY_CMD", "D:/gemini-shim/agy.cmd")
 AGY_MODEL = os.environ.get("DAILY_MAIL_BRIEF_MODEL", "gemini-3.7-flash-high")
-AGY_PRINT_TIMEOUT = os.environ.get("DAILY_MAIL_BRIEF_PRINT_TIMEOUT", "10m")
+AGY_PRINT_TIMEOUT = os.environ.get("DAILY_MAIL_BRIEF_PRINT_TIMEOUT", "15m")
 
 # Fallback inner-LLM CLI, used when agy exhausts its quota: the next healthy
 # worker of the failover chain in ~/.pa/config.yaml (agy → codex → zclaude →
@@ -61,7 +61,7 @@ def _duration_to_seconds(text: str, default: float) -> float:
 # boot/shutdown margin LOOSER than the CLI's own bound so agy's internal
 # timeout normally fires first and its diagnostic stderr (auth text, quota
 # text) reaches the retry loop instead of being cut off mid-flight.
-LLM_SUBPROCESS_TIMEOUT_S = _duration_to_seconds(AGY_PRINT_TIMEOUT, 600.0) + 120.0
+LLM_SUBPROCESS_TIMEOUT_S = _duration_to_seconds(AGY_PRINT_TIMEOUT, 900.0) + 120.0
 
 
 def _dedup_key_for_status(status: str) -> str:
@@ -138,6 +138,31 @@ def build_fallback_llm_command() -> list:
             "-p"]
 
 
+# Claude Code CLI wrappers (zclaude included) proxy to a non-Anthropic
+# backend by setting their OWN ANTHROPIC_* auth/model env vars before
+# invoking the real `claude` binary. Defensive scrub: an ANTHROPIC_* inherited
+# from this process must never be able to override the wrapper's routing.
+# This was NOT the cause of the recorded 2026-09-14..15 fallback failures —
+# the wrapper exports ANTHROPIC_AUTH_TOKEN itself, so the "connectors are
+# disabled" warning and the unrecognized-model diagnostic print on every
+# launch even with none of these inherited (live-probed 2026-09-19); the real
+# cause was z.ai's weekly limit (see _CLI_STARTUP_NOISE_PREFIXES). Mirrors
+# LABELER_ENV_DROP (pa/src/lib/typesafe-judge-eval.ts), the same scrub for the
+# opposite leak direction.
+FALLBACK_LLM_ENV_DROP = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+)
+
+
+def _fallback_llm_env() -> dict:
+    """Parent env minus ANTHROPIC_* auth/model overrides (FALLBACK_LLM_ENV_DROP)."""
+    return {k: v for k, v in os.environ.items() if k not in FALLBACK_LLM_ENV_DROP}
+
+
 def _strip_cli_noise(output: str) -> str:
     """Strip session-hook noise a CLI may append after the real response, and
     surrounding whitespace (harmless and cheap to keep checking on every path)."""
@@ -145,6 +170,39 @@ def _strip_cli_noise(output: str) -> str:
     if noise_marker in output:
         output = output[:output.index(noise_marker)]
     return output.strip()
+
+
+# Lines a Claude Code CLI writes to stderr on EVERY launch, failing or not.
+# On the recorded 2026-09-14..15 outage (6 failed runs) they were the CLI's
+# entire stderr, so the first 300 chars — all the raised error carried — named
+# a "connectors"/"model" problem while the real cause, z.ai's `429 [1310]
+# Weekly/Monthly Limit Exhausted`, sat unreported on stdout.
+_CLI_STARTUP_NOISE_PREFIXES = (
+    "⚠ claude.ai connectors are disabled",
+    "[claude-code:",
+)
+
+
+def _cli_failure_detail(stdout: str, stderr: str, limit: int = 300) -> str:
+    """Actionable failure text for a fallback CLI that exited non-zero.
+
+    In `-p --output-format text` mode a Claude Code CLI prints its fatal error
+    as the LAST line of stdout (after any wrapper banner); zclaude.bat's own
+    failures are stdout `echo`s too. That line comes first, then whatever
+    stderr remains once startup noise is dropped. When neither stream has
+    anything else, the raw stderr is kept so the reason is never blank.
+    """
+    out_lines = [ln.strip() for ln in (stdout or "").splitlines() if ln.strip()]
+    err_lines = [
+        ln for ln in (stderr or "").splitlines()
+        if ln.strip() and not ln.lstrip().startswith(_CLI_STARTUP_NOISE_PREFIXES)
+    ]
+    parts = []
+    if out_lines:
+        parts.append(out_lines[-1][:limit])
+    if err_lines:
+        parts.append("\n".join(err_lines)[:limit])
+    return " | ".join(parts) if parts else (stderr or "")[:limit]
 
 
 def call_fallback_llm(prompt: str) -> str:
@@ -161,6 +219,7 @@ def call_fallback_llm(prompt: str) -> str:
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             cwd=PROJECT_ROOT,
             timeout=LLM_SUBPROCESS_TIMEOUT_S,
+            env=_fallback_llm_env(),
         )
     except subprocess.TimeoutExpired as e:
         raise RuntimeError(
@@ -168,7 +227,8 @@ def call_fallback_llm(prompt: str) -> str:
         ) from e
     if result.returncode != 0:
         raise RuntimeError(
-            f"fallback LLM exited {result.returncode}: {result.stderr[:300]}"
+            f"fallback LLM exited {result.returncode}: "
+            f"{_cli_failure_detail(result.stdout, result.stderr)}"
         )
     return _strip_cli_noise(result.stdout)
 
@@ -618,12 +678,26 @@ def build_marker_retry_prompt(prompt: str) -> str:
     )
 
 
+def local_tz() -> timezone:
+    """PA_TZ_OFFSET_MINUTES (minutes east of UTC) or UTC when unset — a loud
+    stderr warning replaces the old silent IST default (WB-54)."""
+    raw = os.environ.get("PA_TZ_OFFSET_MINUTES")
+    if raw is None or raw == "":
+        print("[daily-mail-brief] PA_TZ_OFFSET_MINUTES not set — defaulting to UTC (was IST before 2026-09-17)", file=sys.stderr)
+        return timezone.utc
+    try:
+        return timezone(timedelta(minutes=int(raw)))
+    except ValueError:
+        print(f"[daily-mail-brief] PA_TZ_OFFSET_MINUTES={raw!r} is not an integer — defaulting to UTC", file=sys.stderr)
+        return timezone.utc
+
+
 def determine_slot(window_end_utc: datetime) -> tuple:
     """Return (date_str, slot_name) for Obsidian filename."""
-    ist = timezone(timedelta(hours=5, minutes=30))
-    end_ist = window_end_utc.astimezone(ist)
-    slot = "morning" if end_ist.hour <= 6 else "evening"
-    return end_ist.strftime("%Y-%m-%d"), slot
+    tz = local_tz()
+    end_local = window_end_utc.astimezone(tz)
+    slot = "morning" if end_local.hour <= 6 else "evening"
+    return end_local.strftime("%Y-%m-%d"), slot
 
 
 def parse_window_end(window_end_utc_str: str | None) -> datetime | None:

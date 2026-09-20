@@ -96,8 +96,63 @@ export function validateTopicResumeAction(action: OAuthResumeAction | undefined)
   return { ok: true, prompt: prompt.trim() };
 }
 
+export const VOICE_INBOX_RESUME_MAX_PROMPT_CHARS = 500;
+const VOICE_INBOX_CONVERSATION_ID_RE = /^vi-[0-9a-f]{12}$/;
+
+export type VoiceInboxResumeValidation =
+  | { ok: true; conversationId: string; prompt: string }
+  | { ok: false; error: string };
+
+/** AI-conversation-context reminder fix (2026-09-12): sibling of
+ * validateTopicResumeAction for a reminder whose pending task/decision
+ * originated in a voice-inbox UI conversation rather than a Telegram chat.
+ * Same closed-vocabulary treatment (one action type, three keys, a
+ * single-line <=500-char prompt) — validated identically here (fire time,
+ * called from drainDueReminderResumes) and at mint time in
+ * projects/reminders/add_reminder.py's validate_voice_inbox_resume
+ * (byte-identical error strings; both pinned by their own tests). Resolved
+ * by projects/voice-inbox/scripts/create_conversation_task.py, which looks
+ * the conversation's CURRENT topic up at fire time rather than trusting a
+ * chat/thread captured at mint time — the topic_resume mechanism has no
+ * concept of a voice-inbox conversation id at all and cannot survive the
+ * conversation's routing moving between topics. */
+export function validateVoiceInboxResumeAction(action: OAuthResumeAction | undefined): VoiceInboxResumeValidation {
+  if (!action || action.type !== 'voice_inbox_resume') {
+    return { ok: false, error: 'not a voice_inbox_resume action' };
+  }
+  const keys = Object.keys(action).sort();
+  if (keys.length !== 3 || keys[0] !== 'conversation_id' || keys[1] !== 'prompt' || keys[2] !== 'type') {
+    return { ok: false, error: 'voice_inbox_resume must have exactly the keys "type", "conversation_id" and "prompt"' };
+  }
+  const conversationId = action.conversation_id;
+  if (typeof conversationId !== 'string' || !VOICE_INBOX_CONVERSATION_ID_RE.test(conversationId)) {
+    return { ok: false, error: 'voice_inbox_resume.conversation_id must match "vi-<12 hex>"' };
+  }
+  const prompt = action.prompt;
+  if (typeof prompt !== 'string') {
+    return { ok: false, error: 'voice_inbox_resume.prompt must be a string' };
+  }
+  if (!prompt.trim()) {
+    return { ok: false, error: 'voice_inbox_resume.prompt must not be empty' };
+  }
+  if (/[\r\n]/.test(prompt)) {
+    return { ok: false, error: 'voice_inbox_resume.prompt must be a single line' };
+  }
+  if (prompt.length > VOICE_INBOX_RESUME_MAX_PROMPT_CHARS) {
+    return { ok: false, error: 'voice_inbox_resume.prompt exceeds 500 characters' };
+  }
+  if (prompt.trim().startsWith('/')) {
+    return { ok: false, error: 'voice_inbox_resume.prompt must not start with "/"' };
+  }
+  return { ok: true, conversationId, prompt: prompt.trim() };
+}
+
 export function redactAuthCommand(): string {
   return '/auth [redacted]';
+}
+
+export function redactSecretCommand(): string {
+  return '/secret [redacted]';
 }
 
 export function resolveOAuthResumeHookPath(

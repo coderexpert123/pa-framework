@@ -368,3 +368,12 @@ git_workflow:
 #   session_ttl_hours: 168          # pairing session lifetime (7 days)
 #   pairing_ttl_minutes: 10         # one-time pairing-code lifetime
 
+
+# === Capability provision (pa init --provision, 2026-09-18) ===
+# `pa init --provision` generates a workers: block for the CLIs/kinds you
+# accept (written to ~/.pa/config.yaml.provisioned for review before merging
+# here) and always keeps a local delivery floor: notifications also land as
+# files under ~/.pa/outbox/ even with no Telegram configured. The generated
+# block carries PATH-resolved commands and env-var NAMES only — never a key
+# value or an absolute machine path. See docs/CONFIGURATION.md
+# "Capability provision (pa init --provision)".

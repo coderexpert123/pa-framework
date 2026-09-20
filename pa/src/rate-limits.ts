@@ -1,10 +1,13 @@
 import { mkdir, readFile, rename, stat, writeFile } from 'fs/promises';
-import { dirname, join } from 'path';
+import { basename, dirname, join } from 'path';
 import { homedir } from 'os';
 import { randomBytes } from 'crypto';
 import lockfile from 'proper-lockfile';
 import { safeLockOptions } from './lib/safe-lock.js';
 import { log } from './lib/log.js';
+import { noteQuotaBurst } from './lib/dynamic-slots.js';
+import { withBoundedQueue } from './lib/stall.js';
+import type { WorkerConfig } from './types.js';
 
 export type RateLimitClassification =
   | 'quota-daily'
@@ -24,8 +27,15 @@ export type RateLimitSource =
   | 'claude-text'
   | 'zhipu-text'
   | 'gemini-stderr'
+  // agy's own CLI-level text ("Individual quota reached...") — a terminal
+  // subscription fault, distinct from the JSON API 429 blobs 'gemini-stderr'
+  // covers (some of which, e.g. Rule 4's server-granted retryDelay, ARE
+  // self-healing and must not trigger the terminal-fault alert below).
+  | 'gemini-cli-text'
   | 'codex-telemetry'
   | 'codex-stderr'
+  // Devin CLI / Codeium cloud quota and rate-limit text on stderr/stdout.
+  | 'devin-text'
   | 'generic-retry'
   | 'default';
 
@@ -47,6 +57,22 @@ export interface WorkerCooldown {
 type RateLimitState = Record<string, WorkerCooldown>;
 
 export const DEFAULT_COOLDOWN_MINUTES = 2;
+
+/**
+ * Cooldown for a BURST-shaped rate limit (operator ruling 2026-09-13,
+ * superseding the same-day 30m quota-window cap it replaced). Two classes of
+ * 429, two correct responses:
+ * - The message CLEARLY states an end time ("resets 6pm", "until <datetime>",
+ *   "rate limited till X"): TRUST it — the parsed duration is recorded
+ *   verbatim, no cap. Waiting until the stated reset is the correct response.
+ * - The limit is burst-shaped ('quota-per-minute': per-request-rate /
+ *   too-many-requests limits with no parseable end): retrying shortly IS the
+ *   correct response, so the event records this short cooldown instead of its
+ *   nominal minutes, and the slot governor sheds capacity (noteQuotaBurst) —
+ *   the concurrency causing the burst is reduced there, not by parking the
+ *   worker.
+ */
+export const BURST_RETRY_COOLDOWN_S = 90;
 
 export function parseRateLimitDuration(output: string, worker?: string): number {
   const now = new Date();
@@ -148,7 +174,9 @@ export async function classifyRateLimit(
   if (worker === 'claude' || worker === 'zclaude') {
     // Session JSONL is the authoritative mechanism: exact 429 api_error events written by the CLI.
     // No text heuristics. Returns null when no session evidence (= not a rate limit).
-    const { readClaudeSessionErrors, classifyClaudeErrors, classifyZhipuAccountExhausted } = await import('./rate-limits-claude.js');
+    // (Dynamic import kept: rate-limits-claude.ts statically imports this
+    // module's constants, so a static edge back would close a require cycle.)
+    const { readClaudeSessionErrors, classifyClaudeErrors, classifyZhipuAccountExhausted, isProxyBannerNoise, hasTimeHint } = await import('./rate-limits-claude.js');
 
     // Terminal billing faults are checked on the RAW output first, ahead of the
     // session-JSONL path. The 2026-07 zclaude incident produced no session
@@ -171,18 +199,49 @@ export async function classifyRateLimit(
       await alertAccountExhausted(worker, result);
       return result;
     }
+    if (result === null && isProxyBannerNoise(`${stdout}\n${stderr}`)) {
+      // Proxy-banner noise rode along in the worker stream — not rate-limit
+      // evidence, and not digest material either (2026-09-13).
+      return null;
+    }
     if (result === null && /429|rate limit|quota/i.test(stdout + stderr)) {
       const { appendUnparseableRateLimit } = await import('./rate-limit-unparseable-log.js');
       const combined = (stdout + stderr).slice(0, 100);
       await appendUnparseableRateLimit({ timestamp: new Date().toISOString(), worker, raw: combined, session_id: sessionId, reason: 'no-session-evidence' });
     }
+    if (result && result.minutes > 0 && result.classification === 'unknown' && result.source === 'claude-session') {
+      // Absence-ladder loud-failure row (2026-09-13): the probe cooldown is
+      // recorded, but the miss must also reach the hourly retrospective
+      // digest — time-hinted raws feed the parser self-heal, timeless raws
+      // are plain unknown-pattern misses. Transient (minutes 0) no-ops,
+      // stated-time and burst classifications never land here.
+      const { appendUnparseableRateLimit } = await import('./rate-limit-unparseable-log.js');
+      await appendUnparseableRateLimit({
+        timestamp: new Date().toISOString(),
+        worker,
+        raw: (result.raw ?? '').slice(0, 100),
+        session_id: sessionId,
+        classification: result.classification,
+        reason: hasTimeHint(result.raw ?? '') ? 'time-hint-unparsed' : 'unknown-pattern',
+      });
+    }
     return result;
   }
 
-  if (worker === 'agy') {
-    // Google API 429 / RESOURCE_EXHAUSTED in stderr. Returns null for non-rate-limit stderr.
+  if (worker === 'agy' || worker === 'agyc') {
+    // Google API 429 / RESOURCE_EXHAUSTED in stderr, or agy/agyc's own CLI-level
+    // terminal quota-exhaustion text (source 'gemini-cli-text' — see
+    // rate-limits-gemini.ts). Returns null for non-rate-limit stderr.
     const { classifyGeminiError } = await import('./rate-limits-gemini.js');
     const result = classifyGeminiError(stderr) ?? null;
+    if (result?.source === 'gemini-cli-text') {
+      // Terminal, subscription-level fault — same alert path as zclaude's
+      // Zhipu 1113 balance fault above. Unlike the JSON API 429 shapes
+      // 'gemini-stderr' covers, this does not self-heal on a schedule the
+      // server already told us, so the operator needs to be told.
+      await alertAccountExhausted(worker, result);
+      return result;
+    }
     if (result === null && /rate limit|quota/i.test(stderr)) {
       const { appendUnparseableRateLimit } = await import('./rate-limit-unparseable-log.js');
       await appendUnparseableRateLimit({ timestamp: new Date().toISOString(), worker, raw: stderr.slice(0, 100), session_id: sessionId, reason: 'no-session-evidence' });
@@ -199,6 +258,22 @@ export async function classifyRateLimit(
       const { appendUnparseableRateLimit } = await import('./rate-limit-unparseable-log.js');
       const combined = (stdout + stderr).slice(0, 100);
       await appendUnparseableRateLimit({ timestamp: new Date().toISOString(), worker, raw: combined, session_id: sessionId, reason: 'no-session-evidence' });
+    }
+    return result;
+  }
+
+  if (worker === 'devin') {
+    // Devin prints Codeium cloud quota/rate-limit text on stderr. Only the
+    // error channel is authoritative; do not scan agent output text.
+    const { classifyDevinError } = await import('./rate-limits-devin.js');
+    const result = classifyDevinError(stderr) ?? null;
+    if (result?.classification === 'account-exhausted') {
+      await alertAccountExhausted(worker, result);
+      return result;
+    }
+    if (result === null && /rate limit|quota|credits/i.test(stderr)) {
+      const { appendUnparseableRateLimit } = await import('./rate-limit-unparseable-log.js');
+      await appendUnparseableRateLimit({ timestamp: new Date().toISOString(), worker, raw: stderr.slice(0, 100), session_id: sessionId, reason: 'no-session-evidence' });
     }
     return result;
   }
@@ -225,24 +300,18 @@ async function ensureStateFile(): Promise<void> {
   });
 }
 
-// In-process mutex: serialize same-process callers BEFORE the cross-process
+// In-process bounded queue (lib/stall.ts, key 'rate-limits'): serialize same-process callers BEFORE the cross-process
 // file lock. Without this, many concurrent same-process calls stampede the file
 // lock — proper-lockfile's synchronized retry backoff then lets only ~1 acquirer
 // through per round, so high concurrency exhausts retries ("Lock file is already
 // being held"). Queuing in-process means only one file-lock acquisition is ever
 // in flight per process; the file lock still guards against OTHER processes.
-let rlMutex: Promise<void> = Promise.resolve();
 
 async function withRateLimitLock<T>(fn: () => Promise<T>): Promise<T> {
-  // Chain the mutex SYNCHRONOUSLY (before any await) so callers serialize in
-  // call order (FIFO) — this preserves last-write-wins for back-to-back records
-  // of the same worker. Doing it after an await would order by await-resume
-  // timing instead, which is non-deterministic.
-  const prev = rlMutex;
-  let releaseMutex!: () => void;
-  rlMutex = new Promise<void>((resolve) => { releaseMutex = resolve; });
-  await prev.catch(() => {});
-  try {
+  // withBoundedQueue records this caller as the queue tail synchronously
+  // (before any await), so callers still serialize in call order (FIFO) and
+  // back-to-back records of the same worker keep last-write-wins.
+  return withBoundedQueue('rate-limits', async () => {
     const path = statePath();
     await ensureStateFile();
     const release = await lockfile.lock(path, safeLockOptions('rate-limits', { retries: 10, realpath: false }));
@@ -251,9 +320,7 @@ async function withRateLimitLock<T>(fn: () => Promise<T>): Promise<T> {
     } finally {
       await release();
     }
-  } finally {
-    releaseMutex();
-  }
+  }, { store: 'rate-limits', target: basename(statePath()) });
 }
 
 async function loadState(): Promise<RateLimitState> {
@@ -308,9 +375,21 @@ export async function recordRateLimit(
     console.log(`[rate-limit] skip: ${worker} transient retry in progress`);
     return;
   }
+  let effectiveMinutes = durationMinutes;
+  let burst = false;
+  if (classification === 'quota-per-minute') {
+    burst = true;
+    effectiveMinutes = BURST_RETRY_COOLDOWN_S / 60;
+    log('info', 'rate-limits', `burst 429: ${worker} records a ${BURST_RETRY_COOLDOWN_S}s retry cooldown (${durationMinutes} min parsed, overridden)`, {
+      worker,
+      classification,
+      parsed_minutes: durationMinutes,
+      burst_cooldown_s: BURST_RETRY_COOLDOWN_S,
+    });
+  }
   await withRateLimitLock(async () => {
     const state = await loadState();
-    const cooldownUntil = new Date(Date.now() + durationMinutes * 60 * 1000).toISOString();
+    const cooldownUntil = new Date(Date.now() + effectiveMinutes * 60 * 1000).toISOString();
     state[worker] = {
       cooldown_until: cooldownUntil,
       last_event: new Date().toISOString(),
@@ -320,6 +399,13 @@ export async function recordRateLimit(
     console.log(`[rate-limit] ${worker} cooling down until ${cooldownUntil} (${reason})`);
     await saveState(state);
   });
+  if (burst) {
+    // Fired only after the cooldown is actually recorded. A burst 429 is
+    // evidence of over-concurrency, so the governor sheds capacity; a
+    // stated-end-time quota event (usage-limit-session, quota-daily, …)
+    // never sheds — waiting is the correct response there, not shedding.
+    noteQuotaBurst();
+  }
 }
 
 /**
@@ -355,6 +441,36 @@ export async function isWorkerCoolingDown(worker: string): Promise<boolean> {
     await saveState(state);
     return false;
   });
+}
+
+export type AutoDispatchIneligibility = 'manual_only' | 'excluded' | 'cooling';
+
+export interface AutoDispatchEligibilityOpts {
+  preferredWorker?: string;
+  workerPin?: string;
+  excludeWorkers?: Set<string>;
+}
+
+/**
+ * Single automatic-dispatch eligibility predicate shared by the failover
+ * cascade and the evaluator chain. Pure reader of cooldown state — never
+ * writes it. Returns the ineligibility reason so callers can log the same
+ * skip strings the inline filters historically emitted.
+ */
+export async function autoDispatchEligibility(
+  worker: WorkerConfig,
+  opts: AutoDispatchEligibilityOpts = {},
+): Promise<{ eligible: true } | { eligible: false; reason: AutoDispatchIneligibility }> {
+  if (worker.manual_only && opts.preferredWorker !== worker.name && opts.workerPin !== worker.name) {
+    return { eligible: false, reason: 'manual_only' };
+  }
+  if (opts.excludeWorkers?.has(worker.name)) {
+    return { eligible: false, reason: 'excluded' };
+  }
+  if (await isWorkerCoolingDown(worker.name)) {
+    return { eligible: false, reason: 'cooling' };
+  }
+  return { eligible: true };
 }
 
 export async function getCooldownStatus(): Promise<RateLimitState> {

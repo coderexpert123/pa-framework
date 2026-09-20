@@ -3,9 +3,19 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync, readdirSync } from 'fs';
 import { mkdtemp, rm, writeFile, mkdir } from 'fs/promises';
 import { tmpdir } from 'os';
-import { execFile } from 'child_process';
-import { promisify } from 'util';
-import { join, dirname, relative } from 'path';
+import { join, dirname } from 'path';
+// The budgeted-doc gate (size budgets + the same-file-trim counter) lives in
+// pa/src/lib/docs-lint.ts — implemented there exactly once so `pa docs-lint`
+// (the commit-time/post-wave arm, AI-242) and this suite (the push-gate arm)
+// can never drift into two similar mechanisms.
+import {
+  budgetedDocFiles,
+  docBudgetFailures,
+  gitLog,
+  sameFileTrimFailures,
+  TRIM_DOCTRINE_REF,
+  BACKLOG_SECTION_BUDGET,
+} from '../src/lib/docs-lint.js';
 
 // Compiled to pa/dist/tests/docs-crossref.test.js — __dirname is that file's
 // dir; 3 levels up (dist/tests -> dist -> pa -> repo root), same convention
@@ -15,13 +25,6 @@ const DOCS_DIR = join(REPO_ROOT, 'docs');
 
 function readIfExists(path: string): string | null {
   return existsSync(path) ? readFileSync(path, 'utf8') : null;
-}
-
-// Budgets measure content, not encoding: public Windows CI checks out CRLF
-// (PR #34 run 33436146842 measured bot CLAUDE.md at 12,073 vs 11,923 LF).
-// Single shared helper so every size-budget check below normalizes the same way.
-function budgetLength(content: string): number {
-  return content.replace(/\r\n/g, '\n').length;
 }
 
 /** All `#{1,6} heading text` lines, full (including the `#` markers). */
@@ -219,188 +222,107 @@ describe('docs cross-reference checker', () => {
     assert.equal(numbers.length, 11);
   });
 
-  // Brain-file size budget (docs/CONVENTIONS.md § "Brain-file organization",
-  // added 2026-08-07). Numbers here MUST match that section — if you're
-  // changing one, change both, or this check silently drifts from the rule
-  // it's supposed to enforce.
+  // Brain-file size budgets (docs/CONVENTIONS.md § "Brain-file organization",
+  // added 2026-08-07). The numbers, the raise-class justifications, and the
+  // CRLF-normalized measure live in pa/src/lib/docs-lint.ts — these tests are
+  // the push-gate arm of the same gate `pa docs-lint` runs at commit time
+  // (AI-242). Numbers there MUST match the CONVENTIONS section — if you're
+  // changing one, change both.
+  const budgetFailuresFor = (prefix: (f: string) => boolean): string[] =>
+    docBudgetFailures(REPO_ROOT)
+      .filter((f) => prefix(f.file))
+      .map((f) => f.message);
+
   it('root CLAUDE.md stays within its size budget (soft 40k, hard 48k chars)', () => {
-    const claudeMd = readIfExists(join(REPO_ROOT, 'CLAUDE.md'));
-    if (claudeMd === null) return; // absent in the public mirror
-    const len = budgetLength(claudeMd);
-    assert.ok(
-      len <= 48000,
-      `CLAUDE.md is ${len} chars, over the 48,000-char hard budget -- run /shorten-brain`
-    );
+    assert.deepEqual(budgetFailuresFor((f) => f === 'CLAUDE.md'), []);
+  });
+
+  it('pa/CLAUDE.md stays within its size budget (12k chars, directory-scoped class)', () => {
+    assert.deepEqual(budgetFailuresFor((f) => f === 'pa/CLAUDE.md'), []);
   });
 
   it('every directory-scoped projects/*/CLAUDE.md stays within its size budget (12k chars)', () => {
-    const PROJECTS_DIR = join(REPO_ROOT, 'projects');
-    if (!existsSync(PROJECTS_DIR)) return;
-
-    const failures: string[] = [];
-    // Named raise-class exceptions to the default 12k (documented in
-    // docs/CONVENTIONS.md's size-budget section). telegram-bot raised to
-    // 15,000 (2026-09-06): the backlog-blitz night added five real subsystem
-    // sections in one wave set (command router, topic sources, voice-inbox
-    // bridge + pin self-heal, orchestrator threads) — growth matched by
-    // capability, not prose drift, the same raise-class as the job/knob
-    // catalogs. An initial 14,000 estimate predated the orchestrator rows.
-    const projectClaudeBudgets: Record<string, number> = {
-      'telegram-bot': 15000,
-    };
-    for (const entry of readdirSync(PROJECTS_DIR, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const claudeMdPath = join(PROJECTS_DIR, entry.name, 'CLAUDE.md');
-      const content = readIfExists(claudeMdPath);
-      if (content === null) continue;
-      const len = budgetLength(content);
-      const budget = projectClaudeBudgets[entry.name] ?? 12000;
-      if (len > budget) {
-        failures.push(`${claudeMdPath} is ${len} chars, over the ${budget}-char budget`);
-      }
-    }
-    assert.deepEqual(failures, [], failures.join('\n'));
+    assert.deepEqual(budgetFailuresFor((f) => f.startsWith('projects/')), []);
   });
 
   it('docs/*.md operational-detail files stay within budget (16k); evergreen UPPERCASE guides get 24k', (t) => {
     if (!existsSync(DOCS_DIR)) return t.skip(DOCS_MISSING_REASON);
-    const failures: string[] = [];
-    for (const f of readdirSync(DOCS_DIR).filter((f) => f.endsWith('.md'))) {
-      const content = readFileSync(join(DOCS_DIR, f), 'utf8');
-      // Evergreen guides are ALL-CAPS-before-the-dot (BOT_GUIDE.md, CONFIGURATION.md);
-      // extracted operational-detail files are lowercase-hyphen (repo-topology.md).
-      // The job catalog (maintenance-jobs.md) grows monotonically with every declared
-      // job — a documented raise-class (budget doctrine): 18k since AI-198's 32nd job.
-      const isEvergreenGuide = /^[A-Z][A-Z0-9_]*\.md$/.test(f);
-      const isJobCatalog = f === 'maintenance-jobs.md';
-      // CONFIGURATION.md is the knobs catalog — one row per knob, the same
-      // documented raise-class as the job catalog. Raised 24,000 -> 25,000
-      // (2026-09-04, placement wave-1): the PA_CDISK_* rows crossed 24k on
-      // legitimate per-knob growth; trimming inside a reference table rows
-      // out knobs the code still ships.
-      const isKnobsCatalog = f === 'CONFIGURATION.md';
-      // ARCHITECTURE.md joins the 25k raise-class (2026-09-04, AI-179 WP-4):
-      // the blackboard section documents the landed tri-state lock renewal —
-      // one sentence for a landed P1 fix, the same raise-class doctrine as
-      // the knobs catalog (trimming would cut live reference content).
-      const isArchGuide = f === 'ARCHITECTURE.md';
-      const budget = isKnobsCatalog || isArchGuide ? 25000 : isEvergreenGuide ? 24000 : isJobCatalog ? 18000 : 16000;
-      const len = budgetLength(content);
-      if (len > budget) {
-        failures.push(`docs/${f} is ${len} chars, over its ${budget.toLocaleString()}-char budget`);
-      }
-    }
-    assert.deepEqual(failures, [], failures.join('\n'));
+    assert.deepEqual(budgetFailuresFor((f) => f.startsWith('docs/')), []);
   });
 
   it('the FILE_INVENTORY.md router stays within its 4k budget', () => {
-    const content = readIfExists(join(REPO_ROOT, 'FILE_INVENTORY.md'));
-    if (content === null) return; // absent in the public mirror
-    const len = budgetLength(content);
-    assert.ok(
-      len <= 4000,
-      `FILE_INVENTORY.md is ${len} chars, over the 4,000-char router budget -- it has stopped being a router, re-split`
-    );
+    assert.deepEqual(budgetFailuresFor((f) => f === 'FILE_INVENTORY.md'), []);
   });
 
-  it('inventory/*.md files stay within budget (16k manual, 20k for auto-managed glob-derived files)', () => {
-    const INVENTORY_DIR = join(REPO_ROOT, 'inventory');
-    if (!existsSync(INVENTORY_DIR)) return; // absent in the public mirror and pre-Phase-3 checkouts
-
-    const failures: string[] = [];
-    for (const f of readdirSync(INVENTORY_DIR).filter((f) => f.endsWith('.md'))) {
-      const content = readFileSync(join(INVENTORY_DIR, f), 'utf8');
-      // docs/CONVENTIONS.md § "Brain-file organization": a file the update-brain
-      // skill rewrites wholesale from one glob() pattern gets the higher ceiling
-      // -- its AUTO:FILE-INVENTORY-* marker pair is what makes it that class.
-      const isAutoManaged = content.includes('<!-- AUTO:FILE-INVENTORY-');
-      // Budget raised 18,000 -> 20,000 (2026-08-30): pa-lib.md crossed 18k on
-      // legitimate growth -- one new entry per new lib module, and the lib only
-      // grows. Trimming inside the AUTO markers is futile (update-brain owns it).
-      // The durable fix is the split pa-lib.md's own header names (maintenance/
-      // out); 20k is headroom toward that, not permission to grow unbounded.
-      // Budget raised 20,000 -> 23,000 (2026-09-03): the handover waves' new lib
-      // modules (topic-tasks/-events/-executor, orphan-ledger, daily-recon, grammars)
-      // pushed pa-lib and telegram-bot past 20k on legitimate per-module growth.
-      // Budget raised 23,000 -> 26,000 (2026-09-06): the backlog-blitz night added
-      // five bot modules in one wave set (command-router, orchestrator,
-      // thread-executor, session-capture, topic-threads) — same per-module class.
-      // Budget raised to 110,000 for placement-registry.md only (2026-09-03,
-      // placement wave-1): it is an every-item-exactly-once census index — 263
-      // 12-column machine-checkable rows validated by the placement completeness
-      // checker (A1-A9), the raise-class per this file's own trim doctrine.
-      // Splitting it would break the checker's single-file contract; growth is
-      // bounded by census re-gates (~4 bytes/char per row), not prose drift.
-      const isPlacementRegistry = f === 'placement-registry.md';
-      const budget = isPlacementRegistry ? 110000 : isAutoManaged ? 26000 : 16000;
-      const len = budgetLength(content);
-      if (len > budget) {
-        failures.push(`inventory/${f} is ${len} chars, over its ${budget.toLocaleString()}-char budget`);
-      }
-    }
-    assert.deepEqual(failures, [], failures.join('\n'));
+  it('inventory/*.md files stay within budget (16k manual, 33k for auto-managed glob-derived files)', () => {
+    assert.deepEqual(budgetFailuresFor((f) => f.startsWith('inventory/')), []);
   });
 
-  it('backlog/completed-index.md (the lookup table, not the archives) stays within its 24k budget', () => {
+  it('backlog/completed-index.md (the lookup table, not the archives) stays within its 27k budget', () => {
     // docs/CONVENTIONS.md § "Brain-file organization": archive-*.md/not-valid.md
     // are the "append-only archive" class with NO hard ceiling -- their size
     // tracks how much work shipped in a window, not anything a reader holds in
     // mind, and splitting one purely to hit a number would separate
     // cross-referenced items that must stay findable together. Only the
-    // lookup-table file gets budget-checked here. Budget raised 16,000 -> 20,000
-    // chars 2026-08-23 (Wave C, W-C13): the index is a monotonically growing
-    // one-row-per-completed-item lookup table, never auto-loaded, so a fixed
-    // ceiling is the wrong instrument -- raise this row rather than splitting.
-    const content = readIfExists(join(REPO_ROOT, 'backlog', 'completed-index.md'));
-    if (content === null) return; // absent in the public mirror and pre-Phase-4 checkouts
-    const len = budgetLength(content);
-    // Budget raised 24,000 -> 25,000 (2026-09-06, backlog-blitz): three
-    // verified bug closures (AI-202/206/208) in one night — one row each,
-    // same monotone-lookup-table class.
-    // Budget raised 21,000 -> 24,000 (2026-09-04, placement Phase-3): 16 DONE
-    // items pruned from BACKLOG.md (back under its 12k gate) landed as index
-    // rows; same monotone-lookup-table class as the 16k->20k raise.
-    assert.ok(
-      len <= 25000,
-      `backlog/completed-index.md is ${len} chars, over the 25,000-char budget -- it's a lookup table, not an archive, and should stay scannable`
-    );
+    // lookup-table file gets budget-checked here. Raise history and the
+    // never-trim rationale live with COMPLETED_INDEX_BUDGET in docs-lint.ts.
+    assert.deepEqual(budgetFailuresFor((f) => f === 'backlog/completed-index.md'), []);
   });
 
-  it('root BACKLOG.md stays within its size budget (12k chars)', () => {
-    const content = readIfExists(join(REPO_ROOT, 'BACKLOG.md'));
-    if (content === null) return; // absent in the public mirror
-    const len = budgetLength(content);
-    assert.ok(
-      len <= 12000,
-      `BACKLOG.md is ${len} chars, over its 12,000-char budget -- move more DONE items to backlog/`
-    );
+  it('root BACKLOG.md stays within its 4k ROUTER budget (2026-09-18, AI-316)', () => {
+    // BACKLOG.md became a router over backlog/open-*.md: the open items moved
+    // to per-section files and the root file keeps preamble + Standard + the
+    // drain-maintained section table. The whole 12k→17k raise history is moot
+    // — a router is a different budget class. EXPECTED RED between code-land
+    // and `pa backlog migrate` (the 32k+ monolith exceeds 4k by design; spec
+    // §8: do not run the full suite inside that window and expect green).
+    assert.deepEqual(budgetFailuresFor((f) => f === 'BACKLOG.md'), []);
+  });
+
+  it('every backlog/open-*.md section file stays within its 24k glob-class budget', () => {
+    // One glob-class budget covers present AND future section files — a new
+    // section auto-created by the drain is covered without a table edit.
+    // Vacuously true before the migration writes the first file.
+    assert.deepEqual(budgetFailuresFor((f) => f.startsWith('backlog/open-')), []);
+  });
+
+  it('layout-violation fixture: an over-budget open-*.md fails the section budget, and an open-*.md in a fixture repo is enumerated', async () => {
+    // The fixture arm of the glob class (the live assertion above is vacuous
+    // pre-migration): seed a temp repo whose backlog/open-bugs.md exceeds
+    // BACKLOG_SECTION_BUDGET and prove the glob arm catches it — the class
+    // must be able to FAIL, not just pass on an absent set.
+    const root = await mkdtemp(join(tmpdir(), 'pa-docs-crossref-backlog-'));
+    try {
+      await mkdir(join(root, 'backlog'), { recursive: true });
+      await writeFile(join(root, 'backlog', 'open-bugs.md'), 'x'.repeat(BACKLOG_SECTION_BUDGET + 1), 'utf8');
+      await writeFile(join(root, 'backlog', 'open-features.md'), 'small\n', 'utf8');
+      await writeFile(join(root, 'backlog', 'completed-index.md'), 'small\n', 'utf8');
+      const failures = docBudgetFailures(root).filter((f) => f.file.startsWith('backlog/'));
+      assert.deepEqual(
+        failures.map((f) => f.file),
+        ['backlog/open-bugs.md'],
+        'only the over-budget section file fails — other backlog/*.md files are not in the glob class',
+      );
+      assert.ok(failures[0].message.includes('section budget'), failures[0].message);
+      assert.equal(failures[0].budget, BACKLOG_SECTION_BUDGET);
+      // Enumeration arm: both open-*.md files are budgeted docs.
+      const covered = budgetedDocFiles(root);
+      assert.ok(covered.includes('backlog/open-bugs.md'));
+      assert.ok(covered.includes('backlog/open-features.md'));
+      assert.ok(!covered.includes('backlog/completed-2026-09-18.md'), 'dated archives are not budgeted docs');
+    } finally {
+      await rm(root, { recursive: true, force: true }).catch(() => {});
+    }
   });
 });
 
 // ---------------------------------------------------------------------------
 // Budget-pressure doctrine — same-file-trim counter (operator directive
-// 2026-09-03, docs/CONVENTIONS.md § "Brain-file organization"). The doctrine
-// clause: "never trim the same file twice in a day — the second trim triggers
-// a contract-look, and the contract picks the response"; its last line names
-// this checker as the mechanical enforcement ("docs-lint's same-file-trim
-// counter"). Coverage is exactly the files the size-budget tests above cover.
-//
-// Discriminator: one `git log --numstat --reverse` invocation per budgeted
-// file; a commit is a TRIM iff its summed deletions exceed its summed
-// additions (net-negative line delta = the file got smaller). Raises
-// (net-positive) and balanced mechanical moves never qualify, whatever the
-// churn volume. Each trim candidate additionally gets one memoized
-// `git show --name-status` probe (commitAddsDoc): a candidate that also
-// CREATES a .md file is a split and resets the counter instead of counting.
-//
-// Window: the doctrine's own landing commit is the rule's effective date —
-// the rule cannot forbid the six-trim night that motivated it, and without
-// this anchor the counter's very first suite run would fail on exactly that
-// pre-doctrine history. In steady state (doctrine older than 24h ago) the
-// anchor is older than now-24h and the window is the plain last 24h. No file
-// is exempt; this is when the rule came into force, not a carve-out. When
-// the marker is absent from this checkout's history (public mirror before
-// its next sync, shallow checkout) the plain 24h window applies.
+// 2026-09-03, docs/CONVENTIONS.md § "Brain-file organization"). The full
+// mechanism — numstat discriminator, split-recognition arms, doctrine-anchor
+// window — is implemented once in pa/src/lib/docs-lint.ts (see its header for
+// the design notes that used to live here); this file keeps the suite-level
+// enforcement test and the fixture-repo instrument.
 //
 // The named tests deliberately run against FIXTURE git repos, not this
 // repository: tonight's live history is itself a (sanctioned) multi-trim
@@ -408,203 +330,9 @@ describe('docs cross-reference checker', () => {
 // mechanism is proven on exactly the shape the doctrine forbids repeating.
 // ---------------------------------------------------------------------------
 
-const TRIM_DOCTRINE_REF =
-  'docs/CONVENTIONS.md § "Brain-file organization" — Budget-pressure doctrine (operator directive 2026-09-03)';
-const TRIM_DOCTRINE_CLAUSE =
-  'never trim the same file twice in a day — the second trim triggers a contract-look, and the contract picks the response';
-const TRIM_WINDOW_MS = 24 * 60 * 60 * 1000;
-const TRIM_COMMIT_LIMIT = 2; // fail at >= 2 trim commits inside the window
-const DOCTRINE_MARKER = 'Budget-pressure doctrine';
-
-const execFileP = promisify(execFile);
-
-async function gitLog(repoRoot: string, args: string[], extraEnv: Record<string, string> = {}): Promise<string> {
-  const { stdout } = await execFileP('git', args, {
-    cwd: repoRoot,
-    windowsHide: true,
-    maxBuffer: 16 * 1024 * 1024,
-    env: { ...process.env, ...extraEnv },
-  });
-  return String(stdout);
-}
-
-let doctrineAnchorCache: string | null | undefined;
-
-/**
- * The doctrine's landing commit time (ISO), or null when this checkout's
- * history doesn't carry it. ONE git invocation, memoized per process.
- */
-function doctrineAnchorIso(repoRoot: string): Promise<string | null> {
-  if (doctrineAnchorCache !== undefined) return Promise.resolve(doctrineAnchorCache);
-  return gitLog(repoRoot, [
-    'log',
-    `-S${DOCTRINE_MARKER}`,
-    '--format=%cI',
-    '-1',
-    '--',
-    'docs/CONVENTIONS.md',
-  ])
-    .then((out) => {
-      const iso = out.trim().split(/\r?\n/)[0]?.trim() ?? '';
-      doctrineAnchorCache = iso ? new Date(iso).toISOString() : null;
-      return doctrineAnchorCache;
-    })
-    .catch(() => {
-      // Not a repo / git missing / marker absent: the plain window applies,
-      // and the per-file lookups below fail closed with a clear message.
-      doctrineAnchorCache = null;
-      return null;
-    });
-}
-
-interface TrimScan {
-  file: string;
-  trimCount: number;
-  trimShas: string[];
-}
-
-/**
- * Memoized per sha: does this commit CREATE any .md file (name-status `A`)?
- */
-const addsDocCache = new Map<string, boolean>();
-
-async function commitAddsDoc(repoRoot: string, sha: string): Promise<boolean> {
-  // `git log --numstat` cannot see file creation: a created file shows a plain
-  // `added<TAB>0<TAB>path` row, byte-identical to a modify that only adds lines
-  // (the `-`-marker form is --stat's, and binary files'.) The truth is one
-  // name-status probe per trim candidate: `A<TAB>path`.
-  const cached = addsDocCache.get(sha);
-  if (cached !== undefined) return cached;
-  const out = await gitLog(repoRoot, ['show', '--name-status', '--format=', sha, '--', '*.md']);
-  const adds = out.split(/\r?\n/).some((line) => /^A\t.*\.md/.test(line));
-  addsDocCache.set(sha, adds);
-  return adds;
-}
-
-/**
- * ONE `git log --numstat --reverse` per file: `%H` lines delimit commits;
- * numstat lines (`added<TAB>deleted<TAB>path`, `-` for binary) accumulate per
- * commit, streamed OLDEST-FIRST (--reverse) so a split's reset clears exactly
- * the trims that accumulated before it — in git log's default newest-first
- * order the reset would fire before anything accumulated and wipe the wrong
- * end (the live window's split, 48929c4, is its newest trim). A commit counts
- * as a trim iff deleted > added — except a split (see commitAddsDoc), which
- * resets the counter instead of counting.
- */
-async function findTrimCommits(repoRoot: string, file: string, sinceIso: string): Promise<TrimScan> {
-  const out = await gitLog(repoRoot, [
-    'log',
-    `--since=${sinceIso}`,
-    '--reverse',
-    '--numstat',
-    '--format=%H',
-    '--',
-    file,
-  ]);
-  const commits: Array<{ sha: string; added: number; deleted: number }> = [];
-  let currentSha: string | null = null;
-  let added = 0;
-  let deleted = 0;
-  const flush = () => {
-    if (currentSha !== null) commits.push({ sha: currentSha, added, deleted });
-    currentSha = null;
-  };
-  for (const line of out.split(/\r?\n/)) {
-    if (/^[0-9a-f]{40}$/.test(line)) {
-      flush();
-      currentSha = line;
-      added = 0;
-      deleted = 0;
-      continue;
-    }
-    const m = line.match(/^(\d+|-)\t(\d+|-)\t/);
-    if (m && currentSha !== null) {
-      added += m[1] === '-' ? 0 : Number(m[1]);
-      deleted += m[2] === '-' ? 0 : Number(m[2]);
-    }
-  }
-  flush();
-
-  let trimCount = 0;
-  const trimShas: string[] = [];
-  for (const { sha, added: a, deleted: d } of commits) {
-    if (d <= a) continue;
-    // Split exemption (doctrine amendment 2026-09-03): a net-negative commit
-    // that also CREATES a new .md file is executing the doctrine's own
-    // split-or-raise remedy, not trimming — its deletions moved to the new
-    // file and the file's contract changed. Reset the counter: pre-split
-    // trims don't count against the post-split file.
-    if (await commitAddsDoc(repoRoot, sha)) {
-      trimCount = 0;
-      trimShas.length = 0;
-      continue;
-    }
-    trimCount += 1;
-    trimShas.push(sha);
-  }
-  return { file, trimCount, trimShas };
-}
-
-function trimFailureMessage(scan: TrimScan, windowStartIso: string): string {
-  return [
-    `${scan.file} was trimmed in ${scan.trimCount} commits within its 24h trim window (window started ${windowStartIso}; commits: ${scan.trimShas.join(', ')}).`,
-    `${TRIM_DOCTRINE_REF}: "${TRIM_DOCTRINE_CLAUSE}".`,
-    'Respond per this file\'s contract, not with a third trim: an auto-managed glob-derived inventory or an every-item-exactly-once index gets its documented ceiling RAISED; genuine prose/scope growth gets a SPLIT at the natural fault line.',
-  ].join('\n');
-}
-
-/** All failing files (>= TRIM_COMMIT_LIMIT trims inside the window), message per file. */
-async function sameFileTrimFailures(repoRoot: string, files: string[], nowMs: number): Promise<string[]> {
-  const anchor = await doctrineAnchorIso(repoRoot);
-  const windowStartMs = Math.max(nowMs - TRIM_WINDOW_MS, anchor ? Date.parse(anchor) : Number.NEGATIVE_INFINITY);
-  const sinceIso = new Date(windowStartMs).toISOString();
-  const failures: string[] = [];
-  for (const file of files) {
-    let scan: TrimScan;
-    try {
-      scan = await findTrimCommits(repoRoot, file, sinceIso);
-    } catch (err) {
-      failures.push(
-        `${file}: same-file-trim counter could not read git history (${String(err)}) — fix the environment; this check fails closed`
-      );
-      continue;
-    }
-    if (scan.trimCount >= TRIM_COMMIT_LIMIT) {
-      failures.push(trimFailureMessage(scan, sinceIso));
-    }
-  }
-  return failures;
-}
-
-/** The exact set the size-budget tests above cover, as repo-relative forward-slash paths. */
-function budgetedDocFiles(): string[] {
-  const files: string[] = [];
-  const push = (abs: string) => {
-    if (existsSync(abs)) files.push(relative(REPO_ROOT, abs).split('\\').join('/'));
-  };
-  push(join(REPO_ROOT, 'CLAUDE.md'));
-  push(join(REPO_ROOT, 'FILE_INVENTORY.md'));
-  push(join(REPO_ROOT, 'BACKLOG.md'));
-  push(join(REPO_ROOT, 'backlog', 'completed-index.md'));
-  const projectsDir = join(REPO_ROOT, 'projects');
-  if (existsSync(projectsDir)) {
-    for (const entry of readdirSync(projectsDir, { withFileTypes: true })) {
-      if (entry.isDirectory()) push(join(projectsDir, entry.name, 'CLAUDE.md'));
-    }
-  }
-  if (existsSync(DOCS_DIR)) {
-    for (const f of readdirSync(DOCS_DIR).filter((f) => f.endsWith('.md'))) push(join(DOCS_DIR, f));
-  }
-  const inventoryDir = join(REPO_ROOT, 'inventory');
-  if (existsSync(inventoryDir)) {
-    for (const f of readdirSync(inventoryDir).filter((f) => f.endsWith('.md'))) push(join(inventoryDir, f));
-  }
-  return files;
-}
-
 describe('budget-pressure doctrine: same-file-trim counter', () => {
   it('no budgeted doc file was trimmed twice within its 24h trim window (enforcement)', async () => {
-    const failures = await sameFileTrimFailures(REPO_ROOT, budgetedDocFiles(), Date.now());
+    const failures = await sameFileTrimFailures(REPO_ROOT, budgetedDocFiles(REPO_ROOT), Date.now());
     assert.deepEqual(failures, [], failures.join('\n'));
   });
 
@@ -726,6 +454,63 @@ describe('budget-pressure doctrine: same-file-trim counter', () => {
         failures,
         [],
         `trim + split-trim + one post-split trim = 1 counted trim, must pass, got:\n${failures.join('\n')}`
+      );
+    });
+
+    it('a net-negative trim relocating content into an EXISTING companion doc is a split too (no A row to see): the counter resets', async () => {
+      // The live shape the companion arm exists for (2026-09-14 regrowth trim
+      // 5d8d039): bot CLAUDE.md went net-negative in the SAME commit that
+      // carried M rows on docs/bot-test-rules.md + docs/bot-incident-records.md
+      // — the 8th test rule and the mutation-pass detail relocated into
+      // companions that already existed, so the A-status probe sees nothing.
+      await commitFile('docs/bot-test-rules.md', lines(40, 'b'));
+      await commitFile('projects/telegram-bot/CLAUDE.md', lines(120, 'a'));
+      await commitFile('projects/telegram-bot/CLAUDE.md', lines(60, 'a')); // trim #1: plain
+      // The split: ONE commit trims the file again AND modifies the existing
+      // companion — a relocation no other arm can see.
+      await commitFiles([
+        { relPath: 'projects/telegram-bot/CLAUDE.md', content: lines(35, 'a') },
+        { relPath: 'docs/bot-test-rules.md', content: lines(50, 'b') },
+      ]);
+      const failures = await sameFileTrimFailures(repo, ['projects/telegram-bot/CLAUDE.md'], Date.now());
+      assert.deepEqual(
+        failures,
+        [],
+        `plain trim + companion-relocation trim must pass (1 counted trim, then reset), got:\n${failures.join('\n')}`
+      );
+    });
+
+    it('the same history with a hypothetical PLAIN second trim — no companion row — still fails', async () => {
+      // The check-can-fail direction, pinned on the documented scenario's own
+      // file: had the live second trim NOT carried the relocations, the
+      // counter would read 2 and red-gate. Also proves a file with a
+      // COMPANION_DOCS row is not blanket-exempt from the counter.
+      await commitFile('projects/telegram-bot/CLAUDE.md', lines(120, 'a'));
+      await commitFile('projects/telegram-bot/CLAUDE.md', lines(60, 'a')); // trim #1
+      await commitFile('projects/telegram-bot/CLAUDE.md', lines(35, 'a')); // trim #2: PLAIN
+      const failures = await sameFileTrimFailures(repo, ['projects/telegram-bot/CLAUDE.md'], Date.now());
+      assert.equal(
+        failures.length,
+        1,
+        `two plain trims on a companion-mapped file must still fail, got:\n${failures.join('\n')}`
+      );
+    });
+
+    it('a trim commit touching an UNRELATED .md is not a companion relocation: the trim counts', async () => {
+      // The companion set is exact paths, not "any other .md": an unrelated
+      // doc edit riding the trim commit must not buy the reset.
+      await commitFile('docs/unrelated-notes.md', lines(40, 'x'));
+      await commitFile('projects/telegram-bot/CLAUDE.md', lines(120, 'a'));
+      await commitFile('projects/telegram-bot/CLAUDE.md', lines(60, 'a')); // trim #1
+      await commitFiles([
+        { relPath: 'projects/telegram-bot/CLAUDE.md', content: lines(35, 'a') },
+        { relPath: 'docs/unrelated-notes.md', content: lines(60, 'x') }, // touched, but not a companion
+      ]);
+      const failures = await sameFileTrimFailures(repo, ['projects/telegram-bot/CLAUDE.md'], Date.now());
+      assert.equal(
+        failures.length,
+        1,
+        `trim + unrelated-doc touch must count as 2 trims and fail, got:\n${failures.join('\n')}`
       );
     });
   });

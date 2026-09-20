@@ -1,7 +1,7 @@
 import { readFile, writeFile } from 'fs/promises';
 import { parse as parseYaml } from 'yaml';
 import { configPath } from './paths.js';
-import type { PaConfig, WorkerConfig, EvaluatorConfig, BgTasksConfig, TunableSpec, TunableValues, MaintenanceConfig, TranscriptionConfig, TranscriptionEnginePreference, TranscriptionWorkerMode, UsageConfig, GitWorkflowConfig } from './types.js';
+import type { PaConfig, WorkerConfig, EvaluatorConfig, BgTasksConfig, TunableSpec, TunableValues, MaintenanceConfig, TranscriptionConfig, TranscriptionEnginePreference, TranscriptionWorkerMode, UsageConfig, GitWorkflowConfig, BrowserConfig, VoiceInboxConfig } from './types.js';
 
 /**
  * Parse a tunable's optional `values:` — a DISPLAY HINT, never a gate.
@@ -460,6 +460,396 @@ export function parseCostTier(raw: any): import('./types.js').CostTierConfig | u
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+const DEFAULT_BROWSER_CDP_PORT = 9222;
+
+/** Parse the optional top-level `browser:` block (AI-246 WP-D). WARN-AND-SKIP,
+ *  same house style — a bad cdp_port falls back to the default rather than
+ *  taking the config down. Always returns a concrete BrowserConfig. */
+export function parseBrowser(raw: any): BrowserConfig {
+  const out: BrowserConfig = { cdp_port: DEFAULT_BROWSER_CDP_PORT };
+  if (raw === undefined || raw === null) return out;
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    console.warn("[config] ~/.pa/config.yaml: 'browser' must be a mapping with 'cdp_port'; using defaults");
+    return out;
+  }
+  if (raw.cdp_port !== undefined && raw.cdp_port !== null) {
+    const p = Number(raw.cdp_port);
+    if (Number.isInteger(p) && p >= 1024 && p <= 65535) {
+      out.cdp_port = p;
+    } else {
+      console.warn(`[config] ~/.pa/config.yaml: browser.cdp_port must be an integer 1024-65535 (got ${JSON.stringify(raw.cdp_port)}); using default ${DEFAULT_BROWSER_CDP_PORT}`);
+    }
+  }
+  return out;
+}
+
+/** Parse the optional top-level `voice_inbox:` block — PA's typed view of the
+ *  keys it consumes (the app itself reads the same keys via its own loader).
+ *  WARN-AND-SKIP per field; absent block => undefined. */
+export function parseVoiceInbox(raw: any): VoiceInboxConfig | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    console.warn("[config] ~/.pa/config.yaml: 'voice_inbox' must be a mapping; ignoring");
+    return undefined;
+  }
+  const out: VoiceInboxConfig = {};
+  if (raw.port !== undefined && raw.port !== null) {
+    const p = Number(raw.port);
+    if (Number.isInteger(p) && p >= 1 && p <= 65535) {
+      out.port = p;
+    } else {
+      console.warn(`[config] ~/.pa/config.yaml: voice_inbox.port must be an integer 1-65535 (got ${JSON.stringify(raw.port)}); ignoring that field`);
+    }
+  }
+  if (raw.screencast_ingest_token !== undefined && raw.screencast_ingest_token !== null) {
+    if (typeof raw.screencast_ingest_token === 'string' && raw.screencast_ingest_token.trim()) {
+      out.screencast_ingest_token = raw.screencast_ingest_token.trim();
+    } else {
+      console.warn("[config] ~/.pa/config.yaml: voice_inbox.screencast_ingest_token must be a non-empty string; ignoring that field");
+    }
+  }
+  return out;
+}
+
+/**
+ * Parse the optional top-level `routing_policy:` block. WARN-AND-SKIP per
+ * field; `enabled !== true` ⇒ undefined (policy absent = disabled = today's
+ * behavior). Worker-name existence is NOT checked here — loadConfig
+ * cross-checks below and resolveRoutingWorker fails open regardless.
+ */
+export function parseRoutingPolicy(raw: any): import('./types.js').RoutingPolicyConfig | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    console.warn("[config] ~/.pa/config.yaml: 'routing_policy' must be a mapping; ignoring");
+    return undefined;
+  }
+  if (raw.enabled !== true) return undefined;
+
+  const out: import('./types.js').RoutingPolicyConfig = {
+    enabled: true,
+    judge: 'agy',
+    judge_model: 'gemini-3.6-flash-low',
+    judge_timeout_ms: 20000,
+  };
+
+  if (raw.judge !== undefined && raw.judge !== null) {
+    if (raw.judge === 'typesafe' || raw.judge === 'agy' || raw.judge === 'deterministic') {
+      out.judge = raw.judge;
+    } else {
+      console.warn(`[config] routing_policy.judge must be 'typesafe' | 'agy' | 'deterministic'; defaulting to 'agy'`);
+      out.judge = 'agy';
+    }
+  }
+
+  if (raw.judge_model !== undefined && raw.judge_model !== null) {
+    if (typeof raw.judge_model === 'string' && raw.judge_model.trim()) {
+      out.judge_model = raw.judge_model.trim();
+    } else {
+      console.warn(`[config] routing_policy.judge_model must be a non-empty string; defaulting to 'gemini-3.6-flash-low'`);
+      out.judge_model = 'gemini-3.6-flash-low';
+    }
+  }
+
+  if (raw.judge_timeout_ms !== undefined && raw.judge_timeout_ms !== null) {
+    const t = Number(raw.judge_timeout_ms);
+    if (Number.isFinite(t) && t > 0) {
+      out.judge_timeout_ms = t;
+    } else {
+      console.warn(`[config] routing_policy.judge_timeout_ms must be a positive number; defaulting to 20000`);
+      out.judge_timeout_ms = 20000;
+    }
+  }
+
+  if (raw.judge_command !== undefined && raw.judge_command !== null) {
+    if (typeof raw.judge_command === 'string' && raw.judge_command.trim()) {
+      out.judge_command = raw.judge_command.trim();
+    } else {
+      console.warn(`[config] routing_policy.judge_command must be a non-empty string; dropping the field`);
+    }
+  }
+
+  for (const field of ['general_worker', 'code_worker', 'peak_code_worker'] as const) {
+    if (raw[field] !== undefined && raw[field] !== null) {
+      if (typeof raw[field] !== 'string' || !raw[field].trim()) {
+        console.warn(`[config] routing_policy.${field} must be a non-empty worker name; dropping the field`);
+        continue;
+      }
+      out[field] = raw[field].trim();
+    }
+  }
+
+  if (raw.code_patterns !== undefined && raw.code_patterns !== null) {
+    if (!Array.isArray(raw.code_patterns)) {
+      console.warn("[config] routing_policy.code_patterns must be an array of regex strings; dropping it");
+    } else {
+      const patterns = raw.code_patterns
+        .map((p: any) => String(p))
+        .filter((p: string) => {
+          try {
+            new RegExp(p, 'i');
+            return true;
+          } catch {
+            console.warn(`[config] routing_policy.code_patterns entry is not a valid regex; dropping it: ${p}`);
+            return false;
+          }
+        });
+      if (patterns.length > 0) out.code_patterns = patterns;
+    }
+  }
+
+  if (raw.topic_classes !== undefined && raw.topic_classes !== null) {
+    if (typeof raw.topic_classes !== 'object' || Array.isArray(raw.topic_classes)) {
+      console.warn("[config] routing_policy.topic_classes must be a mapping of topicKey -> code|general|off; dropping it");
+    } else {
+      const classes: Record<string, 'code' | 'general' | 'off'> = {};
+      for (const [key, val] of Object.entries(raw.topic_classes)) {
+        if (val === 'code' || val === 'general' || val === 'off') {
+          classes[key] = val;
+        } else {
+          console.warn(`[config] routing_policy.topic_classes['${key}'] must be code|general|off; dropping the entry`);
+        }
+      }
+      if (Object.keys(classes).length > 0) out.topic_classes = classes;
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Parse the optional top-level `model_router:` block (2026-09-18,
+ * plans/2026-09-18-model-router-SPEC.md WP-A). WARN-AND-SKIP per field like
+ * parseRoutingPolicy — but the block itself is kept even when `enabled` is
+ * false: shadow staging runs iff the block EXISTS; `enabled: true` only
+ * additionally lets the router DECIDE. Each bad field warns and drops THAT
+ * field, never the whole block (a non-mapping drops the block). Worker names
+ * in table/effort_projection are NOT validated against `workers:` here — the
+ * router's availability layer re-checks fleet membership at resolve time and
+ * fails open (same split as routing_policy's separate load-time warn above).
+ */
+export function parseModelRouter(raw: any): import('./types.js').ModelRouterConfig | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    console.warn("[config] ~/.pa/config.yaml: 'model_router' must be a mapping; ignoring");
+    return undefined;
+  }
+
+  const TIERS = ['quick_lookup', 'standard', 'deep_reasoning', 'rich_toolchain'] as const;
+
+  const out: import('./types.js').ModelRouterConfig = {
+    enabled: false,
+    state_max_chars: 4000,
+    context_max_chars: 2000,
+    topic_max_chars: 300,
+    zai_workers: ['zclaude'],
+  };
+
+  if (raw.enabled !== undefined && raw.enabled !== null) {
+    if (typeof raw.enabled === 'boolean') {
+      out.enabled = raw.enabled;
+    } else {
+      console.warn("[config] model_router.enabled must be a boolean; defaulting to false");
+    }
+  }
+
+  if (raw.judge !== undefined && raw.judge !== null) {
+    if (raw.judge === 'typesafe') {
+      out.judge = raw.judge;
+    } else {
+      console.warn("[config] model_router.judge must be 'typesafe'; dropping the field");
+    }
+  }
+
+  // sticky: absent = ON when the block exists (default per operator); only an
+  // explicit `sticky: false` opts out. Non-boolean warns and drops (stays ON).
+  if (raw.sticky !== undefined && raw.sticky !== null) {
+    if (typeof raw.sticky === 'boolean') {
+      out.sticky = raw.sticky;
+    } else {
+      console.warn('[config] model_router.sticky must be a boolean; dropping the field (default ON)');
+    }
+  }
+
+  // deprecate_pins (decision 25): absent = true when the block exists; only an
+  // explicit `false` restores today's pin behavior on router-decided turns.
+  // Non-boolean warns and drops (stays ON).
+  if (raw.deprecate_pins !== undefined && raw.deprecate_pins !== null) {
+    if (typeof raw.deprecate_pins === 'boolean') {
+      out.deprecate_pins = raw.deprecate_pins;
+    } else {
+      console.warn('[config] model_router.deprecate_pins must be a boolean; dropping the field (default ON)');
+    }
+  }
+
+  // availability_ttl_ms (decision 27): a non-negative number of ms; `0`
+  // disables the cache (always fresh). Non-number warns and drops.
+  if (raw.availability_ttl_ms !== undefined && raw.availability_ttl_ms !== null) {
+    const n = Number(raw.availability_ttl_ms);
+    if (Number.isFinite(n) && n >= 0) {
+      out.availability_ttl_ms = n;
+    } else {
+      console.warn('[config] model_router.availability_ttl_ms must be a non-negative number (ms; 0 disables); dropping the field (default 5000)');
+    }
+  }
+
+  // placement caps (decision 21): positive numbers; each bad field warns and
+  // drops THAT field (default applies at use time).
+  if (raw.placement !== undefined && raw.placement !== null) {
+    if (typeof raw.placement === 'object' && !Array.isArray(raw.placement)) {
+      const placement: import('./types.js').ModelRouterConfig['placement'] = {};
+      for (const [field, dflt] of [
+        ['candidate_cap', 25],
+        ['goal_chars', 80],
+        ['section_chars', 2400],
+      ] as const) {
+        const v = raw.placement[field];
+        if (v === undefined || v === null) continue;
+        const n = Number(v);
+        if (Number.isFinite(n) && n > 0) {
+          (placement as Record<string, number>)[field] = n;
+        } else {
+          console.warn(`[config] model_router.placement.${field} must be a positive number; dropping the field (default ${dflt})`);
+        }
+      }
+      if (Object.keys(placement).length > 0) out.placement = placement;
+    } else {
+      console.warn('[config] model_router.placement must be a mapping of caps; dropping it');
+    }
+  }
+
+  // surfaces staging keys (decision 28): each must be 'shadow' | 'live';
+  // absent = 'shadow' (dark) at use time. Bad values warn and drop THAT field.
+  if (raw.surfaces !== undefined && raw.surfaces !== null) {
+    if (typeof raw.surfaces === 'object' && !Array.isArray(raw.surfaces)) {
+      const surfaces: NonNullable<import('./types.js').ModelRouterConfig['surfaces']> = {};
+      for (const name of ['fallback', 'steer', 'placement'] as const) {
+        const v = raw.surfaces[name];
+        if (v === undefined || v === null) continue;
+        if (v === 'shadow' || v === 'live') {
+          surfaces[name] = v;
+        } else {
+          console.warn(`[config] model_router.surfaces.${name} must be 'shadow' | 'live'; dropping the field (default 'shadow')`);
+        }
+      }
+      if (Object.keys(surfaces).length > 0) out.surfaces = surfaces;
+    } else {
+      console.warn('[config] model_router.surfaces must be a mapping of surface -> staging mode; dropping it');
+    }
+  }
+
+  for (const [field, dflt] of [
+    ['state_max_chars', 4000],
+    ['context_max_chars', 2000],
+    ['topic_max_chars', 300],
+  ] as const) {
+    if (raw[field] !== undefined && raw[field] !== null) {
+      const n = Number(raw[field]);
+      if (Number.isFinite(n) && n > 0) {
+        out[field] = n;
+      } else {
+        console.warn(`[config] model_router.${field} must be a positive number; dropping the field (default ${dflt})`);
+      }
+    }
+  }
+
+  if (raw.zai_workers !== undefined && raw.zai_workers !== null) {
+    if (Array.isArray(raw.zai_workers)) {
+      const names = raw.zai_workers
+        .filter((w: any) => typeof w === 'string' && w.trim())
+        .map((w: string) => w.trim());
+      if (names.length > 0) out.zai_workers = names;
+      if (names.length !== raw.zai_workers.length) {
+        console.warn('[config] model_router.zai_workers entries must be non-empty strings; dropping the bad entries');
+      }
+    } else {
+      console.warn('[config] model_router.zai_workers must be an array of worker names; dropping it (default [zclaude])');
+    }
+  }
+
+  if (raw.table !== undefined && raw.table !== null) {
+    if (Array.isArray(raw.table)) {
+      const rows: import('./types.js').ModelRouterPolicyRow[] = [];
+      for (const row of raw.table) {
+        const worker = typeof row?.worker === 'string' ? row.worker.trim() : '';
+        const model = row?.model;
+        const tier = row?.max_tier;
+        const score = Number(row?.max_score);
+        if (!worker) {
+          console.warn(`[config] model_router.table row must carry a non-empty 'worker'; dropping the row`);
+          continue;
+        }
+        if (model !== undefined && (typeof model !== 'string' || !model.trim())) {
+          console.warn(`[config] model_router.table row '${worker}' has a non-empty-string 'model' expected; dropping the row`);
+          continue;
+        }
+        if (!TIERS.includes(tier)) {
+          console.warn(`[config] model_router.table row '${worker}' has max_tier '${tier}' — must be one of ${TIERS.join(' | ')}; dropping the row`);
+          continue;
+        }
+        if (!Number.isInteger(score) || score < 1 || score > 5) {
+          console.warn(`[config] model_router.table row '${worker}' has max_score ${row?.max_score} — must be an integer 1-5; dropping the row`);
+          continue;
+        }
+        const typed: import('./types.js').ModelRouterPolicyRow = {
+          worker,
+          max_tier: tier,
+          max_score: score as import('./types.js').EffortScore,
+        };
+        if (model !== undefined) typed.model = model.trim();
+        rows.push(typed);
+      }
+      if (rows.length > 0) out.table = rows;
+    } else {
+      console.warn('[config] model_router.table must be an array of rows; dropping it');
+    }
+  }
+
+  if (raw.effort_projection !== undefined && raw.effort_projection !== null) {
+    if (typeof raw.effort_projection === 'object' && !Array.isArray(raw.effort_projection)) {
+      const proj: Record<string, import('./types.js').ModelRouterEffortProjection> = {};
+      for (const [worker, entry] of Object.entries<any>(raw.effort_projection)) {
+        const tunable = entry?.tunable;
+        if (tunable !== 'effort' && tunable !== 'none') {
+          console.warn(`[config] model_router.effort_projection['${worker}'].tunable must be 'effort' | 'none'; dropping the entry`);
+          continue;
+        }
+        const typed: import('./types.js').ModelRouterEffortProjection = { tunable };
+        if (tunable === 'effort' && entry.map !== undefined) {
+          if (typeof entry.map === 'object' && !Array.isArray(entry.map)) {
+            const map: Partial<Record<import('./types.js').EffortScore, string>> = {};
+            for (const [k, v] of Object.entries<any>(entry.map)) {
+              const key = Number(k);
+              if (!Number.isInteger(key) || key < 1 || key > 5 || typeof v !== 'string' || !v.trim()) {
+                console.warn(`[config] model_router.effort_projection['${worker}'].map entry '${k}' must be an integer key 1-5 with a non-empty string value; dropping that pair`);
+                continue;
+              }
+              map[key as import('./types.js').EffortScore] = v;
+            }
+            typed.map = map;
+          } else {
+            console.warn(`[config] model_router.effort_projection['${worker}'].map must be a mapping score -> effort string; dropping the entry`);
+            continue;
+          }
+        }
+        proj[worker] = typed;
+      }
+      if (Object.keys(proj).length > 0) out.effort_projection = proj;
+    } else {
+      console.warn('[config] model_router.effort_projection must be a mapping of worker -> projection; dropping it');
+    }
+  }
+
+  if (raw.shadow_path !== undefined && raw.shadow_path !== null) {
+    if (typeof raw.shadow_path === 'string' && raw.shadow_path.trim()) {
+      out.shadow_path = raw.shadow_path.trim();
+    } else {
+      console.warn('[config] model_router.shadow_path must be a non-empty string; dropping the field');
+    }
+  }
+
+  return out;
+}
+
 export async function loadConfig(): Promise<PaConfig> {
   const path = configPath();
   let raw: string;
@@ -550,19 +940,36 @@ export async function loadConfig(): Promise<PaConfig> {
     }
   }
 
+    const routing_policy = parseRoutingPolicy(parsed.routing_policy);
+    if (routing_policy) {
+      // Load-time cross-check: a typo'd worker name would silently fail open
+      // at resolve time (code turns keep the topic default). Say so once here.
+      const names = new Set(workers.map((w) => w.name));
+      for (const field of ['general_worker', 'code_worker', 'peak_code_worker'] as const) {
+        const target = routing_policy[field];
+        if (target && !names.has(target)) {
+          console.warn(`[config] routing_policy.${field} names unknown worker '${target}' (configured: ${[...names].join(', ')}); turns for it keep the topic default`);
+        }
+      }
+    }
+
     return {
       workers,
       evaluator,
       topic_defaults: parsed.topic_defaults,
       bg_tasks,
-      concurrency_limit: Number.isInteger(parsed.concurrency_limit) ? parsed.concurrency_limit : 2,
+      concurrency_limit: Number.isInteger(parsed.concurrency_limit) ? parsed.concurrency_limit : undefined,
       maintenance: parseMaintenance(parsed.maintenance),
       transcription: parseTranscription(parsed.transcription),
       usage: parseUsage(parsed.usage),
       cost_tier: parseCostTier(parsed.cost_tier),
+      routing_policy,
+      model_router: parseModelRouter(parsed.model_router),
       git_workflow: parseGitWorkflow(parsed.git_workflow),
       quota_aware_failover: typeof parsed.quota_aware_failover === 'boolean' ? parsed.quota_aware_failover : false,
       worker_pin: typeof parsed.worker_pin === 'string' ? parsed.worker_pin.trim() : undefined,
+      browser: parseBrowser(parsed.browser),
+      voice_inbox: parseVoiceInbox(parsed.voice_inbox),
     };
 }
 

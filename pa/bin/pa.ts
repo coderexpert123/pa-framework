@@ -17,6 +17,7 @@ import { approveCommand } from '../src/commands/approve.js';
 import { rejectCommand } from '../src/commands/reject.js';
 import { healthCommand } from '../src/commands/health.js';
 import { notifyCommand } from '../src/commands/notify-cmd.js';
+import { pingCommand } from '../src/commands/ping-cmd.js';
 import { bgtasksCommand } from '../src/commands/bgtasks.js';
 import { refCommand } from '../src/commands/ref.js';
 import { recallCommand } from '../src/commands/recall.js';
@@ -35,6 +36,17 @@ import { gitGuardCommand } from '../src/commands/git-guard.js';
 import { statusCommand } from '../src/commands/status.js';
 import { watchCommand } from '../src/commands/watch.js';
 import { topicTaskCommand, topicNoteCommand, topicEventsCommand } from '../src/commands/topic.js';
+import { orphanCommand } from '../src/commands/orphan.js';
+import { brainSweepCommand } from '../src/commands/brain-sweep.js';
+import { docsLintCommand } from '../src/commands/docs-lint.js';
+import { backlogCommand } from '../src/commands/backlog.js';
+import { authCommand } from '../src/commands/auth.js';
+import { doctorCommand } from '../src/commands/doctor.js';
+import { coexistenceCommand } from '../src/commands/coexistence.js';
+import { verifyInstallCommand } from '../src/commands/verify-install.js';
+import { busCommand } from '../src/commands/bus.js';
+import { browserEnsureCommand, browserStopCommand } from '../src/commands/browser.js';
+import { typesafeCommand } from '../src/commands/typesafe.js';
 
 async function mcpServeCommand(): Promise<void> {
   // @ts-ignore - .mjs module without declaration file
@@ -118,11 +130,12 @@ pa — Personal Assistant CLI Dispatcher
 
 Usage:
   pa init                       Initialize ~/.pa/ directory and config
-  pa run <skill> [-- <args>]    Run a skill with automatic worker failover
+  pa run <skill> [--worker <name>] [--session <label>] [-- <args>]  Run a skill with automatic worker failover
   pa list                       List all skills with schedules and last run
   pa workers                  Show available AI CLI workers
   pa logs <skill> [--last N]  View execution logs for a skill
-  pa catchup [--topic t]      Run missed scheduled skills by topic partition
+  pa catchup [--topic t]      Run missed scheduled skills once, by topic partition
+  pa catchup --loop           Run the long-lived scheduler loop (skills + maintenance lanes)
   pa purge-locks                Clear stale resource locks from blackboard
   pa schedules sync           Register schedules with OS task scheduler
   pa schedules list           Show registered scheduled tasks
@@ -141,22 +154,42 @@ Usage:
   pa watch list [--json]      List registered async watches (active + last 10 terminal)
   pa watch rm <id>            Cancel a watch (no Telegram report is sent)
   pa watch re-register <id>   Re-arm a terminal watch (copy spec into a fresh active row)
+  pa auth request --shape S1|S2|S3|S4|S5 --provider <name> [--prompt <text>] [--task <vi-id>] [--tenant <t-id>] [--expires <seconds>] [--confirmable] [--json]
+  pa auth wait <request-id> [--timeout <seconds>] [--json]  Poll until answered, expired, or timed out
+  pa auth answer --request <request-id> [--tenant <t-id>]  Deliver a value from stdin (bot/interactive shells only)
+  pa auth learn --provider <name> --shape S1..S5 --command <text>  Record a provider profile in ~/.pa/auth-profiles.yaml
   pa topic-task add <chatId>_<threadId> --title "<t>" --prompt "<p>" [--worker <pin>]  Queue a task for the topic's bot drain (content-hash dedup)
   pa topic-task list <topicKey>  List a topic's queued + in-flight (running/parked) tasks
   pa topic-note add <topicKey> "<text>" [--key <k>] [--expires YYYY-MM-DD]  Add an OPEN note to the topic store (rendered into the prompt's Open items)
   pa topic-note list <topicKey>  List the topic's notes from the store
   pa topic-note close <topicKey> <key>  Close an OPEN note (DONE)
   pa topic-events <topicKey>  Show the topic's event log (newest last, last 20)
-  pa git-guard [<dir>]        Check whether skills may run git on your behalf (exit 0 = yes, 1 = no)
+  pa git-guard [<dir>] [--session <label>] [--path <p> ... | -- <path>...]
+                             Check whether skills may run git on your behalf; also refuses when a commit
+                             target (staged index, or named paths) sits under a foreign ACTIVE claim (exit 0 = yes, 1 = no)
   pa health                   Show system health status
+  pa doctor [--json|--text]   Detect machine profile: os/shell/cpu/mem/disk/scheduler/workers (read-only; JSON default, --text table)
+  pa coexistence list|restore List/restore pa's registered, reversible edits to existing CLI configs (registry-and-restore)
+  pa verify-install [--json] [--skill <name>] Run the install acceptance probes; JSON emits the pinned verdict schema
   pa status                   One-screen overview: health, git, skills/next-due, claims, DLQ, maintenance
   pa notify --subject <s> (--body <b> | --body-file <path> | --body-stdin) [--dedup-key <k>] [--topic-thread <id>] [--severity info|warn|error]
+  pa ping --title <t> [--body <b>] | --payload-file <path.json> [--cleanup] [--no-toast] [--no-ping]
   pa bgtasks [--json] [--kill <pid>]  List or kill background descendant processes
+  pa browser ensure [--headed|--headless] [--port N]   Launch/attach PA's CDP Chrome (prints the handle as JSON)
+  pa browser stop               Kill the pidfile-recorded browser-session Chrome
   pa ref <refId>              Look up what message produced a Ref ID (e.g. 'pa ref c-a59a')
   pa recall "<q>" [--thread N] [--json]   Full-text search over turns, traces, brains, KB
   pa improvements [--since N] Eval self-improver's applied/rolled-back changes (default 30d)
   pa improvements accept <commit_hash> [--reason "..."]  Record a human decision to KEEP a commit whose rollback failed
   pa maintenance list         List declared maintenance jobs + resolved target paths
+  pa brain-sweep [--skill-held-lock]  Deterministic update-brain snapshot: commit managed brain paths per owner, defer+alert the rest (never --allow-empty)
+  pa docs-lint [--] [path ...]      Budgeted-doc gate (AI-242): size budgets + 24h same-file-trim counter; scoped to named paths or all budgeted docs (exit 0 clean, 1 = landing fails)
+  pa backlog add --section <bugs|features|process> --title "<t>" (--body "<text>" | --body-file <path>) --session <label>
+  pa backlog status --target <AI-nnn> --status-line "<full replacement paragraph>" --session <label>
+  pa backlog pending [--json]    List unmerged fragments (dedup check before filing)
+  pa backlog archive [--dry-run]    Move DONE-class items out of backlog/open-*.md into backlog/completed-<date>.md
+  pa backlog migrate    One-time cutover: BACKLOG.md → router + backlog/open-*.md section files
+  pa orphan <list|land|keep|diff> [gid]  Orphaned-edit store + operator-gated disposition (land re-checks reservations/lock at press time)
   pa maintenance status       Show the maintenance ledger (last run, outcome, skips)
   pa maintenance run <job> [--dry-run]  Run one job now; --dry-run touches nothing
   pa public-sync [--public-dir <path>] [--dry-run]  Sync the derived pa-public mirror (nested at <repo root>/pa-public) from private HEAD
@@ -165,7 +198,7 @@ Usage:
   pa claim --renew <id> [--ttl <minutes>]  Extend an existing reservation
   pa release <id> [--session <label>] [--force]  Release a reservation by id (ownership-checked when --session is given)
   pa claims [--stats [--days N] [--json]]  Show active reservations + recently modified paths, or a reservation-activity rollup
-  pa reconcile [--check] [--restore <path>] [--merge <path>]  Detect/restore/diagnose files reverted to an ancestor of HEAD
+  pa reconcile [--check [--range <ref>] [--max-commits <n>]] [--restore <path>] [--merge <path>]  Detect/restore/diagnose reverted files (live tree or pushed range)
   pa dlq list                 List Dead Letter Queue entries (age, attempts, quarantined, preview)
   pa dlq replay <index|all>   Clear quarantined flag and reset attempts (retry on next flush)
   pa dlq discard <index|all>  Remove entries from DLQ
@@ -174,6 +207,16 @@ Usage:
   pa rules list [--active] | show <id> | supersede <id> --reason "…" | accept <id> | weekly [--json]  Feedback-rules store (AI-165)
   pa mcp serve                Start the MCP stdio server (for Claude/Codex/agy integration)
   pa mcp manifest             Print MCP manifest + registration instructions
+  pa bus send <to> --from <addr> --body <text> [--reply-to <id>]  Send a bus message (content-hash dedup)
+  pa bus inbox <address> [--peek]    Pop (or peek) the next message; touches cursor
+  pa bus list <address>              List queued envelopes for an address (no consume)
+  pa bus wait <address> [--timeout <s>]  Wait for a new envelope (default 60s)
+  pa bus register <address> --capabilities <csv>  Register an address
+  pa bus registry                    List registered addresses + capabilities
+  pa bus whoami [--provider <name>] [--repo <name>]  Print the derived provider@repo address
+  pa typesafe check [--samples N]  Send N trivial TypeSafe questions; print latency and token usage (needs TYPESAFE_API_KEY)
+  pa typesafe eval [--since YYYY-MM-DD] [--limit N] [--dry-run] [--out <path>]  Replay LLM-routed voice tasks through typed routing; print agreement by confidence
+  pa typesafe eval --judge [--since D] [--until D] [--limit N] [--agy N] [--labels-only] [--dry-run] [--out <path>]  Score the code/general turn judge against Claude-labelled past requests
   pa chain run <name>         Execute a sequential workflow chain
   pa chain list               List available chains
   pa help                     Show this help message
@@ -194,16 +237,30 @@ async function main(): Promise<void> {
         const dashIdx = args.indexOf('--');
         const workerIdx = args.indexOf('--worker');
         const promptArgsIdx = args.indexOf('--prompt-args');
+        const sessionIdx = args.indexOf('--session');
         // Only accept --worker if it appears before -- (or there's no --)
         const preferredWorker = (workerIdx !== -1 && (dashIdx === -1 || workerIdx < dashIdx))
           ? args[workerIdx + 1] : undefined;
         // Only accept --prompt-args if it appears before -- (or there's no --)
         const promptArgs = (promptArgsIdx !== -1 && (dashIdx === -1 || promptArgsIdx < dashIdx))
           ? args[promptArgsIdx + 1] : undefined;
-        if (promptArgs === undefined && promptArgsIdx !== -1) {
-          console.error('Usage: pa run <skill> [--prompt-args "<text>"] [--worker <name>] [-- <extra-args>]');
+        // Only accept --session if it appears before -- (or there's no --)
+        const sessionLabel = (sessionIdx !== -1 && (dashIdx === -1 || sessionIdx < dashIdx))
+          ? args[sessionIdx + 1] : undefined;
+        if ((promptArgs === undefined && promptArgsIdx !== -1 && (dashIdx === -1 || promptArgsIdx < dashIdx))
+          || (sessionLabel === undefined && sessionIdx !== -1 && (dashIdx === -1 || sessionIdx < dashIdx))) {
+          console.error('Usage: pa run <skill> [--prompt-args "<text>"] [--worker <name>] [--session <label>] [-- <extra-args>]');
           process.exitCode = 2;
           break;
+        }
+        // AI-255 B1: PA_SESSION is the claims-gate identity `pa git-guard`
+        // reads — the worker env spreads process.env, so pinning it here
+        // reaches the skill's git-guard children AND trigger-child `pa run`s
+        // for free. Fallback: a session that only ever registered a bus
+        // address (the hooks' env) still gets an exemptable identity.
+        if (sessionLabel) process.env.PA_SESSION = sessionLabel;
+        if (!process.env.PA_SESSION && process.env.PA_BUS_ADDRESS) {
+          process.env.PA_SESSION = process.env.PA_BUS_ADDRESS;
         }
         const extraArgs = dashIdx !== -1 ? args.slice(dashIdx + 1) : [];
         // AI-179 WP-2: this CommandResult used to be discarded, so every `pa run`
@@ -240,7 +297,13 @@ async function main(): Promise<void> {
       case 'catchup': {
         const topicIdx = args.indexOf('--topic') !== -1 ? args.indexOf('--topic') : args.indexOf('-t');
         const topic = topicIdx !== -1 ? args[topicIdx + 1] : undefined;
-        await catchupCommand({ topic });
+        const loop = args.includes('--loop');
+        if (loop && topicIdx !== -1) {
+          console.log('pa catchup --loop does not take --topic (the loop serves all its lanes).');
+          process.exitCode = 2;
+          break;
+        }
+        await catchupCommand({ topic, loop });
         break;
       }
 
@@ -308,11 +371,15 @@ async function main(): Promise<void> {
         break;
 
       case 'git-guard':
-        process.exitCode = await gitGuardCommand(args[1]);
+        process.exitCode = await gitGuardCommand(args.slice(1));
         break;
 
       case 'watch':
         process.exitCode = await watchCommand(args.slice(1));
+        break;
+
+      case 'auth':
+        process.exitCode = await authCommand(args.slice(1));
         break;
 
       case 'topic-task':
@@ -327,6 +394,18 @@ async function main(): Promise<void> {
         process.exitCode = await topicEventsCommand(args.slice(1));
         break;
 
+      case 'doctor':
+        await doctorCommand(args.slice(1));
+        break;
+
+      case 'coexistence':
+        await coexistenceCommand(args.slice(1));
+        break;
+
+      case 'verify-install':
+        await verifyInstallCommand(args.slice(1));
+        break;
+
       case 'health':
         await healthCommand(args.slice(1));
         break;
@@ -339,9 +418,41 @@ async function main(): Promise<void> {
         await notifyCommand(args.slice(1));
         break;
 
+      case 'ping':
+        await pingCommand(args.slice(1));
+        break;
+
+      case 'orphan':
+        await orphanCommand(args.slice(1));
+        break;
+
+      case 'brain-sweep':
+        await brainSweepCommand(args.slice(1));
+        break;
+
+      case 'docs-lint':
+        process.exitCode = await docsLintCommand(args.slice(1));
+        break;
+
+      case 'backlog':
+        await backlogCommand(args.slice(1));
+        break;
+
       case 'bgtasks':
         await bgtasksCommand(args.slice(1));
         break;
+
+      case 'browser': {
+        const sub = args[1];
+        if (sub === 'ensure') {
+          await browserEnsureCommand(args.slice(2));
+        } else if (sub === 'stop') {
+          await browserStopCommand();
+        } else {
+          console.log('Usage: pa browser <ensure [--headed|--headless] [--port N]|stop>');
+        }
+        break;
+      }
 
       case 'ref':
         await refCommand(args[1]);
@@ -434,6 +545,14 @@ async function main(): Promise<void> {
         }
         break;
       }
+
+      case 'bus':
+        process.exitCode = await busCommand(args.slice(1));
+        break;
+
+      case 'typesafe':
+        process.exitCode = await typesafeCommand(args.slice(1));
+        break;
 
       case 'help':
       case '--help':

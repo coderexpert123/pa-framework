@@ -62,8 +62,14 @@ class ReservationGuardTestCase(unittest.TestCase):
 
         self._orig_repo_root = reservation_guard.REPO_ROOT
         self._orig_pa_home_env = os.environ.get('PA_HOME')
+        self._orig_dispatch_env = os.environ.get('PA_WORKER_DISPATCH_ID')
         reservation_guard.REPO_ROOT = self.repo_root
         os.environ['PA_HOME'] = str(self.pa_home)
+        # The hook runs IN-PROCESS and reads PA_WORKER_DISPATCH_ID live: a suite
+        # launched inside a worker dispatch (push gate, skill run) would take
+        # the worker telemetry branch and emit no context. Pin the headed-
+        # session path so the context contract is what these tests exercise.
+        os.environ.pop('PA_WORKER_DISPATCH_ID', None)
 
     def tearDown(self):
         reservation_guard.REPO_ROOT = self._orig_repo_root
@@ -71,6 +77,10 @@ class ReservationGuardTestCase(unittest.TestCase):
             os.environ.pop('PA_HOME', None)
         else:
             os.environ['PA_HOME'] = self._orig_pa_home_env
+        if self._orig_dispatch_env is None:
+            os.environ.pop('PA_WORKER_DISPATCH_ID', None)
+        else:
+            os.environ['PA_WORKER_DISPATCH_ID'] = self._orig_dispatch_env
         shutil.rmtree(self.tmp_root, ignore_errors=True)
 
     # ---- helpers ----
@@ -150,6 +160,45 @@ class ReservationGuardTestCase(unittest.TestCase):
         self.assertIn('r-abc123', ctx)
         self.assertIn('someone-else', ctx)
         self.assertIn('refactoring reservations', ctx)
+
+    def test_case_variant_path_still_warns_no_silent_swallow(self):
+        """WB-208: membership is normcased but the old `relative_to(REPO_ROOT)`
+        was case-SENSITIVE, so a root whose casing differs from the canonical
+        path raised ValueError out of relative_to — and main()'s unconditional
+        except swallowed it into silence. On Windows (where normcase folds
+        case) the variant root is still a member, so the warning must still
+        fire with the repo-relative path intact. On POSIX normcase is the
+        identity — a differently-cased root is a genuinely different directory,
+        the file is outside the repo, and silence is the CORRECT contract
+        (2026-09-20: this test's unconditional warning assert failed on the
+        public mirror's ubuntu/macos legs)."""
+        self._write_reservations([self._default_reservation()])
+        file_path = self._make_file('pa/src/lib/reservations.ts')
+        # A non-canonical root casing: normcase membership accepts it on
+        # Windows, the old case-sensitive relative_to rejects it. (relative_to
+        # is purely lexical, so no filesystem call needed to expose the
+        # divergence.)
+        saved_root = reservation_guard.REPO_ROOT
+        variant_root = saved_root.__class__(str(saved_root).replace('repo', 'Repo', 1))
+        reservation_guard.REPO_ROOT = variant_root
+        try:
+            exit_code, out = self._run_hook({
+                'session_id': 'my-claude-session',
+                'tool_name': 'Edit',
+                'tool_input': {'file_path': str(file_path)},
+            })
+        finally:
+            reservation_guard.REPO_ROOT = saved_root
+
+        self.assertEqual(exit_code, 0)
+        if os.name == 'nt':
+            self.assertTrue(out.strip(), 'case-variant root must still produce a warning, never silence')
+            parsed = json.loads(out.strip())
+            self.assertIn('r-abc123', parsed['hookSpecificOutput']['additionalContext'])
+        else:
+            # POSIX: normcase is identity, the variant root is a different
+            # directory, the file is outside it — silence is the contract.
+            self.assertEqual(out.strip(), '', 'POSIX case-variant root is a different directory — hook must stay silent')
 
     # ---- 2. second identical invocation (same session_id) is silent ----
 
@@ -460,6 +509,188 @@ class ReservationGuardTestCase(unittest.TestCase):
         self.assertLessEqual(rendered_rows, 3)
         if len(ctx) < 1200:
             self.assertIn('more active reservations overlap this path', ctx)
+
+    # ---- 18. AI-255: planned rows warn with the PLANNED wording, not ACTIVE ----
+
+    def test_planned_reservation_warns_with_planned_wording(self):
+        self._write_reservations([self._default_reservation(kind='planned')])
+        file_path = self._make_file('pa/src/lib/reservations.ts')
+
+        exit_code, out = self._run_hook({
+            'session_id': 's-pl',
+            'tool_name': 'Edit',
+            'tool_input': {'file_path': str(file_path)},
+        })
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(out.strip(), 'a planned row must still surface — advisory, not silent')
+        ctx = json.loads(out.strip())['hookSpecificOutput']['additionalContext']
+        self.assertIn('overlaps PLANNED work', ctx)
+        self.assertIn('do not block', ctx)
+        self.assertNotIn('ACTIVE reservation', ctx)
+
+    # ---- 19. AI-255: an active row wins over a planned row on the same path ----
+
+    def test_active_row_takes_precedence_over_planned_on_same_path(self):
+        self._write_reservations([
+            self._default_reservation(id='r-plan', kind='planned', session='planner'),
+            self._default_reservation(id='r-act', session='claimer'),
+        ])
+        file_path = self._make_file('pa/src/lib/reservations.ts')
+
+        exit_code, out = self._run_hook({
+            'session_id': 's-both',
+            'tool_name': 'Edit',
+            'tool_input': {'file_path': str(file_path)},
+        })
+        self.assertEqual(exit_code, 0)
+        ctx = json.loads(out.strip())['hookSpecificOutput']['additionalContext']
+        self.assertIn('ACTIVE reservation', ctx)
+        self.assertIn('r-act', ctx)
+        self.assertNotIn('PLANNED', ctx, 'planned wording must not dilute an active-claim warning')
+
+    # ---- 20. AI-255: a carried bus address renders the actionable send hint ----
+
+    def test_bus_address_renders_send_hint_in_warning(self):
+        self._write_reservations([
+            self._default_reservation(bus='claude@repo#99'),
+        ])
+        file_path = self._make_file('pa/src/lib/reservations.ts')
+
+        exit_code, out = self._run_hook({
+            'session_id': 's-bus',
+            'tool_name': 'Edit',
+            'tool_input': {'file_path': str(file_path)},
+        })
+        self.assertEqual(exit_code, 0)
+        ctx = json.loads(out.strip())['hookSpecificOutput']['additionalContext']
+        self.assertIn('claude@repo#99', ctx)
+        self.assertIn('pa bus send claude@repo#99', ctx)
+
+    # ---- 21. AI-255: the warning log line carries kind + holderBus ----
+
+    def test_log_line_carries_kind_and_holder_bus(self):
+        self._write_reservations([
+            self._default_reservation(kind='planned', bus='devin@repo#5'),
+        ])
+        file_path = self._make_file('pa/src/lib/reservations.ts')
+
+        exit_code, out = self._run_hook({
+            'session_id': 's-log2',
+            'tool_name': 'Edit',
+            'tool_input': {'file_path': str(file_path)},
+        })
+        self.assertEqual(exit_code, 0)
+        lines = self._app_log_lines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0]['kind'], 'planned')
+        self.assertEqual(lines[0]['holderBus'], 'devin@repo#5')
+
+    # ---- 22. AI-255 B5: a shared-surface write under NO claim warns ----
+
+    def test_unclaimed_shared_surface_write_warns(self):
+        self._write_reservations([])  # live store, zero rows
+        file_path = self._make_file('docs/multi-session-protocol.md')
+
+        exit_code, out = self._run_hook({
+            'session_id': 's-unclaimed',
+            'tool_name': 'Edit',
+            'tool_input': {'file_path': str(file_path)},
+        })
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(out.strip(), 'an unclaimed shared-surface write must surface')
+        ctx = json.loads(out.strip())['hookSpecificOutput']['additionalContext']
+        self.assertIn('shared surface', ctx)
+        self.assertIn('NO active reservation', ctx)
+        self.assertIn('pa claim docs/multi-session-protocol.md', ctx)
+
+    # ---- 23. AI-255 B5: the same warning is once per (session, path) ----
+
+    def test_unclaimed_shared_surface_warns_once_per_session_path(self):
+        self._write_reservations([])
+        file_path = self._make_file('BACKLOG.md')
+        payload = {
+            'session_id': 's-once',
+            'tool_name': 'Write',
+            'tool_input': {'file_path': str(file_path)},
+        }
+
+        exit1, out1 = self._run_hook(payload)
+        self.assertTrue(out1.strip())
+        exit2, out2 = self._run_hook(payload)
+        self.assertEqual(out2.strip(), '', 'repeat on the same path must be suppressed')
+
+    # ---- 24. AI-255 B5: an unclaimed NON-shared path stays silent ----
+
+    def test_unclaimed_non_shared_path_is_silent(self):
+        self._write_reservations([])
+        file_path = self._make_file('pa/src/lib/reservations.ts')
+
+        exit_code, out = self._run_hook({
+            'session_id': 's-src',
+            'tool_name': 'Edit',
+            'tool_input': {'file_path': str(file_path)},
+        })
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(out.strip(), '')
+
+    # ---- 25. AI-255 B5: worker context emits telemetry, not context ----
+
+    def test_worker_context_logs_unclaimed_telemetry_without_context(self):
+        self._write_reservations([])
+        file_path = self._make_file('plans/wave-spec.md')
+        prior = os.environ.get('PA_WORKER_DISPATCH_ID')
+        os.environ['PA_WORKER_DISPATCH_ID'] = 'd-test123'
+        try:
+            exit_code, out = self._run_hook({
+                'session_id': 's-worker',
+                'tool_name': 'Edit',
+                'tool_input': {'file_path': str(file_path)},
+            })
+        finally:
+            if prior is None:
+                os.environ.pop('PA_WORKER_DISPATCH_ID', None)
+            else:
+                os.environ['PA_WORKER_DISPATCH_ID'] = prior
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(out.strip(), '', 'a dispatch context emits no additionalContext')
+        lines = self._app_log_lines()
+        self.assertEqual(len(lines), 1, 'one telemetry line per (dispatch, path)')
+        self.assertEqual(lines[0]['module'], 'reservations')
+        self.assertEqual(lines[0]['message'], 'unclaimed write')
+        self.assertEqual(lines[0]['path'], 'plans/wave-spec.md')
+        self.assertEqual(lines[0]['dispatchId'], 'd-test123')
+
+    # ---- 26. AI-255 B5: a covering FOREIGN claim keeps the ACTIVE warning ----
+
+    def test_foreign_claim_still_beats_the_unclaimed_class(self):
+        self._write_reservations([
+            self._default_reservation(paths=['docs']),
+        ])
+        file_path = self._make_file('docs/architecture.md')
+
+        exit_code, out = self._run_hook({
+            'session_id': 's-prec',
+            'tool_name': 'Edit',
+            'tool_input': {'file_path': str(file_path)},
+        })
+        self.assertEqual(exit_code, 0)
+        ctx = json.loads(out.strip())['hookSpecificOutput']['additionalContext']
+        self.assertIn('ACTIVE reservation', ctx, 'a covering foreign claim must not degrade to the unclaimed warning')
+
+    # ---- 27. AI-255 B5: projects/*/CLAUDE.md counts; deeper nesting does not ----
+
+    def test_shared_surface_path_shapes(self):
+        self.assertTrue(reservation_guard._is_shared_surface('CLAUDE.md'))
+        self.assertTrue(reservation_guard._is_shared_surface('BACKLOG.md'))
+        self.assertTrue(reservation_guard._is_shared_surface('docs/x.md'))
+        self.assertTrue(reservation_guard._is_shared_surface('inventory/pa-lib.md'))
+        self.assertTrue(reservation_guard._is_shared_surface('plans/p.md'))
+        self.assertTrue(reservation_guard._is_shared_surface('projects/telegram-bot/CLAUDE.md'))
+        self.assertTrue(reservation_guard._is_shared_surface('projects/telegram-bot/AGENTS.md'))
+        self.assertFalse(reservation_guard._is_shared_surface('projects/telegram-bot/src/CLAUDE.md'))
+        self.assertFalse(reservation_guard._is_shared_surface('pa/src/lib/reservations.ts'))
+        self.assertFalse(reservation_guard._is_shared_surface('docs.md'))
 
 
 if __name__ == '__main__':

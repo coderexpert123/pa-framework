@@ -14,7 +14,7 @@ import { log } from '../lib/log.js';
 // cross-process (runner.ts, AI-196), so without this a manual run can execute a
 // job body concurrently with a catchup tick (destructive prunes racing, doubled
 // D: I/O). Full rationale at runSubcommand.
-const MAINTENANCE_PASS_LOCK_KEYS = ['catchup', 'catchup:topic:default'] as const;
+const MAINTENANCE_PASS_LOCK_KEYS = ['catchup', 'catchup:maintenance'] as const;
 const MAINTENANCE_RUN_LOCK_AGENT = 'maintenance-run-command';
 // Same bounded wait as catchup's own acquire (catchup.ts:51) — a manual run
 // must not queue indefinitely behind a 1-minute tick; it fails fast and the
@@ -171,19 +171,23 @@ async function runSubcommand(args: string[]): Promise<void> {
   }
 
   // AI-200: the run is gated on the SAME lock resource(s) the pass-driving
-  // `pa catchup` invocations hold — one logical resource, two spellings, since
-  // catchup suffixes its lock key with the topic (catchup.ts:48). Every
-  // invocation that drives the maintenance pass holds exactly one of:
-  //   'catchup'               — bare `pa catchup` (posix crontab registration;
-  //                               pass runs when !opts.topic), any manual
-  //                               topic-less run
-  //   'catchup:topic:default' — `catchup --topic default` (the Windows Task
-  //                               Scheduler tick; pass runs when topic ===
-  //                               MAINTENANCE_TOPIC)
-  // 'catchup:topic:reminders' never runs the pass and is correctly NOT
-  // excluded. Verified live 2026-09-04: run-catchup-hidden.vbs runs
-  // `catchup --topic default`. Acquired in fixed order (no deadlock between
-  // two maintenance runs).
+  // `pa catchup` invocations hold. Since 2026-09-11 (C2) that is exactly two
+  // keys, never a per-job scheme and never `catchup:topic:*`:
+  //   'catchup'             — the topic-less one-shot `pa catchup` (posix
+  //                             crontab registration, or any manual
+  //                             topic-less run), which still runs the pass
+  //                             inline (runCatchup's `!opts.topic` gate).
+  //   'catchup:maintenance' — the loop's dedicated maintenance lane
+  //                             (runMaintenanceTick), which now drives the
+  //                             pass on Windows (the live `catchup --loop`
+  //                             launcher) and inside every `pa catchup --loop`
+  //                             process generally.
+  // `catchup:topic:*` never drives the pass since 2026-09-11 — a topic lane
+  // (`default`, `reminders`) holds its own key only while a SKILL runs there,
+  // so a manual `pa maintenance run` is no longer refused while a skill
+  // merely occupies a topic lane (the exact shape of the 2026-09-11 incident
+  // this wave fixes). Acquired in fixed order (no deadlock between two
+  // maintenance runs).
   //
   // Idiom mirrors catchup.ts:51-123 exactly: bounded acquire →
   // startLockRenewal heartbeat with onLost → release in finally. On

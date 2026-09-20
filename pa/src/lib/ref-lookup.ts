@@ -21,7 +21,7 @@ const TAIL_LINES = 10_000;
 
 export interface RefRecord {
   refId: string;
-  kind: 'turn' | 'pin' | 'help' | 'branch' | 'lock_busy' | 'failover' | 'system' | 'skill_alert';
+  kind: 'turn' | 'pin' | 'help' | 'branch' | 'lock_busy' | 'failover' | 'system' | 'skill_alert' | 'route';
   timestamp: string;
   worker?: string;
   chatId?: number;
@@ -224,7 +224,9 @@ function appLogKind(entry: AppLogEntry): RefRecord['kind'] {
   if (entry.message === 'message sent') return 'turn';
   if (entry.message === 'system message sent') {
     const k = entry.kind;
-    if (k === 'pin' || k === 'help' || k === 'branch' || k === 'lock_busy' || k === 'failover' || k === 'system') return k;
+    // 'route' = the router-as-orchestrator placement announce (bot RefKind,
+    // 2026-09-20) — surfaced as its own kind instead of collapsing to 'system'.
+    if (k === 'pin' || k === 'help' || k === 'branch' || k === 'lock_busy' || k === 'failover' || k === 'system' || k === 'route') return k;
     return 'system';
   }
   return 'skill_alert';

@@ -6,7 +6,7 @@ import { writeFile, mkdir, chmod } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { createTempPaHome, createTempSecrets, cleanup } from './helpers.js';
-import { executeWorker } from '../src/workers.js';
+import { executeWorker, isRateLimited } from '../src/workers.js';
 import type { WorkerConfig } from '../src/types.js';
 
 let tempDir: string;
@@ -88,5 +88,20 @@ describe('worker-exec command contract (no name-based rewriting)', () => {
     const result = await executeWorker(worker, 'test prompt', { timeout: 10 });
     assert.ok(result.output.includes('MARKER_AGY_CONTRACT'),
       `Expected stub output, got: ${JSON.stringify(result)}`);
+  });
+
+  it('isRateLimited for devin only scans result.error, not result.output', () => {
+    const worker = makeWorker({
+      name: 'devin',
+      command: 'echo',
+      args: [],
+      rate_limit_patterns: ['rate limit'],
+    });
+
+    const hitInOutput = isRateLimited(worker, { output: 'rate limit', error: '', exitCode: 0, success: true });
+    assert.equal(hitInOutput.hit, false, 'devin output text must NOT trigger rate-limit match');
+
+    const hitInError = isRateLimited(worker, { output: 'normal response', error: 'rate limit exceeded', exitCode: 1, success: false });
+    assert.equal(hitInError.hit, true, 'devin stderr text must trigger rate-limit match');
   });
 });

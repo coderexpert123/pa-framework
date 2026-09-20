@@ -1,0 +1,9 @@
+relay/wrangler.toml*
+!relay/wrangler.toml.example
+relay/.wrangler/
+relay/dryrun/
+relay/relay.config.json
+# TWA signing fingerprint (operator-specific; Bubblewrap APK link verification)
+public/.well-known/
+# APK builds served for phone download (runtime artifact)
+download/

@@ -1,0 +1,75 @@
+name: Install trial
+
+# Fresh-machine install trial (AI-264 Wave C follow-through): runs the
+# docs/INSTALL.md steps EXACTLY as documented (via pa/scripts/install_trial.sh,
+# which mirrors them by hand — see that script's header for the duplication
+# risk) on a fresh checkout, then asserts `pa verify-install --json` returns
+# PASS or DEGRADED-with-degradedFloor.
+#
+# Deliberately workflow_dispatch-only: the trial costs real runner minutes on
+# three OSes, so the operator fires it by hand after a public-sync rather than
+# on every push. No secrets are required — D4 makes Telegram absence a WARN,
+# and a job with no API keys hits the degraded floor honestly (recorded in
+# the verify-install JSON artifact).
+
+on:
+  workflow_dispatch:
+
+jobs:
+  install-trial:
+    name: Install trial (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # macOS is best-effort: hosted macOS runner availability/queueing has
+    # been the flaky leg in past waves (plans/2026-09-18-free-vm-alternatives-no-gha.md);
+    # a mac failure must not mark the trial red when ubuntu+windows pass.
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    env:
+      # Scratch runtime home — the trial must never write a real ~/.pa.
+      # NOTE: ${{ runner.temp }} is INVALID here — GitHub rejects the whole
+      # workflow at parse time ("Unrecognized named-value: 'runner'"), the
+      # runner context isn't bound until steps run. github.workspace works:
+      # it's the checked-out repo dir, and install_trial.sh only requires
+      # PA_HOME to be a set scratch path.
+      PA_HOME: ${{ github.workspace }}/.pa-home-trial
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # S1 (get the code) is the checkout itself; the driver asserts the
+      # 40-char commit id and runs S2–S8 + checklist item 7 verbatim.
+      - name: Run install trial
+        shell: bash
+        run: bash pa/scripts/install_trial.sh "$GITHUB_WORKSPACE"
+
+      - name: Assert trial verdict
+        if: always()
+        shell: bash
+        run: |
+          node -e '
+            const fs = require("fs");
+            const p = process.argv[1];
+            if (!fs.existsSync(p)) { console.error("verify-install JSON missing — trial step failed"); process.exit(1); }
+            const r = JSON.parse(fs.readFileSync(p, "utf8"));
+            const ok = r.verdict === "PASS" || (r.verdict === "DEGRADED" && r.degradedFloor === true);
+            console.log("verdict=" + r.verdict + " degradedFloor=" + (r.degradedFloor === true));
+            if (!ok) { console.error("FAIL: expected PASS or DEGRADED with degradedFloor"); process.exit(1); }
+          ' "$GITHUB_WORKSPACE/.install-trial-logs/verify-install.json"
+
+      - name: Upload trial artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-trial-${{ matrix.os }}
+          path: ${{ github.workspace }}/.install-trial-logs/
+          if-no-files-found: warn
+          retention-days: 14

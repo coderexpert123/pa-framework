@@ -7,7 +7,7 @@
  */
 
 import { join, dirname } from 'path';
-import { paHome } from '../paths.js';
+import { paHome, profilePath } from '../paths.js';
 import { loadSecrets } from '../secrets.js';
 import { logger } from '../lib/log.js';
 import { redactSecrets } from '../lib/redact.js';
@@ -36,8 +36,8 @@ export interface RecallOptions {
 }
 
 const RECALL_USAGE =
-  'Usage: pa recall "<query>" [--thread <id>] [--source <s>] [--role <user|assistant>] ' +
-  '[--since <YYYY-MM-DD>] [--until <YYYY-MM-DD>] [--limit <n>] [--json] [--reindex] [--rebuild]';
+  'Usage: pa recall "<query>" [--thread <id>] [--source <conversation|trace|brain|kb|review|decisions|profile>] ' +
+  '[--role <user|assistant>] [--since <YYYY-MM-DD>] [--until <YYYY-MM-DD>] [--limit <n>] [--json] [--reindex] [--rebuild]';
 
 function requireValue(value: string | undefined, flag: string): string {
   if (value === undefined) throw new Error(`${flag} requires a value`);
@@ -138,6 +138,9 @@ export async function buildSourcesConfig(kbSourcesPath?: string): Promise<Recall
     kb: p ? { dir: dirname(p) } : null,
     reviewDigest: { path: join(home, 'review-digest-pending.jsonl') },
     decisions: { dbPath: join(home, 'decisions.sqlite') },
+    // WP-8 (OD-3): PA_PROFILE_PATH FIRST — learn_agent.py honors it but
+    // profilePath() does not; indexing the wrong file is worse than none.
+    profile: { path: process.env.PA_PROFILE_PATH || profilePath() },
   };
 }
 

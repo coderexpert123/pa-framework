@@ -1,6 +1,22 @@
+import './test-env-guard.js';
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { stalenessCheckJob, stalenessDedupKey } from '../src/lib/maintenance/jobs/staleness-check.js';
+import { readFile, writeFile } from 'fs/promises';
+import { join } from 'path';
+import { existsSync } from 'fs';
+import { createTempPaHome, cleanup } from './helpers.js';
+import { flushLog } from '../src/lib/log.js';
+import { findJob } from '../src/lib/maintenance/registry.js';
+import { PRUNABLE_ARCHIVE_SUFFIXES } from '../src/lib/archive-files.js';
+import { STALL_RECORDS_ARCHIVE_SUFFIX, stallRecordsPath } from '../src/lib/stall.js';
+import {
+  stalenessCheckJob,
+  stalenessDedupKey,
+  findStaleLedgerJobs,
+  ledgerFreshnessDedupKey,
+  drainStallRecords,
+} from '../src/lib/maintenance/jobs/staleness-check.js';
+import type { MaintenanceLedger } from '../src/lib/maintenance/state.js';
 
 describe('staleness-check job (WP-E, 2026-08-23)', () => {
   it('sub-hourly skill (5-min interval) fires after 30 min + 2*interval (recreated from deleted P2-16 case)', async () => {
@@ -167,5 +183,143 @@ describe('staleness-check job (WP-E, 2026-08-23)', () => {
 
     const keyEmpty = stalenessDedupKey([]);
     assert.notEqual(keyEmpty, keyA1);
+  });
+});
+
+describe('ledger freshness and stall drain (2026-09-16)', () => {
+  let tmpHome: string;
+
+  it('ledger freshness: a bot job 16 min without attempt or skip is stale; 14 min is not', () => {
+    const now = Date.now();
+    const job = findJob('model-override-sweep')!;
+    const ledger16: MaintenanceLedger = {
+      version: 1,
+      jobs: { [job.name]: { firstSeenAt: new Date(now - 3600_000).toISOString(), lastSkipAt: new Date(now - 16 * 60_000).toISOString(), consecutiveFailures: 0, consecutiveSkips: 1 } },
+    };
+    const stale16 = findStaleLedgerJobs(ledger16, [job], {}, now);
+    assert.equal(stale16.length, 1);
+    assert.deepEqual({ name: stale16[0].name, host: stale16[0].host }, { name: job.name, host: job.host });
+    assert.ok(stale16[0].ageMs > 15 * 60_000);
+
+    const ledger14: MaintenanceLedger = {
+      version: 1,
+      jobs: { [job.name]: { firstSeenAt: new Date(now - 3600_000).toISOString(), lastSkipAt: new Date(now - 14 * 60_000).toISOString(), consecutiveFailures: 0, consecutiveSkips: 1 } },
+    };
+    const stale14 = findStaleLedgerJobs(ledger14, [job], {}, now);
+    assert.equal(stale14.length, 0);
+  });
+
+  it('ledger freshness: a weekly job whose last skip is 16 min old IS stale (every pass writes a skip)', () => {
+    const now = Date.now();
+    const job = findJob('weekly-learn')!;
+    const ledger: MaintenanceLedger = {
+      version: 1,
+      jobs: { [job.name]: { firstSeenAt: new Date(now - 3600_000).toISOString(), lastSkipAt: new Date(now - 16 * 60_000).toISOString(), consecutiveFailures: 0, consecutiveSkips: 1 } },
+    };
+    const stale = findStaleLedgerJobs(ledger, [job], {}, now);
+    assert.equal(stale.length, 1);
+    assert.deepEqual({ name: stale[0].name, host: stale[0].host }, { name: 'weekly-learn', host: 'pa' });
+  });
+
+  it('ledger freshness: disabled-by-override and row-less jobs are never stale; a lastRunAt-only row counts', () => {
+    const now = Date.now();
+    const modelOverride = findJob('model-override-sweep')!;
+    const grounding = findJob('grounding-check')!;
+    const alertDigest = findJob('alert-digest')!;
+    const ledger: MaintenanceLedger = {
+      version: 1,
+      jobs: {
+        [modelOverride.name]: { firstSeenAt: new Date(now - 3600_000).toISOString(), lastSkipAt: new Date(now - 60 * 60_000).toISOString(), consecutiveFailures: 0, consecutiveSkips: 1 },
+        [alertDigest.name]: { firstSeenAt: new Date(now - 3600_000).toISOString(), lastRunAt: new Date(now - 20 * 60_000).toISOString(), consecutiveFailures: 0, consecutiveSkips: 0 },
+      },
+    };
+    const overrides = { [modelOverride.name]: { enabled: false } };
+    const stale = findStaleLedgerJobs(ledger, [modelOverride, grounding, alertDigest], overrides as any, now);
+    assert.equal(stale.length, 1);
+    assert.deepEqual({ name: stale[0].name, host: stale[0].host }, { name: alertDigest.name, host: alertDigest.host });
+  });
+
+  it('ledgerFreshnessDedupKey is stable across ages and order and changes with the set', () => {
+    const setA = [{ name: 'a', host: 'bot' }, { name: 'b', host: 'pa' }];
+    const setAReordered = [{ name: 'b', host: 'pa' }, { name: 'a', host: 'bot' }];
+    const keyA = ledgerFreshnessDedupKey(setA);
+    const keyAReordered = ledgerFreshnessDedupKey(setAReordered);
+    assert.equal(keyA, keyAReordered);
+    const keySmaller = ledgerFreshnessDedupKey([{ name: 'a', host: 'bot' }]);
+    assert.notEqual(keyA, keySmaller);
+    assert.match(keyA, /^maintenance-freshness:[0-9a-f]{16}$/);
+  });
+
+  it('run() pages Maintenance ledger stale for an injected stale bot row and reports it in detail.staleJobs', async () => {
+    tmpHome = await createTempPaHome();
+    try {
+      const now = Date.now();
+      const job = findJob('model-override-sweep')!;
+      const ledger: MaintenanceLedger = {
+        version: 1,
+        jobs: { [job.name]: { firstSeenAt: new Date(now - 3600_000).toISOString(), lastSkipAt: new Date(now - 20 * 60_000).toISOString(), consecutiveFailures: 0, consecutiveSkips: 1 } },
+      };
+      const ctx = {
+        now,
+        everyMs: 60_000,
+        async listSkills() { return []; },
+        async getLastSuccessfulRun() { return null; },
+        async getFailureState() { return { consecutiveFailures: 0, lastAttemptAt: null }; },
+        readLedger: async () => ledger,
+        declaredJobs: [job],
+        maintenanceOverrides: {},
+      };
+      const result = await stalenessCheckJob.run(ctx as any);
+      assert.equal(result.touched, 1);
+      const detail = result.detail as { staleJobs?: string[] };
+      assert.deepEqual(detail.staleJobs, ['bot/model-override-sweep']);
+      await flushLog();
+      const appLog = await readFile(join(tmpHome, 'app.log.jsonl'), 'utf8');
+      assert.match(appLog, /"subject":"Maintenance ledger stale"/);
+      const expectedKey = ledgerFreshnessDedupKey([{ name: 'model-override-sweep', host: 'bot' }]);
+      assert.ok(appLog.includes(`"dedupKey":"${expectedKey}"`));
+    } finally {
+      await cleanup(tmpHome);
+    }
+  });
+
+  it('drainStallRecords archives the file under the prunable suffix and logs one error line per record with its refId', async () => {
+    tmpHome = await createTempPaHome();
+    try {
+      const recordLine = JSON.stringify({ ts: '2026-09-16T10:00:00.000Z', pid: 1234, host: 'catchup-loop', store: 'maintenance-state', target: 'maintenance-state.json', waitedMs: 180001, maxWaitMs: 180000, refId: 's-aaaaaaaaaaaa' });
+      const launcherLine = '{"ts":"2026-09-16T15:30:00","pid":1234,"host":"launcher","store":"lane-progress","cause":"lane reminders stale at drill-wedge"}';
+      await writeFile(stallRecordsPath(), `${recordLine}\n${launcherLine}\r\n`, 'utf8');
+      const now = Date.now();
+      const result = drainStallRecords(now);
+      assert.equal(result.drained, 2);
+      assert.equal(result.unparseable, 0);
+      assert.equal(existsSync(stallRecordsPath()), false);
+      assert.ok(result.archivedTo);
+      assert.ok(String(result.archivedTo).split(/[\\/]/).pop()!.endsWith(STALL_RECORDS_ARCHIVE_SUFFIX));
+      assert.ok(PRUNABLE_ARCHIVE_SUFFIXES.includes(STALL_RECORDS_ARCHIVE_SUFFIX));
+      await flushLog();
+      const appLog = await readFile(join(tmpHome, 'app.log.jsonl'), 'utf8');
+      const stallLines = appLog.trim().split('\n').map((l) => JSON.parse(l)).filter((e) => e.module === 'stall');
+      assert.equal(stallLines.length, 2);
+      assert.ok(stallLines.every((e) => e.level === 'error'));
+      const byRefId = stallLines.find((e) => e.refId === 's-aaaaaaaaaaaa');
+      assert.ok(byRefId);
+      assert.equal(byRefId.message, 'store stall: maintenance-state (maintenance-state.json) in catchup-loop');
+      const byLauncher = stallLines.find((e) => e.message === 'catchup launcher restarted a stalled loop: lane reminders stale at drill-wedge');
+      assert.ok(byLauncher);
+      assert.match(byLauncher.refId, /^s-[0-9a-f]{12}$/);
+    } finally {
+      await cleanup(tmpHome);
+    }
+  });
+
+  it('drainStallRecords is a no-op without a stall-records file', async () => {
+    tmpHome = await createTempPaHome();
+    try {
+      const result = drainStallRecords(Date.now());
+      assert.deepEqual(result, { drained: 0, unparseable: 0, archivedTo: null });
+    } finally {
+      await cleanup(tmpHome);
+    }
   });
 });

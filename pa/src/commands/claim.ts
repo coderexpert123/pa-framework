@@ -2,7 +2,8 @@ import { randomBytes } from 'crypto';
 import { spawn } from 'child_process';
 import { join } from 'path';
 import fs from 'fs-extra';
-import { claim, release, renew, readActive, type ReleaseOptions } from '../lib/reservations.js';
+import { claim, release, renew, readActive, readPlanned, type ReleaseOptions } from '../lib/reservations.js';
+import { resolveSessionBusAddress } from '../lib/bus-queue.js';
 import { resolveRepoRoot } from '../lib/git-root.js';
 import { parsePorcelainPaths } from '../lib/git-status.js';
 import { paHome } from '../paths.js';
@@ -12,6 +13,7 @@ const POLL_INTERVAL_MS = 5000;
 
 const CLAIM_USAGE =
   'Usage: pa claim <path...> --session <label> --note "<what you are doing>" [--ttl <minutes>] [--force] [--wait <seconds>]\n' +
+  '              [--planned] [--bus <addr>] [--task <id>] [--pid <n>]\n' +
   '       pa claim --renew <id> [--ttl <minutes>]';
 
 const RELEASE_USAGE = 'Usage: pa release <id> [--session <label>] [--force]';
@@ -24,6 +26,10 @@ interface ParsedClaimArgs {
   note?: string;
   ttlMinutes?: number;
   force: boolean;
+  planned: boolean;
+  bus?: string;
+  taskId?: string;
+  pid?: number;
   waitSeconds?: number;
   renewId?: string;
   help: boolean;
@@ -36,6 +42,10 @@ function parseClaimArgs(args: string[]): ParsedClaimArgs {
   let note: string | undefined;
   let ttlMinutes: number | undefined;
   let force = false;
+  let planned = false;
+  let bus: string | undefined;
+  let taskId: string | undefined;
+  let pid: number | undefined;
   let waitSeconds: number | undefined;
   let renewId: string | undefined;
   let help = false;
@@ -47,6 +57,10 @@ function parseClaimArgs(args: string[]): ParsedClaimArgs {
     if (arg === '--note') { note = args[++i]; continue; }
     if (arg === '--ttl') { ttlMinutes = Number(args[++i]); continue; }
     if (arg === '--force') { force = true; continue; }
+    if (arg === '--planned') { planned = true; continue; }
+    if (arg === '--bus') { bus = args[++i]; continue; }
+    if (arg === '--task') { taskId = args[++i]; continue; }
+    if (arg === '--pid') { pid = Number(args[++i]); continue; }
     if (arg === '--wait') { waitSeconds = Number(args[++i]); continue; }
     if (arg === '--renew') { renewId = args[++i]; continue; }
     if (arg === '--help' || arg === '-h') { help = true; continue; }
@@ -60,6 +74,10 @@ function parseClaimArgs(args: string[]): ParsedClaimArgs {
     note,
     ttlMinutes,
     force,
+    planned,
+    bus,
+    taskId,
+    pid: Number.isFinite(pid) ? pid : undefined,
     waitSeconds,
     renewId,
     help,
@@ -117,9 +135,7 @@ export async function claimCommand(args: string[]): Promise<number> {
   }
 
   if (parsed.paths.length === 0) {
-    console.error(
-      'Usage: pa claim <path...> --session <label> --note "<what you are doing>" [--ttl <minutes>] [--force] [--wait <seconds>]'
-    );
+    console.error(CLAIM_USAGE);
     return 1;
   }
 
@@ -128,6 +144,34 @@ export async function claimCommand(args: string[]): Promise<number> {
     session = `s-${randomBytes(3).toString('hex')}`;
     console.log(`No --session given (and PA_SESSION unset) — generated "${session}". Reuse it on every subsequent call.`);
   }
+
+  // Identity auto-fill (AI-255): a claim should name WHERE its owner is
+  // reachable (bus) and WHICH process owns it (pid — enables the GC dead-owner
+  // sweep). Both come from the same resolution `pa bus whoami` uses, so the
+  // claim's bus address IS the session's registered address. Dispatched
+  // workers inherit PA_WORKER_DISPATCH_ID — carrying it lets the worker-exec
+  // settle funnel auto-release the claim (B4: claims outliving their work).
+  const dispatchId = process.env.PA_WORKER_DISPATCH_ID || undefined;
+  let bus = parsed.bus;
+  let pid = parsed.pid;
+  if (bus === undefined || pid === undefined) {
+    const ident = await resolveSessionBusAddress();
+    bus = bus ?? ident.address;
+    // ident.pid is the registered session host (ancestor-matched even on
+    // pin/key paths — AI-260). When it's absent, process.ppid is only a real
+    // owner under a dispatch (the worker host — dead ⇒ the dispatch died ⇒
+    // claims shed); for a headed claim it is a per-invocation shell that's
+    // dead within seconds, and recording it made every plain claim
+    // dead-owner-sweepable. Record nothing instead — the row then rides its
+    // TTL like any pid-less reservation.
+    pid = pid ?? ident.pid ?? (dispatchId ? process.ppid : undefined);
+  }
+  // PA_TASK_ID rides the per-hop getEnv hook (task-executor stamps the task id,
+  // thread-executor t-<n>) — the getEnv merge lands AFTER runWithFailover's
+  // secret_allowlist filter, so it reaches allowlisted workers; a worker's
+  // claims then release on the work item's terminal transition even if the
+  // dispatch settle already ran.
+  const taskId = parsed.taskId ?? process.env.PA_TASK_ID ?? undefined;
 
   const note = parsed.note ?? '';
   // A non-numeric --wait (e.g. a typo'd value) must never become a deadline of NaN:
@@ -146,11 +190,23 @@ export async function claimCommand(args: string[]): Promise<number> {
       note,
       ttlMinutes: parsed.ttlMinutes,
       force: parsed.force,
+      kind: parsed.planned ? 'planned' : undefined,
+      bus,
+      pid,
+      dispatchId,
+      taskId,
     });
 
     if (result.ok) {
       const r = result.reservation!;
-      console.log(`Claimed ${r.id} — ${r.paths.join(', ')} (expires ${r.expiresAt})`);
+      if (result.plannedConflicts?.length) {
+        const lines = result.plannedConflicts
+          .map((c) => `  ${c.paths.join(', ')} planned by "${c.session}" (${c.note})${c.bus ? ` bus=${c.bus}` : ''}`)
+          .join('\n');
+        console.log(`Note — overlapping planned work:\n${lines}`);
+      }
+      const tag = parsed.planned ? 'Planned' : 'Claimed';
+      console.log(`${tag} ${r.id} — ${r.paths.join(', ')} (expires ${r.expiresAt})`);
       return 0;
     }
 
@@ -319,7 +375,21 @@ export async function claimsCommand(args: string[] = []): Promise<number> {
     console.log('  (none)');
   } else {
     for (const r of active) {
-      console.log(`  ${r.id}  ${r.paths.join(', ')}  session=${r.session}  note="${r.note}"  expires=${r.expiresAt}`);
+      const bus = r.bus ? `  bus=${r.bus}` : '';
+      const owner = r.pid ? `  pid=${r.pid}` : '';
+      console.log(`  ${r.id}  ${r.paths.join(', ')}  session=${r.session}${bus}${owner}  note="${r.note}"  expires=${r.expiresAt}`);
+    }
+  }
+
+  const planned = await readPlanned();
+  console.log('');
+  console.log('Planned (declared intent — does not block):');
+  if (planned.length === 0) {
+    console.log('  (none)');
+  } else {
+    for (const r of planned) {
+      const bus = r.bus ? `  bus=${r.bus}` : '';
+      console.log(`  ${r.id}  ${r.paths.join(', ')}  session=${r.session}${bus}  note="${r.note}"  expires=${r.expiresAt}`);
     }
   }
 
@@ -388,6 +458,7 @@ export interface CoordinationStats {
   renewed: number;
   gcExpired: number;
   hookWarnings: number;
+  unclaimedWrites: number;
   distinctSessions: number;
   autoSessionIds: number;
   sessions: Array<{ session: string; claims: number }>;
@@ -439,6 +510,7 @@ export async function coordinationStats(
   let renewed = 0;
   let gcExpired = 0;
   let hookWarnings = 0;
+  let unclaimedWrites = 0;
   const sessionCounts = new Map<string, number>();
 
   for (const file of files) {
@@ -480,6 +552,12 @@ export async function coordinationStats(
         case 'hook warning':
           hookWarnings++;
           break;
+        // AI-255 B5: worker-context unclaimed-write telemetry from the
+        // reservation guard — which dispatches touched shared surfaces with no
+        // covering claim.
+        case 'unclaimed write':
+          unclaimedWrites++;
+          break;
         default:
           break;
       }
@@ -503,6 +581,7 @@ export async function coordinationStats(
     renewed,
     gcExpired,
     hookWarnings,
+    unclaimedWrites,
     distinctSessions,
     autoSessionIds,
     sessions,
@@ -524,6 +603,7 @@ function renderCoordinationStats(stats: CoordinationStats): string {
   lines.push(statsLabel('renewed:') + `${stats.renewed}`);
   lines.push(statsLabel('gc-expired:') + `${stats.gcExpired}`);
   lines.push(statsLabel('hook warnings:') + `${stats.hookWarnings}`);
+  lines.push(statsLabel('unclaimed writes:') + `${stats.unclaimedWrites}`);
   lines.push(
     statsLabel('session labels:') +
       `${stats.distinctSessions} distinct, ${stats.autoSessionIds} auto-generated (s-xxxxxx)`
@@ -533,7 +613,7 @@ function renderCoordinationStats(stats: CoordinationStats): string {
     : '(none)';
   lines.push(statsLabel('top sessions:') + topSessions);
 
-  const hasActivity = stats.claims + stats.denied + stats.released + stats.renewed + stats.gcExpired + stats.hookWarnings > 0;
+  const hasActivity = stats.claims + stats.denied + stats.released + stats.renewed + stats.gcExpired + stats.hookWarnings + stats.unclaimedWrites > 0;
   if (!hasActivity) {
     lines.push('  (no reservation activity logged in this window)');
   }

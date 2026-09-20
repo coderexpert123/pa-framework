@@ -16,7 +16,6 @@ import { logger } from '../../../pa/dist/src/lib/log.js';
 import { loadTopicState, saveTopicState, listTopicStateRefs } from '../dist/conversation.js';
 import { hydrateModelStatus, renderStatusCard } from '../dist/logic.js';
 import { sanitizeMdV2 } from '../dist/telegram.js';
-import { getKeepAwakeStatus } from '../dist/keepawake.js';
 // Preserve Control Card Keyboard:
 // Import buildControlCardKeyboard, currentCardKeyboard and clearCardKeyboard from ../src/callbacks.js (via dist at runtime)
 import { buildControlCardKeyboard, currentCardKeyboard, clearCardKeyboard } from '../dist/callbacks.js';
@@ -140,7 +139,6 @@ export function buildStatusCardPayload(
   threadId: number,
   state: ConversationState,
   snapshot: ModelStatusSnapshot,
-  keepAwake = getKeepAwakeStatus(),
   tasks?: { running: number; parked: number; queued: number }
 ): {
   pinText: string;
@@ -149,7 +147,7 @@ export function buildStatusCardPayload(
   editBody: Record<string, unknown>;
   sendBody: Record<string, unknown>;
 } {
-  const pinText = renderStatusCard({ snapshot, keepAwake, tasks });
+  const pinText = renderStatusCard({ snapshot, tasks });
   const sanitizedText = sanitizeMdV2(pinText.trim());
   const keyboard = (state.pinned_status_message_id
     ? currentCardKeyboard(chatId, state.pinned_status_message_id)
@@ -439,7 +437,6 @@ export async function runRefresh(
       const snapshot = hydrateModelStatus(topicState, effectiveDefault, config);
       syncModelStatusState(topicState, snapshot);
 
-      const keepAwake = getKeepAwakeStatus();
       const tasks = await topicTaskCounts(ref.chatId, ref.threadId);
 
       const payload = buildStatusCardPayload(
@@ -447,7 +444,6 @@ export async function runRefresh(
         ref.threadId,
         topicState,
         snapshot,
-        keepAwake,
         tasks
       );
 

@@ -11,6 +11,21 @@ import { drainDueReminderResumes, injectSystemReminderUpdate, injectSystemResume
 import { flushLog } from '../../../../pa/dist/src/lib/log.js';
 import { waitForDrain } from './test-teardown-guard.js';
 
+// A stub standing in for projects/voice-inbox/scripts/create_conversation_task.py
+// (never the real script, never a real ledger) — it echoes its own argv plus a
+// caller-controlled JSON envelope, so these tests assert exactly what
+// resumeVoiceInboxConversation passes and how it reacts, without touching sqlite
+// or a real python-side ledger write. The real script's own INSERT shape is
+// verified separately (manually, against the real schema) — this suite only
+// owns the TS-side dispatch/validation/fail-open behaviour.
+const STUB_SCRIPT = `
+import sys, json, os
+result = json.loads(os.environ.get("TEST_STUB_RESULT", '{"ok": true, "task_id": "vi-000000000000", "routed_to": null}'))
+result["_argv"] = sys.argv[1:]
+print(json.dumps(result))
+sys.exit(0 if result.get("ok") else 1)
+`;
+
 const CHAT_ID = -1001234567890;
 const THREAD_ID = 5001;
 
@@ -162,6 +177,113 @@ describe('drainDueReminderResumes', () => {
     assert.equal(pop.id, '2026-09-02T09:30:00+00:00-abcd1234');
     assert.equal(String(pop.chatId), String(CHAT_ID));
     assert.equal(pop.threadId, THREAD_ID);
+  });
+});
+
+// AI-conversation-context reminder fix (2026-09-12): drainDueReminderResumes'
+// second branch, for a reminder whose pending decision originated in a
+// voice-inbox UI conversation rather than a Telegram chat/topic.
+describe('drainDueReminderResumes — voice_inbox_resume', () => {
+  let tempDir: string;
+  let originalPaHome: string | undefined;
+  let originalScriptEnv: string | undefined;
+  let originalStubResult: string | undefined;
+  const CONVERSATION_ID = 'vi-682a17c7e13c';
+
+  function voiceInboxRecord(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      id: '2026-09-12T02:30:00+00:00-efgh5678',
+      queued_at: '2026-09-12T02:30:00.000Z',
+      chat_id: CHAT_ID,
+      thread_id: THREAD_ID,
+      resume_action: { type: 'voice_inbox_resume', conversation_id: CONVERSATION_ID, prompt: 'Run the fresh-OTP Swiggy re-run' },
+      ...overrides,
+    };
+  }
+
+  beforeEach(async () => {
+    await flushLog();
+    tempDir = await mkdtemp(join(tmpdir(), 'reminder-resume-vi-'));
+    originalPaHome = process.env.PA_HOME;
+    process.env.PA_HOME = tempDir;
+    const stubPath = join(tempDir, 'stub_create_conversation_task.py');
+    await writeFile(stubPath, STUB_SCRIPT, 'utf8');
+    originalScriptEnv = process.env.PA_VOICE_INBOX_RESUME_SCRIPT;
+    process.env.PA_VOICE_INBOX_RESUME_SCRIPT = stubPath;
+    originalStubResult = process.env.TEST_STUB_RESULT;
+  });
+
+  afterEach(async () => {
+    await flushLog();
+    await waitForDrain();
+    if (originalPaHome === undefined) delete process.env.PA_HOME; else process.env.PA_HOME = originalPaHome;
+    if (originalScriptEnv === undefined) delete process.env.PA_VOICE_INBOX_RESUME_SCRIPT; else process.env.PA_VOICE_INBOX_RESUME_SCRIPT = originalScriptEnv;
+    if (originalStubResult === undefined) delete process.env.TEST_STUB_RESULT; else process.env.TEST_STUB_RESULT = originalStubResult;
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  async function readLogEntries(): Promise<any[]> {
+    await flushLog();
+    const raw = await readFile(join(tempDir, 'app.log.jsonl'), 'utf8');
+    return raw.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  }
+
+  it('resolves via create_conversation_task.py, passing conversation_id and prompt, never via injectFn', async () => {
+    process.env.TEST_STUB_RESULT = JSON.stringify({ ok: true, task_id: 'vi-abc123abc123', routed_to: '-1001234567890_310' });
+    await writeQueue(tempDir, [voiceInboxRecord()]);
+    const updates: any[] = [];
+    const injected = await drainDueReminderResumes(new Set([CHAT_ID]), (u) => updates.push(u));
+    assert.equal(injected, 1);
+    assert.equal(updates.length, 0, 'a voice_inbox_resume never goes through the Telegram injection path');
+
+    const entries = await readLogEntries();
+    const info = entries.find((e) => e.module === 'reminder-resume' && e.message === 'injected voice_inbox_resume turn');
+    assert.ok(info, 'a success log line must exist');
+    assert.equal(info.conversationId, CONVERSATION_ID);
+    assert.equal(info.taskId, 'vi-abc123abc123');
+    assert.deepEqual(await readQueue(tempDir), [], 'record consumed');
+  });
+
+  it('script reporting ok:false drops the record with a WARN (fail-open, never crashes)', async () => {
+    process.env.TEST_STUB_RESULT = JSON.stringify({ ok: false, error: 'no task found for conversation_id' });
+    await writeQueue(tempDir, [voiceInboxRecord()]);
+    const injected = await drainDueReminderResumes(new Set([CHAT_ID]), () => {});
+    assert.equal(injected, 0);
+    assert.deepEqual(await readQueue(tempDir), [], 'record still popped, not left to redrain');
+    const entries = await readLogEntries();
+    const warn = entries.find((e) => e.module === 'reminder-resume' && e.level === 'warn');
+    assert.ok(warn, 'a reminder-resume WARN must be logged');
+    assert.match(warn.message, /voice_inbox_resume script reported failure/);
+  });
+
+  it('a missing/unspawnable script drops the record with a WARN (fail-open)', async () => {
+    process.env.PA_VOICE_INBOX_RESUME_SCRIPT = join(tempDir, 'does-not-exist.py');
+    await writeQueue(tempDir, [voiceInboxRecord()]);
+    const injected = await drainDueReminderResumes(new Set([CHAT_ID]), () => {});
+    assert.equal(injected, 0);
+    const entries = await readLogEntries();
+    const warn = entries.find((e) => e.module === 'reminder-resume' && e.level === 'warn');
+    assert.ok(warn, 'a reminder-resume WARN must be logged');
+    assert.match(warn.message, /voice_inbox_resume script failed/);
+  });
+
+  it('rejects a malformed voice_inbox_resume action before ever spawning the script', async () => {
+    await writeQueue(tempDir, [voiceInboxRecord({
+      resume_action: { type: 'voice_inbox_resume', conversation_id: 'not-a-real-id', prompt: 'do it' },
+    })]);
+    const injected = await drainDueReminderResumes(new Set([CHAT_ID]), () => {});
+    assert.equal(injected, 0);
+    const entries = await readLogEntries();
+    const warn = entries.find((e) => e.module === 'reminder-resume' && e.level === 'warn');
+    assert.ok(warn, 'a reminder-resume WARN must be logged');
+    assert.match(warn.message, /conversation_id must match/);
+  });
+
+  it('is unaffected by allowedChatIds/chat_id — the target is the conversation, not a chat', async () => {
+    process.env.TEST_STUB_RESULT = JSON.stringify({ ok: true, task_id: 'vi-abc123abc123', routed_to: null });
+    await writeQueue(tempDir, [voiceInboxRecord({ chat_id: -999, thread_id: undefined })]);
+    const injected = await drainDueReminderResumes(new Set([CHAT_ID]), () => {});
+    assert.equal(injected, 1, 'voice_inbox_resume bypasses the chat_id/allowedChatIds gate entirely');
   });
 });
 

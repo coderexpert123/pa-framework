@@ -109,6 +109,16 @@ SINGLE_QUOTED='1234567890abcdef'
       const result = redactSecrets(input);
       assert.equal(result, 'Token: <redacted:DOUBLE_QUOTED>');
     });
+
+    it('should redact a TYPESAFE_API_KEY value from secrets.env', () => {
+      const secretsPath = join(TEST_PA_HOME, 'secrets.env');
+      writeFileSync(secretsPath, 'TYPESAFE_API_KEY=ts_live_abcdef1234567890');
+
+      resetRedactCache();
+
+      const result = redactSecrets('key ts_live_abcdef1234567890 end');
+      assert.equal(result, 'key <redacted:TYPESAFE_API_KEY> end');
+    });
   });
 
   describe('generic shape pattern redaction', () => {
@@ -225,5 +235,82 @@ SINGLE_QUOTED='1234567890abcdef'
       const result = redactSecrets(input);
       assert.equal(result, input);
     });
+  });
+});
+
+describe('redactSecrets — stored auth tokens (auth broker)', () => {
+  beforeEach(() => {
+    if (existsSync(TEST_PA_HOME)) {
+      rmSync(TEST_PA_HOME, { recursive: true, force: true });
+    }
+    mkdirSync(TEST_PA_HOME, { recursive: true });
+    process.env.PA_HOME = TEST_PA_HOME;
+  });
+
+  afterEach(() => {
+    if (existsSync(TEST_PA_HOME)) {
+      rmSync(TEST_PA_HOME, { recursive: true, force: true });
+    }
+    delete process.env.PA_HOME;
+    resetRedactCache();
+  });
+
+  it('redacts a stored auth/<provider>.json token value', () => {
+    const authDir = join(TEST_PA_HOME, 'auth');
+    mkdirSync(authDir, { recursive: true });
+    writeFileSync(
+      join(authDir, 'notion.json'),
+      JSON.stringify({ access_token: 'sample-notion-token-abcdefgh', short_field: 'abcdefg' })
+    );
+
+    resetRedactCache();
+
+    const result = redactSecrets('token sample-notion-token-abcdefgh here');
+    assert.equal(result, 'token <redacted:auth:notion> here');
+
+    // Known-bad control: a 7-char value in the SAME file must NOT be
+    // redacted — proves the >= 8 rule still discriminates for auth tokens.
+    const shortResult = redactSecrets('short value abcdefg here');
+    assert.equal(shortResult, 'short value abcdefg here');
+  });
+
+  it('does not load auth/requests/*.json — its values survive verbatim', () => {
+    const requestsDir = join(TEST_PA_HOME, 'auth', 'requests');
+    mkdirSync(requestsDir, { recursive: true });
+    writeFileSync(
+      join(requestsDir, 'ir-000000000000.json'),
+      JSON.stringify({ state: 'somestatevalue123' })
+    );
+
+    resetRedactCache();
+
+    const result = redactSecrets('state is somestatevalue123 here');
+    assert.equal(result, 'state is somestatevalue123 here');
+  });
+
+  it('does not load auth/standing.json', () => {
+    const authDir = join(TEST_PA_HOME, 'auth');
+    mkdirSync(authDir, { recursive: true });
+    writeFileSync(
+      join(authDir, 'standing.json'),
+      JSON.stringify({ 't-1234567': { conversation_id: 'vi-abcdef012345' } })
+    );
+
+    resetRedactCache();
+
+    const result = redactSecrets('conversation vi-abcdef012345 here');
+    assert.equal(result, 'conversation vi-abcdef012345 here');
+  });
+
+  it('redacts a stored google-token.json value', () => {
+    writeFileSync(
+      join(TEST_PA_HOME, 'google-token.json'),
+      JSON.stringify({ refresh_token: 'dummy-refresh-token-12345678' })
+    );
+
+    resetRedactCache();
+
+    const result = redactSecrets('token dummy-refresh-token-12345678 here');
+    assert.equal(result, 'token <redacted:auth:google-token> here');
   });
 });

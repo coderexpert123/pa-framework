@@ -171,9 +171,14 @@ export async function checkWorkers(): Promise<CheckResult> {
   const activeCount = results.filter((r) => r.ok && !r.cooling).length;
 
   if (unavailable.length === results.length) {
+    // WARN, not FAIL (2026-09-20, AI-264 chain): zero installed worker CLIs is
+    // the DOCUMENTED degraded floor — docs/INSTALL.md §3 step 5 defines "Your
+    // assistant runs but can't think yet" as a SUCCESS state, and
+    // verify-install / install_trial.sh S6 count FAIL rows only. The
+    // all-cooling case below stays FAIL: that IS a real runtime outage.
     return {
       name: 'workers',
-      status: 'FAIL',
+      status: 'WARN',
       detail: `all unavailable: ${unavailable.join(', ')}. Fix: install at least one of Claude Code or openai-codex and update ~/.pa/config.yaml's \`command\` paths. See docs/WORKERS_GUIDE.md.`,
     };
   }

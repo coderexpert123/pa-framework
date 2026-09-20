@@ -27,7 +27,7 @@ afterEach(async () => {
 });
 
 function emptySources(): RecallSources {
-  return { conversation: null, traces: null, topicBrains: null, kb: null, reviewDigest: null, decisions: null };
+  return { conversation: null, traces: null, topicBrains: null, kb: null, reviewDigest: null, decisions: null, profile: null };
 }
 
 function convTurn(fields: Record<string, unknown>): string {
@@ -980,5 +980,90 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     } finally {
       recallDb.close();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// profile source (WP-8, OD-3): interests / preferences / live history from
+// ~/.pa/data/profile.json (or PA_PROFILE_PATH) become recallable.
+// ---------------------------------------------------------------------------
+
+describe('profile source (WP-8)', () => {
+  function writeProfile(fields: Record<string, unknown>): string {
+    const profileFile = join(dir, 'data', 'profile.json');
+    mkdirSync(join(dir, 'data'), { recursive: true });
+    writeFileSync(profileFile, JSON.stringify(fields, null, 2), 'utf8');
+    return profileFile;
+  }
+
+  it('indexes an interest term and a preference value as searchable docs', async () => {
+    const profileFile = writeProfile({
+      interests: ['Alpine stays above 2000m', 'Agentic AI tooling'],
+      preferences: { travel: { stay_style: 'Luxury Alpine' } },
+      history: [],
+    });
+    const sources: RecallSources = { ...emptySources(), profile: { path: profileFile } };
+    const dbPath = join(dir, 'recall.sqlite');
+    await indexRecall(dbPath, sources);
+
+    const docs = dbIntrospect(dbPath);
+    assert.deepEqual(
+      docs.map((d) => d.doc_id).sort(),
+      ['profile:interest:0', 'profile:interest:1', 'profile:preference:travel'],
+    );
+
+    const hit = queryRecall(dbPath, sources, { q: 'Alpine', limit: 10, source: 'profile' });
+    assert.equal(hit.total, 2, 'interest:0 + the nested preference value carry "Alpine"; interest:1 does not');
+  });
+
+  it('superseded history rows are absent while live rows index with valid_from as ts', async () => {
+    const profileFile = writeProfile({
+      interests: [],
+      preferences: {},
+      history: [
+        { update: 'Live fact about orchids', valid_from: '2026-09-01', valid_until: null, key: 'live-1', superseded_by: null },
+        { update: 'Superseded fact about orchids', valid_from: '2026-08-01', valid_until: '2026-09-01', key: 'old-1', superseded_by: 'live-1' },
+      ],
+    });
+    const sources: RecallSources = { ...emptySources(), profile: { path: profileFile } };
+    const dbPath = join(dir, 'recall.sqlite');
+    await indexRecall(dbPath, sources);
+
+    const docs = dbIntrospect(dbPath);
+    assert.deepEqual(docs.map((d) => d.doc_id), ['profile:history:0'],
+      'the superseded row must never index — only the live one');
+    assert.equal(docs[0].ts, '2026-09-01', 'valid_from rides the row ts');
+
+    const hit = queryRecall(dbPath, sources, { q: 'orchids', limit: 10, source: 'profile' });
+    assert.equal(hit.total, 1);
+    assert.ok(hit.hits[0].snippet.includes('Live fact'));
+  });
+
+  it('a missing profile file yields zero rows and never throws', async () => {
+    const sources: RecallSources = { ...emptySources(), profile: { path: join(dir, 'data', 'absent.json') } };
+    const dbPath = join(dir, 'recall.sqlite');
+    const stats = await indexRecall(dbPath, sources);
+    assert.equal(stats.sources.profile?.added ?? 0, 0);
+    assert.deepEqual(dbIntrospect(dbPath), []);
+    const hit = queryRecall(dbPath, sources, { q: 'anything', limit: 5, source: 'profile' });
+    assert.equal(hit.total, 0);
+  });
+
+  it('a planted secrets.env value inside a preference is redacted before it reaches the store', async () => {
+    await createTempSecrets(dir, 'MY_SECRET_TOKEN=abcdefgh12345678\n');
+    resetRedactCache();
+    const profileFile = writeProfile({
+      interests: [],
+      preferences: { api: 'abcdefgh12345678' },
+      history: [],
+    });
+    const sources: RecallSources = { ...emptySources(), profile: { path: profileFile } };
+    const dbPath = join(dir, 'recall.sqlite');
+    await indexRecall(dbPath, sources);
+
+    const docs = dbIntrospect(dbPath);
+    assert.equal(docs.length, 1);
+    assert.ok(!docs[0].text.includes('abcdefgh12345678'));
+    resetRedactCache();
   });
 });

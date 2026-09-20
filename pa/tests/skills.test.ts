@@ -64,6 +64,16 @@ describe('loadSkill', () => {
     assert.equal(skill.frontmatter.worker_args, undefined);
   });
 
+  it('parses worktree_cwd (AI-320): bool true, string "true", absent defaults false', async () => {
+    await createTempSkill(tempDir, 'wt-on', '---\nworktree_cwd: true\n---\nP.');
+    await createTempSkill(tempDir, 'wt-str', '---\nworktree_cwd: "true"\n---\nP.');
+    await createTempSkill(tempDir, 'wt-off', '---\nworker: agy\n---\nP.');
+    assert.equal((await loadSkill('wt-on')).frontmatter.worktree_cwd, true);
+    assert.equal((await loadSkill('wt-str')).frontmatter.worktree_cwd, true);
+    assert.equal((await loadSkill('wt-off')).frontmatter.worktree_cwd, false,
+      'default must be off — push-family skills stay pinned to the declared checkout');
+  });
+
   it('defaults critical to false when absent', async () => {
     await createTempSkill(tempDir, 'non-critical-skill', '---\ncron: "0 8 * * *"\n---\nPrompt.');
     const skill = await loadSkill('non-critical-skill');

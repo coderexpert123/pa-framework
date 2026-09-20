@@ -27,7 +27,7 @@ check", or adjust any of them; do not add issues the script did not report.
 ## Step 1 — Run the scan (absolute path; the worker shim forces cwd to the repo root)
 
 ```
-python "${PA_FRAMEWORK_ROOT}/examples/skills/brain-recheck/brain_recheck_scan.py"
+python3 "${PA_FRAMEWORK_ROOT}/examples/skills/brain-recheck/brain_recheck_scan.py" || python "${PA_FRAMEWORK_ROOT}/examples/skills/brain-recheck/brain_recheck_scan.py"
 ```
 
 It prints one JSON object on stdout and always exits 0. Shape:

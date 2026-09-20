@@ -52,7 +52,6 @@ before(async () => {
       { name: 'codex', priority: 2, command: 'g', args: [], check: 'c', rate_limit_patterns: [] },
     ],
   }), 'utf8');
-  await writeFile(join(tempDir, 'telegram-keepawake.json'), JSON.stringify({ active: false }), 'utf8');
 
   const skillsPath = join(tempDir, 'skills');
   await mkdir(skillsPath);

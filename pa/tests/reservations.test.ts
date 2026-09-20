@@ -643,4 +643,180 @@ describe('reservations', () => {
       assert.equal(routed, err, 'the reservations-style reject route must receive the error');
     });
   });
+
+  describe('planned reservations + lifecycle (AI-255 WP-C)', () => {
+    it('a planned row is stored with kind and excluded from readActive, listed by readPlanned', async () => {
+      const { claim, readActive, readPlanned } = await import('../src/lib/reservations.js');
+      const res = await claim({
+        paths: ['pa/src/thing.ts'],
+        session: 'plan-sess',
+        note: 'intend to work here',
+        kind: 'planned',
+        bus: 'devin@personal-assistant#1',
+      });
+      assert.equal(res.ok, true);
+      assert.equal(res.reservation!.kind, 'planned');
+      assert.equal(res.reservation!.bus, 'devin@personal-assistant#1');
+      assert.equal((await readActive()).length, 0, 'planned rows must not count as active claims');
+      const planned = await readPlanned();
+      assert.equal(planned.length, 1);
+      assert.equal(planned[0].id, res.reservation!.id);
+    });
+
+    it('a planned row never blocks a normal claim — it surfaces as a plannedConflict instead', async () => {
+      const { claim } = await import('../src/lib/reservations.js');
+      await claim({
+        paths: ['pa/src/thing.ts'],
+        session: 'planner',
+        note: 'planned work',
+        kind: 'planned',
+      });
+      const res = await claim({ paths: ['pa/src/thing.ts'], session: 'other-sess', note: 'real claim' });
+      assert.equal(res.ok, true, 'planned rows must not block');
+      assert.equal(res.plannedConflicts?.length, 1);
+      assert.equal(res.plannedConflicts![0].session, 'planner');
+    });
+
+    it('a same-session claim fully covering planned paths absorbs the planned row', async () => {
+      const { claim, readPlanned } = await import('../src/lib/reservations.js');
+      await claim({
+        paths: ['pa/src/a.ts', 'pa/src/b.ts'],
+        session: 'same-sess',
+        note: 'plan',
+        kind: 'planned',
+      });
+      const res = await claim({ paths: ['pa/src/a.ts', 'pa/src/b.ts'], session: 'same-sess', note: 'now doing it' });
+      assert.equal(res.ok, true);
+      assert.equal((await readPlanned()).length, 0, 'fully covered planned row should be absorbed');
+    });
+
+    it('a same-session claim only partially covering planned paths leaves the row', async () => {
+      const { claim, readPlanned } = await import('../src/lib/reservations.js');
+      await claim({
+        paths: ['pa/src/wide/'],
+        session: 'same-sess',
+        note: 'plan the whole dir',
+        kind: 'planned',
+      });
+      const res = await claim({ paths: ['pa/src/wide/one.ts'], session: 'same-sess', note: 'narrow start' });
+      assert.equal(res.ok, true);
+      const planned = await readPlanned();
+      assert.equal(planned.length, 1, 'narrower claim must not absorb a broader plan');
+    });
+
+    it('a different-session claim does NOT absorb the planned row', async () => {
+      const { claim, readPlanned } = await import('../src/lib/reservations.js');
+      await claim({
+        paths: ['pa/src/a.ts'],
+        session: 'planner',
+        note: 'plan',
+        kind: 'planned',
+      });
+      const res = await claim({ paths: ['pa/src/a.ts'], session: 'other', note: 'mine now' });
+      assert.equal(res.ok, true);
+      assert.equal((await readPlanned()).length, 1, "a stranger's claim must not absorb the planner's row");
+    });
+
+    it('claim fields bus/pid/dispatchId/taskId persist on the stored row', async () => {
+      const { claim, readActive } = await import('../src/lib/reservations.js');
+      await claim({
+        paths: ['pa/src/x.ts'],
+        session: 's',
+        note: 'n',
+        bus: 'devin@personal-assistant#42',
+        pid: 4321,
+        dispatchId: 'd-abc123',
+        taskId: 't-7',
+      });
+      const [row] = await readActive();
+      assert.equal(row.bus, 'devin@personal-assistant#42');
+      assert.equal(row.pid, 4321);
+      assert.equal(row.dispatchId, 'd-abc123');
+      assert.equal(row.taskId, 't-7');
+    });
+
+    it('release({dispatchId}) and release({taskId}) match-release their rows', async () => {
+      const { claim, release, readActive } = await import('../src/lib/reservations.js');
+      await claim({ paths: ['pa/src/d.ts'], session: 'w', note: 'd', dispatchId: 'd-111' });
+      await claim({ paths: ['pa/src/t.ts'], session: 'w', note: 't', taskId: 'task-9' });
+      await claim({ paths: ['pa/src/k.ts'], session: 'w', note: 'keep' });
+      const r1 = await release({ dispatchId: 'd-111' });
+      assert.equal(r1.released, 1);
+      const r2 = await release({ taskId: 'task-9' });
+      assert.equal(r2.released, 1);
+      const rest = await readActive();
+      assert.equal(rest.length, 1);
+      assert.equal(rest[0].paths[0], 'pa/src/k.ts');
+    });
+
+    it('sweepDeadOwners drops dead-pid rows (ledger reason dead-owner), keeps live and pid-less rows', async () => {
+      const { claim, sweepDeadOwners, readActive, readReleasedSince } = await import('../src/lib/reservations.js');
+      // A pid that just exited: spawn a trivial child, wait for it, reuse its pid.
+      const { spawnSync } = await import('child_process');
+      const child = spawnSync(process.execPath, ['-e', 'process.exit(0)']);
+      const deadPid = child.pid!;
+      await claim({ paths: ['pa/src/dead.ts'], session: 'gone', note: 'crashed', pid: deadPid });
+      await claim({ paths: ['pa/src/live.ts'], session: 'alive', note: 'running', pid: process.pid });
+      await claim({ paths: ['pa/src/no-pid.ts'], session: 'old-style', note: 'pre-AI-255 row' });
+      const swept = await sweepDeadOwners();
+      assert.equal(swept, 1);
+      const active = await readActive();
+      const paths = active.map((r) => r.paths[0]).sort();
+      assert.deepEqual(paths, ['pa/src/live.ts', 'pa/src/no-pid.ts']);
+      const ledger = await readReleasedSince(Date.now() - 60_000);
+      assert.equal(ledger[0].reason, 'dead-owner', 'swept rows land in the release ledger with an audit reason');
+    });
+
+    it('AI-260: a dead pid + FRESH bus cursor vetoes the sweep; a stale cursor does not', async () => {
+      const { claim, sweepDeadOwners, readActive } = await import('../src/lib/reservations.js');
+      const { touchBusCursor, busCursorPath } = await import('../src/lib/bus-queue.js');
+      const { writeJsonAtomic } = await import('../src/lib/atomic-write.js');
+      const { spawnSync } = await import('child_process');
+      const dead1 = spawnSync(process.execPath, ['-e', 'process.exit(0)']).pid!;
+      const dead2 = spawnSync(process.execPath, ['-e', 'process.exit(0)']).pid!;
+      // Same dead-pid posture on both rows — only the cursor freshness differs.
+      // The fresh-cursor row models a session that re-registered under the same
+      // address after its host respawned: recorded pid dead, session alive.
+      await claim({ paths: ['pa/src/respawned.ts'], session: 'respawned', note: 'respawn', pid: dead1, bus: 'claude@personal-assistant#freshcur' });
+      await claim({ paths: ['pa/src/reallydead.ts'], session: 'reallydead', note: 'dead', pid: dead2, bus: 'claude@personal-assistant#stalecur' });
+      await touchBusCursor('claude@personal-assistant#freshcur', 'ev-fresh');
+      await writeJsonAtomic(busCursorPath('claude@personal-assistant#stalecur'),
+        { last_event: 'ev-old', last_event_at: new Date(Date.now() - 60 * 60_000).toISOString(), pid: dead2 });
+      const swept = await sweepDeadOwners();
+      assert.equal(swept, 1, 'only the stale-cursor row sheds');
+      const paths = (await readActive()).map((r) => r.paths[0]);
+      assert.deepEqual(paths, ['pa/src/respawned.ts'], 'fresh cursor kept the claim alive');
+    });
+
+    it('2026-09-17: a LIVE pid with a superseded bus identity still sheds — spawned-context claims', async () => {
+      const { claim, sweepDeadOwners, readActive } = await import('../src/lib/reservations.js');
+      const { touchBusCursor, registerBusAddress } = await import('../src/lib/bus-queue.js');
+      const { spawn } = await import('child_process');
+      const livePid = process.pid;
+      // A second live host that registers/fires NOTHING — the silent-host
+      // posture (agy-style or a wedged session): claims on it stay ambiguous.
+      const silentHost = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' });
+      try {
+        // The host now lives under a DIFFERENT registered address with a fresh
+        // cursor (a restarted generation / a sibling session on the same host).
+        await registerBusAddress('claude@personal-assistant#222222', { capabilities: ['hooks'], pid: livePid });
+        await touchBusCursor('claude@personal-assistant#222222', 'ev-live');
+        // Phantom bus identity: the subagent/worker/dead-generation address —
+        // registered nowhere, cursor silent.
+        await claim({ paths: ['pa/src/spawned.ts'], session: 'spawned', note: 'subagent done', pid: livePid, bus: 'claude@personal-assistant#333333' });
+        // Control: live pid hosting no live identity at all → kept.
+        await claim({ paths: ['pa/src/ambiguous.ts'], session: 'ambig', note: 'host silent', pid: silentHost.pid, bus: 'claude@personal-assistant#444444' });
+        // The claimant's OWN fresh cursor still vetoes under a live pid.
+        await claim({ paths: ['pa/src/stillfiring.ts'], session: 'firing', note: 'claimant live', pid: livePid, bus: 'claude@personal-assistant#555555' });
+        await touchBusCursor('claude@personal-assistant#555555', 'ev-claimant');
+        const swept = await sweepDeadOwners();
+        const paths = (await readActive()).map((r) => r.paths[0]).sort();
+        assert.deepEqual(paths, ['pa/src/ambiguous.ts', 'pa/src/stillfiring.ts'],
+          'superseded row sheds; ambiguous-host and still-firing claimants keep their claims');
+        assert.equal(swept, 1);
+      } finally {
+        silentHost.kill();
+      }
+    });
+  });
 });

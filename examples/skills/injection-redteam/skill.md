@@ -31,7 +31,7 @@ No LLM is invoked — this is purely pattern matching against deterministic code
 ## Execution
 
 1. Ensure you're at the repo root: `cd "$PA_FRAMEWORK_ROOT"`
-2. Run: `python pa/scripts/redteam_injection.py`
+2. Run: `python3 pa/scripts/redteam_injection.py || python pa/scripts/redteam_injection.py`
 3. Report the outcome:
    - If all pass: brief confirmation ("✅ Redteam test passed")
    - If any fail: show which fixture(s) failed and which layer(s)

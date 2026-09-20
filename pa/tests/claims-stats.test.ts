@@ -157,6 +157,7 @@ describe('coordinationStats (D11)', () => {
       renewed: 0,
       gcExpired: 0,
       hookWarnings: 0,
+      unclaimedWrites: 0,
       distinctSessions: 0,
       autoSessionIds: 0,
       sessions: [],

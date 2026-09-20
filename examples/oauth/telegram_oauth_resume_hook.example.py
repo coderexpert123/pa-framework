@@ -47,7 +47,25 @@ def dispatch(action: dict) -> int:
             cmd.append("--")
             cmd.extend(str(item) for item in extra_args)
 
-        subprocess.Popen(cmd, cwd=cwd, shell=True)
+        # No shell (WB-207): the argv is a list, so shell=True only adds a
+        # word-splitting/quote-injection surface. Failures are surfaced, never
+        # fire-and-forget: an OSError (e.g. `pa` not on PATH) prints loudly,
+        # and the child is WAITED on so a non-zero exit reaches the hook's
+        # caller instead of disappearing behind a successful spawn.
+        try:
+            proc = subprocess.Popen(
+                cmd, cwd=cwd, shell=False,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            )
+        except OSError as exc:
+            print(f"[oauth_resume_hook] failed to spawn {cmd!r}: {exc}", file=sys.stderr)
+            return 1
+        _, stderr = proc.communicate()
+        if proc.returncode != 0:
+            tail = (stderr or "").strip()
+            print(f"[oauth_resume_hook] 'pa run {skill}' exited {proc.returncode}"
+                  + (f": {tail}" if tail else ""), file=sys.stderr)
+            return proc.returncode
         return 0
 
     raise ValueError(f"Unsupported resume action type: {action_type!r}")

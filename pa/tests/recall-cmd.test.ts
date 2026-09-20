@@ -129,13 +129,24 @@ describe('buildSourcesConfig', () => {
     }
   });
 
-  it('conversation/traces/topicBrains/reviewDigest/decisions are all derived under PA_HOME', async () => {
+  it('conversation/traces/topicBrains/reviewDigest/decisions/profile are all derived under PA_HOME', async () => {
     const sources = await buildSourcesConfig(undefined);
     assert.equal(sources.conversation!.live, join(dir, 'conversation-history.jsonl'));
     assert.equal(sources.traces!.live, join(dir, 'turn-traces.jsonl'));
     assert.equal(sources.topicBrains!.dir, join(dir, 'topic-brains'));
     assert.equal(sources.reviewDigest!.path, join(dir, 'review-digest-pending.jsonl'));
     assert.equal(sources.decisions!.dbPath, join(dir, 'decisions.sqlite'));
+    assert.equal(sources.profile!.path, join(dir, 'data', 'profile.json'));
+  });
+
+  it('PA_PROFILE_PATH wins over profilePath() (WP-8 — learn_agent.py honors it; indexing the wrong file is worse than none)', async () => {
+    process.env.PA_PROFILE_PATH = join(dir, 'elsewhere', 'prof.json');
+    try {
+      const sources = await buildSourcesConfig(undefined);
+      assert.equal(sources.profile!.path, join(dir, 'elsewhere', 'prof.json'));
+    } finally {
+      delete process.env.PA_PROFILE_PATH;
+    }
   });
 });
 

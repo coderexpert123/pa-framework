@@ -234,6 +234,12 @@ def main():
                     "status": "ok",
                     "auth_url": reusable["auth_url"],
                     "auth_id": reusable["auth_id"],
+                    # AI-220 auth broker Phase A: the caller (oauth-mint.ts)
+                    # persists this into the broker row so the new
+                    # /api/v1/auth/callback endpoint can find the request by
+                    # state when Google redirects back — never a second,
+                    # independently generated state value.
+                    "state": reusable.get("state"),
                     "reused": True,
                     "sent": sent,
                 }))
@@ -299,6 +305,12 @@ def main():
             "status": "ok",
             "auth_url": auth_url,
             "auth_id": pending["auth_id"],
+            # AI-220 auth broker Phase A: surface the Flow's own `state` (the
+            # OAuth CSRF nonce, already persisted in `pending` above) so the
+            # caller (oauth-mint.ts) can copy it into the broker row —
+            # `/api/v1/auth/callback` correlates a redirect purely by this
+            # value, and this script is the only place that ever learns it.
+            "state": pending["state"],
             "reused": False,
             "sent": sent,
         }))

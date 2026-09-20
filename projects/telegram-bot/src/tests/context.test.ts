@@ -6,7 +6,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { fileURLToPath } from 'url';
 import { dirname, resolve } from 'path';
-import { buildResumedPrompt, buildPrompt, shouldIncludeSkillStatus, buildSkillStatus, _resetSkillStatusCache } from '../context.js';
+import { buildResumedPrompt, buildPrompt, shouldIncludeSkillStatus, buildSkillStatus, _resetSkillStatusCache, _resetSkillRosterCache, renderSkillRosterSection } from '../context.js';
 import { resolveReplyContext } from '../reply-context.js';
 import type { ConversationState } from '../types.js';
 import type { TopicNameMap } from '../topic-names.js';
@@ -35,6 +35,7 @@ beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), 'tgbot-ctx-'));
   process.env.PA_HOME = tempDir;
   _resetSkillStatusCache();
+  _resetSkillRosterCache();
 });
 
 afterEach(async () => {
@@ -308,6 +309,47 @@ describe('bot-instructions.md content', { skip: !BOT_INSTRUCTIONS_EXISTS && 'bot
         process.env.PA_KB_SOURCES_PATH = originalValue;
       }
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AI-249: the PA_META template must never teach a placeholder action type.
+// A live model copied the literal placeholder verbatim (twice): the envelope
+// parsed, no handler matched, and the action vanished silently. Four surfaces
+// teach the envelope: context.ts's inline block (agy/codex half), the
+// gitignored bot-instructions.md (skip-guarded), the tracked example
+// (CI-enforced half), and orchestrator.ts's fresh-prompt template.
+// ---------------------------------------------------------------------------
+const OLD_TEMPLATE_LITERAL = '"type":"T"';
+const NEW_TEMPLATE = '{"actions":[...]}';
+// The orchestrator fresh-prompt surface carries suggested_items inside the
+// same envelope, so its action-less placeholder reads differently.
+const NEW_TEMPLATE_ORCHESTRATOR = '{"actions":[...], "suggested_items"';
+const ORCHESTRATOR_SRC_PATH = resolve(__dirname, '../../src/orchestrator.ts');
+
+describe('AI-249: PA_META template placeholder removed from all four surfaces', () => {
+  it('context.ts inline block: old literal absent, new template present', async () => {
+    const prompt = await buildPrompt('hello', makeState(), undefined);
+    assert.ok(!prompt.includes(OLD_TEMPLATE_LITERAL), 'the inline PA_META template must not teach a placeholder type');
+    assert.ok(prompt.includes(NEW_TEMPLATE), 'the inline PA_META template must use the action-less placeholder');
+  });
+
+  it('examples/bot-instructions.example.md (tracked, CI-enforced half)', async () => {
+    const content = await readFile(BOT_INSTRUCTIONS_EXAMPLE_PATH, 'utf8');
+    assert.ok(!content.includes(OLD_TEMPLATE_LITERAL));
+    assert.ok(content.includes(NEW_TEMPLATE));
+  });
+
+  it('bot-instructions.md (local, skip-guarded)', { skip: !BOT_INSTRUCTIONS_EXISTS && 'bot-instructions.md not present locally' }, async () => {
+    const content = await readFile(BOT_INSTRUCTIONS_PATH, 'utf8');
+    assert.ok(!content.includes(OLD_TEMPLATE_LITERAL));
+    assert.ok(content.includes(NEW_TEMPLATE));
+  });
+
+  it('orchestrator.ts fresh-prompt template (source pin)', async () => {
+    const content = await readFile(ORCHESTRATOR_SRC_PATH, 'utf8');
+    assert.ok(!content.includes(OLD_TEMPLATE_LITERAL));
+    assert.ok(content.includes(NEW_TEMPLATE_ORCHESTRATOR));
   });
 });
 
@@ -618,7 +660,7 @@ describe('watch_job standing-rule bullet (AI-170)', () => {
 // All three synced prompt surfaces must carry the exact guidance.
 // ---------------------------------------------------------------------------
 
-const REAUTH_RESUME_BULLET = `- Blocked on Google auth mid-task: mint a resumable reauth link instead of exiting — run python <repo>/pa/scripts/start_google_telegram_reauth.py --redirect-uri <GOOGLE_AUTH_REDIRECT_URI from ~/.pa/secrets.env> --chat-id <chat> --thread-id <thread> (IDs from your Telegram Metadata section; <repo> from your Working Directory section) --resume-action-json '{"type":"topic_resume","prompt":"<the waiting work, one line, <=500 chars>"}'. The link posts to that chat/thread, and once the user completes /auth the bot re-dispatches your prompt into the topic automatically as a system turn. For a skill-shaped blockage prefer telling the user to run /reauth <skill-name>. Never mint a mid-task reauth link without a resume payload.`;
+const REAUTH_RESUME_BULLET = `- Blocked on Google auth mid-task: mint a resumable reauth link instead of exiting — run python3 <repo>/pa/scripts/start_google_telegram_reauth.py --redirect-uri <GOOGLE_AUTH_REDIRECT_URI from ~/.pa/secrets.env> --chat-id <chat> --thread-id <thread> || python <repo>/pa/scripts/start_google_telegram_reauth.py --redirect-uri <GOOGLE_AUTH_REDIRECT_URI from ~/.pa/secrets.env> --chat-id <chat> --thread-id <thread> (IDs from your Telegram Metadata section; <repo> from your Working Directory section) --resume-action-json '{"type":"topic_resume","prompt":"<the waiting work, one line, <=500 chars>"}'. The link posts to that chat/thread, and once the user completes /auth the bot re-dispatches your prompt into the topic automatically as a system turn. For a skill-shaped blockage prefer telling the user to run /reauth <skill-name>. Never mint a mid-task reauth link without a resume payload.`;
 
 describe('reauth resume guidance bullet (AI-181)', () => {
   it('matches examples/bot-instructions.example.md verbatim', async () => {
@@ -688,6 +730,187 @@ describe('PA_META question vocabulary present in all three surfaces', () => {
       'deployed bot-instructions.md must include question{text,options} — hand-sync on merge');
     assert.ok(botInstructionsContent.includes(QUESTION_BULLET),
       'deployed bot-instructions.md must contain the frozen question bullet verbatim — hand-sync on merge');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Next-actions block (2026-09-11 action-block SPEC ITEM 1) — a reply that
+// leaves steps outstanding must end in a NEXT ACTIONS block. The frozen
+// bullet is taught on EVERY reply-shaping surface: the context capabilities
+// block, the task-lane TASK_RULES (which also feeds the thread lane), the
+// orchestrator's self-contained role prompt, and the hand-synced instruction
+// files (prompt-triangle convention).
+// ---------------------------------------------------------------------------
+
+const NEXT_ACTIONS_BULLET =
+  'Next-actions block: when your reply leaves any step outstanding — including a finding, risk, or incomplete item your own work surfaced that nobody has acted on yet, even if you were not asked to act on it and even if your own task is otherwise done — end it with the literal line NEXT ACTIONS, then one numbered line per outstanding step in execution order, each tagged You or Assistant so the next actor is explicit. Every next step named in the reply appears in the block, and the block contains nothing that is not a real step; an Assistant step must be concretely queued or part of a confirmed plan, never a vague promise. When a write action awaits confirmation, the final numbered item is the existing yes-or-no confirmation sentence and it stays the reply\'s last line. Omit the block only for a plain answer or a task that finished with nothing left to decide. The block is the last visible text, after any Details heading and before any machine footer line.';
+
+describe('Next-actions block bullet present in all reply-shaping surfaces', () => {
+  it('context.ts carries the frozen bullet', async () => {
+    // Tests run from dist/tests/ — the source file is two levels up, under src/.
+    const contextSource = await readFile(resolve(__dirname, '../../src/context.ts'), 'utf8');
+    assert.ok(contextSource.includes(NEXT_ACTIONS_BULLET),
+      'context.ts capabilities block must contain the frozen next-actions bullet verbatim');
+  });
+
+  it('examples/bot-instructions.example.md carries the frozen bullet', async () => {
+    const exampleContent = await readFile(BOT_INSTRUCTIONS_EXAMPLE_PATH, 'utf8');
+    assert.ok(exampleContent.includes(NEXT_ACTIONS_BULLET),
+      'examples/bot-instructions.example.md must contain the frozen next-actions bullet verbatim');
+  });
+
+  it('deployed bot-instructions.md carries the frozen bullet (local, skip-guarded)', { skip: !BOT_INSTRUCTIONS_EXISTS && 'bot-instructions.md not present locally (public-clone default — see examples/bot-instructions.example.md)' }, async () => {
+    const botInstructionsContent = await readFile(BOT_INSTRUCTIONS_PATH, 'utf8');
+    assert.ok(botInstructionsContent.includes(NEXT_ACTIONS_BULLET),
+      'deployed bot-instructions.md must contain the frozen next-actions bullet verbatim — hand-sync on merge');
+  });
+
+  it('task-executor.ts carries the frozen bullet in TASK_RULES', async () => {
+    const taskExecutorSource = await readFile(resolve(__dirname, '../../src/task-executor.ts'), 'utf8');
+    assert.ok(taskExecutorSource.includes(`- ${NEXT_ACTIONS_BULLET}`),
+      'task-executor.ts TASK_RULES must carry the frozen next-actions bullet verbatim');
+  });
+
+  it('orchestrator.ts carries the frozen bullet as a role bullet', async () => {
+    const orchestratorSource = await readFile(resolve(__dirname, '../../src/orchestrator.ts'), 'utf8');
+    assert.ok(orchestratorSource.includes(`- ${NEXT_ACTIONS_BULLET}`),
+      'orchestrator.ts role section must carry the frozen next-actions bullet verbatim');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Voice-transcript caveat (2026-09-16 evangelism wave WP-4, OD-6) — the live
+// bot-instructions.md `## Voice Messages` paragraph is claude/zclaude-only via
+// --append-system-prompt-file; agy/codex and the orchestrator lane never saw
+// it. The two-sentence anchor below is FROZEN verbatim from the live file
+// (:67-68) and pinned on every transcript-reading surface. The anchor carries
+// backticks, so .ts sources are compared after unescaping `\`` template
+// escapes.
+// ---------------------------------------------------------------------------
+
+const VOICE_CAVEAT_ANCHOR =
+  'Messages prefixed `[Voice message]` (or `[Audio file]` / `[Video note]`) are speech-to-text transcripts, not typed text. They may contain recognition errors, especially for names and numbers — read odd or out-of-context phrasing as likely mishearing, not a literal statement.';
+
+const unescapeTicks = (s: string) => s.replaceAll('\\`', '`');
+
+describe('voice-transcript caveat present on every transcript-reading surface', () => {
+  it('context.ts capabilities block carries the anchor verbatim', async () => {
+    const contextSource = unescapeTicks(await readFile(resolve(__dirname, '../../src/context.ts'), 'utf8'));
+    assert.ok(contextSource.includes(`- ${VOICE_CAVEAT_ANCHOR}`),
+      'context.ts capabilities block must carry the voice caveat verbatim');
+  });
+
+  it('orchestrator.ts role bullets carry the anchor verbatim', async () => {
+    const orchestratorSource = unescapeTicks(await readFile(resolve(__dirname, '../../src/orchestrator.ts'), 'utf8'));
+    assert.ok(orchestratorSource.includes(`- ${VOICE_CAVEAT_ANCHOR}`),
+      'orchestrator.ts role section must carry the voice caveat verbatim');
+  });
+
+  it('examples/bot-instructions.example.md carries the anchor inside ## Voice Messages', async () => {
+    const exampleContent = await readFile(BOT_INSTRUCTIONS_EXAMPLE_PATH, 'utf8');
+    assert.ok(exampleContent.includes('## Voice Messages'),
+      'example file must have a ## Voice Messages section');
+    assert.ok(exampleContent.includes(VOICE_CAVEAT_ANCHOR),
+      'example file must carry the voice caveat verbatim');
+  });
+
+  it('deployed bot-instructions.md carries the anchor (local, skip-guarded)', { skip: !BOT_INSTRUCTIONS_EXISTS && 'bot-instructions.md not present locally (public-clone default — see examples/bot-instructions.example.md)' }, async () => {
+    const botInstructionsContent = await readFile(BOT_INSTRUCTIONS_PATH, 'utf8');
+    assert.ok(botInstructionsContent.includes(VOICE_CAVEAT_ANCHOR),
+      'deployed bot-instructions.md must carry the voice caveat verbatim');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Operator-commands bullet (2026-09-16 evangelism wave WP-6, OD-5/OD-8) —
+// pa ping/notify/watch/topic-task/ref/health/doctor existed but no worker
+// prompt named them. The bullet below is FROZEN (SPEC-prescribed text) and
+// pinned on all four triangle surfaces; .ts sources compare after unescaping
+// template-literal `\`` escapes.
+// ---------------------------------------------------------------------------
+
+const OPERATOR_COMMANDS_BULLET =
+  '- Page the operator when only they can unblock you: `pa ping`. Deliver into another topic: `pa notify --topic-thread <id>`. Register a completion watch: `pa watch add`. Queue follow-up work: `pa topic-task add <chatId>_<threadId> --title "<t>" --prompt "<p>"`. `_Ref:` lookup: `pa ref <id>`. Platform looks broken: `pa health`, then `pa doctor`.';
+
+describe('operator-commands bullet present on all four triangle surfaces', () => {
+  it('context.ts capabilities block carries the bullet verbatim', async () => {
+    const contextSource = unescapeTicks(await readFile(resolve(__dirname, '../../src/context.ts'), 'utf8'));
+    assert.ok(contextSource.includes(OPERATOR_COMMANDS_BULLET),
+      'context.ts capabilities block must carry the operator-commands bullet verbatim');
+  });
+
+  it('task-executor.ts TASK_RULES carries the bullet verbatim', async () => {
+    const taskExecutorSource = await readFile(resolve(__dirname, '../../src/task-executor.ts'), 'utf8');
+    assert.ok(taskExecutorSource.includes(OPERATOR_COMMANDS_BULLET),
+      'task-executor.ts TASK_RULES must carry the operator-commands bullet verbatim');
+  });
+
+  it('examples/bot-instructions.example.md carries the bullet inside ## Capabilities & Rules', async () => {
+    const exampleContent = await readFile(BOT_INSTRUCTIONS_EXAMPLE_PATH, 'utf8');
+    const sectionStart = exampleContent.indexOf('## Capabilities & Rules');
+    const sectionEnd = exampleContent.indexOf('\n## ', sectionStart);
+    assert.ok(sectionStart !== -1 && sectionEnd !== -1, 'example file must have a ## Capabilities & Rules section');
+    assert.ok(exampleContent.slice(sectionStart, sectionEnd).includes(OPERATOR_COMMANDS_BULLET),
+      'example file must carry the operator-commands bullet verbatim inside ## Capabilities & Rules');
+  });
+
+  it('deployed bot-instructions.md carries the bullet (local, skip-guarded)', { skip: !BOT_INSTRUCTIONS_EXISTS && 'bot-instructions.md not present locally (public-clone default — see examples/bot-instructions.example.md)' }, async () => {
+    const botInstructionsContent = await readFile(BOT_INSTRUCTIONS_PATH, 'utf8');
+    assert.ok(botInstructionsContent.includes(OPERATOR_COMMANDS_BULLET),
+      'deployed bot-instructions.md must carry the operator-commands bullet verbatim');
+  });
+
+  it('the bullet is <=400 chars and apostrophe-free', () => {
+    assert.ok(OPERATOR_COMMANDS_BULLET.length <= 400, 'bullet must stay within the 400-char SPEC cap');
+    assert.ok(!OPERATOR_COMMANDS_BULLET.includes("'"), 'bullet must stay apostrophe-free (byte-pin surfaces)');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Skill roster section (2026-09-16 evangelism wave WP-5) — every lane whose
+// PA_META offers run_skill must see the live roster; execution mode suppresses
+// it (PA_META is stripped there). Roster data is local (~/.pa/skills), never
+// tracked source.
+// ---------------------------------------------------------------------------
+
+async function writeFixtureSkill(name: string, desc: string): Promise<void> {
+  const dir = join(tempDir, 'skills', name);
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, 'skill.md'), ['---', `description: "${desc}"`, '---', 'Prompt body.'].join('\n'));
+}
+
+describe('buildPrompt: skill roster section', () => {
+  it('renders ## Skills you can trigger with fixture skills, before ## Telegram Metadata', async () => {
+    await writeFixtureSkill('fixture-skill', 'a fixture capability');
+    const prompt = await buildPrompt('hello', makeState());
+    const rosterIdx = prompt.indexOf('## Skills you can trigger');
+    assert.ok(rosterIdx > 0, 'roster section present');
+    assert.ok(prompt.includes('[fixture-skill] a fixture capability'), 'roster line present');
+    assert.ok(rosterIdx < prompt.indexOf('## Telegram Metadata'), 'roster lands before Telegram Metadata');
+  });
+
+  it('omitStatic: true still renders the roster (live data, not static)', async () => {
+    await writeFixtureSkill('fixture-skill', 'a fixture capability');
+    const prompt = await buildPrompt('hello', makeState(), undefined, undefined, undefined, { omitStatic: true });
+    assert.ok(prompt.includes('## Skills you can trigger'), 'lean prompts carry the live roster');
+    assert.ok(prompt.includes('[fixture-skill]'));
+  });
+
+  it('execution mode (pendingAction) suppresses the roster — PA_META is stripped there', async () => {
+    await writeFixtureSkill('fixture-skill', 'a fixture capability');
+    const prompt = await buildPrompt('hello', makeState(), undefined, undefined, 'do the thing');
+    assert.ok(!prompt.includes('## Skills you can trigger'), 'execution-mode prompt must not carry the roster');
+  });
+
+  it('empty skills dir renders no section — absent, not an empty stub', async () => {
+    const prompt = await buildPrompt('hello', makeState());
+    assert.ok(!prompt.includes('## Skills you can trigger'), 'no skills → no section');
+  });
+
+  it('renderSkillRosterSection fails to empty string on a broken skills dir', async () => {
+    // A skills PATH that is a file, not a dir — listSkills must throw, section ''.
+    await writeFile(join(tempDir, 'skills'), 'not a dir');
+    assert.equal(await renderSkillRosterSection(), '');
   });
 });
 
@@ -858,6 +1081,31 @@ describe('buildPrompt: topic brain pointer', () => {
     assert.equal(descCount, 1, 'description must appear exactly once, not restated or duplicated');
   });
 
+  it('## Topic section is byte-identical to the pinned literal (description + brain + recall + decisions)', async () => {
+    const chatId = -1001234567890;
+    const threadId = 8306;
+    const state = makeState({ chat_id: chatId, thread_id: threadId });
+    const topicNames: TopicNameMap = new Map([
+      [String(chatId), new Map([[threadId, { name: 'my-topic', description: 'things' }]])],
+    ]);
+
+    const topicDir = join(tempDir, 'topic-brains', `${chatId}_${threadId}`);
+    await mkdir(topicDir, { recursive: true });
+    const brainContent = `# Test Topic\n\n<!-- topic-brain: consolidated=2026-08-21T21:30:00+05:30 covers=2026-08-21T18:03:11.000Z -->\n\n## Current state\n`;
+    await writeFile(join(topicDir, 'BRAIN.md'), brainContent, 'utf8');
+    const brainPath = join(topicDir, 'BRAIN.md');
+
+    const result = await buildPrompt('hello', state, topicNames);
+
+    const expected =
+      `## Topic\n` +
+      `Topic: my-topic — things\n` +
+      `Topic brain: ${brainPath} (consolidated 2026-08-21, covers through 2026-08-21) — durable per-topic knowledge: what was discussed, decided, and left open. Read it before assuming prior context in this topic; fresh turns override it.\n` +
+      `Recall: \`pa recall "<terms>" --thread ${threadId} --json\` searches this topic's full history, worker traces, topic brains and the Ecosystem KB — use it instead of guessing about anything before the window above.\n` +
+      `Precedent: before proposing in this topic, run \`pa recall "<intent>" --source decisions --thread ${threadId} --json\` — past judgment calls with rationale and your reaction; honor strong precedents.\n`;
+    assert.ok(result.includes(expected), 'the ## Topic block must render byte-identical to the pinned literal');
+  });
+
   it('both-places test: standing-rule sentence appears in bot-instructions.md and inline capabilities', { skip: !BOT_INSTRUCTIONS_EXISTS && 'bot-instructions.md not present locally' }, async () => {
     // Check bot-instructions.md contains the sentence
     const botInstructionsContent = await readFile(BOT_INSTRUCTIONS_PATH, 'utf8');
@@ -1025,10 +1273,11 @@ describe('buildPrompt: cwd sections', () => {
 // ---------------------------------------------------------------------------
 // buildPrompt — active reservations injection (C1b, coordination-remediation Wave C, W-C6)
 // ---------------------------------------------------------------------------
-// buildReservationLines is not exported; exercised only through buildPrompt's
-// injectable `readActiveFn` option — the same `<name>Fn?:` DI pattern used
-// elsewhere in the bot (voice.ts, voice-worker-client.ts) — so these tests never
-// touch the real ~/.pa reservations store.
+// The reservations renderer lives in topic-pointers.ts (prompt-evangelism wave:
+// shared across all lanes); exercised here through buildPrompt's injectable
+// `readActiveFn` option — the same `<name>Fn?:` DI pattern used elsewhere in the
+// bot (voice.ts, voice-worker-client.ts) — so these tests never touch the real
+// ~/.pa reservations store.
 
 function makeReservation(overrides: Partial<Reservation> = {}): Reservation {
   return {
@@ -1043,27 +1292,31 @@ function makeReservation(overrides: Partial<Reservation> = {}): Reservation {
 }
 
 const RESERVATIONS_HEADER = '- Active reservations right now (do not edit these paths unless the reservation is yours):';
-const RESERVATIONS_MIRROR_ANCHOR = '(Mirrors the Shared working tree block in bot-instructions.md and examples/bot-instructions.example.md';
 
 describe('buildPrompt: active reservations (W-C6)', () => {
-  it('stubbed readActive returning two reservations: both rows present, directly after the mirror-note line', async () => {
+  it('stubbed readActive returning two reservations: both rows present in a standalone ## Live reservations section', async () => {
     const r1 = makeReservation({ id: 'r-11111111', paths: ['pa/src/a.ts'], session: 'sess-a', note: 'work a', expiresAt: '2026-08-23T11:00:00.000Z' });
     const r2 = makeReservation({ id: 'r-22222222', paths: ['pa/src/b.ts'], session: 'sess-b', note: 'work b', expiresAt: '2026-08-23T12:00:00.000Z' });
     const result = await buildPrompt('hello', makeState(), undefined, undefined, undefined, {
       readActiveFn: async () => [r1, r2],
     });
+    assert.ok(result.includes('## Live reservations'), 'section header present');
     assert.ok(result.includes(RESERVATIONS_HEADER), 'header row present');
     assert.ok(result.includes('r-11111111'), 'first reservation id present');
     assert.ok(result.includes('r-22222222'), 'second reservation id present');
     assert.ok(result.includes('sess-a'), 'first session present');
     assert.ok(result.includes('sess-b'), 'second session present');
 
-    const mirrorIdx = result.indexOf(RESERVATIONS_MIRROR_ANCHOR);
-    const headerIdx = result.indexOf(RESERVATIONS_HEADER);
-    const topicBrainsIdx = result.indexOf('- Topic brains:');
-    assert.ok(mirrorIdx >= 0, 'mirror-note line present');
-    assert.ok(headerIdx > mirrorIdx, 'reservation block must come directly after the mirror-note line');
-    assert.ok(headerIdx < topicBrainsIdx, 'reservation block must come before the Topic brains bullet');
+    // Standalone section now — lands between the dynamic topic blocks and
+    // ## Telegram Metadata, NOT nested inside ## Capabilities & Rules.
+    const sectionIdx = result.indexOf('## Live reservations');
+    const metaIdx = result.indexOf('## Telegram Metadata');
+    assert.ok(sectionIdx > 0, 'reservation section present');
+    assert.ok(metaIdx > sectionIdx, 'reservation section must come before Telegram Metadata');
+    assert.ok(
+      result.indexOf(RESERVATIONS_HEADER) === sectionIdx + '## Live reservations\n'.length,
+      'header row is the first line of the section'
+    );
   });
 
   it('zero reservations: "Active reservations right now: none." present', async () => {
@@ -1081,12 +1334,13 @@ describe('buildPrompt: active reservations (W-C6)', () => {
     assert.ok(result.includes('## Capabilities & Rules'), 'prompt still complete on throw');
   });
 
-  it('omitStatic: true — no reservation text at all', async () => {
+  it('omitStatic: true — reservations still render (lean prompts are not exempt)', async () => {
     const result = await buildPrompt('hello', makeState(), undefined, undefined, undefined, {
       omitStatic: true,
       readActiveFn: async () => [makeReservation()],
     });
-    assert.ok(!result.includes('Active reservations right now'), 'no reservation text in lean mode');
+    assert.ok(result.includes('## Live reservations'), 'section present in lean mode');
+    assert.ok(result.includes('r-abc12345'), 'reservation row present in lean mode');
   });
 
   it('pendingAction set — no reservation text at all', async () => {
@@ -1094,6 +1348,7 @@ describe('buildPrompt: active reservations (W-C6)', () => {
       readActiveFn: async () => [makeReservation()],
     });
     assert.ok(!result.includes('Active reservations right now'), 'no reservation text in execution mode');
+    assert.ok(!result.includes('## Live reservations'), 'no section header in execution mode');
   });
 
   it('12 active reservations: exactly 10 rows plus a "(+2 more" line', async () => {
@@ -1911,6 +2166,7 @@ describe('buildPrompt: fresh dispatch never carries turns (operator directive 20
     // Whether the topic has no history at all, recent history, or hours-old
     // history, buildPrompt renders the SAME two-line retrieval pointer and
     // injects no turn text — there is no window to be inside or outside of.
+    // Brain fixture present ⇒ the with-brain form ("the topic brain above").
     const recentTurns = Array.from({ length: 12 }, (_, i) => ({
       role: (i % 2 === 0 ? 'user' : 'assistant') as 'user' | 'assistant',
       text: `turn ${i + 1}`,
@@ -1924,6 +2180,10 @@ describe('buildPrompt: fresh dispatch never carries turns (operator directive 20
       `(Conversation turns are not injected into this prompt.)\n` +
       'Use the topic brain above and `pa recall "<terms>" --thread 29 --json` for this topic\'s history.';
 
+    const brainDir = join(tempDir, 'topic-brains', '-1001234567890_29');
+    await mkdir(brainDir, { recursive: true });
+    await writeFile(join(brainDir, 'BRAIN.md'), '# T\n\n<!-- topic-brain: consolidated=2026-09-10T12:00:00+05:30 covers=2026-09-09T18:00:00.000Z -->\n', 'utf8');
+
     for (const turns of [[], recentTurns, staleTurns]) {
       const result = await buildPrompt('hello', makeState({ turns }));
       assert.ok(
@@ -1935,6 +2195,17 @@ describe('buildPrompt: fresh dispatch never carries turns (operator directive 20
     assert.ok(!resultRecent.includes('turn 1\n') && !resultRecent.includes('turn 12'), 'recent turn text must not render');
     const resultStale = await buildPrompt('hello', makeState({ turns: staleTurns }));
     assert.ok(!resultStale.includes('morning question') && !resultStale.includes('morning answer'), 'stale turn text must not render');
+  });
+
+  it('no topic brain → the pointer drops the "topic brain above" clause', async () => {
+    // The clause was previously unconditional — a lie on topics with no brain
+    // file. With no brain fixture the pointer names `pa recall` alone.
+    const result = await buildPrompt('hello', makeState());
+    assert.ok(
+      result.includes('Use `pa recall "<terms>" --thread 29 --json` for this topic\'s history.'),
+      'no-brain form renders the recall-only pointer'
+    );
+    assert.ok(!result.includes('Use the topic brain above'), 'no phantom brain reference');
   });
 
   it('buildResumedPrompt never carries turns', async () => {
@@ -1965,5 +2236,369 @@ describe('buildPrompt: fresh dispatch never carries turns (operator directive 20
     assert.ok(result.includes('Conversation turns are not injected'), 'buildPrompt still renders the pointer for this state');
     assert.ok(!result.includes('stale window turn'), 'turns do not leak into the prompt');
     assert.ok(!result.includes('archived old message text'), 'buildPrompt never inlines archive content');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Browser MCP tools bullet (2026-09-13, WORKERS_GUIDE.md "Browser automation
+// (Playwright MCP)") — Playwright MCP is the default browser tool for every
+// headless worker session, but print-mode runs connect MCP asynchronously: the
+// first round carries only built-ins plus WaitForMcpServers and the browser
+// tools join 1-3 rounds later. A worker that is not told to wait falls back or
+// reports the tools missing. Same byte-identical sync pattern as the raw-send
+// guard above: context.ts's inline capabilities block (agy/codex-visible half)
+// ↔ examples/bot-instructions.example.md (tracked, CI-enforced half) ↔ the
+// task lane's TASK_RULES. The gitignored local bot-instructions.md is
+// hand-synced (never rides git patches), so no local-half test here.
+// ---------------------------------------------------------------------------
+
+const BROWSER_MCP_BULLET = '- Browser tools (Playwright MCP) are available in this headless session but join the toolset 1-3 rounds after start: when the task needs browser interaction or visual verification, call `WaitForMcpServers` first and wait — never fall back or report the tools missing. If a `wingman_do` tool is listed, you may hand it one bounded step on the page that is already open (pick a row, fill a form from values you pass, click through a wizard); Playwright MCP stays the default, and `needs_confirmation` means ask the operator before acting.';
+
+describe('Browser MCP tools bullet', () => {
+  it('matches examples/bot-instructions.example.md verbatim', async () => {
+    const exampleContent = await readFile(BOT_INSTRUCTIONS_EXAMPLE_PATH, 'utf8');
+    assert.ok(exampleContent.includes(BROWSER_MCP_BULLET),
+      'examples/bot-instructions.example.md must contain the browser MCP bullet verbatim');
+
+    const inlinePrompt = await buildPrompt('hello', makeState(), undefined, undefined, undefined, { omitStatic: false });
+    assert.ok(inlinePrompt.includes(BROWSER_MCP_BULLET),
+      'context.ts inline capabilities block must contain the SAME browser MCP bullet verbatim — keep both in sync');
+  });
+
+  it('task-executor.ts carries the bullet in TASK_RULES', async () => {
+    const taskExecutorSource = await readFile(resolve(__dirname, '../../src/task-executor.ts'), 'utf8');
+    assert.ok(taskExecutorSource.includes(BROWSER_MCP_BULLET),
+      'task-executor.ts TASK_RULES must carry the browser MCP bullet verbatim');
+  });
+
+  it('is absent in omitStatic (lean) mode', async () => {
+    const result = await buildPrompt('hello', makeState(), undefined, undefined, undefined, { omitStatic: true });
+    assert.ok(!result.includes(BROWSER_MCP_BULLET), 'lean mode must not include the browser MCP bullet');
+  });
+
+  it('is absent in execution mode (pendingAction set)', async () => {
+    const result = await buildPrompt('yes', makeState(), undefined, undefined, 'send email to John', { omitStatic: false });
+    assert.ok(!result.includes(BROWSER_MCP_BULLET), 'execution mode must not include the browser MCP bullet');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Voice-task summary standard (2026-09-14): the --summary a worker passes
+// task_complete.py is the operator-facing OUTCOME — never the routing
+// receipt or command output (the junk-summary fix). Same sync pattern as the
+// bullets above: context.ts's inline capabilities block (agy/codex half) ↔
+// examples/bot-instructions.example.md (tracked, CI-enforced half) ↔ the
+// task lane's TASK_RULES. The gitignored local bot-instructions.md is
+// hand-synced (never rides git patches), so no local-half test here.
+// ---------------------------------------------------------------------------
+
+const SUMMARY_STANDARD_BULLET = '- Voice-inbox task closures: the --summary you pass task_complete.py to close a voice-inbox task is the OUTCOME for the operator — plain language stating what was asked and what resulted. Never the command output, a routing receipt, or a transcript re-paste (2+ sentences quoted verbatim from the request) — those are process, not the answer; the script refuses receipts and exits non-zero, so re-run with a real plain-language summary. When the answer is long, also pass --short with the plain-words standalone answer the card leads with (IN SHORT) — as long as it needs, never capped; --recap and --next each take one line saying where things stand and what the operator must do next.';
+
+describe('Voice-task summary standard bullet', () => {
+  it('context.ts carries the frozen bullet in the capabilities block', async () => {
+    const contextSource = await readFile(resolve(__dirname, '../../src/context.ts'), 'utf8');
+    assert.ok(contextSource.includes(SUMMARY_STANDARD_BULLET),
+      'context.ts capabilities block must contain the summary-standard bullet verbatim');
+  });
+
+  it('examples/bot-instructions.example.md carries the frozen bullet', async () => {
+    const exampleContent = await readFile(BOT_INSTRUCTIONS_EXAMPLE_PATH, 'utf8');
+    assert.ok(exampleContent.includes(SUMMARY_STANDARD_BULLET),
+      'examples/bot-instructions.example.md must contain the summary-standard bullet verbatim');
+  });
+
+  it('deployed bot-instructions.md carries the frozen bullet (local, skip-guarded)', { skip: !BOT_INSTRUCTIONS_EXISTS && 'bot-instructions.md not present locally (public-clone default — see examples/bot-instructions.example.md)' }, async () => {
+    const botInstructionsContent = await readFile(BOT_INSTRUCTIONS_PATH, 'utf8');
+    assert.ok(botInstructionsContent.includes(SUMMARY_STANDARD_BULLET),
+      'deployed bot-instructions.md must contain the summary-standard bullet verbatim — hand-sync on merge');
+  });
+
+  it('task-executor.ts carries the bullet in TASK_RULES', async () => {
+    const taskExecutorSource = await readFile(resolve(__dirname, '../../src/task-executor.ts'), 'utf8');
+    assert.ok(taskExecutorSource.includes(SUMMARY_STANDARD_BULLET),
+      'task-executor.ts TASK_RULES must contain the summary-standard bullet verbatim');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Visual-answer standard (2026-09-14): when an answer benefits from structure
+// (comparisons, steps, choices, small data sets, a decision the user must
+// make), the worker builds the reply from the rich shapes the inbox renders
+// (cards, tiered short/full answers, forms with steps, lists, tables) instead
+// of a prose wall — full answer in plain product language, short version the
+// readable one-liner. Completes the rich-answer stack (rendering, forms and
+// the answer-register rule landed earlier). Same sync pattern as the bullets
+// above: context.ts's inline capabilities block (agy/codex half) ↔
+// examples/bot-instructions.example.md (tracked, CI-enforced half) ↔ the
+// task lane's TASK_RULES. The gitignored local bot-instructions.md is
+// hand-synced (never rides git patches), so no local-half test here.
+// ---------------------------------------------------------------------------
+
+const VISUAL_ANSWER_BULLET = '- When an answer benefits from structure — comparisons, steps, choices, small data sets, or a decision the user must make — build it from the rich shapes the inbox renders (cards, tiered short/full answers, forms with steps, lists, tables) instead of prose walls. The full answer reads in plain product language — no ids, schemas, exit codes, or technical terms (the answer register); the short version is the readable one-liner a busy person gets first. Reach for the visual form whenever a wall of text would be the alternative, and if no existing shape fits the answer, generate the raw-HTML shape freely — the inbox renders it in a sandboxed frame, so you have complete freedom over form; recurring patterns graduate into the standard components.';
+
+describe('Visual-answer standard bullet', () => {
+  it('context.ts carries the frozen bullet in the capabilities block', async () => {
+    const contextSource = await readFile(resolve(__dirname, '../../src/context.ts'), 'utf8');
+    assert.ok(contextSource.includes(VISUAL_ANSWER_BULLET),
+      'context.ts capabilities block must contain the visual-answer bullet verbatim');
+  });
+
+  it('examples/bot-instructions.example.md carries the frozen bullet', async () => {
+    const exampleContent = await readFile(BOT_INSTRUCTIONS_EXAMPLE_PATH, 'utf8');
+    assert.ok(exampleContent.includes(VISUAL_ANSWER_BULLET),
+      'examples/bot-instructions.example.md must contain the visual-answer bullet verbatim');
+  });
+
+  it('deployed bot-instructions.md carries the frozen bullet (local, skip-guarded)', { skip: !BOT_INSTRUCTIONS_EXISTS && 'bot-instructions.md not present locally (public-clone default — see examples/bot-instructions.example.md)' }, async () => {
+    const botInstructionsContent = await readFile(BOT_INSTRUCTIONS_PATH, 'utf8');
+    assert.ok(botInstructionsContent.includes(VISUAL_ANSWER_BULLET),
+      'deployed bot-instructions.md must contain the visual-answer bullet verbatim — hand-sync on merge');
+  });
+
+  it('task-executor.ts carries the bullet in TASK_RULES', async () => {
+    const taskExecutorSource = await readFile(resolve(__dirname, '../../src/task-executor.ts'), 'utf8');
+    assert.ok(taskExecutorSource.includes(VISUAL_ANSWER_BULLET),
+      'task-executor.ts TASK_RULES must contain the visual-answer bullet verbatim');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Blocker screenshot-ask bullet (2026-09-14): a worker whose headless browser
+// hits a page it cannot control (captcha, login, consent) escalates instead
+// of stalling — screenshot, task_blocker_ask.py (attaches the screenshot to
+// the task + creates the question card), END the turn; the operator answers
+// in the inbox and the answer-and-resume steer re-dispatches with the answer
+// pointer. Same byte-identical sync pattern as the browser MCP bullet above:
+// context.ts's inline capabilities block ↔ examples/bot-instructions.example.md
+// (tracked, CI-enforced half) ↔ the task lane's TASK_RULES. The gitignored
+// local bot-instructions.md is hand-synced (adapted wording, never rides git
+// patches), so no local-half test here.
+// ---------------------------------------------------------------------------
+
+const BLOCKER_ASK_BULLET = '- If a page blocks the task (captcha, login, consent wall): screenshot it, run `python3 <repo>/projects/voice-inbox/scripts/task_blocker_ask.py --task <task_id> --screenshot <path> --prompt "<plain-language question>" || python <repo>/projects/voice-inbox/scripts/task_blocker_ask.py --task <task_id> --screenshot <path> --prompt "<plain-language question>"` (add `--options "a|b|c"` for choices) and END your turn — the operator answers the question in their inbox, and your next dispatch opens with the answer pointer; read the answer from that file, continue from where you stopped, and finish with task_complete.py.';
+
+describe('Blocker screenshot-ask bullet', () => {
+  it('matches examples/bot-instructions.example.md verbatim', async () => {
+    const exampleContent = await readFile(BOT_INSTRUCTIONS_EXAMPLE_PATH, 'utf8');
+    assert.ok(exampleContent.includes(BLOCKER_ASK_BULLET),
+      'examples/bot-instructions.example.md must contain the blocker-ask bullet verbatim');
+
+    const inlinePrompt = await buildPrompt('hello', makeState(), undefined, undefined, undefined, { omitStatic: false });
+    assert.ok(inlinePrompt.includes(BLOCKER_ASK_BULLET),
+      'context.ts inline capabilities block must contain the SAME blocker-ask bullet verbatim — keep both in sync');
+  });
+
+  it('task-executor.ts carries the bullet in TASK_RULES', async () => {
+    const taskExecutorSource = await readFile(resolve(__dirname, '../../src/task-executor.ts'), 'utf8');
+    assert.ok(taskExecutorSource.includes(BLOCKER_ASK_BULLET),
+      'task-executor.ts TASK_RULES must carry the blocker-ask bullet verbatim');
+  });
+
+  it('is absent in omitStatic (lean) mode', async () => {
+    const result = await buildPrompt('hello', makeState(), undefined, undefined, undefined, { omitStatic: true });
+    assert.ok(!result.includes(BLOCKER_ASK_BULLET), 'lean mode must not include the blocker-ask bullet');
+  });
+
+  it('is absent in execution mode (pendingAction set)', async () => {
+    const result = await buildPrompt('yes', makeState(), undefined, undefined, 'send email to John', { omitStatic: false });
+    assert.ok(!result.includes(BLOCKER_ASK_BULLET), 'execution mode must not include the blocker-ask bullet');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Live-screencast bullet (2026-09-14, live-screencast design): the worker
+// decides when the operator should watch the page it is driving (payment,
+// login, OTP) and spawns screencast_bridge.mjs in the background — a zero-dep
+// Node sidecar that CDP-screencasts PA's Chrome into the voice-inbox
+// in-memory frame store; the PWA polls the latest frame. Stop = kill the
+// process. Same byte-identical sync pattern as the blocker-ask bullet above:
+// context.ts's inline capabilities block ↔ examples/bot-instructions.example.md
+// (tracked, CI-enforced half) ↔ the task lane's TASK_RULES. The gitignored
+// local bot-instructions.md is hand-synced (adapted wording, never rides git
+// patches), so no local-half test here.
+// ---------------------------------------------------------------------------
+
+const SCREENCAST_BULLET = '- For browser work the worker drives PA’s Chrome (endpoint env is already injected): before the first browser action run `pa browser ensure --headed` when the task may need the operator (credentials, payments, posting — anything a human might have to take over) or `pa browser ensure --headless` for pure read-only work. To let the operator watch the page you are on (payment, login, OTP, or anything you want watched), run `node <repo>/projects/voice-inbox/scripts/screencast_bridge.mjs --task <task_id>` in the background and continue your turn; it streams the live screen to the inbox. Stop it (kill the process) when the operator no longer needs to watch. Use it alongside task_blocker_ask.py when you escalate a page you cannot control. The operator can also take over the page in fullscreen (tap, type, scroll, navigate) from the voice-inbox live view — input is enabled only in fullscreen. If the operator takes over the page themselves (a resume note may say so, or the page changes without your action), pause page-driving and re-read the live page state before your next action — do not race operator input.';
+
+describe('Live-screencast bullet', () => {
+  it('matches examples/bot-instructions.example.md verbatim', async () => {
+    const exampleContent = await readFile(BOT_INSTRUCTIONS_EXAMPLE_PATH, 'utf8');
+    assert.ok(exampleContent.includes(SCREENCAST_BULLET),
+      'examples/bot-instructions.example.md must contain the screencast bullet verbatim');
+
+    const inlinePrompt = await buildPrompt('hello', makeState(), undefined, undefined, undefined, { omitStatic: false });
+    assert.ok(inlinePrompt.includes(SCREENCAST_BULLET),
+      'context.ts inline capabilities block must contain the SAME screencast bullet verbatim — keep both in sync');
+  });
+
+  it('task-executor.ts carries the bullet in TASK_RULES', async () => {
+    const taskExecutorSource = await readFile(resolve(__dirname, '../../src/task-executor.ts'), 'utf8');
+    assert.ok(taskExecutorSource.includes(SCREENCAST_BULLET),
+      'task-executor.ts TASK_RULES must carry the screencast bullet verbatim');
+  });
+
+  it('is absent in omitStatic (lean) mode', async () => {
+    const result = await buildPrompt('hello', makeState(), undefined, undefined, undefined, { omitStatic: true });
+    assert.ok(!result.includes(SCREENCAST_BULLET), 'lean mode must not include the screencast bullet');
+  });
+
+  it('is absent in execution mode (pendingAction set)', async () => {
+    const result = await buildPrompt('yes', makeState(), undefined, undefined, 'send email to John', { omitStatic: false });
+    assert.ok(!result.includes(SCREENCAST_BULLET), 'execution mode must not include the screencast bullet');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Promises-need-a-mechanism bullet (2026-09-14, operator directive): threads
+// habitually promise future actions in words alone and the promise never
+// fires — a task closed Done on "next stage dispatches when it lands" with
+// nothing scheduled. Work that must continue after the turn is registered in
+// a mechanism instead: the next stage spawns NOW as a dependent thread
+// (depends_on — it wakes with the current thread's result) or a watch_job
+// PA_META action carries the trigger. Same sync pattern as the bullets above:
+// context.ts's inline capabilities block ↔ examples/bot-instructions.example.md
+// (tracked, CI-enforced half) ↔ the task lane's TASK_RULES. The gitignored
+// local bot-instructions.md is hand-synced (never rides git patches), so its
+// test is skip-guarded.
+// ---------------------------------------------------------------------------
+
+const PROMISE_MECHANISM_BULLET = '- Never promise future action in words alone: if work must continue after your turn, register it in a mechanism — spawn the next stage now as a dependent thread (`depends_on`, it wakes with your result), or register a `watch_job` for the trigger — a promise without a mechanism is a dropped promise.';
+
+describe('Promises-need-a-mechanism bullet', () => {
+  it('matches examples/bot-instructions.example.md verbatim', async () => {
+    const exampleContent = await readFile(BOT_INSTRUCTIONS_EXAMPLE_PATH, 'utf8');
+    assert.ok(exampleContent.includes(PROMISE_MECHANISM_BULLET),
+      'examples/bot-instructions.example.md must contain the promise-mechanism bullet verbatim');
+  });
+
+  it('context.ts inline capabilities block carries the SAME bullet', async () => {
+    const inlinePrompt = await buildPrompt('hello', makeState(), undefined, undefined, undefined, { omitStatic: false });
+    assert.ok(inlinePrompt.includes(PROMISE_MECHANISM_BULLET),
+      'context.ts inline capabilities block must contain the SAME promise-mechanism bullet verbatim — keep both in sync');
+  });
+
+  it('deployed bot-instructions.md carries the bullet (local, skip-guarded)', { skip: !BOT_INSTRUCTIONS_EXISTS && 'bot-instructions.md not present locally (public-clone default — see examples/bot-instructions.example.md)' }, async () => {
+    const botInstructionsContent = await readFile(BOT_INSTRUCTIONS_PATH, 'utf8');
+    assert.ok(botInstructionsContent.includes(PROMISE_MECHANISM_BULLET),
+      'deployed bot-instructions.md must contain the promise-mechanism bullet verbatim — hand-sync on merge');
+  });
+
+  it('task-executor.ts carries the bullet in TASK_RULES', async () => {
+    const taskExecutorSource = await readFile(resolve(__dirname, '../../src/task-executor.ts'), 'utf8');
+    assert.ok(taskExecutorSource.includes(PROMISE_MECHANISM_BULLET),
+      'task-executor.ts TASK_RULES must carry the promise-mechanism bullet verbatim');
+  });
+
+  it('is absent in omitStatic (lean) mode', async () => {
+    const result = await buildPrompt('hello', makeState(), undefined, undefined, undefined, { omitStatic: true });
+    assert.ok(!result.includes(PROMISE_MECHANISM_BULLET), 'lean mode must not include the promise-mechanism bullet');
+  });
+
+  it('is absent in execution mode (pendingAction set)', async () => {
+    const result = await buildPrompt('yes', makeState(), undefined, undefined, 'send email to John', { omitStatic: false });
+    assert.ok(!result.includes(PROMISE_MECHANISM_BULLET), 'execution mode must not include the promise-mechanism bullet');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PA_META envelope wire format for the task/thread lanes (2026-09-14 audit):
+// TASK_RULES referenced PA_META actions (question, watch_job) for two waves
+// but never taught the envelope syntax. claude/zclaude task dispatches get it
+// via bot-instructions.md, but agy/codex (no static prompt file) and EVERY
+// thread spawn (stripArgs removes --append-system-prompt-file) saw only
+// TASK_RULES — so the question-park, task-lane watch_job and thread
+// ask-mirroring features were unreachable for them. TASK_RULES is the shared
+// prompt tail of BOTH lanes (buildTaskPrompt + buildThreadPrompt), so one
+// bullet here wires all four CLIs; the per-lane Type support is stated in the
+// bullet itself and DERIVED from the lane constants
+// (THREAD_LANE_PA_META_TYPES/TASK_LANE_PA_META_TYPES in task-executor.ts —
+// 2026-09-16: watch_job became real on the thread lane).
+// ---------------------------------------------------------------------------
+
+const PAMETA_ENVELOPE_TASK_RULES_BULLET = '- Machine actions ride the PA_META envelope: to emit one, end your reply with a single final line [PA_META]: {"actions":[...]} — single-line JSON, nothing after it. The question action above is {"type":"question","text":"...","options":["..."]}. A thread lane accepts question, confirm_required and watch_job{description,check,deadline_minutes} (check is a required object, e.g. {"type":"file_newer_than","path":"C:/abs/path"}); a task lane accepts question and watch_job plus kb_note{domain,note} and run_skill{skill} — an unsupported type comes back as a rejection notice, never a silently dropped action. Omit the envelope otherwise.';
+
+describe('PA_META envelope bullet (task/thread lanes)', () => {
+  it('task-executor.ts carries the bullet in TASK_RULES', async () => {
+    const taskExecutorSource = await readFile(resolve(__dirname, '../../src/task-executor.ts'), 'utf8');
+    assert.ok(taskExecutorSource.includes(PAMETA_ENVELOPE_TASK_RULES_BULLET),
+      'task-executor.ts TASK_RULES must carry the PA_META envelope bullet verbatim');
+  });
+
+  it('buildTaskPrompt embeds TASK_RULES (the bullet rides both lanes)', async () => {
+    const { buildTaskPrompt } = await import('../task-executor.js');
+    const prompt = await buildTaskPrompt(
+      { id: 'tt-test', title: 't', prompt: 'p', status: 'running', attempts: 1, created_at: new Date().toISOString(), created_by: 'test', micro_thread: [] } as never,
+      { chatId: 1, threadId: 2, topicName: 'x' }
+    );
+    assert.ok(prompt.includes(PAMETA_ENVELOPE_TASK_RULES_BULLET),
+      'buildTaskPrompt output must carry the PA_META envelope bullet');
+  });
+
+  it('lane clauses in the bullet are derived from the exported lane-type constants', async () => {
+    const { THREAD_LANE_PA_META_TYPES, TASK_LANE_PA_META_TYPES } = await import('../task-executor.js');
+    const [threadSeg, taskSeg] = PAMETA_ENVELOPE_TASK_RULES_BULLET.split(';');
+    // Every type a lane accepts must be taught in its segment of the bullet.
+    for (const t of THREAD_LANE_PA_META_TYPES) {
+      assert.ok(threadSeg.includes(t), `thread segment must teach ${t}`);
+    }
+    for (const t of TASK_LANE_PA_META_TYPES) {
+      assert.ok(taskSeg.includes(t), `task segment must teach ${t}`);
+    }
+    // And no lane may teach a type its constant does not list (drift catch).
+    for (const t of TASK_LANE_PA_META_TYPES.filter((x) => !(THREAD_LANE_PA_META_TYPES as readonly string[]).includes(x))) {
+      assert.ok(!threadSeg.includes(t), `thread segment must not teach task-only ${t}`);
+    }
+    for (const t of THREAD_LANE_PA_META_TYPES.filter((x) => !(TASK_LANE_PA_META_TYPES as readonly string[]).includes(x))) {
+      assert.ok(!taskSeg.includes(t), `task segment must not teach thread-only ${t}`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Progress-posting bullet (2026-09-14): task_telemetry.py --event task.progress
+// existed and carried hundreds of events from SPEC-taught waves, but no
+// general worker prompt taught it — the inbox's Running substate derives from
+// the latest step, so untaught means the operator sees a bare Running state
+// for the whole task. Same byte-identical sync pattern as the bullets above:
+// context.ts's inline capabilities block ↔ examples/bot-instructions.example.md
+// (tracked, CI-enforced half) ↔ the task lane's TASK_RULES. The gitignored
+// local bot-instructions.md is hand-synced; its test is skip-guarded.
+// ---------------------------------------------------------------------------
+
+const PROGRESS_BULLET = '- Post a progress update when you complete each meaningful sub-step of a long task: run `python3 <repo>/projects/voice-inbox/scripts/task_telemetry.py --event task.progress --task <task_id> --step "<short plain-language phrase>" || python <repo>/projects/voice-inbox/scripts/task_telemetry.py --event task.progress --task <task_id> --step "<short plain-language phrase>"` — the inbox shows the operator what you are doing live while you work.';
+
+describe('Progress-posting bullet', () => {
+  it('matches examples/bot-instructions.example.md verbatim', async () => {
+    const exampleContent = await readFile(BOT_INSTRUCTIONS_EXAMPLE_PATH, 'utf8');
+    assert.ok(exampleContent.includes(PROGRESS_BULLET),
+      'examples/bot-instructions.example.md must contain the progress-posting bullet verbatim');
+  });
+
+  it('context.ts inline capabilities block carries the SAME bullet', async () => {
+    const inlinePrompt = await buildPrompt('hello', makeState(), undefined, undefined, undefined, { omitStatic: false });
+    assert.ok(inlinePrompt.includes(PROGRESS_BULLET),
+      'context.ts inline capabilities block must contain the SAME progress-posting bullet verbatim — keep both in sync');
+  });
+
+  it('deployed bot-instructions.md carries the bullet (local, skip-guarded)', { skip: !BOT_INSTRUCTIONS_EXISTS && 'bot-instructions.md not present locally (public-clone default — see examples/bot-instructions.example.md)' }, async () => {
+    const botInstructionsContent = await readFile(BOT_INSTRUCTIONS_PATH, 'utf8');
+    assert.ok(botInstructionsContent.includes(PROGRESS_BULLET),
+      'deployed bot-instructions.md must contain the progress-posting bullet verbatim — hand-sync on merge');
+  });
+
+  it('task-executor.ts carries the bullet in TASK_RULES', async () => {
+    const taskExecutorSource = await readFile(resolve(__dirname, '../../src/task-executor.ts'), 'utf8');
+    assert.ok(taskExecutorSource.includes(PROGRESS_BULLET),
+      'task-executor.ts TASK_RULES must carry the progress-posting bullet verbatim');
+  });
+
+  it('is absent in omitStatic (lean) mode', async () => {
+    const result = await buildPrompt('hello', makeState(), undefined, undefined, undefined, { omitStatic: true });
+    assert.ok(!result.includes(PROGRESS_BULLET), 'lean mode must not include the progress-posting bullet');
+  });
+
+  it('is absent in execution mode (pendingAction set)', async () => {
+    const result = await buildPrompt('yes', makeState(), undefined, undefined, 'send email to John', { omitStatic: false });
+    assert.ok(!result.includes(PROGRESS_BULLET), 'execution mode must not include the progress-posting bullet');
   });
 });

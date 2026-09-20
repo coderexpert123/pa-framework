@@ -3,6 +3,7 @@ import { basename, join, dirname } from 'path';
 import lockfile from 'proper-lockfile';
 import { safeLockOptions } from './safe-lock.js';
 import { paHome } from '../paths.js';
+import { STALL_RECORDS_ARCHIVE_SUFFIX, withBoundedQueue } from './stall.js';
 
 export const RUNTIME_ARCHIVE_MAX_BYTES = 5 * 1024 * 1024;
 
@@ -10,7 +11,7 @@ function archiveDir(): string {
   return join(paHome(), 'archive');
 }
 
-function formatArchiveStamp(date: Date): string {
+export function formatArchiveStamp(date: Date): string {
   const pad = (value: number) => String(value).padStart(2, '0');
   return [
     date.getFullYear(),
@@ -58,33 +59,9 @@ async function ensureFile(path: string): Promise<void> {
   }
 }
 
-const rotationMutexes: Map<string, Promise<void>> = new Map();
-
-/**
- * In-process mutex per file to prevent concurrent lock attempts from the same process.
- */
-async function withRotationMutex<T>(filePath: string, fn: () => Promise<T>): Promise<T> {
-  const previous = rotationMutexes.get(filePath) || Promise.resolve();
-  let release!: () => void;
-  const current = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  rotationMutexes.set(filePath, current);
-
-  await previous.catch(() => {});
-  try {
-    return await fn();
-  } finally {
-    if (rotationMutexes.get(filePath) === current) {
-      rotationMutexes.delete(filePath);
-    }
-    release();
-  }
-}
-
 /**
  * Rotates a file if it exceeds the maximum allowed size.
- * Uses a combination of an in-process mutex and proper-lockfile to ensure 
+ * Uses a bounded in-process queue (lib/stall.ts) and proper-lockfile to ensure
  * cross-process safety during rotation.
  * 
  * @param filePath Path to the file to rotate.
@@ -108,7 +85,7 @@ export async function rotateFileIfNeeded(
 
   await ensureFile(filePath);
   
-  return withRotationMutex(filePath, async () => {
+  return withBoundedQueue(`archive-rotate:${filePath}`, async () => {
     // Use a lock to ensure only one process performs the rotation.
     // realpath: false is used for Windows compatibility and to handle renames better.
     const release = await lockfile.lock(filePath, safeLockOptions('archive-rotate', { retries: 5, realpath: false }));
@@ -131,7 +108,7 @@ export async function rotateFileIfNeeded(
     } finally {
       await release();
     }
-  });
+  }, { store: 'archive-rotate', target: basename(filePath) });
 }
 
 export async function listArchiveFiles(baseName: string, newestFirst: boolean = true): Promise<string[]> {
@@ -179,8 +156,11 @@ export const DEFAULT_ARCHIVE_RETENTION: Required<ArchiveRetention> = {
  * 2026-08-24) are DERIVED — rebuildable from nothing, a debugging aid rather
  * than a record of user content — so they prune at 90 days like the other
  * entries here, unlike the permanent conversation-history shards.
+ *
+ * Drained stall-records.jsonl shards (2026-09-16, moved here by the
+ * staleness-check job) are diagnostic evidence and prune at 90 days too.
  */
-export const PRUNABLE_ARCHIVE_SUFFIXES = ['-app.log.jsonl', '-telegram-bot.log', '-turn-traces.jsonl'];
+export const PRUNABLE_ARCHIVE_SUFFIXES = ['-app.log.jsonl', '-telegram-bot.log', '-turn-traces.jsonl', STALL_RECORDS_ARCHIVE_SUFFIX];
 
 function isPrunableArchiveFile(name: string): boolean {
   return PRUNABLE_ARCHIVE_SUFFIXES.some((s) => name.endsWith(s));

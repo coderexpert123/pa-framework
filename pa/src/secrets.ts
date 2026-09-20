@@ -1,4 +1,5 @@
 import { readFile } from 'fs/promises';
+import { readFileSync } from 'fs';
 import { secretsPath } from './paths.js';
 
 export async function loadSecrets(keys?: string[]): Promise<Record<string, string>> {
@@ -10,6 +11,24 @@ export async function loadSecrets(keys?: string[]): Promise<Record<string, strin
     return {};
   }
 
+  const secrets = parseSecretsEnv(raw);
+
+  if (!keys) return secrets;
+  const filtered: Record<string, string> = {};
+  for (const key of keys) {
+    if (secrets[key] !== undefined) {
+      filtered[key] = secrets[key];
+    } else {
+      console.warn(`Warning: secret '${key}' not found in ${path}`);
+    }
+  }
+  return filtered;
+}
+
+/** KEY=VALUE lines of a secrets.env body: blank and # lines skipped,
+ *  surrounding quotes stripped. The one parser behind loadSecrets and
+ *  loadSecretsSync. */
+export function parseSecretsEnv(raw: string): Record<string, string> {
   const secrets: Record<string, string> = {};
   for (const line of raw.split('\n')) {
     const trimmed = line.trim();
@@ -25,15 +44,17 @@ export async function loadSecrets(keys?: string[]): Promise<Record<string, strin
     }
     secrets[key] = value;
   }
+  return secrets;
+}
 
-  if (!keys) return secrets;
-  const filtered: Record<string, string> = {};
-  for (const key of keys) {
-    if (secrets[key] !== undefined) {
-      filtered[key] = secrets[key];
-    } else {
-      console.warn(`Warning: secret '${key}' not found in ${path}`);
-    }
+/** Synchronous, unfiltered loadSecrets() for sync callers (the TypeSafe
+ *  client's key check). A missing or unreadable file yields {}. */
+export function loadSecretsSync(): Record<string, string> {
+  let raw: string;
+  try {
+    raw = readFileSync(secretsPath(), 'utf8');
+  } catch {
+    return {};
   }
-  return filtered;
+  return parseSecretsEnv(raw);
 }

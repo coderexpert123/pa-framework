@@ -31,7 +31,7 @@ import {
 } from '../logic.js';
 import { BOT_COMMANDS } from '../commands.js';
 import { TOPIC_SOURCES_MAX } from '../sources.js';
-import { redactAuthCommand, buildOAuthCompletionMessage } from '../oauth.js';
+import { redactAuthCommand, redactSecretCommand, buildOAuthCompletionMessage } from '../oauth.js';
 import {
   voiceErrorMessage,
   formatTranscriptUserText,
@@ -99,6 +99,33 @@ function makeSpawnDouble(calls: string[], json: () => string) {
     },
     on: (ev: string, cb: () => void) => {
       if (ev === 'close') queueMicrotask(cb);
+      return proc; // chainable — WB-304 error listeners attach after spawn
+    },
+    unref: () => calls.push('unref'),
+  };
+  const fn = ((file: string, args: string[], opts: any) => {
+    calls.push(`spawn:${JSON.stringify(args)}:${JSON.stringify(opts)}`);
+    return proc as any;
+  }) as unknown as typeof import('child_process').spawn;
+  return fn;
+}
+
+/** Like makeSpawnDouble, but also models a writable stdin — for /secret's
+ *  `pa auth answer` spawn, which pipes the value on stdin rather than argv. */
+function makeSpawnDoubleWithStdin(calls: string[], stdinWrites: string[], json: () => string) {
+  const proc = {
+    stdin: {
+      write: (data: string) => { stdinWrites.push(data); },
+      end: () => {},
+    },
+    stdout: {
+      on: (ev: string, cb: (d: Buffer) => void) => {
+        if (ev === 'data') queueMicrotask(() => cb(Buffer.from(json())));
+      },
+    },
+    on: (ev: string, cb: () => void) => {
+      if (ev === 'close') queueMicrotask(cb);
+      return proc; // chainable — WB-304 error listeners attach after spawn
     },
     unref: () => calls.push('unref'),
   };
@@ -157,9 +184,6 @@ function baseDeps(): { deps: CommandRouterDeps; calls: string[] } {
     addTurnFn: ((state: any, turn: any) => { calls.push(`addTurn:${turn.text}`); state.turns.push(turn); }) as any,
     saveTopicStateFn: (async () => { calls.push('saveTopicState'); }) as any,
     markRepliedFn: ((chatId: number, threadId: number) => { calls.push(`markReplied:${chatId}_${threadId}`); }) as any,
-    updateDashboardFn: (async () => { calls.push('updateDashboard'); return {} as any; }) as any,
-    toggleKeepAwakeFn: (async () => { calls.push('toggleKeepAwake'); return { active: true }; }) as any,
-    getKeepAwakeFn: (() => { calls.push('getKeepAwake'); return { active: false }; }) as any,
     spawnFn: makeSpawnDouble(calls, () => '') as any,
     statFn: stat as any,
     mkdirFn: (async (path: string, opts: any) => { calls.push(`mkdir:${path}`); return undefined as any; }) as any,
@@ -204,7 +228,7 @@ describe('command router — plain text, guard, /auth, archive', () => {
     assert.equal(r.voiceTranscribed, false);
     assert.equal(r.archivedUserText, 'hello there');
     // no interception dep fired
-    for (const marker of ['refreshCard', 'syncModelStatus:', 'handleTunables', 'toggleKeepAwake', 'updateDashboard', 'execPaCommand:', 'execPaRef:', 'spawnReauthLink:', 'injectResume:']) {
+    for (const marker of ['refreshCard', 'syncModelStatus:', 'handleTunables', 'execPaCommand:', 'execPaRef:', 'spawnReauthLink:', 'injectResume:']) {
       assert.ok(!calls.some((c) => c.startsWith(marker)), `unexpected call: ${marker}`);
     }
     assert.ok(calls.some((c) => c.startsWith('addTurn:')));
@@ -354,10 +378,66 @@ describe('command router — plain text, guard, /auth, archive', () => {
 });
 
 // ---------------------------------------------------------------------------
-// R-T11 .. R-T17: agent card, agent switch, keepawake, reset, /new
+// command-router — /secret (auth broker Phase A, generalizes /auth)
 // ---------------------------------------------------------------------------
 
-describe('command router — agent/keepawake/reset//new blocks', () => {
+describe('command-router — /secret (auth broker)', () => {
+  it('delivers the value via pa auth answer, redacts the archive, deletes the message, never logs the value', async () => {
+    const { deps, calls } = baseDeps();
+    const deleteMessageCalls: unknown[][] = [];
+    deps.deleteMessageFn = (async (t: string, c: number, m: number) => {
+      deleteMessageCalls.push([t, c, m]);
+      return {} as any;
+    }) as any;
+    const stdinWrites: string[] = [];
+    deps.spawnFn = makeSpawnDoubleWithStdin(
+      calls,
+      stdinWrites,
+      () => JSON.stringify({ ok: true, status: 'answered', request_id: 'ir-0123456789ab' })
+    ) as any;
+
+    const r = await run({ userText: '/secret ir-0123456789ab hunter2' }, deps);
+
+    assert.equal(r.archivedUserText, redactSecretCommand());
+    assert.equal(deleteMessageCalls.length, 1);
+    assert.deepEqual(deleteMessageCalls[0], ['test-token', CHAT, 42]);
+
+    const spawnCall = calls.find((c) => c.startsWith('spawn:['));
+    assert.ok(spawnCall);
+    assert.ok(!spawnCall!.includes('hunter2'), 'value must never reach argv');
+    assert.ok(spawnCall!.includes('"auth"') && spawnCall!.includes('"answer"') && spawnCall!.includes('ir-0123456789ab'));
+    assert.ok(!spawnCall!.includes('"shell":true'), 'no shell:true — the value can never reach a shell command line');
+
+    assert.deepEqual(stdinWrites, ['hunter2']);
+
+    assert.equal(r.response, 'Sent. The task continues.');
+    assert.equal(r.skipWorker, true);
+
+    // Known-bad control: the value must appear in NO captured log line for the turn.
+    assert.ok(!calls.some((c) => c.includes('hunter2')));
+  });
+
+  it('a non-ok result from pa auth answer yields the not-pending/unknown message', async () => {
+    const { deps } = baseDeps();
+    deps.spawnFn = makeSpawnDoubleWithStdin([], [], () => JSON.stringify({ ok: false })) as any;
+    const r = await run({ userText: '/secret ir-0123456789ab hunter2' }, deps);
+    assert.equal(r.response, 'That request is no longer pending, or the id is unknown.');
+    assert.equal(r.skipWorker, true);
+  });
+
+  it('a malformed /secret falls through to the worker, not to this branch', async () => {
+    const { deps, calls } = baseDeps();
+    const r = await run({ userText: '/secret nope x' }, deps);
+    assert.ok(!calls.some((c) => c.startsWith('spawn:')));
+    assert.equal(r.skipWorker, false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R-T11 .. R-T17: agent card, agent switch, reset, /new
+// ---------------------------------------------------------------------------
+
+describe('command router — agent/reset//new blocks', () => {
   it('R-T11: bare /agent renders the agent status card', async () => {
     const { deps, calls } = baseDeps();
     const r = await run({ userText: '/agent' }, deps);
@@ -386,15 +466,6 @@ describe('command router — agent/keepawake/reset//new blocks', () => {
     const r = await run({ userText: '/agent zclaude', effectiveDefault: 'zclaude', topicState: state }, deps);
     assert.equal(state.preferred_worker, undefined);
     assert.ok(calls.includes('syncModelStatus:user_selected_default'));
-    assert.equal(r.skipWorker, true);
-  });
-
-  it('R-T14: /keepawake toggles, refreshes the card and the dashboard', async () => {
-    const { deps, calls } = baseDeps();
-    const r = await run({ userText: '/keepawake' }, deps);
-    assert.ok(calls.includes('toggleKeepAwake'));
-    assert.ok(calls.includes('refreshCard'));
-    assert.ok(calls.includes('updateDashboard'));
     assert.equal(r.skipWorker, true);
   });
 
@@ -790,6 +861,7 @@ describe('command router — every intercepted local command is discoverable', (
     // registration and that the argumented form is guard-known.
     const argRequired = [
       ['auth', '/auth 4/0abc.def:1:abc'],
+      ['secret', '/secret ir-0123456789ab hunter2'],
       ['ref', '/ref s-abc123'],
       ['branch', '/branch name'],
       ['child_of', '/child_of parent'],
@@ -799,7 +871,7 @@ describe('command router — every intercepted local command is discoverable', (
     const bareComplete = [
       'agent', 'model', 'effort', 'default', 'code', 'sources', 'reset', 'new',
       'status', 'skills', 'reauth', 'help', 'health', 'claims', 'debug',
-      'keepawake', 'retranscribe', 'commit', 'push', 'push_public',
+      'retranscribe', 'commit', 'push', 'push_public',
       'investigate_flagged', 'update_brain', 'pair', 'orchestrator', 'merge',
     ];
     const all = [...argRequired.map(([cmd]) => cmd), ...bareComplete];
@@ -880,5 +952,51 @@ describe('command router — /sources add seam (stat gate + frozen responses)', 
     assert.equal(out.skipWorker, true);
     assert.equal(state.sources?.length, TOPIC_SOURCES_MAX, 'cap must not append');
     assert.equal(out.response, `⚠️ Source cap reached (${TOPIC_SOURCES_MAX} per topic). Remove one first: /sources remove <n>.`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WP-5 (§5, decision 25): /agent under an effective deprecate-pins gate —
+// the standing notice rides the reply while the state writes stay EXACTLY
+// today's (flag-off reversal). No block / explicit false → no notice.
+// ---------------------------------------------------------------------------
+const { ROUTER_OWNS_DISPATCH_NOTICE } = await import('../command-router.js');
+
+describe('WP-5 /agent standing notice under the deprecate-pins gate', () => {
+  it('gate effective (absent deprecate_pins + enabled block): notice on, state writes unchanged', async () => {
+    const { deps, calls } = baseDeps();
+    const state = makeState({ session: { session_id: 's1', worker: 'agy', started_at: new Date().toISOString() } });
+    const r = await run(
+      {
+        userText: '/agent zclaude',
+        topicState: state,
+        config: { workers: [{ name: 'agy' }, { name: 'zclaude' }], model_router: { enabled: true, table: [] } },
+      },
+      deps,
+    );
+    assert.ok(r.response.startsWith('Switched agent:'));
+    assert.ok(r.response.endsWith(ROUTER_OWNS_DISPATCH_NOTICE), 'the reply must carry the standing notice');
+    assert.equal(state.preferred_worker, 'zclaude', 'the pin still writes (flag-off reversal)');
+    assert.ok(state.preferred_worker_set_at);
+    assert.ok(calls.includes('syncModelStatus:user_override'), 'state writes unchanged');
+    assert.ok(calls.includes('refreshCard'));
+    assert.equal(r.skipWorker, true);
+  });
+
+  it('no block → no notice (byte-identity); explicit deprecate_pins false → no notice', async () => {
+    const { deps } = baseDeps();
+    const plain = await run({ userText: '/agent zclaude', topicState: makeState() }, deps);
+    assert.ok(!plain.response.includes('routing owns worker+model now'), 'no block = today’s reply');
+
+    const { deps: deps2 } = baseDeps();
+    const off = await run(
+      {
+        userText: '/agent zclaude',
+        topicState: makeState(),
+        config: { workers: [{ name: 'agy' }, { name: 'zclaude' }], model_router: { enabled: true, deprecate_pins: false, table: [] } },
+      },
+      deps2,
+    );
+    assert.ok(!off.response.includes('routing owns worker+model now'), 'explicit false = today’s reply');
   });
 });

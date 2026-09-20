@@ -40,7 +40,15 @@ grounding-check, registry-content-watch, alert-digest, dashboard-refresh,
   byte-pinned with the oauth path G3). NOT cold-start-seeded — fires on the first tick
   after restart. Gotchas: logger entries serialize context FLAT (`entry.chatId`); the
   cold-start `updateJobState` name array does NOT gate registration
-  (`createBotMaintenanceJobs`'s return array does).
+  (`createBotMaintenanceJobs`'s return array does). Type-branches BEFORE the above (AI-
+  conversation-context reminder fix, 2026-09-12): a popped record with
+  `resume_action.type === 'voice_inbox_resume'` skips `injectSystemReminderUpdate`/
+  `allowedChatIds` entirely (that gate applies only to `topic_resume`'s Telegram target)
+  and instead shells out to `projects/voice-inbox/scripts/create_conversation_task.py` to
+  append a task into the `conversation_id` it carries, looked up fresh at fire time so it
+  lands correctly even if the conversation's topic routing has since moved. Fail-open,
+  same as every other source here: a spawn/parse/non-zero-exit failure is logged and
+  swallowed, never crashing the drain.
 
 **Task executor lane** (Wave-2 SPEC §3.1: `task-executor.ts` + `drainDueTopicTasks`):
 **`topic-task-drain`** (60s) claims ≤2 tasks/tick globally off

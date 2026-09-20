@@ -53,12 +53,71 @@ function computeNextPacificMidnightMinutes(now: Date): { minutes: number; resets
   return { minutes, resetsAtIST };
 }
 
+// Mirrors rate-limits-claude.ts's ACCOUNT_EXHAUSTED_COOLDOWN_MINUTES (6h) — same
+// "terminal fault, long bench" convention, applied here when agy's own
+// "Individual quota reached" message (see below) carries no parseable
+// "Resets in <duration>" tail.
+const AGY_QUOTA_EXHAUSTED_DEFAULT_MINUTES = 6 * 60;
+
+// Parses a "Resets in <duration>" tail such as "Resets in 2h 13m", "Resets in
+// 45m", "Resets in 1 day 3 hours", or agy's own real (unspaced) production
+// format "Resets in 53h9m30s" into minutes. Returns null when no d/h/m
+// component is found (caller falls back to AGY_QUOTA_EXHAUSTED_DEFAULT_MINUTES)
+// — never guesses a number out of unrecognized text. Capped at 24h, matching
+// Rule 4's retryDelay cap below.
+//
+// 2026-09-10 fix: each unit used to require a trailing `\b` word boundary,
+// which never matches between "h" and the digit that starts the next unit
+// (both are \w — there is no boundary) — so EVERY real agy specimen sampled
+// ("53h9m30s", "52h16m3s", "24h36m57s", ...; agy never emits a space between
+// units) silently failed to parse and fell back to the 6h default regardless
+// of how long the real reset actually was, up to a day+ off. `(?![a-z])`
+// (next char is not a lowercase letter) replaces `\b`: it still rejects a
+// partial match into a longer word, but allows the next unit's digit,
+// whitespace, punctuation, or end-of-string to follow immediately.
+function parseResetsInMinutes(stderr: string): number | null {
+  const tailMatch = stderr.match(/Resets in\s+([^.\n]+)/i);
+  if (!tailMatch) return null;
+  const tail = tailMatch[1];
+  const dMatch = tail.match(/(\d+)\s*d(?:ays?)?(?![a-z])/i);
+  const hMatch = tail.match(/(\d+)\s*h(?:ours?|rs?)?(?![a-z])/i);
+  const mMatch = tail.match(/(\d+)\s*m(?:in(?:utes?)?)?(?![a-z])/i);
+  if (!dMatch && !hMatch && !mMatch) return null;
+  const days = dMatch ? parseInt(dMatch[1], 10) : 0;
+  const hours = hMatch ? parseInt(hMatch[1], 10) : 0;
+  const mins = mMatch ? parseInt(mMatch[1], 10) : 0;
+  const total = days * 1440 + hours * 60 + mins;
+  return total > 0 ? Math.min(total, 1440) : null;
+}
+
 /**
  * Classify a gemini stderr dump. Returns null when the stderr contains no
  * 429 / RESOURCE_EXHAUSTED / 403 marker (i.e. not a rate limit at all).
  */
 export function classifyGeminiError(stderr: string): RateLimitParseResult | null {
   if (!stderr) return null;
+
+  // Rule -1: agy's own CLI-level terminal quota exhaustion. Distinct from every
+  // rule below: those parse a JSON-shaped Google API error blob carrying
+  // 429 / RESOURCE_EXHAUSTED; this is Antigravity's CLI wrapper printing a
+  // plain-English message when the operator's subscription quota is used up.
+  // No 429/RESOURCE_EXHAUSTED marker appears in it, so it fell through every
+  // rule below (and the `!has429` guard further down) straight to null for a
+  // month — rate-limit-unparseable.jsonl carries this exact text dated
+  // 2026-08-09, reason 'no-session-evidence', with zero cooldown ever written.
+  // Exact-phrase match only — per this file's own no-loose-heuristics rule.
+  const AGY_QUOTA_PHRASE = /Individual quota reached/i;
+  if (AGY_QUOTA_PHRASE.test(stderr)) {
+    const markerIdx = stderr.search(AGY_QUOTA_PHRASE);
+    const minutes = parseResetsInMinutes(stderr) ?? AGY_QUOTA_EXHAUSTED_DEFAULT_MINUTES;
+    return {
+      minutes,
+      classification: 'quota-exhausted',
+      source: 'gemini-cli-text',
+      resetsAtIST: formatIST(new Date(Date.now() + minutes * 60_000)),
+      raw: sliceSnippet(stderr, markerIdx),
+    };
+  }
 
   // Rule 0: 403 / PERMISSION_DENIED — IAM or auth failure (not a quota error).
   // Apply a 120-minute cooldown to stop repeated futile attempts until the user

@@ -1,10 +1,11 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp } from 'fs/promises';
+import { mkdtemp, writeFile } from 'fs/promises';
+import lockfile from 'proper-lockfile';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { decideJob, runDueJobs, resolveEveryMs } from '../src/lib/maintenance/runner.js';
-import { readLedger } from '../src/lib/maintenance/state.js';
+import { readLedger, maintenanceStatePath } from '../src/lib/maintenance/state.js';
 import type { MaintenanceJob } from '../src/lib/maintenance/types.js';
 import { rmRetry } from './rm-retry.js';
 
@@ -181,6 +182,37 @@ function makeFakeNotify(): { notify: (subject: string, body: string, opts?: any)
     return { sent: true, suppressed: false };
   };
   return { notify, calls };
+}
+
+/**
+ * Polls `predicate` until it returns true, instead of a fixed sleep. A
+ * parallel pass (S8) settles its detached completion (job body + the
+ * three-layer-serialized `updateJobState` write) on its own schedule; a
+ * fixed `setTimeout` guess flaked under shared-tree contention (observed
+ * 2026-09-11 — a ~150ms fixed wait was sometimes not enough). Fails loudly
+ * (never a silent pass) if the condition never holds within the budget.
+ *
+ * intervalMs defaults to 50ms, not tighter: a predicate that calls
+ * readLedger() is a plain unlocked readFile, and polling it too often
+ * measurably raises the odds of colliding with updateJobState's own
+ * lock+atomic-rename write (Windows refuses to rename over a file that is
+ * open elsewhere — the exact EPERM class atomic-write.ts's renameWithRetry
+ * exists for, AI-150) — observed 2026-09-11: an 8-job concurrent-completion
+ * pass hit `EPERM ... rename ... maintenance-state.json` after exhausting
+ * renameWithRetry's 5 attempts while this test's own poll loop was reading
+ * the same file every 10ms. This is a pre-existing hazard in state.ts (out
+ * of this file's ownership) between an unlocked reader and the atomic
+ * rename; the fix in scope here is to not manufacture it by over-polling.
+ */
+async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs = 2000, intervalMs = 50): Promise<void> {
+  const maxAttempts = Math.max(1, Math.ceil(timeoutMs / intervalMs));
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (await predicate()) return;
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  if (!(await predicate())) {
+    throw new Error(`waitUntil: condition not met within ~${timeoutMs}ms`);
+  }
 }
 
 describe('runDueJobs', () => {
@@ -385,6 +417,194 @@ describe('runDueJobs', () => {
   });
 });
 
+describe('runDueJobs parallel option (S8, 2026-09-11)', () => {
+  it('default (parallel unset) is unchanged — re-asserts the existing awaited-per-job contract verbatim', async () => {
+    const job = makeJob({ name: 'touches-two-parallel-unset', run: async () => ({ touched: 2 }) });
+    const { notify } = makeFakeNotify();
+    const records = await runDueJobs('pa', [job], { notify });
+    assert.equal(records.length, 1);
+    assert.equal(records[0].outcome, 'ran');
+    assert.equal(records[0].touched, 2);
+    const ledger = await readLedger();
+    assert.ok(ledger.jobs['touches-two-parallel-unset'].lastRunAt);
+    assert.equal(ledger.jobs['touches-two-parallel-unset'].consecutiveFailures, 0);
+  });
+
+  it('parallel: true starts two due jobs of different durations in one pass; both records are "started" (durationMs 0) and the pass resolves before the slow job ends', async () => {
+    let slowJobFinished = false;
+    let releaseSlow!: () => void;
+    const slowGate = new Promise<void>((resolve) => { releaseSlow = resolve; });
+    const slowJob = makeJob({
+      name: 'slow-parallel-job',
+      run: async () => { await slowGate; slowJobFinished = true; return { touched: 1 }; },
+    });
+    const fastJob = makeJob({
+      name: 'fast-parallel-job',
+      run: async () => ({ touched: 1 }),
+    });
+    const { notify } = makeFakeNotify();
+
+    const records = await runDueJobs('pa', [slowJob, fastJob], { notify, parallel: true });
+
+    assert.deepEqual(records.map((r) => r.outcome), ['started', 'started']);
+    assert.deepEqual(records.map((r) => r.durationMs), [0, 0]);
+    assert.equal(slowJobFinished, false, 'the pass must resolve before the slow job completes');
+
+    releaseSlow();
+    await waitUntil(() => slowJobFinished);
+  });
+
+  it('a job still running from an earlier parallel pass is skipped in-flight on the next pass, then runs on the first pass after it completes', async () => {
+    let releaseRun!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseRun = resolve; });
+    let runCount = 0;
+    const job = makeJob({
+      name: 'in-flight-parallel-job',
+      run: async () => { runCount++; await gate; return { touched: 0 }; },
+    });
+    const { notify } = makeFakeNotify();
+
+    const firstPass = await runDueJobs('pa', [job], { notify, parallel: true });
+    assert.equal(firstPass[0].outcome, 'started');
+
+    const secondPass = await runDueJobs('pa', [job], { notify, parallel: true });
+    assert.equal(secondPass[0].outcome, 'skipped');
+    assert.equal(secondPass[0].skipReason, 'in-flight');
+    assert.equal(runCount, 1, 'run() must not be invoked a second time while still in flight');
+
+    releaseRun();
+    // Wait for the first pass's detached completion handler to write the
+    // ledger and release IN_FLIGHT.
+    await waitUntil(async () => (await readLedger()).jobs['in-flight-parallel-job']?.lastOutcome === 'ran');
+
+    // force:true bypasses cadence (everyMs) so this exercises the in-flight
+    // release, not the unrelated not-due decision.
+    const thirdPass = await runDueJobs('pa', [job], { notify, parallel: true, force: true });
+    assert.equal(thirdPass[0].outcome, 'started');
+    await waitUntil(() => runCount === 2);
+    assert.equal(runCount, 2, 'run() must be invoked again once the earlier pass released the slot');
+  });
+
+  it('concurrent completions from one parallel pass leave EVERY outcome correctly recorded in the ledger (C15 — updateJobState already serializes; no runner-added mutex)', async () => {
+    const N = 8;
+    const jobs = Array.from({ length: N }, (_, i) => makeJob({
+      name: `concurrent-job-${i}`,
+      run: async () => {
+        // Stagger completion order so the ledger writes race each other.
+        await new Promise((r) => setTimeout(r, (N - i) % 3));
+        if (i % 3 === 0) throw new Error(`boom-${i}`);
+        return { touched: i };
+      },
+    }));
+    const { notify } = makeFakeNotify();
+
+    const records = await runDueJobs('pa', jobs, { notify, parallel: true });
+    assert.equal(records.length, N);
+    assert.ok(records.every((r) => r.outcome === 'started'));
+
+    // Poll until every detached completion has written its terminal outcome.
+    // N serialized real lock+atomic-rename writes (updateJobState's own
+    // three-layer serialization, C15) can take longer than the default
+    // budget on a contended host (observed 2026-09-11 in a many-agent
+    // shared-tree wave) — generous timeout, still fails loudly if truly wedged.
+    await waitUntil(async () => {
+      const l = await readLedger();
+      return jobs.every((j) => {
+        const outcome = l.jobs[j.name]?.lastOutcome;
+        return outcome !== undefined && outcome !== 'started';
+      });
+    }, 15_000);
+
+    const ledger = await readLedger();
+    for (let i = 0; i < N; i++) {
+      const state = ledger.jobs[`concurrent-job-${i}`];
+      assert.ok(state, `job ${i} missing from ledger`);
+      if (i % 3 === 0) {
+        assert.equal(state.lastOutcome, 'failed', `job ${i} should be failed`);
+      } else {
+        assert.equal(state.lastOutcome, 'ran', `job ${i} should be ran`);
+        assert.ok(state.lastRunAt, `job ${i} should have lastRunAt set`);
+      }
+    }
+  });
+
+  it('a throwing job in a parallel pass leaves its siblings\' outcomes intact and never rejects the pass', async () => {
+    const throwingJob = makeJob({ name: 'parallel-throws', run: async () => { throw new Error('boom'); } });
+    const okJob = makeJob({ name: 'parallel-ok', run: async () => ({ touched: 3 }) });
+    const { notify } = makeFakeNotify();
+
+    const records = await runDueJobs('pa', [throwingJob, okJob], { notify, parallel: true });
+    assert.deepEqual(records.map((r) => r.outcome), ['started', 'started']);
+
+    await waitUntil(async () => {
+      const l = await readLedger();
+      return l.jobs['parallel-throws']?.lastOutcome === 'failed' && l.jobs['parallel-ok']?.lastOutcome === 'ran';
+    });
+
+    const ledger = await readLedger();
+    assert.equal(ledger.jobs['parallel-throws'].lastOutcome, 'failed');
+    assert.equal(ledger.jobs['parallel-ok'].lastOutcome, 'ran');
+    assert.ok(ledger.jobs['parallel-ok'].lastRunAt);
+  });
+
+  it('"started" never appears as a ledger lastOutcome once a parallel pass settles', async () => {
+    const jobs = [
+      makeJob({ name: 'never-started-a', run: async () => ({ touched: 0 }) }),
+      makeJob({ name: 'never-started-b', run: async () => { throw new Error('x'); } }),
+    ];
+    const { notify } = makeFakeNotify();
+    await runDueJobs('pa', jobs, { notify, parallel: true });
+    await waitUntil(async () => {
+      const l = await readLedger();
+      return jobs.every((j) => l.jobs[j.name]?.lastOutcome !== undefined);
+    });
+
+    const ledger = await readLedger();
+    for (const job of jobs) {
+      assert.notEqual(ledger.jobs[job.name].lastOutcome, 'started');
+    }
+  });
+});
+
+describe('runDueJobs skip-bookkeeping batching (AI-315)', () => {
+  it('a failing ledger write does not abort the pass — every job still gets a record', async () => {
+    // Hold the ledger's lockfile so every updateJobState/updateJobsState
+    // acquisition ELOCKEDs. Pre-AI-315 the skip path awaited updateJobState
+    // per job inside the pass loop, so the first job's write threw and the
+    // whole pass aborted mid-list — the tail jobs (backlog-fragments-drain,
+    // bus-drain) starved for hours on 2026-09-17. The batched write still
+    // fails, but the pass must return every job's record.
+    const jobs = Array.from({ length: 5 }, (_, i) => makeJob({ name: `batch-skip-${i}` }));
+    const { notify } = makeFakeNotify();
+    await writeFile(maintenanceStatePath(), '{"version":1,"jobs":{}}');
+    const release = await lockfile.lock(maintenanceStatePath(), { realpath: false });
+    try {
+      const records = await runDueJobs('pa', jobs, {
+        notify,
+        overrides: Object.fromEntries(jobs.map((j) => [j.name, { enabled: false }])),
+      });
+      assert.equal(records.length, jobs.length, 'every job must produce a record even when the skip-write fails');
+      assert.ok(records.every((r) => r.outcome === 'skipped' && r.skipReason === 'disabled'));
+    } finally {
+      await release().catch(() => {});
+    }
+  });
+
+  it('skip bookkeeping lands for every skipped job in the pass', async () => {
+    const jobs = Array.from({ length: 4 }, (_, i) => makeJob({ name: `batched-lands-${i}` }));
+    const { notify } = makeFakeNotify();
+    const records = await runDueJobs('pa', jobs, {
+      notify,
+      overrides: Object.fromEntries(jobs.map((j) => [j.name, { enabled: false }])),
+    });
+    assert.equal(records.length, jobs.length);
+    await waitUntil(async () => {
+      const l = await readLedger();
+      return jobs.every((j) => l.jobs[j.name]?.lastSkipReason === 'disabled' && l.jobs[j.name]?.consecutiveSkips === 1);
+    });
+  });
+});
+
 describe('skippedTooLongThreshold floor', () => {
   it('a 60s job skipped degraded for 5 minutes does NOT page; for 20 minutes it does', async () => {
     const everyMs = 60_000; // 60s cadence — bare 3x would be 3 min; the 15 min floor applies.
@@ -426,5 +646,41 @@ describe('resolveEveryMs', () => {
   it('no override → declared cadence, including function form', () => {
     const job = makeJob({ name: 'x', everyMs: () => 4242 });
     assert.equal(resolveEveryMs(job), 4242);
+  });
+});
+
+describe('runDueJobs onJobDecision (catchup-lane-wedge wave)', () => {
+  it('reports each target job once, in order, with its action, before that job runs', async () => {
+    const now = 2_000_000_000_000;
+    const events: string[] = [];
+    const decisionA = makeJob({
+      name: 'decision-a',
+      everyMs: 60_000,
+      run: async () => { events.push('run:decision-a'); return { touched: 0 }; },
+    });
+    const decisionB = makeJob({
+      name: 'decision-b',
+      everyMs: 3_600_000,
+      run: async () => { events.push('run:decision-b'); return { touched: 0 }; },
+    });
+
+    await runDueJobs('pa', [decisionB], { now });
+    events.length = 0;
+
+    await runDueJobs('pa', [decisionA, decisionB], {
+      now: now + 1000,
+      onJobDecision: (n, a) => events.push(`decide:${n}:${a}`),
+    });
+
+    assert.deepEqual(events, ['decide:decision-a:run', 'run:decision-a', 'decide:decision-b:skip']);
+  });
+
+  it('a throwing onJobDecision does not break the pass', async () => {
+    const decisionC = makeJob({ name: 'decision-c', run: async () => ({ touched: 0 }) });
+    const records = await runDueJobs('pa', [decisionC], {
+      onJobDecision: () => { throw new Error('x'); },
+    });
+    assert.equal(records.length, 1);
+    assert.equal(records[0].outcome, 'ran');
   });
 });

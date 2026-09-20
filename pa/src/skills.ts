@@ -108,6 +108,9 @@ export async function loadSkill(name: string): Promise<Skill> {
     no_fallback: typeof meta.no_fallback === 'string'
       ? String(meta.no_fallback).toLowerCase() === 'true'
       : !!meta.no_fallback,
+    worktree_cwd: typeof meta.worktree_cwd === 'string'
+      ? String(meta.worktree_cwd).toLowerCase() === 'true'
+      : !!meta.worktree_cwd,
     critical: !!meta.critical,
     worker_args: Array.isArray(meta.worker_args)
       ? meta.worker_args.map((a: unknown) => String(a))

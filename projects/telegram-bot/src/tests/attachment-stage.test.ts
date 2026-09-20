@@ -570,9 +570,9 @@ describe('AI-208: foldedVoice (steer re-dispatch)', () => {
 describe('AI-191: voice-invoked commands', () => {
   /** Injected closed set — matchVoiceCommand's `isRegistered` gate. */
   const reg = (...names: string[]) => (c: string) => names.includes(c);
-  /** The nine commands the SAFE_BARE list covers, as a deps-shaped set. */
-  const FULL_SAFE_SET = () => new Set(['status', 'health', 'help', 'skills', 'claims', 'agent', 'keepawake', 'retranscribe', 'update_brain']);
-  const FULL_SAFE = reg('status', 'health', 'help', 'skills', 'claims', 'agent', 'keepawake', 'retranscribe', 'update_brain');
+  /** The eight commands the SAFE_BARE list covers, as a deps-shaped set. */
+  const FULL_SAFE_SET = () => new Set(['status', 'health', 'help', 'skills', 'claims', 'agent', 'retranscribe', 'update_brain']);
+  const FULL_SAFE = reg('status', 'health', 'help', 'skills', 'claims', 'agent', 'retranscribe', 'update_brain');
 
   describe('layer 1 — literal spoken slash form', () => {
     it('V1: "slash status" → /status', () => {
@@ -675,7 +675,7 @@ describe('AI-191: voice-invoked commands', () => {
     // recognize it (never "Unknown command", never a worker dispatch).
     for (const t of [
       'slash status', 'slash health', 'slash help', 'slash skills', 'slash claims',
-      'status', 'health.', 'please help', 'skills please', 'claims', 'agent', 'keepawake',
+      'status', 'health.', 'please help', 'skills please', 'claims', 'agent',
       'update brain', 'update brains',
       'retranscribe', 'retranscribe that note', 'slash retranscribe groq',
     ]) {

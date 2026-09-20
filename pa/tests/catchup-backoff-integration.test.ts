@@ -42,6 +42,8 @@ import type { RunMeta } from '../src/types.js';
 
 type CatchupCommand = (opts?: { topic?: string }) => Promise<void>;
 
+let runMaintenanceTick: () => Promise<void>;
+
 let dir: string;
 let catchupCommand: CatchupCommand;
 
@@ -134,6 +136,7 @@ before(async () => {
 
   const mod = await import('../src/commands/catchup.js');
   catchupCommand = mod.catchupCommand;
+  runMaintenanceTick = mod.runMaintenanceTick;
 });
 
 after(async () => {
@@ -276,8 +279,8 @@ describe('AI-098 integration: backoff never throttles a skill below its own sche
   });
 });
 
-describe('WP-B: catchup gates pa-host maintenance to a single topic (2026-08-23)', () => {
-  it('does not run pa-host maintenance for topic:reminders, but does for topic:default', async () => {
+describe('the maintenance lane, not any topic, drives pa-host maintenance (2026-09-11, supersedes the 2026-08-23 topic gate)', () => {
+  it('no topic-scoped tick runs pa-host maintenance; only runMaintenanceTick() does', async () => {
     const statePath = join(dir, 'maintenance-state.json');
 
     await catchupCommand({ topic: 'reminders' });
@@ -286,6 +289,10 @@ describe('WP-B: catchup gates pa-host maintenance to a single topic (2026-08-23)
 
     await catchupCommand({ topic: 'default' });
     const afterDefault = await readFile(statePath, 'utf8').catch(() => null);
-    assert.ok(afterDefault, 'topic:default must run pa-host maintenance and create the ledger');
+    assert.equal(afterDefault, null, 'topic:default must no longer create the maintenance ledger — the pass moved to its own lane');
+
+    await runMaintenanceTick();
+    const afterMaintenanceTick = await readFile(statePath, 'utf8').catch(() => null);
+    assert.ok(afterMaintenanceTick, 'runMaintenanceTick() must run pa-host maintenance and create the ledger');
   });
 });

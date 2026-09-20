@@ -3,6 +3,7 @@ import { join } from 'path';
 import { pipeline } from 'stream/promises';
 import { logger } from '../../../pa/dist/src/lib/log.js';
 import { telegramFetch } from '../../../pa/dist/src/lib/telegram-proxy.js';
+import { redactSecrets } from '../../../pa/dist/src/lib/redact.js';
 import type { TelegramUpdate } from './types.js';
 
 const BASE = 'https://api.telegram.org';
@@ -334,27 +335,59 @@ export interface SendMessageResult {
   lastErrorText?: string;
 }
 
-async function sendChunksWithDetails(
+interface ChunkedSendResult {
+  ok: boolean;
+  messageId: number | null;
+  terminalError: boolean;
+  lastStatus?: number;
+  lastErrorText?: string;
+}
+
+/**
+ * Single core send loop shared by every `sendMessage*` variant: splits `text`
+ * into Telegram-sized chunks, sends each with the 429/5xx backoff retry
+ * (`postSendMessageWithRetries`), and applies both corrective retries
+ * (MarkdownV2 parse failure -> plain text; reply-target-gone -> drop
+ * reply_to_message_id) per chunk. `keyboard`, when given, attaches to the
+ * LAST chunk only (Telegram allows one keyboard per message). Every
+ * `sendMessage*` export differs only in which fields of this result it
+ * surfaces — this is the one place the send/retry/fallback contract lives
+ * (2026-09-12 unification — previously `sendMessageWithId` had none of this
+ * and `sendMessageWithKeyboardDetailed` duplicated it minus the 429/5xx retry).
+ *
+ * Timeout handling is uniform across every variant: a timed-out chunk is
+ * "possibly delivered" (Telegram may have processed it despite no response),
+ * so it does not flip `ok`/`anyFailed` — this now also applies to the
+ * keyboard path, which previously treated any exception, timeout included,
+ * as an outright failure.
+ */
+async function sendChunked(
   token: string,
   chatId: number,
   text: string,
-  replyToMessageId?: number,
-  threadId?: number
-): Promise<SendMessageResult> {
+  opts: { replyToMessageId?: number; threadId?: number; keyboard?: InlineKeyboardMarkup } = {}
+): Promise<ChunkedSendResult> {
+  let replyToMessageId = opts.replyToMessageId;
+  const { threadId, keyboard } = opts;
   const trimmed = text.trim();
-  if (!trimmed) return { ok: true };
+  if (!trimmed) return { ok: true, messageId: null, terminalError: false };
 
   const chunks = splitMessage(trimmed);
   let allDelivered = true;
+  let firstMessageId: number | null = null;
+  let anyFailed = false;
+  let allFailuresChatNotFound = true;
   let lastStatus: number | undefined;
   let lastErrorText: string | undefined;
 
-  for (const chunk of chunks) {
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
     const body: Record<string, unknown> = {
       chat_id: chatId,
       text: sanitizeMdV2(chunk),
       parse_mode: 'MarkdownV2',
     };
+    if (i === chunks.length - 1 && keyboard) body.reply_markup = keyboard;
     if (threadId !== undefined && threadId !== null && threadId !== 0) body.message_thread_id = threadId;
     let hasReplyTarget = false;
     if (replyToMessageId) {
@@ -367,6 +400,7 @@ async function sendChunksWithDetails(
     let timedOut = false;
     let parseModeStripped = false;
     let replyTargetStripped = false;
+    let chunkChatNotFound = false;
 
     // At most 3 phases per chunk: the initial attempt, plus at most one
     // corrective retry for each of the two known causes (MarkdownV2 parse
@@ -413,18 +447,38 @@ async function sendChunksWithDetails(
         continue;
       }
 
-      console.error(`sendMessage failed: ${res.status} ${errorText}`);
+      console.error(`sendMessage failed: ${res.status} ${errorText} (chatId=${chatId}, threadId=${threadId})`);
+      if (isTerminalChatError(res.status, errorText)) chunkChatNotFound = true;
       break;
     }
 
     if (!res) {
-      if (!timedOut) allDelivered = false;
+      if (!timedOut) {
+        allDelivered = false;
+        anyFailed = true;
+        allFailuresChatNotFound = false;
+      }
       continue;
     }
-    if (!res.ok && !timedOut) allDelivered = false;
+    if (res.ok) {
+      if (i === 0) {
+        const data = await res.json().catch(() => null) as { ok?: boolean; result?: { message_id: number } } | null;
+        firstMessageId = data?.ok ? (data.result?.message_id ?? null) : null;
+      }
+    } else if (!timedOut) {
+      allDelivered = false;
+      anyFailed = true;
+      if (!chunkChatNotFound) allFailuresChatNotFound = false;
+    }
   }
 
-  return { ok: allDelivered, lastStatus, lastErrorText };
+  return {
+    ok: allDelivered,
+    messageId: anyFailed ? null : firstMessageId,
+    terminalError: anyFailed && allFailuresChatNotFound,
+    lastStatus,
+    lastErrorText,
+  };
 }
 
 export async function sendMessage(
@@ -434,7 +488,7 @@ export async function sendMessage(
   replyToMessageId?: number,
   threadId?: number
 ): Promise<boolean> {
-  return (await sendChunksWithDetails(token, chatId, text, replyToMessageId, threadId)).ok;
+  return (await sendChunked(token, chatId, text, { replyToMessageId, threadId })).ok;
 }
 
 /**
@@ -452,18 +506,19 @@ export async function sendMessageWithDetails(
   replyToMessageId?: number,
   threadId?: number
 ): Promise<SendMessageResult> {
-  return sendChunksWithDetails(token, chatId, text, replyToMessageId, threadId);
+  const r = await sendChunked(token, chatId, text, { replyToMessageId, threadId });
+  return { ok: r.ok, lastStatus: r.lastStatus, lastErrorText: r.lastErrorText };
 }
 
 /**
  * Like sendMessage but returns the message_id of the sent message (first chunk only).
  * Used when the caller needs to pin the message afterwards.
  *
- * NO MarkdownV2 -> plain-text fallback (unlike `sendMessage` / `sendMessageWithKeyboard`):
- * a parse-mode 400 here just fails. A new caller sending user- or worker-generated text
- * (not a fixed, known-safe template) must go through `sendMessage` or
- * `sendMessageWithKeyboard` instead, or port the fallback here first (bp-fix 2026-08-24 —
- * this exact gap cost two work packages a day earlier).
+ * Shares sendMessage's full safety net (2026-09-12 unification): chunking,
+ * MarkdownV2 -> plain-text fallback, 429/5xx backoff retry. Previously this sent a
+ * single unchunked, un-retried request — a long or malformed worker/thread-completion
+ * message silently failed instead of delivering (bp-fix 2026-08-24 first flagged the
+ * gap; closed by folding this into the shared `sendChunked` core).
  */
 export async function sendMessageWithId(
   token: string,
@@ -472,31 +527,7 @@ export async function sendMessageWithId(
   threadId?: number,
   replyMarkup?: InlineKeyboardMarkup
 ): Promise<number | null> {
-  const body: Record<string, unknown> = {
-    chat_id: chatId,
-    text: sanitizeMdV2(text.trim()),
-    parse_mode: 'MarkdownV2',
-  };
-  if (threadId !== undefined && threadId !== null && threadId !== 0) body.message_thread_id = threadId;
-  if (replyMarkup !== undefined) body.reply_markup = replyMarkup;
-
-  try {
-    const res = await telegramFetch(`${BASE}/bot${token}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(30_000),
-    });
-    if (!res.ok) {
-      console.error(`sendMessageWithId failed: ${res.status} ${await safeResponseText(res)}`);
-      return null;
-    }
-    const data = await res.json().catch(() => null) as { ok?: boolean; result?: { message_id: number } } | null;
-    return data?.ok ? (data.result?.message_id ?? null) : null;
-  } catch (err) {
-    console.error('sendMessageWithId network error:', err);
-    return null;
-  }
+  return (await sendChunked(token, chatId, text, { threadId, keyboard: replyMarkup })).messageId;
 }
 
 export async function editMessageText(
@@ -801,6 +832,10 @@ export interface InlineKeyboardMarkup {
  * Same contract as `sendMessageWithKeyboard`, plus `terminalError`: true only
  * when at least one chunk failed AND every failed chunk's final failure was a
  * 400 "chat not found" (AI-186) — a send that can never succeed on retry.
+ *
+ * Thin wrapper over the shared `sendChunked` core (2026-09-12 unification) —
+ * previously this had its own duplicate chunking/fallback loop with no
+ * 429/5xx backoff retry.
  */
 export async function sendMessageWithKeyboardDetailed(
   token: string,
@@ -810,104 +845,8 @@ export async function sendMessageWithKeyboardDetailed(
   replyToMessageId?: number,
   threadId?: number
 ): Promise<{ messageId: number | null; terminalError: boolean }> {
-  // 2026-08-24 (buttons program, P1f): the keyboard goes on the LAST chunk only
-  // (Telegram allows one keyboard per message; the press must land on the message
-  // the reader finishes on), and the return value is the FIRST chunk's message_id
-  // (null on any failure) — mirroring sendMessageWithId — so a caller can anchor
-  // `pending_action.message_id` / a later editMessageReplyMarkup on it.
-  const trimmed = text.trim();
-  if (!trimmed) return { messageId: null, terminalError: false };
-
-  const chunks = splitMessage(trimmed);
-  let firstMessageId: number | null = null;
-  let anyFailed = false;
-  let allFailuresChatNotFound = true;
-
-  for (let i = 0; i < chunks.length; i++) {
-    const body: Record<string, unknown> = {
-      chat_id: chatId,
-      text: sanitizeMdV2(chunks[i]),
-      parse_mode: 'MarkdownV2',
-    };
-    if (i === chunks.length - 1) body.reply_markup = keyboard;
-    if (threadId !== undefined && threadId !== null && threadId !== 0) body.message_thread_id = threadId;
-    let hasReplyTarget = false;
-    if (replyToMessageId) {
-      body.reply_to_message_id = replyToMessageId;
-      hasReplyTarget = true;
-      replyToMessageId = undefined; // Only reply on the first chunk
-    }
-
-    let parseModeStripped = false;
-    let replyTargetStripped = false;
-    let succeeded = false;
-    let chunkChatNotFound = false;
-
-    // At most 3 attempts per chunk: the initial send, plus at most one
-    // corrective retry for each of the two known causes (MarkdownV2 parse
-    // failure, reply-target message deleted). Same termination argument as
-    // sendMessage: each retry flips one `*Stripped` flag false->true and
-    // re-entry is gated on that flag, so this always terminates within 3
-    // attempts regardless of which cause Telegram reports first.
-    for (let phase = 0; phase < 3; phase++) {
-      try {
-        const res = await telegramFetch(`${BASE}/bot${token}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-          signal: AbortSignal.timeout(30_000),
-        });
-
-        if (res.ok) {
-          const data = await res.json().catch(() => null) as { ok?: boolean; result?: { message_id: number } } | null;
-          if (i === 0) firstMessageId = data?.ok ? (data.result?.message_id ?? null) : null;
-          succeeded = true;
-          break;
-        }
-
-        const errorText = await safeResponseText(res);
-
-        // If Markdown fails, retry as plain text (same as sendMessage/editMessageText),
-        // keeping reply_markup (already set on the last chunk's body) intact.
-        if (!parseModeStripped && res.status === 400 && errorText.includes('parse')) {
-          delete (body as any).parse_mode;
-          // Same ref-marker de-italicisation as sendMessage's fallback: without MdV2
-          // the surrounding underscores would render literally.
-          body.text = chunks[i].replace(/((?:\n\n)?)_Ref: ([a-z]+-[0-9a-f]{4,})_$/, '$1Ref: $2');
-          parseModeStripped = true;
-          continue;
-        }
-
-        // If the reply target message no longer exists (e.g. deleted right
-        // after send, as with /auth's delete-then-reply flow), retry once
-        // without reply_to_message_id instead of dead-lettering the send.
-        if (hasReplyTarget && !replyTargetStripped && isReplyTargetGoneError(res.status, errorText)) {
-          logger.warn('telegram', 'reply target message no longer exists — retrying without reply_to_message_id', {
-            chatId,
-            threadId,
-            error: errorText,
-          });
-          delete body.reply_to_message_id;
-          replyTargetStripped = true;
-          continue;
-        }
-
-        console.error(`sendMessageWithKeyboard failed: ${res.status} ${errorText} (chatId=${chatId}, threadId=${threadId})`);
-        if (isTerminalChatError(res.status, errorText)) chunkChatNotFound = true;
-        break;
-      } catch (err) {
-        console.error(`sendMessageWithKeyboard network error: (chatId=${chatId}, threadId=${threadId})`, err);
-        break;
-      }
-    }
-
-    if (!succeeded) {
-      anyFailed = true;
-      if (!chunkChatNotFound) allFailuresChatNotFound = false;
-    }
-  }
-
-  return { messageId: anyFailed ? null : firstMessageId, terminalError: anyFailed && allFailuresChatNotFound };
+  const r = await sendChunked(token, chatId, text, { replyToMessageId, threadId, keyboard });
+  return { messageId: r.messageId, terminalError: r.terminalError };
 }
 
 /**
@@ -923,6 +862,75 @@ export async function sendMessageWithKeyboard(
   threadId?: number
 ): Promise<number | null> {
   return (await sendMessageWithKeyboardDetailed(token, chatId, text, keyboard, replyToMessageId, threadId)).messageId;
+}
+
+/** Meaningful only when `ok === false` — the HTTP status/body of the last failed chunk. */
+export interface SendPlainMessageResult {
+  ok: boolean;
+  lastStatus?: number;
+  lastErrorText?: string;
+}
+
+/**
+ * The bot-side twin of pa's `sendToTelegram(text, config, token, false)` plain-text
+ * mode (auth broker Phase A, 2026-09-10 build spec §3.9, WP-F). `sendMessage` and
+ * `sendMessageWithKeyboard` unconditionally send `parse_mode: 'MarkdownV2'` with
+ * `sanitizeMdV2()` escaping — fine for prose, but a raw URL comes back
+ * backslash-escaped (`https\.example\.com/...\_id\=...`), non-tappable and
+ * unreadable, exactly the failure the 2026-08-15 OAuth-URL lesson (root
+ * `CLAUDE.md`) exists to prevent. This function sends the text UNCHANGED, with
+ * NO `parse_mode` key in the payload at all — Telegram's default "plain text"
+ * parsing, which still auto-links bare URLs. Use it whenever the text is, or
+ * might contain, a URL the reader must be able to tap or copy verbatim.
+ *
+ * Same `telegramFetch` path and chunking/retry discipline as `sendMessage`
+ * (`splitMessage`, `postSendMessageWithRetries`) — but no MarkdownV2-parse-failure
+ * corrective retry (there is no parse_mode to fail) and no `replyToMessageId`
+ * (this seam has no delete-then-reply precedent to protect). `redactSecrets`
+ * runs on the text here, at the point of egress — root `CLAUDE.md`'s "Secret
+ * egress is redacted by default" applies to every new egress path, and unlike
+ * `sendMessage` this one has no other transformation between caller-supplied
+ * text and the wire.
+ */
+export async function sendPlainMessage(
+  token: string,
+  chatId: number,
+  text: string,
+  threadId?: number,
+  replyMarkup?: InlineKeyboardMarkup
+): Promise<SendPlainMessageResult> {
+  const trimmed = (redactSecrets(text.trim()) as string);
+  if (!trimmed) return { ok: true };
+
+  const chunks = splitMessage(trimmed);
+  let allDelivered = true;
+  let lastStatus: number | undefined;
+  let lastErrorText: string | undefined;
+
+  for (let i = 0; i < chunks.length; i++) {
+    const body: Record<string, unknown> = {
+      chat_id: chatId,
+      text: chunks[i],
+    };
+    if (threadId !== undefined && threadId !== null && threadId !== 0) body.message_thread_id = threadId;
+    if (replyMarkup !== undefined && i === chunks.length - 1) body.reply_markup = replyMarkup;
+
+    const { res, timedOut } = await postSendMessageWithRetries(token, body, 'sendPlainMessage');
+
+    if (!res) {
+      if (!timedOut) allDelivered = false;
+      continue;
+    }
+    if (!res.ok) {
+      const errorText = await safeResponseText(res);
+      lastStatus = res.status;
+      lastErrorText = errorText;
+      console.error(`sendPlainMessage failed: ${res.status} ${errorText}`);
+      allDelivered = false;
+    }
+  }
+
+  return { ok: allDelivered, lastStatus, lastErrorText };
 }
 
 /**

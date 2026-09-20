@@ -8,8 +8,11 @@ One script, three subcommands:
       the public-path projection: ALLOW globs (R1 every PUBLIC row, R2 every
       public-tracked-boundary row even when SPLIT, R3 every uncovered SPLIT surface as
       `assumed: true` with a loud SPLIT-ASSUMED-PUBLIC warning on stderr), DENY globs
-      (exact-file PRIVATE surfaces only; dir/glob PRIVATE surfaces never deny). Written
-      atomically (tmp + os.replace). Success line:
+      (every PRIVATE row's surface, which must be exact-file — a directory or glob
+      PRIVATE surface can never produce a DENY and is refused at parse time with a
+      PlacementGateError naming the row; author it as an exact-file surface per path,
+      or record the row under a different verdict). Written atomically (tmp +
+      os.replace). Success line:
       PLACEMENT-PROJECTION OK rows=%d allow=%d deny=%d assumed=%d -> <out>
       With --gitignore: the registry's N3 feature cells (`L<lineno>:<exact gitignore
       line>`) are projected verbatim, in registry file order, under a fixed
@@ -62,6 +65,18 @@ parsers; the projection's registry_sha256 freshness check turns drift into exit 
 never silent mismatch; and check_completeness.py's A4 compares the N3 line-texts
 with the generated boundary's meaningful lines (content identity, no physical line
 numbers) — a schema or emission change must move both.
+
+Content coupling (found 2026-09-10, resolving the PRIVATE dir/glob refusal below):
+check_completeness.py's A9 also reads the surfaces cell of every PUBLIC/PRIVATE row
+directly against real `git ls-files` output, independent of this module. Rewriting a
+PRIVATE row's surface as prose (or its verdict to SPLIT) to satisfy derive()'s new
+exact-file-only rule removes that row from A9's leak check entirely — A9 skips SPLIT
+outright and silently no-ops on prose text, since neither matches a real path. This
+is an accepted, understood tradeoff for genuinely non-enumerable directory/glob
+catch-alls (the true enforcement for those is the boundary line itself, not a DENY
+glob), not a regression to chase — but a future schema/content change touching many
+PRIVATE rows at once should re-run check_completeness.py and expect its A9 coverage
+for those specific rows to have moved, not to still fire.
 
 Engineering rules: stdlib only; git spawns carry creationflags=CREATE_NO_WINDOW on
 win32; the registry path arrives only via --registry (this file is public-tracked and
@@ -288,6 +303,12 @@ def derive(rows):
                         "row %r (census %s, line %d): prose surface %r is not a repo "
                         "path" % (row.feature, row.census, row.lineno, s))
                 continue  # PRIVATE-row prose describes runtime state, not a path
+            if row.verdict == "PRIVATE" and not is_exact_file(s):
+                raise PlacementGateError(
+                    "row %r (census %s, line %d): PRIVATE surface %r is directory- or "
+                    "glob-grained and can never produce a DENY — use an exact-file "
+                    "surface per path, or a different verdict" % (row.feature, row.census,
+                                                                   row.lineno, s))
             entries.append((s, norm_surface(s)))
         parsed.append(entries)
 
@@ -318,7 +339,8 @@ def derive(rows):
                                          % (row.feature, norm))
             elif row.verdict == "PRIVATE":
                 # DENY is belt-and-suspenders under the boundary: exact files only.
-                # Dir/glob PRIVATE surfaces coexist with re-includes and never deny.
+                # A dir/glob PRIVATE surface can never reach here — the parse loop
+                # above already refused it, since it could never produce a DENY.
                 if is_exact_file(_raw):
                     proj.deny.append({"feature": row.feature, "census": row.census,
                                       "glob": norm})

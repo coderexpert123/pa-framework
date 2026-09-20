@@ -1,4 +1,5 @@
 import { spawn } from 'child_process';
+import { StringDecoder } from 'string_decoder';
 import { writeFile, unlink, mkdir } from 'fs/promises';
 import { createWriteStream } from 'fs';
 import { join } from 'path';
@@ -9,13 +10,19 @@ import { DEFAULT_TIMEOUT, DEFAULT_IDLE_TIMEOUT } from './types.js';
 import type { WorkerConfig, CommandResult, RunOptions } from './types.js';
 import { blackboard } from './blackboard.js';
 import { resolveStateDir, getLatestStateMtime, analyzeAgentState } from './state-monitor.js';
-import { hasChildProcesses, killProcessTree, getDescendantPids, getCommandLines, areProcessesAlive } from './process-tree.js';
+import { hasChildProcesses, killProcessTree, getDescendantPids, getCommandLines, areProcessesAlive, getProcessSnapshot, partitionVerifiedTreeMembers } from './process-tree.js';
+import type { ProcessRecord } from './process-tree.js';
 import { evaluateWorkerState } from './worker-evaluator.js';
 import { addWorkerPid, removeWorkerPid, updateWorkerPidDescendants, isProcessAlive } from './worker-pids.js';
 import { logger } from './lib/log.js';
+import { effectiveSlotCount, resolveCeiling } from './lib/dynamic-slots.js';
+import { recordRateLimit } from './rate-limits.js';
 import { notifyUser } from './lib/notify.js';
+import { release as releaseReservations } from './lib/reservations.js';
 import { getSkillTranslationPatterns } from './lib/skill-translations.js';
 import { appendUsage, extractUsageFromEvent, type UsageRecord } from './lib/usage-ledger.js';
+import { appendTelemetryRecord } from './lib/model-router/telemetry.js';
+import { loadConfig } from './config.js';
 import {
   TraceCollector,
   appendTurnTrace,
@@ -48,6 +55,40 @@ export function detectRawTelegramSends(commands: string[]): string[] {
       matches.push(c.slice(0, 200));
       if (matches.length >= 3) break;
     }
+  }
+  return matches;
+}
+
+/**
+ * Auth-prompt sentinel (auth broker Phase A, 2026-09-10 build spec §5 WP-G,
+ * decisions C6/D8): pure detector over a worker turn's raw stdout, looking
+ * for shapes a human has to act on by hand — an auth-looking URL, a
+ * device-style XXXX-XXXX code, or an "enter/paste the code" instruction —
+ * that the worker printed instead of raising a proper `pa auth request`.
+ * Deterministic, no I/O; returns at most 3 matching lines, each truncated to
+ * 200 chars. Accepted false-positive class (nudge-only, never blocking): a
+ * worker discussing auth prompts in prose without actually being stuck on
+ * one.
+ */
+export const AUTH_PROMPT_PATTERNS: readonly RegExp[] = [
+  /https?:\/\/\S*(?:oauth|authorize|device|login|verify)\S*/i,
+  /\b[A-Z0-9]{4}-[A-Z0-9]{4}\b/,
+  /\benter the code\b/i,
+  /\bpaste (?:the |this )?(?:code|token|url)\b/i,
+  /\bone-time code\b/i,
+];
+
+export function detectAuthPrompts(output: string): string[] {
+  const matches: string[] = [];
+  for (const line of output.split(/\r?\n/)) {
+    if (!line) continue;
+    for (const pattern of AUTH_PROMPT_PATTERNS) {
+      if (pattern.test(line)) {
+        matches.push(line.slice(0, 200));
+        break;
+      }
+    }
+    if (matches.length >= 3) break;
   }
   return matches;
 }
@@ -150,6 +191,40 @@ export function stripConfiguredArgs(args: string[], strip: string[] | undefined)
   return out;
 }
 
+/**
+ * Mtime-freshness window for the kill-decision shortcut (OD-5, 2026-09-18
+ * slow-machine RCA): a state file written inside the firing timer's silence
+ * window proves the worker is alive without consulting the judge. Fixed
+ * const, no env knob.
+ */
+export const EVALUATOR_MTIME_FRESH_MS = 60_000;
+
+/**
+ * Pure mtime-freshness predicate. False on null/non-Date/NaN; otherwise
+ * strict `nowMs - mtime < windowMs` — future mtimes read fresh (the safe
+ * direction: a clock-skewed fresh write must extend, never kill).
+ */
+export function isMtimeFresh(mtime: Date | null, nowMs: number, windowMs: number): boolean {
+  if (!(mtime instanceof Date) || Number.isNaN(mtime.getTime())) return false;
+  return nowMs - mtime.getTime() < windowMs;
+}
+
+/**
+ * Kill-decision freshness probe: true when the latest state file under
+ * `stateDir`/`statePattern` was written inside `windowMs`. False on null
+ * dir; getLatestStateMtime never throws (state-monitor catches to null),
+ * so a missing dir resolves to null → false.
+ */
+export async function isStateFreshForKillDecision(
+  stateDir: string | null,
+  statePattern: string,
+  nowMs: number,
+  windowMs: number,
+): Promise<boolean> {
+  if (!stateDir) return false;
+  return isMtimeFresh(await getLatestStateMtime(stateDir, statePattern), nowMs, windowMs);
+}
+
 // agy and agyc are the SAME binary (agy.exe via the gemini-shim) emitting the
 // SAME stream-json dialect — `event.event` as discriminator, response in
 // result events, text_delta on step_update. agyc only pins a non-Gemini-family
@@ -161,6 +236,113 @@ export function stripConfiguredArgs(args: string[], strip: string[] | undefined)
 function isAgyStreamWorker(worker: WorkerConfig): boolean {
   return worker.name === 'agy' || worker.name === 'agyc';
 }
+
+/**
+ * Consecutive agy `step_update` events with `step_type: 'error_message'` and
+ * no intervening event that produced usable output (a non-empty, non-
+ * whitespace `text_delta` on an `agent_response` step, or a `result` event
+ * carrying a real response) before a run is judged to be spinning rather than
+ * working and killed outright (2026-09-10 incident: an agy dispatch
+ * alternated `agent_response`/`error_message` steps — each `agent_response`
+ * carrying an empty `text_delta` — for 11+ minutes without ever exiting,
+ * holding the only worker slot and starving `pa catchup` for 38 minutes).
+ *
+ * Consecutive-`error_message` count alone is NOT a safe discriminator on its
+ * own — a run legitimately recovering from one bad tool call also emits an
+ * `error_message` step — so the counter resets on ANY usable output in
+ * between (narration-only text_deltas excluded via isNarrationOnly — an
+ * error/narration alternation still trips the counter); only an unbroken run
+ * of them with nothing getting through counts.
+ * N was 3 (the real production tee corpus for this account's prior
+ * quota-exhaustion episodes: every sampled occurrence of this exact
+ * empty-agent_response/error_message alternation, without exception, turned
+ * out to be the account's quota exhausted, and the shortest of those episodes
+ * had already reached 3 rounds before either recovering or giving up).
+ * Lowered to 2 (Oracle, 2026-09-17): waiting for a 3rd occurrence burned most
+ * of the run's time budget on a worker already shown to be looping — the 2nd
+ * consecutive `error_message` step is itself the stuck signal. The
+ * reset-on-usable-output guard is what keeps this from firing on a single
+ * self-healing blip, independent of N, so lowering N does not reopen that
+ * false-positive risk.
+ */
+const AGY_ERROR_LOOP_THRESHOLD = 2;
+
+const NARRATION_PATTERNS: readonly RegExp[] = [
+  /\bwaiting\b/i,
+  /\bstand\s?by\b/i,
+  /\bpolling\b/i,
+  /\bchecking\s+(back|on|status)\b[\s\p{P}\p{N}]*$/iu,
+  /\bstill\s+(running|going|working)\b/i,
+];
+
+/** Narration-only worker chatter (P8, 2026-09-18): "waiting for X" style turns that
+ *  describe waiting without delivering anything (the six text_deltas of the 668 s
+ *  incident). Conservative by construction: EVERY non-empty line must match, empty /
+ *  whitespace-only is NOT narration (that stays "no output", caught elsewhere), and a
+ *  single substantive line makes the whole delta usable. Misclassification escalates to
+ *  the liveness ladder (live child => extend, bounded by NO_PROGRESS_MAX_EXTENDS), never
+ *  to a summary kill. */
+export function isNarrationOnly(text: string): boolean {
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (lines.length === 0) return false;
+  return lines.every((l) => NARRATION_PATTERNS.some((p) => p.test(l)));
+}
+
+const DEFAULT_WORKER_FAULT_COOLDOWN_MS = 600_000; // 10 min
+
+// The fault cooldown is a "we saw it fail, stop asking for a while" reflex, not a
+// parsed provider limit. recordRateLimit takes MINUTES and drops anything <= 0, so
+// round UP to at least one minute or the cooldown is silently skipped.
+function workerFaultCooldownMinutes(): number {
+  const n = parseInt(process.env.PA_WORKER_FAULT_COOLDOWN_MS ?? '', 10);
+  const ms = Number.isFinite(n) && n > 0 ? n : DEFAULT_WORKER_FAULT_COOLDOWN_MS;
+  return Math.max(1, Math.round(ms / 60_000));
+}
+
+/**
+ * Wall-clock companion to the counter above: fires when a run has produced no
+ * *usable* output for this long, regardless of whether it is emitting
+ * error_message steps at all. The existing idle timer cannot catch this
+ * class — it resets on ANY stdout byte, and a spinning agy stream never
+ * stops emitting step_update JSON, so idle timeout keeps extending forever
+ * while genuinely no progress is made. Configurable (PA_AGY_NO_PROGRESS_TIMEOUT_MS,
+ * milliseconds) because "usable output" can legitimately be sparse on a long
+ * single-tool-call step; default sits well under the ~9-11 minute spins
+ * observed in production while giving real slow steps room to finish. Read at
+ * call time (like workerSlotCount() below) so tests can override the env var
+ * per-case.
+ *
+ * vi-2638f25056ba (2026-09-11): the fire is no longer a summary execution.
+ * A bare kill here discarded 5+ minutes of real work every time agy ran slow
+ * but alive on the starved D: HDD — 7 such kills in one day, each followed by
+ * a full failover re-run. The fire now goes through the same check-before-kill
+ * ladder the idle timer uses (state analyzer → evaluator → process tree) and
+ * kills outright only when that ladder finds no liveness signal or the
+ * NO_PROGRESS_MAX_EXTENDS cap below is exhausted. The error-loop counter above
+ * still kills its own signature in seconds, untouched. Narration-only
+ * text_deltas ("waiting for X" chatter, isNarrationOnly) do NOT count as
+ * usable output here — a run emitting nothing but that still trips this guard.
+ */
+function agyNoProgressTimeoutMs(): number {
+  const n = parseInt(process.env.PA_AGY_NO_PROGRESS_TIMEOUT_MS ?? '', 10);
+  return Number.isFinite(n) && n > 0 ? n : 5 * 60_000;
+}
+
+/**
+ * Consecutive no-progress fires answered with "extend" before the run is
+ * force-killed anyway. Every fire re-verifies liveness (evaluator verdict or
+ * a live subprocess tree), so reaching this cap means the run produced zero
+ * usable output for ~cap × the window (3 × 5 min default ≈ 15 min base,
+ * plus per-fire evaluator latency) with no evaluator willing to call it done.
+ * That is a deliberate loosening versus the old flat 5-minute kill: the
+ * 2026-09-10 spin class this does NOT cover — alternating empty
+ * agent_response / error_message steps — is still killed in seconds by the
+ * AGY_ERROR_LOOP_THRESHOLD counter above, independent of these timers, so
+ * the extra window is spent only on runs that are alive but silent (the
+ * starved-D: pattern). Tune PA_AGY_NO_PROGRESS_TIMEOUT_MS, not this cap,
+ * if the total feels too long.
+ */
+const NO_PROGRESS_MAX_EXTENDS = 3;
 
 async function writeTempPrompt(prompt: string): Promise<string> {
   const id = randomBytes(8).toString('hex');
@@ -190,6 +372,20 @@ export function selectKillTargets(
     if (alive(pid)) targets.push(pid);
   }
   return targets;
+}
+
+/** Test-only module-wide dep override for the orphan-sweep / kill-verification
+ *  seams (AI-328 — mirrors browser-launcher's _setBrowserLauncherDepsForTest).
+ *  _bgTaskHooks remains the per-dispatch injection surface; the sweep's
+ *  snapshot + kill calls need a module seam because tests must observe kills
+ *  without taskkilling real processes. Pass null to restore. */
+export interface OrphanSweepTestDeps {
+  getProcessSnapshot?: (fresh?: boolean) => Promise<Map<number, ProcessRecord>>;
+  killProcessTree?: (pid: number) => void;
+}
+let _sweepDeps: OrphanSweepTestDeps | null = null;
+export function _setOrphanSweepDepsForTest(deps: OrphanSweepTestDeps | null): void {
+  _sweepDeps = deps;
 }
 
 export async function executeWorker(
@@ -240,7 +436,8 @@ export async function executeWorker(
         // can exceed HEARTBEAT_STALE_MS, and a purged topic lock would let a
         // concurrent same-topic dispatch through.
         await blackboard.updateHeartbeat(resource, agentName, contextId).catch(err => logger.warn('worker-exec', 'heartbeat update failed during slot queue', { error: err?.message ?? String(err) }));
-      });
+      },
+      options.slotPriority ? { priority: options.slotPriority } : undefined);
   if (slotHandle === null) {
     await blackboard.releaseLock(resource, agentName, contextId);
     return {
@@ -251,6 +448,10 @@ export async function executeWorker(
       runId,
     };
   }
+
+  // Minted at function scope so the settle `finally` can release reservations
+  // tagged with it (see the dispatch-identity comment where mergedEnv is built).
+  const dispatchId = randomBytes(6).toString('hex');
 
   try {
     const idleTimeoutMs = Math.min((options.idleTimeout || DEFAULT_IDLE_TIMEOUT) * 1000, maxTimeoutMs);
@@ -298,7 +499,56 @@ export async function executeWorker(
     // shell metacharacters so they aren't word-split by cmd.exe / sh.
     args = args.map(quoteArg);
 
-    const mergedEnv = { ...process.env, ...(options.env || {}), PA_BOT_PID: String(process.pid) } as NodeJS.ProcessEnv;
+    // PA_WORKER_RESOURCE is the worker's own identity. For every dispatch
+    // that carries a resource — every topic and thread dispatch, and
+    // therefore every voice-inbox task — it is byte-identical to the `skill`
+    // key this dispatch registers in worker-pids (see addWorkerPid below,
+    // `options.resource || 'unknown'`), so a process holding it can record
+    // exactly the string that later identifies its process tree. When no
+    // resource is supplied the env is deliberately EMPTY rather than
+    // 'unknown': 'unknown' would be a killable-looking placeholder that
+    // could later match an unrelated worker's registry entry. Deliberately
+    // NOT the local `resource` const (which falls back to worker.name) and
+    // deliberately always present: spreading process.env first means an
+    // unset value would otherwise inherit a parent's.
+    //
+    // Dispatch identity (WP-5 D12). `resource` names a LANE; a bare topic
+    // resource is reused by every message in that topic, so a later kill that
+    // matched on the resource alone could hit a stranger. This id names THIS
+    // dispatch. Minted BEFORE the env is built and written onto the
+    // worker-pids entry AFTER the spawn, so the worker is HANDED its identity
+    // and never has to look one up — addWorkerPid runs after spawn and is not
+    // awaited, so a lookup would race, and its key would be the same reused
+    // `skill` string whose reuse is the problem. Declared at FUNCTION scope
+    // (below the slot acquisition, before this `try`): AI-255 B4's settle
+    // `finally` releases reservations by this id, and a `const` inside
+    // `try {}` is a sibling block — invisible to `finally`.
+    const mergedEnv = {
+      ...process.env,
+      ...(options.env || {}),
+      // Per-hop env hook (WS3 answer provenance, 2026-09-18): evaluated with
+      // THIS hop's WorkerConfig inside the per-candidate construction, so a
+      // failover hop stamps its own identity — and lands AFTER options.env,
+      // which runWithFailover replaces with the secret_allowlist-filtered
+      // subset (an allowlisted worker drops every non-allowlisted key, so
+      // framework-stamped env like PA_WORKER_CLI must ride this post-filter
+      // hook or it never reaches the child).
+      ...(options.getEnv?.(worker) ?? {}),
+      PA_BOT_PID: String(process.pid),
+      PA_WORKER_RESOURCE: options.resource ?? '',
+      PA_WORKER_DISPATCH_ID: dispatchId,
+    } as NodeJS.ProcessEnv;
+
+    // Lean evaluator spawn (C4, 2026-09-18 slow-machine RCA): drop the three
+    // browserSessionEnvOverlay pointer keys (Playwright CDP endpoint, browser
+    // CDP port, voice-inbox port) — the judge never drives a browser, so it
+    // must not inherit them. Secrets filtering is untouched (that stays the
+    // dispatcher's job). Const-object property delete — no reassignment.
+    if (options.isEvaluator) {
+      delete mergedEnv.PLAYWRIGHT_MCP_CDP_ENDPOINT;
+      delete mergedEnv.PA_BROWSER_CDP_PORT;
+      delete mergedEnv.VOICE_INBOX_PORT;
+    }
 
     // Tee stdout for all workers: for agy, the shim wraps agy with the tee
     // helper when AGY_TEE_OUT is set, capturing output to disk so the orphan
@@ -330,6 +580,7 @@ export async function executeWorker(
         resolved = true;
         clearTimeout(idleTimer);
         clearTimeout(maxTimer);
+        clearTimeout(noProgressTimer);
         clearInterval(heartbeatInterval);
         if (child.pid) {
           (pidTracked || Promise.resolve()).then(() => removeWorkerPid(child.pid!)).catch(err => logger.warn('worker-exec', 'removeWorkerPid failed on done', { error: err?.message ?? String(err) }));
@@ -348,6 +599,11 @@ export async function executeWorker(
         // for direct Telegram Bot API sends; attached to the result only when
         // non-empty (optional field — the bot alerts pa-support, never blocks).
         const rawSends = detectRawTelegramSends(h.commands);
+        // Auth-prompt sentinel (auth broker Phase A, 2026-09-10, C6/D8): scan
+        // this run's raw stdout for auth-shaped lines; attached to the result
+        // only when non-empty (optional field — the bot nudges once and never
+        // blocks the reply on it).
+        const authHits = detectAuthPrompts(r.output ?? '');
         void appendTurnTrace({
           v: 1,
           run_id: runId,
@@ -374,7 +630,7 @@ export async function executeWorker(
           bytes_out: Buffer.byteLength(r.output ?? '', 'utf8'),
           truncated: h.truncated,
         } satisfies TurnTraceV1);
-        resolve({ ...r, teePath: r.teePath ?? teePath, runId, ...(rawSends.length > 0 ? { rawTelegramSends: rawSends } : {}) });
+        resolve({ ...r, teePath: r.teePath ?? teePath, runId, ...(rawSends.length > 0 ? { rawTelegramSends: rawSends } : {}), ...(authHits.length > 0 ? { authPrompts: authHits } : {}) });
       };
 
       let stdout = '';
@@ -385,6 +641,11 @@ export async function executeWorker(
       let agyStreamError = ''; // captures error text from agy result events with status !== SUCCESS
       let agyResultSeen = false; // tracks whether an agy result event was parsed (for fallback logic)
       let capturedUsage: { tokensIn: number; tokensOut: number; tokensThinking?: number; tokensCacheRead?: number } | undefined; // tracks usage from stream events
+      // Error-loop / no-progress guard (2026-09-10 incident, agy/agyc only —
+      // see AGY_ERROR_LOOP_THRESHOLD / agyNoProgressTimeoutMs above).
+      let agyConsecutiveErrorSteps = 0; // resets on any usable output
+      let agyStepsSeen = 0; // total step_update events observed; heartbeat progress marker only
+      let lastUsableOutputAt = Date.now(); // wall-clock anchor for the no-progress guard
       const isStreamJson = worker.output_format === 'stream-json';
       const trace = new TraceCollector({ isAgyDialect: isAgyStreamWorker(worker) });
 
@@ -423,6 +684,7 @@ export async function executeWorker(
             spawnedBy: process.pid,
             worker: worker.name,
             skill: options.resource || 'unknown',
+            dispatchId,
             startedAt: new Date().toISOString(),
             ...(options.harvestWindowMs
               ? { harvestUntil: new Date(Date.now() + options.harvestWindowMs).toISOString() }
@@ -470,19 +732,54 @@ export async function executeWorker(
       // the worker-pids row unconditionally — /stop looked like it worked but
       // did nothing to the actual process.
       const killWorkerTree = (reason: string) => {
-        const targets = selectKillTargets(child.pid, [...bgTaskMap.keys()]);
+        void killWorkerTreeInner(reason).catch(err =>
+          logger.warn('worker-exec', 'killWorkerTree failed', { error: err?.message ?? String(err) }));
+      };
+      const killWorkerTreeInner = async (reason: string) => {
+        const candidates = selectKillTargets(child.pid, [...bgTaskMap.keys()]);
+        let targets = candidates;
+        // Stale-PPID verification (AI-328): bgTaskMap can contain phantoms —
+        // Windows ParentProcessId is immutable, so pid reuse mis-attributes
+        // foreign/system processes into the tree (observed: 211 "descendants"
+        // incl. svchost on a commit run). Verify before taskkill: a verified
+        // member was created during this run AND has no live ancestor outside
+        // the family. On snapshot failure/emptiness we cannot verify — kill
+        // candidates anyway: failing to kill a runaway worker is worse than
+        // the phantom risk (taskkill on SYSTEM services fails as non-admin).
+        if (candidates.length > 0) {
+          try {
+            const snapshot = await bgGetSnapshot(true);
+            if (snapshot.size > 0) {
+              const { verified, foreign } = partitionVerifiedTreeMembers(
+                candidates, child.pid, new Set(bgTaskMap.keys()), snapshot, tsStartMs - 5_000,
+              );
+              if (foreign.length > 0) {
+                logger.warn('worker-exec', 'killWorkerTree skipping non-family pids (stale-PPID mis-attribution)', {
+                  worker: worker.name, resource, pid: child.pid, foreign,
+                });
+              }
+              targets = verified;
+            }
+          } catch { /* snapshot unavailable → kill unverified (pre-AI-328 behavior) */ }
+        }
         const level = reason === 'evaluator-done' ? 'info' : 'warn';
         logger[level]('worker-exec', 'Killing worker tree', {
           worker: worker.name, resource, pid: child.pid, targets, tracked: bgTaskMap.size,
         });
         if (targets.length > 0) {
-          for (const pid of targets) killProcessTree(pid);
+          for (const pid of targets) bgKillTree(pid);
         } else if (!child.pid) {
           child.kill();
         }
       };
 
       const killWithMessage = (reason: string) => {
+        // S8: an agy fault guard fired. Remember it instead of re-probing on the
+        // next dispatch. Ordinary kills (idle, absolute timeout, evaluator-done)
+        // must NOT cool anything down, hence the prefix gate.
+        if (reason.startsWith('Killed: agy-error-loop') || reason.startsWith('Killed: agy-no-progress')) {
+          void recordRateLimit(worker.name, workerFaultCooldownMinutes(), '[error-loop] agy-error-loop');
+        }
         killWorkerTree(reason);
         done({
           success: false,
@@ -516,6 +813,31 @@ export async function executeWorker(
         });
       };
 
+      // Shared tail of every "the run looks alive, keep going" verdict in
+      // checkAndMaybeKill. The idle trigger keeps its original semantics:
+      // reset the idle timer, unbounded. The no-progress trigger (vi-2638f25056ba,
+      // 2026-09-11) counts its extensions and force-kills at
+      // NO_PROGRESS_MAX_EXTENDS — a run that keeps answering "alive" while
+      // producing nothing usable for ~cap × the window is a spin the
+      // error-loop counter cannot see, and unbounded extension would regress
+      // the 2026-09-10 slot-starvation protection. The kill reason keeps the
+      // greppable `agy-no-progress` marker.
+      let noProgressExtends = 0;
+      const extendAfterCheck = (trigger: 'idle' | 'no-progress', status: string): void => {
+        if (trigger === 'no-progress') {
+          noProgressExtends++;
+          if (noProgressExtends >= NO_PROGRESS_MAX_EXTENDS) {
+            const ageSec = Math.round((Date.now() - lastUsableOutputAt) / 1000);
+            killWithMessage(`Killed: agy-no-progress — no usable output for ${ageSec}s (${noProgressExtends} liveness extensions without progress; forcing termination)`);
+            return;
+          }
+          resetNoProgressTimer();
+        } else {
+          resetIdleTimer();
+        }
+        process.stdout.write(`\r  [check] ${worker.name}: ${status}    `);
+      };
+
       // --- Idle timeout with "check before kill" ---
       // When idle timer fires, don't kill immediately. First analyze the conversation
       // state to see if the agent is actually working (pending tool call, active thinking)
@@ -529,11 +851,33 @@ export async function executeWorker(
       // Track consecutive extend verdicts for the same stuck evaluation (P2-17)
       let consecutiveExtends = 0;
 
-      const checkAndMaybeKill = async () => {
-        if (resolved || evaluating) return;
+      const checkAndMaybeKill = async (trigger: 'idle' | 'no-progress' = 'idle') => {
+        if (resolved) return;
+        // An evaluation already in flight must not swallow a no-progress fire:
+        // the one-shot timer is consumed either way, so re-arm it — if the
+        // in-flight evaluation extends via extendAfterCheck it re-arms again,
+        // which is harmless (clearTimeout + fresh setTimeout).
+        if (evaluating) {
+          if (trigger === 'no-progress') resetNoProgressTimer();
+          return;
+        }
         evaluating = true;
 
         try {
+          // Mtime-freshness shortcut (2026-09-18 slow-machine RCA): a state
+          // file written inside the firing timer's silence window proves the
+          // worker is alive — extend without consulting the judge. The window
+          // is min(60s, firing timer's duration) so pre-spawn fixtures (older
+          // than their own timer by construction) always run the ladder below.
+          const freshWindowMs = Math.min(
+            EVALUATOR_MTIME_FRESH_MS,
+            trigger === 'no-progress' ? agyNoProgressTimeoutMs() : idleTimeoutMs,
+          );
+          if (await isStateFreshForKillDecision(stateDir, statePattern, Date.now(), freshWindowMs)) {
+            extendAfterCheck(trigger, 'state file updated inside the silence window — extending without judge...');
+            return;
+          }
+
           // Check 1: analyze conversation state file (high-signal heuristics)
           if (stateDir) {
             const state = await analyzeAgentState(stateDir, statePattern, worker.name);
@@ -570,22 +914,19 @@ export async function executeWorker(
                   killWithMessage(`Killed: ${consecutiveExtends} consecutive extend verdicts — forcing termination`);
                   return;
                 }
-                process.stdout.write(`\r  [check] ${worker.name}: evaluator extending (${consecutiveExtends}/3) — ${verdict.summary}    `);
-                resetIdleTimer();
+                extendAfterCheck(trigger, `evaluator extending (${consecutiveExtends}/3) — ${verdict.summary}`);
                 return;
               }
               // Evaluator unavailable/failed — fall through to heuristic result
               consecutiveExtends = 0;
               if (state.verdict === 'alive') {
-                process.stdout.write(`\r  [check] ${worker.name}: ${state.status} — extending (no evaluator)...    `);
-                resetIdleTimer();
+                extendAfterCheck(trigger, `${state.status} — extending (no evaluator)...`);
                 return;
               }
             } else if (state.verdict === 'alive') {
               // This IS the evaluator — use heuristic only, no recursion
               consecutiveExtends = 0;
-              process.stdout.write(`\r  [check] ${worker.name}: ${state.status} — extending...    `);
-              resetIdleTimer();
+              extendAfterCheck(trigger, `${state.status} — extending...`);
               return;
             }
           }
@@ -595,8 +936,7 @@ export async function executeWorker(
           // fresh:true — this is a kill/extend DECISION: a ≤300ms-stale cached snapshot can
           // list a just-exited child as present and wrongly extend instead of killing (2026-08-31).
           if (child.pid && await hasChildProcesses(child.pid, true, undefined, true)) {
-            process.stdout.write(`\r  [check] ${worker.name}: subprocess still running, extending...    `);
-            resetIdleTimer();
+            extendAfterCheck(trigger, 'subprocess still running, extending...');
             return;
           }
         } catch {
@@ -605,8 +945,16 @@ export async function executeWorker(
           evaluating = false;
         }
 
-        // No signal either way — kill
-        killWithMessage(`Killed: no activity for ${idleTimeoutMs / 1000}s (idle timeout)`);
+        // No signal either way — kill. The no-progress trigger keeps its
+        // greppable marker here too: a spin with no state file and no live
+        // tool process must still show up as agy-no-progress in the logs
+        // (vi-2638f25056ba, 2026-09-11).
+        if (trigger === 'no-progress') {
+          const ageSec = Math.round((Date.now() - lastUsableOutputAt) / 1000);
+          killWithMessage(`Killed: agy-no-progress — no usable output for ${ageSec}s (no liveness signal from state or process tree)`);
+        } else {
+          killWithMessage(`Killed: no activity for ${idleTimeoutMs / 1000}s (idle timeout)`);
+        }
       };
 
       let idleTimer = setTimeout(checkAndMaybeKill, idleTimeoutMs);
@@ -620,6 +968,18 @@ export async function executeWorker(
         idleTimer = setTimeout(checkAndMaybeKill, idleTimeoutMs);
       };
 
+      // 2026-09-10 incident: "[heartbeat] <worker>: subprocess running" reports
+      // LIVENESS, not progress — a spinning agy stream keeps producing stdout
+      // bytes forever, so this line alone made an 11-minute error loop look
+      // identical to a healthy long-running task. Adds a progress marker for
+      // the agy/agyc dialect only (steps seen, age of the last USABLE output);
+      // unchanged for every other worker.
+      const agyProgressMarker = (): string => {
+        if (!isAgyStreamWorker(worker)) return 'subprocess running';
+        const ageSec = Math.round((Date.now() - lastUsableOutputAt) / 1000);
+        return `subprocess running (agy steps seen=${agyStepsSeen}, last-usable-output=${ageSec}s ago)`;
+      };
+
       // BG-task tracking state
       const bgCfg = options.bgTasksConfig ?? { alert_seconds: 300, alert_repeat_seconds: 1800 };
       const bgAlertMs = bgCfg.alert_seconds * 1000;
@@ -629,12 +989,39 @@ export async function executeWorker(
       const bgGetCmdlines = bgHooks.getCommandLines ?? getCommandLines;
       const bgAreAlive = bgHooks.areProcessesAlive ?? areProcessesAlive;
       const bgNotify = bgHooks.notifyUser ?? notifyUser;
+      const bgGetSnapshot = _sweepDeps?.getProcessSnapshot ?? ((fresh?: boolean) => getProcessSnapshot(undefined, fresh));
+      const bgKillTree = _sweepDeps?.killProcessTree ?? killProcessTree;
       const heartbeatMs = bgHooks.heartbeatIntervalMs ?? 30_000;
       const startedAt = Date.now();
 
       // Periodic heartbeat: checks process tree AND state file mtime
+      // Re-entrancy guard (2026-09-12, 4th storm variant): under WMI pressure a
+      // tick's async body (snapshot query + BFS) can outlast the interval
+      // period. Without this guard, ticks stack and each stacked tick spawns
+      // its own snapshot query, compounding the very storm the timed/cached
+      // exec in process-tree.ts was meant to bound. tickInFlight is scoped to
+      // this one worker's heartbeat (this whole block runs per executeWorker
+      // invocation, not globally).
+      let tickInFlight = false;
+      let consecutiveSkippedTicks = 0;
+      let warnedStuckHeartbeatTick = false;
       const heartbeatInterval = setInterval(() => {
         if (resolved || !child.pid) return;
+
+        if (tickInFlight) {
+          consecutiveSkippedTicks++;
+          if (consecutiveSkippedTicks >= 3 && !warnedStuckHeartbeatTick) {
+            warnedStuckHeartbeatTick = true;
+            logger.info('worker-exec', 'heartbeat tick skipped — previous tick still in flight', {
+              worker: worker.name,
+              pid: child.pid,
+              resource,
+              consecutiveSkippedTicks,
+            });
+          }
+          return;
+        }
+        tickInFlight = true;
 
         (async () => {
           if (resolved) return; // guard: done() may have fired while we were awaiting
@@ -647,8 +1034,27 @@ export async function executeWorker(
             }
 
             // BG-task tracking: one OS query → BFS in memory
-            const descendants = await bgGetDescendants(child.pid!);
+            const rawDescendants = await bgGetDescendants(child.pid!);
             if (resolved) return; // guard: worker may have exited while querying OS
+            // Stale-PPID guard (AI-328): Windows ParentProcessId is set at spawn
+            // and never updated — a dead ancestor's pid can be reused by an
+            // unrelated process, and BFS then pulls phantoms into the tree
+            // (observed: 211 "descendants" incl. svchost/WUDFHost/fontdrvhost).
+            // A process created BEFORE this run cannot be its descendant —
+            // drop it here so bgTaskMap, bg-leak and the persisted reaper list
+            // stay honest. The snapshot query coalesces with the one
+            // getDescendantPids just issued (300ms TTL) → ~free.
+            let descendants = rawDescendants;
+            try {
+              const snap = await bgGetSnapshot();
+              if (snap.size > 0) {
+                descendants = rawDescendants.filter(d => {
+                  const rec = snap.get(d.pid);
+                  return rec?.createdMs === undefined || rec.createdMs >= tsStartMs - 5_000;
+                });
+              }
+            } catch { /* snapshot unavailable → keep raw list (pre-AI-328 behavior) */ }
+            if (resolved) return;
             // Persist the live worker tree so the orphan reaper can check liveness
             // even after the shell wrapper (child.pid) dies with a crashed spawner.
             updateWorkerPidDescendants(child.pid!, descendants.map(d => d.pid)).catch(err => logger.warn('worker-exec', 'updateWorkerPidDescendants failed', { error: err?.message ?? String(err) }));
@@ -697,7 +1103,7 @@ export async function executeWorker(
             // Check 1: process tree (idle-timer reset) — fresh read: kill/extend decision (2026-08-31)
             const hasChildren = await hasChildProcesses(child.pid!, true, undefined, true);
             if (hasChildren) {
-              resetIdleTimer('subprocess running');
+              resetIdleTimer(agyProgressMarker());
               return;
             }
 
@@ -714,7 +1120,15 @@ export async function executeWorker(
           } catch {
             // Heartbeat check failed — don't crash, just let idle timer continue
           }
-        })();
+        })().finally(() => {
+          // Reset regardless of which path the tick exited through — including
+          // the `if (resolved) return;` guard above, which runs BEFORE the
+          // try/catch. An internal try/finally would miss that early-return
+          // path and leave tickInFlight stuck true forever.
+          tickInFlight = false;
+          consecutiveSkippedTicks = 0;
+          warnedStuckHeartbeatTick = false;
+        });
       }, heartbeatMs);
 
       // Hard max timeout: absolute safety net with "check before kill" escalation
@@ -761,9 +1175,42 @@ export async function executeWorker(
       // discarding all intermediate planning narration from multi-step tool use.
       let lastToolBoundary = 0;
 
+      // Wall-clock no-progress guard (agy/agyc only, see agyNoProgressTimeoutMs
+      // above): reset whenever usable output arrives; fires when none has for
+      // that long, even if the stream keeps emitting bytes (which is exactly
+      // what a spinning agy run does, and why the plain idle timer never
+      // catches it — see AGY_ERROR_LOOP_THRESHOLD's comment for the incident).
+      // vi-2638f25056ba (2026-09-11): the fire escalates through
+      // checkAndMaybeKill (state analyzer → evaluator → process tree) instead
+      // of killing outright — a run that is merely slow on the starved D: HDD
+      // gets extended (bounded by NO_PROGRESS_MAX_EXTENDS) instead of having
+      // minutes of real work discarded; the kill-reason `agy-no-progress`
+      // marker now only appears when the ladder finds no liveness or the cap
+      // is exhausted.
+      let noProgressTimer: NodeJS.Timeout | undefined;
+      const resetNoProgressTimer = () => {
+        if (!isAgyStreamWorker(worker) || resolved) return;
+        clearTimeout(noProgressTimer);
+        noProgressTimer = setTimeout(() => {
+          void checkAndMaybeKill('no-progress');
+        }, agyNoProgressTimeoutMs());
+      };
+      resetNoProgressTimer();
+
+      // UTF-8 decoders that survive pipe-chunk boundaries (ai246 WP-E,
+      // 2026-09-15): data.toString() decodes each chunk on its own, so a
+      // multi-byte char split across two OS reads (an em-dash inside a
+      // PA_META envelope was the live casualty — U+FFFD fragments broke
+      // JSON.parse and silently dropped spawn_thread actions) corrupts at
+      // every boundary. StringDecoder holds the trailing partial sequence
+      // until the rest arrives; the close handler flushes any remainder.
+      // The tee still writes the raw Buffer — byte-exact, unaffected.
+      const stdoutDecoder = new StringDecoder('utf8');
+      const stderrDecoder = new StringDecoder('utf8');
+
       child.stdout?.on('data', (data: Buffer) => {
         if (teeWriteStream) teeWriteStream.write(data);
-        const chunk = data.toString();
+        const chunk = stdoutDecoder.write(data);
         if (isStreamJson) {
           // Buffer chunks and process complete lines only
           ndjsonBuffer += chunk;
@@ -852,13 +1299,50 @@ export async function executeWorker(
                   if (typeof event.result.response === 'string') {
                     stdout = event.result.response;
                   }
-                  if (event.result.status && event.result.status !== 'SUCCESS' && typeof event.result.response === 'string') {
-                    agyStreamError += (agyStreamError ? '\n' : '') + event.result.response;
+                  // 2026-09-10 fix: the quota-exhaustion phrase (and any other
+                  // terminal-fault text) lives on `.error`, NOT `.response` — a
+                  // real "Individual quota reached..." result event carries
+                  // status:"ERROR", response:"" (or unrelated narration text)
+                  // and the actual message on `.error`. Reading only `.response`
+                  // silently dropped the phrase before it ever reached the
+                  // rate-limit classifier (verified against real production agy
+                  // result events — every sampled quota-exhaustion terminal
+                  // event had status:"ERROR" with the quota text exclusively on
+                  // `.error`). Fall back to `.response` when `.error` is absent
+                  // so the pre-existing (synthetic) shape keeps working.
+                  if (event.result.status && event.result.status !== 'SUCCESS') {
+                    const errText = typeof event.result.error === 'string' && event.result.error
+                      ? event.result.error
+                      : (typeof event.result.response === 'string' ? event.result.response : '');
+                    if (errText) agyStreamError += (agyStreamError ? '\n' : '') + errText;
+                  } else if (typeof event.result.response === 'string' && event.result.response.trim()) {
+                    lastUsableOutputAt = Date.now();
+                    resetNoProgressTimer();
                   }
                 }
-                // step_update: accumulate text_delta as fallback (used if no result event)
-                if (event.event === 'step_update' && event.step_update?.text_delta && !agyResultSeen) {
-                  stdout += event.step_update.text_delta;
+                // step_update: track error-loop/no-progress state (see
+                // AGY_ERROR_LOOP_THRESHOLD/agyNoProgressTimeoutMs above) and
+                // accumulate text_delta as fallback (used if no result event).
+                if (event.event === 'step_update') {
+                  agyStepsSeen++;
+                  const su = event.step_update;
+                  const usableText = typeof su?.text_delta === 'string' && su.text_delta.trim().length > 0 && !isNarrationOnly(su.text_delta);
+                  if (su?.step_type === 'error_message') {
+                    agyConsecutiveErrorSteps++;
+                  } else if (usableText) {
+                    agyConsecutiveErrorSteps = 0;
+                  }
+                  if (usableText) {
+                    lastUsableOutputAt = Date.now();
+                    resetNoProgressTimer();
+                  }
+                  if (su?.text_delta && !agyResultSeen) {
+                    stdout += su.text_delta;
+                  }
+                  if (!resolved && agyConsecutiveErrorSteps >= AGY_ERROR_LOOP_THRESHOLD) {
+                    killWithMessage(`Killed: agy-error-loop after ${agyConsecutiveErrorSteps} consecutive error_message steps — no usable output (worker: ${worker.name})`);
+                    return;
+                  }
                 }
 
                 // Extract usage from agy events
@@ -876,7 +1360,7 @@ export async function executeWorker(
       });
 
       child.stderr?.on('data', (data: Buffer) => {
-        stderr += data.toString();
+        stderr += stderrDecoder.write(data);
         resetIdleTimer();
       });
 
@@ -897,6 +1381,16 @@ export async function executeWorker(
       });
 
       child.on('close', (code: number | null) => {
+        // Flush the decoders first — a multi-byte char split across the final
+        // chunk boundary is still buffered inside them (see the StringDecoder
+        // comment at the stdout handler).
+        const stdoutTail = stdoutDecoder.end();
+        const stderrTail = stderrDecoder.end();
+        if (stderrTail) stderr += stderrTail;
+        if (stdoutTail) {
+          if (isStreamJson) ndjsonBuffer += stdoutTail;
+          else stdout += stdoutTail;
+        }
         // Flush any remaining NDJSON buffer content
         if (isStreamJson && ndjsonBuffer.trim()) {
           try {
@@ -954,8 +1448,12 @@ export async function executeWorker(
                 if (typeof event.result.response === 'string') {
                   stdout = event.result.response;
                 }
-                if (event.result.status && event.result.status !== 'SUCCESS' && typeof event.result.response === 'string') {
-                  agyStreamError += (agyStreamError ? '\n' : '') + event.result.response;
+                // Same `.error`-preferring fix as the live stdout handler above.
+                if (event.result.status && event.result.status !== 'SUCCESS') {
+                  const errText = typeof event.result.error === 'string' && event.result.error
+                    ? event.result.error
+                    : (typeof event.result.response === 'string' ? event.result.response : '');
+                  if (errText) agyStreamError += (agyStreamError ? '\n' : '') + errText;
                 }
               }
               if (event.event === 'step_update' && event.step_update?.text_delta && !agyResultSeen) {
@@ -1045,20 +1543,87 @@ export async function executeWorker(
           appendUsage(usageRecord).catch(err => logger.warn('worker-exec', 'Failed to append usage record', { error: err?.message ?? String(err) }));
         }
 
-        // Post-exit orphan sweep: fire-and-forget, does not block the result
+        // Model-router telemetry (WP-G, plans/2026-09-18-model-router-SPEC.md §8.2):
+        // ONE line per SUCCESSFUL stream-json dispatch while a model_router block
+        // exists — token usage + latency for shadow disagreement joins. Fire-and-
+        // forget, never alters the exit path, no turn text in the record.
+        if (code === 0 && isStreamJson) {
+          const telemModel = trace.model;
+          const telemDurationMs = Date.now() - tsStartMs;
+          const telemInput = capturedUsage?.tokensIn;
+          const telemOutput = capturedUsage?.tokensOut;
+          void (async () => {
+            try {
+              const cfg = await loadConfig();
+              if (!cfg?.model_router) return;
+              await appendTelemetryRecord({
+                at: new Date().toISOString(),
+                worker: worker.name,
+                ...(telemModel !== undefined ? { model: telemModel } : {}),
+                durationMs: telemDurationMs,
+                ...(telemInput !== undefined ? { inputTokens: telemInput } : {}),
+                ...(telemOutput !== undefined ? { outputTokens: telemOutput } : {}),
+              });
+            } catch {
+              // best-effort — never alters the exit path
+            }
+          })();
+        }
+
+        // Post-exit orphan sweep: fire-and-forget, does not block the result.
+        // AI-328: verified survivors are REAPED, not just alerted on — done()
+        // already removed the worker-pids registry entry, so the periodic
+        // cleanupOrphanedWorkers reaper never learns about them; without the
+        // kill here they persist (the bg-orphan alerts this produced were the
+        // symptom). partitionVerifiedTreeMembers strips stale-PPID phantoms
+        // and pid-reuse victims from the kill set — a survivor whose live
+        // ancestry or creation time doesn't belong to this run's family is
+        // skipped and only logged, never taskkilled.
         if (bgTaskMap.size > 0 && child.pid) {
           const workerPid = child.pid;
           const tracked = Array.from(bgTaskMap.keys());
-          bgAreAlive(tracked).then(alive => {
+          bgAreAlive(tracked).then(async alive => {
             const orphans = tracked.filter(pid => alive.get(pid));
-            if (orphans.length > 0) {
-              const lines = orphans.map(pid => {
-                const entry = bgTaskMap.get(pid);
-                return `  PID ${pid}: ${entry?.cmdline ?? '(unknown)'}`;
+            if (orphans.length === 0) return;
+            // verified: partitioned OK → reaped. unverifiable: snapshot
+            // missing/failed → never killed, but still alert-worthy (the
+            // pre-AI-328 alert-only contract survives as the degraded path).
+            let reaped: number[] = [];
+            let foreign: number[] = [];
+            let unverifiable = false;
+            try {
+              const snapshot = await bgGetSnapshot(true);
+              if (snapshot.size > 0) {
+                const part = partitionVerifiedTreeMembers(
+                  orphans, workerPid, tracked, snapshot, tsStartMs - 5_000,
+                );
+                reaped = part.verified;
+                foreign = part.foreign;
+              } else {
+                unverifiable = true;
+              }
+            } catch { unverifiable = true; }
+            for (const pid of reaped) bgKillTree(pid);
+            if (foreign.length > 0) {
+              logger.info('worker-exec', 'orphan sweep skipped non-family survivors', {
+                worker: worker.name, resource, pid: workerPid, skipped: foreign,
               });
-              const body = `Worker: ${worker.name} (pid ${workerPid}) exited with ${orphans.length} descendant(s) still running:\n${lines.join('\n')}`;
+            }
+            // Alert on what was ours (reaped) or what we cannot rule out
+            // (unverifiable). foreign-only survivors are not this worker's
+            // mess — log-only above, no page.
+            const reported = unverifiable ? orphans : reaped;
+            if (reported.length > 0) {
+              const tag = (pid: number) => reaped.includes(pid) ? 'reaped'
+                : foreign.includes(pid) ? 'skipped: not verified as this worker\'s descendant'
+                : 'unverifiable: no snapshot — left running';
+              const lines = reported.map(pid => {
+                const entry = bgTaskMap.get(pid);
+                return `  PID ${pid} (${tag(pid)}): ${entry?.cmdline ?? '(unknown)'}`;
+              });
+              const body = `Worker: ${worker.name} (pid ${workerPid}) exited with ${orphans.length} descendant(s) still running — reaped ${reaped.length}, skipped ${foreign.length} non-family${unverifiable ? ', snapshot unavailable — nothing killed' : ''}:\n${lines.join('\n')}`;
               bgNotify(
-                `bg-orphan: ${orphans.length} orphaned descendant(s) of ${worker.name}`,
+                `bg-orphan: ${reported.length} orphaned descendant(s) of ${worker.name}`,
                 body.slice(0, 3500),
                 { dedupKey: `bg-orphan-${startedAt}-${workerPid}` },
               ).catch(err => logger.warn('worker-exec', 'bgNotify failed for bg-orphan alert', { error: err?.message ?? String(err) }));
@@ -1074,6 +1639,15 @@ export async function executeWorker(
 
     return result;
   } finally {
+    // AI-255 B4: reservations a dispatched worker claimed (they carry
+    // PA_WORKER_DISPATCH_ID via `pa claim`'s auto-fill) release on dispatch
+    // settlement — claims must not outlive the work they guarded. Awaited
+    // but .catch-swallowed: a ~10ms store write that can't fail the result,
+    // and a fire-and-forget write would race callers tearing down PA_HOME.
+    await releaseReservations({ dispatchId }).catch((err) =>
+      logger.warn('worker-exec', 'reservation release by dispatchId failed', {
+        dispatchId, error: err?.message ?? String(err),
+      }));
     await blackboard.releaseLock(resource, agentName, contextId);
     if (slotHandle !== 'disabled') {
       await blackboard.releaseLock(slotHandle.slot, agentName, slotHandle.ctx).catch(err => logger.warn('worker-exec', 'releaseLock failed for slot', { error: err?.message ?? String(err) }));
@@ -1086,10 +1660,12 @@ export async function executeWorker(
 // ---------------------------------------------------------------------------
 
 const SLOT_RETRY_MS = 5_000;
+const ROUTING_SLOT_RETRY_MS = 250;
 
 export function workerSlotCount(): number {
-  const n = parseInt(process.env.PA_MAX_CONCURRENT_WORKERS ?? '3', 10);
-  return Number.isFinite(n) ? n : 3;
+  const { ceiling, origin } = resolveCeiling();
+  if (ceiling <= 0) return ceiling;
+  return effectiveSlotCount(ceiling, origin);
 }
 
 export interface WorkerSlotHandle { slot: string; ctx: string }
@@ -1099,7 +1675,10 @@ export interface WorkerSlotHandle { slot: string; ctx: string }
  * Returns 'disabled' when PA_MAX_CONCURRENT_WORKERS <= 0 (no limiting), a
  * handle when a slot was acquired, or null when maxWaitMs elapsed with every
  * slot busy. Each acquisition uses a fresh contextId so same-PID concurrent
- * spawns (the bot) still exclude each other.
+ * spawns (the bot) still exclude each other. opts.priority === 'routing' waits
+ * at the 250ms cadence instead of the 5s normal one — for short-lived routing
+ * dispatches only. The slot-scan bound re-reads the EFFECTIVE slot count at the
+ * top of every pass, so a queue that outlives a cap change adopts it next pass.
  */
 export async function acquireWorkerSlot(
   agent: string,
@@ -1107,12 +1686,16 @@ export async function acquireWorkerSlot(
   bb: Pick<typeof blackboard, 'acquireLock'> = blackboard,
   sleepFn: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
   onRetry?: () => Promise<void>,
+  opts?: { priority?: 'routing' | 'normal' },
 ): Promise<WorkerSlotHandle | 'disabled' | null> {
-  const n = workerSlotCount();
-  if (n <= 0) return 'disabled';
+  // Hoisted disabled check: a cap <= 0 never enters the dynamic path. With
+  // ceiling > 0 the dynamic effective is always >= 1, so it can never regress
+  // to disabled mid-wait — the loop re-reads the effective count per pass.
+  if (workerSlotCount() <= 0) return 'disabled';
   const ctx = randomUUID();
   const start = Date.now();
   do {
+    const n = workerSlotCount();
     for (let i = 0; i < n; i++) {
       const slot = `worker-slot-${i}`;
       // timeoutMs=50 → effectively a single acquisition attempt per slot (the
@@ -1121,7 +1704,7 @@ export async function acquireWorkerSlot(
       if (await bb.acquireLock(slot, agent, process.pid, 50, ctx)) return { slot, ctx };
     }
     if (onRetry) await onRetry();
-    await sleepFn(SLOT_RETRY_MS);
+    await sleepFn(opts?.priority === 'routing' ? ROUTING_SLOT_RETRY_MS : SLOT_RETRY_MS);
   } while (Date.now() - start < maxWaitMs);
   return null;
 }

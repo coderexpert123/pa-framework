@@ -3,7 +3,8 @@ import { join } from 'path';
 import { log } from '../log.js';
 import { notifyUser } from '../notify.js';
 import { validateRegistry } from './policy.js';
-import { readLedger, updateJobState, migrateLastLearnState } from './state.js';
+import { readLedger, updateJobState, updateJobsState, migrateLastLearnState } from './state.js';
+import type { MaintenanceJobState } from './state.js';
 import type {
   JobOutcome,
   JobRunRecord,
@@ -115,6 +116,20 @@ export interface RunDueJobsOptions {
   force?: boolean;                  // set by `pa maintenance run` — see decideJob
   /** Injectable for tests; defaults to lib/notify.js's notifyUser. */
   notify?: NotifyFn;
+  /** Opt-in (2026-09-11, S8): when true, due jobs on this pass are STARTED
+   *  without being awaited — each returns a 'started' JobRunRecord immediately
+   *  and its real terminal outcome is written to the ledger by a detached
+   *  completion handler. Default false so every existing awaited caller
+   *  (including `pa maintenance run`, which reads records[0] synchronously) is
+   *  unaffected. pa-host only: the bot's own maintenance-jobs.ts documents its
+   *  dlq queue chain as order-load-bearing and must stay serial, so its call
+   *  site never sets this. */
+  parallel?: boolean;
+  /** Called synchronously once per target job, right after its run-or-skip
+   *  decision and before any await for that job (catchup-lane-wedge wave,
+   *  2026-09-16): the catchup loop's maintenance lane stamps its lane progress
+   *  file here. A throwing callback is ignored. */
+  onJobDecision?: (jobName: string, action: 'run' | 'skip') => void;
 }
 
 // Floored at 15 min: for a 60s job (model-override-sweep) the old bare 3x was
@@ -155,9 +170,101 @@ async function maybePageSkippedTooLong(
 }
 
 /**
- * Runs every due job for `host`, SEQUENTIALLY (D: is a 5400rpm HDD; parallel
- * fs sweeps starve each other). Never throws: a job that throws is recorded
- * as `failed` and the remaining jobs still run.
+ * Executes one job's `run()` to completion: ledger write (success or
+ * failure), the touched-item log line, the failure notify, and the
+ * IN_FLIGHT release — the entire "the job actually ran" body, unchanged
+ * from the pre-S8 shape below. A serial pass awaits this inline; a
+ * parallel pass (S8, 2026-09-11) starts it and lets it settle in the
+ * background, so the completion handling here is what performs the REAL
+ * terminal ledger write no matter which mode dispatched it.
+ */
+async function runJobToCompletion(
+  job: MaintenanceJob,
+  host: MaintenanceHost,
+  now: number,
+  everyMs: number,
+  notify: NotifyFn,
+): Promise<JobRunRecord> {
+  const t0 = Date.now();
+  try {
+    const result = await job.run({ now, everyMs });
+    const nowIso = new Date(now).toISOString();
+
+    await updateJobState(job.name, (prev) => ({
+      ...prev,
+      lastRunAt: nowIso,
+      lastAttemptAt: nowIso,
+      lastOutcome: 'ran' as JobOutcome,
+      lastTouched: result.touched,
+      consecutiveFailures: 0,
+      consecutiveSkips: 0,
+      lastError: undefined,
+      // A run resets the "first skip after a run" clock so the next skip
+      // (even with the same reason as before this run) is logged once.
+      lastLoggedSkipReason: undefined,
+    }), now);
+
+    if (result.touched > 0) {
+      log('info', 'maintenance', `${job.name}: ${result.touched} item(s)`, {
+        job: job.name,
+        host,
+        touched: result.touched,
+        durationMs: Date.now() - t0,
+        ...result.detail,
+      });
+    }
+
+    return {
+      name: job.name,
+      outcome: 'ran',
+      touched: result.touched,
+      durationMs: Date.now() - t0,
+      ...(result.detail ? { detail: result.detail } : {}),
+    };
+  } catch (err: any) {
+    const errorMessage = err?.message ?? String(err);
+    const persisted = await updateJobState(job.name, (prev) => ({
+      ...prev,
+      lastAttemptAt: new Date(now).toISOString(),
+      lastOutcome: 'failed' as JobOutcome,
+      lastError: errorMessage,
+      consecutiveFailures: prev.consecutiveFailures + 1,
+    }), now);
+
+    log('error', 'maintenance', `${job.name} failed`, {
+      job: job.name,
+      host,
+      error: errorMessage,
+      consecutiveFailures: persisted.consecutiveFailures,
+    });
+
+    await notify(`Maintenance job failed: ${job.name}`, errorMessage, {
+      dedupKey: `maintenance-failed-${job.name}`,
+      severity: 'error',
+      replyMarkup: RUN_NOW_JOB_NAME_PATTERN.test(job.name)
+        ? { inline_keyboard: [[{ text: '▶ Run now', callback_data: `sk:job:${job.name}` }]] }
+        : undefined,
+    }).catch(() => {});
+
+    return {
+      name: job.name,
+      outcome: 'failed',
+      error: errorMessage,
+      durationMs: Date.now() - t0,
+    };
+  } finally {
+    IN_FLIGHT.delete(job.name);
+  }
+}
+
+/**
+ * Runs every due job for `host`. SEQUENTIALLY by default (D: is a 5400rpm
+ * HDD; parallel fs sweeps starve each other) — never throws: a job that
+ * throws is recorded as `failed` and the remaining jobs still run. With
+ * `opts.parallel` (S8, 2026-09-11, pa-host opt-in) due jobs are STARTED
+ * without being awaited: each returns immediately with a 'started' record
+ * and `runJobToCompletion`'s detached promise performs the real ledger
+ * write once the job actually finishes.
  */
 export async function runDueJobs(
   host: MaintenanceHost,
@@ -195,6 +302,13 @@ export async function runDueJobs(
   const records: JobRunRecord[] = [];
   const targetJobs = opts.onlyJob ? jobs.filter((j) => j.name === opts.onlyJob) : jobs;
 
+  // AI-315: skip bookkeeping is collected here and written as ONE ledger
+  // transaction after the loop. Awaiting updateJobState per skipped job let a
+  // single wedged maintenance-state queue charge ~one store-bound per job
+  // (and a throwing write aborted the pass mid-list) — on 2026-09-17 the
+  // tail jobs backlog-fragments-drain and bus-drain starved ~3.5 h that way.
+  const skipBookkeeping = new Map<string, (prev: MaintenanceJobState) => MaintenanceJobState>();
+
   for (const job of targetJobs) {
     const everyMs = resolveEveryMs(job, overrides[job.name]);
     const override = overrides[job.name];
@@ -224,6 +338,13 @@ export async function runDueJobs(
     if (decision.action === 'run') {
       IN_FLIGHT.add(job.name);
     }
+    if (opts.onJobDecision) {
+      try {
+        opts.onJobDecision(job.name, decision.action);
+      } catch {
+        /* progress reporting never breaks a pass */
+      }
+    }
 
     const t0 = Date.now();
 
@@ -231,20 +352,20 @@ export async function runDueJobs(
       const skipReason = decision.skipReason;
       const nowIso = new Date(now).toISOString();
 
-      let shouldLog = false;
-      const persisted = await updateJobState(job.name, (prev) => {
-        shouldLog = prev.lastLoggedSkipReason !== skipReason;
-        return {
-          ...prev,
-          lastSkipAt: nowIso,
-          lastSkipReason: skipReason,
-          lastOutcome: 'skipped' as JobOutcome,
-          consecutiveSkips: skipReason === 'not-due' ? 0 : prev.consecutiveSkips + 1,
-          lastLoggedSkipReason: shouldLog ? skipReason : prev.lastLoggedSkipReason,
-        };
-      }, now);
+      // Deferred to the single batched write after the loop (AI-315). The
+      // mutate recomputes against the CURRENT entry at write time; the log
+      // line and skip-too-long page below read the pass snapshot, matching
+      // the values the old inline write persisted.
+      skipBookkeeping.set(job.name, (prev) => ({
+        ...prev,
+        lastSkipAt: nowIso,
+        lastSkipReason: skipReason,
+        lastOutcome: 'skipped' as JobOutcome,
+        consecutiveSkips: skipReason === 'not-due' ? 0 : prev.consecutiveSkips + 1,
+        lastLoggedSkipReason: prev.lastLoggedSkipReason !== skipReason ? skipReason : prev.lastLoggedSkipReason,
+      }));
 
-      if (shouldLog) {
+      if (state?.lastLoggedSkipReason !== skipReason) {
         const level = skipReason === 'not-due' ? 'info' : 'warn';
         log(level, 'maintenance', `${job.name}: skipped (${skipReason})`, { job: job.name, host, skipReason });
       }
@@ -255,9 +376,9 @@ export async function runDueJobs(
         everyMs,
         skipReason,
         now,
-        persisted.lastRunAt,
-        persisted.firstSeenAt,
-        persisted.consecutiveSkips,
+        state?.lastRunAt,
+        state?.firstSeenAt ?? nowIso,
+        skipReason === 'not-due' ? 0 : (state?.consecutiveSkips ?? 0) + 1,
         notify,
       );
 
@@ -272,74 +393,43 @@ export async function runDueJobs(
 
     // action === 'run' — the slot was already claimed above, synchronously
     // with the decision.
-    try {
-      const result = await job.run({ now, everyMs });
-      const nowIso = new Date(now).toISOString();
-
-      await updateJobState(job.name, (prev) => ({
-        ...prev,
-        lastRunAt: nowIso,
-        lastAttemptAt: nowIso,
-        lastOutcome: 'ran' as JobOutcome,
-        lastTouched: result.touched,
-        consecutiveFailures: 0,
-        consecutiveSkips: 0,
-        lastError: undefined,
-        // A run resets the "first skip after a run" clock so the next skip
-        // (even with the same reason as before this run) is logged once.
-        lastLoggedSkipReason: undefined,
-      }), now);
-
-      if (result.touched > 0) {
-        log('info', 'maintenance', `${job.name}: ${result.touched} item(s)`, {
+    if (opts.parallel) {
+      // S8 (2026-09-11): started, not awaited. runJobToCompletion's own
+      // completion handling performs the REAL ledger write, notify and
+      // IN_FLIGHT release once the job actually finishes. Terminal .catch
+      // (E19) so a throwing job can never surface as an unhandled rejection
+      // and take the loop process down — runJobToCompletion itself already
+      // turns job.run() throwing into a 'failed' ledger write, so this only
+      // guards against updateJobState/log/notify themselves throwing
+      // synchronously.
+      runJobToCompletion(job, host, now, everyMs, notify).catch((err) => {
+        log('error', 'maintenance', `${job.name}: detached parallel run rejected unexpectedly`, {
           job: job.name,
           host,
-          touched: result.touched,
-          durationMs: Date.now() - t0,
-          ...result.detail,
+          error: err?.message ?? String(err),
         });
-      }
-
+      });
       records.push({
         name: job.name,
-        outcome: 'ran',
-        touched: result.touched,
-        durationMs: Date.now() - t0,
-        ...(result.detail ? { detail: result.detail } : {}),
+        outcome: 'started',
+        durationMs: 0,
       });
+    } else {
+      records.push(await runJobToCompletion(job, host, now, everyMs, notify));
+    }
+  }
+
+  if (skipBookkeeping.size > 0) {
+    try {
+      await updateJobsState(skipBookkeeping, now);
     } catch (err: any) {
-      const errorMessage = err?.message ?? String(err);
-      const persisted = await updateJobState(job.name, (prev) => ({
-        ...prev,
-        lastAttemptAt: new Date(now).toISOString(),
-        lastOutcome: 'failed' as JobOutcome,
-        lastError: errorMessage,
-        consecutiveFailures: prev.consecutiveFailures + 1,
-      }), now);
-
-      log('error', 'maintenance', `${job.name} failed`, {
-        job: job.name,
+      // Bookkeeping failure never aborts the pass — the records above are
+      // already produced and the skips re-record next pass (AI-315).
+      log('warn', 'maintenance', `skip bookkeeping write failed for ${skipBookkeeping.size} job(s)`, {
         host,
-        error: errorMessage,
-        consecutiveFailures: persisted.consecutiveFailures,
+        jobs: skipBookkeeping.size,
+        error: err?.message ?? String(err),
       });
-
-      await notify(`Maintenance job failed: ${job.name}`, errorMessage, {
-        dedupKey: `maintenance-failed-${job.name}`,
-        severity: 'error',
-        replyMarkup: RUN_NOW_JOB_NAME_PATTERN.test(job.name)
-          ? { inline_keyboard: [[{ text: '▶ Run now', callback_data: `sk:job:${job.name}` }]] }
-          : undefined,
-      }).catch(() => {});
-
-      records.push({
-        name: job.name,
-        outcome: 'failed',
-        error: errorMessage,
-        durationMs: Date.now() - t0,
-      });
-    } finally {
-      IN_FLIGHT.delete(job.name);
     }
   }
 

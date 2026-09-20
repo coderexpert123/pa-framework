@@ -3,7 +3,7 @@ cron: "0 * * * *"
 cost_tier: off_peak
 on_missed: latest
 cwd: "${PA_HOME}/skills/rate-limit-retrospective"
-cmd: "python rate_limit_digest.py"
+cmd: "python3 rate_limit_digest.py || python rate_limit_digest.py"
 timeout: 120
 secrets:
   - TELEGRAM_BOT_TOKEN

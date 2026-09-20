@@ -60,9 +60,11 @@ def main():
         
         if status == "auth":
             try:
-                # Path to start_google_telegram_reauth.py relative to projects/daily-mail-brief/scripts/preflight.py
-                # D:\Personal Assistant\projects\daily-mail-brief\scripts\preflight.py
-                # -> D:\Personal Assistant\pa\scripts\start_google_telegram_reauth.py
+                # Path to start_google_telegram_reauth.py relative to this script:
+                # <repo-root>/projects/daily-mail-brief/scripts/preflight.py
+                # -> <repo-root>/pa/scripts/start_google_telegram_reauth.py
+                # (repo_root is derived from SCRIPT_DIR, never hardcoded, so this
+                # resolves correctly on any clone regardless of checkout path)
                 repo_root = os.path.dirname(os.path.dirname(os.path.dirname(SCRIPT_DIR)))
                 pa_scripts_dir = os.path.join(repo_root, "pa", "scripts")
                 start_script = os.path.join(pa_scripts_dir, "start_google_telegram_reauth.py")

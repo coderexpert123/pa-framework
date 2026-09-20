@@ -4,6 +4,7 @@ import { join, dirname, basename } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { ensureFreshDist } from './dist-guard.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, '../..');
@@ -174,13 +175,20 @@ async function main() {
   // lock, never the guard. The policy (incl. the PA_ALLOW_STALE_DIST=1
   // warn-and-continue escape hatch) lives in assertDistFresh; a missing
   // compiled module/function (fresh clone, pre-build bootstrap) skips it.
+  // AI-255 WP-G: a stale dist gets ONE managed rebuild via the package's own
+  // build.mjs (which takes @build itself) before refusing — PA_NO_AUTOBUILD=1
+  // restores refuse-fast for callers that manage their own builds.
   const blGuard = loadBuildLock(repoRoot);
   if (blGuard && typeof blGuard.assertDistFresh === 'function') {
-    try {
-      await blGuard.assertDistFresh({ pkg: isBot ? 'bot' : 'pa', repoRoot });
-    } catch (e) {
-      console.error(`Refusing to run tests against this dist (AI-180): ${e?.message ?? e}`);
-      process.exitCode = 1;
+    const pkg = isBot ? 'bot' : 'pa';
+    const guardCode = await ensureFreshDist({
+      pkg,
+      assertFresh: () => blGuard.assertDistFresh({ pkg, repoRoot }),
+      buildScript: join(repoRoot, pkg === 'bot' ? 'projects/telegram-bot/scripts/build.mjs' : 'pa/scripts/build.mjs'),
+      buildCwd: join(repoRoot, pkg === 'bot' ? 'projects/telegram-bot' : 'pa'),
+    });
+    if (guardCode !== 0) {
+      process.exitCode = guardCode;
       return;
     }
   }

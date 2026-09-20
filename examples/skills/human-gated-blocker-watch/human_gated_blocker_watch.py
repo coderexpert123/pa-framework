@@ -69,7 +69,7 @@ inside `"blockers"` itself, because `evaluate()`'s vanished-key cleanup would
 silently delete any key there that isn't a live worker `"<worker>:<classification>"`
 pair. See `load_google_auth_stamp()` / `save_google_auth_stamp()`.
 
-Usage:  python human_gated_blocker_watch.py
+Usage:  python3 human_gated_blocker_watch.py   # (Windows: python human_gated_blocker_watch.py)
 """
 from __future__ import annotations
 
@@ -453,7 +453,7 @@ def render_report(alerts: list[dict], resolved_notes: list[str], postmortem_aler
                 f"Google authentication has been expired for *{ga['age_days']} days* "
                 f"({sev_txt}), blocking {skills_txt}{reason_txt}.")
         lines.append("")
-        lines.append("Send /reauth in Telegram, or run python ~/.pa/reauth_google.py on the laptop.")
+        lines.append("Send /reauth in Telegram, or run python3 ~/.pa/reauth_google.py (Windows: python) on the laptop.")
 
     lines.append("")
     lines.append("_Ledger: ~/.pa/human-gated-blockers.json (age tracking; "

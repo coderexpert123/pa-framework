@@ -28,6 +28,12 @@ export interface SelfRestartInputs {
   buildLockHeld: boolean;
   /** listPendingDispatches().length. */
   inFlightWorkers: number;
+  /** Size of runPollLoop's in-process `inFlight` Set — promises for updates
+   *  the poll loop has picked up but not yet settled. Covers the window
+   *  between classification and pending-dispatch/topic-lock registration
+   *  that inFlightWorkers/topicLocksHeld miss (2026-09-16 incident:
+   *  self-restart fired mid-turn, dropping it silently). */
+  pollLoopInFlight: number;
   /** Count of topic states carrying a truthy pending_action. */
   pendingActions: number;
   /** Age in ms of the OLDEST fresh pending_action; null when pendingActions
@@ -75,7 +81,7 @@ export function shouldSelfRestart(i: SelfRestartInputs): SelfRestartDecision {
   if (i.buildLockHeld) {
     return { restart: false, reason: 'build-lock-held', stampIsNewer: true };
   }
-  if (i.inFlightWorkers > 0 || i.pendingActions > 0 || i.topicLocksHeld > 0) {
+  if (i.inFlightWorkers > 0 || i.pendingActions > 0 || i.topicLocksHeld > 0 || i.pollLoopInFlight > 0) {
     return { restart: false, reason: 'busy', stampIsNewer: true };
   }
   return { restart: true, reason: 'stamp-newer-and-idle', stampIsNewer: true };
@@ -116,5 +122,6 @@ export function formatRestartBlockers(i: SelfRestartInputs): string {
     parts.push(`pending_action×${i.pendingActions}${ageText}`);
   }
   if (i.topicLocksHeld > 0) parts.push(`topic locks×${i.topicLocksHeld} (this pid)`);
+  if (i.pollLoopInFlight > 0) parts.push(`in-flight turns×${i.pollLoopInFlight}`);
   return parts.join(', ');
 }

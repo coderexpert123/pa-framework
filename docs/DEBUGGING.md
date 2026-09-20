@@ -1,7 +1,7 @@
 # Debugging Conversation Traces
 
 > Audience: any agent debugging a pa dispatcher run. Lookup-oriented, not tutorial.
-> Scope: covers the four CLI workers registered in `~/.pa/config.yaml` — `zclaude`, `claude`, `codex`, `agy`.
+> Scope: covers the CLI workers registered in `~/.pa/config.yaml` — `zclaude`, `claude`, `codex`, `agy`, `agyc`, `devin`, `kgclaude`, `opencode`.
 
 ## 1. Three levels of history — pick the right one
 
@@ -30,9 +30,9 @@ If you need to see *exactly* what the model saw and produced on a given turn —
 - **Top-level per-line fields:** `parentUuid`, `type` (`user` | `assistant` | `system`), `message.{role,content}`, `uuid`, `timestamp`, `cwd`, `sessionId`, `gitBranch`, `version`.
 - **Subagents:** `<session-uuid>/subagents/agent-*.jsonl` — one file per Task-tool spawn, same JSONL envelope, plus a sibling `agent-*.meta.json`. A top-level `*.jsonl` glob on the project dir will **miss** these; walk one level in.
 - **Tool results folder:** `<session-uuid>/tool-results/` (referenced by the subagent transcripts; usually not needed directly).
-- **Same-dir caveat:** zclaude and claude are indistinguishable from filename alone. Disambiguate by:
+- **Same-dir caveat:** zclaude, claude and kgclaude are indistinguishable from filename alone. Disambiguate by:
     1. `session.worker` in `~/.pa/telegram-bot-topic-*.json` for the topic.
-    2. Model name in message payloads — `GLM-*` ⇒ zclaude, `claude-*` ⇒ claude.
+    2. Model name in message payloads — `GLM-*` ⇒ zclaude or kgclaude (kgclaude pins bare `glm-5.3-flash`; zclaude uses `[1m]`-suffixed names), `claude-*` ⇒ claude.
     3. The matching spawn entry in `~/.pa/logs/` by timestamp.
 
 ### 2.2 codex
@@ -50,6 +50,13 @@ If you need to see *exactly* what the model saw and produced on a given turn —
   If `sqlite3` is not on PATH, install with `winget install sqlite.sqlite` (CLI only) or open the file in any SQLite browser.
 - **Rollout transcript:** the full turn-by-turn transcript lives at `rollout_path` (a file path inside `~/.codex/`) — `threads` is the index, not the transcript.
 - **Resume args:** pa uses the subcommand form `resume <uuid>` (not `--resume`) — see `buildResumeArgs` in `session.ts`.
+
+### 2.3 opencode
+
+- **Store:** `~/.local/share/opencode/opencode.db` — a SQLite DB, **not** flat files. Do **not** `cat` it; open with `sqlite3` (see §2.2's pattern).
+- **Quick-inspect:** `opencode session list` lists sessions; `opencode export <sessionID>` prints the transcript.
+- **Resume flags:** `-s`/`--session <sessionID>` to resume a session, `-c`/`--continue` for the most recent.
+- **Disambiguation:** separate store from claude/zclaude/kgclaude (`~/.claude/projects/<cwd-slug>/*.jsonl`) — no same-dir caveat applies.
 
 ### 2.4 agy
 

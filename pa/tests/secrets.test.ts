@@ -1,7 +1,9 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { createTempPaHome, createTempSecrets, cleanup } from './helpers.js';
-import { loadSecrets } from '../src/secrets.js';
+import { loadSecrets, loadSecretsSync } from '../src/secrets.js';
 
 let tempDir: string;
 
@@ -85,5 +87,17 @@ describe('loadSecrets', () => {
     const secrets = await loadSecrets();
     assert.equal(Object.keys(secrets).length, 1);
     assert.equal(secrets.KEY, 'val');
+  });
+
+  it('loadSecretsSync parses the same KEY=VALUE rules as loadSecrets', async () => {
+    const content = '# c\nA=1\nB="two words"\nC=\'x\'\n\nNOEQ\n';
+    writeFileSync(join(tempDir, 'secrets.env'), content, 'utf8');
+    const expected = { A: '1', B: 'two words', C: 'x' };
+    assert.deepEqual(loadSecretsSync(), expected);
+    assert.deepEqual(await loadSecrets(), expected);
+
+    await cleanup(tempDir);
+    tempDir = await createTempPaHome();
+    assert.deepEqual(loadSecretsSync(), {});
   });
 });

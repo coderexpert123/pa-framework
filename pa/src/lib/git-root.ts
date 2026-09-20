@@ -1,5 +1,5 @@
 import { spawn } from 'child_process';
-import { existsSync } from 'fs';
+import { existsSync, realpathSync } from 'fs';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -89,4 +89,77 @@ export function walkUpToRepoRoot(startDir: string): string {
     dir = parent;
   }
   throw new Error(`repoRootFromModule: no repo root above ${startDir} (no .git, no pa/package.json)`);
+}
+
+/**
+ * `git rev-parse --git-common-dir` resolved to an absolute, normalized-for-
+ * comparison path — the shared object store two worktrees of ONE repo have in
+ * common (a linked worktree's own .git dir differs; its common dir is the main
+ * checkout's). Output can be repo-relative (`.git` from the main tree), so it
+ * is resolved against the probe cwd, then realpath'd: on macOS TMPDIR is a
+ * `/var` symlink to `/private/var`, and on Windows a TMPDIR path can carry
+ * the 8.3 short name (`RUNNER~1`) while git's own --show-toplevel emits the
+ * long form — either way the two sides never string-equal without
+ * canonicalization (CI fail 2026-09-20, macOS + Windows
+ * `resolveWorkerTreeRoot` subtests). `.native` is required on win32: the
+ * default libuv fastpath resolves symlinks but leaves 8.3 names unexpanded,
+ * and its `\\?\` prefix is stripped back off for comparison. Case-folded on
+ * win32. Null outside a repo or without git — callers treat it as "no
+ * worktree relationship provable".
+ */
+async function gitCommonDir(cwd: string): Promise<string | null> {
+  return new Promise((resolvePromise) => {
+    const child = spawn('git', ['rev-parse', '--git-common-dir'], {
+      cwd,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    let out = '';
+    child.stdout?.on('data', (d: Buffer) => { out += d.toString(); });
+    child.on('close', (code) => {
+      if (code !== 0 || !out.trim()) return resolvePromise(null);
+      let p = resolve(cwd, out.trim()).replace(/[\\/]+$/, '');
+      try {
+        p = realpathSync.native(p).replace(/^\\\\\?\\/, '');
+      } catch { /* keep the unresolved form */ }
+      if (process.platform === 'win32') p = p.toLowerCase();
+      resolvePromise(p);
+    });
+    child.on('error', () => resolvePromise(null));
+  });
+}
+
+/**
+ * The working tree a spawned worker should run in: the skill's declared `cwd:`
+ * by default — or the CALLER's toplevel when the caller invoked `pa run` from
+ * inside a linked worktree of that same repo. Equal --git-common-dir means the
+ * same object store, i.e. the same repository with a different checked-out
+ * branch: the caller's pending files live THERE, not in the declared path.
+ * Without this, `pa run commit` invoked from a worktree spawned its worker at
+ * the frontmatter's hardcoded main checkout and reported "nothing to commit —
+ * byte-identical to HEAD" over files that were modified in the caller's tree
+ * (observed 2026-09-18, AI-315's commit run).
+ *
+ * Callers outside any repo (bot/scheduler cwd, C:\Windows\System32) and callers
+ * inside a DIFFERENT repo — including nested repos like pa-public/ — fall back
+ * to the declared cwd: the override only ever redirects within one repo's
+ * worktree family, never across repositories. A skill with no declared cwd
+ * already inherits the caller's cwd at spawn, so it returns the caller cwd
+ * unchanged.
+ */
+export async function resolveWorkerTreeRoot(
+  declaredCwd: string | undefined,
+  callerCwd: string = process.cwd(),
+): Promise<string> {
+  if (!declaredCwd) return callerCwd;
+  const declaredCommon = await gitCommonDir(declaredCwd);
+  if (!declaredCommon) return declaredCwd;
+  let callerTop: string;
+  try {
+    callerTop = await resolveRepoRoot(callerCwd);
+  } catch {
+    return declaredCwd;
+  }
+  const callerCommon = await gitCommonDir(callerTop);
+  return callerCommon === declaredCommon ? callerTop : declaredCwd;
 }

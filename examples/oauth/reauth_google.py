@@ -7,7 +7,7 @@ has been revoked or is otherwise unrecoverable.
 Saves a fresh token to ~/.pa/google-token.json with all PA scopes.
 
 Usage:
-    python ~/.pa/reauth_google.py
+    python3 ~/.pa/reauth_google.py   # (Windows: python ~/.pa/reauth_google.py)
 """
 
 import os

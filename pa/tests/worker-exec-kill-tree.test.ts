@@ -6,7 +6,7 @@ import { writeFile, mkdir } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { createTempPaHome, createTempSecrets, cleanup } from './helpers.js';
-import { executeWorker, selectKillTargets } from '../src/workers.js';
+import { executeWorker, selectKillTargets, _setOrphanSweepDepsForTest } from '../src/workers.js';
 import { isProcessAlive } from '../src/worker-pids.js';
 import type { WorkerConfig } from '../src/types.js';
 
@@ -90,6 +90,15 @@ describe('AI-112: kill reaches tracked descendants, not just the wrapper', { con
       const script = await writeScript('hang.js', 'setInterval(() => {}, 1000);');
       const worker = makeWorker({ args: [script] });
 
+      // AI-328: killWorkerTree now verifies ancestry before taskkill. The
+      // stand-in's REAL parent is this test runner — under a real snapshot it
+      // correctly classifies as foreign and would be skipped. Inject the
+      // snapshot that simulates the production case: the stand-in as a
+      // verified member of the worker family (rooted ancestry, created now).
+      _setOrphanSweepDepsForTest({
+        getProcessSnapshot: async () => new Map([[standIn.pid!, { parentPid: 0, cmdline: 'stand-in', createdMs: Date.now() }]]),
+      });
+
       const result = await executeWorker(worker, '', {
         timeout: 10,
         idleTimeout: 0.5, // 500ms
@@ -115,6 +124,7 @@ describe('AI-112: kill reaches tracked descendants, not just the wrapper', { con
       }
       assert.equal(isProcessAlive(standIn.pid!), false, 'tracked descendant must be killed, not just the wrapper');
     } finally {
+      _setOrphanSweepDepsForTest(null);
       try { standIn.kill('SIGKILL'); } catch { /* already dead — expected */ }
     }
   });

@@ -1,10 +1,11 @@
 import { randomBytes } from 'crypto';
 import { mkdir, readFile, stat, unlink, writeFile } from 'fs/promises';
-import { dirname, join } from 'path';
+import { basename, dirname, join } from 'path';
 import lockfile from 'proper-lockfile';
 import { safeLockOptions } from '../safe-lock.js';
 import { paHome } from '../../paths.js';
 import { renameWithRetry } from '../atomic-write.js';
+import { withBoundedQueue } from '../stall.js';
 import type { JobOutcome, SkipReason } from './types.js';
 
 export { renameWithRetry } from '../atomic-write.js';
@@ -102,30 +103,14 @@ async function writeLedgerAtomic(path: string, ledger: MaintenanceLedger): Promi
   }
 }
 
-const stateMutexes: Map<string, Promise<void>> = new Map();
-
 /**
- * In-process FIFO mutex per file, mirroring archive-files.ts's
- * withRotationMutex. Two updateJobState calls in the same process would
- * otherwise collide on proper-lockfile with ELOCKED.
+ * In-process serializer key for one ledger file (lib/stall.ts). Two
+ * updateJobState calls in one process would otherwise collide on
+ * proper-lockfile with ELOCKED. Bounded since 2026-09-16: a hung write detaches
+ * its successors after PA_STORE_WAIT_MAX_MS. Exported for tests.
  */
-async function withStateMutex<T>(filePath: string, fn: () => Promise<T>): Promise<T> {
-  const previous = stateMutexes.get(filePath) || Promise.resolve();
-  let release!: () => void;
-  const current = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  stateMutexes.set(filePath, current);
-
-  await previous.catch(() => {});
-  try {
-    return await fn();
-  } finally {
-    if (stateMutexes.get(filePath) === current) {
-      stateMutexes.delete(filePath);
-    }
-    release();
-  }
+export function maintenanceStateQueueKey(filePath: string): string {
+  return `maintenance-state:${filePath}`;
 }
 
 function defaultJobState(nowMs: number): MaintenanceJobState {
@@ -158,7 +143,7 @@ export async function updateJobState(
   const path = maintenanceStatePath();
   await ensureFile(path);
 
-  return withStateMutex(path, async () => {
+  return withBoundedQueue(maintenanceStateQueueKey(path), async () => {
     const release = await lockfile.lock(path, safeLockOptions('maintenance-state', { retries: 5, realpath: false }));
     try {
       const ledger = await readLedger();
@@ -170,7 +155,36 @@ export async function updateJobState(
     } finally {
       await release();
     }
-  });
+  }, { store: 'maintenance-state', target: basename(path) });
+}
+
+/**
+ * Batch variant of updateJobState: ONE queue slot, one lock acquisition, one
+ * atomic write for many jobs (AI-315 — a pass's skip bookkeeping used to
+ * write per job; N queued writes behind a wedged queue head cost ~N×bound and
+ * a throwing write aborted the pass mid-list). Each mutate receives the
+ * CURRENT entry, exactly as updateJobState's does.
+ */
+export async function updateJobsState(
+  mutations: ReadonlyMap<string, (prev: MaintenanceJobState) => MaintenanceJobState>,
+  nowMs: number = Date.now(),
+): Promise<void> {
+  if (mutations.size === 0) return;
+  const path = maintenanceStatePath();
+  await ensureFile(path);
+
+  await withBoundedQueue(maintenanceStateQueueKey(path), async () => {
+    const release = await lockfile.lock(path, safeLockOptions('maintenance-state', { retries: 5, realpath: false }));
+    try {
+      const ledger = await readLedger();
+      for (const [name, mutate] of mutations) {
+        ledger.jobs[name] = mutate(ledger.jobs[name] ?? defaultJobState(nowMs));
+      }
+      await writeLedgerAtomic(path, ledger);
+    } finally {
+      await release();
+    }
+  }, { store: 'maintenance-state', target: basename(path) });
 }
 
 /**
