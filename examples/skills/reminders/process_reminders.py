@@ -67,7 +67,10 @@ def main() -> None:
     due, remaining = [], []
     for r in reminders:
         try:
-            due_at = datetime.fromisoformat(r["due_at"])
+            # .replace("Z","+00:00"): Python <3.11 fromisoformat rejects the
+            # bare UTC 'Z' suffix (stock macOS python3 is 3.9 — install-trial
+            # leg 2 fail, 2026-09-21).
+            due_at = datetime.fromisoformat(r["due_at"].replace("Z", "+00:00"))
             if due_at.tzinfo is None:
                 due_at = due_at.replace(tzinfo=timezone.utc)
             (due if due_at <= now else remaining).append(r)

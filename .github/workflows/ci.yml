@@ -25,8 +25,11 @@ jobs:
   # do not rename `test`/`test-python` or change their matrix values
   # without also updating pa-framework's required-status-checks list, or
   # PRs will block forever on a check that never gets reported. A skipped
-  # required check is treated as passing by GitHub branch protection, which
-  # is the mechanism this whole skip depends on.
+  # required check is treated as passing by GitHub branch protection — but
+  # ONLY when the check-run posts under its expanded name; a job-level
+  # `if:` on a matrix job reports one collapsed literal-name run instead
+  # (2026-09-21 PR #43 wedge), so REQUIRED jobs gate at step level
+  # (`RUN_STEPS`), never at job level. Non-required jobs may still skip.
   changes:
     name: Detect affected paths
     runs-on: ubuntu-latest
@@ -53,8 +56,17 @@ jobs:
   test:
     name: Build + test (${{ matrix.os }})
     needs: changes
-    if: needs.changes.outputs.pa == 'true' || needs.changes.outputs.bot == 'true' || needs.changes.outputs.workflow == 'true'
     runs-on: ${{ matrix.os }}
+    # REQUIRED-CHECK RULE (2026-09-21, PR #43 wedge): branch protection
+    # requires "Build + test (<expanded os>)" — a job-level `if:` that skips
+    # a MATRIX job posts ONE collapsed check-run under the literal
+    # '${{ matrix.os }}' name, so the required contexts stay "Expected"
+    # forever and every filtered-out PR wedges (observed live). This job
+    # therefore ALWAYS runs and gates at STEP level via RUN_STEPS below;
+    # jobs that are NOT required checks (test-python) may keep a job-level
+    # `if:` — skipping them blocks nothing.
+    env:
+      RUN_STEPS: ${{ needs.changes.outputs.pa == 'true' || needs.changes.outputs.bot == 'true' || needs.changes.outputs.workflow == 'true' }}
 
     strategy:
       fail-fast: false
@@ -64,8 +76,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        if: env.RUN_STEPS == 'true'
 
       - name: Set up Node.js ${{ matrix.node-version }}
+        if: env.RUN_STEPS == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
@@ -81,6 +95,7 @@ jobs:
       # in the bot's own node_modules). pa must be installed + built before
       # the bot's install/build/test step runs.
       - name: Build and test pa orchestrator
+        if: env.RUN_STEPS == 'true'
         working-directory: pa
         run: |
           npm ci
@@ -89,11 +104,13 @@ jobs:
 
       # Non-blocking npm audit for pa (informational until baseline is clean)
       - name: npm audit (pa)
+        if: env.RUN_STEPS == 'true'
         continue-on-error: true
         working-directory: pa
         run: npm audit --audit-level=high
 
       - name: Build and test Telegram bot
+        if: env.RUN_STEPS == 'true'
         working-directory: projects/telegram-bot
         run: |
           npm ci
@@ -102,6 +119,7 @@ jobs:
 
       # Non-blocking npm audit for bot (informational until baseline is clean)
       - name: npm audit (bot)
+        if: env.RUN_STEPS == 'true'
         continue-on-error: true
         working-directory: projects/telegram-bot
         run: npm audit --audit-level=high
